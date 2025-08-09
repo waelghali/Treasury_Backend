@@ -12,6 +12,7 @@ import logging
 import uuid
 from functools import lru_cache
 from datetime import datetime, timedelta # Added timedelta for signed URL expiry
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -139,7 +140,7 @@ _get_vision_client()
 _get_gemini_model()
 
 # --- Local Output Directory Setup ---
-BASE_OUTPUT_DIR = r"C:\Grow\Output" # Base directory for local outputs
+BASE_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "Output")
 OCR_INPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "OCR_Input_to_Gemini")
 GEMINI_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "Gemini")
 
