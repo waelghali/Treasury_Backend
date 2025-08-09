@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>LG Extension Instruction</title>
+    <style>
+        /* Basic CSS for the letter */
+        body {
+            font-family: 'Inter', sans-serif; /* Use Inter font if available, fallback to generic sans-serif */
+            font-size: 10pt; /* Keep slightly reduced font size for single page */
+            line-height: 1.5;
+            color: #333;
+            margin: 0;
+            padding: 0; /* Ensure no body padding interferes with @page margins */
+        }
+        .container {
+            /* REMOVED explicit width: 19cm;
+               This allows the container to naturally fit within the @page margins. */
+            margin: 0 auto; /* Keep for centering if needed, though @page margins define print area */
+            padding: 0.5cm; /* Keep some internal padding within the container */
+            /* Optional: for visual debugging - remove in production */
+            /* border: 1px solid #eee; */
+            /* box-shadow: 0 0 10px rgba(0,0,0,0.05); */
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+            margin-top: 1em;
+            margin-bottom: 0.4em;
+        }
+        h1 {
+            font-size: 16pt;
+            text-align: center;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 0.4em;
+            margin-bottom: 0.8em;
+        }
+        p {
+            margin-bottom: 0.8em;
+            text-align: justify;
+        }
+        .header, .footer {
+            text-align: center;
+            font-size: 8pt;
+            color: #777;
+            margin-top: 1.5em;
+            border-top: 1px solid #eee;
+            padding-top: 0.4em;
+        }
+        .date {
+            text-align: right;
+            margin-bottom: 1.5em;
+        }
+        .salutation {
+            margin-top: 1.5em;
+            margin-bottom: 0.8em;
+        }
+        .closing {
+            margin-top: 2em;
+            text-align: left;
+        }
+        .signature {
+            margin-top: 0.8em;
+            font-weight: bold;
+        }
+        .details-table {
+            width: 100%; /* Ensure table takes full available width */
+            border-collapse: collapse;
+            margin-top: 1em;
+            margin-bottom: 1em;
+            font-size: 9pt;
+        }
+        .details-table th, .details-table td {
+            border: 1px solid #ddd;
+            padding: 6px;
+            text-align: left;
+            vertical-align: top;
+        }
+        .details-table th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+            width: 30%;
+        }
+        .highlight {
+            background-color: #f0f8ff;
+            padding: 0.1em 0.3em;
+            border-radius: 3px;
+        }
+        /* WeasyPrint specific page settings */
+        @page {
+            size: A4;
+            margin: 2cm; /* Balanced margins: 2cm on all four sides */
+            @top-center { content: "LG Extension Instruction"; font-size: 8pt; color: #555; }
+            @bottom-center { content: "Page " counter(page) " of " counter(pages); font-size: 8pt; color: #555; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <!-- You can add your company logo or address here -->
+            <p><strong>{{customer_name}}</strong></p>
+            <p>Treasury Department</p>
+            <p>123 Business Road, City, Country</p>
+            <p>Phone: (123) 456-7890 | Email: info@{{customer_name}}.com</p>
+        </div>
+
+        <div class="date">
+            <p>Date: {{current_date}}</p>
+        </div>
+
+        <div class="salutation">
+            <p>To Whom It May Concern,</p>
+            <p><strong>Subject: Instruction to Extend Letter of Guarantee #<span class="highlight">{{lg_number}}</span></strong></p>
+        </div>
+
+        <p>Kindly arrange to extend Letter of Guarantee number <strong>{{lg_number}}</strong> with original expiry date <strong>{{old_expiry_date}}</strong> until <strong>{{new_expiry_date}}</strong>.</p>
+
+        <p>The details of the guarantee are as follows:</p>
+
+        <table class="details-table">
+            <tr>
+                <th>LG Number:</th>
+                <td>{{lg_number}}</td>
+            </tr>
+            <tr>
+                <th>Original Expiry Date:</th>
+                <td>{{old_expiry_date}}</td>
+            </tr>
+            <tr>
+                <th>New Expiry Date:</th>
+                <td>{{new_expiry_date}}</td>
+            </tr>
+            <tr>
+                <th>Amount:</th>
+                <td>{{lg_amount}} {{lg_currency}}</td>
+            </tr>
+            <tr>
+                <th>Issued By:</th>
+                <td>{{issuing_bank_name}}</td>
+            </tr>
+            <tr>
+                <th>Beneficiary:</th>
+                <td>{{lg_beneficiary_name}}</td>
+            </tr>
+            <tr>
+                <th>Issuer Name:</th>
+                <td>{{lg_issuer_name}}</td>
+            </tr>
+            <tr>
+                <th>Internal Owner:</th>
+                <td>{{internal_owner_email}}</td>
+            </tr>
+        </table>
+
+        <p>Your prompt attention to this matter is greatly appreciated.</p>
+
+        <div class="closing">
+            <p>Sincerely,</p>
+            <p class="signature">{{customer_name}}</p>
+            <p>Treasury Department</p>
+            <p>For and on behalf of {{platform_name}}</p>
+        </div>
+
+        <div class="footer">
+            <p>Confidential &copy; {{platform_name}} - All Rights Reserved.</p>
+        </div>
+    </div>
+</body>
+</html>

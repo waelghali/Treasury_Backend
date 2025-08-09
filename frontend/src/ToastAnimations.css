@@ -1,0 +1,26 @@
+/* ToastAnimations.css */
+
+/* Remove custom keyframes and animate-enter/exit overrides */
+/* Keep styles for font size and padding to make it smaller */
+
+body .Toastify__toast-container {
+  width: 350px !important;
+}
+
+body .Toastify__toast {
+  padding: 8px 12px !important;
+  font-size: 0.80rem !important;
+  box-sizing: border-box !important; /* Good practice for consistent sizing */
+  /* Remove any animation or transform properties here */
+  /* These will be handled by React-Toastify's built-in Fade transition */
+}
+
+body .Toastify__toast-body {
+  font-size: 0.80rem !important;
+}
+
+body .Toastify__close-button {
+  font-size: 0.70rem !important;
+  align-self: flex-start !important; /* Adjust if button position is off */
+  margin-top: 2px !important; /* Small adjustment for close button alignment */
+}
