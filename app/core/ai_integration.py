@@ -56,6 +56,20 @@ _gcs_client = None
 _vision_client = None
 _gemini_model_global = None
 
+# --- Dynamically set GOOGLE_APPLICATION_CREDENTIALS if JSON is provided ---
+# This block replaces the direct os.environ lookup with a temporary file approach.
+creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+if creds_json:
+    # Use tempfile to create a secure temporary file
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_creds_file:
+        temp_creds_file.write(creds_json)
+        tmp_path = temp_creds_file.name
+    # Set the environment variable to point to the temporary file
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
+    logger.info(f"Google credentials written to temporary file: {tmp_path}")
+else:
+    logger.warning("GOOGLE_CREDENTIALS_JSON environment variable not found. Attempting to use existing GOOGLE_APPLICATION_CREDENTIALS.")
+
 @lru_cache(maxsize=1)
 def _get_google_credentials():
     global _google_credentials
