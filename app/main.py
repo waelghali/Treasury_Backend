@@ -41,6 +41,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         "https://treasury-frontend.vercel.app",
         "treasury-frontend-8btnica55-waels-projects-e59ad1d5.vercel.app",
         "https://treasury-frontend-8btnica55-waels-projects-e59ad1d5.vercel.app",
+        "https://treasury-frontend-8btnica55-waels-projects-e59ad1d5.vercel.app/",
         "https://treasury-frontend-3sky3divg-waels-projects-e59ad1d5.vercel.app/",
         "https://treasury-frontend-3sky3divg-waels-projects-e59ad1d5.vercel.app,"
         "https://*.vercel.app",
