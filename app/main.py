@@ -38,7 +38,8 @@ app = FastAPI(
 def configure_app_instance(fastapi_app: FastAPI):
     # CORS Middleware for frontend communication
     origins = [
-        "https://treasury-frontend.vercel.app"
+        "https://treasury-frontend.vercel.app",
+        "https://*.vercel.app",
         "http://localhost",
         "http://localhost:3000",
         "http://127.0.0.1",
