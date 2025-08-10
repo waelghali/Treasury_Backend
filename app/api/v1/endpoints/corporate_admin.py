@@ -70,7 +70,8 @@ except Exception as e:
     print(f"FATAL ERROR (corporate_admin.py): Could not import core.security module directly. Error: {e}")
     raise
 
-
+import logging
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # NEW DEPENDENCY: Check subscription status
@@ -1327,25 +1328,30 @@ def get_action_center_instructions_undelivered(
     skip: int = 0,
     limit: int = 100
 ):
-    """
-    Retrieves instructions that have been issued but not yet delivered to the bank.
-    """
     customer_id = corporate_admin_context.customer_id
     
-    # Get configurable days from customer or global settings
-    report_start_days = crud_customer_configuration.get_customer_config_or_global_fallback(
+    # Safely retrieve configuration for the start days
+    report_start_days_config = crud_customer_configuration.get_customer_config_or_global_fallback(
         db, customer_id, GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_REPORT_UNDELIVERED
-    )['effective_value']
-    
-    report_stop_days = crud_customer_configuration.get_customer_config_or_global_fallback(
+    )
+    # Safely retrieve configuration for the stop days
+    report_stop_days_config = crud_customer_configuration.get_customer_config_or_global_fallback(
         db, customer_id, GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED
-    )['effective_value']
-    
-    undelivered_instructions = crud_lg_instruction.get_undelivered_instructions_for_reporting(
-        db, customer_id, int(report_start_days), int(report_stop_days)
     )
     
-    return undelivered_instructions
+    # Extract values with a default if the config is missing
+    report_start_days = int(report_start_days_config.get('effective_value', 3)) if report_start_days_config else 3
+    report_stop_days = int(report_stop_days_config.get('effective_value', 60)) if report_stop_days_config else 60
+
+    if not (0 <= report_start_days < report_stop_days):
+        logger.warning(f"Invalid report start/stop days config for customer {customer_id}. Using default range.")
+        report_start_days = 3
+        report_stop_days = 60
+    
+    instructions = crud_lg_instruction.get_undelivered_instructions_for_reporting(
+        db, customer_id, report_start_days, report_stop_days
+    )
+    return instructions[skip:skip+limit]
 
 @router.get(
     "/action-center/instructions/awaiting-reply",
