@@ -1,15 +1,12 @@
-// frontend/src/services/apiClient.js
 import axios from 'axios';
 
-// Get the base URL from your environment variables or hardcode it
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000/api/v1';
+// Use consistent env var name everywhere
+const API_BASE_URL = process.env.REACT_APP_API_URL;
 
-// Create an Axios instance with the base URL
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
 });
 
-// Add a request interceptor to include the JWT token in every request
 apiClient.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('jwt_token');
@@ -18,9 +15,7 @@ apiClient.interceptors.request.use(
     }
     return config;
   },
-  (error) => {
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error)
 );
 
 export default apiClient;
