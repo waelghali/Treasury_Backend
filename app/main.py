@@ -38,18 +38,10 @@ app = FastAPI(
 def configure_app_instance(fastapi_app: FastAPI):
     # CORS Middleware for frontend communication
     origins = [
-        "https://treasury-frontend.vercel.app",
-<<<<<<< HEAD
-=======
-        "https://treasury-test-frontend-git-main-waels-projects-e59ad1d5.vercel.app/",
-        "https://treasury-test-frontend-git-main-waels-projects-e59ad1d5.vercel.app",
-        "treasury-frontend-8btnica55-waels-projects-e59ad1d5.vercel.app",
-        "https://treasury-frontend-8btnica55-waels-projects-e59ad1d5.vercel.app",
-        "https://treasury-frontend-8btnica55-waels-projects-e59ad1d5.vercel.app/",
-        "https://treasury-frontend-3sky3divg-waels-projects-e59ad1d5.vercel.app/",
-        "https://treasury-frontend-3sky3divg-waels-projects-e59ad1d5.vercel.app,"
->>>>>>> 90677b21f660b4410340779d289c28157fe54366
-        "https://*.vercel.app",
+        "https://treasury-frontend-46hip9jex-waels-projects-e59ad1d5.vercel.app/",
+        "https://treasury-frontend-46hip9jex-waels-projects-e59ad1d5.vercel.app",
+        "https://treasury-frontend-nu.vercel.app/",
+        "https://treasury-frontend-nu.vercel.app",
         "http://localhost",
         "http://localhost:3000",
         "http://127.0.0.1",
