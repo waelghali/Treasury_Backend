@@ -420,7 +420,7 @@ ROLE_PERMISSIONS_MAPPING = {
         "lg_record:create", "lg_record:view_own", "lg_record:extend", "lg_record:amend",
         "lg_record:liquidate", "lg_record:release", "lg_record:decrease_amount",
         "lg_instruction:update_status", "lg_instruction:cancel_last", "lg_instruction:send_reminder",
-        "template:view","lg_document:view", "internal_owner_contact:view", "system_notification:view",
+        "template:view","lg_document:view", "internal_owner_contact:view", "system_notification:view", "lg_record:ai_scan",
     ],
     UserRole.CHECKER.value: [
         "lg_record:view_own", "maker_checker:approve", "system_notification:view",
