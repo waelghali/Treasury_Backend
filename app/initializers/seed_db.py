@@ -390,6 +390,8 @@ INITIAL_PERMISSIONS = [
     {"name": "action_center:view", "description": "Allow corporate admins to view action center pending actions"},
     {"name": "system_notification:view", "description": "Allow corporate admins and end users to view notifications"},
     {"name": "system_owner:resume_scheduler_job", "description": "Allow manually running background tasks"},
+    {"name": "system_owner:reschedule_scheduler_job", "description": "Allow manually running background tasks"},
+    {"name": "lg_record:ai_scan", "description": "Allow scan new lg record"},
     
 ]
 
