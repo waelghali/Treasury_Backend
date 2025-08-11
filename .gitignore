@@ -7,3 +7,4 @@ dist/
 build/
 .DS_Store
 lg-document-processing-*.json
+frontend/ 
