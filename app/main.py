@@ -116,6 +116,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(system_owner.router, prefix="/api/v1/system-owner")
     fastapi_app.include_router(corporate_admin.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(end_user.router, prefix="/api/v1/end-user")
+    fastapi_app.include_router(auth_v2_router, prefix="/api/v1")
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
 
