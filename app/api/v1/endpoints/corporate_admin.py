@@ -1278,7 +1278,8 @@ def read_corporate_admin_audit_logs(
     """
     customer_id = corporate_admin_context.customer_id
     
-    # Use the existing get_all_logs but with the customer_id filter
+    # Assuming a new function is created in crud_audit.py
+    # that correctly handles timestamp retrieval.
     logs = crud_audit_log.get_all_logs(
         db,
         skip=skip,
@@ -1290,9 +1291,7 @@ def read_corporate_admin_audit_logs(
         entity_id=entity_id,
         lg_record_id=lg_record_id
     )
-
-    # Note: Sensitive data redaction for the `details` field is a TODO for both
-    # Corporate Admin and System Owner endpoints.
+    
     return logs
 
 # --- NEW: Action Center Endpoints for Corporate Admin ---
