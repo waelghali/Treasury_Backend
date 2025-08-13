@@ -638,7 +638,7 @@ async def seed_db():
         lg_types_to_seed = [
             {"name": "Performance Guarantee", "description": "Guarantees performance of contractual obligations."},
             {"name": "Bid Bond", "description": "Guarantees that a bidder will enter into a contract if awarded."},
-            {"name": "Advance Payment Guarantee", "description": "Guarantees repayment of an advance payment."},
+            {"name": "Advance Payment LG", "description": "Guarantees repayment of an advance payment."},
             {"name": "Financial Guarantee", "description": "Guarantees a financial obligation."},
         ]
         for lg_type_data in lg_types_to_seed:
@@ -1176,11 +1176,11 @@ async def seed_db():
                 template_type="LETTER",
                 action_type="LG_ACTIVATE_NON_OPERATIVE",
                 content="""
-                Subject: Instruction to Activate Non-Operative Advance Payment Guarantee #{{lg_number}}
+                Subject: Instruction to Activate Non-Operative Advance Payment LG #{{lg_number}}
 
                 To {{issuing_bank_name}},
 
-                Please arrange to activate the Advance Payment Guarantee number {{lg_number}}.
+                Please arrange to activate the Advance Payment LG number {{lg_number}}.
                 This guarantee becomes operative upon receipt of payment as follows:
                 Payment Method: {{payment_method}}
                 Amount: {{payment_amount_formatted}}
@@ -1207,7 +1207,7 @@ async def seed_db():
                 <html>
                 <body>
                     <p>Dear {{internal_owner_email}},</p>
-                    <p>This is to confirm that an instruction has been issued to activate Advance Payment Guarantee:</p>
+                    <p>This is to confirm that an instruction has been issued to activate Advance Payment LG:</p>
                     <ul>
                         <li><b>LG Number:</b> {{lg_number}}</li>
                         <li><b>Amount:</b> {{lg_amount}} {{lg_currency}}</li>
@@ -1625,7 +1625,7 @@ async def seed_db():
         performance_lg_type_id = performance_lg_type.id if performance_lg_type else None
         bid_bond_lg_type = db.query(models.LgType).filter(models.LgType.name == "Bid Bond").first()
         bid_bond_lg_type_id = bid_bond_lg_type.id if bid_bond_lg_type else None
-        advance_payment_lg_type = db.query(models.LgType).filter(models.LgType.name == "Advance Payment Guarantee").first()
+        advance_payment_lg_type = db.query(models.LgType).filter(models.LgType.name == "Advance Payment LG").first()
         advance_payment_lg_type_id = advance_payment_lg_type.id if advance_payment_lg_type else None
         financial_lg_type = db.query(models.LgType).filter(models.LgType.name == "Financial Guarantee").first()
         financial_lg_type_id = financial_lg_type.id if financial_lg_type else None

@@ -619,6 +619,7 @@ class LGCategoryOut(BaseModel):
     
     has_all_entity_access: bool
     entities_with_access: List[CustomerEntityOut] = []
+    lg_count: int = Field(0, description="The number of active LG records assigned to this category.")
 
     class Config:
         from_attributes = True
