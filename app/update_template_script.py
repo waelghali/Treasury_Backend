@@ -60,7 +60,8 @@ def update_all_templates_sync():
                 template_to_update = db_session.query(Template).filter(
                     Template.action_type == action_type,
                     Template.is_notification_template == False,
-                    Template.is_global == True
+                    Template.is_global == True,
+                    Template.is_deleted == False  # Add this new filter
                 ).first()
 
                 if template_to_update:
@@ -89,7 +90,7 @@ def update_all_templates_sync():
     finally:
         if db_session:
             db_session.close()
-
+            
 if __name__ == "__main__":
     print("Starting batch template update script...")
     update_all_templates_sync()
