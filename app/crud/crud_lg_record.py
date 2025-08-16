@@ -32,11 +32,12 @@ from app.constants import (
     ACTION_TYPE_LG_RECORD_DELIVERY, AUDIT_ACTION_TYPE_LG_INSTRUCTION_DELIVERED,
     ACTION_TYPE_LG_RECORD_BANK_REPLY, AUDIT_ACTION_TYPE_LG_BANK_REPLY_RECORDED,
     ACTION_TYPE_LG_UNDELIVERED_INSTRUCTIONS_REPORT, AUDIT_ACTION_TYPE_LG_UNDELIVERED_INSTRUCTIONS_REPORT_SENT,
+    ACTION_TYPE_LG_REMINDER_TO_BANKS, AUDIT_ACTION_TYPE_LG_REMINDER_SENT_TO_BANK,
     ACTION_TYPE_LG_EXTEND, ACTION_TYPE_LG_RELEASE, ACTION_TYPE_LG_LIQUIDATE,
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, ACTION_TYPE_LG_AMEND,
     ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION,
     ACTION_TYPE_LG_CHANGE_OWNER_DETAILS, ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER, ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER,
-    AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED, # Reusing this for bulk auto-renewal logging
+    AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED,
     AUDIT_ACTION_TYPE_LG_AMENDED, AUDIT_ACTION_TYPE_LG_ACTIVATED,
     LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, # Corrected to models.LgOperationalStatusEnum
     ACTION_TYPE_LG_TOGGLE_AUTO_RENEWAL, AUDIT_ACTION_TYPE_LG_AUTO_RENEWAL_TOGGLED, # Added toggle constants
@@ -45,8 +46,13 @@ from app.constants import (
     ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT,
     ACTION_TYPE_LG_REMINDER_TO_INTERNAL_OWNER, AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT,
     AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SKIPPED_RECENTLY_SENT,
-    # NEW: Constants for instruction serial generation
+    # NEW: Import DOCUMENT_TYPE_ORIGINAL_LG
+    DOCUMENT_TYPE_ORIGINAL_LG,
+    # New constants for new LG record email confirmation
+    ACTION_TYPE_LG_RECORDED,
+    # New constants for instruction serial generation
     InstructionTypeCode, SubInstructionCode,
+    UserRole # ADDED in the previous turn
 )
 from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
 from app.core.document_generator import generate_pdf_from_html
@@ -329,6 +335,183 @@ class CRUDLGRecord(CRUDBase):
             db.refresh(customer)
 
         db.refresh(db_lg_record)
+
+        try:
+            # 1. Retrieve all email recipients
+            to_emails = [db_lg_record.internal_owner_contact.email]
+            cc_emails = []
+            if db_lg_record.internal_owner_contact.manager_email:
+                cc_emails.append(db_lg_record.internal_owner_contact.manager_email)
+
+            if db_lg_record.lg_category and db_lg_record.lg_category.communication_list:
+                cc_emails.extend(db_lg_record.lg_category.communication_list)
+
+            # Get the common communication list from customer configuration
+            common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                db, customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+            )
+            if common_comm_list_config and common_comm_list_config.get('effective_value'):
+                try:
+                    parsed_list = json.loads(common_comm_list_config['effective_value'])
+                    if isinstance(parsed_list, list):
+                        cc_emails.extend([email for email in parsed_list if isinstance(email, str)])
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON for common communication list for customer {customer_id}. Skipping.")
+
+            # Get all corporate admins for this customer to CC them
+            corporate_admins = db.query(models.User).filter(
+                models.User.customer_id == customer_id,
+                models.User.role == UserRole.CORPORATE_ADMIN,
+                models.User.is_deleted == False
+            ).all()
+            for admin in corporate_admins:
+                if admin.email:
+                    cc_emails.append(admin.email)
+
+            # Remove duplicates and self from CC lists
+            cc_emails = list(set(cc_emails) - set(to_emails))
+
+            # 2. Find the notification template for a new LG
+            notification_template = db.query(models.Template).filter(
+                models.Template.action_type == "LG_RECORDED",
+                models.Template.is_notification_template == True,
+                models.Template.is_global == True, # Assuming a global template for this
+                models.Template.is_deleted == False
+            ).first()
+
+            if notification_template:
+                # 3. Prepare template data
+                template_data = {
+                    "lg_number": db_lg_record.lg_number,
+                    "lg_amount": float(db_lg_record.lg_amount),
+                    "lg_currency": db_lg_record.lg_currency.iso_code,
+                    "issuing_bank_name": db_lg_record.issuing_bank.name,
+                    "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
+                    "lg_owner_email": db_lg_record.internal_owner_contact.email,
+                    "internal_owner_email": db_lg_record.internal_owner_contact.email, # NEW
+                    "lg_type": db_lg_record.lg_type.name,
+                    "lg_category": db_lg_record.lg_category.category_name,
+                    "customer_name": db_lg_record.customer.name,
+                    "user_email": db.query(models.User.email).filter(models.User.id == user_id).scalar(),
+                    "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "platform_name": "Treasury Platform",
+                }
+
+                # Add formatted currency for display
+                template_data['lg_amount_formatted'] = f"{db_lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
+
+                # 4. Handle attachment
+                attachments = []
+                lg_document = db.query(models.LGDocument).filter(
+                    models.LGDocument.lg_record_id == db_lg_record.id,
+                    models.LGDocument.document_type == DOCUMENT_TYPE_ORIGINAL_LG,
+                    models.LGDocument.is_deleted == False
+                ).first()
+
+                if lg_document:
+                    # In a real-world scenario, you would need to download the file from GCS
+                    # using the `lg_document.file_path` and store it in memory.
+                    # For this example, we'll simulate the file content.
+                    try:
+                        # Placeholder for GCS download function
+                        # from app.core.ai_integration import _download_from_gcs
+                        # file_content = await _download_from_gcs(lg_document.file_path)
+                        file_content = b"This is a placeholder for the LG document content."
+                        attachments.append(EmailAttachment(
+                            filename=lg_document.file_name,
+                            content=file_content,
+                            mime_type=lg_document.mime_type
+                        ))
+                    except Exception as e:
+                        logger.error(f"Failed to retrieve LG document from GCS for email attachment: {e}")
+
+                # 5. Get email settings and send the email
+                email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer_id)
+                
+                # Replace placeholders in subject/body templates
+                subject = notification_template.subject
+                body_html = notification_template.content
+                for key, value in template_data.items():
+                    str_value = str(value) if value is not None else ""
+                    subject = subject.replace(f"{{{{{key}}}}}", str_value)
+                    body_html = body_html.replace(f"{{{{{key}}}}}", str_value)
+
+                email_sent_successfully = await send_email(
+                    db=db,
+                    to_emails=to_emails,
+                    cc_emails=cc_emails,
+                    subject_template=subject,
+                    body_template=body_html,
+                    template_data=template_data,
+                    email_settings=email_settings_to_use,
+                    attachments=attachments
+                )
+
+                # 6. Log the notification action
+                if email_sent_successfully:
+                    log_action(
+                        db,
+                        user_id=user_id,
+                        action_type="NOTIFICATION_SENT",
+                        entity_type="LGRecord",
+                        entity_id=db_lg_record.id,
+                        details={
+                            "recipient": to_emails,
+                            "cc_recipients": cc_emails,
+                            "subject": subject,
+                            "method": email_method_for_log,
+                            "notification_type": "LG Recorded Confirmation"
+                        },
+                        customer_id=customer_id,
+                        lg_record_id=db_lg_record.id,
+                    )
+                else:
+                     log_action(
+                        db,
+                        user_id=user_id,
+                        action_type="NOTIFICATION_FAILED",
+                        entity_type="LGRecord",
+                        entity_id=db_lg_record.id,
+                        details={
+                            "recipient": to_emails,
+                            "cc_recipients": cc_emails,
+                            "subject": subject,
+                            "method": email_method_for_log,
+                            "notification_type": "LG Recorded Confirmation"
+                        },
+                        customer_id=customer_id,
+                        lg_record_id=db_lg_record.id,
+                    )
+
+            else:
+                logger.warning(f"Notification template for 'LG_RECORDED' not found for customer {customer_id}.")
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_SKIPPED", entity_type="LGRecord", entity_id=db_lg_record.id,
+                    details={"reason": "Template for 'LG_RECORDED' notification not found."},
+                    customer_id=customer_id, lg_record_id=db_lg_record.id
+                )
+
+        except Exception as e:
+            logger.error(f"An error occurred while sending LG Recorded confirmation email for LG {db_lg_record.lg_number}: {e}", exc_info=True)
+            db.rollback() # Rollback the email part of the transaction if it fails
+            log_action(
+                db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
+                details={"reason": f"Unhandled exception during email send: {e}"},
+                customer_id=customer_id, lg_record_id=db_lg_record.id
+            )
+        # --- END NEW CODE BLOCK: Send LG Recorded Confirmation Email ---
+
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="CREATE",
+            entity_type="LGRecord",
+            entity_id=db_lg_record.id,
+            details={"lg_number": db_lg_record.lg_number, "customer_id": customer_id, "lg_sequence_number": db_lg_record.lg_sequence_number},
+            customer_id=customer_id,
+            lg_record_id=db_lg_record.id,
+        )
+        return db_lg_record
 
         log_action(
             db,

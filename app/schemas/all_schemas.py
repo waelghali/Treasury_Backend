@@ -1,7 +1,8 @@
 # app/schemas/all_schemas.py
+# app/schemas/all_schemas.py
 from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union # ADDED Union
 from enum import Enum
 from uuid import UUID
 import os
@@ -11,7 +12,8 @@ import re
 
 logger = logging.getLogger(__name__) # Get logger instance for the module
 
-from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus
+from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus, DOCUMENT_TYPE_ORIGINAL_LG
+
 
 class BaseSchema(BaseModel):
     id: int
@@ -811,8 +813,7 @@ class LGRecordBase(BaseModel):
     issuing_method_id: int = Field(..., description="ID of the method by which LG was issued")
     applicable_rule_id: int = Field(..., description="ID of the set of rules governing the LG")
     applicable_rules_text: Optional[str] = Field(None, max_length=64, description="Free text for rules (conditional)")
-    other_conditions: Optional[str] = Field(None, max_length=2048, description="Any other specific conditions not covered elsewhere")
-
+    other_conditions: Optional[str] = Field(None, max_length=4096, description="Any other specific conditions not covered elsewhere")
     internal_owner_contact_id: int = Field(..., description="ID of the internal owner contact person")
 
     lg_category_id: int = Field(..., description="ID of the LG Category for internal classification")
@@ -1197,6 +1198,34 @@ class SystemNotificationViewLogOut(SystemNotificationViewLogBase, BaseSchema):
     pass
 
 # --- NEW: Report Schemas (MINIMALIST) ---
+class ReportDataOut(BaseModel):
+    name: str
+    value: Union[str, float, int, Decimal]
+
+class AvgDeliveryDaysReportOut(BaseModel):
+    customer_avg: Optional[float] = None
+    overall_avg: Optional[float] = None
+
+class AvgDaysToActionEventOut(BaseModel):
+    customer_avg: Optional[float] = None
+    overall_avg: Optional[float] = None
+    
+class AvgDaysToActionEventReportOut(BaseModel):
+    customer_avg: Optional[int]
+    overall_avg: Optional[int]
+
+class LgTypeMixReportOut(BaseModel):
+    report_date: date
+    data: List[ReportDataOut]
+
+class AvgBankProcessingTimeReportOut(BaseModel):
+    report_date: date
+    data: List[ReportDataOut]
+
+class BankMarketShareReportOut(BaseModel):
+    report_date: date
+    data: List[ReportDataOut]
+
 class SystemUsageOverviewReportItemOut(BaseModel):
     total_customers: int
     total_lgs_managed: int

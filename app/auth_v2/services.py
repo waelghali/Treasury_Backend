@@ -117,7 +117,6 @@ class AuthService:
         user = crud_user.get_by_email(db, email)
         
         if not user:
-            # MODIFIED: Call log_action utility
             log_action(
                 db,
                 user_id=None,
@@ -132,9 +131,7 @@ class AuthService:
                 detail="Incorrect email or password."
             )
 
-        # Verify password using the hashing utility
         if not verify_password(password, user.password_hash):
-            # MODIFIED: Call log_action utility
             log_action(
                 db,
                 user_id=user.id,
@@ -150,10 +147,16 @@ class AuthService:
                 detail="Incorrect email or password."
             )
 
-        # Fetch user's permissions for the token
         from app.crud.crud import crud_role_permission # Late import
         db_permissions = crud_role_permission.get_permissions_for_role(db, user.role.value)
         permission_names = [p.name for p in db_permissions]
+
+        # NEW CODE TO ADD: Fetch customer name and add to token data
+        customer_name = None
+        if user.customer_id:
+            customer = db.query(Customer).filter(Customer.id == user.customer_id).first()
+            if customer:
+                customer_name = customer.name
 
         # Prepare data for token
         token_data = {
@@ -162,6 +165,7 @@ class AuthService:
             "role": user.role.value,
             "permissions": permission_names,
             "customer_id": user.customer_id,
+            "customer_name": customer_name, # <-- ADD THIS LINE
             "has_all_entity_access": user.has_all_entity_access,
             "entity_ids": [assoc.customer_entity_id for assoc in user.entity_associations] if not user.has_all_entity_access else [],
             "must_change_password": user.must_change_password,
@@ -169,7 +173,6 @@ class AuthService:
         
         access_token = create_access_token(data=token_data)
 
-        # MODIFIED: Call log_action utility
         log_action(
             db,
             user_id=user.id,
@@ -180,7 +183,6 @@ class AuthService:
             ip_address=request_ip,
             customer_id=user.customer_id,
         )
-        # Removed db.commit() here, `get_db` generator handles it.
 
         return {
             "access_token": access_token,

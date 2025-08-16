@@ -257,3 +257,90 @@ class CRUDReports(CRUDBase):
             report_date=date.today(),
             data=report_data
         )
+        
+    def get_chart_data(self, db: Session, report_type: str, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Retrieves data for the dashboard charts based on report type and user context.
+        """
+        query = None
+        if report_type == "lg_type_mix":
+            query = db.query(
+                models.LgType.name,
+                func.count(models.LGRecord.id)
+            ).join(models.LGRecord).filter(
+                models.LGRecord.customer_id == user_context['customer_id'],
+                models.LGRecord.is_deleted == False
+            ).group_by(models.LgType.name)
+        elif report_type == "bank_processing_times":
+            query = db.query(
+                models.Bank.short_name,
+                func.avg(
+                    (models.LGInstruction.bank_reply_date - models.LGInstruction.delivery_date)
+                ).label('avg_timedelta')
+            ).join(
+                models.LGRecord, models.LGInstruction.lg_record_id == models.LGRecord.id
+            ).join(
+                models.Bank, models.LGRecord.issuing_bank_id == models.Bank.id
+            ).filter(
+                models.LGInstruction.delivery_date.isnot(None),
+                models.LGInstruction.bank_reply_date.isnot(None),
+                models.LGInstruction.is_deleted == False,
+                models.LGRecord.is_deleted == False
+            ).group_by(models.Bank.short_name)
+        elif report_type == "bank_market_share":
+            # Corrected: Filter by customer_id if present
+            query = db.query(
+                models.Bank.short_name,
+                func.count(models.LGRecord.id)
+            ).join(models.LGRecord)
+
+            if user_context.get('customer_id'):
+                query = query.filter(models.LGRecord.customer_id == user_context['customer_id'])
+
+            query = query.group_by(models.Bank.short_name)
+
+        elif report_type == "avg_delivery_days":
+            # Refactored query to be more explicit and correct
+            query = db.query(
+                func.avg(models.LGInstruction.delivery_date - models.LGInstruction.instruction_date)
+            ).join(
+                models.LGRecord, models.LGRecord.id == models.LGInstruction.lg_record_id
+            ).filter(
+                models.LGInstruction.delivery_date.isnot(None),
+                models.LGInstruction.instruction_date.isnot(None),
+                models.LGInstruction.is_deleted == False
+            )
+            # This filter is now correctly applied to the LGRecord model
+            if user_context.get('customer_id'):
+                query = query.filter(models.LGRecord.customer_id == user_context['customer_id'])
+
+        elif report_type == "avg_days_to_action":
+            # Refactored query to be more explicit and correct
+            action_types = [
+                ACTION_TYPE_LG_EXTEND, ACTION_TYPE_LG_RELEASE, ACTION_TYPE_LG_LIQUIDATE, ACTION_TYPE_LG_DECREASE_AMOUNT
+            ]
+            query = db.query(
+                func.avg(models.LGRecord.expiry_date - models.LGInstruction.instruction_date)
+            ).join(
+                models.LGInstruction, models.LGRecord.id == models.LGInstruction.lg_record_id
+            ).filter(
+                models.LGInstruction.instruction_type.in_(action_types),
+                models.LGRecord.is_deleted == False,
+                models.LGInstruction.is_deleted == False,
+                models.LGRecord.expiry_date.isnot(None)
+            )
+            # This filter is now correctly applied to the LGRecord model
+            if user_context.get('customer_id'):
+                query = query.filter(models.LGRecord.customer_id == user_context['customer_id'])
+
+
+        if query:
+            results = query.all()
+            if report_type == "bank_processing_times":
+                return [{"name": row.short_name, "value": row.avg_timedelta.total_seconds() / 86400} for row in results]
+            elif report_type in ["avg_delivery_days", "avg_days_to_action"]:
+                avg_timedelta = results[0][0] if results and results[0][0] is not None else None
+                avg_days = avg_timedelta.total_seconds() / 86400 if avg_timedelta else None
+                return {'average_days': avg_days} if avg_days is not None else None
+            return [{"name": row[0], "value": row[1]} for row in results]
+        return []

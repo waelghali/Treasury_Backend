@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Type, Tuple
 from fastapi import HTTPException, status
 from sqlalchemy import func, and_
 from sqlalchemy.orm import Session, selectinload, aliased
-
+from app.core.encryption import encrypt_data, decrypt_data
 from app.crud.crud import CRUDBase, log_action
 import app.models as models
 from app.models import Customer, CustomerEntity, User, SubscriptionPlan, CustomerEmailSetting
