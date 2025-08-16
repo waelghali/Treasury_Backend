@@ -392,7 +392,11 @@ INITIAL_PERMISSIONS = [
     {"name": "system_owner:resume_scheduler_job", "description": "Allow manually running background tasks"},
     {"name": "system_owner:reschedule_scheduler_job", "description": "Allow manually running background tasks"},
     {"name": "lg_record:ai_scan", "description": "Allow scan new lg record"},
-    
+    {"name": "lg_instruction:cancel", "description": "Allow cancelling last trasnaction"},
+    {"name": "report:lg_type_mix:view", "description": "Allows viewing LG Type Mix report."},
+    {"name": "report:avg_bank_processing_time:view", "description": "Allows viewing Average Bank Processing Time report."},
+    {"name": "report:bank_market_share:view", "description": "Allows viewing Bank Market Share report."},
+
 ]
 
 # Define role-permission mappings
@@ -415,12 +419,15 @@ ROLE_PERMISSIONS_MAPPING = {
         "email_setting:manage","lg_document:view",
         "audit_log:view_auth","internal_owner_contact:view", "audit_log:view",
         "action_center:view", "system_notification:view",
+        "report:lg_type_mix:view",
+        "report:avg_bank_processing_time:view",
+        "report:bank_market_share:view",
     ],
     UserRole.END_USER.value: [
         "lg_record:create", "lg_record:view_own", "lg_record:extend", "lg_record:amend",
         "lg_record:liquidate", "lg_record:release", "lg_record:decrease_amount",
         "lg_instruction:update_status", "lg_instruction:cancel_last", "lg_instruction:send_reminder",
-        "template:view","lg_document:view", "internal_owner_contact:view", "system_notification:view", "lg_record:ai_scan",
+        "template:view","lg_document:view", "internal_owner_contact:view", "system_notification:view", "lg_record:ai_scan", "lg_instruction:cancel",
     ],
     UserRole.CHECKER.value: [
         "lg_record:view_own", "maker_checker:approve", "system_notification:view",
@@ -1198,6 +1205,37 @@ async def seed_db():
                 is_notification_template=False,
                 subject="Instruction to Activate LG #{{lg_number}}" # Added subject
             ),
+ 
+                # NEW: LG Record email notification
+                TemplateCreate(
+                name="LG Recorded Confirmation Notification",
+                template_type="EMAIL",
+                action_type="LG_RECORDED", # This is the action_type your crud_lg_record.py is looking for.
+                content="""
+                <html>
+                <body>
+                    <p>Dear {{internal_owner_email}},</p>
+                    <p>This is to confirm that a new Letter of Guarantee has been recorded in the system:</p>
+                    <ul>
+                        <li><b>LG Number:</b> {{lg_number}}</li>
+                        <li><b>LG Amount:</b> {{lg_amount_formatted}} {{lg_currency}}</li>
+                        <li><b>Issuing Bank:</b> {{issuing_bank_name}}</li>
+                        <li><b>LG Type:</b> {{lg_type}}</li>
+                        <li><b>LG Category:</b> {{lg_category}}</li>
+                        <li><b>Recorded By:</b> {{user_email}}</li>
+                    </ul>
+                    <p>You can view the full details by logging into the Treasury Platform.</p>
+                    <p>Regards,</p>
+                    <p>The {{platform_name}} Team</p>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=True,
+                subject="New LG Recorded: {{lg_number}}"
+            ),
+            
             # NEW: LG Activate Non-Operative Notification Email
             TemplateCreate(
                 name="LG Notification - Activation Confirmation",

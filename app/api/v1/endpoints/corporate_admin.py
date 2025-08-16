@@ -966,7 +966,7 @@ def update_customer_configuration(
 
 
 # --- Customer Email Settings Management (Corporate Admin) (NEW SECTION) ---
-# All write operations must use check_for_read_only_mode
+@router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 @router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 def create_customer_email_settings(
     settings_in: CustomerEmailSettingCreate,
@@ -978,13 +978,45 @@ def create_customer_email_settings(
     customer_id = corporate_admin_context.customer_id
 
     try:
-        db_settings = crud_customer_email_setting.create(db, settings_in, customer_id, corporate_admin_context.user_id)
-        return db_settings
+        # NEW LOGIC: Check for existing settings first, including soft-deleted ones.
+        existing_settings = db.query(CustomerEmailSetting).filter(
+            CustomerEmailSetting.customer_id == customer_id
+        ).first()
+
+        if existing_settings:
+            # If a record already exists (even if deleted), update it instead of creating a new one.
+            settings_update_payload = CustomerEmailSettingUpdate(
+                smtp_host=settings_in.smtp_host,
+                smtp_port=settings_in.smtp_port,
+                smtp_username=settings_in.smtp_username,
+                smtp_password=settings_in.smtp_password,
+                sender_email=settings_in.sender_email,
+                sender_display_name=settings_in.sender_display_name,
+                is_active=settings_in.is_active,
+            )
+            
+            # Use the update method and explicitly set is_deleted to False to restore it
+            db_settings = crud_customer_email_setting.update(db, existing_settings, settings_update_payload, corporate_admin_context.user_id)
+            db_settings.is_deleted = False # Restore the soft-deleted record
+            db.add(db_settings)
+            
+            # The update method handles flushing and logging internally.
+            # We explicitly commit here to finalize the transaction for this endpoint.
+            db.commit()
+            db.refresh(db_settings)
+            
+            return db_settings
+        else:
+            # If no settings exist at all, proceed with a new creation.
+            db_settings = crud_customer_email_setting.create(db, settings_in, customer_id, corporate_admin_context.user_id)
+            db.commit()
+            db.refresh(db_settings)
+            return db_settings
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -997,7 +1029,12 @@ def get_customer_email_settings(
 ):
     customer_id = corporate_admin_context.customer_id
     settings = crud_customer_email_setting.get_by_customer_id(db, customer_id)
-    return settings
+
+    # NEW: Add a check to ensure the returned settings are valid and not soft-deleted.
+    if settings and not settings.is_deleted and settings.smtp_host and settings.sender_email and settings.smtp_username and settings.smtp_password_encrypted:
+        return settings
+    
+    return None
 
 @router.put("/email-settings/{setting_id}", response_model=CustomerEmailSettingOut, dependencies=[Depends(check_for_read_only_mode)])
 def update_customer_email_settings(

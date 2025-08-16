@@ -63,6 +63,7 @@ class ApprovalRequestStatusEnum(str, Enum):
 
 # --- LG Action Types ---
 ACTION_TYPE_LG_CREATE = "LG_CREATE"
+ACTION_TYPE_LG_RECORDED = "LG_RECORDED"
 ACTION_TYPE_LG_EXTEND = "LG_EXTENSION"
 ACTION_TYPE_LG_AMEND = "LG_AMEND"
 ACTION_TYPE_LG_LIQUIDATE = "LG_LIQUIDATE"
@@ -101,6 +102,11 @@ ACTION_TYPES_REQUIRING_APPROVAL = [
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
     ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION
 ]
+
+# --- NEW Permissions for Reports ---
+REPORT_LG_TYPE_MIX_VIEW = "report:lg_type_mix:view"
+REPORT_AVG_BANK_PROCESSING_TIME_VIEW = "report:avg_bank_processing_time:view"
+REPORT_BANK_MARKET_SHARE_VIEW = "report:bank_market_share:view"
 
 # --- NEW: Instruction Type Codes (for new serial format) ---
 # These are the 2-character codes used in the instruction serial number

@@ -15,7 +15,13 @@ from app.database import get_db
 from app.schemas.all_schemas import (
     SystemUsageOverviewReportOut,
     CustomerLGPerformanceReportOut,
-    MyLGDashboardReportOut
+    MyLGDashboardReportOut,
+    LgTypeMixReportOut,
+    AvgBankProcessingTimeReportOut,
+    BankMarketShareReportOut,
+    AvgDeliveryDaysReportOut,
+    AvgDaysToActionEventReportOut,
+    AvgDaysToActionEventOut,
 )
 from app.crud.crud import crud_reports, log_action
 from app.constants import UserRole, GlobalConfigKey
@@ -178,6 +184,39 @@ async def get_system_usage_overview(
 
     return report_data_out
 
+@router.get("/customer-lg-type-mix", response_model=LgTypeMixReportOut, summary="LG type mix per customer (Pie Chart)")
+def get_customer_lg_type_mix(
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+):
+    if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+    
+    data = crud_reports.get_chart_data(db, "lg_type_mix", user_context)
+    return {"report_date": date.today(), "data": data}
+
+@router.get("/avg-bank-processing-time", response_model=AvgBankProcessingTimeReportOut, summary="Average processing times by bank (Bar Chart)")
+def get_avg_bank_processing_time(
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+):
+    if user_context['role'] not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+    
+    data = crud_reports.get_chart_data(db, "bank_processing_times", user_context)
+    return {"report_date": date.today(), "data": data}
+
+@router.get("/bank-market-share", response_model=BankMarketShareReportOut, summary="Bank market share (Pie Chart)")
+def get_bank_market_share(
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+):
+    if user_context['role'] not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+
+    data = crud_reports.get_chart_data(db, "bank_market_share", user_context)
+    return {"report_date": date.today(), "data": data}
+
 # FIX: Remove the redundant /reports prefix from all endpoint decorators.
 @router.get("/corporate-admin/lg-performance", response_model=CustomerLGPerformanceReportOut)
 async def get_customer_lg_performance(
@@ -231,3 +270,46 @@ async def get_my_lg_dashboard(
         return _export_to_csv(list_of_dicts, "my_lg_dashboard")
 
     return report_data_out
+
+# app/api/v1/endpoints/reports.py
+
+@router.get("/avg-delivery-days", response_model=AvgDeliveryDaysReportOut, summary="Average delivery days (per customer vs. overall)")
+def get_avg_delivery_days(
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+):
+    if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+    
+    # Corrected: Pass user_context unconditionally to let crud handle the filter
+    customer_avg_data = crud_reports.get_chart_data(db, "avg_delivery_days", user_context) # Pass the user_context here
+    customer_avg = customer_avg_data['average_days'] if customer_avg_data else None
+    
+    overall_avg_data = crud_reports.get_chart_data(db, "avg_delivery_days", {"role": UserRole.SYSTEM_OWNER})
+    overall_avg = overall_avg_data['average_days'] if overall_avg_data else None
+
+    return {
+        "customer_avg": customer_avg,
+        "overall_avg": overall_avg,
+    }
+
+
+@router.get("/avg-days-to-action", response_model=AvgDaysToActionEventOut, summary="Average days before expiry when action is taken")
+def get_avg_days_to_action(
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+):
+    if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+
+    # Corrected: Pass user_context unconditionally to let crud handle the filter
+    customer_avg_data = crud_reports.get_chart_data(db, "avg_days_to_action", user_context) # Pass the user_context here
+    customer_avg = customer_avg_data['average_days'] if customer_avg_data else None
+    
+    overall_avg_data = crud_reports.get_chart_data(db, "avg_days_to_action", {"role": UserRole.SYSTEM_OWNER})
+    overall_avg = overall_avg_data['average_days'] if overall_avg_data else None
+
+    return {
+        "customer_avg": customer_avg,
+        "overall_avg": overall_avg,
+    }

@@ -20,6 +20,8 @@ from app.constants import (
     LgStatusEnum,
     LgTypeEnum,
 )
+# NEW: Import timezone from the datetime module
+from datetime import timezone
 
 import logging
 logger = logging.getLogger(__name__)
@@ -76,7 +78,8 @@ class CRUDLGCancellation(CRUDBase):
         )
         cancellation_window_days = int(cancellation_window_config.get('effective_value', 7)) # Use days from the config
 
-        time_since_creation = datetime.now() - db_instruction.created_at
+        # FIX: Make datetime.now() timezone-aware by using timezone.utc
+        time_since_creation = datetime.now(timezone.utc) - db_instruction.created_at
         if time_since_creation.days > cancellation_window_days:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"The cancellation window of {cancellation_window_days} days has expired for this instruction.")
 
@@ -91,7 +94,8 @@ class CRUDLGCancellation(CRUDBase):
                 "reason": cancel_in.reason,
                 "declaration_confirmed": cancel_in.declaration_confirmed,
                 "canceled_by_user_id": user_id,
-                "canceled_at": datetime.now().isoformat(),
+                # FIX: Make datetime.now() timezone-aware
+                "canceled_at": datetime.now(timezone.utc).isoformat(),
             },
             **(db_instruction.details or {})
         }
@@ -139,7 +143,8 @@ class CRUDLGCancellation(CRUDBase):
             # Reverse extension: change expiry date back to old_expiry_date
             old_expiry_date = instruction.details.get("old_expiry_date")
             if old_expiry_date:
-                lg_record.expiry_date = datetime.strptime(old_expiry_date, '%Y-%m-%d')
+                # FIX: Change from datetime.strptime to date.fromisoformat, it's safer
+                lg_record.expiry_date = datetime.combine(date.fromisoformat(old_expiry_date), datetime.min.time())
                 db.add(lg_record)
                 db.flush()
         elif instruction.instruction_type == "LG_RELEASE":

@@ -96,6 +96,117 @@ def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSet
         return get_global_email_settings(), "global"
 
 
+# app/core/email_service.py
+import os
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from typing import List, Optional, Tuple, Dict, Any, Union
+from sqlalchemy.orm import Session, selectinload
+import logging
+from io import BytesIO
+
+# Import encryption/decryption utilities
+from app.core.encryption import decrypt_data
+
+# NEW: Import Customer and CustomerEmailSetting models
+from app.models import Customer, CustomerEmailSetting
+
+logger = logging.getLogger(__name__) # Initialize logger for this module
+
+# We'll define a simple structure for email settings to pass around
+class EmailSettings:
+    def __init__(self, smtp_host: str, smtp_port: int, smtp_username: str, smtp_password: str, sender_email: str, sender_display_name: Optional[str] = None):
+        self.smtp_host = smtp_host
+        self.smtp_port = smtp_port
+        self.smtp_username = smtp_username
+        self.smtp_password = smtp_password # This would be decrypted
+        self.sender_email = sender_email
+        self.sender_display_name = sender_display_name
+        
+# NEW: Data structure for an attachment
+class EmailAttachment:
+    def __init__(self, filename: str, content: bytes, mime_type: str):
+        self.filename = filename
+        self.content = content
+        self.mime_type = mime_type
+
+def get_global_email_settings() -> EmailSettings:
+    """
+    Retrieves global email settings from environment variables.
+    """
+    _sender_email = os.getenv("EMAIL_SENDER_EMAIL")
+    _smtp_host = os.getenv("EMAIL_SMTP_HOST")
+    _smtp_port = int(os.getenv("EMAIL_SMTP_PORT", 587)) # Default to 587 if not set
+    _smtp_username = os.getenv("EMAIL_SMTP_USERNAME")
+    _smtp_password = os.getenv("EMAIL_SMTP_PASSWORD") # This would be plain text from env
+    _global_sender_display_name = os.getenv("GLOBAL_SENDER_DISPLAY_NAME", "Treasury Platform Notifications") # NEW env var for global display name
+
+    if not all([_sender_email, _smtp_host, _smtp_username, _smtp_password]):
+        logger.warning("Missing one or more global email configuration environment variables. Using fallback/empty settings.")
+        return EmailSettings(
+            smtp_host="", smtp_port=587, smtp_username="", smtp_password="",
+            sender_email="no-reply@example.com", sender_display_name="System Notifications"
+        )
+
+    return EmailSettings(
+        smtp_host=_smtp_host,
+        smtp_port=_smtp_port,
+        smtp_username=_smtp_username,
+        smtp_password=_smtp_password,
+        sender_email=_sender_email,
+        sender_display_name=_global_sender_display_name
+    )
+
+# NEW FUNCTION: get_customer_email_settings
+def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSettings, str]:
+    """
+    Retrieves customer-specific email settings from the database.
+    If not found or inactive or invalid, falls back to global settings.
+    Returns a tuple of (EmailSettings object, string indicating method used).
+    """
+    customer = db.query(Customer).options(
+        selectinload(Customer.customer_email_settings)
+    ).filter(Customer.id == customer_id).first()
+
+    if (
+        customer
+        and customer.customer_email_settings
+        and customer.customer_email_settings.is_active
+    ):
+        # NEW: Check for missing or blank essential fields before attempting to use them
+        settings = customer.customer_email_settings
+        if not all([settings.smtp_host, settings.smtp_username, settings.smtp_password_encrypted, settings.sender_email]):
+            logger.warning(f"Incomplete customer-specific email settings found for customer ID {customer_id}. Falling back to global.")
+            return get_global_email_settings(), "global_fallback_due_to_incomplete_settings"
+
+        try:
+            decrypted_password = decrypt_data(
+                settings.smtp_password_encrypted
+            )
+            logger.info(f"Using customer-specific email settings for customer ID: {customer_id}")
+            return (
+                EmailSettings(
+                    smtp_host=settings.smtp_host,
+                    smtp_port=settings.smtp_port,
+                    smtp_username=settings.smtp_username,
+                    smtp_password=decrypted_password,
+                    sender_email=settings.sender_email,
+                    sender_display_name=settings.sender_display_name,
+                ),
+                "customer_specific" # Indicate method used
+            )
+        except Exception as e:
+            logger.error(f"Failed to decrypt/load customer-specific email settings for customer ID {customer_id}: {e}. Falling back to global settings.", exc_info=True)
+            # Fallback returns tuple as well
+            return get_global_email_settings(), "global_fallback_due_to_error"
+    else:
+        logger.info(f"Customer-specific email settings not found or inactive for customer ID: {customer_id}. Falling back to global settings.")
+        # Fallback returns tuple as well
+        return get_global_email_settings(), "global"
+
 async def send_email( # Changed to async function
     db: Session, # NEW: Added db session as a parameter for logging purposes
     to_emails: List[str],
@@ -104,7 +215,8 @@ async def send_email( # Changed to async function
     template_data: Dict[str, Any], # NEW: Added template_data for subject/body population
     email_settings: EmailSettings,
     cc_emails: Optional[List[str]] = None,
-    sender_name: Optional[str] = None # NEW: Added sender_name
+    sender_name: Optional[str] = None, # NEW: Added sender_name
+    attachments: Optional[List[EmailAttachment]] = None # NEW: Added attachments parameter
 ) -> bool:
     """
     Sends an email using the provided SMTP settings.
@@ -120,6 +232,7 @@ async def send_email( # Changed to async function
         cc_emails: An optional list of CC recipient email addresses.
         sender_name: Optional string to use as the display name in the From header.
                      If not provided, email_settings.sender_display_name is used.
+        attachments: An optional list of EmailAttachment objects to be attached.
 
     Returns:
         True if the email was sent successfully, False otherwise.
@@ -128,15 +241,9 @@ async def send_email( # Changed to async function
         logger.warning("No recipient email addresses provided. Email not sent.")
         return False
 
-    # Populate subject and body from templates
     subject = subject_template
     body_html = body_template
-    # No longer using looping through template_data here as it's done in calling crud
-    # for key, value in template_data.items():
-    #     str_value = str(value) if value is not None else ""
-    #     subject = subject.replace(f"{{{{{key}}}}}", str_value)
-    #     body_html = body_html.replace(f"{{{{{key}}}}}", str_value)
-
+    
     try:
         final_sender_display_name = sender_name if sender_name else email_settings.sender_display_name
 
@@ -144,7 +251,8 @@ async def send_email( # Changed to async function
         logger.debug(f"Using SMTP Host: {email_settings.smtp_host}, Port: {email_settings.smtp_port}, Username: {email_settings.smtp_username}")
         logger.debug(f"Sender: {final_sender_display_name} <{email_settings.sender_email}>")
 
-        msg = MIMEMultipart('alternative')
+        # Use MIMEMultipart('mixed') for attachments
+        msg = MIMEMultipart('mixed')
 
         if final_sender_display_name:
             msg['From'] = f"{final_sender_display_name} <{email_settings.sender_email}>"
@@ -157,7 +265,19 @@ async def send_email( # Changed to async function
 
         msg['Subject'] = subject
 
+        # Create a separate part for the HTML body
         msg.attach(MIMEText(body_html, 'html'))
+        
+        # Attach files if any
+        if attachments:
+            for attachment in attachments:
+                main_type, sub_type = attachment.mime_type.split('/', 1)
+                part = MIMEBase(main_type, sub_type)
+                part.set_payload(attachment.content)
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{attachment.filename}"')
+                msg.attach(part)
+
 
         all_recipients = to_emails[:] # Create a copy to avoid modifying original list
         if cc_emails:

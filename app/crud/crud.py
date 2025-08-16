@@ -165,6 +165,7 @@ from app.constants import (
     AUDIT_ACTION_TYPE_LG_ACTIVATED,
     # NEW: Import subscription notification types
     SubscriptionNotificationType,
+    ACTION_TYPE_LG_RECORDED,
 )
 
 

@@ -23,6 +23,7 @@ import pytz
 from app.database import get_db, Base, engine
 
 # Configure logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
