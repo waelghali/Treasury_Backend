@@ -39,6 +39,8 @@ app = FastAPI(
 def configure_app_instance(fastapi_app: FastAPI):
     # CORS Middleware for frontend communication
     origins = [
+        "https://www.growbusinessdevelopment.com/",
+        "https://www.growbusinessdevelopment.com",
         "https://treasury-frontend-46hip9jex-waels-projects-e59ad1d5.vercel.app/",
         "https://treasury-frontend-46hip9jex-waels-projects-e59ad1d5.vercel.app",
         "https://treasury-frontend-nu.vercel.app/",
@@ -65,8 +67,10 @@ def configure_app_instance(fastapi_app: FastAPI):
         import app.core.hashing as app_hashing
         import app.core.email_service as app_email_service
         import app.core.background_tasks as app_background_tasks
+        # NEW: Import subscription_tasks
+        import app.crud.subscription_tasks as subscription_tasks
 
-        logger.info("Core modules (security, ai_integration, document_generator, hashing, email_service, background_tasks) pre-loaded using absolute paths.")
+        logger.info("Core modules (security, ai_integration, document_generator, hashing, email_service, background_tasks, subscription_tasks) pre-loaded using absolute paths.")
     except Exception as e:
         logger.critical(f"FATAL ERROR: Could not pre-load core modules. Ensure paths and dependencies are correct. Error: {e}", exc_info=True)
         sys.exit(1)
@@ -76,7 +80,6 @@ def configure_app_instance(fastapi_app: FastAPI):
     from app.auth_v2.routers import router as auth_v2_router
     from app.api.v1.endpoints import reports
     # NEW: Import the subscription tasks module
-    from app.crud import subscription_tasks
     from app.crud.crud import crud_customer, crud_customer_configuration, log_action
 
     # --- DATABASE TABLE CREATION & DIAGNOSTICS ---
@@ -191,6 +194,16 @@ def configure_app_instance(fastapi_app: FastAPI):
             args=[subscription_tasks.run_daily_subscription_status_update, log_action, crud_customer, crud_customer_configuration]
         )
         logger.info("Scheduled 'Daily Subscription Status Update' to run every day at 2:15 AM EEST.")
+
+        # NEW: Schedule the LG status update task
+        scheduler.add_job(
+            func=job_wrapper,
+            trigger=CronTrigger(hour=2, minute=20, timezone=EGYPT_TIMEZONE),
+            id='lg_status_daily_job',
+            name='Daily LG Status Update to Expired',
+            args=[app_background_tasks.run_daily_lg_status_update]
+        )
+        logger.info("Scheduled 'Daily LG Status Update to Expired' to run every day at 2:20 AM EEST.")
 
         scheduler.start()
         logger.info("APScheduler started and daily background tasks have been scheduled.")

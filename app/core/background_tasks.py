@@ -8,8 +8,10 @@ from typing import List, Dict, Any
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import exc
 from sqlalchemy.sql import func
+from sqlalchemy import and_, or_
 
-import app.models
+import app.models as models # MODIFIED: Import models under an alias to prevent conflict
+
 from app.crud.crud import (
     crud_customer,
     crud_global_configuration,
@@ -40,6 +42,7 @@ from app.constants import (
     # NEW: Import subscription related constants
     SubscriptionStatus,
     SubscriptionNotificationType,
+    LgStatusEnum, # ADDED: Import LgStatusEnum
 )
 from pydantic import EmailStr
 
@@ -342,15 +345,15 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
     """
     Helper function to send email notification to Corporate Admins about auto-corrected configs.
     """
-    customer = db.query(app.models.Customer).filter(app.models.Customer.id == customer_id).first()
+    customer = db.query(models.Customer).filter(models.Customer.id == customer_id).first()
     if not customer:
         logger.warning(f"Customer with ID {customer_id} not found for sending config correction notification.")
         return
 
-    corporate_admins = db.query(app.models.User).filter(
-        app.models.User.customer_id == customer_id,
-        app.models.User.role == UserRole.CORPORATE_ADMIN,
-        app.models.User.is_deleted == False
+    corporate_admins = db.query(models.User).filter(
+        models.User.customer_id == customer_id,
+        models.User.role == UserRole.CORPORATE_ADMIN,
+        models.User.is_deleted == False
     ).all()
     
     to_emails = [admin.email for admin in corporate_admins if admin.email]
@@ -420,7 +423,7 @@ async def run_daily_print_reminders(db: Session):
         ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
     ]
 
-    customers = db.query(app.models.Customer).filter(app.models.Customer.is_deleted == False).all()
+    customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
     if not customers:
         logger.info("No active customers found. Skipping print reminders and escalation.")
         return
@@ -446,20 +449,20 @@ async def run_daily_print_reminders(db: Session):
                 
                 current_date_aware = datetime.now(EEST_TIMEZONE)
 
-                approved_requests_for_printing = db.query(app.models.ApprovalRequest).filter(
-                    app.models.ApprovalRequest.customer_id == customer.id,
-                    app.models.ApprovalRequest.status == app.models.ApprovalRequestStatusEnum.APPROVED,
-                    app.models.ApprovalRequest.related_instruction_id.isnot(None),
-                    app.models.ApprovalRequest.entity_type == "LGRecord",
-                    app.models.ApprovalRequest.action_type.in_(INSTRUCTION_TYPES_REQUIRING_PRINTING)
+                approved_requests_for_printing = db.query(models.ApprovalRequest).filter(
+                    models.ApprovalRequest.customer_id == customer.id,
+                    models.ApprovalRequest.status == models.ApprovalRequestStatusEnum.APPROVED,
+                    models.ApprovalRequest.related_instruction_id.isnot(None),
+                    models.ApprovalRequest.entity_type == "LGRecord",
+                    models.ApprovalRequest.action_type.in_(INSTRUCTION_TYPES_REQUIRING_PRINTING)
                 ).options(
-                    selectinload(app.models.ApprovalRequest.related_instruction).selectinload(app.models.LGInstruction.lg_record),
-                    selectinload(app.models.ApprovalRequest.related_instruction).selectinload(app.models.LGInstruction.lg_record).selectinload(app.models.LGRecord.lg_currency),
-                    selectinload(app.models.ApprovalRequest.related_instruction).selectinload(app.models.LGInstruction.lg_record).selectinload(app.models.LGRecord.issuing_bank),
-                    selectinload(app.models.ApprovalRequest.related_instruction).selectinload(app.models.LGInstruction.lg_record).selectinload(app.models.LGRecord.internal_owner_contact),
-                    selectinload(app.models.ApprovalRequest.related_instruction).selectinload(app.models.LGInstruction.template),
-                    selectinload(app.models.ApprovalRequest.maker_user),
-                    selectinload(app.models.ApprovalRequest.checker_user),
+                    selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.lg_record),
+                    selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+                    selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+                    selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.internal_owner_contact),
+                    selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.template),
+                    selectinload(models.ApprovalRequest.maker_user),
+                    selectinload(models.ApprovalRequest.checker_user),
                 ).all()
 
                 for req in approved_requests_for_printing:
@@ -646,7 +649,7 @@ async def run_daily_renewal_reminders(db: Session):
     """
     logger.info("Starting daily LG renewal reminders orchestration.")
     
-    customers = db.query(app.models.Customer).filter(app.models.Customer.is_deleted == False).all()
+    customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
     if not customers:
         logger.info("No active customers found. Skipping all renewal reminder tasks.")
         return
@@ -683,7 +686,6 @@ async def run_daily_renewal_reminders(db: Session):
 
     logger.info("Daily LG renewal reminders orchestration completed.")
 
-# NEW FUNCTION: Run Daily Subscription Status Update
 async def run_daily_subscription_status_update(db: Session):
     """
     Daily background task to check and update the subscription status of all customers.
@@ -776,7 +778,7 @@ async def run_daily_subscription_status_update(db: Session):
 
 async def _send_subscription_notification(
     db: Session,
-    customer: app.models.Customer,
+    customer: models.Customer,
     email_type: SubscriptionNotificationType,
     subject: str,
     body: str,
@@ -785,7 +787,7 @@ async def _send_subscription_notification(
     """Helper function to send a subscription-related notification email."""
     try:
         # Fetch all Corporate Admins for the customer
-        corporate_admins = crud_user.get_users_by_role_for_customer(db, customer.id, app.models.UserRole.CORPORATE_ADMIN)
+        corporate_admins = crud_user.get_users_by_role_for_customer(db, customer.id, models.UserRole.CORPORATE_ADMIN)
         to_emails = [admin.email for admin in corporate_admins]
 
         if not to_emails:
@@ -859,3 +861,58 @@ async def _send_subscription_notification(
         )
     finally:
         db.rollback()
+
+async def run_daily_lg_status_update(db: Session):
+    """
+    Daily background task to update LG records with an expired status
+    if their expiry date has passed.
+    """
+    logger.info("Starting daily LG status update task.")
+    
+    current_date = datetime.now(EEST_TIMEZONE).date()
+    
+    # Query for LGs that are 'VALID' but have expired
+    expired_lgs_to_update = db.query(models.LGRecord).filter( # MODIFIED: Use the models alias
+        and_(
+            models.LGRecord.expiry_date < current_date, # MODIFIED: Use the models alias
+            models.LGRecord.lg_status_id == LgStatusEnum.VALID.value,
+            models.LGRecord.is_deleted == False # MODIFIED: Use the models alias
+        )
+    ).all()
+    
+    updated_count = 0
+    if expired_lgs_to_update:
+        logger.info(f"Found {len(expired_lgs_to_update)} LG records to update to 'expired' status.")
+        expired_status_id = LgStatusEnum.EXPIRED.value
+        
+        for lg_record in expired_lgs_to_update:
+            try:
+                lg_record.lg_status_id = expired_status_id
+                db.add(lg_record)
+                
+                # Log the change
+                log_action(
+                    db,
+                    user_id=None,  # System action
+                    action_type="LG_STATUS_UPDATE_EXPIRED",
+                    entity_type="LGRecord",
+                    entity_id=lg_record.id,
+                    details={
+                        "lg_number": lg_record.lg_number,
+                        "old_status_id": LgStatusEnum.VALID.value,
+                        "new_status_id": expired_status_id,
+                        "reason": "Automated daily status update due to expiry date passing."
+                    },
+                    customer_id=lg_record.customer_id,
+                    lg_record_id=lg_record.id
+                )
+                updated_count += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to update LG record {lg_record.id}: {e}", exc_info=True)
+                # Rollback this specific record's changes in case of failure,
+                # but let the loop continue. This is handled by `db.commit()` at the end.
+                continue
+
+    db.commit() # Commit all successful updates at once.
+    logger.info(f"Finished daily LG status update task. {updated_count} records were updated.")
