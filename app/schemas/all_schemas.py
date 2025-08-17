@@ -1197,6 +1197,14 @@ class SystemNotificationViewLogBase(BaseModel):
 class SystemNotificationViewLogOut(SystemNotificationViewLogBase, BaseSchema):
     pass
 
+# --- NEW: Request a demo ---
+class DemoRequestCreate(BaseModel):
+    name: str = Field(..., description="Name of the person requesting the demo.")
+    company: str = Field(..., description="Company name of the requester.")
+    email: EmailStr = Field(..., description="Email address of the requester.")
+    phone: str = Field(..., description="Phone number of the requester.")
+    message: Optional[str] = Field(None, description="Optional notes from the requester.")
+
 # --- NEW: Report Schemas (MINIMALIST) ---
 class ReportDataOut(BaseModel):
     name: str
