@@ -8,8 +8,8 @@ from typing import List, Optional, Any, Dict
 import io
 import csv
 import decimal
-
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
+import json
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response, Request
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas.all_schemas import (
@@ -22,6 +22,7 @@ from app.schemas.all_schemas import (
     AvgDeliveryDaysReportOut,
     AvgDaysToActionEventReportOut,
     AvgDaysToActionEventOut,
+    DemoRequestCreate,
 )
 from app.crud.crud import crud_reports, log_action
 from app.constants import UserRole, GlobalConfigKey
@@ -313,3 +314,80 @@ def get_avg_days_to_action(
         "customer_avg": customer_avg,
         "overall_avg": overall_avg,
     }
+
+@router.post("/demo-requests", status_code=status.HTTP_201_CREATED)
+async def submit_demo_request(
+    demo_request: DemoRequestCreate,
+    db: Session = Depends(get_db),
+    request: Request = None
+):
+    """
+    Receives and stores demo request form data.
+    This is a public endpoint and does not require authentication.
+    """
+    try:
+        # Define a private directory for storing the data, relative to the project root
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+        storage_dir = os.path.join(project_root, 'private_data')
+        os.makedirs(storage_dir, exist_ok=True)
+        
+        # Use a unique file name to avoid conflicts
+        file_path = os.path.join(storage_dir, 'demo_requests.jsonl')
+        
+        # Prepare the data with a timestamp and IP address
+        data_to_store = demo_request.model_dump()
+        data_to_store['timestamp'] = datetime.now().isoformat()
+        data_to_store['ip_address'] = request.client.host if request else None
+
+        # Append the JSON data to the file
+        with open(file_path, 'a') as f:
+            f.write(json.dumps(data_to_store) + '\n')
+        
+        # Log the action for audit purposes
+        log_action(
+            db,
+            user_id=None,  # No user is logged in for this public action
+            action_type="DEMO_REQUEST_SUBMITTED",
+            entity_type="DemoRequest",
+            entity_id=None,
+            details=data_to_store,
+            customer_id=None,
+            lg_record_id=None
+        )
+
+        return {"message": "Demo request submitted successfully."}
+    except Exception as e:
+        logger.error(f"Error processing demo request: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while processing your request."
+        )
+
+# Add a simple, authenticated endpoint to retrieve the data
+@router.get("/demo-requests", summary="Retrieve all demo requests (Admin only)")
+async def get_all_demo_requests(
+    current_user: TokenData = Depends(HasPermission("system_owner:view_dashboard")), # Protect with a relevant permission
+    request: Request = None
+):
+    """
+    Retrieves all submitted demo requests from the private storage file.
+    This endpoint requires System Owner permissions.
+    """
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    file_path = os.path.join(project_root, 'private_data', 'demo_requests.jsonl')
+
+    if not os.path.exists(file_path):
+        return {"message": "No demo requests have been submitted yet."}
+
+    requests_list = []
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                requests_list.append(json.loads(line))
+        return {"demo_requests": requests_list}
+    except Exception as e:
+        logger.error(f"Error reading demo requests file: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while retrieving the demo requests."
+        )
