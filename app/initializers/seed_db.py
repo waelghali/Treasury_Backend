@@ -38,7 +38,7 @@ try:
         crud_customer_entity,
         crud_global_configuration,
         crud_currency, crud_lg_type, crud_rule, crud_issuing_method,
-        crud_lg_status, crud_lg_operational_status, crud_universal_category,
+        crud_lg_status, crud_lg_operational_status,
         crud_bank, crud_template,
         crud_permission, crud_role_permission,
         crud_lg_category,
@@ -56,7 +56,7 @@ try:
         CustomerEntityCreate,
         GlobalConfigurationCreate,
         CurrencyCreate, LgTypeCreate, RuleCreate, IssuingMethodCreate, LgStatusCreate,
-        LgOperationalStatusCreate, UniversalCategoryCreate,
+        LgOperationalStatusCreate, 
         BankCreate, TemplateCreate,
         PermissionCreate, RolePermissionCreate,
         LGCategoryCreate,
@@ -77,13 +77,6 @@ try:
         InstructionTypeCode, SubInstructionCode # NEW: Import for serial generation
     )
 
-    from app.schemas.migration import (
-        LGMigrationStagingIn,
-        LGMigrationStagingOut,
-        MigrationRecordStatusEnum,
-        MigrationReportSummary,
-    )
-    from app.models.migration import LGMigrationStaging
 
 except Exception as e:
     print(f"FATAL ERROR: Could not import core modules. Ensure project structure and run command are correct. Error: {e}")
@@ -1574,17 +1567,17 @@ async def seed_db():
         print("\n--- Seeding LG Categories for Customers ---")
         lg_categories_to_seed = [
             # Acme Corp Categories
-            {"customer_id": acme_corp_id, "category_name": "IT Projects", "code": "IT", "extra_field_name": "Project ID", "is_mandatory": True, "communication_list": []}, # Corrected email list format
+            {"customer_id": acme_corp_id, "category_name": "IT Projects", "code": "IT", "extra_field_name": "Project ID", "is_mandatory": True, "communication_list": []},
             {"customer_id": acme_corp_id, "category_name": "HR Department", "code": "HR", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
             # Globex Industries Categories
-            {"customer_id": globex_id, "category_name": "Manufacturing", "code": "MA", "extra_field_name": "Batch No.", "is_mandatory": False, "communication_list": []}, # Corrected email list format
+            {"customer_id": globex_id, "category_name": "Manufacturing", "code": "MA", "extra_field_name": "Batch No.", "is_mandatory": False, "communication_list": []},
             # Cyberdyne Systems Categories
-            {"customer_id": cyberdyne_id, "category_name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []}, # Corrected email list format
+            {"customer_id": cyberdyne_id, "category_name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []},
         ]
         for category_data in lg_categories_to_seed:
             try:
                 # Check for existing category by name and customer_id
-                if not crud_lg_category.get_by_name_for_customer(db, customer_id=category_data["customer_id"], category_name=category_data["category_name"]):
+                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], category_name=category_data["category_name"]):
                     crud_lg_category.create(db, obj_in=LGCategoryCreate(**category_data), customer_id=category_data["customer_id"], user_id=system_owner_id)
                     print(f"  Added LG Category: {category_data['category_name']} for Customer ID {category_data['customer_id']}")
                 else:
@@ -1637,9 +1630,9 @@ async def seed_db():
         acme_west_entity_id = acme_west_entity.id if acme_west_entity else None
         acme_admin_user = db.query(models.User).filter(models.User.email == "corp.admin@acmecorp.com").first()
         acme_admin_user_id = acme_admin_user.id if acme_admin_user else None
-        acme_it_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == acme_corp_id, models.LGCategory.category_name == "IT Projects").first() if acme_corp_id else None
+        acme_it_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == acme_corp_id, models.LGCategory.name == "IT Projects").first() if acme_corp_id else None
         acme_it_category_id = acme_it_category.id if acme_it_category else None
-        acme_hr_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == acme_corp_id, models.LGCategory.category_name == "HR Department").first() if acme_corp_id else None
+        acme_hr_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == acme_corp_id, models.LGCategory.name == "HR Department").first() if acme_corp_id else None
         acme_hr_category_id = acme_hr_category.id if acme_hr_category else None
         globex = db.query(models.Customer).filter(models.Customer.name == "Globex Industries").first()
         globex_id = globex.id if globex else None
@@ -1647,9 +1640,8 @@ async def seed_db():
         globex_main_entity_id = globex_main_entity.id if globex_main_entity else None
         globex_admin_user = db.query(models.User).filter(models.User.email == "corp.admin@globex.com").first()
         globex_admin_user_id = globex_admin_user.id if globex_admin_user else None
-        globex_mfg_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == globex_id, models.LGCategory.category_name == "Manufacturing").first() if globex_id else None
+        globex_mfg_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == globex_id, models.LGCategory.name == "Manufacturing").first() if globex_id else None
         globex_mfg_category_id = globex_mfg_category.id if globex_mfg_category else None
-
         cyberdyne = db.query(models.Customer).filter(models.Customer.name == "Cyberdyne Systems").first()
         cyberdyne_id = cyberdyne.id if cyberdyne else None
         cyberdyne_rd_entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.customer_id == cyberdyne_id, models.CustomerEntity.entity_name == "R&D Lab").first() if cyberdyne_id else None
@@ -1658,7 +1650,7 @@ async def seed_db():
         cyberdyne_sales_entity_id = cyberdyne_sales_entity.id if cyberdyne_sales_entity else None
         cyberdyne_admin_user = db.query(models.User).filter(models.User.email == "corp.admin@cyberdyne.com").first()
         cyberdyne_admin_user_id = cyberdyne_admin_user.id if cyberdyne_admin_user else None
-        cyberdyne_rg_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == cyberdyne_id, models.LGCategory.category_name == "Research Grants").first() if cyberdyne_id else None
+        cyberdyne_rg_category = db.query(models.LGCategory).filter(models.LGCategory.customer_id == cyberdyne_id, models.LGCategory.name == "Research Grants").first() if cyberdyne_id else None
         cyberdyne_rg_category_id = cyberdyne_rg_category.id if cyberdyne_rg_category else None
         
         # Currency IDs
@@ -2450,17 +2442,10 @@ async def seed_db():
 
                 lg_record_create_payload = {
                     key: value for key, value in lg_data.items()
+                    if key not in ["lg_sequence_number", "lg_period_months", "lg_type_id"] # Exclude auto-generated or relational keys
                 }
-                # This line correctly adds the ID after the InternalOwnerContact has been handled.
+                lg_record_create_payload["lg_type_id"] = lg_data["lg_type_id"]
                 lg_record_create_payload["internal_owner_contact_id"] = internal_owner_contact_obj.id
-
-
-                # The following lines are redundant if crud_lg_record.create only takes LGRecordCreate schema
-                # and expects internal_owner_contact_id. They are removed to avoid confusion.
-                # lg_record_create_payload["internal_owner_email"] = lg_data["internal_owner_email"]
-                # lg_record_create_payload["internal_owner_phone"] = lg_data["internal_owner_phone"]
-                # lg_record_create_payload["manager_email"] = lg_data["manager_email"]
-                # lg_record_create_payload["internal_owner_id"] = lg_data.get("internal_owner_id")
 
                 # AWAIT the async function call here
                 await crud_lg_record.create(
