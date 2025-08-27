@@ -731,48 +731,6 @@ async def seed_db():
                 traceback.print_exc()
         db.commit() # Commit after all LG statuses are processed
 
-        # 9. Seed LG Operational Statuses
-        print("\n--- Seeding LG Operational Statuses ---")
-        lg_operational_statuses_to_seed = [
-            {"name": "Operative", "description": "LG is currently active and can be drawn upon."},
-            {"name": "Non-Operative", "description": "LG is issued but not yet effective (e.g., pending advance payment)."},
-        ]
-
-        for op_status_data in lg_operational_statuses_to_seed:
-            try:
-                if not crud_lg_operational_status.get_by_name(db, name=op_status_data["name"]):
-                    crud_lg_operational_status.create(db, obj_in=LgOperationalStatusCreate(**op_status_data))
-                    print(f"  Added LG Operational Status: {op_status_data['name']}")
-                else:
-                    print(f"  LG Operational Status '{op_status_data['name']}' already exists.")
-                db.flush()  # Flush after each creation
-            except Exception as e:
-                print(f"  ERROR seeding LG operational status '{op_status_data['name']}': {e}")
-                traceback.print_exc()
-
-        db.commit()  # Commit after all are processed
-
-
-        # 10. Seed Universal Categories
-        print("\n--- Seeding Universal Categories ---")
-        universal_categories_to_seed = [
-            {"name": "Default Category", "code": "DF", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
-            {"name": "Construction Projects", "code": "CP", "extra_field_name": "Project Code", "is_mandatory": True, "communication_list": ["construction.team@example.com"]},
-            {"name": "Service Contracts", "code": "SC", "extra_field_name": "Contract ID", "is_mandatory": False, "communication_list": ["service.dept@example.com", "legal@example.com"]},
-        ]
-        for category_data in universal_categories_to_seed:
-            try:
-                # CORRECTED: Access UniversalCategory model via the 'models' module
-                if not crud_universal_category.get_by_name(db, name=category_data["name"]):
-                    crud_universal_category.create(db, obj_in=UniversalCategoryCreate(**category_data))
-                    print(f"  Added Universal Category: {category_data['name']}")
-                else:
-                    print(f"  Universal Category '{category_data['name']}' already exists.")
-                db.flush() # Flush after each universal category creation
-            except Exception as e:
-                print(f"  ERROR seeding universal category '{category_data['name']}': {e}")
-                traceback.print_exc()
-        db.commit() # Commit after all universal categories are processed
 
         # 11. Seed Banks
         print("\n--- Seeding Banks ---")
@@ -1564,47 +1522,6 @@ async def seed_db():
         cyberdyne_sales_entity_id = cyberdyne_sales_entity.id if cyberdyne_sales_entity else None
         cyberdyne_admin_user = db.query(models.User).filter(models.User.email == "corp.admin@cyberdyne.com").first()
         cyberdyne_admin_user_id = cyberdyne_admin_user.id if cyberdyne_admin_user else None
-
-        # Seed LG Categories after customer entities 
-        print("\n--- Seeding LG Categories for Customers ---")
-        lg_categories_to_seed = [
-            {"customer_id": acme_corp_id, "name": "IT Projects", "code": "IT", "extra_field_name": "Project ID", "is_mandatory": True, "communication_list": []},
-            {"customer_id": acme_corp_id, "name": "HR Department", "code": "HR", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
-            {"customer_id": globex_id, "name": "Manufacturing", "code": "MA", "extra_field_name": "Batch No.", "is_mandatory": False, "communication_list": []},
-            {"customer_id": cyberdyne_id, "name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []},
-        ]
-
-        for raw_data in lg_categories_to_seed:
-            try:
-                customer_id = raw_data["customer_id"]
-                # Explicitly copy only the fields LGCategoryCreate needs
-                category_data = {
-                    "name": raw_data["name"],
-                    "code": raw_data["code"],
-                    "extra_field_name": raw_data["extra_field_name"],
-                    "is_mandatory": raw_data["is_mandatory"],
-                    "communication_list": raw_data["communication_list"],
-                }
-
-                print(f"DEBUG: Creating LGCategory with {category_data} (customer_id={customer_id})")
-
-                if not crud_lg_category.get_by_name(db, customer_id=customer_id, name=category_data["name"]):
-                    crud_lg_category.create(
-                        db,
-                        obj_in=LGCategoryCreate(**category_data),
-                        customer_id=customer_id,
-                        user_id=system_owner_id,
-                    )
-                    print(f"  Added LG Category: {category_data['name']} for Customer ID {customer_id}")
-                else:
-                    print(f"  LG Category '{category_data['name']}' for Customer ID {customer_id} already exists.")
-                db.flush()
-            except Exception as e:
-                print(f"  ERROR seeding LG Category '{raw_data.get('name', 'N/A')}' for Customer ID {raw_data.get('customer_id', 'N/A')}: {e}")
-                traceback.print_exc()
-
-        db.commit()
-
 
 
         # Now, fetch the IDs of these newly created categories, entities, and users
