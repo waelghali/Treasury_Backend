@@ -193,8 +193,17 @@ def get_customer_lg_type_mix(
     if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
     
-    data = crud_reports.get_chart_data(db, "lg_type_mix", user_context)
-    return {"report_date": date.today(), "data": data}
+    customer_data = crud_reports.get_chart_data(db, "lg_type_mix", user_context)
+    global_user_context = {"role": UserRole.SYSTEM_OWNER} 
+    global_data = crud_reports.get_chart_data(db, "lg_type_mix", global_user_context)
+
+    return {
+        "report_date": date.today(),
+        "data": {
+            "customer_lg_type_mix": customer_data,
+            "global_lg_type_mix": global_data
+        }
+    }
 
 @router.get("/avg-bank-processing-time", response_model=AvgBankProcessingTimeReportOut, summary="Average processing times by bank (Bar Chart)")
 def get_avg_bank_processing_time(
@@ -215,8 +224,17 @@ def get_bank_market_share(
     if user_context['role'] not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
 
-    data = crud_reports.get_chart_data(db, "bank_market_share", user_context)
-    return {"report_date": date.today(), "data": data}
+    customer_data = crud_reports.get_chart_data(db, "bank_market_share", user_context)
+    global_user_context = {"role": UserRole.SYSTEM_OWNER} 
+    global_data = crud_reports.get_chart_data(db, "bank_market_share", global_user_context)
+
+    return {
+        "report_date": date.today(), 
+        "data": {
+            "customer_market_share": customer_data,
+            "global_market_share": global_data
+        }
+    }
 
 # FIX: Remove the redundant /reports prefix from all endpoint decorators.
 @router.get("/corporate-admin/lg-performance", response_model=CustomerLGPerformanceReportOut)

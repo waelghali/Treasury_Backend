@@ -1,7 +1,12 @@
 # crud_master_data.py
 from typing import Any, List, Optional, Type
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy.sql import func, and_
+from sqlalchemy.sql import func, and_, or_
+from fastapi import HTTPException, status # NEW: Add this import for the new template method
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import cast
+
+import app.models as models # NEW: Add this line to import the models module
 
 from app.crud.crud import CRUDBase, log_action
 from app.models import (
@@ -13,9 +18,8 @@ from app.models import (
     LgType,
     Rule,
     Template,
-    UniversalCategory,
     BaseModel,
-    Customer, # Explicitly imported for Template.customer relation
+    Customer,
 )
 from app.schemas.all_schemas import (
     BankCreate,
@@ -42,9 +46,6 @@ from app.schemas.all_schemas import (
     TemplateCreate,
     TemplateOut,
     TemplateUpdate,
-    UniversalCategoryCreate,
-    UniversalCategoryOut,
-    UniversalCategoryUpdate,
 )
 
 
@@ -52,12 +53,18 @@ from app.schemas.all_schemas import (
 # Master Data Management (Global Scope)
 # =====================================================================================
 class CRUDBank(CRUDBase):
-    def get_by_name(self, db: Session, name: str) -> Optional[Bank]:
-        return (
-            db.query(self.model)
-            .filter(self.model.name == name, self.model.is_deleted == False)
-            .first()
-        )
+    def get_by_name(self, db: Session, name: str) -> Optional[models.Bank]:
+        """
+        Retrieves a Bank object by its name, short name, or former names.
+        This provides robust lookup for the migration process.
+        """
+        return db.query(self.model).filter(
+            or_(
+                func.lower(self.model.name) == func.lower(name),
+                func.lower(self.model.short_name) == func.lower(name),
+                cast(self.model.former_names, JSONB).op('?')(name)
+            )
+        ).first()
 
     def get_by_swift_code(self, db: Session, swift_code: str) -> Optional[Bank]:
         return (
@@ -639,78 +646,6 @@ class CRUDLgOperationalStatus(CRUDBase):
             user_id=None,
             action_type="RESTORE",
             entity_type="LgOperationalStatus",
-            entity_id=restored_obj.id,
-            details={"name": restored_obj.name},
-        )
-        return restored_obj
-
-
-class CRUDUniversalCategory(CRUDBase):
-    def get_by_category_name(
-        self, db: Session, category_name: str
-    ) -> Optional[UniversalCategory]:
-        return (
-            db.query(self.model)
-            .filter(
-                self.model.category_name == category_name, self.model.is_deleted == False
-            )
-            .first()
-        )
-
-    def get_by_code(self, db: Session, code: str) -> Optional[UniversalCategory]:
-        return (
-            db.query(self.model)
-            .filter(self.model.code == code, self.model.is_deleted == False)
-            .first()
-        )
-
-    def create(self, db: Session, obj_in: BaseModel, **kwargs: Any) -> BaseModel:
-        db_obj = super().create(db, obj_in, **kwargs)
-        log_action(
-            db,
-            user_id=None,
-            action_type="CREATE",
-            entity_type="UniversalCategory",
-            entity_id=db_obj.id,
-            details={"category_name": db_obj.category_name},
-        )
-        return db_obj
-
-    def update(
-        self, db: Session, db_obj: BaseModel, obj_in: BaseModel, **kwargs: Any
-    ) -> BaseModel:
-        updated_obj = super().update(db, db_obj, obj_in, **kwargs)
-        if hasattr(updated_obj, "_changed_fields_for_log") and updated_obj._changed_fields_for_log:
-            log_action(
-                db,
-                user_id=None,
-                action_type="UPDATE",
-                entity_type="UniversalCategory",
-                entity_id=updated_obj.id,
-                details={"category_name": updated_obj.category_name, "changes": updated_obj._changed_fields_for_log},
-            )
-            del updated_obj._changed_fields_for_log
-        return updated_obj
-
-    def soft_delete(self, db: Session, db_obj: BaseModel) -> BaseModel:
-        deleted_obj = super().soft_delete(db, db_obj)
-        log_action(
-            db,
-            user_id=None,
-            action_type="SOFT_DELETE",
-            entity_type="UniversalCategory",
-            entity_id=deleted_obj.id,
-            details={"name": deleted_obj.name},
-        )
-        return deleted_obj
-
-    def restore(self, db: Session, db_obj: BaseModel) -> BaseModel:
-        restored_obj = super().restore(db, db_obj)
-        log_action(
-            db,
-            user_id=None,
-            action_type="RESTORE",
-            entity_type="UniversalCategory",
             entity_id=restored_obj.id,
             details={"name": restored_obj.name},
         )

@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import Depends, HTTPException, status, Request
+from fastapi import Depends, HTTPException, status, Request, Response # NEW: Import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
@@ -21,7 +21,8 @@ from app.core.hashing import get_password_hash, verify_password_direct
 # Environment variables for JWT
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+# MODIFIED: Set expiration to a very short time (e.g., 5 minutes) for sliding expiration
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 5))
 
 if SECRET_KEY is None:
     raise ValueError("SECRET_KEY environment variable is not set.")
@@ -54,6 +55,7 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
 # MODIFIED: get_current_user to check query params if header token is missing and to fetch subscription status
 async def get_current_user(
     request: Request,
+    response: Response, # NEW: Pass the response object to set the new token header
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
@@ -118,6 +120,13 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
+    # --- NEW: Sliding Expiration Logic ---
+    # Create a new token with a fresh expiration time
+    new_token_data = token_data.model_dump()
+    new_access_token = create_access_token(data=new_token_data)
+    response.headers['X-New-Auth-Token'] = new_access_token
+    # --- END NEW LOGIC ---
+
     return token_data
 
 async def get_current_active_user(current_user: TokenData = Depends(get_current_user)):

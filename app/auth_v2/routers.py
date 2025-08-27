@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session
 
 # Core security and database dependencies
 from app.database import get_db
-import app.core.security as security # Use alias to avoid name conflicts
+import app.core.security as security
+# NEW: Import the custom token creation function with a specific name
+from app.core.security import create_access_token as create_fresh_access_token 
 
 # Auth_v2 specific schemas and services
 from app.schemas.all_schemas import (
@@ -35,6 +37,8 @@ async def login_for_access_token(
     Redirects to change-password if must_change_password = True.
     """
     try:
+        # Call service to authenticate user and get a fresh token
+        # The authenticate_user function in the service layer will be updated to include subscription status in the payload.
         auth_response = await auth_service.authenticate_user(
             db, form_data.username, form_data.password, request.client.host
         )
@@ -42,13 +46,11 @@ async def login_for_access_token(
         if auth_response.get("must_change_password"):
             # If must_change_password is true, return a 307 redirect status
             # or a specific header for the frontend to handle.
-            # For API, it's often better to signal via response body/status code.
             # Returning 200 OK with must_change_password flag is a common pattern.
             # The frontend should interpret this and redirect accordingly.
             return Token(
                 access_token=auth_response["access_token"],
-                token_type=auth_response["token_type"],
-                must_change_password=True # Custom attribute for frontend guidance
+                token_type=auth_response["token_type"]
             )
 
         return Token(
@@ -67,6 +69,7 @@ async def login_for_access_token(
 @router.post("/change-password", response_model=Token, status_code=status.HTTP_200_OK)
 async def change_password(
     request: Request,
+    response: Response, # NEW: Add response parameter for the sliding expiration
     request_body: ChangePasswordRequest,
     current_user: security.TokenData = Depends(security.get_current_user), # Use get_current_user to allow password change even if must_change_password is true
     db: Session = Depends(get_db)
@@ -88,6 +91,7 @@ async def change_password(
             request.client.host,
             is_first_login_change=is_first_login_change
         )
+        # Note: The `get_current_user` dependency already added a new token to the response header.
         return new_token
     except HTTPException as e:
         raise e

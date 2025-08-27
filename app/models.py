@@ -1,11 +1,12 @@
 # app/models.py
-from __future__ import annotations # NEW: Add this line to handle forward references
+from __future__ import annotations
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, UniqueConstraint, Enum as SQLEnum, Text, Index
 from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus
+from app.schemas.migration_schemas import MigrationRecordStatusEnum, MigrationTypeEnum
 
 # --- BASE MODEL DEFINITION ---
 class BaseModel(Base):
@@ -51,7 +52,7 @@ class SubscriptionPlan(BaseModel):
     description = Column(String, nullable=True, comment="Description of the subscription plan")
     duration_months = Column(Integer, nullable=False, comment="Duration of the plan in months (e.g., 1 for monthly, 12 for annual)")
     monthly_price = Column(Float, nullable=False, comment="Monthly price of the plan")
-    annual_price = Column(Float, nullable=False, comment="Annual price of the plan")
+    annual_price = Column(Float, nullable=False, comment="Annual price of the plan (should be less than monthly_price * duration_months)")
     max_users = Column(Integer, nullable=False, comment="Maximum number of users allowed under this plan")
     max_records = Column(Integer, nullable=False, comment="Maximum number of records (e.g., LGs) allowed under this plan")
     can_maker_checker = Column(Boolean, default=False, nullable=False, comment="Allows maker-checker workflow")
@@ -281,42 +282,35 @@ class LgOperationalStatus(BaseModel):
     def __repr__(self: LgOperationalStatus):
         return f"<LgOperationalStatus(id={self.id}, name='{self.name}')>"
 
-class UniversalCategory(BaseModel):
-    __tablename__ = "universal_categories"
-    category_name = Column(String, unique=True, nullable=False, comment="Name of the universal category (e.g., 'Project Category A')")
-    code = Column(String, nullable=True, comment="Unique 1-2 character code for the universal category")
-    extra_field_name = Column(String, nullable=True, comment="Name for an optional extra field (e.g., 'Project Code')")
-    is_mandatory = Column(Boolean, nullable=True, comment="Whether the extra field is mandatory for LGs in this category")
-    communication_list = Column(JSON, nullable=True, comment="List of email addresses for communication (JSON array of strings)")
-
-    def __repr__(self: UniversalCategory):
-        return f"<UniversalCategory(id={self.id}, category_name='{self.category_name}')>"
-
 
 class LGCategory(BaseModel):
     __tablename__ = "lg_categories"
-    category_name = Column(String, nullable=False, comment="Name of the LG category specific to a customer")
-    code = Column(String, nullable=False, comment="Unique 1-2 character code for the category, used in LG serialization")
+    name = Column(String, nullable=False, comment="Name of the LG category")
+    code = Column(String(2), nullable=True, comment="Unique 1-2 character code for the category")
     extra_field_name = Column(String, nullable=True, comment="Name for an optional extra field for LGs in this category")
     is_mandatory = Column(Boolean, default=False, nullable=False, comment="Whether the extra field is mandatory for LGs in this category")
-    communication_list = Column(JSON, nullable=True, comment="List of email addresses for communication specific to this category (JSON array of strings)")
-
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    communication_list = Column(JSON, nullable=True, comment="List of email addresses for communication (JSON array of strings)")
+    
+    # CRITICAL CHANGE: customer_id is now nullable. NULL means it is a universal category.
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, comment="The ID of the customer. NULL for universal categories.")
     customer = relationship("Customer", back_populates="lg_categories")
+    
+    # NEW FIELD: to mark a category as the default for its scope (global or customer-specific)
+    is_default = Column(Boolean, default=False, nullable=False, comment="Whether this is the default category for its scope (global or customer-specific).")
 
     has_all_entity_access = Column(Boolean, default=True, nullable=False, comment="True if category applies to all entities under their customer, False if restricted to specific entities")
-
     entity_associations = relationship("LGCategoryCustomerEntityAssociation", back_populates="lg_category", cascade="all, delete-orphan")
     entities_with_access = relationship("CustomerEntity", secondary="lg_category_customer_entity_association", viewonly=True)
 
     __table_args__ = (
-        UniqueConstraint('customer_id', 'category_name', name='_customer_category_name_uc'),
+        UniqueConstraint('customer_id', 'name', name='_customer_category_name_uc'),
         UniqueConstraint('customer_id', 'code', name='_customer_category_code_uc'),
         Index('idx_lg_category_customer_id_code', 'customer_id', 'code'),
     )
 
     def __repr__(self: LGCategory):
-        return f"<LGCategory(id={self.id}, name='{self.category_name}', code='{self.code}', customer_id={self.customer_id})>"
+        scope = "Universal" if self.customer_id is None else f"Customer {self.customer_id}"
+        return f"<LGCategory(id={self.id}, name='{self.name}', code='{self.code}', scope='{scope}')>"
 
 
 class InternalOwnerContact(BaseModel):
@@ -396,7 +390,7 @@ class LGRecord(BaseModel):
     issuing_method_id = Column(Integer, ForeignKey("issuing_methods.id"), nullable=False, comment="ID of the method by which LG was issued")
     applicable_rule_id = Column(Integer, ForeignKey("rules.id"), nullable=False, comment="ID of the set of rules governing the LG")
     applicable_rules_text = Column(String, nullable=True, comment="Free text for rules (conditional)")
-    other_conditions = Column(String, nullable=True, comment="Any other specific conditions not covered elsewhere")
+    other_conditions = Column(String(8000), nullable=True, comment="Any other specific conditions not covered elsewhere")
 
     internal_owner_contact_id = Column(Integer, ForeignKey("internal_owner_contacts.id"), nullable=False, comment="ID of the internal owner contact person")
 
@@ -404,6 +398,10 @@ class LGRecord(BaseModel):
     additional_field_values = Column(JSON, nullable=True, comment="Dynamic fields based on selected LGCategory's extra_field_name (JSONB)")
     internal_contract_project_id = Column(String, nullable=True, comment="Internal reference ID for contract/project")
     notes = Column(Text, nullable=True, comment="Free-form notes related to the LG")
+    
+    # NEW: Migration-related columns
+    migration_source = Column(String, nullable=True, comment="Indicates the source of the LG (e.g., 'LEGACY' for migrated records).")
+    migrated_from_staging_id = Column(Integer, ForeignKey('lg_migration_staging.id'), nullable=True, comment="Foreign key to the last staged record used for this LG.")
 
     # Relationships
     customer = relationship("Customer")
@@ -422,6 +420,7 @@ class LGRecord(BaseModel):
     # Documents associated with this LG record
     documents = relationship("LGDocument", back_populates="lg_record", cascade="all, delete-orphan")
     instructions = relationship("LGInstruction", back_populates="lg_record")
+    change_logs = relationship("LGChangeLog", back_populates="lg_record")
 
     __table_args__ = (
         UniqueConstraint('lg_number', name='uq_lg_record_number'),
@@ -429,6 +428,7 @@ class LGRecord(BaseModel):
         Index('idx_lg_record_customer_id', 'customer_id'),
         Index('idx_lg_record_lg_number', 'lg_number'),
         Index('idx_lg_record_expiry_date', 'expiry_date'),
+        Index('ix_lg_records_migrated_from_staging_id', 'migrated_from_staging_id'),
     )
 
     def __repr__(self: LGRecord):
@@ -464,8 +464,8 @@ class LGInstruction(BaseModel):
     __tablename__ = "lg_instructions"
 
     lg_record_id = Column(Integer, ForeignKey("lg_records.id"), nullable=False, comment="The LG record this instruction pertains to")
-    instruction_type = Column(String, nullable=False, comment="Type of instruction (e.g., 'EXTENSION', 'RELEASE', 'AMENDMENT', 'REMINDER', 'ACTIVATION')")
-    serial_number = Column(String, unique=True, nullable=False, comment="Unique serial number for the instruction (e.g., 0001AP0042EX0012002O)")
+    instruction_type = Column(String, nullable=False, comment="Type of instruction (e.g., 'EXTENSION', 'RELEASE', 'AMENDMENT', 'ACTIVATION')") # Removed 'REMINDER' as it's a sub-type
+    serial_number = Column(String, unique=True, nullable=False, comment="Unique serial number for the instruction")
     global_seq_per_lg = Column(Integer, nullable=False, default=1, comment="Global sequential number for all instructions related to this LG record")
     type_seq_per_lg = Column(Integer, nullable=False, default=1, comment="Sequential number per instruction type for this LG record")
     template_id = Column(Integer, ForeignKey("templates.id"), nullable=False, comment="The template used to generate this instruction")
@@ -474,7 +474,7 @@ class LGInstruction(BaseModel):
     delivery_date = Column(DateTime(timezone=True), nullable=True, comment="Date the instruction was physically delivered to the bank")
     bank_reply_date = Column(DateTime(timezone=True), nullable=True, comment="Date the bank's reply was received")
     details = Column(JSON, nullable=True, comment="JSON object for instruction-specific details")
-    generated_content_path = Column(String, nullable=True, comment="Path or URL to the generated instruction document (e.g., PDF for letter)")
+    generated_content_path = Column(String, nullable=True, comment="Path or URL to the generated instruction document")
     sent_to_bank = Column(Boolean, default=False, nullable=False, comment="Indicates if this instruction has been marked as sent to the bank")
     is_printed = Column(Boolean, default=False, nullable=False, comment="True if this instruction letter has been printed by a user")
     maker_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, comment="User who initiated this instruction (Maker)")
@@ -636,3 +636,72 @@ class SystemNotificationViewLog(Base):
 
     def __repr__(self: SystemNotificationViewLog):
         return f"<SystemNotificationViewLog(id={self.id}, user_id={self.user_id}, notification_id={self.notification_id}, view_count={self.view_count})>"
+        
+# NEW MIGRATION MODELS - Added to this file
+class LGMigrationStaging(BaseModel):
+    __tablename__ = 'lg_migration_staging'
+    
+    # The BaseModel already provides: id, created_at, updated_at, is_deleted, deleted_at
+    file_name = Column(String, nullable=True, comment="Original name of the uploaded file.")
+    record_status = Column(SQLEnum(MigrationRecordStatusEnum), default=MigrationRecordStatusEnum.PENDING, nullable=False, index=True)
+    validation_log = Column(JSON, nullable=True, comment="Details of validation errors or warnings.")
+    internal_notes = Column(Text, nullable=True, comment="Internal notes from a reviewer.")
+    file_content_hash = Column(String, nullable=True, comment="SHA256 hash of the uploaded file for duplicate detection.")
+    source_data_json = Column(JSON, nullable=True, comment="The raw extracted data from the document.")
+    structured_data_json = Column(JSON, nullable=True, comment="The cleaned, validated, and normalized data ready for import.")
+    
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    # NEW: Add migration_type column for records vs instructions
+    migration_type = Column(SQLEnum(MigrationTypeEnum), default=MigrationTypeEnum.RECORD, nullable=False, index=True, comment="Distinguishes between a full LG record or a subsequent instruction.")
+    
+    # NEW: Historical Reconstruction columns
+    history_sequence = Column(Integer, nullable=True, comment="User-provided sequence number for timeline ordering.")
+    history_timestamp = Column(DateTime(timezone=True), nullable=True, comment="User-provided timestamp for timeline ordering.")
+    production_lg_id = Column(Integer, ForeignKey('lg_records.id'), nullable=True, comment="The ID of the final LG record this staged record was used to create/update.")
+
+    __table_args__ = (
+        Index('idx_lg_migration_staging_customer_id_status', 'customer_id', 'record_status'),
+        Index('ix_lg_migration_staging_production_lg_id', 'production_lg_id'),
+        # CORRECTED: Functional Index for faster grouping by lg_number for history reconstruction
+        Index('ix_lg_migration_staging_lg_number_lower', func.lower((source_data_json['lg_number'].astext))),
+    )
+    
+    def __repr__(self):
+        return f"<LGMigrationStaging(id={self.id}, file_name='{self.file_name}', status='{self.record_status}')>"
+
+
+class MigrationBatch(BaseModel):
+    __tablename__ = "migration_batches"
+    
+    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    source_files = Column(JSONB, nullable=True)
+    totals = Column(JSONB, nullable=True)
+    notes = Column(Text, nullable=True)
+    # NEW: Add file_hash to the batch for duplicate file detection
+    file_hash = Column(String, nullable=True, comment="SHA256 hash of the uploaded file for duplicate detection.")
+    
+    user = relationship("User")
+    
+    __table_args__ = (
+        Index('ix_migration_batches_user_id', 'user_id'),
+    )
+
+class LGChangeLog(BaseModel):
+    __tablename__ = "lg_change_log"
+    
+    lg_id = Column(Integer, ForeignKey('lg_records.id'), nullable=False)
+    staging_id = Column(Integer, ForeignKey('lg_migration_staging.id'), nullable=True)
+    change_index = Column(Integer, nullable=False)
+    applied_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    diff_json = Column(JSONB, nullable=False)
+    note = Column(Text, nullable=True)
+
+    lg_record = relationship("LGRecord", back_populates="change_logs")
+    staging_record = relationship("LGMigrationStaging")
+
+    __table_args__ = (
+        UniqueConstraint('lg_id', 'change_index', name='uq_lg_change_log_index'),
+        Index('ix_lg_change_log_lg_id', 'lg_id'),
+    )

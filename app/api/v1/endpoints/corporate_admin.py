@@ -15,6 +15,7 @@ from app.database import get_db
 from app.schemas.all_schemas import (
     CustomerEntityCreate, CustomerEntityUpdate, CustomerEntityOut,
     UserCreateCorporateAdmin, UserUpdateCorporateAdmin, UserOut,
+    # MODIFIED: Use new unified LGCategory schemas
     LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
     CustomerConfigurationCreate, CustomerConfigurationUpdate, CustomerConfigurationOut,
     CustomerEmailSettingCreate, CustomerEmailSettingUpdate, CustomerEmailSettingOut,
@@ -26,7 +27,8 @@ from app.schemas.all_schemas import (
 )
 from app.crud.crud import (
     crud_customer, crud_customer_entity, crud_user,
-    crud_lg_category, crud_universal_category,
+    # MODIFIED: Removed crud_universal_category
+    crud_lg_category,
     crud_global_configuration, crud_customer_configuration,
     crud_audit_log, log_action,
     crud_permission, crud_role_permission,
@@ -37,11 +39,10 @@ from app.crud.crud import (
     crud_system_notification,
     crud_system_notification_view_log,
 )
+import app.models as models
 from app.models import (
-    User, Customer, CustomerEntity,
-    LGCategory, UniversalCategory, GlobalConfiguration,
-    CustomerEmailSetting, UserCustomerEntityAssociation,
-    ApprovalRequest, InternalOwnerContact,
+    InternalOwnerContact, LGCategory, Bank, IssuingMethod, Rule,User,
+    ApprovalRequest,CustomerEntity,
 )
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, SubscriptionStatus
 
@@ -441,7 +442,6 @@ def restore_customer_entity(
         )
 
 # --- User Management (within Corporate Admin's customer scope) ---
-# NEW ENDPOINT: Create User (was missing)
 @router.post("/users/", response_model=UserOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 def create_user(
     user_in: UserCreateCorporateAdmin,
@@ -457,17 +457,21 @@ def create_user(
     customer_id = corporate_admin_context.customer_id
 
     try:
-        # FIX: Call get_with_relations with positional argument for customer_id
         customer_check = crud_customer.get_with_relations(db, customer_id)
         if not customer_check:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found or is deleted.")
         
-        # Check user limit for subscription plan
-        active_users_count = db.query(User).filter(
+        # FIX: Re-synchronize the active_user_count before performing the check
+        actual_active_users_count = db.query(User).filter(
             User.customer_id == customer_id,
             User.is_deleted == False
         ).count()
-        if active_users_count >= customer_check.subscription_plan.max_users:
+        customer_check.active_user_count = actual_active_users_count
+        db.add(customer_check)
+        db.flush() # Ensure the session has the corrected count before the next check
+        
+        # Check user limit for subscription plan
+        if customer_check.active_user_count >= customer_check.subscription_plan.max_users:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Customer's subscription plan '{customer_check.subscription_plan.name}' limit of {customer_check.subscription_plan.max_users} users reached."
@@ -624,6 +628,8 @@ def restore_user(
 
 # --- LG Category Management (within Corporate Admin's customer scope) ---
 # All write operations must use check_for_read_only_mode
+# --- LG Category Management (within Corporate Admin's customer scope) ---
+# All write operations must use check_for_read_only_mode
 @router.post("/lg-categories/", response_model=LGCategoryOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 def create_lg_category(
     lg_category_in: LGCategoryCreate, 
@@ -634,93 +640,74 @@ def create_lg_category(
     client_host = request.client.host if request else None
     customer_id = corporate_admin_context.customer_id
 
+    # CRITICAL FIX: Explicitly set the customer_id from the authenticated user's context.
+    # This prevents the category from being created as a system-wide (NULL customer_id) category.
+    lg_category_in.customer_id = customer_id
+    
     try:
-        db_lg_category = crud_lg_category.create(db, obj_in=lg_category_in, customer_id=customer_id, user_id=corporate_admin_context.user_id)
-        
-        return db_lg_category
+        db_lg_category = crud_lg_category.create(db, obj_in=lg_category_in, user_id=corporate_admin_context.user_id)
+
+        customer_name = db.query(models.Customer.name).filter(models.Customer.id == customer_id).scalar()
+        entities_out = [
+            CustomerEntityOut.model_validate(assoc.customer_entity)
+            for assoc in db_lg_category.entity_associations if not assoc.customer_entity.is_deleted
+        ]
+
+        return LGCategoryOut.model_validate(
+            db_lg_category,
+            context={
+                'customer_name': customer_name,
+                'entities_with_access': entities_out
+            }
+        )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"category_name": lg_category_in.category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"name": lg_category_in.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"category_name": lg_category_in.category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred: {e}"
-        )
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"name": lg_category_in.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+
+# In api/v1/endpoints/corporate_admin.py
 
 @router.get("/lg-categories/", response_model=List[LGCategoryOut], dependencies=[Depends(check_subscription_status)])
 def list_lg_categories(
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:view"))
+    corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:view")),
+    include_deleted: Optional[bool] = Query(False)
 ):
     customer_id = corporate_admin_context.customer_id
-    all_categories = []
-
-    universal_categories_db = crud_universal_category.get_all(db)
-    for uc in universal_categories_db:
-        all_categories.append(
-            LGCategoryOut(
-                id=uc.id,
-                category_name=uc.category_name,
-                code=uc.code,
-                extra_field_name=uc.extra_field_name,
-                is_mandatory=uc.is_mandatory if uc.is_mandatory is not None else False,
-                communication_list=uc.communication_list,
-                customer_id=None,
-                customer_name="System Default",
-                is_deleted=False,
-                created_at=uc.created_at,
-                updated_at=uc.updated_at,
-                type="universal",
-                has_all_entity_access=True,
-                entities_with_access=[]
-            )
-        )
-
-    customer_lg_categories = crud_lg_category.get_all_for_customer(
-        db,
-        customer_id=customer_id
+    
+    # Logic to fetch all categories for the customer, including deleted ones if the flag is True
+    all_categories_from_db_query = db.query(LGCategory).filter(
+        (LGCategory.customer_id == customer_id) | (LGCategory.customer_id.is_(None))
     )
+    if not include_deleted:
+        all_categories_from_db_query = all_categories_from_db_query.filter(LGCategory.is_deleted == False)
 
+    all_categories_from_db = all_categories_from_db_query.all()
+    
+    all_categories = []
     customer = crud_customer.get(db, customer_id)
-    customer_name = customer.name if customer else None
+    customer_name = customer.name if customer else "Unknown Customer"
 
-    for cat in customer_lg_categories:
+    for cat in all_categories_from_db:
+        cat_customer_name = customer_name if cat.customer_id is not None else "System Default"
         entities_out = [
-            CustomerEntityOut(
-                id=assoc.customer_entity.id,
-                entity_name=assoc.customer_entity.entity_name,
-                code=assoc.customer_entity.code,
-                contact_person=assoc.customer_entity.contact_person,
-                contact_email=assoc.customer_entity.contact_email,
-                is_active=assoc.customer_entity.is_active,
-                customer_id=assoc.customer_entity.customer_id,
-                created_at=assoc.customer_entity.created_at,
-                updated_at=assoc.customer_entity.updated_at,
-                is_deleted=assoc.customer_entity.is_deleted,
-                deleted_at=assoc.customer_entity.deleted_at
-            ) for assoc in cat.entity_associations if not assoc.customer_entity.is_deleted
-        ]
+            CustomerEntityOut.model_validate(assoc.customer_entity)
+            for assoc in cat.entity_associations if not assoc.customer_entity.is_deleted
+        ] if cat.customer_id is not None else []
+        
         all_categories.append(
-            LGCategoryOut(
-                id=cat.id,
-                category_name=cat.category_name,
-                code=cat.code,
-                extra_field_name=cat.extra_field_name,
-                is_mandatory=cat.is_mandatory,
-                communication_list=cat.communication_list,
-                customer_id=cat.customer_id,
-                customer_name=customer_name,
-                is_deleted=cat.is_deleted,
-                created_at=cat.created_at,
-                updated_at=cat.updated_at,
-                type="customer",
-                has_all_entity_access=cat.has_all_entity_access,
-                entities_with_access=entities_out
+            LGCategoryOut.model_validate(
+                cat,
+                context={
+                    'customer_name': cat_customer_name,
+                    'entities_with_access': entities_out
+                }
             )
         )
 
-    all_categories.sort(key=lambda x: (0 if x.type == 'universal' else 1, x.category_name.lower()))
+    all_categories.sort(key=lambda x: (0 if x.customer_id is None else 1, x.name.lower()))
     return all_categories
 
 @router.get("/lg-categories/{category_id}", response_model=LGCategoryOut, dependencies=[Depends(check_subscription_status)])
@@ -734,61 +721,24 @@ def read_lg_category(
     db_lg_category = crud_lg_category.get_for_customer(db, category_id, customer_id)
 
     if not db_lg_category:
-        db_lg_category = crud_universal_category.get(db, category_id)
-        if not db_lg_category:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Category not found.")
-        
-        return LGCategoryOut(
-            id=db_lg_category.id,
-            category_name=db_lg_category.category_name,
-            code=db_lg_category.code,
-            extra_field_name=db_lg_category.extra_field_name,
-            is_mandatory=db_lg_category.is_mandatory if db_lg_category.is_mandatory is not None else False,
-            communication_list=db_lg_category.communication_list,
-            customer_id=None,
-            customer_name="System Default",
-            is_deleted=False,
-            created_at=db_lg_category.created_at,
-            updated_at=db_lg_category.updated_at,
-            type="universal",
-            has_all_entity_access=True,
-            entities_with_access=[]
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Category not found or not accessible.")
+    
+    customer_name = db_lg_category.customer.name if db_lg_category.customer_id else "System Default"
 
-    customer = crud_customer.get(db, customer_id)
-    customer_name = customer.name if customer else None
     entities_out = [
-        CustomerEntityOut(
-            id=assoc.customer_entity.id,
-            entity_name=assoc.customer_entity.entity_name,
-            code=assoc.customer_entity.code,
-            contact_person=assoc.customer_entity.contact_person,
-            contact_email=assoc.customer_entity.contact_email,
-            is_active=assoc.customer_entity.is_active,
-            customer_id=assoc.customer_entity.customer_id,
-            created_at=assoc.customer_entity.created_at,
-            updated_at=assoc.customer_entity.updated_at,
-            is_deleted=assoc.customer_entity.is_deleted,
-            deleted_at=assoc.customer_entity.deleted_at
-        ) for assoc in db_lg_category.entity_associations if not assoc.customer_entity.is_deleted
-    ]
-    return LGCategoryOut(
-        id=db_lg_category.id,
-        category_name=db_lg_category.category_name,
-        code=db_lg_category.code,
-        extra_field_name=db_lg_category.extra_field_name,
-        is_mandatory=db_lg_category.is_mandatory,
-        is_deleted=db_lg_category.is_deleted,
-        created_at=db_lg_category.created_at,
-        updated_at=db_lg_category.updated_at,
-        communication_list=db_lg_category.communication_list,
-        customer_id=db_lg_category.customer_id,
-        customer_name=customer_name,
-        type="customer",
-        has_all_entity_access=db_lg_category.has_all_entity_access,
-        entities_with_access=entities_out
+        CustomerEntityOut.model_validate(assoc.customer_entity)
+        for assoc in db_lg_category.entity_associations if not assoc.customer_entity.is_deleted
+    ] if db_lg_category.customer_id is not None else []
+    
+    # CRITICAL FIX: Pass the ORM object directly to Pydantic's model_validate.
+    # We pass extra arguments as a dictionary to handle the computed fields.
+    return LGCategoryOut.model_validate(
+        db_lg_category,
+        context={
+            'customer_name': customer_name,
+            'entities_with_access': entities_out
+        }
     )
-
 
 @router.put("/lg-categories/{category_id}", response_model=LGCategoryOut, dependencies=[Depends(check_for_read_only_mode)])
 def update_lg_category(
@@ -802,21 +752,36 @@ def update_lg_category(
     customer_id = corporate_admin_context.customer_id
 
     try:
-        db_lg_category = crud_lg_category.get_for_customer(db, category_id, customer_id)
-        if not db_lg_category:
+        db_lg_category = crud_lg_category.get(db, id=category_id)
+        if not db_lg_category or db_lg_category.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Category not found or does not belong to your customer.")
         
-        if db_lg_category.customer_id is None:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Universal categories can only be updated by a System Owner.")
-
         updated_lg_category = crud_lg_category.update(db, db_lg_category, lg_category_in, corporate_admin_context.user_id)
         
-        return updated_lg_category
+        customer = crud_customer.get(db, customer_id)
+        customer_name = customer.name if customer else "Unknown Customer"
+        
+        entities_out = [
+            CustomerEntityOut.model_validate(assoc.customer_entity)
+            for assoc in updated_lg_category.entity_associations if not assoc.customer_entity.is_deleted
+        ]
+        
+        return LGCategoryOut.model_validate(
+            updated_lg_category,
+            context={
+                'customer_name': customer_name,
+                'entities_with_access': entities_out
+            }
+        )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": lg_category_in.category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        # FIX: Use getattr to safely access `lg_category_in.name`
+        category_name = getattr(lg_category_in, 'name', 'N/A')
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": lg_category_in.category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        # FIX: Use getattr to safely access `lg_category_in.name`
+        category_name = getattr(lg_category_in, 'name', 'N/A')
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -833,21 +798,27 @@ def delete_lg_category(
     customer_id = corporate_admin_context.customer_id
 
     try:
-        db_lg_category = crud_lg_category.get_for_customer(db, category_id, customer_id)
-        if not db_lg_category:
+        db_lg_category = crud_lg_category.get(db, id=category_id)
+        if not db_lg_category or db_lg_category.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Category not found or does not belong to your customer.")
         
-        if db_lg_category.customer_id is None:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Universal categories can only be deleted by a System Owner.")
-
         deleted_lg_category = crud_lg_category.soft_delete(db, db_lg_category, corporate_admin_context.user_id)
         
-        return deleted_lg_category
+        customer = crud_customer.get(db, customer_id)
+        customer_name = customer.name if customer else "Unknown Customer"
+        
+        return LGCategoryOut.model_validate(
+            deleted_lg_category,
+            context={
+                'customer_name': customer_name,
+                'entities_with_access': []
+            }
+        )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_lg_category.category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_lg_category.category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -876,22 +847,32 @@ def restore_lg_category(
                 detail="LG Category not found or not in a soft-deleted state, or does not belong to your customer."
             )
         
-        if db_lg_category.customer_id is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Universal categories can only be restored by a System Owner.")
-
         restored_lg_category = crud_lg_category.restore(db, db_lg_category, corporate_admin_context.user_id)
         
-        return restored_lg_category
+        customer = crud_customer.get(db, customer_id)
+        customer_name = customer.name if customer else "Unknown Customer"
+        
+        entities_out = [
+            CustomerEntityOut.model_validate(assoc.customer_entity)
+            for assoc in restored_lg_category.entity_associations if not assoc.customer_entity.is_deleted
+        ]
+        
+        return LGCategoryOut.model_validate(
+            restored_lg_category,
+            context={
+                'customer_name': customer_name,
+                'entities_with_access': entities_out
+            }
+        )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_lg_category.category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_lg_category.category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
         )
-
 
 # --- Customer Configuration Management (Corporate Admin) ---
 # All write operations must use check_for_read_only_mode

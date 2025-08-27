@@ -1,51 +1,72 @@
-# app/crud/crud_lg_category.py
 import json
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Type, Tuple
 from fastapi import HTTPException, status
-from sqlalchemy import func
+from sqlalchemy import func, and_, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.crud.crud import CRUDBase, log_action
-import app.models as models
-from app.models import LGCategory, CustomerEntity, LGRecord, LGCategoryCustomerEntityAssociation
+from app.models import (
+    LGCategory,
+    CustomerEntity,
+    LGRecord,
+    LGCategoryCustomerEntityAssociation,
+)
 from app.schemas.all_schemas import LGCategoryCreate, LGCategoryUpdate
 
 import logging
 logger = logging.getLogger(__name__)
 
 class CRUDLGCategory(CRUDBase):
-    def get_by_name_for_customer(
-        self, db: Session, customer_id: int, category_name: str
+    def get_by_name(
+        self, db: Session, category_name: str, customer_id: Optional[int]
     ) -> Optional[LGCategory]:
+        """
+        Retrieves a category by its name and customer scope (customer_id).
+        customer_id=None is used for universal categories.
+        """
         return (
             db.query(self.model)
             .filter(
                 self.model.customer_id == customer_id,
-                func.lower(self.model.category_name) == func.lower(category_name),
+                func.lower(self.model.name) == func.lower(category_name),
+                self.model.is_deleted == False
             )
             .first()
         )
 
-    def get_by_code_for_customer(
-        self, db: Session, customer_id: int, code: str
+    def get_by_code(
+        self, db: Session, code: str, customer_id: Optional[int]
     ) -> Optional[LGCategory]:
+        """
+        Retrieves a category by its code and customer scope (customer_id).
+        customer_id=None is used for universal categories.
+        """
         return (
             db.query(self.model)
             .filter(
-                self.model.customer_id == customer_id, func.lower(self.model.code) == func.lower(code)
+                self.model.customer_id == customer_id,
+                func.lower(self.model.code) == func.lower(code),
+                self.model.is_deleted == False
             )
             .first()
         )
-
+        
     def get_all_for_customer(
         self, db: Session, customer_id: int, skip: int = 0, limit: int = 100
     ) -> List[LGCategory]:
+        """
+        Retrieves all active categories for a specific customer, including universal categories.
+        """
         return (
             db.query(self.model)
-            .filter(self.model.customer_id == customer_id, self.model.is_deleted == False)
+            .filter(
+                (self.model.customer_id == customer_id) | (self.model.customer_id.is_(None)),
+                self.model.is_deleted == False
+            )
+            .order_by(self.model.customer_id.desc().nulls_first(), self.model.name) # Show universal first, then customer-specific
             .options(
-                selectinload(LGCategory.entity_associations).selectinload(
+                selectinload(self.model.entity_associations).selectinload(
                     LGCategoryCustomerEntityAssociation.customer_entity
                 )
             )
@@ -54,67 +75,90 @@ class CRUDLGCategory(CRUDBase):
             .all()
         )
 
+    def get_default_category(self, db: Session, customer_id: Optional[int]) -> Optional[LGCategory]:
+        """
+        Retrieves the default category for a specific scope (customer or universal).
+        """
+        return (
+            db.query(self.model)
+            .filter(
+                self.model.is_default == True,
+                self.model.customer_id == customer_id, # Use == for customer, is_(None) for universal
+                self.model.is_deleted == False
+            )
+            .first()
+        )
+        
     def get_for_customer(
         self, db: Session, lg_category_id: int, customer_id: int
     ) -> Optional[LGCategory]:
+        """
+        Retrieves a category by ID, ensuring it belongs to the customer or is a universal category.
+        """
         return (
             db.query(self.model)
             .filter(
                 self.model.id == lg_category_id,
-                self.model.customer_id == customer_id,
                 self.model.is_deleted == False,
+                or_(
+                    self.model.customer_id == customer_id,
+                    self.model.customer_id.is_(None)
+                )
             )
             .options(
-                selectinload(LGCategory.entity_associations).selectinload(
+                selectinload(self.model.entity_associations).selectinload(
                     LGCategoryCustomerEntityAssociation.customer_entity
                 )
             )
             .first()
         )
 
-    def create(self, db: Session, obj_in: LGCategoryCreate, customer_id: int, user_id: int) -> LGCategory:
-        existing_name = self.get_by_name_for_customer(
-            db, customer_id, obj_in.category_name
-        )
+    def create(self, db: Session, obj_in: LGCategoryCreate, user_id: int) -> LGCategory:
+        target_customer_id = obj_in.customer_id
+        
+        # Check for existing categories with the same name or code in the target scope.
+        existing_name = self.get_by_name(db, obj_in.name, target_customer_id)
         if existing_name:
-            if existing_name.is_deleted:
-                raise HTTPException(
+             raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Category with name '{obj_in.name}' already exists for this scope.",
+            )
+
+        if obj_in.code:
+            existing_code = self.get_by_code(db, obj_in.code, target_customer_id)
+            if existing_code:
+                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Category with name '{obj_in.category_name}' already exists for this customer but is deleted. Please restore it if needed.",
-                )
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Category with name '{obj_in.category_name}' already exists for this customer.",
+                    detail=f"Category with code '{obj_in.code}' already exists for this scope.",
                 )
 
-        existing_code = self.get_by_code_for_customer(db, customer_id, obj_in.code)
-        if existing_code:
-            if existing_code.is_deleted:
+        # Ensure only one default category per scope.
+        if obj_in.is_default:
+            existing_default = self.get_default_category(db, target_customer_id)
+            if existing_default:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Category with code '{obj_in.code}' already exists for this customer but is deleted. Please restore it if needed.",
-                )
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Category with code '{obj_in.code}' already exists for this customer.",
+                    detail="A default category for this scope already exists. Please set the 'is_default' flag to false or update the existing default category."
                 )
 
-        lg_category_data = obj_in.model_dump(exclude_unset=True)
-        entity_ids = lg_category_data.pop("entity_ids", [])
-
-        db_obj = self.model(customer_id=customer_id, **lg_category_data)
+        # Create new object
+        lg_category_data = obj_in.model_dump(exclude_unset=True, exclude={"entity_ids"})
+        entity_ids = obj_in.entity_ids if obj_in.entity_ids is not None else []
+        
+        # Add the customer_id to the dictionary
+        lg_category_data["customer_id"] = target_customer_id
+        
+        db_obj = self.model(**lg_category_data)
 
         db.add(db_obj)
         db.flush()
 
-        if not db_obj.has_all_entity_access and entity_ids:
+        if db_obj.customer_id is not None and not db_obj.has_all_entity_access:
             customer_entities = (
                 db.query(CustomerEntity)
                 .filter(
                     CustomerEntity.id.in_(entity_ids),
-                    CustomerEntity.customer_id == customer_id,
+                    CustomerEntity.customer_id == db_obj.customer_id,
                     CustomerEntity.is_deleted == False,
                 )
                 .all()
@@ -132,67 +176,76 @@ class CRUDLGCategory(CRUDBase):
                 db.add(association)
 
         db.refresh(db_obj)
-
+        
         log_action(
             db,
             user_id=user_id,
             action_type="CREATE",
             entity_type="LGCategory",
             entity_id=db_obj.id,
-            details={"category_name": db_obj.category_name, "code": db_obj.code, "customer_id": db_obj.customer_id, "has_all_entity_access": db_obj.has_all_entity_access, "entity_ids": entity_ids,},
-            customer_id=customer_id,
+            details={
+                "name": db_obj.name,
+                "code": db_obj.code,
+                "customer_id": db_obj.customer_id,
+                "is_default": db_obj.is_default,
+            },
+            customer_id=db_obj.customer_id,
         )
         return db_obj
 
     def update(self, db: Session, db_obj: LGCategory, obj_in: LGCategoryUpdate, user_id: int) -> LGCategory:
-        if obj_in.category_name is not None and obj_in.category_name.lower() != db_obj.category_name.lower():
-            existing_name = self.get_by_name_for_customer(
-                db, db_obj.customer_id, obj_in.category_name
-            )
+        # Check if the name or code is being changed to an existing one
+        update_data = obj_in.model_dump(exclude_unset=True)
+        target_customer_id = db_obj.customer_id
+        
+        if obj_in.name and obj_in.name.lower() != db_obj.name.lower():
+            existing_name = self.get_by_name(db, obj_in.name, target_customer_id)
             if existing_name and existing_name.id != db_obj.id:
-                raise HTTPException(
+                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Category with name '{obj_in.category_name}' already exists for this customer.",
+                    detail=f"Category with name '{obj_in.name}' already exists for this scope.",
                 )
 
-        if obj_in.code is not None and obj_in.code.lower() != db_obj.code.lower():
-            existing_code = self.get_by_code_for_customer(
-                db, db_obj.customer_id, obj_in.code
-            )
+        if obj_in.code and obj_in.code.lower() != db_obj.code.lower():
+            existing_code = self.get_by_code(db, obj_in.code, target_customer_id)
             if existing_code and existing_code.id != db_obj.id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Category with code '{obj_in.code}' already exists for this customer.",
+                    detail=f"Category with code '{obj_in.code}' already exists for this scope.",
+                )
+        
+        if obj_in.is_default is True and not db_obj.is_default:
+            existing_default = self.get_default_category(db, target_customer_id)
+            if existing_default and existing_default.id != db_obj.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A default category for this scope already exists. Please update the existing one first."
                 )
 
-        old_data_for_log = obj_in.model_dump(exclude_unset=True)
-
-        if "has_all_entity_access" in old_data_for_log:
-            new_has_all_entity_access = old_data_for_log.pop("has_all_entity_access")
-            new_entity_ids = old_data_for_log.pop("entity_ids", [])
-
+        # Handle entity access changes
+        if "has_all_entity_access" in update_data:
+            new_has_all_entity_access = update_data.pop("has_all_entity_access")
+            
             if new_has_all_entity_access != db_obj.has_all_entity_access:
                 db.query(LGCategoryCustomerEntityAssociation).filter(
                     LGCategoryCustomerEntityAssociation.lg_category_id == db_obj.id
                 ).delete()
-
                 db_obj.has_all_entity_access = new_has_all_entity_access
                 db.flush()
-
                 db.refresh(db_obj, attribute_names=['entity_associations'])
-
-
-            if not db_obj.has_all_entity_access:
+            
+            if db_obj.customer_id is not None and not new_has_all_entity_access:
+                new_entity_ids = update_data.pop("entity_ids", [])
                 customer_entities = (
                     db.query(CustomerEntity)
                     .filter(
-                        CustomerEntity.id.in_(new_entity_ids), # Use new_entity_ids here
+                        CustomerEntity.id.in_(new_entity_ids),
                         CustomerEntity.customer_id == db_obj.customer_id,
                         CustomerEntity.is_deleted == False,
                     )
                     .all()
                 )
-                if len(customer_entities) != len(new_entity_ids): # Compare with new_entity_ids
+                if len(customer_entities) != len(new_entity_ids):
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="One or more provided entity IDs are invalid or do not belong to this customer.",
@@ -209,7 +262,6 @@ class CRUDLGCategory(CRUDBase):
                         )
                         db.add(association)
 
-                # Corrected logic to remove deselected entities
                 for entity_id in current_entity_ids:
                     if entity_id not in new_entity_ids:
                         db.query(LGCategoryCustomerEntityAssociation).filter(
@@ -218,33 +270,27 @@ class CRUDLGCategory(CRUDBase):
                             LGCategoryCustomerEntityAssociation.customer_entity_id
                             == entity_id,
                         ).delete()
-            db.flush()
-
-        # Update other fields from obj_in
-        for field, value in old_data_for_log.items():
-            setattr(db_obj, field, value)
-
-        db_obj.updated_at = func.now()
-        db.add(db_obj)
+        
         db.flush()
-        db.refresh(db_obj)
 
+        updated_category = super().update(db, db_obj, update_data)
+        
         log_action(
             db,
             user_id=user_id,
             action_type="UPDATE",
             entity_type="LGCategory",
             entity_id=db_obj.id,
-            details={"category_name": db_obj.category_name, "code": db_obj.code, "customer_id": db_obj.customer_id, "changes": old_data_for_log},
+            details={"name": db_obj.name, "code": db_obj.code, "customer_id": db_obj.customer_id, "changes": update_data},
             customer_id=db_obj.customer_id,
         )
 
-        return db_obj
+        return updated_category
 
     def soft_delete(self, db: Session, db_obj: LGCategory, user_id: int) -> LGCategory:
-        if db_obj.customer_id is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Universal categories cannot be deleted by Corporate Admin.")
-
+        if db_obj.is_default:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete a default category. Please set a new default first.")
+        
         active_lg_records = db.query(LGRecord).filter(
             LGRecord.lg_category_id == db_obj.id,
             LGRecord.is_deleted == False
@@ -255,14 +301,6 @@ class CRUDLGCategory(CRUDBase):
 
         deleted_category = super().soft_delete(db, db_obj)
 
-        # Soft delete associated entity access entries
-        db.query(LGCategoryCustomerEntityAssociation).filter(
-            LGCategoryCustomerEntityAssociation.lg_category_id == deleted_category.id
-        ).update(
-            {"is_deleted": True, "deleted_at": func.now()}, synchronize_session=False
-        )
-        db.flush()
-
         log_action(
             db,
             user_id=user_id,
@@ -270,7 +308,7 @@ class CRUDLGCategory(CRUDBase):
             entity_type="LGCategory",
             entity_id=deleted_category.id,
             details={
-                "category_name": deleted_category.category_name,
+                "name": deleted_category.name,
                 "code": deleted_category.code,
                 "customer_id": deleted_category.customer_id,
             },
@@ -279,18 +317,7 @@ class CRUDLGCategory(CRUDBase):
         return deleted_category
 
     def restore(self, db: Session, db_obj: LGCategory, user_id: int) -> LGCategory:
-        if db_obj.customer_id is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Universal categories cannot be restored by Corporate Admin.")
-
         restored_category = super().restore(db, db_obj)
-
-        # Restore associated entity access entries
-        db.query(LGCategoryCustomerEntityAssociation).filter(
-            LGCategoryCustomerEntityAssociation.lg_category_id == restored_category.id
-        ).update(
-            {"is_deleted": False, "deleted_at": None}, synchronize_session=False
-        )
-        db.flush()
 
         log_action(
             db,
@@ -299,7 +326,7 @@ class CRUDLGCategory(CRUDBase):
             entity_type="LGCategory",
             entity_id=restored_category.id,
             details={
-                "category_name": restored_category.category_name,
+                "name": restored_category.name,
                 "code": restored_category.code,
                 "customer_id": restored_category.customer_id,
             },
