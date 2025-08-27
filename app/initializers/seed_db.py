@@ -1568,19 +1568,25 @@ async def seed_db():
         # Seed LG Categories after customer entities 
         print("\n--- Seeding LG Categories for Customers ---")
         lg_categories_to_seed = [
-            # Acme Corp Categories
             {"customer_id": acme_corp_id, "name": "IT Projects", "code": "IT", "extra_field_name": "Project ID", "is_mandatory": True, "communication_list": []},
             {"customer_id": acme_corp_id, "name": "HR Department", "code": "HR", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
-            # Globex Industries Categories
             {"customer_id": globex_id, "name": "Manufacturing", "code": "MA", "extra_field_name": "Batch No.", "is_mandatory": False, "communication_list": []},
-            # Cyberdyne Systems Categories
             {"customer_id": cyberdyne_id, "name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []},
         ]
 
         for raw_data in lg_categories_to_seed:
             try:
                 customer_id = raw_data["customer_id"]
-                category_data = {k: v for k, v in raw_data.items() if k != "customer_id"}
+                # Explicitly copy only the fields LGCategoryCreate needs
+                category_data = {
+                    "name": raw_data["name"],
+                    "code": raw_data["code"],
+                    "extra_field_name": raw_data["extra_field_name"],
+                    "is_mandatory": raw_data["is_mandatory"],
+                    "communication_list": raw_data["communication_list"],
+                }
+
+                print(f"DEBUG: Creating LGCategory with {category_data} (customer_id={customer_id})")
 
                 if not crud_lg_category.get_by_name(db, customer_id=customer_id, name=category_data["name"]):
                     crud_lg_category.create(
