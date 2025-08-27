@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 # Base class for our SQLAlchemy models - ONLY DEFINE THIS ONCE!
 Base = declarative_base()
 import app.models # Do not remove this line! It makes the models discoverable.
+from app import models # Do not remove this line! It makes the models discoverable.
 
 # Load environment variables from .env file
 load_dotenv()

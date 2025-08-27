@@ -31,7 +31,7 @@ try:
     # Now, with project_root added to sys.path, direct imports from 'app' should work.
     from app.database import SessionLocal, Base # Import Base as well, needed for metadata
     import app.models as models # Import models to ensure all models are registered
-    from app.crud.crud import ( # Import all the instantiated CRUD objects
+    from app.crud.crud import (
         crud_subscription_plan,
         crud_customer,
         crud_user,
@@ -45,7 +45,9 @@ try:
         crud_internal_owner_contact,
         crud_lg_record,
         crud_approval_request,
-        crud_lg_instruction, # NEW: Import crud_lg_instruction
+        crud_lg_instruction,
+        crud_lg_instruction,
+        crud_lg_migration,
         log_action,
     )
     from app.schemas.all_schemas import (
@@ -61,7 +63,8 @@ try:
         InternalOwnerContactCreate,
         LGRecordCreate,
         CustomerCreate,
-        LGInstructionCreate # NEW: Import LGInstructionCreate
+        LGInstructionCreate,
+        LGInstructionCreate
     )
     from app.constants import ( # Make sure all constants are imported with app. prefix
         UserRole, GlobalConfigKey, ACTION_TYPE_LG_DECREASE_AMOUNT,
@@ -73,6 +76,14 @@ try:
         ACTION_TYPE_LG_REMINDER_TO_INTERNAL_OWNER,
         InstructionTypeCode, SubInstructionCode # NEW: Import for serial generation
     )
+
+    from app.schemas.migration import (
+        LGMigrationStagingIn,
+        LGMigrationStagingOut,
+        MigrationRecordStatusEnum,
+        MigrationReportSummary,
+    )
+    from app.models.migration import LGMigrationStaging
 
 except Exception as e:
     print(f"FATAL ERROR: Could not import core modules. Ensure project structure and run command are correct. Error: {e}")
@@ -687,8 +698,8 @@ async def seed_db():
         # 7. Seed Issuing Methods
         print("\n--- Seeding Issuing Methods ---")
         issuing_methods_to_seed = [
-            {"name": "SWIFT MT760", "description": "Issued via SWIFT message type MT760."},
             {"name": "Manual Delivery", "description": "Physical delivery of the LG."},
+            {"name": "SWIFT MT760", "description": "Issued via SWIFT message type MT760."},
             {"name": "Bank Portal", "description": "Issued through bank's online portal."},
         ]
         for method_data in issuing_methods_to_seed:

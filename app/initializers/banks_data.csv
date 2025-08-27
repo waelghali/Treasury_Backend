@@ -1,41 +1,37 @@
-,,,,,,,,
-,,,,,,,,
-,,,,,,,,
-,,,,,,,,
-,Bank Name,Code,Head Office Address,Historical Name Changes,SWIFT Code,Phone,Fax,Current Owner
-,National Bank of Egypt (NBE),NBE,"1187, Cornich El Nile St., Cairo.",,NBEGEGCX,19623,00202 2574 9624,Egyptian Government
-,Banque Misr,BM,"151, Mohamed Farid St., Cairo.",,BMISEGCX,19838,00202 2393 0200,Egyptian Government
-,Commercial International Bank (CIB),CIB,"21/23 Charles Du Gaulle St., (ex Giza St.,), Nile Tower, Giza.",,CIBEEGCX,19666,00202 3336 0610,"Actis, EFG Hermes, Fairfax"
-,QNB Al Ahli,QNB,"Dar Champellion, 5, Champellion St., Downtown, Cairo.",National Société Générale Bank (NSGB),QNBAEGCX,16516,00202 2391 9000,Qatar National Bank (QNB)
-,Arab African International Bank,AAIB,"5, El Saray El Kubra St., Garden City, Cairo.",Bank of Nova Scotia Egypt,ARAIEGCX,19555,00202 2794 6000,"Central Bank of Egypt, Kuwait Investment Auth."
-,Banque Du Caire,BDC,"6, Dr. Moustafa Abu Zahra St., Nasr city, Cairo.",,BDCAEGCX,19777,00202 2403 0303,Egyptian Government (majority)
-,Bank of Alexandria,ALEX,"49, Kasr El Nile St., Cairo.",Intesa Sanpaolo,ALEXEGCX,19033,00202 2392 7000,Intesa Sanpaolo (Italy)
-,Emirates NBD Egypt,ENBD,Plot 85 Block G - City center- Sector A - Road 90 - Fifth District - Cairo.,BNP Paribas Egypt,EBONEECA,00202 2579 0000,00202 2579 0001,Emirates NBD (UAE)
-,Attijariwafa Bank Egypt,ATTIJ,"Star Capital A1 Tower, City Stars, 2 Ali Rashed St., Nasr City, Cairo.",Barclays Bank Egypt,ATTJEGCX,00202 2480 0000,00202 2480 0001,Attijariwafa Bank (Morocco)
-,HSBC Bank Egypt,HSBC,"306, Cornich El Nile St., El Maadi, Cairo.",British Bank of the Middle East (BBME),HSBCEGCX,00202 2528 0000,00202 2528 0001,HSBC Holdings (UK)
-,Crédit Agricole Egypt,CAE,"Touristic area No. (9/10/11/12/13) Fifth Settlement, Cairo.",Crédit Agricole Indosuez - Calyon Egypt,AGRIEGCX,00202 2565 0000,00202 2565 0001,Crédit Agricole Group (France)
-,Al Ahli Bank of Kuwait - Egypt,ABK,Smart village - Kilo 28 Cairo - Alex. desert road - building 227B & 228B 6th of October.,Piraeus Bank Egypt,ECBAEGCAXXX,19322,00202 3538 1000,Al Ahli Bank of Kuwait
-,First Abu Dhabi Bank - Misr,FAB,"84, 90th Street, Fifth Settlement, 11835, P.O. Box 278",National Bank of Abu Dhabi (NBAD) Egypt - Cairo Far East Bank - Bank Audi Egypt - National Bank of Greece - Egypt,FABCEGCX,00202 2578 0000,00202 2578 0001,First Abu Dhabi Bank (UAE)
-,Abu Dhabi Islamic Bank - Egypt,ADIB,"9 Rostom St., Garden City, Cairo.",,ABDIEGCAXXX,19951,00202 2792 2000,Abu Dhabi Islamic Bank (UAE)
-,Arab Bank Egypt,ARAB,Plot 43 sector 1-5th Settlement - New Cairo - Cairo.,,ARABEGCX,19100,00202 2614 0000,Arab Bank PLC (Jordan)
-,Mashreq Bank Egypt,MSHQ,"Block No. 77, 90 St., The Fifth Compound, New Cairo.",,MSHQEGCA,00202 2539 0000,00202 2539 0001,Mashreq Bank (UAE)
-,National Bank of Kuwait - Egypt,NBK,"Plot No. 155, City Center, First Sector, 5th Settlement, New Cairo, Cairo.",,NBKEEGCX,00202 2576 0000,00202 2576 0001,National Bank of Kuwait
-,Suez Canal Bank,SCB,"7, 9 Abdel Kader Hamza St., Garden City, Cairo.",,SUEZEGCX,00202 2794 0000,00202 2794 0040,Egyptian Government (majority)
-,Faisal Islamic Bank,FAIS,"3-26 July St., Cairo.",,FAISEGCX,00202 2391 0000,00202 2391 0010,Faisal Islamic Holding (Saudi Arabia)
-,Housing & Development Bank,HDB,"26 El Krom St., Mohandessin, Dokki Police Station, Giza.",,HDBKEGCX,00202 3303 6000,00202 3303 6050,Egyptian Government
-,Al Baraka Bank Egypt,BBE,"29, 90th St. (south), city center Fifth Settlement New Cairo",Egyptian Saudi Finance Bank (ESFB),ABRKEGCAXXX,19373,00202 2120 5858,Al Baraka Banking Group (Bahrain)
-,Société Arabe Int. de Banque (SAIB),SAIB,"56, Gameat El Dewal Al Arabia St., Mohandessin, Giza.",,SAIBEGCX,00202 3303 5000,00202 3303 5050,Mixed (public/private)
-,Export Development Bank of Egypt,EDB,"78, 90th St. (South), 5th District, New Cairo.",,EDBEEGCX,00202 2565 0000,00202 2565 0001,Egyptian Government
-,Egyptian Arab Land Bank,EALB,"78 Gameat El Dewal El Arabia St., Mohandessin, Giza.",,EALBEGCX,00202 3302 8000,00202 3302 8001,Egyptian Government
-,Agricultural Bank of Egypt,AGRI,"1, El Seid Club St., Dokki, Giza.",,BDACEGCA,00202 3335 9000,00202 3336 0204,Egyptian Government
-,Industrial Development Bank,IDB,"2 Abdel Kader Hamza street, Cairo Centre Building, Garden City, Cairo",,IDBBEGCX,00202 2795 0000,00202 2795 0050,Egyptian Government
-,The United Bank,THEUB,"106, El Kasr El Einy St., (Cairo Center Tower), Cairo.",,UNTIEGCX,00202 2393 0000,00202 2393 0049,Egyptian Government
-,MIDBank,MIDB,"21/23 Charles De Gaulle St., (ex Giza st.,), Nile Tower, Giza.",,MIDBEGCX,00202 3336 0000,00202 3336 0040,Banque Du Caire
-,Abu Dhabi Commercial Bank - Egypt,ADCB,"16 Gammat El Dowel el Arabia Street, Giza.",Alexandria Commercial & Maritime Bank (ACMB),ADCBEGCX,16862,00202 3828 0701,Abu Dhabi Commercial Bank (UAE)
-,Egyptian Gulf Bank,EGB,"Block 45, North Teseen Road, 5th settlement, New Cairo.",,EGUBEGCX,00202 2568 0000,00202 2568 0001,Private investors
-,Arab International Bank,ARIB,"77 B Nasr Road , Nasr City, Cairo, Arab Republic of Egypt.",,ARIBEGCX,00202 2393 2000,00202 2393 2050,Libyan & Egyptian governments
-,CitiBank Egypt,CITI,"46, Al Salam Axis Street, First Sector at the Fifth Settlement, New Cairo.",,CITIEGCX,00202 2461 0000,00202 2461 0001,Citigroup (USA)
-,Standard Chartered Egypt,SCEG,Administrative office building at Cairo Festival City No. 12b03/A- New Cairo,,SCBLEGCX,00202 2461 0000,00202 2461 0001,Standard Chartered (UK)
-,Kuwait Finance House - Egypt,KFH,"81, Ninety St., City Center, The Fifth Compound, New Cairo.",Ahli United Bank,KFHHEGCX,00202 2614 9500,00202 2614 9600,Kuwait Finance House
-,Bank NXT,NXT,"8, Abdel Khalek Sarwat St., (Cairo-Sky Building), Cairo.",Arab Investment Bank,ARIBEGCX,16697,00202 2586 1100,Private investors
-,Arab Banking Corporation - Egypt S.A.E (ABC Egypt),ABC,"90th St. (North), Fifth settlement, New Cairo",Egypt Arab African Bank - BLOM Bank Egypt,EAABEGCX,00202 2586 1199,00202 2811 1555,"Arab Banking Corporation (ABC) Group, Bahrain"
+Bank Name,Code,Head Office Address,Historical Name Changes,SWIFT Code,Phone,Fax,Current Owner
+National Bank of Egypt (NBE),NBE,"1187, Cornich El Nile St., Cairo.",,NBEGEGCX,19623,00202 2574 9624,Egyptian Government
+Banque Misr,BM,"151, Mohamed Farid St., Cairo.",,BMISEGCX,19838,00202 2393 0200,Egyptian Government
+Commercial International Bank (CIB),CIB,"21/23 Charles Du Gaulle St., (ex Giza St.,), Nile Tower, Giza.",,CIBEEGCX,19666,00202 3336 0610,"Actis, EFG Hermes, Fairfax"
+QNB Al Ahli,QNB,"Dar Champellion, 5, Champellion St., Downtown, Cairo.",National Société Générale Bank (NSGB),QNBAEGCX,16516,00202 2391 9000,Qatar National Bank (QNB)
+Arab African International Bank,AAIB,"5, El Saray El Kubra St., Garden City, Cairo.",Bank of Nova Scotia Egypt,ARAIEGCX,19555,00202 2794 6000,"Central Bank of Egypt, Kuwait Investment Auth."
+Banque Du Caire,BDC,"6, Dr. Moustafa Abu Zahra St., Nasr city, Cairo.",,BDCAEGCX,19777,00202 2403 0303,Egyptian Government (majority)
+Bank of Alexandria,ALEX,"49, Kasr El Nile St., Cairo.",Intesa Sanpaolo,ALEXEGCX,19033,00202 2392 7000,Intesa Sanpaolo (Italy)
+Emirates NBD Egypt,ENBD,Plot 85 Block G - City center- Sector A - Road 90 - Fifth District - Cairo.,BNP Paribas Egypt,EBONEECA,00202 2579 0000,00202 2579 0001,Emirates NBD (UAE)
+Attijariwafa Bank Egypt,ATTIJ,"Star Capital A1 Tower, City Stars, 2 Ali Rashed St., Nasr City, Cairo.",Barclays Bank Egypt,ATTJEGCX,00202 2480 0000,00202 2480 0001,Attijariwafa Bank (Morocco)
+HSBC Bank Egypt,HSBC,"306, Cornich El Nile St., El Maadi, Cairo.",British Bank of the Middle East (BBME),HSBCEGCX,00202 2528 0000,00202 2528 0001,HSBC Holdings (UK)
+Crédit Agricole Egypt,CAE,"Touristic area No. (9/10/11/12/13) Fifth Settlement, Cairo.",Crédit Agricole Indosuez - Calyon Egypt,AGRIEGCX,00202 2565 0000,00202 2565 0001,Crédit Agricole Group (France)
+Al Ahli Bank of Kuwait - Egypt,ABK,Smart village - Kilo 28 Cairo - Alex. desert road - building 227B & 228B 6th of October.,Piraeus Bank Egypt,ECBAEGCAXXX,19322,00202 3538 1000,Al Ahli Bank of Kuwait
+First Abu Dhabi Bank - Misr,FAB,"84, 90th Street, Fifth Settlement, 11835, P.O. Box 278",National Bank of Abu Dhabi (NBAD) Egypt - Cairo Far East Bank - Bank Audi Egypt - National Bank of Greece - Egypt,FABCEGCX,00202 2578 0000,00202 2578 0001,First Abu Dhabi Bank (UAE)
+Abu Dhabi Islamic Bank - Egypt,ADIB,"9 Rostom St., Garden City, Cairo.",,ABDIEGCAXXX,19951,00202 2792 2000,Abu Dhabi Islamic Bank (UAE)
+Arab Bank Egypt,ARAB,Plot 43 sector 1-5th Settlement - New Cairo - Cairo.,,ARABEGCX,19100,00202 2614 0000,Arab Bank PLC (Jordan)
+Mashreq Bank Egypt,MSHQ,"Block No. 77, 90 St., The Fifth Compound, New Cairo.",,MSHQEGCA,00202 2539 0000,00202 2539 0001,Mashreq Bank (UAE)
+National Bank of Kuwait - Egypt,NBK,"Plot No. 155, City Center, First Sector, 5th Settlement, New Cairo, Cairo.",,NBKEEGCX,00202 2576 0000,00202 2576 0001,National Bank of Kuwait
+Suez Canal Bank,SCB,"7, 9 Abdel Kader Hamza St., Garden City, Cairo.",,SUEZEGCX,00202 2794 0000,00202 2794 0040,Egyptian Government (majority)
+Faisal Islamic Bank,FAIS,"3-26 July St., Cairo.",,FAISEGCX,00202 2391 0000,00202 2391 0010,Faisal Islamic Holding (Saudi Arabia)
+Housing & Development Bank,HDB,"26 El Krom St., Mohandessin, Dokki Police Station, Giza.",,HDBKEGCX,00202 3303 6000,00202 3303 6050,Egyptian Government
+Al Baraka Bank Egypt,BBE,"29, 90th St. (south), city center Fifth Settlement New Cairo",Egyptian Saudi Finance Bank (ESFB),ABRKEGCAXXX,19373,00202 2120 5858,Al Baraka Banking Group (Bahrain)
+Société Arabe Int. de Banque (SAIB),SAIB,"56, Gameat El Dewal Al Arabia St., Mohandessin, Giza.",,SAIBEGCX,00202 3303 5000,00202 3303 5050,Mixed (public/private)
+Export Development Bank of Egypt,EDB,"78, 90th St. (South), 5th District, New Cairo.",,EDBEEGCX,00202 2565 0000,00202 2565 0001,Egyptian Government
+Egyptian Arab Land Bank,EALB,"78 Gameat El Dewal El Arabia St., Mohandessin, Giza.",,EALBEGCX,00202 3302 8000,00202 3302 8001,Egyptian Government
+Agricultural Bank of Egypt,AGRI,"1, El Seid Club St., Dokki, Giza.",,BDACEGCA,00202 3335 9000,00202 3336 0204,Egyptian Government
+Industrial Development Bank,IDB,"2 Abdel Kader Hamza street, Cairo Centre Building, Garden City, Cairo",,IDBBEGCX,00202 2795 0000,00202 2795 0050,Egyptian Government
+The United Bank,THEUB,"106, El Kasr El Einy St., (Cairo Center Tower), Cairo.",,UNTIEGCX,00202 2393 0000,00202 2393 0049,Egyptian Government
+MIDBank,MIDB,"21/23 Charles De Gaulle St., (ex Giza st.,), Nile Tower, Giza.",,MIDBEGCX,00202 3336 0000,00202 3336 0040,Banque Du Caire
+Abu Dhabi Commercial Bank - Egypt,ADCB,"16 Gammat El Dowel el Arabia Street, Giza.",Alexandria Commercial & Maritime Bank (ACMB),ADCBEGCX,16862,00202 3828 0701,Abu Dhabi Commercial Bank (UAE)
+Egyptian Gulf Bank,EGB,"Block 45, North Teseen Road, 5th settlement, New Cairo.",,EGUBEGCX,00202 2568 0000,00202 2568 0001,Private investors
+Arab International Bank,ARIB,"77 B Nasr Road , Nasr City, Cairo, Arab Republic of Egypt.",,ARIBEGCX,00202 2393 2000,00202 2393 2050,Libyan & Egyptian governments
+CitiBank Egypt,CITI,"46, Al Salam Axis Street, First Sector at the Fifth Settlement, New Cairo.",,CITIEGCX,00202 2461 0000,00202 2461 0001,Citigroup (USA)
+Standard Chartered Egypt,SCEG,Administrative office building at Cairo Festival City No. 12b03/A- New Cairo,,SCBLEGCX,00202 2461 0000,00202 2461 0001,Standard Chartered (UK)
+Kuwait Finance House - Egypt,KFH,"81, Ninety St., City Center, The Fifth Compound, New Cairo.",Ahli United Bank,KFHHEGCX,00202 2614 9500,00202 2614 9600,Kuwait Finance House
+Bank NXT,NXT,"8, Abdel Khalek Sarwat St., (Cairo-Sky Building), Cairo.",Arab Investment Bank,AINBEGCA,16697,00202 2586 1100,Private investors
+Arab Banking Corporation - Egypt S.A.E (ABC Egypt),ABC,"90th St. (North), Fifth settlement, New Cairo",Egypt Arab African Bank - BLOM Bank Egypt,EAABEGCX,00202 2586 1199,00202 2811 1555,"Arab Banking Corporation (ABC) Group, Bahrain"

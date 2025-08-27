@@ -68,7 +68,7 @@ from app.crud.crud import (
     crud_issuing_method,
     crud_lg_status,
     crud_lg_operational_status,
-    crud_universal_category,
+    # MODIFIED: Removed crud_universal_category
     crud_user,
     crud_customer_entity, # Added missing import for crud_customer_entity
     # NEW: Import crud_system_notification
@@ -2399,7 +2399,7 @@ async def get_lg_operational_statuses_for_end_user(
     lg_operational_statuses = crud_lg_operational_status.get_all(db, skip=skip, limit=limit)
     return lg_operational_statuses
 
-@router.get("/lg-categories/", response_model=List[LGCategoryOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
+@router.get("/lg-categories/", response_model=List[LGCategoryOut], dependencies=[Depends(check_subscription_status)])
 async def get_lg_categories_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
@@ -2409,72 +2409,59 @@ async def get_lg_categories_for_end_user(
 ):
     """
     Retrieves a list of all active LG categories relevant to the authenticated End User's customer,
-    including Universal Categories (System Owner managed) as default options.
+    including Universal Categories (managed by the system) as default options.
     """
+    # CRITICAL CHANGE: Use the new unified CRUD method that handles both customer and universal categories
+    all_categories_from_db = crud_lg_category.get_all_for_customer(db, end_user_context.customer_id, skip=skip, limit=limit)
+    
     all_categories = []
-    universal_categories_db = crud_universal_category.get_all(db)
-    for uc in universal_categories_db:
-        all_categories.append(
-            LGCategoryOut(
-                id=uc.id,
-                category_name=uc.category_name,
-                code=uc.code,
-                extra_field_name=uc.extra_field_name,
-                is_mandatory=uc.is_mandatory if uc.is_mandatory is not None else False,
-                communication_list=uc.communication_list,
-                customer_id=None,
-                customer_name="System Default",
-                is_deleted=False,
-                created_at=uc.created_at,
-                updated_at=uc.updated_at,
-                type="universal",
-                has_all_entity_access=True,
-                entities_with_access=[]
-            )
-        )
-
-    customer_lg_categories = crud_lg_category.get_all_for_customer(
-        db,
-        customer_id=end_user_context.customer_id,
-        skip=skip,
-        limit=limit
-    )
-
     customer = crud_customer.get(db, end_user_context.customer_id)
-    customer_name = customer.name if customer else None
+    customer_name = customer.name if customer else "Unknown Customer"
 
-    for cat in customer_lg_categories:
-        entities_out = [
-            CustomerEntityOut(
-                id=assoc.customer_entity.id,
-                entity_name=assoc.customer_entity.entity_name,
-                code=assoc.customer_entity.code,
-                contact_person=assoc.customer_entity.contact_person,
-                contact_email=assoc.customer_entity.contact_email,
-                is_active=assoc.customer_entity.is_active,
-                customer_id=assoc.customer_entity.customer_id
-            ) for assoc in cat.entity_associations if not assoc.customer_entity.is_deleted
-        ]
-        all_categories.append(
-            LGCategoryOut(
-                id=cat.id,
-                category_name=cat.category_name,
-                code=cat.code,
-                extra_field_name=cat.extra_field_name,
-                is_mandatory=cat.is_mandatory,
-                communication_list=cat.communication_list,
-                customer_id=cat.customer_id,
-                customer_name=customer_name,
-                is_deleted=cat.is_deleted,
-                created_at=cat.created_at,
-                updated_at=cat.updated_at,
-                type="customer",
-                has_all_entity_access=cat.has_all_entity_access,
-                entities_with_access=entities_out
+    for cat in all_categories_from_db:
+        # Check if the user has access to this category's entities
+        has_access = False
+        if cat.customer_id is None or cat.has_all_entity_access:
+            has_access = True
+        else:
+            category_entity_ids = {assoc.customer_entity_id for assoc in cat.entity_associations}
+            if end_user_context.has_all_entity_access or not end_user_context.entity_ids:
+                has_access = True
+            elif category_entity_ids.intersection(set(end_user_context.entity_ids)):
+                has_access = True
+
+        if not has_access:
+            continue
+
+        entities_with_access_for_cat = []
+        if cat.customer_id is not None and not cat.has_all_entity_access:
+            entity_ids_with_access = set(end_user_context.entity_ids).intersection(
+                {assoc.customer_entity.id for assoc in cat.entity_associations if assoc.customer_entity}
             )
-        )
+            entities_with_access_for_cat = [
+                CustomerEntityOut.model_validate(db.query(models.CustomerEntity).get(entity_id))
+                for entity_id in entity_ids_with_access
+                if db.query(models.CustomerEntity).get(entity_id) is not None and not db.query(models.CustomerEntity).get(entity_id).is_deleted
+            ]
+        elif cat.customer_id is not None and cat.has_all_entity_access:
+             entities_with_access_for_cat = [
+                CustomerEntityOut.model_validate(entity)
+                for entity in db.query(models.CustomerEntity).filter(models.CustomerEntity.customer_id == end_user_context.customer_id, models.CustomerEntity.is_deleted == False).all()
+            ]
 
-    all_categories.sort(key=lambda x: (0 if x.type == 'universal' else 1, x.category_name.lower()))
+        # CRITICAL FIX: Pass the ORM object directly to Pydantic's model_validate.
+        # We pass extra arguments as a dictionary to handle the computed fields.
+        category_out = LGCategoryOut.model_validate(
+            cat,
+            context={
+                'name': cat.name,
+                'customer_name': customer_name if cat.customer_id is not None else "System Default",
+                'entities_with_access': entities_with_access_for_cat
+            }
+        )
+        all_categories.append(category_out)
+
+    all_categories.sort(key=lambda x: (0 if x.customer_id is None else 1, x.name.lower()))
     return all_categories
 
 @router.post(

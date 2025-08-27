@@ -82,7 +82,6 @@ class CustomerEntityUpdate(CustomerEntityBase):
     contact_person: Optional[str] = Field(None, max_length=100)
     contact_email: Optional[EmailStr] = None
     is_active: Optional[bool] = None
-
 class CustomerEntityOut(CustomerEntityBase, BaseSchema):
     customer_id: int
 
@@ -524,38 +523,16 @@ class LgOperationalStatusUpdate(LgOperationalStatusBase):
 class LgOperationalStatusOut(LgOperationalStatusBase, BaseSchema):
     pass
 
-class UniversalCategoryBase(BaseModel):
-    category_name: str = Field(..., min_length=1, max_length=100, description="Name of the universal category")
-    code: Optional[str] = Field(None, max_length=2, description="Unique 1-2 character code for the universal category")
-    extra_field_name: Optional[str] = Field(None, max_length=100, description="Name for an optional extra field (e.g., 'Project Code')")
-    is_mandatory: Optional[bool] = Field(None, description="Whether the extra field is mandatory for LGs in this category")
-    communication_list: Optional[List[str]] = Field(None, description="List of email addresses for communication (JSON array of strings)")
-
-class UniversalCategoryCreate(UniversalCategoryBase):
-    pass
-
-class UniversalCategoryUpdate(UniversalCategoryBase):
-    category_name: Optional[str] = Field(None, min_length=1, max_length=100)
-    code: Optional[str] = Field(None, max_length=2)
-    extra_field_name: Optional[str] = None
-    is_mandatory: Optional[bool] = None
-    communication_list: Optional[List[str]] = None
-
-class UniversalCategoryOut(UniversalCategoryBase):
-    id: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-    
-    class Config:
-        from_attributes = True
-
 class LGCategoryBase(BaseModel):
-    category_name: str = Field(..., min_length=1, max_length=100, description="Name of the LG category specific to a customer")
-    code: str = Field(..., min_length=1, max_length=2, description="Unique 1-2 character code for the category, used in LG serialization")
+    name: str = Field(..., min_length=1, max_length=100, description="Name of the LG category")
+    code: Optional[str] = Field(None, max_length=2, description="Unique 1-2 character code for the category")
     extra_field_name: Optional[str] = Field(None, max_length=100, description="Name for an optional extra field for LGs in this category")
     is_mandatory: bool = Field(False, description="Whether the extra field is mandatory for LGs in this category")
-    communication_list: Optional[List[EmailStr]] = Field(None, description="List of email addresses for communication specific to this category")
+    communication_list: Optional[List[EmailStr]] = Field(None, description="List of email addresses for communication (JSON array of strings)")
     
+    customer_id: Optional[int] = Field(None, description="The ID of the customer for customer-specific categories. Null for universal categories.")
+    is_default: bool = Field(False, description="Whether this is a default category for its scope (global or customer-specific).")
+
     has_all_entity_access: bool = Field(True, description="True if category applies to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this category applies to (if has_all_entity_access is False)")
 
@@ -569,21 +546,33 @@ class LGCategoryBase(BaseModel):
 
     @model_validator(mode='after')
     def validate_entity_access(self):
-        if self.has_all_entity_access and self.entity_ids:
-            raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
-        if not self.has_all_entity_access and not self.entity_ids:
-            raise ValueError("Must provide specific entity_ids when has_all_entity_access is False.")
+        # Universal categories must have all entity access, and cannot have entity IDs.
+        if self.customer_id is None:
+            if not self.has_all_entity_access:
+                raise ValueError("Universal categories must have 'has_all_entity_access' set to True.")
+            if self.entity_ids:
+                raise ValueError("Universal categories cannot have 'entity_ids'.")
+
+        # All other validation logic remains the same for customer-specific categories.
+        if self.has_all_entity_access is not None:
+            if self.has_all_entity_access and self.entity_ids:
+                raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
+            if not self.has_all_entity_access and not self.entity_ids:
+                raise ValueError("Must provide specific entity_ids when has_all_entity_access is False.")
         return self
 
 class LGCategoryCreate(LGCategoryBase):
     pass
 
 class LGCategoryUpdate(BaseModel):
-    category_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
     code: Optional[str] = Field(None, min_length=1, max_length=2)
     extra_field_name: Optional[str] = None
     is_mandatory: Optional[bool] = None
     communication_list: Optional[List[EmailStr]] = None
+    
+    # FIX: Add the missing 'is_default' field to the schema
+    is_default: Optional[bool] = None
     
     has_all_entity_access: Optional[bool] = Field(None, description="True if category applies to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this category applies to (if has_all_entity_access is False)")
@@ -607,17 +596,25 @@ class LGCategoryUpdate(BaseModel):
 
 class LGCategoryOut(BaseModel):
     id: int
-    category_name: str
+    name: str
     code: Optional[str] = None
     extra_field_name: Optional[str] = None
     is_mandatory: bool = False
     communication_list: Optional[List[EmailStr]] = None
+    
     customer_id: Optional[int] = None
     customer_name: Optional[str] = None
+    is_default: bool = False
+
     is_deleted: bool = False
     created_at: datetime
     updated_at: Optional[datetime] = None
-    type: Optional[str] = None
+    
+    # Helper field to maintain compatibility with existing API logic
+    @computed_field
+    @property
+    def type(self) -> str:
+        return "universal" if self.customer_id is None else "customer"
     
     has_all_entity_access: bool
     entities_with_access: List[CustomerEntityOut] = []
@@ -813,7 +810,7 @@ class LGRecordBase(BaseModel):
     issuing_method_id: int = Field(..., description="ID of the method by which LG was issued")
     applicable_rule_id: int = Field(..., description="ID of the set of rules governing the LG")
     applicable_rules_text: Optional[str] = Field(None, max_length=64, description="Free text for rules (conditional)")
-    other_conditions: Optional[str] = Field(None, max_length=4096, description="Any other specific conditions not covered elsewhere")
+    other_conditions: Optional[str] = Field(None, max_length=8000, description="Any other specific conditions not covered elsewhere")
     internal_owner_contact_id: int = Field(..., description="ID of the internal owner contact person")
 
     lg_category_id: int = Field(..., description="ID of the LG Category for internal classification")
@@ -838,12 +835,12 @@ class LGRecordCreate(LGRecordBase):
     internal_owner_phone: str = Field(..., description="Phone number of the internal owner")
     internal_owner_id: Optional[str] = Field(None, max_length=10, description="Optional internal ID for the owner")
     manager_email: EmailStr = Field(..., description="Manager's email of the internal owner")
-
     internal_owner_contact_id: Any = Field(None, exclude=True)
     lg_sequence_number: Any = Field(None, exclude=True) # Exclude lg_sequence_number from create input as it's auto-generated
 
     ai_scan_file: Optional[LGDocumentCreate] = Field(None, description="Metadata for the AI Scan File (optional)")
     internal_supporting_document_file: Optional[LGDocumentCreate] = Field(None, description="Metadata for the Internal Supporting Document (optional)")
+
 
 class LGRecordUpdate(BaseModel):
     expiry_date: Optional[date] = Field(None, description="New expiry date for the LG")
@@ -1222,17 +1219,33 @@ class AvgDaysToActionEventReportOut(BaseModel):
     customer_avg: Optional[int]
     overall_avg: Optional[int]
 
+class LgTypeMixDataItemOut(BaseModel):
+    name: str
+    value: int
+
+class LgTypeMixReportDataOut(BaseModel):
+    customer_lg_type_mix: List[LgTypeMixDataItemOut]
+    global_lg_type_mix: List[LgTypeMixDataItemOut]
+
 class LgTypeMixReportOut(BaseModel):
     report_date: date
-    data: List[ReportDataOut]
+    data: LgTypeMixReportDataOut
 
 class AvgBankProcessingTimeReportOut(BaseModel):
     report_date: date
     data: List[ReportDataOut]
 
+class BankMarketShareItemOut(BaseModel):
+    name: str
+    value: int
+
+class BankMarketShareDataOut(BaseModel):
+    customer_market_share: List[BankMarketShareItemOut]
+    global_market_share: List[BankMarketShareItemOut]
+
 class BankMarketShareReportOut(BaseModel):
     report_date: date
-    data: List[ReportDataOut]
+    data: BankMarketShareDataOut
 
 class SystemUsageOverviewReportItemOut(BaseModel):
     total_customers: int

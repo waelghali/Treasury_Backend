@@ -315,7 +315,10 @@ class CRUDCustomerEntity(CRUDBase):
             code=obj_in.code.upper() if obj_in.code else None, # Store code in uppercase if provided
             contact_person=obj_in.contact_person,
             contact_email=obj_in.contact_email,
-            is_active=obj_in.is_active
+            is_active=obj_in.is_active,
+            address=obj_in.address,
+            commercial_register_number=obj_in.commercial_register_number,
+            tax_id=obj_in.tax_id
         )
         db.add(db_obj)
         db.flush() # Flush to assign ID to db_obj

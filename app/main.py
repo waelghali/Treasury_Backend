@@ -23,8 +23,7 @@ import pytz
 from app.database import get_db, Base, engine
 
 # Configure logging
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app GLOBALLY AT THE VERY BEGINNING
@@ -76,7 +75,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         sys.exit(1)
 
     # Now import API routers using absolute paths from 'app' package
-    from app.api.v1.endpoints import system_owner, corporate_admin, end_user
+    from app.api.v1.endpoints import system_owner, corporate_admin, end_user, migration
     from app.auth_v2.routers import router as auth_v2_router
     from app.api.v1.endpoints import reports
     # NEW: Import the subscription tasks module
@@ -88,6 +87,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         logger.info(f"DIAG: Engine DSN: {engine.url.render_as_string(hide_password=True)}")
 
         import app.models
+        # import app.models.migration # NEW: Import migration models
 
         if Base.metadata.tables:
             logger.info(f"DIAG: Number of models registered with Base.metadata: {len(Base.metadata.tables)}")
@@ -120,6 +120,8 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(system_owner.router, prefix="/api/v1/system-owner")
     fastapi_app.include_router(corporate_admin.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(end_user.router, prefix="/api/v1/end-user")
+    # FIX: Correct the prefix for the migration router to avoid a double prefix in the URL.
+    fastapi_app.include_router(migration.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(auth_v2_router, prefix="/api/v1")
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
@@ -195,7 +197,6 @@ def configure_app_instance(fastapi_app: FastAPI):
         )
         logger.info("Scheduled 'Daily Subscription Status Update' to run every day at 2:15 AM EEST.")
 
-        # NEW: Schedule the LG status update task
         scheduler.add_job(
             func=job_wrapper,
             trigger=CronTrigger(hour=2, minute=20, timezone=EGYPT_TIMEZONE),

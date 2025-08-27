@@ -263,76 +263,75 @@ class CRUDReports(CRUDBase):
         Retrieves data for the dashboard charts based on report type and user context.
         """
         query = None
+        customer_id = user_context.get('customer_id')
+
+        # LG Type Mix
         if report_type == "lg_type_mix":
-            query = db.query(
+            base_lg_query = db.query(models.LGRecord).filter(models.LGRecord.is_deleted == False)
+            if customer_id:
+                base_lg_query = base_lg_query.filter(models.LGRecord.customer_id == customer_id)
+            query = base_lg_query.with_entities(
                 models.LgType.name,
                 func.count(models.LGRecord.id)
-            ).join(models.LGRecord).filter(
-                models.LGRecord.customer_id == user_context['customer_id'],
-                models.LGRecord.is_deleted == False
-            ).group_by(models.LgType.name)
+            ).join(models.LgType).group_by(models.LgType.name)
+
+        # Bank Processing Times
         elif report_type == "bank_processing_times":
-            query = db.query(
-                models.Bank.short_name,
-                func.avg(
-                    (models.LGInstruction.bank_reply_date - models.LGInstruction.delivery_date)
-                ).label('avg_timedelta')
-            ).join(
-                models.LGRecord, models.LGInstruction.lg_record_id == models.LGRecord.id
-            ).join(
-                models.Bank, models.LGRecord.issuing_bank_id == models.Bank.id
-            ).filter(
+            instruction_query = db.query(models.LGInstruction).filter(
+                models.LGInstruction.is_deleted == False,
                 models.LGInstruction.delivery_date.isnot(None),
                 models.LGInstruction.bank_reply_date.isnot(None),
-                models.LGInstruction.is_deleted == False,
-                models.LGRecord.is_deleted == False
-            ).group_by(models.Bank.short_name)
+            ).join(models.LGRecord)
+            
+            if customer_id:
+                instruction_query = instruction_query.filter(models.LGRecord.customer_id == customer_id)
+
+            query = instruction_query.with_entities(
+                models.Bank.short_name,
+                func.avg(models.LGInstruction.bank_reply_date - models.LGInstruction.delivery_date).label('avg_timedelta')
+            ).join(models.Bank, models.LGRecord.issuing_bank_id == models.Bank.id).group_by(models.Bank.short_name)
+
+        # Bank Market Share
         elif report_type == "bank_market_share":
-            # Corrected: Filter by customer_id if present
-            query = db.query(
+            base_lg_query = db.query(models.LGRecord).filter(models.LGRecord.is_deleted == False)
+            if customer_id:
+                base_lg_query = base_lg_query.filter(models.LGRecord.customer_id == customer_id)
+            query = base_lg_query.with_entities(
                 models.Bank.short_name,
                 func.count(models.LGRecord.id)
-            ).join(models.LGRecord)
+            ).join(models.Bank).group_by(models.Bank.short_name)
 
-            if user_context.get('customer_id'):
-                query = query.filter(models.LGRecord.customer_id == user_context['customer_id'])
-
-            query = query.group_by(models.Bank.short_name)
-
+        # Average Delivery Days
         elif report_type == "avg_delivery_days":
-            # Refactored query to be more explicit and correct
-            query = db.query(
-                func.avg(models.LGInstruction.delivery_date - models.LGInstruction.instruction_date)
-            ).join(
-                models.LGRecord, models.LGRecord.id == models.LGInstruction.lg_record_id
-            ).filter(
+            instruction_query = db.query(models.LGInstruction).filter(
+                models.LGInstruction.is_deleted == False,
                 models.LGInstruction.delivery_date.isnot(None),
                 models.LGInstruction.instruction_date.isnot(None),
-                models.LGInstruction.is_deleted == False
-            )
-            # This filter is now correctly applied to the LGRecord model
-            if user_context.get('customer_id'):
-                query = query.filter(models.LGRecord.customer_id == user_context['customer_id'])
+            ).join(models.LGRecord)
+            
+            if customer_id:
+                instruction_query = instruction_query.filter(models.LGRecord.customer_id == customer_id)
 
+            query = instruction_query.with_entities(
+                func.avg(models.LGInstruction.delivery_date - models.LGInstruction.instruction_date)
+            )
+
+        # Average Days to Action
         elif report_type == "avg_days_to_action":
-            # Refactored query to be more explicit and correct
             action_types = [
                 ACTION_TYPE_LG_EXTEND, ACTION_TYPE_LG_RELEASE, ACTION_TYPE_LG_LIQUIDATE, ACTION_TYPE_LG_DECREASE_AMOUNT
             ]
-            query = db.query(
-                func.avg(models.LGRecord.expiry_date - models.LGInstruction.instruction_date)
-            ).join(
-                models.LGInstruction, models.LGRecord.id == models.LGInstruction.lg_record_id
-            ).filter(
-                models.LGInstruction.instruction_type.in_(action_types),
-                models.LGRecord.is_deleted == False,
+            instruction_query = db.query(models.LGInstruction).filter(
                 models.LGInstruction.is_deleted == False,
-                models.LGRecord.expiry_date.isnot(None)
-            )
-            # This filter is now correctly applied to the LGRecord model
-            if user_context.get('customer_id'):
-                query = query.filter(models.LGRecord.customer_id == user_context['customer_id'])
+                models.LGInstruction.instruction_type.in_(action_types)
+            ).join(models.LGRecord)
 
+            if customer_id:
+                instruction_query = instruction_query.filter(models.LGRecord.customer_id == customer_id)
+            
+            query = instruction_query.with_entities(
+                func.avg(models.LGRecord.expiry_date - models.LGInstruction.instruction_date)
+            )
 
         if query:
             results = query.all()

@@ -22,7 +22,8 @@ from app.schemas.all_schemas import (
     IssuingMethodCreate, IssuingMethodUpdate, IssuingMethodOut,
     LgStatusCreate, LgStatusUpdate, LgStatusOut,
     LgOperationalStatusCreate, LgOperationalStatusUpdate, LgOperationalStatusOut,
-    UniversalCategoryCreate, UniversalCategoryUpdate, UniversalCategoryOut,
+    # MODIFIED: Use new unified LGCategory schemas
+    LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
     AuditLogOut,
     SystemNotificationCreate, SystemNotificationUpdate, SystemNotificationOut,
 )
@@ -30,14 +31,18 @@ from app.crud.crud import (
     crud_subscription_plan, crud_customer, crud_customer_entity, crud_user,
     crud_global_configuration, crud_bank, crud_template,
     crud_currency, crud_lg_type, crud_rule, crud_issuing_method,
-    crud_lg_status, crud_lg_operational_status, crud_universal_category,
+    crud_lg_status, crud_lg_operational_status,
+    # MODIFIED: Use new unified crud_lg_category
+    crud_lg_category,
     crud_audit_log, log_action,
     crud_system_notification,
 )
 from app.models import (
     SubscriptionPlan, Customer, CustomerEntity, User,
     GlobalConfiguration, Bank, Template,
-    Currency, LgType, Rule, IssuingMethod, LgStatus, LgOperationalStatus, UniversalCategory,
+    Currency, LgType, Rule, IssuingMethod, LgStatus, LgOperationalStatus,
+    # MODIFIED: Use new unified LGCategory model
+    LGCategory,
     AuditLog,
     SystemNotification,
 )
@@ -364,6 +369,7 @@ def restore_subscription_plan(
     
     return restored_plan
 
+
 @router.post("/customers/onboard", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
 def onboard_customer(
     customer_in: CustomerCreate,
@@ -371,6 +377,12 @@ def onboard_customer(
     current_user: TokenData = Depends(HasPermission("customer:create")),
     request: Request = None
 ):
+    """
+    Onboard a new customer, including their initial entities and a Corporate Admin user.
+    """
+    client_host = request.client.host if request else None
+
+    # This is a good practice for debugging, but doesn't fix the issue
     if customer_in.initial_entities and customer_in.initial_entities[0].contact_email:
         email_val = customer_in.initial_entities[0].contact_email
         logger.info(f"DEBUG: Received contact_email: '{email_val}' (Length: {len(email_val)})")
@@ -378,7 +390,11 @@ def onboard_customer(
         if not isinstance(email_val, str):
             logger.error(f"DEBUG: contact_email is not a string, type: {type(email_val)}")
 
-    client_host = request.client.host if request else None
+    # Call the actual onboarding logic in the CRUD layer
+    db_customer = crud_customer.onboard_customer(db, customer_in, user_id_caller=current_user.user_id)
+    
+    # Return the created customer object. FastAPI will automatically serialize it to JSON
+    return db_customer
 
 @router.get("/customers/", response_model=List[CustomerOut])
 def read_customers(
@@ -807,6 +823,66 @@ def restore_customer_entity(
     
     return restored_entity
 
+# api/v1/endpoints/system_owner.py
+
+# (Other imports and router definitions remain the same)
+
+@router.post("/customers/{customer_id}/entities/", response_model=CustomerEntityOut, status_code=status.HTTP_201_CREATED)
+def create_customer_entity(
+    customer_id: int,
+    entity_in: CustomerEntityCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("customer_entity:create")),
+    request: Request = None
+):
+    client_host = request.client.host if request else None
+
+    # CORRECTED: Use 'customer_id' as the keyword argument.
+    customer_check = crud_customer.get_with_relations(db, customer_id=customer_id)
+    if not customer_check:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found or is deleted.")
+    
+    active_entities_count = db.query(CustomerEntity).filter(
+        CustomerEntity.customer_id == customer_id,
+        CustomerEntity.is_deleted == False,
+        CustomerEntity.is_active == True
+    ).count()
+
+    if not customer_check.subscription_plan.can_multi_entity and active_entities_count >= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Customer's subscription plan '{customer_check.subscription_plan.name}' does not support adding more entities. Max 1 active entity allowed."
+        )
+
+    existing_entity_name = db.query(CustomerEntity).filter(
+        CustomerEntity.customer_id == customer_id,
+        func.lower(CustomerEntity.entity_name) == func.lower(entity_in.entity_name)
+    ).first()
+    if existing_entity_name:
+        if existing_entity_name.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Entity with name '{entity_in.entity_name}' already exists for this customer but is deleted. Please restore it if needed."
+                    )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Entity with name '{entity_in.entity_name}' already exists for this customer."
+            )
+    
+    if entity_in.code:
+        existing_entity_code = crud_customer_entity.get_by_code_for_customer(db, customer_id, entity_in.code)
+        if existing_entity_code and existing_entity_code.is_deleted == False:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Entity with code '{entity_in.code}' already exists for customer '{customer_check.name}'."
+            )
+            
+    db_entity = crud_customer_entity.create(db, obj_in=entity_in, customer_id=customer_id, user_id=current_user.user_id)
+    
+    log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="CustomerEntity", entity_id=db_entity.id, details={"name": db_entity.entity_name, "code": db_entity.code, "customer_id": db_entity.customer_id, "ip_address": client_host})
+    
+    return db_entity
 
 @router.post("/global-configurations/", response_model=GlobalConfigurationOut, status_code=status.HTTP_201_CREATED)
 def create_global_configuration(
@@ -1505,94 +1581,176 @@ def restore_lg_operational_status(
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="LgOperationalStatus", entity_id=db_op_status.id, details={"name": db_op_status.name, "ip_address": client_host})
     return db_op_status
 
-@router.post("/universal-categories/", response_model=UniversalCategoryOut, status_code=status.HTTP_201_CREATED)
+@router.post("/lg-categories/universal", response_model=LGCategoryOut, status_code=status.HTTP_201_CREATED)
 def create_universal_category(
-    category_in: UniversalCategoryCreate, db: Session = Depends(get_db),
+    category_in: LGCategoryCreate, db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("universal_category:create")),
     request: Request = None
 ):
     """Create a new Universal Category entry."""
-    existing_category = crud_universal_category.get_by_category_name(db, category_name=category_in.category_name)
-    if existing_category:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Universal Category with name '{category_in.category_name}' already exists."
-        )
-    db_category = crud_universal_category.create(db, obj_in=category_in)
     client_host = request.client.host if request else None
-    log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="UniversalCategory", entity_id=db_category.id, details={"category_name": db_category.category_name, "ip_address": client_host})
-    return db_category
+    
+    # Enforce universal scope by setting customer_id to None
+    category_in.customer_id = None
+    
+    try:
+        db_category = crud_lg_category.create(db, obj_in=category_in, user_id=current_user.user_id)
+        # Manually create the output model to include customer_name helper field
+        return LGCategoryOut(
+            **db_category.model_dump(),
+            customer_name="System Default",
+            type="universal"
+        )
+    except HTTPException as e:
+        log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"category_name": category_in.name, "reason": str(e.detail), "scope": "universal"}, customer_id=None)
+        raise
+    except Exception as e:
+        log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"category_name": category_in.name, "reason": str(e), "scope": "universal"}, customer_id=None)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
-@router.get("/universal-categories/", response_model=List[UniversalCategoryOut])
+@router.get("/lg-categories/universal", response_model=List[LGCategoryOut])
 def read_universal_categories(
-    skip: int = 0, limit: int = 100, db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100,
+    include_deleted: Optional[bool] = Query(False),
+    db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("universal_category:view"))
 ):
     """Retrieve a list of all active Universal Categories."""
-    categories = crud_universal_category.get_all(db, skip=skip, limit=limit)
-    return categories
+    # Logic to fetch all categories, including deleted ones if the flag is True
+    categories = db.query(LGCategory).filter(LGCategory.customer_id.is_(None))
+    if not include_deleted:
+        categories = categories.filter(LGCategory.is_deleted == False)
 
-@router.get("/universal-categories/{category_id}", response_model=UniversalCategoryOut)
+    categories = categories.order_by(LGCategory.name).offset(skip).limit(limit).all()
+
+    return [
+        LGCategoryOut.model_validate(
+            cat,
+            context={
+                'customer_name': "System Default",
+                'type': "universal"
+            }
+        ) for cat in categories
+    ]
+
+@router.get("/lg-categories/universal/{category_id}", response_model=LGCategoryOut)
 def read_universal_category(
     category_id: int, db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("universal_category:view"))
 ):
     """Retrieve a single Universal Category by its ID."""
-    db_category = crud_universal_category.get(db, id=category_id)
-    if db_category is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found or already deleted")
-    return db_category
+    db_category = crud_lg_category.get(db, id=category_id)
+    if not db_category or db_category.customer_id is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found, already deleted, or is a customer-specific category.")
+    
+    # FIX: Use LGCategoryOut.model_validate to correctly create a Pydantic instance from the ORM object.
+    return LGCategoryOut.model_validate(
+        db_category,
+        context={
+            'customer_name': "System Default",
+            'type': "universal"
+        }
+    )
 
-@router.put("/universal-categories/{category_id}", response_model=UniversalCategoryOut)
+@router.put("/lg-categories/universal/{category_id}", response_model=LGCategoryOut)
 def update_universal_category(
-    category_id: int, category_in: UniversalCategoryUpdate, db: Session = Depends(get_db),
+    category_id: int, category_in: LGCategoryUpdate, db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("universal_category:edit")),
     request: Request = None
 ):
     """Update an existing Universal Category by ID."""
-    db_category = crud_universal_category.get(db, id=category_id)
-    if db_category is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found or already deleted")
-    
-    if category_in.category_name is not None and category_in.category_name != db_category.category_name:
-        existing_category = crud_universal_category.get_by_category_name(db, category_name=category_in.category_name)
-        if existing_category and existing_category.id != category_id:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Universal Category with name '{category_in.category_name}' already exists.")
-            
-    updated_category = crud_universal_category.update(db, db_obj=db_category, obj_in=category_in)
     client_host = request.client.host if request else None
-    log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="UniversalCategory", entity_id=updated_category.id, details={"category_name": updated_category.category_name, "ip_address": client_host, "updated_fields": category_in.model_dump(exclude_unset=True)})
-    return updated_category
+    
+    db_category = crud_lg_category.get(db, id=category_id)
+    if not db_category or db_category.customer_id is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found, already deleted, or is a customer-specific category.")
+    
+    # FIX: Remove the problematic line `category_in.customer_id = None`.
+    # This is not a valid operation on the Pydantic schema.
+    # The CRUD layer is responsible for ensuring the customer_id remains None.
+    
+    try:
+        updated_category = crud_lg_category.update(db, db_category, category_in, user_id=current_user.user_id)
+        return LGCategoryOut.model_validate(
+            updated_category,
+            context={
+                'customer_name': "System Default",
+                'type': "universal"
+            }
+        )
+    except HTTPException as e:
+        # Safely get the category name for logging
+        category_name = category_in.name if category_in.name else "N/A"
+        log_action(db, user_id=current_user.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": category_name, "reason": str(e.detail), "scope": "universal"}, customer_id=None)
+        raise
+    except Exception as e:
+        # Safely get the category name for logging
+        category_name = category_in.name if category_in.name else "N/A"
+        log_action(db, user_id=current_user.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": category_name, "reason": str(e), "scope": "universal"}, customer_id=None)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
-@router.delete("/universal-categories/{category_id}", response_model=UniversalCategoryOut)
+@router.delete("/lg-categories/universal/{category_id}", response_model=LGCategoryOut)
 def delete_universal_category(
     category_id: int, db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("universal_category:delete")),
     request: Request = None
 ):
     """Soft-delete a Universal Category by ID."""
-    db_category = crud_universal_category.get(db, id=category_id)
-    if db_category is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found or already deleted")
-    db_category = crud_universal_category.soft_delete(db, db_category)
-    client_host = request.client.host if request else None
-    log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="UniversalCategory", entity_id=db_category.id, details={"category_name": db_category.category_name, "ip_address": client_host})
-    return db_category
+    db_category = crud_lg_category.get(db, id=category_id)
+    if not db_category or db_category.customer_id is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found, already deleted, or is a customer-specific category.")
+    
+    try:
+        deleted_category = crud_lg_category.soft_delete(db, db_category, user_id=current_user.user_id)
+        # The logic here is fine. It does not try to modify `category_in`.
+        return LGCategoryOut.model_validate(
+            deleted_category,
+            context={
+                'customer_name': "System Default",
+                'type': "universal"
+            }
+        )
+    except HTTPException as e:
+        log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_category.name, "reason": str(e.detail), "scope": "universal"}, customer_id=None)
+        raise
+    except Exception as e:
+        log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_category.name, "reason": str(e), "scope": "universal"}, customer_id=None)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
-@router.post("/universal-categories/{category_id}/restore", response_model=UniversalCategoryOut)
+@router.post("/lg-categories/universal/{category_id}/restore", response_model=LGCategoryOut)
 def restore_universal_category(
     category_id: int, db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("universal_category:edit")),
     request: Request = None
 ):
     """Restore a soft-deleted Universal Category by ID."""
-    db_category = db.query(UniversalCategory).filter(UniversalCategory.id == category_id, UniversalCategory.is_deleted == True).first()
+    db_category = db.query(LGCategory).filter(
+        LGCategory.id == category_id,
+        LGCategory.customer_id.is_(None),
+        LGCategory.is_deleted == True
+    ).first()
+    
     if db_category is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Universal Category not found or not in a soft-deleted state.")
-    restored_category = crud_universal_category.restore(db, db_category)
-    client_host = request.client.host if request else None
-    log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="UniversalCategory", entity_id=db_category.id, details={"category_name": db_category.category_name, "ip_address": client_host})
-    return restored_category
+    
+    try:
+        restored_category = crud_lg_category.restore(db, db_category, user_id=current_user.user_id)
+        # FIX: Use model_validate instead of model_dump()
+        return LGCategoryOut.model_validate(
+            restored_category,
+            context={
+                'customer_name': "System Default",
+                'type': "universal"
+            }
+        )
+    except HTTPException as e:
+        log_action(db, user_id=current_user.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_category.name, "reason": str(e.detail), "scope": "universal"}, customer_id=None)
+        raise
+    except Exception as e:
+        log_action(db, user_id=current_user.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"category_name": db_category.name, "reason": str(e), "scope": "universal"}, customer_id=None)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+
 
 @router.post("/banks/", response_model=BankOut, status_code=status.HTTP_201_CREATED)
 def create_bank(

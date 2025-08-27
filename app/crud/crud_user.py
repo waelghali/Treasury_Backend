@@ -112,6 +112,14 @@ class CRUDUser(CRUDBase):
         return db_user
 
     def create_user_by_corporate_admin(self, db: Session, user_in: UserCreateCorporateAdmin, customer_id: int, user_id_caller: int) -> User:
+        # Check for existing user with the same email address
+        existing_user = self.get_by_email(db, user_in.email)
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"User with email '{user_in.email}' already exists."
+            )
+
         customer = (
             db.query(Customer)
             .options(selectinload(Customer.subscription_plan))
@@ -121,7 +129,13 @@ class CRUDUser(CRUDBase):
         if not customer:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
 
-        if customer.active_user_count >= customer.subscription_plan.max_users:
+        # FIX: Use a fresh count from the database for the user limit check
+        actual_active_user_count = db.query(User).filter(
+            User.customer_id == customer_id,
+            User.is_deleted == False
+        ).count()
+        
+        if actual_active_user_count >= customer.subscription_plan.max_users:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"User limit ({customer.subscription_plan.max_users}) exceeded for this customer's subscription plan. Cannot create new user.",
@@ -146,8 +160,6 @@ class CRUDUser(CRUDBase):
         db.flush()
 
         if not db_user.has_all_entity_access and entity_ids:
-            # REMOVED: Redundant late import, CustomerEntity is directly imported at top
-            # import app.crud.crud as crud_instances
             customer_entities = (
                 db.query(CustomerEntity)
                 .filter(
@@ -169,7 +181,8 @@ class CRUDUser(CRUDBase):
                 )
                 db.add(association)
 
-        customer.active_user_count += 1
+        # FIX: The active_user_count will now be updated directly by the database logic
+        customer.active_user_count = actual_active_user_count + 1
         db.add(customer)
         db.flush()
         db.refresh(db_user)
@@ -514,19 +527,25 @@ class CRUDUser(CRUDBase):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Customer not found for user restoration.",
             )
-
-        if customer.active_user_count >= customer.subscription_plan.max_users:
+        
+        # FIX: Use a fresh count from the database before performing the check
+        actual_active_user_count = db.query(User).filter(
+            User.customer_id == db_obj.customer_id,
+            User.is_deleted == False
+        ).count()
+        
+        if actual_active_user_count >= customer.subscription_plan.max_users:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"User limit ({customer.subscription_plan.max_users}) exceeded for this customer's subscription plan. Cannot restore user.",
             )
-
+            
         restored_obj = super().restore(db, db_obj)
 
-        if restored_obj.customer and not restored_obj.is_deleted:
-            restored_obj.customer.active_user_count += 1
-            db.add(restored_obj.customer)
-            db.flush()
+        # FIX: Increment the count after the restoration and before flushing
+        customer.active_user_count = actual_active_user_count + 1
+        db.add(customer)
+        db.flush()
 
         # IMPORTANT: UserCustomerEntityAssociation records were hard-deleted during soft_delete.
         # They are NOT automatically restored here. If the user had granular entity access
@@ -548,7 +567,7 @@ class CRUDUser(CRUDBase):
     def get_users_by_customer_id(self, db: Session, customer_id: int, skip: int = 0, limit: int = 100) -> List[User]:
         return (
             db.query(self.model)
-            .filter(self.model.customer_id == customer_id, self.model.is_deleted == False)
+            .filter(self.model.customer_id == customer_id)
             .options(
                 selectinload(User.entity_associations).selectinload(
                     UserCustomerEntityAssociation.customer_entity

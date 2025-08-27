@@ -18,7 +18,7 @@ import app.models as models
 from app.models import (
     Customer, CustomerEmailSetting, CustomerEntity, InternalOwnerContact,
     LGCategory, LGCategoryCustomerEntityAssociation, LGDocument, LGInstruction,
-    LGRecord, LgType, LgOperationalStatus, LgStatus, Rule, UniversalCategory,
+    LGRecord, LgType, LgOperationalStatus, LgStatus, Rule,
     Template, GlobalConfiguration, CustomerConfiguration, User, ApprovalRequest
 )
 from app.schemas.all_schemas import (
@@ -190,15 +190,12 @@ class CRUDLGRecord(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Applicable Rule ID provided."
             )
 
-        lg_category = db.query(models.LGCategory).filter(models.LGCategory.id == obj_in.lg_category_id).first()
-        if not lg_category:
-            lg_category_universal = db.query(models.UniversalCategory).filter(models.UniversalCategory.id == obj_in.lg_category_id).first()
-            if not lg_category_universal:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid LG Category ID provided or category not accessible for your customer.",
-                )
-            lg_category = lg_category_universal
+        lg_category = db.query(models.LGCategory).filter(models.LGCategory.id == obj_in.lg_category_id, models.LGCategory.is_deleted == False).first()
+        if not lg_category or (lg_category.customer_id is not None and lg_category.customer_id != customer_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid LG Category ID provided or category not accessible for your customer.",
+            )
 
         if lg_type.id == models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value: # Corrected to models.LgTypeEnum
             if obj_in.lg_operational_status_id is None:
@@ -390,7 +387,7 @@ class CRUDLGRecord(CRUDBase):
                     "lg_owner_email": db_lg_record.internal_owner_contact.email,
                     "internal_owner_email": db_lg_record.internal_owner_contact.email, # NEW
                     "lg_type": db_lg_record.lg_type.name,
-                    "lg_category": db_lg_record.lg_category.category_name,
+                    "lg_category": db_lg_record.lg_category.name,
                     "customer_name": db_lg_record.customer.name,
                     "user_email": db.query(models.User.email).filter(models.User.id == user_id).scalar(),
                     "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2975,3 +2972,52 @@ class CRUDLGRecord(CRUDBase):
         )
 
         return query.offset(skip).limit(limit).all()
+
+    async def create_from_migration(self, db: Session, obj_in: LGRecordCreate, customer_id: int, user_id: int, migration_source: str, migrated_from_staging_id: int) -> models.LGRecord:
+        # Check for existing LG in production before creating a new one (proactive check)
+        existing_lg = self.get_by_lg_number(db, obj_in.lg_number)
+        if existing_lg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"LG with number '{obj_in.lg_number}' already exists in production. Cannot migrate."
+            )
+
+        # Get the next LG sequence number
+        last_lg_sequence = db.query(func.max(self.model.lg_sequence_number)).filter(
+            self.model.beneficiary_corporate_id == obj_in.beneficiary_corporate_id,
+            self.model.is_deleted == False
+        ).scalar()
+        next_lg_sequence = (last_lg_sequence if last_lg_sequence is not None else 0) + 1
+        
+        # We assume the obj_in already has the correct IDs for owner, bank, etc. from the staging process.
+        lg_record_data = obj_in.model_dump(exclude_unset=True)
+        lg_record_data["customer_id"] = customer_id
+        lg_record_data["lg_sequence_number"] = next_lg_sequence
+        
+        # Set the migration-specific flags
+        lg_record_data["migration_source"] = migration_source
+        lg_record_data["migrated_from_staging_id"] = migrated_from_staging_id
+        
+        db_lg_record = self.model(**lg_record_data)
+        db.add(db_lg_record)
+        db.flush()
+        
+        db.refresh(db_lg_record)
+        
+        # Log the migration action for this specific record
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="MIGRATION_IMPORT_RECORD",
+            entity_type="LGRecord",
+            entity_id=db_lg_record.id,
+            details={
+                "lg_number": db_lg_record.lg_number,
+                "customer_id": customer_id,
+                "staged_record_id": migrated_from_staging_id,
+                "migration_source": migration_source,
+            },
+            customer_id=customer_id,
+            lg_record_id=db_lg_record.id,
+        )
+        return db_lg_record
