@@ -754,21 +754,21 @@ async def seed_db():
         # 10. Seed Universal Categories
         print("\n--- Seeding Universal Categories ---")
         universal_categories_to_seed = [
-            {"category_name": "Default Category", "code": "DF", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
-            {"category_name": "Construction Projects", "code": "CP", "extra_field_name": "Project Code", "is_mandatory": True, "communication_list": ["construction.team@example.com"]},
-            {"category_name": "Service Contracts", "code": "SC", "extra_field_name": "Contract ID", "is_mandatory": False, "communication_list": ["service.dept@example.com", "legal@example.com"]},
+            {"name": "Default Category", "code": "DF", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
+            {"name": "Construction Projects", "code": "CP", "extra_field_name": "Project Code", "is_mandatory": True, "communication_list": ["construction.team@example.com"]},
+            {"name": "Service Contracts", "code": "SC", "extra_field_name": "Contract ID", "is_mandatory": False, "communication_list": ["service.dept@example.com", "legal@example.com"]},
         ]
         for category_data in universal_categories_to_seed:
             try:
                 # CORRECTED: Access UniversalCategory model via the 'models' module
-                if not crud_universal_category.get_by_category_name(db, category_name=category_data["category_name"]):
+                if not crud_universal_category.get_by_name(db, name=category_data["name"]):
                     crud_universal_category.create(db, obj_in=UniversalCategoryCreate(**category_data))
-                    print(f"  Added Universal Category: {category_data['category_name']}")
+                    print(f"  Added Universal Category: {category_data['name']}")
                 else:
-                    print(f"  Universal Category '{category_data['category_name']}' already exists.")
+                    print(f"  Universal Category '{category_data['name']}' already exists.")
                 db.flush() # Flush after each universal category creation
             except Exception as e:
-                print(f"  ERROR seeding universal category '{category_data['category_name']}': {e}")
+                print(f"  ERROR seeding universal category '{category_data['name']}': {e}")
                 traceback.print_exc()
         db.commit() # Commit after all universal categories are processed
 
@@ -1578,7 +1578,7 @@ async def seed_db():
             try:
                 # Check for existing category by name and customer_id
                 # The 'name' parameter is now correctly passed to the crud method.
-                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], category_name=category_data["name"]):
+                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], name=category_data["name"]):
                     crud_lg_category.create(db, obj_in=LGCategoryCreate(**category_data), customer_id=category_data["customer_id"], user_id=system_owner_id)
                     print(f"  Added LG Category: {category_data['name']} for Customer ID {category_data['customer_id']}")
                 else:
