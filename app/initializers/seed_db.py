@@ -1577,9 +1577,8 @@ async def seed_db():
         for category_data in lg_categories_to_seed:
             try:
                 # Check for existing category by name and customer_id
-                # Note: The `crud_lg_category.get_by_name` method should also be checked to ensure it accepts the correct parameter name (e.g., `name` vs `category_name`).
-                # Assuming the method parameter is 'name' based on the schema and the previous context.
-                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], name=category_data["name"]):
+                # The 'name' parameter is now correctly passed to the crud method.
+                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], category_name=category_data["name"]):
                     crud_lg_category.create(db, obj_in=LGCategoryCreate(**category_data), customer_id=category_data["customer_id"], user_id=system_owner_id)
                     print(f"  Added LG Category: {category_data['name']} for Customer ID {category_data['customer_id']}")
                 else:
@@ -1588,7 +1587,7 @@ async def seed_db():
             except Exception as e:
                 print(f"  ERROR seeding LG Category '{category_data.get('name', 'N/A')}' for Customer ID {category_data.get('customer_id', 'N/A')}: {e}")
                 traceback.print_exc()
-        db.commit() # Commit after all LG Categories are processed
+        db.commit()
 
 
         # Now, fetch the IDs of these newly created categories, entities, and users
