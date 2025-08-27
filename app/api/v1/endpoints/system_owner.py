@@ -1581,6 +1581,7 @@ def restore_lg_operational_status(
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="LgOperationalStatus", entity_id=db_op_status.id, details={"name": db_op_status.name, "ip_address": client_host})
     return db_op_status
 
+
 @router.post("/lg-categories/universal", response_model=LGCategoryOut, status_code=status.HTTP_201_CREATED)
 def create_universal_category(
     category_in: LGCategoryCreate, db: Session = Depends(get_db),
@@ -1589,24 +1590,29 @@ def create_universal_category(
 ):
     """Create a new Universal Category entry."""
     client_host = request.client.host if request else None
-    
+
     # Enforce universal scope by setting customer_id to None
     category_in.customer_id = None
-    
+
     try:
         db_category = crud_lg_category.create(db, obj_in=category_in, user_id=current_user.user_id)
         # Manually create the output model to include customer_name helper field
-        return LGCategoryOut(
-            **db_category.model_dump(),
-            customer_name="System Default",
-            type="universal"
+        # --- FIX START ---
+        return LGCategoryOut.model_validate(
+            db_category,
+            context={
+                'customer_name': "System Default",
+                'type': "universal"
+            }
         )
+        # --- FIX END ---
     except HTTPException as e:
         log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"category_name": category_in.name, "reason": str(e.detail), "scope": "universal"}, customer_id=None)
         raise
     except Exception as e:
         log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"category_name": category_in.name, "reason": str(e), "scope": "universal"}, customer_id=None)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+
 
 @router.get("/lg-categories/universal", response_model=List[LGCategoryOut])
 def read_universal_categories(
