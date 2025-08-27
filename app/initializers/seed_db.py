@@ -737,19 +737,21 @@ async def seed_db():
             {"name": "Operative", "description": "LG is currently active and can be drawn upon."},
             {"name": "Non-Operative", "description": "LG is issued but not yet effective (e.g., pending advance payment)."},
         ]
+
         for op_status_data in lg_operational_statuses_to_seed:
             try:
-                # CORRECTED: Access LgOperationalStatus model via the 'models' module
                 if not crud_lg_operational_status.get_by_name(db, name=op_status_data["name"]):
                     crud_lg_operational_status.create(db, obj_in=LgOperationalStatusCreate(**op_status_data))
                     print(f"  Added LG Operational Status: {op_status_data['name']}")
                 else:
                     print(f"  LG Operational Status '{op_status_data['name']}' already exists.")
-                db.flush() # Flush after each op status creation
+                db.flush()  # Flush after each creation
             except Exception as e:
                 print(f"  ERROR seeding LG operational status '{op_status_data['name']}': {e}")
                 traceback.print_exc()
-        db.commit() # Commit after all LG operational statuses are processed
+
+        db.commit()  # Commit after all are processed
+
 
         # 10. Seed Universal Categories
         print("\n--- Seeding Universal Categories ---")
@@ -1563,7 +1565,7 @@ async def seed_db():
         cyberdyne_admin_user = db.query(models.User).filter(models.User.email == "corp.admin@cyberdyne.com").first()
         cyberdyne_admin_user_id = cyberdyne_admin_user.id if cyberdyne_admin_user else None
 
-        # Seed LG Categories after customer entities
+        # Seed LG Categories after customer entities 
         print("\n--- Seeding LG Categories for Customers ---")
         lg_categories_to_seed = [
             # Acme Corp Categories
@@ -1574,20 +1576,29 @@ async def seed_db():
             # Cyberdyne Systems Categories
             {"customer_id": cyberdyne_id, "name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []},
         ]
-        for category_data in lg_categories_to_seed:
+
+        for raw_data in lg_categories_to_seed:
             try:
-                # Check for existing category by name and customer_id
-                # The 'name' parameter is now correctly passed to the crud method.
-                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], name=category_data["name"]):
-                    crud_lg_category.create(db, obj_in=LGCategoryCreate(**category_data), customer_id=category_data["customer_id"], user_id=system_owner_id)
-                    print(f"  Added LG Category: {category_data['name']} for Customer ID {category_data['customer_id']}")
+                customer_id = raw_data["customer_id"]
+                category_data = {k: v for k, v in raw_data.items() if k != "customer_id"}
+
+                if not crud_lg_category.get_by_name(db, customer_id=customer_id, name=category_data["name"]):
+                    crud_lg_category.create(
+                        db,
+                        obj_in=LGCategoryCreate(**category_data),
+                        customer_id=customer_id,
+                        user_id=system_owner_id,
+                    )
+                    print(f"  Added LG Category: {category_data['name']} for Customer ID {customer_id}")
                 else:
-                    print(f"  LG Category '{category_data['name']}' for Customer ID {category_data['customer_id']} already exists.")
+                    print(f"  LG Category '{category_data['name']}' for Customer ID {customer_id} already exists.")
                 db.flush()
             except Exception as e:
-                print(f"  ERROR seeding LG Category '{category_data.get('name', 'N/A')}' for Customer ID {category_data.get('customer_id', 'N/A')}: {e}")
+                print(f"  ERROR seeding LG Category '{raw_data.get('name', 'N/A')}' for Customer ID {raw_data.get('customer_id', 'N/A')}: {e}")
                 traceback.print_exc()
+
         db.commit()
+
 
 
         # Now, fetch the IDs of these newly created categories, entities, and users
