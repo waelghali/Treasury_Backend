@@ -1567,24 +1567,26 @@ async def seed_db():
         print("\n--- Seeding LG Categories for Customers ---")
         lg_categories_to_seed = [
             # Acme Corp Categories
-            {"customer_id": acme_corp_id, "category_name": "IT Projects", "code": "IT", "extra_field_name": "Project ID", "is_mandatory": True, "communication_list": []},
-            {"customer_id": acme_corp_id, "category_name": "HR Department", "code": "HR", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
+            {"customer_id": acme_corp_id, "name": "IT Projects", "code": "IT", "extra_field_name": "Project ID", "is_mandatory": True, "communication_list": []},
+            {"customer_id": acme_corp_id, "name": "HR Department", "code": "HR", "extra_field_name": None, "is_mandatory": False, "communication_list": []},
             # Globex Industries Categories
-            {"customer_id": globex_id, "category_name": "Manufacturing", "code": "MA", "extra_field_name": "Batch No.", "is_mandatory": False, "communication_list": []},
+            {"customer_id": globex_id, "name": "Manufacturing", "code": "MA", "extra_field_name": "Batch No.", "is_mandatory": False, "communication_list": []},
             # Cyberdyne Systems Categories
-            {"customer_id": cyberdyne_id, "category_name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []},
+            {"customer_id": cyberdyne_id, "name": "Research Grants", "code": "RG", "extra_field_name": "Grant ID", "is_mandatory": True, "communication_list": []},
         ]
         for category_data in lg_categories_to_seed:
             try:
                 # Check for existing category by name and customer_id
-                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], category_name=category_data["category_name"]):
+                # Note: The `crud_lg_category.get_by_name` method should also be checked to ensure it accepts the correct parameter name (e.g., `name` vs `category_name`).
+                # Assuming the method parameter is 'name' based on the schema and the previous context.
+                if not crud_lg_category.get_by_name(db, customer_id=category_data["customer_id"], name=category_data["name"]):
                     crud_lg_category.create(db, obj_in=LGCategoryCreate(**category_data), customer_id=category_data["customer_id"], user_id=system_owner_id)
-                    print(f"  Added LG Category: {category_data['category_name']} for Customer ID {category_data['customer_id']}")
+                    print(f"  Added LG Category: {category_data['name']} for Customer ID {category_data['customer_id']}")
                 else:
-                    print(f"  LG Category '{category_data['category_name']}' for Customer ID {category_data['customer_id']} already exists.")
+                    print(f"  LG Category '{category_data['name']}' for Customer ID {category_data['customer_id']} already exists.")
                 db.flush()
             except Exception as e:
-                print(f"  ERROR seeding LG Category '{category_data.get('category_name', 'N/A')}' for Customer ID {category_data.get('customer_id', 'N/A')}: {e}")
+                print(f"  ERROR seeding LG Category '{category_data.get('name', 'N/A')}' for Customer ID {category_data.get('customer_id', 'N/A')}: {e}")
                 traceback.print_exc()
         db.commit() # Commit after all LG Categories are processed
 
