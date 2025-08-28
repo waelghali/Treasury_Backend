@@ -3,17 +3,16 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import Depends, HTTPException, status, Request, Response # NEW: Import Response
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import Depends, HTTPException, status, Request, Response
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
-# UPDATED: Import SubscriptionStatus
 from app.constants import UserRole, SubscriptionStatus
-from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import or_ # NEW: Added or_ for the user check
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from app.database import get_db
-from app.crud.crud import crud_user, crud_role_permission, crud_customer
-from app.models import User, RolePermission, UserCustomerEntityAssociation, Customer # UPDATED: Add Customer model
+from app.crud.crud import crud_user, crud_role_permission
+from app.models import User, RolePermission
 
 # NEW: Import hashing for password verification
 from app.core.hashing import get_password_hash, verify_password_direct
@@ -21,8 +20,8 @@ from app.core.hashing import get_password_hash, verify_password_direct
 # Environment variables for JWT
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-# MODIFIED: Set expiration to a very short time (e.g., 5 minutes) for sliding expiration
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 5))
+# MODIFIED: Increase expiration time for the frontend timer
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
 if SECRET_KEY is None:
     raise ValueError("SECRET_KEY environment variable is not set.")
@@ -38,7 +37,6 @@ class TokenData(BaseModel):
     has_all_entity_access: Optional[bool] = Field(True, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: List[int] = Field([], description="List of customer entity IDs this user has access to.")
     must_change_password: Optional[bool] = Field(False, description="True if user must change password on next login.")
-    # NEW: Add subscription status to the token payload
     subscription_status: Optional[SubscriptionStatus] = Field(None, description="Current subscription status of the customer.")
 
 
@@ -55,7 +53,7 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
 # MODIFIED: get_current_user to check query params if header token is missing and to fetch subscription status
 async def get_current_user(
     request: Request,
-    response: Response, # NEW: Pass the response object to set the new token header
+    response: Response,
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
@@ -79,7 +77,6 @@ async def get_current_user(
         has_all_entity_access: Optional[bool] = payload.get("has_all_entity_access")
         entity_ids: List[int] = payload.get("entity_ids", [])
         must_change_password: Optional[bool] = payload.get("must_change_password")
-        # NEW: Get subscription_status from payload
         subscription_status: Optional[str] = payload.get("subscription_status")
 
         if email is None or user_id is None or role is None:
@@ -88,7 +85,6 @@ async def get_current_user(
         db_permissions = crud_role_permission.get_permissions_for_role(db, role)
         permission_names = [p.name for p in db_permissions]
         
-        # NEW: Ensure subscription_status is a valid enum value if present
         if subscription_status:
              subscription_status = SubscriptionStatus(subscription_status)
 
@@ -101,7 +97,7 @@ async def get_current_user(
             has_all_entity_access=has_all_entity_access,
             entity_ids=entity_ids,
             must_change_password=must_change_password,
-            subscription_status=subscription_status # NEW
+            subscription_status=subscription_status
         )
     except JWTError:
         raise credentials_exception
@@ -120,12 +116,8 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # --- NEW: Sliding Expiration Logic ---
-    # Create a new token with a fresh expiration time
-    new_token_data = token_data.model_dump()
-    new_access_token = create_access_token(data=new_token_data)
-    response.headers['X-New-Auth-Token'] = new_access_token
-    # --- END NEW LOGIC ---
+    # REMOVED: Sliding Expiration Logic
+    # The frontend will now manage the inactivity timer.
 
     return token_data
 
@@ -133,7 +125,6 @@ async def get_current_active_user(current_user: TokenData = Depends(get_current_
     if current_user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     
-    # NEW: Check must_change_password for all roles except System Owner
     if current_user.role != UserRole.SYSTEM_OWNER and current_user.must_change_password:
          raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -146,7 +137,6 @@ def check_subscription_status(
     current_user: TokenData = Depends(get_current_active_user)
 ):
     if current_user.role == UserRole.SYSTEM_OWNER:
-        # System owners are not subject to subscription status
         return current_user
         
     if current_user.subscription_status == SubscriptionStatus.EXPIRED:
@@ -154,7 +144,6 @@ def check_subscription_status(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Subscription is expired. Access is denied. Please contact the system owner to renew."
         )
-    # Allows 'active' and 'grace' statuses to pass
     return current_user
 
 # NEW DEPENDENCY: Check for read-only mode (allows only 'active' status)
@@ -162,7 +151,6 @@ def check_for_read_only_mode(
     current_user: TokenData = Depends(check_subscription_status)
 ):
     if current_user.role == UserRole.SYSTEM_OWNER:
-        # System owners are not subject to subscription status
         return current_user
         
     if current_user.subscription_status == SubscriptionStatus.GRACE:
@@ -180,7 +168,7 @@ async def get_current_system_owner(current_user: TokenData = Depends(get_current
         )
     return current_user
 
-async def get_current_corporate_admin_context(current_user: TokenData = Depends(check_subscription_status)): # UPDATED: Use check_subscription_status
+async def get_current_corporate_admin_context(current_user: TokenData = Depends(check_subscription_status)):
     """
     Dependency that ensures the current user is a Corporate Admin and has an associated customer_id.
     """
