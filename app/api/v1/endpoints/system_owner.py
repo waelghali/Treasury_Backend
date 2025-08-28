@@ -145,12 +145,13 @@ def get_dashboard_metrics(
 @router.get("/template-placeholders", response_model=List[Dict[str, str]])
 def get_template_placeholders(
     action_type: Optional[str] = Query(None, description="Filter placeholders by action type (e.g., LG_EXTENSION)"),
+    lg_record_id: Optional[int] = Query(None, description="Optional LG Record ID to fetch LG-specific placeholders"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("template:view"))
 ):
     """
     Retrieves a list of available placeholders for templates, optionally filtered by action type.
-    These placeholders dynamically insert data into template content.
+    Includes LG-specific placeholders, dynamically fetching LG data if lg_record_id is provided.
     """
     
     placeholders = [
@@ -159,6 +160,25 @@ def get_template_placeholders(
         {"name": "{{platform_name}}", "description": "Name of the platform (e.g., 'Treasury Management Platform')."},
         {"name": "{{user_email}}", "description": "Email of the user triggering the action."},
     ]
+    
+    # NEW: Add general customer/entity placeholders with fallback logic
+    if lg_record_id:
+        from app.crud.lg_records import crud_lg_record
+        lg_record = crud_lg_record.get(db, id=lg_record_id)
+        if lg_record:
+            customer = lg_record.customer
+            entity = lg_record.beneficiary_corporate
+            
+            # Fallback logic for address, phone, and email
+            customer_address = entity.address if entity.address else customer.address
+            customer_phone = entity.contact_phone if entity.contact_phone else customer.contact_phone
+            customer_email = entity.contact_email if entity.contact_email else customer.contact_email
+            
+            placeholders.extend([
+                {"name": "{{customer_address}}", "description": "Address of the customer entity (falls back to customer address)."},
+                {"name": "{{customer_phone}}", "description": "Phone number of the customer entity (falls back to customer phone)."},
+                {"name": "{{customer_contact_email}}", "description": "Contact email of the customer entity (falls back to customer email)."},
+            ])
 
     if action_type and action_type.upper().startswith("LG_"):
         lg_placeholders = [
@@ -168,6 +188,9 @@ def get_template_placeholders(
             {"name": "{{issuing_bank_name}}", "description": "Name of the LG's issuing bank."},
             {"name": "{{issue_date}}", "description": "Issue date of the LG."},
             {"name": "{{expiry_date}}", "description": "Expiry date of the LG."},
+            {"name": "{{lg_issuer_name}}", "description": "Name of the LG issuer/applicant."},
+            {"name": "{{lg_beneficiary_name}}", "description": "Name of the LG beneficiary."},
+            {"name": "{{internal_owner_email}}", "description": "Email of the internal owner."},
         ]
         placeholders.extend(lg_placeholders)
 
@@ -203,6 +226,9 @@ def get_template_placeholders(
         reminder_placeholders = [
             {"name": "{{original_instruction_serial}}", "description": "Serial number of the instruction the reminder relates to."},
             {"name": "{{days_overdue}}", "description": "Number of days the instruction has been overdue."},
+            {"name": "{{original_instruction_date}}", "description": "The date the original instruction was issued."},
+            {"name": "{{original_instruction_delivery_date}}", "description": "The date the original instruction was delivered."},
+            {"name": "{{original_instruction_type}}", "description": "Type of the original instruction."},
         ]
         placeholders.extend(reminder_placeholders)
 

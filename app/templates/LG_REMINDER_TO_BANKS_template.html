@@ -27,8 +27,8 @@
         <div class="header">
             <p><strong>{{customer_name}}</strong></p>
             <p>Treasury Department</p>
-            <p>123 Business Road, City, Country</p>
-            <p>Phone: (123) 456-7890 | Email: info@{{customer_name}}.com</p>
+            <p>{{customer_address}}</p>
+            <p>Email: {{customer_contact_email}}</p>
         </div>
 
         <div class="date">
@@ -50,13 +50,13 @@
 
         <div class="closing">
             <p>Sincerely,</p>
-            <p class="signature">{{customer_name}}</p>
+            <p class="signature">{{lg_beneficiary_name}}</p>
             <p>Treasury Department</p>
-            <p>For and on behalf of {{platform_name}}</p>
+            <em style="font-size: 8pt;">For and on behalf of Grow BD Treasury Plateform</em>
         </div>
 
         <div class="footer">
-            <p>Confidential &copy; {{platform_name}} - All Rights Reserved.</p>
+            <p>Confidential &copy; Grow BD Treasury Plateform - All Rights Reserved.</p>
         </div>
     </div>
 </body>

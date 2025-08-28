@@ -506,6 +506,12 @@ class CRUDLGInstruction(CRUDBase):
             instruction_type_code=instruction_type_code,
             sub_instruction_code=sub_instruction_code
         )
+        
+        # NEW LOGIC: Get entity and customer details with fallback
+        customer = lg_record.customer
+        entity = lg_record.beneficiary_corporate
+        customer_address = entity.address if entity.address else customer.address
+        customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
 
         template_data = {
             "lg_number": lg_record.lg_number,
@@ -516,6 +522,9 @@ class CRUDLGInstruction(CRUDBase):
             "issuing_bank_name": lg_record.issuing_bank.name,
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "customer_name": lg_record.customer.name,
+            "customer_address": customer_address,
+            "customer_phone": customer_phone,
+            "customer_contact_email": customer_contact_email,
             "current_date": date.today().strftime("%Y-%m-%d"),
             "platform_name": "Treasury Management Platform",
             "original_instruction_type": original_instruction.instruction_type,
@@ -672,6 +681,13 @@ class CRUDLGInstruction(CRUDBase):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"System configuration error: Reminder to Banks template not found.")
         customer_obj = db.query(models.Customer).filter(models.Customer.id == customer_id).first()
         customer_name = customer_obj.name if customer_obj else "N/A"
+        
+        # NEW LOGIC: Get customer details for fallback
+        customer = customer_obj
+        customer_address = customer.address
+        customer_phone = customer.contact_phone
+        customer_contact_email = customer.contact_email
+
         for original_instruction in eligible_instructions:
             existing_reminder = db.query(self.model).filter(
                 self.model.instruction_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
@@ -683,6 +699,13 @@ class CRUDLGInstruction(CRUDBase):
                 logger.warning(f"Reminder already exists for original instruction {original_instruction.id} (Serial: {original_instruction.serial_number}). Skipping in bulk generation.")
                 continue
             lg_record = original_instruction.lg_record
+            
+            # Apply the fallback logic at the instruction level for each reminder
+            entity = lg_record.beneficiary_corporate
+            customer_address_final = entity.address if entity.address else customer_address
+            customer_phone_final = entity.contact_phone if entity.contact_phone else customer_phone
+            customer_contact_email_final = entity.contact_email if entity.contact_email else customer_contact_email
+
             days_overdue = (date.today() - original_instruction.instruction_date.date()).days
             
             beneficiary_entity_code = lg_record.beneficiary_corporate.code
@@ -711,6 +734,9 @@ class CRUDLGInstruction(CRUDBase):
                 "issuing_bank_name": lg_record.issuing_bank.name,
                 "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
                 "customer_name": lg_record.customer.name,
+                "customer_address": customer_address_final,
+                "customer_phone": customer_phone_final,
+                "customer_contact_email": customer_contact_email_final,
                 "current_date": date.today().strftime("%Y-%m-%d"),
                 "platform_name": "Treasury Management Platform",
                 "original_instruction_type": original_instruction.instruction_type,
