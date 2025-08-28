@@ -27,8 +27,8 @@
         <div class="header">
             <p><strong>{{customer_name}}</strong></p>
             <p>Treasury Department</p>
-            <p>123 Business Road, City, Country</p>
-            <p>Phone: (123) 456-7890 | Email: info@{{customer_name}}.com</p>
+            <p>{{customer_address}}</p>
+            <p>Email: {{customer_contact_email}}</p>
         </div>
 
         <div class="date">
@@ -40,7 +40,9 @@
             <p><strong>Subject: Instruction to Release Letter of Guarantee #<span class="highlight">{{lg_number}}</span></strong></p>
         </div>
 
-        <p>Please be advised that Letter of Guarantee number <strong>{{lg_number}}</strong> is no longer required and can be released. We kindly request you to cancel the guarantee and return the original document to us.</p>
+        <p>We confirm that {{lg_issuer_name}} has fulfilled their obligations. Accordingly, we release the above-mentioned Letter of Guarantee from any further claim and consider it null and void.</p>
+
+        <p>The details of the guarantee are as follows:</p>
 
         <table class="details-table">
             <tr>
@@ -60,22 +62,23 @@
                 <td>{{lg_beneficiary_name}}</td>
             </tr>
             <tr>
-                <th>Internal Owner:</th>
-                <td>{{internal_owner_email}}</td>
+                <th>Issuer Name:</th>
+                <td>{{lg_issuer_name}}</td>
             </tr>
         </table>
         
+        <p>Enclosed herewith are the original guarantee and all related amendments available with us for your records and cancellation.</p>
         <p>Your prompt attention to this matter is greatly appreciated.</p>
 
         <div class="closing">
             <p>Sincerely,</p>
-            <p class="signature">{{customer_name}}</p>
+            <p class="signature">{{lg_beneficiary_name}}</p>
             <p>Treasury Department</p>
-            <p>For and on behalf of {{platform_name}}</p>
+            <em style="font-size: 8pt;">For and on behalf of Grow BD Treasury Plateform</em>
         </div>
 
         <div class="footer">
-            <p>Confidential &copy; {{platform_name}} - All Rights Reserved.</p>
+            <p>Confidential &copy; Grow BD Treasury Plateform - All Rights Reserved.</p>
         </div>
     </div>
 </body>

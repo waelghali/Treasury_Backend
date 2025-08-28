@@ -27,8 +27,8 @@
         <div class="header">
             <p><strong>{{customer_name}}</strong></p>
             <p>Treasury Department</p>
-            <p>123 Business Road, City, Country</p>
-            <p>Phone: (123) 456-7890 | Email: info@{{customer_name}}.com</p>
+            <p>{{customer_address}}</p>
+            <p>Email: {{customer_contact_email}}</p>
         </div>
 
         <div class="date">
@@ -40,7 +40,8 @@
             <p><strong>Subject: Instruction for {{liquidation_type}} Liquidation of Letter of Guarantee #<span class="highlight">{{lg_number}}</span></strong></p>
         </div>
 
-        <p>Please be advised that Letter of Guarantee number <strong>{{lg_number}}</strong> requires a <strong>{{liquidation_type}}</strong> liquidation. We request you to process this liquidation and update the outstanding amount accordingly.</p>
+        <p>As {{lg_issuer_name}} has failed to fulfill their contractual obligations towards us, we hereby formally demand {{liquidation_type}} liquidation.</p>
+
         <p>The details of the liquidation are as follows:</p>
 
         <table class="details-table">
@@ -50,11 +51,11 @@
             </tr>
             <tr>
                 <th>Original LG Amount:</th>
-                <td>{{original_lg_amount}} {{lg_currency}}</td>
+                <td>{{original_lg_amount_formatted}} {{lg_currency}}</td>
             </tr>
             <tr>
                 <th>New Remaining LG Amount:</th>
-                <td>{{new_lg_amount}} {{lg_currency}}</td>
+                <td>{{new_lg_amount_formatted}} {{lg_currency}}</td>
             </tr>
             <tr>
                 <th>Issued By:</th>
@@ -65,22 +66,22 @@
                 <td>{{lg_beneficiary_name}}</td>
             </tr>
             <tr>
-                <th>Internal Owner:</th>
-                <td>{{internal_owner_email}}</td>
+                <th>Issuer Name:</th>
+                <td>{{lg_issuer_name}}</td>
             </tr>
         </table>
         
-        <p>Your prompt attention to this matter is greatly appreciated.</p>
+        <p>Kindly arrange to settle the proceeds of this guarantee by issuing a bank draft/cashier order payable to {{lg_beneficiary_name}}, and notify us once it is ready for collection.</p>
 
         <div class="closing">
             <p>Sincerely,</p>
-            <p class="signature">{{customer_name}}</p>
+            <p class="signature">{{lg_beneficiary_name}}</p>
             <p>Treasury Department</p>
-            <p>For and on behalf of {{platform_name}}</p>
+            <em style="font-size: 8pt;">For and on behalf of Grow BD Treasury Plateform</em>
         </div>
 
         <div class="footer">
-            <p>Confidential &copy; {{platform_name}} - All Rights Reserved.</p>
+            <p>Confidential &copy; Grow BD Treasury Plateform - All Rights Reserved.</p>
         </div>
     </div>
 </body>
