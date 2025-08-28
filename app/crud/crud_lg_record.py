@@ -1804,7 +1804,7 @@ class CRUDLGRecord(CRUDBase):
     async def activate_non_operative_lg(self, db: Session, lg_record: LGRecord, payment_details: LGActivateNonOperativeRequest, user_id: int, customer_id: int, approval_request_id: Optional[int]) -> Tuple[models.LGRecord, int]:
         """
         Activates a non-operative Advance Payment Guarantee.
-        Updates status to "Valid", creates an activation instruction, and notifies stakeholders.
+        Updates operational status to "Operative", creates an activation instruction, and notifies stakeholders.
         user_id here refers to the actual actor (maker if direct, checker if approved).
         """
         logger.debug(f"[CRUDLGRecord.activate_non_operative_lg] Initiating activation for LG ID: {lg_record.id}")
@@ -1817,31 +1817,38 @@ class CRUDLGRecord(CRUDBase):
             else:
                 logger.warning(f"ApprovalRequest with ID {approval_request_id} not found when creating LGInstruction for activation. Using checker_user_id as maker for instruction.")
 
-        if lg_record.lg_status_id != models.LgStatusEnum.VALID.value:
+        # Re-fetch the record with a fresh session to avoid stale data
+        db_lg_record = self.get_lg_record_with_relations(db, lg_record.id, customer_id)
+        if not db_lg_record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
+
+
+        # Validation checks
+        if db_lg_record.lg_status_id != models.LgStatusEnum.VALID.value:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"LG record must be in 'Valid' status to be activated. Current status: {lg_record.lg_status.name}."
+                detail=f"LG record must be in 'Valid' status to be activated. Current status: {db_lg_record.lg_status.name}."
             )
 
-        if lg_record.lg_type_id != models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value:
+        if db_lg_record.lg_type_id != models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Only 'Advance Payment Guarantee' LG types can be activated via this process."
             )
 
-        if lg_record.lg_operational_status_id != models.LgOperationalStatusEnum.NON_OPERATIVE.value:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"LG record must be in 'Non-Operative' operational status to be activated. Current operational status: {lg_record.lg_operational_status.name if lg_record.lg_operational_status else 'N/A'}."
-            )
+        if db_lg_record.lg_operational_status_id != models.LgOperationalStatusEnum.NON_OPERATIVE.value:
+             raise HTTPException(
+                 status_code=status.HTTP_400_BAD_REQUEST,
+                 detail=f"LG record must be in 'Non-Operative' operational status to be activated. Current operational status: {db_lg_record.lg_operational_status.name if db_lg_record.lg_operational_status else 'N/A'}."
+             )
 
+        # Update the operational status to 'Operative'
+        operative_status = db.query(models.LgOperationalStatus).filter(models.LgOperationalStatus.id == models.LgOperationalStatusEnum.OPERATIVE.value).first()
+        if not operative_status:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="System misconfiguration: 'Operative' operational status not found.")
 
-        valid_status = db.query(models.LgStatus).filter(models.LgStatus.id == models.LgStatusEnum.VALID.value).first()
-        if not valid_status:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="System misconfiguration: 'Valid' status not found.")
-
-        lg_record.lg_status_id = valid_status.id
-        db.add(lg_record)
+        db_lg_record.lg_operational_status_id = operative_status.id
+        db.add(db_lg_record)
         db.flush()
 
         instruction_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, models.Template.is_global == True, models.Template.is_notification_template == False, models.Template.is_deleted == False).first()
@@ -1852,8 +1859,8 @@ class CRUDLGRecord(CRUDBase):
         payment_bank = db.query(models.Bank).filter(models.Bank.id == payment_details.issuing_bank_id).first()
 
         # --- NEW LOGIC: Apply fallback for customer/entity details ---
-        customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
-        entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
+        customer = db.query(models.Customer).filter(models.Customer.id == db_lg_record.customer_id).first()
+        entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
 
         if not customer or not entity:
              raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
@@ -1863,18 +1870,18 @@ class CRUDLGRecord(CRUDBase):
         # --- END NEW LOGIC ---
 
         instruction_details = {
-            "lg_number": lg_record.lg_number,
-            "lg_amount": float(lg_record.lg_amount),
-            "lg_currency": lg_record.lg_currency.iso_code,
-            "issuing_bank_name": lg_record.issuing_bank.name,
-            "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-            "lg_issuer_name": lg_record.issuer_name,
+            "lg_number": db_lg_record.lg_number,
+            "lg_amount": float(db_lg_record.lg_amount),
+            "lg_currency": db_lg_record.lg_currency.iso_code,
+            "issuing_bank_name": db_lg_record.issuing_bank.name,
+            "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
+            "lg_issuer_name": db_lg_record.issuer_name,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
-            "customer_name": lg_record.customer.name,
-            "customer_address": customer_address,  # NEW
-            "customer_contact_email": customer_contact_email, # NEW
-            "internal_owner_email": lg_record.internal_owner_contact.email,
-            "lg_serial_number": lg_record.lg_number,
+            "customer_name": db_lg_record.customer.name,
+            "customer_address": customer_address,
+            "customer_contact_email": customer_contact_email,
+            "internal_owner_email": db_lg_record.internal_owner_contact.email,
+            "lg_serial_number": db_lg_record.lg_number,
             "payment_method": payment_details.payment_method,
             "payment_amount": float(payment_details.amount),
             "payment_currency_code": payment_currency.iso_code if payment_currency else "N/A",
@@ -1885,7 +1892,7 @@ class CRUDLGRecord(CRUDBase):
             "new_lg_status_id": models.LgOperationalStatusEnum.OPERATIVE.value,
             "lg_type_id": models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value
         }
-        instruction_details["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
+        instruction_details["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
         instruction_details["payment_amount_formatted"] = f"{payment_currency.iso_code if payment_currency else 'N/A'} {float(payment_details.amount):,.2f}"
 
         generated_instruction_html = instruction_template.content
@@ -1896,7 +1903,7 @@ class CRUDLGRecord(CRUDBase):
         # --- MODIFIED BLOCK START ---
         try:
             instruction_create_payload_for_schema = {
-                "lg_record_id": lg_record.id,
+                "lg_record_id": db_lg_record.id,
                 "instruction_type": ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
                 "template_id": instruction_template.id,
                 "status": "Instruction Issued",
@@ -1911,7 +1918,7 @@ class CRUDLGRecord(CRUDBase):
             sub_instruction_code_enum = SubInstructionCode.ORIGINAL
 
             serial_generation_params = {
-                'lg_record_id': lg_record.id,
+                'lg_record_id': db_lg_record.id,
                 'instruction_type_code': instruction_type_code_enum,
                 'sub_instruction_code': sub_instruction_code_enum,
                 'user_id': user_id
@@ -1927,7 +1934,7 @@ class CRUDLGRecord(CRUDBase):
             if not db_lg_instruction:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
 
-            filename_for_pdf = f"lg_activation_{lg_record.lg_number}_instruction_{db_lg_instruction.serial_number}"
+            filename_for_pdf = f"lg_activation_{db_lg_record.lg_number}_instruction_{db_lg_instruction.serial_number}"
             generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, filename_for_pdf)
             
             generated_content_path = f"gs://your-gcs-bucket/generated_instructions/{filename_for_pdf}.pdf"
@@ -1937,40 +1944,46 @@ class CRUDLGRecord(CRUDBase):
             db.add(db_lg_instruction_in_current_session)
             db.flush()
 
-            db.refresh(lg_record)
+            db.refresh(db_lg_record)
             db.refresh(db_lg_instruction_in_current_session)
 
         except Exception as e:
             db.rollback()
-            logger.exception(f"An unexpected error occurred during LG activation for LG {lg_record.lg_number}: {e}")
+            logger.exception(f"An unexpected error occurred during LG activation for LG {db_lg_record.lg_number}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG activation: {e}")
         # --- MODIFIED BLOCK END ---
 
+        # --- FIX START: Correctly serialize date objects for the audit log
+        payment_details_for_log = payment_details.model_dump()
+        if 'payment_date' in payment_details_for_log and isinstance(payment_details_for_log['payment_date'], date):
+            payment_details_for_log['payment_date'] = payment_details_for_log['payment_date'].isoformat()
+        
         log_action(
-            db, user_id, AUDIT_ACTION_TYPE_LG_ACTIVATED, "LGRecord", lg_record.id,
-            {"lg_number": lg_record.lg_number, "old_status": models.LgStatusEnum.NON_OPERATIVE.name, "new_status": models.LgStatusEnum.VALID.name, "payment_details": payment_details.model_dump(), "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id},
-            lg_record.customer_id, lg_record.id
+            db, user_id, AUDIT_ACTION_TYPE_LG_ACTIVATED, "LGRecord", db_lg_record.id,
+            {"lg_number": db_lg_record.lg_number, "old_status": models.LgOperationalStatusEnum.NON_OPERATIVE.name, "new_status": models.LgOperationalStatusEnum.OPERATIVE.name, "payment_details": payment_details_for_log, "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id},
+            db_lg_record.customer_id, db_lg_record.id
         )
+        # --- FIX END
 
         if approval_request_id is None:
             email_settings_to_use: EmailSettings
             email_method_for_log: str
             try:
-                email_settings_to_use, email_method_for_log = get_customer_email_settings(db, lg_record.customer_id)
+                email_settings_to_use, email_method_for_log = get_customer_email_settings(db, db_lg_record.customer_id)
             except Exception as e:
                 email_settings_to_use = get_global_email_settings()
                 email_method_for_log = "global_fallback_due_to_error"
-                logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {lg_record.customer_id}: {e}. Falling back to global settings.")
+                logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {db_lg_record.customer_id}: {e}. Falling back to global settings.")
 
-            email_to_send_to = [lg_record.internal_owner_contact.email]
+            email_to_send_to = [db_lg_record.internal_owner_contact.email]
             cc_emails = []
-            if lg_record.internal_owner_contact.manager_email:
-                cc_emails.append(lg_record.internal_owner_contact.manager_email)
-            if lg_record.lg_category and lg_record.lg_category.communication_list:
-                cc_emails.extend(lg_record.lg_category.communication_list)
+            if db_lg_record.internal_owner_contact.manager_email:
+                cc_emails.append(db_lg_record.internal_owner_contact.manager_email)
+            if db_lg_record.lg_category and db_lg_record.lg_category.communication_list:
+                cc_emails.extend(db_lg_record.lg_category.communication_list)
 
             common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-                db, lg_record.customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+                db, db_lg_record.customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
             )
             if common_comm_list_config and common_comm_list_config.get('effective_value'):
                 try:
@@ -1978,31 +1991,31 @@ class CRUDLGRecord(CRUDBase):
                     if isinstance(parsed_common_list, list) and all(isinstance(e, str) and "@" in e for e in parsed_common_list):
                         cc_emails.extend(parsed_common_list)
                 except json.JSONDecodeError:
-                    logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
+                    logger.warning(f"COMMON_COMMUNICATION_LIST for customer {db_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
             notification_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
 
             if not notification_template:
                 log_action(
-                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
+                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
                     details={"recipient": email_to_send_to, "subject": "N/A", "reason": f"{ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE} notification template (is_notification_template=True) not found", "method": "none"},
-                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                    customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
                 )
-                logger.error(f"LG activated (ID: {lg_record.id}), but failed to send email notification.")
+                logger.error(f"LG activated (ID: {db_lg_record.id}), but failed to send email notification.")
             else:
                 template_data = {
-                    "lg_number": lg_record.lg_number,
-                    "lg_amount": float(lg_record.lg_amount),
-                    "lg_currency": lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": lg_record.issuing_bank.name,
-                    "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-                    "lg_issuer_name": lg_record.issuer_name,
+                    "lg_number": db_lg_record.lg_number,
+                    "lg_amount": float(db_lg_record.lg_amount),
+                    "lg_currency": db_lg_record.lg_currency.iso_code,
+                    "issuing_bank_name": db_lg_record.issuing_bank.name,
+                    "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
+                    "lg_issuer_name": db_lg_record.issuer_name,
                     "current_date": datetime.now().strftime("%Y-%m-%d"),
-                    "customer_name": lg_record.customer.name,
+                    "customer_name": db_lg_record.customer.name,
                     "action_type": "LG Activation",
                     "instruction_serial": db_lg_instruction.serial_number,
-                    "internal_owner_email": lg_record.internal_owner_contact.email,
+                    "internal_owner_email": db_lg_record.internal_owner_contact.email,
                     "payment_method": payment_details.payment_method,
                     "payment_amount": float(payment_details.amount),
                     "payment_currency_code": payment_currency.iso_code,
@@ -2010,7 +2023,7 @@ class CRUDLGRecord(CRUDBase):
                     "payment_issuing_bank_name": payment_bank.name if payment_bank else "N/A",
                     "payment_date": payment_details.payment_date.isoformat(),
                 }
-                template_data["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
+                template_data["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
                 template_data["payment_amount_formatted"] = f"{template_data['payment_currency_code']} {float(payment_details.amount):,.2f}"
 
                 email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
@@ -2022,31 +2035,31 @@ class CRUDLGRecord(CRUDBase):
 
                 email_sent_successfully = await send_email(
                     db=db,
-                    to_emails=to_emails,
+                    to_emails=email_to_send_to,
                     cc_emails=cc_emails,
                     subject_template=email_subject,
                     body_template=email_body_html,
                     template_data=template_data,
                     email_settings=email_settings_to_use,
-                    sender_name=lg_record.customer.name
+                    sender_name=db_lg_record.customer.name
                 )
                 if not email_sent_successfully:
                     log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
+                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
                         details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                        customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
                     )
-                    logger.error(f"LG activated (ID: {lg_record.id}), but failed to send email notification.")
+                    logger.error(f"LG activated (ID: {db_lg_record.id}), but failed to send email notification.")
                 else:
                     log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
+                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=db_lg_record.id,
                         details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                        customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
                     )
 
-        db.refresh(lg_record)
-        return lg_record, db_lg_instruction.id
-
+        db.refresh(db_lg_record)
+        return db_lg_record, db_lg_instruction.id
+        
     def get_lg_record_with_relations(
         self, db: Session, lg_record_id: int, customer_id: Optional[int]
     ) -> Optional[models.LGRecord]:

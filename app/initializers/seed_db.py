@@ -371,6 +371,7 @@ INITIAL_PERMISSIONS = [
     {"name": "lg_instruction:update_status", "description": "Allows updating status of LG instructions (e.g., delivered, confirmed)."},
     {"name": "lg_instruction:cancel_last", "description": "Allows canceling the last issued LG instruction."},
     {"name": "lg_instruction:send_reminder", "description": "Allows sending reminder instructions for LGs."},
+    {"name": "lg_record:activate_non_operative", "description": "Allows Activating none operative LG"},
     {"name": "user:create", "description": "Allows Corporate Admins to create new users for their customer."},
     {"name": "user:view", "description": "Allows Corporate Admins to view users for their customer."},
     {"name": "user:edit", "description": "Allows Corporate Admins to edit users for their customer."},
@@ -431,7 +432,7 @@ ROLE_PERMISSIONS_MAPPING = {
         "lg_record:create", "lg_record:view_own", "lg_record:extend", "lg_record:amend",
         "lg_record:liquidate", "lg_record:release", "lg_record:decrease_amount",
         "lg_instruction:update_status", "lg_instruction:cancel_last", "lg_instruction:send_reminder",
-        "template:view","lg_document:view", "internal_owner_contact:view", "system_notification:view", "lg_record:ai_scan", "lg_instruction:cancel",
+        "template:view","lg_document:view", "internal_owner_contact:view", "system_notification:view", "lg_record:ai_scan", "lg_instruction:cancel","lg_record:activate_non_operative",
     ],
     UserRole.CHECKER.value: [
         "lg_record:view_own", "maker_checker:approve", "system_notification:view",
