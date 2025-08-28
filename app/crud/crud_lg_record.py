@@ -161,13 +161,13 @@ class CRUDLGRecord(CRUDBase):
         delta = obj_in.expiry_date - obj_in.issuance_date
         total_days = delta.days
         lg_period_months = max(
-            3, round(total_days / 30.44 / 3) * 3
-        )
+            3, min(12, round(total_days / 30.44 / 3) * 3
+        ))
 
         lg_record_data["customer_id"] = customer_id
         lg_record_data["lg_period_months"] = lg_period_months
 
-        valid_lg_status = db.query(models.LgStatus).filter(models.LgStatus.id == models.LgStatusEnum.VALID.value).first() # Corrected to models.LgStatusEnum
+        valid_lg_status = db.query(models.LgStatus).filter(models.LgStatus.id == models.LgStatusEnum.VALID.value).first()
         if not valid_lg_status:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -197,7 +197,8 @@ class CRUDLGRecord(CRUDBase):
                 detail="Invalid LG Category ID provided or category not accessible for your customer.",
             )
 
-        if lg_type.id == models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value: # Corrected to models.LgTypeEnum
+        # --- MODIFIED LOGIC START ---
+        if lg_type.id == models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value:
             if obj_in.lg_operational_status_id is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -207,21 +208,24 @@ class CRUDLGRecord(CRUDBase):
             if not op_status:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid LG Operational Status ID provided.",
+                    detail="Invalid LG Operational Status ID provided."
                 )
+            lg_record_data["lg_operational_status_id"] = obj_in.lg_operational_status_id
         else:
             lg_record_data["lg_operational_status_id"] = None
+        # --- MODIFIED LOGIC END ---
 
-        if lg_type.id == models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value and ( # Corrected to models.LgTypeEnum
+        if lg_type.id == models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value and (
             obj_in.lg_operational_status_id is not None
             and db.query(models.LgOperationalStatus).filter(models.LgOperationalStatus.id == obj_in.lg_operational_status_id).first().id
-            == models.LgOperationalStatusEnum.NON_OPERATIVE.value # Corrected to models.LgOperationalStatusEnum
+            == models.LgOperationalStatusEnum.NON_OPERATIVE.value
         ):
             if not obj_in.payment_conditions or not obj_in.payment_conditions.strip():
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Payment Conditions are mandatory when LG Type is 'Advance Payment Guarantee' and Operational Status is 'Non-Operative'.",
                 )
+            lg_record_data["payment_conditions"] = obj_in.payment_conditions
         else:
             lg_record_data["payment_conditions"] = None
 
@@ -231,6 +235,7 @@ class CRUDLGRecord(CRUDBase):
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Applicable Rules Text is mandatory when Applicable Rule is 'Other'.",
                 )
+            lg_record_data["applicable_rules_text"] = obj_in.applicable_rules_text
         else:
             lg_record_data["applicable_rules_text"] = None
 
@@ -245,13 +250,7 @@ class CRUDLGRecord(CRUDBase):
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Custom field '{lg_category.extra_field_name}' is mandatory for the selected LG Category.",
                     )
-            else:
-                if (
-                    not obj_in.additional_field_values
-                    or lg_category.extra_field_name not in obj_in.additional_field_values
-                    or not obj_in.additional_field_values[lg_category.extra_field_name]
-                ):
-                    lg_record_data["additional_field_values"] = None
+            lg_record_data["additional_field_values"] = obj_in.additional_field_values
         else:
             lg_record_data["additional_field_values"] = None
 
@@ -548,7 +547,6 @@ class CRUDLGRecord(CRUDBase):
 
         update_dict = {
             "expiry_date": datetime.combine(new_expiry_date, datetime.min.time()),
-            "lg_period_months": new_lg_period_months,
         }
         updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
 
