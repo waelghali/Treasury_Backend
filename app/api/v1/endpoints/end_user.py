@@ -2538,10 +2538,11 @@ async def send_reminder_to_bank_api(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
         )
+
 @router.get(
     "/lg-records/instructions/generate-all-bank-reminders-pdf",
-    response_class=HTMLResponse,
-    dependencies=[Depends(HasPermission("lg_instruction:send_reminder")), Depends(check_for_read_only_mode)], # ADDED dependency
+    response_model=Dict[str, Any],
+    dependencies=[Depends(HasPermission("lg_instruction:send_reminder")), Depends(check_for_read_only_mode)],
     summary="Generate a consolidated PDF of all eligible LG bank reminder instructions for printing"
 )
 async def generate_all_eligible_bank_reminders_pdf_api(
@@ -2552,9 +2553,8 @@ async def generate_all_eligible_bank_reminders_pdf_api(
     """
     Automatically identifies all LG instructions for the current customer that are eligible
     for a bank reminder (based on predefined conditions), generates a single PDF document
-    containing all such reminders, and returns an HTML response designed to trigger
-    the browser's print dialog. No instruction IDs are passed by the user; the system
-    determines the list automatically.
+    containing all such reminders, and returns a JSON object with the base64-encoded PDF.
+    No instruction IDs are passed by the user; the system determines the list automatically.
     """
     client_host = request.client.host if request else None
 
@@ -2573,31 +2573,12 @@ async def generate_all_eligible_bank_reminders_pdf_api(
 
         pdf_base64 = base64.b64encode(consolidated_pdf_bytes).decode('utf-8')
 
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Print Consolidated LG Bank Reminders</title>
-            <style>
-                body {{ margin: 0; overflow: hidden; }}
-                embed {{ width: 100vw; height: 100vh; border: none; }}
-            </style>
-        </head>
-        <body>
-            <embed src="data:application/pdf;base64,{pdf_base64}" type="application/pdf" width="100%" height="100%">
-            <script>
-                window.onload = function() {{
-                    setTimeout(function() {{
-                        window.print();
-                        # window.close(); // Automatically close the new window/tab after printing
-                    }}, 500);
-                }};
-            </script>
-        </body>
-        </html>
-        """
-        logger.info(f"Generated consolidated PDF for {generated_reminder_count} eligible bank reminders for customer {end_user_context.customer_id}.")
-        return HTMLResponse(content=html_content, status_code=status.HTTP_200_OK)
+        log_action(db, user_id=end_user_context.user_id, action_type="GENERATE_BULK_REMINDER_PDF_SUCCESS", entity_type="LGInstruction", entity_id=None, details={"reminders_generated_count": generated_reminder_count, "eligible_instruction_ids": eligible_instruction_ids}, customer_id=end_user_context.customer_id)
+        
+        return {
+            "message": f"Successfully generated a consolidated PDF for {generated_reminder_count} reminders.",
+            "combined_pdf_base64": pdf_base64
+        }
 
     except HTTPException as e:
         log_action(db, user_id=end_user_context.user_id, action_type="GENERATE_BULK_REMINDER_PDF_FAILED", entity_type="LGInstruction", entity_id=None, details={"reason": str(e.detail), "customer_id": end_user_context.customer_id}, customer_id=end_user_context.customer_id)

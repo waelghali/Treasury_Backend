@@ -523,7 +523,6 @@ class CRUDLGInstruction(CRUDBase):
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "customer_name": lg_record.customer.name,
             "customer_address": customer_address,
-            "customer_phone": customer_phone,
             "customer_contact_email": customer_contact_email,
             "current_date": date.today().strftime("%Y-%m-%d"),
             "platform_name": "Treasury Management Platform",
@@ -685,7 +684,6 @@ class CRUDLGInstruction(CRUDBase):
         # NEW LOGIC: Get customer details for fallback
         customer = customer_obj
         customer_address = customer.address
-        customer_phone = customer.contact_phone
         customer_contact_email = customer.contact_email
 
         for original_instruction in eligible_instructions:
@@ -703,7 +701,6 @@ class CRUDLGInstruction(CRUDBase):
             # Apply the fallback logic at the instruction level for each reminder
             entity = lg_record.beneficiary_corporate
             customer_address_final = entity.address if entity.address else customer_address
-            customer_phone_final = entity.contact_phone if entity.contact_phone else customer_phone
             customer_contact_email_final = entity.contact_email if entity.contact_email else customer_contact_email
 
             days_overdue = (date.today() - original_instruction.instruction_date.date()).days
@@ -735,7 +732,6 @@ class CRUDLGInstruction(CRUDBase):
                 "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
                 "customer_name": lg_record.customer.name,
                 "customer_address": customer_address_final,
-                "customer_phone": customer_phone_final,
                 "customer_contact_email": customer_contact_email_final,
                 "current_date": date.today().strftime("%Y-%m-%d"),
                 "platform_name": "Treasury Management Platform",
