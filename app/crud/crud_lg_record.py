@@ -802,8 +802,9 @@ class CRUDLGRecord(CRUDBase):
         db.flush()
         db.refresh(updated_lg_record)
         return updated_lg_record, db_lg_instruction.id, generated_instruction_html
-        
-    async def release_lg(self, db: Session, lg_record: models.LGRecord, user_id: int, approval_request_id: Optional[int]) -> Tuple[models.LGRecord, int]:
+     
+
+    async def release_lg(self, db: Session, lg_record: models.LGRecord, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
         """
         Releases an LG record. Updates status to "Released", issues a bank letter,
         notifies stakeholders, and marks it as un-actionable.
@@ -849,7 +850,7 @@ class CRUDLGRecord(CRUDBase):
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
 
         if not customer or not entity:
-             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
@@ -936,6 +937,16 @@ class CRUDLGRecord(CRUDBase):
             db_lg_instruction_in_current_session.generated_content_path = generated_content_path
             db.add(db_lg_instruction_in_current_session)
             db.flush()
+
+            # FIX: Link the supporting document to the new instruction
+            if supporting_document_id:
+                db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
+                if db_document and not db_document.lg_instruction_id:
+                    db_document.lg_instruction_id = db_lg_instruction_in_current_session.id
+                    db.add(db_document)
+                    db.flush()
+                    logger.debug(f"Successfully linked supporting document ID {supporting_document_id} to new instruction ID {db_lg_instruction_in_current_session.id}.")
+
 
             db.refresh(lg_record)
             db.refresh(db_lg_instruction_in_current_session)
@@ -1054,7 +1065,7 @@ class CRUDLGRecord(CRUDBase):
                 detail=f"An unexpected internal error occurred after LG release. Please check server logs for details."
             )
 
-    async def liquidate_lg(self, db: Session, lg_record: LGRecord, liquidation_type: str, new_amount: Optional[float], user_id: int, approval_request_id: Optional[int]) -> Tuple[models.LGRecord, int]:
+    async def liquidate_lg(self, db: Session, lg_record: LGRecord, liquidation_type: str, new_amount: Optional[float], user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
         """
         Liquidates an LG record (full or partial). Updates status, adjusts amount,
         issues a bank letter, and notifies stakeholders.
@@ -1118,7 +1129,7 @@ class CRUDLGRecord(CRUDBase):
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
 
         if not customer or not entity:
-             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
@@ -1208,6 +1219,15 @@ class CRUDLGRecord(CRUDBase):
             db_lg_instruction_in_current_session.generated_content_path = generated_content_path
             db.add(db_lg_instruction_in_current_session)
             db.flush()
+
+            # FIX: Link the supporting document to the new instruction
+            if supporting_document_id:
+                db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
+                if db_document and not db_document.lg_instruction_id:
+                    db_document.lg_instruction_id = db_lg_instruction_in_current_session.id
+                    db.add(db_document)
+                    db.flush()
+                    logger.debug(f"Successfully linked supporting document ID {supporting_document_id} to new instruction ID {db_lg_instruction_in_current_session.id}.")
 
             db.refresh(lg_record)
             db.refresh(db_lg_instruction_in_current_session)
@@ -1313,8 +1333,8 @@ class CRUDLGRecord(CRUDBase):
 
         db.refresh(lg_record)
         return lg_record, db_lg_instruction.id
-        
-    async def decrease_lg_amount(self, db: Session, lg_record: LGRecord, decrease_amount: float, user_id: int, approval_request_id: Optional[int]) -> Tuple[models.LGRecord, int]:
+
+    async def decrease_lg_amount(self, db: Session, lg_record: LGRecord, decrease_amount: float, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
         """
         Decreases the amount of an LG record. Updates the amount, issues a bank letter,
         and notifies stakeholders. LG status remains 'Valid'.
@@ -1361,7 +1381,7 @@ class CRUDLGRecord(CRUDBase):
             entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
 
             if not customer or not entity:
-                 raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
+                    raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
 
             customer_address = entity.address if entity.address else customer.address
             customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
@@ -1435,6 +1455,15 @@ class CRUDLGRecord(CRUDBase):
                 db_lg_instruction_in_current_session.generated_content_path = generated_content_path
                 db.add(db_lg_instruction_in_current_session)
                 db.flush()
+                
+                # FIX: Link the supporting document to the new instruction
+                if supporting_document_id:
+                    db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
+                    if db_document and not db_document.lg_instruction_id:
+                        db_document.lg_instruction_id = db_lg_instruction_in_current_session.id
+                        db.add(db_document)
+                        db.flush()
+                        logger.debug(f"Successfully linked supporting document ID {supporting_document_id} to new instruction ID {db_lg_instruction_in_current_session.id}.")
 
                 db.refresh(lg_record)
                 db.refresh(db_lg_instruction_in_current_session)
@@ -1547,261 +1576,7 @@ class CRUDLGRecord(CRUDBase):
             logger.error(f"An unexpected error occurred in decrease_lg_amount for LG {lg_record.id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected internal error occurred during amount decrease: {e}")
             
-    async def toggle_lg_auto_renewal(self, db: Session, lg_record: models.LGRecord, new_auto_renewal_status: bool, user_id: int, customer_id: int, reason: Optional[str], approval_request_id: Optional[int]) -> models.LGRecord:
-        """
-        Toggles the auto_renewal status of an LG record directly, without an approval process
-        and without sending a notification email.
-        """
-        logger.debug(f"[CRUDLGRecord.toggle_lg_auto_renewal] Toggling auto-renewal for LG ID: {lg_record.id} to {new_auto_renewal_status}.")
-
-        if lg_record.lg_status_id != models.LgStatusEnum.VALID.value: # Corrected to models.LgStatusEnum
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Auto-renewal cannot be toggled for LGs in status '{lg_record.lg_status.name}'. Must be 'Valid'."
-            )
-
-        if lg_record.auto_renewal == new_auto_renewal_status:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"LG auto-renewal is already set to {new_auto_renewal_status}."
-            )
-
-        old_auto_renewal_status = lg_record.auto_renewal
-
-        lg_record.auto_renewal = new_auto_renewal_status
-        db.add(lg_record)
-        db.flush()
-
-        logger.info(f"Auto-renewal for LG {lg_record.lg_number} toggled from {old_auto_renewal_status} to {new_auto_renewal_status}. No notification email sent as per requirement.")
-
-        log_action(
-            db, user_id, AUDIT_ACTION_TYPE_LG_AUTO_RENEWAL_TOGGLED, "LGRecord", lg_record.id,
-            {"lg_number": lg_record.lg_number, "old_status": old_auto_renewal_status, "new_status": new_auto_renewal_status, "reason": reason},
-            customer_id, lg_record.id
-        )
-
-        db.refresh(lg_record)
-        return lg_record
-    # NEW METHOD: LG Amend
-    async def amend_lg(self,
-                       db: Session,
-                       lg_record_id: int,
-                       amendment_letter_file: Optional[UploadFile],
-                       amendment_document_metadata: Optional[LGDocumentCreate],
-                       amendment_details: Dict[str, Any],
-                       user_id: int,
-                       customer_id: int,
-                       approval_request_id: Optional[int],
-                       existing_document_id: Optional[int] = None
-                       ) -> models.LGRecord:
-        """
-        Applies amendments to an LG record based on bank amendment letter.
-        This updates the LGRecord fields and logs the changes. No instruction letter is generated.
-        user_id here refers to the actual actor (maker if direct, checker if approved).
-        """
-        logger.debug(f"[CRUDLGRecord.amend_lg] Initiating amendment for LG ID: {lg_record_id}")
-
-        db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, customer_id)
-        if not db_lg_record:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
-
-        if db_lg_record.is_deleted or db_lg_record.lg_status_id in [models.LgStatusEnum.EXPIRED.value, models.LgStatusEnum.LIQUIDATED.value, models.LgStatusEnum.RELEASED.value]: # Corrected to models.LgStatusEnum
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"LG record cannot be amended. Current status: {db_lg_record.lg_status.name}."
-            )
-        acting_user_id = user_id
-
-        updated_lg_record = db_lg_record
-
-        document_id_for_log = None
-
-        if existing_document_id:
-            document_id_for_log = existing_document_id
-            logger.debug(f"[CRUDLGRecord.amend_lg] Using existing amendment document ID from approval request: {document_id_for_log}")
-        elif amendment_letter_file and amendment_document_metadata:
-            customer_obj = db.query(models.Customer).options(selectinload(models.Customer.subscription_plan)).filter(models.Customer.id == customer_id).first()
-            if not customer_obj or not customer_obj.subscription_plan or not customer_obj.subscription_plan.can_image_storage:
-                logger.warning(f"[CRUDLGRecord.amend_lg] Customer's plan '{customer_obj.subscription_plan.name}' does not support image storage. Amendment document will not be stored for direct call.")
-            else:
-                try:
-                    file_bytes = await amendment_letter_file.read()
-                    db_amendment_document = await self.crud_lg_document_instance.create_document(
-                        db,
-                        obj_in=amendment_document_metadata,
-                        file_content=file_bytes,
-                        lg_record_id=db_lg_record.id,
-                        uploaded_by_user_id=user_id
-                    )
-                    document_id_for_log = db_amendment_document.id
-                    logger.debug(f"[CRUDLGRecord.amend_lg] Amendment letter document stored: {db_amendment_document.file_path} for direct call.")
-                except Exception as e:
-                    logger.error(f"[CRUDLGRecord.amend_lg] Failed to store amendment letter for LG {lg_record_id} at maker submission: {e}", exc_info=True)
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store amendment letter: {e}")
-        else:
-            logger.debug(f"No amendment letter file provided or existing document ID found for LG {lg_record_id}. Proceeding without document link for log.")
-
-        updatable_fields = [
-            "lg_amount", "lg_currency_id", "lg_payable_currency_id", "issuance_date",
-            "expiry_date", "auto_renewal", "lg_type_id", "lg_status_id",
-            "lg_operational_status_id", "payment_conditions", "description_purpose",
-            "issuing_bank_id", "issuing_bank_address", "issuing_bank_phone",
-            "issuing_bank_fax", "issuing_method_id", "applicable_rule_id",
-            "applicable_rules_text", "other_conditions", "internal_owner_contact_id",
-            "lg_category_id", "additional_field_values", "internal_contract_project_id",
-            "notes", "lg_number", "beneficiary_corporate_id", "issuer_name", "issuer_id"
-        ]
-
-        updates_to_apply = {}
-        for key, value in amendment_details.items():
-            if key in updatable_fields:
-                if key in ["issuance_date", "expiry_date"] and isinstance(value, str):
-                    try:
-                        updates_to_apply[key] = datetime.strptime(value, "%Y-%m-%d").date()
-                    except ValueError:
-                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid date format for {key}. Expected YYYY-MM-DD.")
-                elif key in ["lg_amount"] and isinstance(value, (int, float, str)):
-                    try:
-                        updates_to_apply[key] = decimal.Decimal(str(value))
-                    except (decimal.InvalidOperation, ValueError):
-                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid numeric format for {key}.")
-                else:
-                    updates_to_apply[key] = value
-            else:
-                logger.warning(f"Attempted to amend non-updatable field: {key}. Skipping.")
-
-        if not updates_to_apply:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid LG fields provided for amendment.")
-
-        old_values_for_log = {key: getattr(db_lg_record, key) for key in updates_to_apply.keys()}
-        for key, value in old_values_for_log.items():
-            if isinstance(value, (date, datetime)):
-                old_values_for_log[key] = value.isoformat()
-            elif isinstance(value, decimal.Decimal):
-                old_values_for_log[key] = float(value)
-
-        updated_lg_record = super().update(db, db_lg_record, obj_in=updates_to_apply)
-
-        if "issuance_date" in updates_to_apply or "expiry_date" in updates_to_apply:
-            if updated_lg_record.issuance_date and updated_lg_record.expiry_date:
-                delta = updated_lg_record.expiry_date.date() - updated_lg_record.issuance_date.date()
-                new_lg_period_months = max(1, round(delta.days / 30.44))
-                updated_lg_record.lg_period_months = new_lg_period_months
-                db.add(updated_lg_record)
-                db.flush()
-                db.refresh(updated_lg_record)
-
-        json_serializable_amended_fields = {}
-        for k, v in updates_to_apply.items():
-            if isinstance(v, decimal.Decimal):
-                json_serializable_amended_fields[k] = float(v)
-            elif isinstance(v, (date, datetime)):
-                json_serializable_amended_fields[k] = v.isoformat()
-            else:
-                json_serializable_amended_fields[k] = v
-
-        log_action(
-            db, acting_user_id, AUDIT_ACTION_TYPE_LG_AMENDED, "LGRecord", updated_lg_record.id,
-            {
-                "lg_number": updated_lg_record.lg_number,
-                "amended_fields": json_serializable_amended_fields,
-                "old_values": old_values_for_log,
-                "amendment_document_id": document_id_for_log,
-                "approved_by_user_id": acting_user_id
-            },
-            updated_lg_record.customer_id, updated_lg_record.id
-        )
-        # Notification Logic for LG_AMEND (only if direct action)
-        if approval_request_id is None: # Only send this notification if it was a direct action, not through approval
-            email_settings_to_use: EmailSettings
-            email_method_for_log: str
-            try:
-                email_settings_to_use, email_method_for_log = get_customer_email_settings(db, updated_lg_record.customer_id)
-            except Exception as e:
-                email_settings_to_use = get_global_email_settings()
-                email_method_for_log = "global_fallback_due_to_error"
-                logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {updated_lg_record.customer_id}: {e}. Falling back to global settings.")
-
-            email_to_send_to = [updated_lg_record.internal_owner_contact.email]
-            cc_emails = []
-            if updated_lg_record.internal_owner_contact.manager_email:
-                cc_emails.append(updated_lg_record.internal_owner_contact.manager_email)
-            if updated_lg_record.lg_category and updated_lg_record.lg_category.communication_list:
-                cc_emails.extend(updated_lg_record.lg_category.communication_list)
-
-            common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-                db, updated_lg_record.customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
-            )
-            if common_comm_list_config and common_comm_list_config.get('effective_value'):
-                try:
-                    parsed_common_list = json.loads(common_comm_list_config['effective_value'])
-                    if isinstance(parsed_common_list, list) and all(isinstance(e, str) and "@" in e for e in parsed_common_list):
-                        cc_emails.extend(parsed_common_list)
-                except json.JSONDecodeError:
-                    logger.warning(f"COMMON_COMMUNICATION_LIST for customer {updated_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
-            cc_emails = list(set(cc_emails))
-
-            notification_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_AMEND, models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
-
-            if not notification_template:
-                log_action(
-                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=updated_lg_record.id,
-                    details={"recipient": email_to_send_to, "subject": "N/A", "reason": f"{ACTION_TYPE_LG_AMEND} notification template (is_notification_template=True) not found", "method": "none"},
-                    customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
-                )
-                logger.error(f"LG amended (ID: {updated_lg_record.id}), but failed to send email notification.")
-            else:
-                template_data = {
-                    "lg_number": updated_lg_record.lg_number,
-                    "amended_fields_summary": ", ".join(json_serializable_amended_fields.keys()),
-                    "lg_amount": float(updated_lg_record.lg_amount),
-                    "lg_currency": updated_lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": updated_lg_record.issuing_bank.name,
-                    "lg_beneficiary_name": updated_lg_record.beneficiary_corporate.entity_name,
-                    "current_date": datetime.now().strftime("%Y-%m-%d"),
-                    "customer_name": updated_lg_record.customer.name,
-                    "action_type": "LG Amendment",
-                    "internal_owner_email": updated_lg_record.internal_owner_contact.email,
-                    "amendment_document_id": document_id_for_log,
-                    "full_amendment_details": json.dumps(json_serializable_amended_fields, indent=2),
-                    "lg_amount_formatted": f"{updated_lg_record.lg_currency.symbol} {float(updated_lg_record.lg_amount):,.2f}",
-                }
-                email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}}"
-                email_body_html = notification_template.content
-                for key, value in template_data.items():
-                    str_value = str(value) if value is not None else ""
-                    email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                    email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
-
-                email_sent_successfully = await send_email(
-                    db=db,
-                    to_emails=email_to_send_to,
-                    cc_emails=cc_emails,
-                    subject_template=email_subject,
-                    body_template=email_body_html,
-                    template_data=template_data,
-                    email_settings=email_settings_to_use,
-                    sender_name=updated_lg_record.customer.name # Use customer name as sender
-                )
-                if not email_sent_successfully:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=updated_lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                        customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
-                    )
-                    logger.error(f"LG amended (ID: {updated_lg_record.id}), but failed to send email notification.")
-                else:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=updated_lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                        customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
-                    )
-        # --- END MODIFIED BLOCK ---
-
-        db.refresh(updated_lg_record)
-        return updated_lg_record
-
-    async def activate_non_operative_lg(self, db: Session, lg_record: LGRecord, payment_details: LGActivateNonOperativeRequest, user_id: int, customer_id: int, approval_request_id: Optional[int]) -> Tuple[models.LGRecord, int]:
+    async def activate_non_operative_lg(self, db: Session, lg_record: LGRecord, payment_details: LGActivateNonOperativeRequest, user_id: int, customer_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
         """
         Activates a non-operative Advance Payment Guarantee.
         Updates operational status to "Operative", creates an activation instruction, and notifies stakeholders.
@@ -1837,10 +1612,10 @@ class CRUDLGRecord(CRUDBase):
             )
 
         if db_lg_record.lg_operational_status_id != models.LgOperationalStatusEnum.NON_OPERATIVE.value:
-             raise HTTPException(
-                 status_code=status.HTTP_400_BAD_REQUEST,
-                 detail=f"LG record must be in 'Non-Operative' operational status to be activated. Current operational status: {db_lg_record.lg_operational_status.name if db_lg_record.lg_operational_status else 'N/A'}."
-             )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"LG record must be in 'Non-Operative' operational status to be activated. Current operational status: {db_lg_record.lg_operational_status.name if db_lg_record.lg_operational_status else 'N/A'}."
+                )
 
         # Update the operational status to 'Operative'
         operative_status = db.query(models.LgOperationalStatus).filter(models.LgOperationalStatus.id == models.LgOperationalStatusEnum.OPERATIVE.value).first()
@@ -1863,7 +1638,7 @@ class CRUDLGRecord(CRUDBase):
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
 
         if not customer or not entity:
-             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
@@ -1943,6 +1718,15 @@ class CRUDLGRecord(CRUDBase):
             db_lg_instruction_in_current_session.generated_content_path = generated_content_path
             db.add(db_lg_instruction_in_current_session)
             db.flush()
+
+            # FIX: Link the supporting document to the new instruction
+            if supporting_document_id:
+                db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
+                if db_document and not db_document.lg_instruction_id:
+                    db_document.lg_instruction_id = db_lg_instruction_in_current_session.id
+                    db.add(db_document)
+                    db.flush()
+                    logger.debug(f"Successfully linked supporting document ID {supporting_document_id} to new instruction ID {db_lg_instruction_in_current_session.id}.")
 
             db.refresh(db_lg_record)
             db.refresh(db_lg_instruction_in_current_session)
@@ -2059,6 +1843,289 @@ class CRUDLGRecord(CRUDBase):
 
         db.refresh(db_lg_record)
         return db_lg_record, db_lg_instruction.id
+
+     
+    async def toggle_lg_auto_renewal(self, db: Session, lg_record: models.LGRecord, new_auto_renewal_status: bool, user_id: int, customer_id: int, reason: Optional[str], approval_request_id: Optional[int]) -> models.LGRecord:
+        """
+        Toggles the auto_renewal status of an LG record directly, without an approval process
+        and without sending a notification email.
+        """
+        logger.debug(f"[CRUDLGRecord.toggle_lg_auto_renewal] Toggling auto-renewal for LG ID: {lg_record.id} to {new_auto_renewal_status}.")
+
+        if lg_record.lg_status_id != models.LgStatusEnum.VALID.value: # Corrected to models.LgStatusEnum
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Auto-renewal cannot be toggled for LGs in status '{lg_record.lg_status.name}'. Must be 'Valid'."
+            )
+
+        if lg_record.auto_renewal == new_auto_renewal_status:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"LG auto-renewal is already set to {new_auto_renewal_status}."
+            )
+
+        old_auto_renewal_status = lg_record.auto_renewal
+
+        lg_record.auto_renewal = new_auto_renewal_status
+        db.add(lg_record)
+        db.flush()
+
+        logger.info(f"Auto-renewal for LG {lg_record.lg_number} toggled from {old_auto_renewal_status} to {new_auto_renewal_status}. No notification email sent as per requirement.")
+
+        log_action(
+            db, user_id, AUDIT_ACTION_TYPE_LG_AUTO_RENEWAL_TOGGLED, "LGRecord", lg_record.id,
+            {"lg_number": lg_record.lg_number, "old_status": old_auto_renewal_status, "new_status": new_auto_renewal_status, "reason": reason},
+            customer_id, lg_record.id
+        )
+
+        db.refresh(lg_record)
+        return lg_record
+
+    async def amend_lg(self,
+                       db: Session,
+                       lg_record_id: int,
+                       amendment_letter_file: Optional[UploadFile],
+                       amendment_document_metadata: Optional[LGDocumentCreate],
+                       amendment_details: Dict[str, Any],
+                       user_id: int,
+                       customer_id: int,
+                       approval_request_id: Optional[int],
+                       existing_document_id: Optional[int] = None
+                       ) -> models.LGRecord:
+        """
+        Applies amendments to an LG record based on bank amendment letter.
+        This updates the LGRecord fields and logs the changes. No instruction letter is generated.
+        user_id here refers to the actual actor (maker if direct, checker if approved).
+        """
+        logger.debug(f"[CRUDLGRecord.amend_lg] Initiating amendment for LG ID: {lg_record_id}")
+
+        db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, customer_id)
+        if not db_lg_record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
+
+        # MODIFIED LOGIC START: Allow amendment for expired LGs within 30 days.
+        current_date = date.today()
+        thirty_days_ago = current_date - timedelta(days=30)
+        
+        is_expired_within_grace_period = (
+            db_lg_record.lg_status_id == models.LgStatusEnum.EXPIRED.value
+            and db_lg_record.expiry_date.date() >= thirty_days_ago
+        )
+
+        if db_lg_record.is_deleted or (db_lg_record.lg_status_id not in [models.LgStatusEnum.VALID.value, models.LgStatusEnum.EXPIRED.value]) or (
+            db_lg_record.lg_status_id == models.LgStatusEnum.EXPIRED.value and not is_expired_within_grace_period
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"LG record cannot be amended. It is either released, liquidated, or expired more than 30 days ago. Current status: {db_lg_record.lg_status.name}."
+            )
+        # MODIFIED LOGIC END
+
+        acting_user_id = user_id
+
+        updated_lg_record = db_lg_record
+
+        document_id_for_log = None
+
+        if existing_document_id:
+            document_id_for_log = existing_document_id
+            logger.debug(f"[CRUDLGRecord.amend_lg] Using existing amendment document ID from approval request: {document_id_for_log}")
+        elif amendment_letter_file and amendment_document_metadata:
+            customer_obj = db.query(models.Customer).options(selectinload(models.Customer.subscription_plan)).filter(models.Customer.id == customer_id).first()
+            if not customer_obj or not customer_obj.subscription_plan or not customer_obj.subscription_plan.can_image_storage:
+                logger.warning(f"[CRUDLGRecord.amend_lg] Customer's plan '{customer_obj.subscription_plan.name}' does not support image storage. Amendment document will not be stored for direct call.")
+            else:
+                try:
+                    file_bytes = await amendment_letter_file.read()
+                    db_amendment_document = await self.crud_lg_document_instance.create_document(
+                        db,
+                        obj_in=amendment_document_metadata,
+                        file_content=file_bytes,
+                        lg_record_id=db_lg_record.id,
+                        uploaded_by_user_id=user_id
+                    )
+                    document_id_for_log = db_amendment_document.id
+                    logger.debug(f"[CRUDLGRecord.amend_lg] Amendment letter document stored: {db_amendment_document.file_path} for direct call.")
+                except Exception as e:
+                    logger.error(f"[CRUDLGRecord.amend_lg] Failed to store amendment letter for LG {lg_record_id} at maker submission: {e}", exc_info=True)
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store amendment letter: {e}")
+        else:
+            logger.debug(f"No amendment letter file provided or existing document ID found for LG {lg_record_id}. Proceeding without document link for log.")
+
+        updatable_fields = [
+            "lg_amount", "lg_currency_id", "lg_payable_currency_id", "issuance_date",
+            "expiry_date", "auto_renewal", "lg_type_id", "lg_status_id",
+            "lg_operational_status_id", "payment_conditions", "description_purpose",
+            "issuing_bank_id", "issuing_bank_address", "issuing_bank_phone",
+            "issuing_bank_fax", "issuing_method_id", "applicable_rule_id",
+            "applicable_rules_text", "other_conditions", "internal_owner_contact_id",
+            "lg_category_id", "additional_field_values", "internal_contract_project_id",
+            "notes", "lg_number", "beneficiary_corporate_id", "issuer_name", "issuer_id"
+        ]
+
+        updates_to_apply = {}
+        for key, value in amendment_details.items():
+            if key in updatable_fields:
+                if key in ["issuance_date", "expiry_date"] and isinstance(value, str):
+                    try:
+                        # FIX: Use date.fromisoformat to handle ISO 8601 dates correctly.
+                        updates_to_apply[key] = date.fromisoformat(value.split("T")[0])
+                    except ValueError:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid date format for {key}. Expected YYYY-MM-DD.")
+                elif key in ["lg_amount"] and isinstance(value, (int, float, str)):
+                    try:
+                        updates_to_apply[key] = decimal.Decimal(str(value))
+                    except (decimal.InvalidOperation, ValueError):
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid numeric format for {key}.")
+                else:
+                    updates_to_apply[key] = value
+            else:
+                logger.warning(f"Attempted to amend non-updatable field: {key}. Skipping.")
+
+        if not updates_to_apply:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid LG fields provided for amendment.")
+
+        old_values_for_log = {key: getattr(db_lg_record, key) for key in updates_to_apply.keys()}
+        for key, value in old_values_for_log.items():
+            if isinstance(value, (date, datetime)):
+                old_values_for_log[key] = value.isoformat()
+            elif isinstance(value, decimal.Decimal):
+                old_values_for_log[key] = float(value)
+
+        updated_lg_record = super().update(db, db_lg_record, obj_in=updates_to_apply)
+
+        # NEW LOGIC START: Check for expired status and future expiry date
+        is_currently_expired = db_lg_record.lg_status_id == models.LgStatusEnum.EXPIRED.value
+        has_future_expiry_date = "expiry_date" in updates_to_apply and updates_to_apply["expiry_date"] > date.today()
+
+        if is_currently_expired and has_future_expiry_date:
+            valid_status = db.query(models.LgStatus).filter(models.LgStatus.id == models.LgStatusEnum.VALID.value).first()
+            if not valid_status:
+                logger.error("System misconfiguration: 'Valid' LG status not found. Cannot automatically update status.")
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="System misconfiguration: 'Valid' status not found.")
+            
+            updated_lg_record.lg_status_id = valid_status.id
+            db.add(updated_lg_record)
+            db.flush()
+            logger.info(f"LG {updated_lg_record.lg_number} status automatically updated from 'Expired' to 'Valid' due to expiry date amendment.")
+        # NEW LOGIC END
+
+
+        if "issuance_date" in updates_to_apply or "expiry_date" in updates_to_apply:
+            if updated_lg_record.issuance_date and updated_lg_record.expiry_date:
+                delta = updated_lg_record.expiry_date.date() - updated_lg_record.issuance_date.date()
+                new_lg_period_months = max(1, round(delta.days / 30.44))
+                updated_lg_record.lg_period_months = new_lg_period_months
+                db.add(updated_lg_record)
+                db.flush()
+                db.refresh(updated_lg_record)
+
+        json_serializable_amended_fields = {}
+        for k, v in updates_to_apply.items():
+            if isinstance(v, decimal.Decimal):
+                json_serializable_amended_fields[k] = float(v)
+            elif isinstance(v, (date, datetime)):
+                json_serializable_amended_fields[k] = v.isoformat()
+            else:
+                json_serializable_amended_fields[k] = v
+
+        log_action(
+            db, acting_user_id, AUDIT_ACTION_TYPE_LG_AMENDED, "LGRecord", updated_lg_record.id,
+            {
+                "lg_number": updated_lg_record.lg_number,
+                "amended_fields": json_serializable_amended_fields,
+                "old_values": old_values_for_log,
+                "amendment_document_id": document_id_for_log,
+                "approved_by_user_id": acting_user_id
+            },
+            updated_lg_record.customer_id, updated_lg_record.id
+        )
+        if approval_request_id is None:
+            email_settings_to_use: EmailSettings
+            email_method_for_log: str
+            try:
+                email_settings_to_use, email_method_for_log = get_customer_email_settings(db, updated_lg_record.customer_id)
+            except Exception as e:
+                email_settings_to_use = get_global_email_settings()
+                email_method_for_log = "global_fallback_due_to_error"
+                logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {updated_lg_record.customer_id}: {e}. Falling back to global settings.")
+
+            email_to_send_to = [updated_lg_record.internal_owner_contact.email]
+            cc_emails = []
+            if updated_lg_record.internal_owner_contact.manager_email:
+                cc_emails.append(updated_lg_record.internal_owner_contact.manager_email)
+            if updated_lg_record.lg_category and updated_lg_record.lg_category.communication_list:
+                cc_emails.extend(updated_lg_record.lg_category.communication_list)
+
+            common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                db, updated_lg_record.customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+            )
+            if common_comm_list_config and common_comm_list_config.get('effective_value'):
+                try:
+                    parsed_common_list = json.loads(common_comm_list_config['effective_value'])
+                    if isinstance(parsed_common_list, list) and all(isinstance(e, str) and "@" in e for e in parsed_common_list):
+                        cc_emails.extend(parsed_common_list)
+                except json.JSONDecodeError:
+                    logger.warning(f"COMMON_COMMUNICATION_LIST for customer {updated_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
+            cc_emails = list(set(cc_emails))
+
+            notification_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_AMEND, models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+
+            if not notification_template:
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=updated_lg_record.id,
+                    details={"recipient": email_to_send_to, "subject": "N/A", "reason": f"{ACTION_TYPE_LG_AMEND} notification template (is_notification_template=True) not found", "method": "none"},
+                    customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
+                )
+                logger.error(f"LG amended (ID: {updated_lg_record.id}), but failed to send email notification.")
+            else:
+                template_data = {
+                    "lg_number": updated_lg_record.lg_number,
+                    "amended_fields_summary": ", ".join(json_serializable_amended_fields.keys()),
+                    "lg_amount": float(updated_lg_record.lg_amount),
+                    "lg_currency": updated_lg_record.lg_currency.iso_code,
+                    "issuing_bank_name": updated_lg_record.issuing_bank.name,
+                    "lg_beneficiary_name": updated_lg_record.beneficiary_corporate.entity_name,
+                    "current_date": datetime.now().strftime("%Y-%m-%d"),
+                    "customer_name": updated_lg_record.customer.name,
+                    "action_type": "LG Amendment",
+                    "internal_owner_email": updated_lg_record.internal_owner_contact.email,
+                    "amendment_document_id": document_id_for_log,
+                    "full_amendment_details": json.dumps(json_serializable_amended_fields, indent=2),
+                    "lg_amount_formatted": f"{updated_lg_record.lg_currency.symbol} {float(updated_lg_record.lg_amount):,.2f}",
+                }
+                email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}}"
+                email_body_html = notification_template.content
+                for key, value in template_data.items():
+                    str_value = str(value) if value is not None else ""
+                    email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
+                    email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
+
+                email_sent_successfully = await send_email(
+                    db=db,
+                    to_emails=email_to_send_to,
+                    cc_emails=cc_emails,
+                    subject_template=email_subject,
+                    body_template=email_body_html,
+                    template_data=template_data,
+                    email_settings=email_settings_to_use,
+                    sender_name=updated_lg_record.customer.name
+                )
+                if not email_sent_successfully:
+                    log_action(
+                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=updated_lg_record.id,
+                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
+                        customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
+                    )
+                    logger.error(f"LG amended (ID: {updated_lg_record.id}), but failed to send email notification.")
+                else:
+                    log_action(
+                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=updated_lg_record.id,
+                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                        customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
+                    )
+        db.refresh(updated_lg_record)
+        return updated_lg_record
         
     def get_lg_record_with_relations(
         self, db: Session, lg_record_id: int, customer_id: Optional[int]
@@ -2108,6 +2175,7 @@ class CRUDLGRecord(CRUDBase):
             .limit(limit)
             .all()
         )
+
     def create_document_model(self, obj_in: LGDocumentCreate, lg_record_id: int, uploaded_by_user_id: int) -> LGDocument:
         document_data = obj_in.model_dump()
         # Extract and remove lg_instruction_id from document_data before unpacking

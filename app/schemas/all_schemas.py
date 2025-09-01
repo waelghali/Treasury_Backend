@@ -1,5 +1,4 @@
 # app/schemas/all_schemas.py
-# app/schemas/all_schemas.py
 from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Union # ADDED Union
@@ -843,10 +842,19 @@ class LGRecordCreate(LGRecordBase):
 
 
 class LGRecordUpdate(BaseModel):
+    # This schema is used for direct CRUD updates, so we'll add the new fields here.
     expiry_date: Optional[date] = Field(None, description="New expiry date for the LG")
     lg_period_months: Optional[int] = Field(None, description="Recalculated duration of the LG in months")
-    lg_amount: Optional[float] = Field(None, ge=0, description="New amount for partial liquidation or decrease")
+    lg_amount: Optional[Decimal] = Field(None, ge=0, description="New amount for partial liquidation or decrease")
     lg_status_id: Optional[int] = Field(None, description="New status for release/liquidation")
+    
+    # NEW fields to allow for amendment updates
+    issuer_name: Optional[str] = Field(None, description="New issuer name")
+    lg_number: Optional[str] = Field(None, max_length=64, description="New LG number")
+    issuance_date: Optional[date] = Field(None, description="New issuance date")
+    issuing_bank_id: Optional[int] = Field(None, description="New issuing bank ID")
+    issuing_bank_address: Optional[str] = Field(None, description="New issuing bank address")
+    # End NEW fields
     pass
 
 class LGRecordAmendRequest(BaseModel):
@@ -855,11 +863,32 @@ class LGRecordAmendRequest(BaseModel):
         description="Dictionary of LGRecord fields to be amended and their new values. "
                     "Keys should match LGRecord model attributes. Example: {'expiry_date': '2025-12-31', 'lg_amount': 50000.0}"
     )
+    amendment_document_id: Optional[int] = Field(None, description="The ID of the uploaded amendment document.")
     ai_extracted_data: Optional[Dict[str, Any]] = Field(
         None,
         description="Optional: Data extracted by AI, presented to the user for review. Not directly used for updating LG."
     )
     reason: Optional[str] = Field(None, description="Reason for amending the LG.")
+
+    @model_validator(mode='after')
+    def validate_amendment_details(self) -> 'LGRecordAmendRequest':
+        allowed_fields = {
+            # ... (other allowed fields)
+            "lg_amount", "issuance_date", "expiry_date", 
+            "issuing_bank_id", "issuing_bank_address", "issuing_bank_phone",
+            "issuing_bank_fax", "lg_type_id", "lg_category_id",
+            "description_purpose", "other_conditions", "notes",
+            "internal_owner_contact_id", "beneficiary_corporate_id",
+            "issuing_method_id", "applicable_rule_id", "applicable_rules_text",
+            "auto_renewal", "payment_conditions", "lg_operational_status_id",
+            "internal_contract_project_id", "issuer_name", "lg_number",
+            # FIX: Add the lg_currency_id field to the allowed_fields set.
+            "lg_currency_id", 
+        }
+        for field in self.amendment_details.keys():
+            if field not in allowed_fields:
+                raise ValueError(f"Field '{field}' is not a valid field for amendment.")
+        return self
 
 class LGActivateNonOperativeRequest(BaseModel):
     payment_method: str = Field(..., description="Payment method used (e.g., 'Wire', 'Check')")
@@ -874,6 +903,16 @@ class LGActivateNonOperativeRequest(BaseModel):
         if self.payment_date > date.today():
             raise ValueError("Payment date cannot be in the future.")
         return self
+    
+    # NEW: Custom model_dump to handle date serialization for JSON fields
+    def model_dump_for_json(self) -> Dict[str, Any]:
+        """
+        Custom dump method to ensure date objects are converted to strings.
+        """
+        data = self.model_dump()
+        if isinstance(data.get("payment_date"), date):
+            data["payment_date"] = data["payment_date"].isoformat()
+        return data
 
 class LGRecordRelease(BaseModel):
     reason: Optional[str] = Field(None, description="Reason for releasing the LG (e.g., contract fulfilled).")
