@@ -298,21 +298,27 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
             logger.debug(text_content[:500] + "..." if len(text_content) > 500 else text_content)
             logger.info(f"--- FULL OCR TEXT END ({file_uri}) ---")
             
+            # CRITICAL FIX: Sanitize the filename to remove invalid path characters
+            sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
+            ocr_output_filename = os.path.join(OCR_INPUT_DIR, f"ocr_input_to_gemini_{sanitized_file_id}.txt")
+            
             # Save OCR text to local file
-            ocr_output_filename = os.path.join(OCR_INPUT_DIR, f"ocr_input_to_gemini_{unique_file_id}.txt")
             with open(ocr_output_filename, "w", encoding="utf-8") as f:
                 f.write(text_content)
             logger.info(f"OCR input for Gemini saved to {ocr_output_filename}")
             # Log OCR cost metric (character count)
             logger.info(f"OCR Cost Metric: {len(text_content)} characters processed by Google Vision.")
+            return text_content
         else:
             logger.warning(f"No text detected by OCR from {file_uri}.")
-        return text_content
+            return None # Ensure None is returned if no text is found.
     except GoogleAPIError as e:
         logger.error(f"Google Vision API error during OCR for {file_uri}: {e}", exc_info=True)
+        # CRITICAL FIX: Reraise the exception or explicitly return None on failure
         return None
     except Exception as e:
         logger.error(f"An unexpected error occurred during Google Vision OCR for {file_uri}: {e}", exc_info=True)
+        # CRITICAL FIX: Reraise the exception or explicitly return None on failure
         return None
 
 # --- PyMuPDF PDF to Image Conversion and GCS Upload ---
@@ -361,9 +367,10 @@ def _sanitize_text_for_json(text: str) -> str:
     text = text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
     return text
 
-# --- Gemini Structured Data Extraction Function ---
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), reraise=True)
-async def extract_structured_data_with_gemini(text_content: str, unique_file_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+async def extract_structured_data_with_gemini(text_content: str, unique_file_id: str, context: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     model = _get_gemini_model()
     if not model:
         logger.error("Gemini AI model is not available or not configured.")
@@ -380,25 +387,73 @@ async def extract_structured_data_with_gemini(text_content: str, unique_file_id:
 
     sanitized_text_content = _sanitize_text_for_json(text_content)
 
-    response_schema = {
-        "type": "OBJECT",
-        "properties": {
-            "issuerName": { "type": "STRING" },
-            "beneficiaryName": { "type": "STRING" },
-            "issuingBankName": { "type": "STRING" },
-            "lgNumber": { "type": "STRING" },
-            "lgAmount": { "type": "NUMBER" },
-            "currency": { "type": "STRING" },
-            "lgType": { "type": "STRING" },
-            "purpose": { "type": "STRING" },
-            "issuanceDate": { "type": "STRING", "format": "date-time" }, 
-            "expiryDate": { "type": "STRING", "format": "date-time" },   
-            "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" } }
-        },
-        "required": ["issuerName", "beneficiaryName", "issuingBankName", "lgNumber", "lgAmount", "currency", "lgType", "purpose", "issuanceDate", "expiryDate"]
-    }
+    is_amendment = context and "lg_record_details" in context
+    
+    if is_amendment:
+        response_schema = {
+            "type": "OBJECT",
+            "properties": {
+                "is_relevant_amendment": { "type": "BOOLEAN", "description": "Does this document refer to the provided LG number?"},
+                "lgNumber": { "type": "STRING", "description": "The LG number as it appears in the amendment document."},
+                "amendedFields": {
+                    "type": "OBJECT",
+                    "description": "A JSON object containing only the fields that are being amended, with their new values.",
+                    "properties": {
+                        "lgAmount": { "type": "NUMBER", "description": "New LG amount."},
+                        "currency": { "type": "STRING", "description": "New currency."},
+                        "expiryDate": { "type": "STRING", "format": "date-time", "description": "New expiry date in YYYY-MM-DD format."},
+                        "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "New or amended conditions."}
+                    },
+                }
+            },
+            "required": ["is_relevant_amendment", "amendedFields"]
+        }
+        
+        lg_number = context["lg_record_details"].get("lgNumber", "")
+        prompt = f"""
+You are a financial document analyst. You have received a document which may be a bank amendment letter for an existing Letter of Guarantee (LG).
 
-    prompt = f"""
+Your task is to:
+1.  Verify if this document is a relevant amendment for LG number: "{lg_number}".
+2.  If it is, extract *only* the fields that are being amended and their new values. Do not include any fields that are not mentioned as changed.
+
+Return your output as a JSON object with the following fields:
+
+1.  **is_relevant_amendment**: A boolean value (true/false). Set this to `true` if the document explicitly refers to the LG number: "{lg_number}". Otherwise, set to `false`.
+2.  **lgNumber**: The LG number as it appears in the amendment document. This should match the provided number for a relevant amendment.
+3.  **amendedFields**: A JSON object containing only the fields that have been changed. The keys should be the field names (e.g., `lgAmount`, `expiryDate`) and the values should be the new values from the document. The date format for `expiryDate` must be YYYY-MM-DD. Omit this object if no amendments are found or if the document is not relevant.
+
+---
+**Important Notes:**
+-   Return **only** the final JSON object—no extra explanations.
+-   If the document is not a relevant amendment, the `is_relevant_amendment` field should be `false`, and `amendedFields` should be an empty object or omitted.
+-   Dates must be in format: `YYYY-MM-DD`
+-   Numbers must be plain (no commas or symbols)
+
+---
+Document Text:
+{sanitized_text_content}
+"""
+
+    else: # Original prompt for new LG documents
+        response_schema = {
+            "type": "OBJECT",
+            "properties": {
+                "issuerName": { "type": "STRING" },
+                "beneficiaryName": { "type": "STRING" },
+                "issuingBankName": { "type": "STRING" },
+                "lgNumber": { "type": "STRING" },
+                "lgAmount": { "type": "NUMBER" },
+                "currency": { "type": "STRING" },
+                "lgType": { "type": "STRING" },
+                "purpose": { "type": "STRING" },
+                "issuanceDate": { "type": "STRING", "format": "date-time" }, 
+                "expiryDate": { "type": "STRING", "format": "date-time" },   
+                "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" } }
+            },
+            "required": ["issuerName", "beneficiaryName", "issuingBankName", "lgNumber", "lgAmount", "currency", "lgType", "purpose", "issuanceDate", "expiryDate"]
+        }
+        prompt = f"""
 You are a financial document analyst. Extract structured data from the following Letter of Guarantee (LG) document. The document may contain both English and Arabic. Use only the provided text—do not rely on outside knowledge or assumptions.
 
 Return your output as a JSON object with the following fields, based strictly on the content of the document.
@@ -491,8 +546,10 @@ Document Text:
         else:
             logger.warning("Gemini usage_metadata not available in response.")
 
-        # Save Gemini output to local file
-        gemini_output_filename = os.path.join(GEMINI_OUTPUT_DIR, f"gemini_output_{unique_file_id}.json")
+        # CRITICAL FIX: Sanitize the filename to remove invalid path characters
+        sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
+        gemini_output_filename = os.path.join(GEMINI_OUTPUT_DIR, f"gemini_output_{sanitized_file_id}.json")
+        
         with open(gemini_output_filename, "w", encoding="utf-8") as f:
             f.write(extracted_data_str)
         logger.info(f"Gemini output saved to {gemini_output_filename}")
@@ -506,6 +563,8 @@ Document Text:
     except Exception as e:
         logger.error(f"Error during Gemini AI extraction: {e}. Raw response: {extracted_data_str if 'extracted_data_str' in locals() else 'N/A'}", exc_info=True)
         raise
+
+
 # --- Main AI Processing Function ---
 async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_number_hint: str = "unknown_lg") -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     logger.info(f"Starting AI processing for MIME type: {mime_type}, LG Hint: {lg_number_hint}")
@@ -586,6 +645,75 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
         if temp_files:
             await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS files for session: {unique_file_id}")
+
+# NEW FUNCTION: For amendment-specific AI processing
+async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record_details: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+    """
+    Dedicated AI function to process a bank amendment letter, confirming its relevance
+    and extracting only the amended fields.
+    """
+    lg_number_hint = lg_record_details.get("lgNumber", "unknown_amendment")
+    logger.info(f"Starting AI processing for LG amendment. LG Hint: {lg_number_hint}")
+    
+    # Initialize return values
+    structured_data = None
+    total_usage_metadata = {
+        "ocr_characters": 0,
+        "gemini_prompt_tokens": 0,
+        "gemini_completion_tokens": 0,
+        "total_pages_processed": 0
+    }
+    raw_text = ""
+    unique_file_id = f"{lg_number_hint}_{uuid.uuid4().hex}"
+    temp_files = []
+    
+    try:
+        # Step 1: Upload file and perform OCR (using existing helpers)
+        if mime_type.startswith("image/"):
+            blob_name = f"lg_amendment_scans_temp/{unique_file_id}/image_{uuid.uuid4().hex}.{mime_type.split('/')[-1]}"
+            gcs_uri_for_ocr = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, mime_type)
+            if gcs_uri_for_ocr:
+                temp_files.append(blob_name)
+                raw_text = await perform_ocr_with_google_vision(gcs_uri_for_ocr, unique_file_id)
+                total_usage_metadata["total_pages_processed"] = 1
+        elif mime_type == "application/pdf":
+            image_uris = await _convert_pdf_to_images_and_upload_to_gcs(file_bytes, GCS_BUCKET_NAME, unique_file_id)
+            if not image_uris:
+                raise Exception("Failed to convert PDF to images for OCR.")
+            temp_files.extend([uri.replace(f"gs://{GCS_BUCKET_NAME}/", "") for uri in image_uris])
+            all_page_texts = [await perform_ocr_with_google_vision(uri, unique_file_id) for uri in image_uris]
+            raw_text = "\\n".join(filter(None, all_page_texts))
+            total_usage_metadata["total_pages_processed"] = len(image_uris)
+        else:
+            raise ValueError(f"Unsupported MIME type: {mime_type}")
+
+        if not raw_text:
+            raise Exception("OCR failed or no text extracted.")
+            
+        total_usage_metadata["ocr_characters"] = len(raw_text)
+
+        # Step 2: Extract structured data using Gemini with a contextual prompt
+        context = {"lg_record_details": lg_record_details}
+        structured_data, gemini_usage_metadata = await extract_structured_data_with_gemini(raw_text, unique_file_id, context=context)
+        
+        if gemini_usage_metadata:
+            total_usage_metadata["gemini_prompt_tokens"] = gemini_usage_metadata.get("prompt_tokens", 0)
+            total_usage_metadata["gemini_completion_tokens"] = gemini_usage_metadata.get("completion_tokens", 0)
+
+        if not structured_data:
+            raise Exception("Gemini AI structured data extraction failed.")
+
+        logger.info("AI amendment processing completed successfully.")
+        return structured_data, total_usage_metadata
+
+    except Exception as e:
+        logger.critical(f"Critical error during AI amendment processing: {e}", exc_info=True)
+        return None, total_usage_metadata
+    finally:
+        # Step 3: Clean up temporary GCS files
+        if temp_files:
+            await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_amendment_scans_temp/{unique_file_id}/")
+            logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
 
 # Example usage (for isolated testing)
 if __name__ == "__main__":

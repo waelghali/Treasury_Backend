@@ -375,12 +375,14 @@ class CRUDApprovalRequest(CRUDBase):
                 logger.debug(f"Approval Request {db_request.id}: Calling crud_instances.crud_lg_record.release_lg.")
                 if not db_request.lg_record:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Associated LG Record not loaded for execution.")
+                supporting_document_id = db_request.request_details.get("supporting_document_id")
 
                 _, instruction_id = await crud_instances.crud_lg_record.release_lg(
                     db,
                     lg_record=db_request.lg_record,
                     user_id=db_request.maker_user_id,
-                    approval_request_id=db_request.id
+                    approval_request_id=db_request.id,
+                    supporting_document_id=supporting_document_id
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"DEBUG: Approval Request {db_request.id}: crud_instances.crud_lg_record.release_lg call completed successfully. Instruction ID: {generated_instruction_id}.")
@@ -394,16 +396,20 @@ class CRUDApprovalRequest(CRUDBase):
                 liquidation_type = db_request.request_details["liquidation_type"]
                 new_amount = db_request.request_details.get("new_amount")
                 logger.debug(f"Approval Request {db_request.id}: Calling crud_instances.crud_lg_record.liquidate_lg with type {liquidation_type}.")
+                supporting_document_id = db_request.request_details.get("supporting_document_id")
+
                 _, instruction_id = await crud_instances.crud_lg_record.liquidate_lg(
                     db,
                     lg_record=db_request.lg_record,
                     liquidation_type=db_request.request_details["liquidation_type"],
                     new_amount=db_request.request_details.get("new_amount"),
                     user_id=db_request.maker_user_id,
-                    approval_request_id=db_request.id
+                    approval_request_id=db_request.id,
+                    supporting_document_id=supporting_document_id # NEW: Pass the document ID
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.liquidate_lg completed. Instruction ID: {generated_instruction_id}.")
+
 
             elif db_request.entity_type == "LGRecord" and db_request.action_type == ACTION_TYPE_LG_DECREASE_AMOUNT:
                 logger.debug(f"Approval Request {db_request.id}: Detected '{ACTION_TYPE_LG_DECREASE_AMOUNT}' action. Preparing to call crud_instances.crud_lg_record.decrease_lg_amount.")
@@ -413,6 +419,7 @@ class CRUDApprovalRequest(CRUDBase):
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Associated LG Record not loaded for execution.")
 
                 decrease_amount = db_request.request_details["decrease_amount"]
+                supporting_document_id = db_request.request_details.get("supporting_document_id")
                 logger.debug(f"Approval Request {db_request.id}: Decrease amount from request_details: {decrease_amount}. Passing to crud_instances.crud_lg_record.decrease_lg_amount.")
 
                 _, instruction_id = await crud_instances.crud_lg_record.decrease_lg_amount(
@@ -420,7 +427,8 @@ class CRUDApprovalRequest(CRUDBase):
                     lg_record=db_request.lg_record,
                     decrease_amount=decrease_amount,
                     user_id=db_request.maker_user_id,
-                    approval_request_id=db_request.id
+                    approval_request_id=db_request.id,
+                    supporting_document_id=supporting_document_id
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.decrease_lg_amount call successfully awaited. Instruction ID: {generated_instruction_id}.")
@@ -457,6 +465,7 @@ class CRUDApprovalRequest(CRUDBase):
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Associated LG Record not loaded for execution.")
 
                 payment_details = LGActivateNonOperativeRequest(**db_request.request_details)
+                supporting_document_id = db_request.request_details.get("supporting_document_id")
 
                 _, instruction_id = await crud_instances.crud_lg_record.activate_non_operative_lg(
                     db,
@@ -464,7 +473,8 @@ class CRUDApprovalRequest(CRUDBase):
                     payment_details=payment_details,
                     user_id=db_request.maker_user_id,
                     customer_id=customer_id,
-                    approval_request_id=db_request.id
+                    approval_request_id=db_request.id,
+                    supporting_document_id=supporting_document_id
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.activate_non_operative_lg call completed. Instruction ID: {generated_instruction_id}.")
@@ -765,7 +775,6 @@ class CRUDApprovalRequest(CRUDBase):
             logger.info(f"Auto-rejected {len(auto_rejected_requests)} expired approval requests.")
 
         return auto_rejected_requests
-
 
     async def _send_approval_for_processing_notification(self, db: Session, approval_request: models.ApprovalRequest):
         logger.info(f"Attempting to send 'Approval for Processing' notification for Approval Request ID: {approval_request.id}.")
