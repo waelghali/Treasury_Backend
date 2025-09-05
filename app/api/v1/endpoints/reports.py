@@ -212,8 +212,15 @@ def get_avg_bank_processing_time(
 ):
     if user_context['role'] not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
-    
-    data = crud_reports.get_chart_data(db, "bank_processing_times", user_context)
+
+    # Modified logic: Check the user's role and fetch global data if the user is a CORPORATE_ADMIN
+    if user_context['role'] == UserRole.CORPORATE_ADMIN:
+        global_user_context = {"role": UserRole.SYSTEM_OWNER} # Create a new context to bypass customer filtering
+        data = crud_reports.get_chart_data(db, "bank_processing_times", global_user_context)
+    else:
+        # For System Owners, the default user_context is already global
+        data = crud_reports.get_chart_data(db, "bank_processing_times", user_context)
+
     return {"report_date": date.today(), "data": data}
 
 @router.get("/bank-market-share", response_model=BankMarketShareReportOut, summary="Bank market share (Pie Chart)")
