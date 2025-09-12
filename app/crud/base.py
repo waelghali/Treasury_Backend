@@ -103,9 +103,57 @@ class CRUDBase:
         db.refresh(db_obj)
         return db_obj
 
+
 # =====================================================================================
 # Log Action Utility
 # =====================================================================================
+
+def sanitize_log_details(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Recursively sanitizes a dictionary of log details to remove or mask sensitive information.
+    
+    This function checks for a predefined list of sensitive keywords in dictionary keys
+    and replaces their corresponding values with '********'. It also handles nested
+    dictionaries and lists of dictionaries to ensure deep sanitization.
+    """
+    if not data:
+        return None
+
+    sensitive_keys = [
+        "password",
+        "new_password",
+        "current_password",
+        "token",
+        "access_token",
+        "smtp_password",
+        "smtp_password_encrypted",
+        "key",
+        "secret",
+        "api_key",
+        "credentials"
+    ]
+    
+    sanitized_data = data.copy()
+    
+    for key, value in data.items():
+        # Mask direct sensitive key-value pairs
+        if any(sk in key.lower() for sk in sensitive_keys):
+            sanitized_data[key] = "********"
+        
+        # Recursively sanitize nested dictionaries
+        elif isinstance(value, dict):
+            sanitized_data[key] = sanitize_log_details(value)
+            
+        # Recursively sanitize lists of dictionaries
+        elif isinstance(value, list):
+            sanitized_data[key] = [
+                sanitize_log_details(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+            
+    return sanitized_data
+
+
 def log_action(
     db: Session,
     user_id: Optional[int],
@@ -118,15 +166,18 @@ def log_action(
     ip_address: Optional[str] = None,
 ):
     """
-    Logs an action to the AuditLog.
+    Logs an action to the AuditLog after sanitizing the details.
     """
     try:
+        # CRITICAL CHANGE: Sanitize the details dictionary before creating the log
+        sanitized_details = sanitize_log_details(details)
+        
         audit_log_entry = AuditLog(
             user_id=user_id,
             action_type=action_type,
             entity_type=entity_type,
             entity_id=entity_id,
-            details=details,
+            details=sanitized_details, # Use the sanitized data
             customer_id=customer_id,
             lg_record_id=lg_record_id,
             ip_address=ip_address,

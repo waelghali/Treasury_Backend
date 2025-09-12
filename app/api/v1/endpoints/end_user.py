@@ -121,7 +121,7 @@ try:
         get_current_active_user,
         get_current_user,
         check_subscription_status,
-        check_for_read_only_mode
+        check_for_read_only_mode, get_client_ip
     )
     from app.core.ai_integration import process_lg_document_with_ai, generate_signed_gcs_url, process_amendment_with_ai
 
@@ -210,7 +210,7 @@ async def run_auto_renewal_endpoint(
     Triggers the bulk auto-renewal and force-renewal process for eligible LG records.
     Returns a summary of renewed LGs and the combined instruction PDF.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     try:
         renewed_count, combined_pdf_bytes = await crud_lg_record.run_auto_renewal_process(
@@ -270,7 +270,7 @@ async def create_lg_record(
     Performs comprehensive validation and links associated documents.
     Now accepts JSON data as a form field and files as UploadFile objects.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     # Parse the JSON string back into a Pydantic model
     try:
@@ -353,7 +353,7 @@ async def scan_lg_file(
     Returns a dictionary of extracted fields for form auto-population.
     This endpoint checks if the customer's plan supports AI integration.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     ai_usage_metadata = {}
     customer = crud_customer.get_with_relations(db, end_user_context.customer_id)
     if not customer or not customer.subscription_plan or not customer.subscription_plan.can_ai_integration:
@@ -475,7 +475,7 @@ async def scan_amendment_letter_file(
     Performs AI scanning of a bank amendment letter to extract structured data
     and confirms its relevance to the specified LG record.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
     if not lg_record:
@@ -688,16 +688,22 @@ async def get_lg_record_by_id(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
     return lg_record
 
-
 @router.post(
     "/lg-records/{lg_record_id}/extend",
     response_model=Dict[str, Any],
-    dependencies=[Depends(HasPermission("lg_record:extend")), Depends(check_for_read_only_mode)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:extend")), Depends(check_for_read_only_mode)],
     summary="Extend an LG record and return new instruction ID"
 )
 async def extend_lg_record(
     lg_record_id: int,
-    new_expiry_date: date = Body(..., embed=True),
+    # NEW: Expect the request body to be a JSON object containing the new_expiry_date and optional notes
+    request_body: Dict[str, Any] = Body(
+        ...,
+        example={
+            "new_expiry_date": "2026-12-31",
+            "notes": "Extending due to a new project milestone.",
+        }
+    ),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -708,11 +714,28 @@ async def extend_lg_record(
     Returns the updated LG record and the ID of the newly created instruction.
     Requires 'lg_record:extend' permission.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
+    
+    new_expiry_date = request_body.get("new_expiry_date")
+    notes = request_body.get("notes") # NEW: Extract notes from the request body
+
+    if not new_expiry_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="new_expiry_date is required in the request body."
+        )
+    
+    try:
+        new_expiry_date_obj = datetime.strptime(new_expiry_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid date format for new_expiry_date. Please use YYYY-MM-DD."
+        )
 
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
     if not db_lg_record:
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": "LG Record not found or not accessible to user's customer", "new_expiry_date": new_expiry_date.isoformat()}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
+        log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": "LG Record not found or not accessible to user's customer", "new_expiry_date": new_expiry_date}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="LG Record not found or you do not have access to it.")
 
     customer = crud_customer.get_with_relations(db, end_user_context.customer_id)
@@ -721,12 +744,11 @@ async def extend_lg_record(
 
     action_type = ACTION_TYPE_LG_EXTEND
 
-    current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL # This will be True
+    current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
 
-    # --- REVISED BLOCKING LOGIC START ---
-    if current_action_requires_maker_checker: # This condition is True
+    if current_action_requires_maker_checker:
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, lg_record_id, end_user_context.customer_id)
-        if existing_pending_requests: # If ANY pending request exists, this block executes and raises HTTPException
+        if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -737,8 +759,9 @@ async def extend_lg_record(
         updated_lg_record_db, latest_instruction_id, _ = await crud_lg_record.extend_lg(
             db,
             lg_record_id=lg_record_id,
-            new_expiry_date=new_expiry_date,
-            user_id=end_user_context.user_id
+            new_expiry_date=new_expiry_date_obj,
+            user_id=end_user_context.user_id,
+            notes=notes # NEW: Pass notes to the crud function
         )
         return {
             "lg_record": LGRecordOut.model_validate(updated_lg_record_db),
@@ -746,29 +769,25 @@ async def extend_lg_record(
         }
 
     except HTTPException as e:
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": str(e.detail), "new_expiry_date": new_expiry_date.isoformat()}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
+        log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": str(e.detail), "new_expiry_date": new_expiry_date}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
         raise
     except Exception as e:
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": f"An unexpected error occurred: {e}", "new_expiry_date": new_expiry_date.isoformat()}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
+        log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": f"An unexpected error occurred: {e}", "new_expiry_date": new_expiry_date}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
         )
 
-
-
-
-
-
 @router.post(
     "/lg-records/{lg_record_id}/release",
     response_model=Dict[str, Any],
-    dependencies=[Depends(HasPermission("lg_record:release")), Depends(check_for_read_only_mode)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:release")), Depends(check_for_read_only_mode)],
     summary="Release an LG record (potentially via Maker-Checker workflow)"
 )
 async def release_lg_record(
     lg_record_id: int,
     reason: str = Form(..., description="Reason for releasing the LG."),
+    notes: Optional[str] = Form(None, description="Additional notes for the action."), # NEW: Add notes field
     internal_supporting_document_file: Optional[UploadFile] = File(None, description="Optional internal supporting document."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -779,8 +798,10 @@ async def release_lg_record(
     If Maker-Checker is enabled for the customer, an ApprovalRequest is created.
     Otherwise, the LG is released directly.
     """
-    client_host = request.client.host if request else None
-    release_in = LGRecordRelease(reason=reason)
+    client_host = get_client_ip(request) if request else None
+    
+    # NEW: Include notes in the release_in object for validation and passing to CRUD
+    release_in = LGRecordRelease(reason=reason, notes=notes)
     
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
     if not db_lg_record:
@@ -798,7 +819,7 @@ async def release_lg_record(
 
     action_type = ACTION_TYPE_LG_RELEASE
 
-    current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL # This will be True
+    current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
 
     document_id_for_approval_request = None
     if internal_supporting_document_file:
@@ -825,22 +846,21 @@ async def release_lg_record(
             logger.error(f"Failed to store supporting document for LG {lg_record_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store supporting document: {e}")
 
-    # --- REVISED BLOCKING LOGIC START ---
-    if current_action_requires_maker_checker: # This condition is True
+    if current_action_requires_maker_checker:
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, lg_record_id, end_user_context.customer_id)
-        if existing_pending_requests: # If ANY pending request exists, this block executes and raises HTTPException
+        if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Another action ({first_pending_req.action_type}) is already pending approval for this LG Record (Request ID: {first_pending_req.id}, Status: {first_pending_req.status.value}). This Maker-Checker action cannot be submitted until the pending action is resolved."
             )
 
-    if customer.subscription_plan.can_maker_checker: # Maker-Checker check only if action_type is in ACTION_TYPES_REQUIRING_APPROVAL
+    if customer.subscription_plan.can_maker_checker:
         # Maker-Checker flow: Create Approval Request
         try:
             lg_snapshot = crud_approval_request._get_lg_record_snapshot(db_lg_record)
             
-            request_details = release_in.model_dump()
+            request_details = release_in.model_dump() # NEW: Use the release_in model which contains notes
             if document_id_for_approval_request:
                 request_details["supporting_document_id"] = document_id_for_approval_request
             
@@ -871,6 +891,7 @@ async def release_lg_record(
                     "status": db_approval_request.status.value,
                     "maker_email": end_user_context.email,
                     "reason_for_request": release_in.reason,
+                    "notes_for_request": release_in.notes, # NEW: Include notes in the log
                     "supporting_document_id": document_id_for_approval_request,
                 },
                 customer_id=end_user_context.customer_id,
@@ -899,7 +920,8 @@ async def release_lg_record(
                 lg_record=db_lg_record,
                 user_id=end_user_context.user_id,
                 approval_request_id=None,
-                supporting_document_id=document_id_for_approval_request
+                supporting_document_id=document_id_for_approval_request,
+                notes=release_in.notes # NEW: Pass notes to the crud function
             )
 
             return {
@@ -917,7 +939,6 @@ async def release_lg_record(
                 detail=f"An unexpected error occurred during direct release: {e}"
             )
 
-# NEW ENDPOINT: LG Liquidation
 @router.post(
     "/lg-records/{lg_record_id}/liquidate",
     response_model=Dict[str, Any],
@@ -930,6 +951,7 @@ async def liquidate_lg_record(
     liquidation_type: str = Form(..., description="Type of liquidation: 'full' or 'partial'."),
     new_amount: Optional[float] = Form(None, description="The new amount of the LG if partial liquidation."),
     reason: str = Form(..., description="Reason for liquidating the LG."),
+    notes: Optional[str] = Form(None, description="Additional notes for the action."), # ADDED THIS LINE
     internal_supporting_document_file: Optional[UploadFile] = File(None, description="Optional supporting document."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -940,13 +962,14 @@ async def liquidate_lg_record(
     If Maker-Checker is enabled for the customer, an ApprovalRequest is created.
     Otherwise, the LG is liquidated directly.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     # FIX: Manually create the Pydantic model for validation
     liquidation_in = LGRecordLiquidation(
         liquidation_type=liquidation_type,
         new_amount=new_amount,
-        reason=reason
+        reason=reason,
+        notes=notes # Now the notes are part of the model
     )
 
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
@@ -1048,6 +1071,7 @@ async def liquidate_lg_record(
                     "new_amount": liquidation_in.new_amount,
                     "reason_for_request": liquidation_in.reason,
                     "supporting_document_id": document_id_for_approval_request,
+                    "notes": liquidation_in.notes, # ADDED: Log the notes in the submission details
                 },
                 customer_id=end_user_context.customer_id,
                 lg_record_id=lg_record_id,
@@ -1078,7 +1102,8 @@ async def liquidate_lg_record(
                 user_id=end_user_context.user_id,
                 approval_request_id=None,
                 # NEW: Pass document ID and file to the crud method
-                supporting_document_id=document_id_for_approval_request
+                supporting_document_id=document_id_for_approval_request,
+                notes=liquidation_in.notes # PASS THE NOTES HERE
             )
 
             return {
@@ -1096,7 +1121,6 @@ async def liquidate_lg_record(
                 detail=f"An unexpected error occurred during direct liquidation: {e}"
             )
 
-# NEW ENDPOINT: Decrease LG Amount
 @router.post(
     "/lg-records/{lg_record_id}/decrease-amount",
     response_model=Dict[str, Any],
@@ -1105,9 +1129,9 @@ async def liquidate_lg_record(
 )
 async def decrease_lg_amount_record(
     lg_record_id: int,
-    # FIX: Change to Form and File parameters to handle file uploads
     decrease_amount: float = Form(..., gt=0, description="The amount to decrease the LG by."),
     reason: str = Form(..., description="Reason for decreasing the LG amount."),
+    notes: Optional[str] = Form(None, description="Additional notes for the action."), # NEW: Add notes field
     internal_supporting_document_file: Optional[UploadFile] = File(None, description="Optional internal supporting document."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -1118,10 +1142,10 @@ async def decrease_lg_amount_record(
     If Maker-Checker is enabled for the customer, an ApprovalRequest is created.
     Otherwise, the LG amount is decreased directly.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
-    # FIX: Manually create the Pydantic model for validation
-    decrease_in = LGRecordDecreaseAmount(decrease_amount=decrease_amount, reason=reason)
+    # NEW: Include notes in the decrease_in object
+    decrease_in = LGRecordDecreaseAmount(decrease_amount=decrease_amount, reason=reason, notes=notes)
 
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
     if not db_lg_record:
@@ -1145,7 +1169,6 @@ async def decrease_lg_amount_record(
     action_type = ACTION_TYPE_LG_DECREASE_AMOUNT
     current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
     
-    # NEW: Handle document upload logic
     document_id_for_approval_request = None
     if internal_supporting_document_file:
         if not customer.subscription_plan.can_image_storage:
@@ -1184,6 +1207,7 @@ async def decrease_lg_amount_record(
         try:
             lg_snapshot = crud_approval_request._get_lg_record_snapshot(db_lg_record)
 
+            # NEW: Include notes in the request_details
             request_details = decrease_in.model_dump()
             if document_id_for_approval_request:
                 request_details["supporting_document_id"] = document_id_for_approval_request
@@ -1216,6 +1240,7 @@ async def decrease_lg_amount_record(
                     "maker_email": end_user_context.email,
                     "decrease_amount": decrease_in.decrease_amount,
                     "reason_for_request": decrease_in.reason,
+                    "notes": decrease_in.notes, # NEW: Log the notes
                     "supporting_document_id": document_id_for_approval_request
                 },
                 customer_id=end_user_context.customer_id,
@@ -1244,7 +1269,8 @@ async def decrease_lg_amount_record(
                 decrease_amount=decrease_in.decrease_amount,
                 user_id=end_user_context.user_id,
                 approval_request_id=None,
-                supporting_document_id=document_id_for_approval_request
+                supporting_document_id=document_id_for_approval_request,
+                notes=decrease_in.notes # NEW: Pass notes to the crud function
             )
             return {
                 "message": f"LG '{updated_lg.lg_number}' amount decreased directly.",
@@ -1261,7 +1287,6 @@ async def decrease_lg_amount_record(
                 detail=f"An unexpected error occurred during direct decrease: {e}"
             )
 
-
 @router.post(
     "/lg-records/{lg_record_id}/activate-non-operative",
     response_model=Dict[str, Any],
@@ -1270,13 +1295,13 @@ async def decrease_lg_amount_record(
 )
 async def activate_non_operative_lg_record(
     lg_record_id: int,
-    # FIX: Change to Form and File parameters to handle file uploads
     payment_method: str = Form(..., description="Payment method used (e.g., 'Wire', 'Check')"),
     currency_id: int = Form(..., description="ID of the Currency for the payment."),
     amount: float = Form(..., gt=0, description="The payment amount."),
     payment_reference: str = Form(..., max_length=100, description="Wire reference or check number."),
-    issuing_bank_id: int = Form(..., description="ID of the Issuing Bank related to the payment."),
+    issuing_bank_id: int = Form(..., description="ID of the Issuing Bank related to the payment."), # NEW: Add this line
     payment_date: date = Form(..., description="Date the payment was made (DD/MM/YYYY)."),
+    notes: Optional[str] = Form(None, description="Additional notes for the action."),
     internal_supporting_document_file: Optional[UploadFile] = File(None, description="Optional internal supporting document."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -1286,16 +1311,16 @@ async def activate_non_operative_lg_record(
     Activates a non-operative Advance Payment Guarantee by processing payment details.
     If Maker-Checker is enabled, an ApprovalRequest is created. Otherwise, the LG is activated directly.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
-    # FIX: Manually create the Pydantic model for validation
     activate_in = LGActivateNonOperativeRequest(
         payment_method=payment_method,
         currency_id=currency_id,
         amount=amount,
         payment_reference=payment_reference,
         issuing_bank_id=issuing_bank_id,
-        payment_date=payment_date
+        payment_date=payment_date,
+        notes=notes
     )
 
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
@@ -1320,7 +1345,6 @@ async def activate_non_operative_lg_record(
 
     action_type = ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE
     
-    # NEW: Handle document upload logic
     document_id_for_approval_request = None
     if internal_supporting_document_file:
         if not customer.subscription_plan.can_image_storage:
@@ -1346,17 +1370,15 @@ async def activate_non_operative_lg_record(
             logger.error(f"Failed to store supporting document for LG {lg_record_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store supporting document: {e}")
 
-    # FIX: Also serialize payment_details here to make it available for all log actions
     serialized_payment_details = activate_in.model_dump_for_json()
     if document_id_for_approval_request:
         serialized_payment_details["supporting_document_id"] = document_id_for_approval_request
 
     current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
     
-    # --- REVISED BLOCKING LOGIC START ---
-    if current_action_requires_maker_checker: # This condition is True
+    if current_action_requires_maker_checker:
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, lg_record_id, end_user_context.customer_id)
-        if existing_pending_requests: # If ANY pending request exists, this block executes and raises HTTPException
+        if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1382,7 +1404,6 @@ async def activate_non_operative_lg_record(
                 lg_record=db_lg_record
             )
             
-            # FIX: Move the log_action call for submission inside this block
             log_action(
                 db,
                 user_id=end_user_context.user_id,
@@ -1406,11 +1427,9 @@ async def activate_non_operative_lg_record(
                 "lg_record": LGRecordOut.model_validate(db_lg_record)
             }
         except HTTPException as e:
-            # FIX: The log_action calls here also need to use the serialized details
             log_action(db, user_id=end_user_context.user_id, action_type="LG_ACTIVATED_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"lg_number": db_lg_record.lg_number, "reason": str(e.detail), "payment_details": serialized_payment_details}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
             raise
         except Exception as e:
-            # FIX: The log_action calls here also need to use the serialized details
             log_action(db, user_id=end_user_context.user_id, action_type="LG_ACTIVATED_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"lg_number": db_lg_record.lg_number, "reason": f"An unexpected error occurred during approval request creation: {e}", "payment_details": serialized_payment_details}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1425,7 +1444,8 @@ async def activate_non_operative_lg_record(
                 user_id=end_user_context.user_id,
                 customer_id=end_user_context.customer_id,
                 approval_request_id=None,
-                supporting_document_id=document_id_for_approval_request
+                supporting_document_id=document_id_for_approval_request,
+                notes=activate_in.notes
             )
             return {
                 "message": f"LG '{activated_lg.lg_number}' activated directly.",
@@ -1433,20 +1453,15 @@ async def activate_non_operative_lg_record(
                 "latest_instruction_id": latest_instruction_id
             }
         except HTTPException as e:
-            # FIX: The log_action calls here also need to use the serialized details
             log_action(db, user_id=end_user_context.user_id, action_type="LG_ACTIVATED_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"lg_number": db_lg_record.lg_number, "reason": str(e.detail), "payment_details": serialized_payment_details}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
             raise
         except Exception as e:
-            # FIX: The log_action calls here also need to use the serialized details
             log_action(db, user_id=end_user_context.user_id, action_type="LG_ACTIVATED_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"lg_number": db_lg_record.lg_number, "reason": f"An unexpected error occurred during direct activation: {e}", "payment_details": serialized_payment_details}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"An unexpected error occurred during direct activation: {e}"
             )
-
-
-
-
+            
 @router.post(
     "/lg-records/{lg_record_id}/amend",
     response_model=Dict[str, Any],
@@ -1468,7 +1483,7 @@ async def amend_lg_record(
     If Maker-Checker is enabled, an ApprovalRequest is created. Otherwise, the LG is amended directly.
     The `amendment_details` is provided as a JSON string.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     try:
         parsed_amendment_details = json.loads(amendment_details_json_str)
@@ -1647,7 +1662,7 @@ async def toggle_lg_auto_renewal_api(
     Toggles the auto-renewal status of an LG record directly, without using the Maker-Checker workflow.
     No approval request is created, and no notification email is sent.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
     if not db_lg_record:
@@ -1930,7 +1945,7 @@ async def record_instruction_delivery_api(
     Records the delivery details for a specific LG instruction.
     Allows specifying delivery date and an optional supporting document.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     # Manually create the LGInstructionRecordDelivery object
     file_bytes = None
@@ -2006,7 +2021,7 @@ async def record_bank_reply_api(
     end_user_context: TokenData = Depends(get_current_end_user_context),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     file_bytes = None
     bank_reply_document_data = None
@@ -2728,7 +2743,7 @@ async def send_reminder_to_bank_api(
     for an LG instruction that has not yet received a bank reply.
     Creates a new LGInstruction record of type 'LG_REMINDER_TO_BANKS'.
     """
-    client_host = request.client.host if request else None # This is your reference indentation
+    client_host = get_client_ip(request) if request else None # This is your reference indentation
 
     try:
         lg_record, new_instruction_id, generated_pdf_bytes = await crud_lg_instruction.send_bank_reminder(
@@ -2803,7 +2818,7 @@ async def generate_all_eligible_bank_reminders_pdf_api(
     containing all such reminders, and returns a JSON object with the base64-encoded PDF.
     No instruction IDs are passed by the user; the system determines the list automatically.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     try:
         consolidated_pdf_bytes, generated_reminder_count, eligible_instruction_ids = await crud_lg_instruction.generate_all_eligible_bank_reminders_pdf(
@@ -3112,7 +3127,7 @@ async def cancel_lg_instruction(
     end_user_context: TokenData = Depends(get_current_end_user_context),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     
     # 1. Fetch the instruction to get the LG Record ID
     db_instruction = crud_lg_instruction.get(db, instruction_id)

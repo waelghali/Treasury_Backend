@@ -307,6 +307,7 @@ INITIAL_PERMISSIONS = [
     {"name": "system_notification:create", "description": "Allows creating a notification."},
     {"name": "system_notification:edit", "description": "Allows editing a notification."},
     {"name": "system_notification:delete", "description": "Allows deleting a notification."},
+    {"name": "system_owner:run_scheduler_job", "description": "Allows running scheduled jobs."},
     {"name": "subscription_plan:view", "description": "Allows viewing subscription plans."},
     {"name": "subscription_plan:create", "description": "Allows creating new subscription plans."},
     {"name": "subscription_plan:edit", "description": "Allows editing existing subscription plans."},

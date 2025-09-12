@@ -521,7 +521,7 @@ class CRUDLGRecord(CRUDBase):
         )
         return db_lg_record
 
-    async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int) -> Tuple[models.LGRecord, int, str]:
+    async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None) -> Tuple[models.LGRecord, int, str]: # NEW: Add notes parameter
         db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
         if not db_lg_record:
             raise HTTPException(
@@ -558,7 +558,6 @@ class CRUDLGRecord(CRUDBase):
                 detail="LG Extension Instruction template not found. Please ensure a global 'LG_EXTENSION' template (non-notification) exists."
             )
         
-        # --- NEW LOGIC: Apply fallback for customer/entity details ---
         customer = db.query(models.Customer).filter(models.Customer.id == db_lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
         
@@ -567,8 +566,6 @@ class CRUDLGRecord(CRUDBase):
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
-        # --- END NEW LOGIC ---
-
         customer_name = customer.name if customer else "N/A"
         current_date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -588,11 +585,19 @@ class CRUDLGRecord(CRUDBase):
             "lg_issuer_name": updated_lg_record.issuer_name,
             "lg_beneficiary_name": updated_lg_record.beneficiary_corporate.entity_name,
             "customer_name": customer_name,
-            "customer_address": customer_address,  # NEW
-            "customer_contact_email": customer_contact_email, # NEW
+            "customer_address": customer_address,
+            "customer_contact_email": customer_contact_email,
             "current_date": current_date_str,
             "platform_name": "Grow BD Treasury Management Platform",
         }
+        
+        notes_html = ""
+        if notes:
+            notes_html = f"""
+            <h3>Additional Notes</h3>
+            <p>{notes}</p>
+            """
+        instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
 
         instruction_details["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
 
@@ -601,7 +606,6 @@ class CRUDLGRecord(CRUDBase):
             str_value = str(value) if value is not None else ""
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
-        # --- MODIFIED BLOCK START ---
         try:
             instruction_create_payload_for_schema = {
                 "lg_record_id": db_lg_record.id,
@@ -650,7 +654,6 @@ class CRUDLGRecord(CRUDBase):
             db.rollback()
             logger.exception(f"An unexpected error occurred during LG extension for LG {db_lg_record.lg_number}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG extension: {e}")
-        # --- MODIFIED BLOCK END ---
 
         customer_with_email_settings = db.query(models.Customer).options(selectinload(models.Customer.customer_email_settings)).filter(models.Customer.id == db_lg_record.customer_id).first()
 
@@ -726,6 +729,7 @@ class CRUDLGRecord(CRUDBase):
                 "instruction_serial": db_lg_instruction.serial_number,
                 "issue_date": db_lg_record.issuance_date.date().isoformat(),
                 "lg_serial_number": updated_lg_record.lg_number,
+                "notes": notes, # NEW: Add notes to the email template data
              }
 
             template_data["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
@@ -794,6 +798,7 @@ class CRUDLGRecord(CRUDBase):
                 "new_expiry_date": instruction_details["new_expiry_date"],
                 "instruction_serial": db_lg_instruction.serial_number,
                 "generated_instruction_id": db_lg_instruction.id,
+                "notes": notes, # NEW: Add notes to the audit log
             },
             customer_id=updated_lg_record.customer_id,
             lg_record_id=updated_lg_record.id,
@@ -802,9 +807,8 @@ class CRUDLGRecord(CRUDBase):
         db.flush()
         db.refresh(updated_lg_record)
         return updated_lg_record, db_lg_instruction.id, generated_instruction_html
-     
-
-    async def release_lg(self, db: Session, lg_record: models.LGRecord, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
+  
+    async def release_lg(self, db: Session, lg_record: models.LGRecord, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None, notes: Optional[str] = None) -> Tuple[models.LGRecord, int]: # NEW: Add notes parameter
         """
         Releases an LG record. Updates status to "Released", issues a bank letter,
         notifies stakeholders, and marks it as un-actionable.
@@ -845,7 +849,6 @@ class CRUDLGRecord(CRUDBase):
         if not instruction_template:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LG Release Instruction template not found. Please ensure a global 'LG_RELEASE' template (non-notification) exists.")
         
-        # --- NEW LOGIC: Apply fallback for customer/entity details ---
         customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
 
@@ -854,7 +857,6 @@ class CRUDLGRecord(CRUDBase):
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
-        # --- END NEW LOGIC ---
 
         total_original_documents = db.query(models.LGDocument).filter(
             models.LGDocument.lg_record_id == lg_record.id,
@@ -880,22 +882,30 @@ class CRUDLGRecord(CRUDBase):
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
             "customer_name": lg_record.customer.name,
-            "customer_address": customer_address, # NEW
-            "customer_contact_email": customer_contact_email, # NEW
+            "customer_address": customer_address,
+            "customer_contact_email": customer_contact_email,
             "internal_owner_email": lg_record.internal_owner_contact.email,
             "instruction_wording_documents": instruction_wording_documents,
             "instruction_wording_replies": instruction_wording_replies,
             "lg_serial_number": lg_record.lg_number
         }
+        
+        # NEW LOGIC: Add a notes_section with HTML to be replaced in the template
+        notes_html = ""
+        if notes:
+            notes_html = f"""
+            <h3>Additional Notes</h3>
+            <p>{notes}</p>
+            """
+        instruction_details["notes_section"] = notes_html # NEW: Use this placeholder key
+        
         instruction_details["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
         generated_instruction_html = instruction_template.content
         for key, value in instruction_details.items():
             str_value = str(value) if value is not None else ""
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
-        # --- MODIFIED BLOCK START ---
         try:
-            # Construct the payload for LGInstructionCreate.
             instruction_create_payload_for_schema = {
                 "lg_record_id": lg_record.id,
                 "instruction_type": "RELEASE",
@@ -938,7 +948,6 @@ class CRUDLGRecord(CRUDBase):
             db.add(db_lg_instruction_in_current_session)
             db.flush()
 
-            # FIX: Link the supporting document to the new instruction
             if supporting_document_id:
                 db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
                 if db_document and not db_document.lg_instruction_id:
@@ -955,9 +964,7 @@ class CRUDLGRecord(CRUDBase):
             db.rollback()
             logger.exception(f"An unexpected error occurred during LG release for LG {lg_record.lg_number}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG release: {e}")
-        # --- MODIFIED BLOCK END ---
 
-        # --- MODIFIED: Wrap notification in conditional block ---
         if approval_request_id is None:
             email_settings_to_use: EmailSettings
             email_method_for_log: str
@@ -1011,6 +1018,7 @@ class CRUDLGRecord(CRUDBase):
                     "internal_owner_email": lg_record.internal_owner_contact.email,
                     "total_original_documents": total_original_documents,
                     "pending_replies_count": pending_replies_count,
+                    "notes": notes, # NEW: Add notes to the email template data
                 }
                 email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
                 email_body_html = notification_template.content
@@ -1047,7 +1055,7 @@ class CRUDLGRecord(CRUDBase):
         try:
             log_action(
                 db, user_id, "LG_RELEASED", "LGRecord", lg_record.id,
-                {"lg_number": lg_record.lg_number, "status": "Released", "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id},
+                {"lg_number": lg_record.lg_number, "status": "Released", "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id, "notes": notes}, # NEW: Add notes to the audit log
                 lg_record.customer_id, lg_record.id
             )
             logger.debug(f"DEBUG: Successfully logged LG_RELEASED action for LG ID: {lg_record.id}")
@@ -1065,7 +1073,7 @@ class CRUDLGRecord(CRUDBase):
                 detail=f"An unexpected internal error occurred after LG release. Please check server logs for details."
             )
 
-    async def liquidate_lg(self, db: Session, lg_record: LGRecord, liquidation_type: str, new_amount: Optional[float], user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
+    async def liquidate_lg(self, db: Session, lg_record: LGRecord, liquidation_type: str, new_amount: Optional[float], user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None, notes: Optional[str] = None) -> Tuple[models.LGRecord, int]:
         """
         Liquidates an LG record (full or partial). Updates status, adjusts amount,
         issues a bank letter, and notifies stakeholders.
@@ -1090,7 +1098,6 @@ class CRUDLGRecord(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Only LGs with status 'Valid' can be liquidated. Current status: {lg_record.lg_status.name}.",
             )
-
 
         liquidated_status = db.query(models.LgStatus).filter(models.LgStatus.id == models.LgStatusEnum.LIQUIDATED.value).first()
         if not liquidated_status:
@@ -1124,7 +1131,6 @@ class CRUDLGRecord(CRUDBase):
         if not instruction_template:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LG Liquidation Instruction template not found. Please ensure a global 'LG_LIQUIDATE' template (non-notification) exists.")
 
-        # --- NEW LOGIC: Apply fallback for customer/entity details ---
         customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
 
@@ -1133,7 +1139,6 @@ class CRUDLGRecord(CRUDBase):
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
-        # --- END NEW LOGIC ---
 
         total_original_documents = db.query(models.LGDocument).filter(
             models.LGDocument.lg_record_id == lg_record.id,
@@ -1149,7 +1154,6 @@ class CRUDLGRecord(CRUDBase):
         instruction_wording_documents = f"documents (Total: {total_original_documents})" if total_original_documents > 0 else "no documents"
         instruction_wording_replies = f"and there are {pending_replies_count} pending replies." if pending_replies_count > 0 else "and no pending replies."
 
-
         instruction_details = {
             "lg_number": lg_record.lg_number,
             "liquidation_type": liquidation_type.capitalize(),
@@ -1161,23 +1165,41 @@ class CRUDLGRecord(CRUDBase):
             "lg_issuer_name": lg_record.issuer_name,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
             "customer_name": lg_record.customer.name,
-            "customer_address": customer_address,  # NEW
-            "customer_contact_email": customer_contact_email, # NEW
+            "customer_address": customer_address,
+            "customer_contact_email": customer_contact_email,
             "internal_owner_email": lg_record.internal_owner_contact.email,
             "instruction_wording_documents": instruction_wording_documents,
             "instruction_wording_replies": instruction_wording_replies,
-            "lg_serial_number": lg_record.lg_number
+            "lg_serial_number": lg_record.lg_number,
         }
+
+        notes_html = ""
+        if notes:
+            notes_html = f"""
+            <h3>Additional Notes</h3>
+            <p>{notes}</p>
+            """
+        instruction_details["notes_section"] = notes_html
+        
+        # --- NEW LOGGING FOR DEBUGGING ---
+        logger.info(f"DEBUG: Liquidate LG function received 'notes': '{notes}'")
+        logger.info(f"DEBUG: Generated HTML snippet for notes_section: '{notes_html}'")
+        # --- END NEW LOGGING ---
+
         instruction_details["original_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}"
         instruction_details["new_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
+        
         generated_instruction_html = instruction_template.content
         for key, value in instruction_details.items():
             str_value = str(value) if value is not None else ""
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
-        # --- MODIFIED BLOCK START ---
+        if "notes_section" in generated_instruction_html:
+            logger.error("DEBUG: notes_section placeholder was NOT replaced.")
+        else:
+            logger.info("DEBUG: notes_section placeholder WAS successfully replaced.")
+
         try:
-            # Construct the payload for LGInstructionCreate.
             instruction_create_payload_for_schema = {
                 "lg_record_id": lg_record.id,
                 "instruction_type": "LIQUIDATION",
@@ -1220,7 +1242,6 @@ class CRUDLGRecord(CRUDBase):
             db.add(db_lg_instruction_in_current_session)
             db.flush()
 
-            # FIX: Link the supporting document to the new instruction
             if supporting_document_id:
                 db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
                 if db_document and not db_document.lg_instruction_id:
@@ -1236,7 +1257,6 @@ class CRUDLGRecord(CRUDBase):
             db.rollback()
             logger.exception(f"An unexpected error occurred during LG liquidation for LG {lg_record.lg_number}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG liquidation: {e}")
-        # --- MODIFIED BLOCK END ---
 
         log_action(
             db, user_id, f"LG_LIQUIDATED_{liquidation_type.upper()}", "LGRecord", lg_record.id,
@@ -1299,6 +1319,7 @@ class CRUDLGRecord(CRUDBase):
                     "internal_owner_email": lg_record.internal_owner_contact.email,
                     "total_original_documents": total_original_documents,
                     "pending_replies_count": pending_replies_count,
+                    "notes": notes,
                 }
                 email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
                 email_body_html = notification_template.content
@@ -1332,9 +1353,9 @@ class CRUDLGRecord(CRUDBase):
                     )
 
         db.refresh(lg_record)
-        return lg_record, db_lg_instruction.id
+        return lg_record, db_lg_instruction.id    
 
-    async def decrease_lg_amount(self, db: Session, lg_record: LGRecord, decrease_amount: float, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
+    async def decrease_lg_amount(self, db: Session, lg_record: LGRecord, decrease_amount: float, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None, notes: Optional[str] = None) -> Tuple[models.LGRecord, int]:
         """
         Decreases the amount of an LG record. Updates the amount, issues a bank letter,
         and notifies stakeholders. LG status remains 'Valid'.
@@ -1376,7 +1397,6 @@ class CRUDLGRecord(CRUDBase):
             if not instruction_template:
                 raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"LG Decrease Amount Instruction template not found. Please ensure a global '{ACTION_TYPE_LG_DECREASE_AMOUNT}' template (non-notification) exists.")
             
-            # --- NEW LOGIC: Apply fallback for customer/entity details ---
             customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
             entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
 
@@ -1385,7 +1405,6 @@ class CRUDLGRecord(CRUDBase):
 
             customer_address = entity.address if entity.address else customer.address
             customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
-            # --- END NEW LOGIC ---
 
             instruction_details = {
                 "lg_number": lg_record.lg_number,
@@ -1398,11 +1417,20 @@ class CRUDLGRecord(CRUDBase):
                 "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
                 "current_date": datetime.now().strftime("%Y-%m-%d"),
                 "customer_name": lg_record.customer.name,
-                "customer_address": customer_address,  # NEW
-                "customer_contact_email": customer_contact_email, # NEW
+                "customer_address": customer_address,
+                "customer_contact_email": customer_contact_email,
                 "action_type": "LG Amount Decrease",
                 "internal_owner_email": lg_record.internal_owner_contact.email,
             }
+
+            notes_html = ""
+            if notes:
+                notes_html = f"""
+                <h3>Additional Notes</h3>
+                <p>{notes}</p>
+                """
+            instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
+            
             instruction_details["original_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}"
             instruction_details["decrease_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(decrease_amount):,.2f}"
             instruction_details["new_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(new_amount):,.2f}"
@@ -1412,7 +1440,6 @@ class CRUDLGRecord(CRUDBase):
                 str_value = str(value) if value is not None else ""
                 generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
-            # --- MODIFIED BLOCK START ---
             try:
                 instruction_create_payload_for_schema = {
                     "lg_record_id": lg_record.id,
@@ -1456,7 +1483,6 @@ class CRUDLGRecord(CRUDBase):
                 db.add(db_lg_instruction_in_current_session)
                 db.flush()
                 
-                # FIX: Link the supporting document to the new instruction
                 if supporting_document_id:
                     db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
                     if db_document and not db_document.lg_instruction_id:
@@ -1472,11 +1498,17 @@ class CRUDLGRecord(CRUDBase):
                 db.rollback()
                 logger.exception(f"An unexpected error occurred during LG amount decrease for LG {lg_record.lg_number}: {e}")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG amount decrease: {e}")
-            # --- MODIFIED BLOCK END ---
-
+            
             log_action(
                 db, user_id, AUDIT_ACTION_TYPE_LG_DECREASED_AMOUNT, "LGRecord", lg_record.id,
-                {"lg_number": lg_record.lg_number, "old_amount": float(original_amount), "new_amount": float(new_amount), "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id},
+                {
+                    "lg_number": lg_record.lg_number, 
+                    "old_amount": float(original_amount), 
+                    "new_amount": float(new_amount), 
+                    "instruction_id": db_lg_instruction.id, 
+                    "approved_by_user_id": user_id, 
+                    "notes": notes # NEW: Log the notes
+                },
                 lg_record.customer_id, lg_record.id
             )
 
@@ -1536,6 +1568,7 @@ class CRUDLGRecord(CRUDBase):
                         "action_type": "LG Amount Decrease",
                         "instruction_serial": db_lg_instruction.serial_number,
                         "internal_owner_email": lg_record.internal_owner_contact.email,
+                        "notes": notes, # NEW: Add notes to the email template
                     }
                     email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
                     email_body_html = notification_template.content
@@ -1575,8 +1608,8 @@ class CRUDLGRecord(CRUDBase):
         except Exception as e:
             logger.error(f"An unexpected error occurred in decrease_lg_amount for LG {lg_record.id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected internal error occurred during amount decrease: {e}")
-            
-    async def activate_non_operative_lg(self, db: Session, lg_record: LGRecord, payment_details: LGActivateNonOperativeRequest, user_id: int, customer_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None) -> Tuple[models.LGRecord, int]:
+
+    async def activate_non_operative_lg(self, db: Session, lg_record: LGRecord, payment_details: LGActivateNonOperativeRequest, user_id: int, customer_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None, notes: Optional[str] = None) -> Tuple[models.LGRecord, int]: # NEW: Add notes parameter
         """
         Activates a non-operative Advance Payment Guarantee.
         Updates operational status to "Operative", creates an activation instruction, and notifies stakeholders.
@@ -1592,13 +1625,11 @@ class CRUDLGRecord(CRUDBase):
             else:
                 logger.warning(f"ApprovalRequest with ID {approval_request_id} not found when creating LGInstruction for activation. Using checker_user_id as maker for instruction.")
 
-        # Re-fetch the record with a fresh session to avoid stale data
         db_lg_record = self.get_lg_record_with_relations(db, lg_record.id, customer_id)
         if not db_lg_record:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
 
-        # Validation checks
         if db_lg_record.lg_status_id != models.LgStatusEnum.VALID.value:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1617,7 +1648,6 @@ class CRUDLGRecord(CRUDBase):
                     detail=f"LG record must be in 'Non-Operative' operational status to be activated. Current operational status: {db_lg_record.lg_operational_status.name if db_lg_record.lg_operational_status else 'N/A'}."
                 )
 
-        # Update the operational status to 'Operative'
         operative_status = db.query(models.LgOperationalStatus).filter(models.LgOperationalStatus.id == models.LgOperationalStatusEnum.OPERATIVE.value).first()
         if not operative_status:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="System misconfiguration: 'Operative' operational status not found.")
@@ -1633,7 +1663,6 @@ class CRUDLGRecord(CRUDBase):
         payment_currency = db.query(models.Currency).filter(models.Currency.id == payment_details.currency_id).first()
         payment_bank = db.query(models.Bank).filter(models.Bank.id == payment_details.issuing_bank_id).first()
 
-        # --- NEW LOGIC: Apply fallback for customer/entity details ---
         customer = db.query(models.Customer).filter(models.Customer.id == db_lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
 
@@ -1642,7 +1671,6 @@ class CRUDLGRecord(CRUDBase):
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
-        # --- END NEW LOGIC ---
 
         instruction_details = {
             "lg_number": db_lg_record.lg_number,
@@ -1667,6 +1695,15 @@ class CRUDLGRecord(CRUDBase):
             "new_lg_status_id": models.LgOperationalStatusEnum.OPERATIVE.value,
             "lg_type_id": models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value
         }
+
+        notes_html = ""
+        if notes:
+            notes_html = f"""
+            <h3>Additional Notes</h3>
+            <p>{notes}</p>
+            """
+        instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
+
         instruction_details["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
         instruction_details["payment_amount_formatted"] = f"{payment_currency.iso_code if payment_currency else 'N/A'} {float(payment_details.amount):,.2f}"
 
@@ -1675,7 +1712,6 @@ class CRUDLGRecord(CRUDBase):
             str_value = str(value) if value is not None else ""
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
-        # --- MODIFIED BLOCK START ---
         try:
             instruction_create_payload_for_schema = {
                 "lg_record_id": db_lg_record.id,
@@ -1719,7 +1755,6 @@ class CRUDLGRecord(CRUDBase):
             db.add(db_lg_instruction_in_current_session)
             db.flush()
 
-            # FIX: Link the supporting document to the new instruction
             if supporting_document_id:
                 db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
                 if db_document and not db_document.lg_instruction_id:
@@ -1735,19 +1770,16 @@ class CRUDLGRecord(CRUDBase):
             db.rollback()
             logger.exception(f"An unexpected error occurred during LG activation for LG {db_lg_record.lg_number}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG activation: {e}")
-        # --- MODIFIED BLOCK END ---
 
-        # --- FIX START: Correctly serialize date objects for the audit log
         payment_details_for_log = payment_details.model_dump()
         if 'payment_date' in payment_details_for_log and isinstance(payment_details_for_log['payment_date'], date):
             payment_details_for_log['payment_date'] = payment_details_for_log['payment_date'].isoformat()
         
         log_action(
             db, user_id, AUDIT_ACTION_TYPE_LG_ACTIVATED, "LGRecord", db_lg_record.id,
-            {"lg_number": db_lg_record.lg_number, "old_status": models.LgOperationalStatusEnum.NON_OPERATIVE.name, "new_status": models.LgOperationalStatusEnum.OPERATIVE.name, "payment_details": payment_details_for_log, "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id},
+            {"lg_number": db_lg_record.lg_number, "old_status": models.LgOperationalStatusEnum.NON_OPERATIVE.name, "new_status": models.LgOperationalStatusEnum.OPERATIVE.name, "payment_details": payment_details_for_log, "instruction_id": db_lg_instruction.id, "approved_by_user_id": user_id, "notes": notes}, # NEW: Log the notes
             db_lg_record.customer_id, db_lg_record.id
         )
-        # --- FIX END
 
         if approval_request_id is None:
             email_settings_to_use: EmailSettings
@@ -1806,6 +1838,7 @@ class CRUDLGRecord(CRUDBase):
                     "payment_reference": payment_details.payment_reference,
                     "payment_issuing_bank_name": payment_bank.name if payment_bank else "N/A",
                     "payment_date": payment_details.payment_date.isoformat(),
+                    "notes": notes, # NEW: Add notes to email template data
                 }
                 template_data["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
                 template_data["payment_amount_formatted"] = f"{template_data['payment_currency_code']} {float(payment_details.amount):,.2f}"
@@ -1843,7 +1876,6 @@ class CRUDLGRecord(CRUDBase):
 
         db.refresh(db_lg_record)
         return db_lg_record, db_lg_instruction.id
-
      
     async def toggle_lg_auto_renewal(self, db: Session, lg_record: models.LGRecord, new_auto_renewal_status: bool, user_id: int, customer_id: int, reason: Optional[str], approval_request_id: Optional[int]) -> models.LGRecord:
         """

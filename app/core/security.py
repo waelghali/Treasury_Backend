@@ -1,4 +1,4 @@
-# core/security.py
+# app/core/security.py
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
@@ -22,6 +22,9 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 # MODIFIED: Increase expiration time for the frontend timer
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+
+# NEW: Define environment variable for trusted proxies
+TRUST_X_FORWARDED = os.getenv("TRUST_X_FORWARDED", "false").lower() == "true"
 
 if SECRET_KEY is None:
     raise ValueError("SECRET_KEY environment variable is not set.")
@@ -49,6 +52,38 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+# NEW FUNCTION: Secure IP resolution
+def get_client_ip(request: Request) -> Optional[str]:
+    """
+    Safely retrieves the client's real IP address, handling proxies and load balancers.
+    
+    This function checks for the 'X-Forwarded-For' header, but only if the
+    TRUST_X_FORWARDED environment variable is set to true. This prevents IP spoofing
+    when the application is not behind a known, trusted proxy.
+    
+    Args:
+        request (Request): The FastAPI Request object.
+        
+    Returns:
+        Optional[str]: The resolved client IP address, or None if it cannot be determined.
+    """
+    # IP spoofing protection: Only trust X-Forwarded-For if explicitly configured.
+    if TRUST_X_FORWARDED:
+        # The 'X-Forwarded-For' header can contain a list of IPs.
+        # The left-most IP is the original client.
+        x_forwarded_for = request.headers.get("x-forwarded-for")
+        if x_forwarded_for:
+            # Get the first IP and strip whitespace.
+            ip = x_forwarded_for.split(',')[0].strip()
+            # Basic validation could go here, e.g., regex check for IPv4/IPv6.
+            # For simplicity, we'll assume the proxy provides a valid IP.
+            return ip
+            
+    # Fallback to the direct client's host IP (e.g., the load balancer or direct client).
+    # This is the safest default if proxies are not explicitly trusted.
+    return request.client.host
+
 
 # MODIFIED: get_current_user to check query params if header token is missing and to fetch subscription status
 async def get_current_user(

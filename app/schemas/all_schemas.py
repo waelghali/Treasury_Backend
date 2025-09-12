@@ -90,7 +90,7 @@ class LoginRequest(BaseModel):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., description="User's current password")
-    new_password: str = Field(..., min_length=8, description="User's new password, must be at least 8 characters long.")
+    new_password: str = Field(..., description="User's new password, complexity enforced by business logic.")
     confirm_new_password: str = Field(..., description="Confirmation of the new password.")
 
     @model_validator(mode='after')
@@ -98,33 +98,18 @@ class ChangePasswordRequest(BaseModel):
         if self.new_password != self.confirm_new_password:
             raise ValueError("New password and confirmation do not match.")
         return self
+    
+    # REMOVED: The password policy validator here is now removed.
+    # The password policy is now centralized in the services layer and is configuration-driven.
+    # This ensures consistency and simplifies maintenance.
 
-    @model_validator(mode='after')
-    def validate_password_policy(self) -> 'ChangePasswordRequest':
-        # These values will ideally come from GlobalConfiguration,
-        # but for schema validation, we can assume typical defaults or fetch from a config service.
-        min_length = 8 # Default, to be overridden by config
-        require_uppercase = True # Default, to be overridden by config
-        require_lowercase = True # Default, to be overridden by config
-        require_digit = True # Default, to be overridden by config
-
-        if len(self.new_password) < min_length:
-            raise ValueError(f"Password must be at least {min_length} characters long.")
-        if require_uppercase and not re.search(r'[A-Z]', self.new_password):
-            raise ValueError("Password must contain at least one uppercase letter.")
-        if require_lowercase and not re.search(r'[a-z]', self.new_password):
-            raise ValueError("Password must contain at least one lowercase letter.")
-        if require_digit and not re.search(r'\d', self.new_password):
-            raise ValueError("Password must contain at least one digit.")
-
-        return self
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr = Field(..., description="Email address associated with the account to reset.")
 
 class ResetPasswordRequest(BaseModel):
     token: str = Field(..., description="Password reset token received via email.")
-    new_password: str = Field(..., min_length=8, description="New password for the account.")
+    new_password: str = Field(..., description="New password for the account.")
     confirm_new_password: str = Field(..., description="Confirmation of the new password.")
 
     @model_validator(mode='after')
@@ -132,25 +117,11 @@ class ResetPasswordRequest(BaseModel):
         if self.new_password != self.confirm_new_password:
             raise ValueError("New password and confirmation do not match.")
         return self
+    
+    # REMOVED: The password policy validator here is now removed.
+    # The password policy is now centralized in the services layer and is configuration-driven.
+    # This ensures consistency and simplifies maintenance.
 
-    @model_validator(mode='after')
-    def validate_password_policy(self) -> 'ResetPasswordRequest':
-        # Same password policy validation as ChangePasswordRequest
-        min_length = 8
-        require_uppercase = True
-        require_lowercase = True
-        require_digit = True
-
-        if len(self.new_password) < min_length:
-            raise ValueError(f"Password must be at least {min_length} characters long.")
-        if require_uppercase and not re.search(r'[A-Z]', self.new_password):
-            raise ValueError("Password must contain at least one uppercase letter.")
-        if require_lowercase and not re.search(r'[a-z]', self.new_password):
-            raise ValueError("Password must contain at least one lowercase letter.")
-        if require_digit and not re.search(r'\d', self.new_password):
-            raise ValueError("Password must contain at least one digit.")
-
-        return self
 
 class UserAccountOut(BaseModel):
     id: int
@@ -167,7 +138,7 @@ class UserAccountOut(BaseModel):
         from_attributes = True # Allow mapping from ORM models
 
 class AdminUserUpdate(BaseModel):
-    new_password: str = Field(..., min_length=8, description="New password for the user.")
+    new_password: str = Field(..., description="New password for the user.")
     confirm_new_password: str = Field(..., description="Confirmation of the new password.")
     force_change_on_next_login: bool = Field(True, description="If true, user must change password on next login.")
 
@@ -177,31 +148,17 @@ class AdminUserUpdate(BaseModel):
             raise ValueError("New password and confirmation do not match.")
         return self
 
-    @model_validator(mode='after')
-    def validate_password_policy(self) -> 'AdminUserUpdate':
-        # Same password policy validation as ChangePasswordRequest
-        min_length = 8
-        require_uppercase = True
-        require_lowercase = True
-        require_digit = True
+    # REMOVED: The password policy validator here is now removed.
+    # The password policy is now centralized in the services layer and is configuration-driven.
+    # This ensures consistency and simplifies maintenance.
 
-        if len(self.new_password) < min_length:
-            raise ValueError(f"Password must be at least {min_length} characters long.")
-        if require_uppercase and not re.search(r'[A-Z]', self.new_password):
-            raise ValueError("Password must contain at least one uppercase letter.")
-        if require_lowercase and not re.search(r'[a-z]', self.new_password):
-            raise ValueError("Password must contain at least one lowercase letter.")
-        if require_digit and not re.search(r'\d', self.new_password):
-            raise ValueError("Password must contain at least one digit.")
-
-        return self
 
 class UserBase(BaseModel):
     email: EmailStr = Field(..., description="User's email address")
     role: UserRole = Field(UserRole.END_USER, description="Role of the user within the system")
 
 class UserCreate(UserBase):
-    password: str = Field(..., min_length=8, description="User's password")
+    password: str = Field(..., description="User's password, complexity enforced by business logic.")
     customer_id: Optional[int] = Field(None, description="Customer ID for the user (required for non-SYSTEM_OWNER)")
     has_all_entity_access: bool = Field(True, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this user has access to (if has_all_entity_access is False)")
@@ -218,7 +175,7 @@ class UserCreate(UserBase):
 class UserUpdate(UserBase):
     email: Optional[EmailStr] = Field(None, description="User's email address")
     role: Optional[UserRole] = Field(None, description="Role of the user within the system")
-    password: Optional[str] = Field(None, min_length=8, description="User's new password (optional for update)")
+    password: Optional[str] = Field(None, description="User's new password (optional for update), complexity enforced by business logic.")
     customer_id: Optional[int] = Field(None, description="Customer ID for the user (required for non-SYSTEM_OWNER)")
     has_all_entity_access: Optional[bool] = Field(None, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this user has access to (if has_all_entity_access is False)")
@@ -234,7 +191,7 @@ class UserUpdate(UserBase):
         return self
 
 class UserCreateCorporateAdmin(UserBase):
-    password: str = Field(..., min_length=8, description="User's password")
+    password: str = Field(..., description="User's password, complexity enforced by business logic.")
     role: UserRole = Field(..., description="Role of the user within the system (cannot be SYSTEM_OWNER)")
     has_all_entity_access: bool = Field(True, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this user has access to (if has_all_entity_access is False)")
@@ -253,7 +210,7 @@ class UserCreateCorporateAdmin(UserBase):
 class UserUpdateCorporateAdmin(UserBase):
     email: Optional[EmailStr] = Field(None, description="User's email address")
     role: Optional[UserRole] = Field(None, description="Role of the user within the system (cannot be SYSTEM_OWNER)")
-    password: Optional[str] = Field(None, min_length=8, description="User's new password (optional for update)")
+    password: Optional[str] = Field(None, description="User's new password (optional for update), complexity enforced by business logic.")
     has_all_entity_access: Optional[bool] = Field(None, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this user has access to (if has_all_entity_access is False)")
     must_change_password: Optional[bool] = Field(None, description="True if user must change password on next login")
@@ -897,6 +854,7 @@ class LGActivateNonOperativeRequest(BaseModel):
     payment_reference: str = Field(..., max_length=100, description="Wire reference or check number.")
     issuing_bank_id: int = Field(..., description="ID of the Issuing Bank related to the payment.")
     payment_date: date = Field(..., description="Date the payment was made (DD/MM/YYYY).")
+    notes: Optional[str] = Field(None, description="Additional notes for the activation.")
 
     @model_validator(mode='after')
     def validate_payment_date(self):
@@ -916,15 +874,18 @@ class LGActivateNonOperativeRequest(BaseModel):
 
 class LGRecordRelease(BaseModel):
     reason: Optional[str] = Field(None, description="Reason for releasing the LG (e.g., contract fulfilled).")
+    notes: Optional[str] = Field(None, description="Additional notes for the action.")
 
 class LGRecordLiquidation(BaseModel):
     liquidation_type: str = Field(..., description="Type of liquidation: 'full' or 'partial'.")
     new_amount: Optional[float] = Field(None, description="The new amount of the LG if partial liquidation. Required for partial, ignored for full.")
     reason: Optional[str] = Field(None, description="Reason for liquidating the LG.")
+    notes: Optional[str] = Field(None, description="Additional notes for the action.")
 
 class LGRecordDecreaseAmount(BaseModel):
     decrease_amount: float = Field(..., gt=0, description="The amount to decrease the LG by.")
     reason: Optional[str] = Field(None, description="Reason for decreasing the LG amount.")
+    notes: Optional[str] = Field(None, description="Additional notes for the action.")
 
 class LGInstructionCancelRequest(BaseModel):
     reason: str = Field(
@@ -969,6 +930,7 @@ class LGInstructionCreate(LGInstructionBase):
     global_seq_per_lg: Any = Field(None, exclude=True)
     type_seq_per_lg: Any = Field(None, exclude=True)
     # --- END CRITICAL CHANGE ---
+    notes: Optional[str] = Field(None, description="Additional notes for the instruction.")
 
 class LGInstructionUpdate(BaseModel):
     status: Optional[str] = None
@@ -1109,7 +1071,7 @@ class InternalOwnerChangeScope(str, Enum):
 class InternalOwnerContactUpdateDetails(BaseModel):
     email: Optional[EmailStr] = Field(None, description="New email of the internal owner contact person")
     phone_number: Optional[str] = Field(None, description="New phone number of the internal owner")
-    internal_id: Optional[str] = Field(None, max_length=10, description="New optional internal ID for the owner")
+    internal_id: Optional[str] = Field(None, max_length=10, description="Optional internal ID for the owner")
     manager_email: Optional[EmailStr] = Field(None, description="New manager's email of the internal owner")
 
 class LGRecordChangeOwner(BaseModel):

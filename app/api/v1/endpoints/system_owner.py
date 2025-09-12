@@ -12,7 +12,7 @@ from app.database import get_db
 from app.schemas.all_schemas import (
     SubscriptionPlanCreate, SubscriptionPlanUpdate, SubscriptionPlanOut,
     CustomerCreate, CustomerUpdate, CustomerOut, CustomerCoreCreate,
-    UserCreate, UserOut, CustomerEntityCreate, CustomerEntityUpdate, CustomerEntityOut,
+    UserCreate, UserOut, UserUpdate, CustomerEntityCreate, CustomerEntityUpdate, CustomerEntityOut,
     GlobalConfigurationCreate, GlobalConfigurationUpdate, GlobalConfigurationOut,
     BankCreate, BankUpdate, BankOut,
     TemplateCreate, TemplateUpdate, TemplateOut,
@@ -44,7 +44,7 @@ from app.models import (
     # MODIFIED: Use new unified LGCategory model
     LGCategory,
     AuditLog,
-    SystemNotification,
+    SystemNotification, UserCustomerEntityAssociation,
 )
 import app.core.background_tasks as background_tasks_module 
 import logging
@@ -67,7 +67,7 @@ try:
         get_current_user,
         get_current_system_owner,
         HasPermission,
-        TokenData
+        TokenData, get_client_ip
     )
     from app.main import app as fastapi_app
     from apscheduler.triggers.cron import CronTrigger
@@ -261,7 +261,7 @@ def create_subscription_plan(
 
     db_plan = crud_subscription_plan.create(db, obj_in=plan_in)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="SubscriptionPlan", entity_id=db_plan.id, details={"name": db_plan.name, "ip_address": client_host})
     
     return db_plan
@@ -336,7 +336,7 @@ def update_subscription_plan(
 
     updated_plan = crud_subscription_plan.update(db, db_obj=db_plan, obj_in=plan_in)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="SubscriptionPlan", entity_id=updated_plan.id, details={"name": updated_plan.name, "ip_address": client_host, "updated_fields": plan_in.model_dump(exclude_unset=True)})
     
     return updated_plan
@@ -361,7 +361,7 @@ def delete_subscription_plan(
     
     deleted_plan = crud_subscription_plan.soft_delete(db, db_plan)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="SubscriptionPlan", entity_id=deleted_plan.id, details={"name": deleted_plan.name, "ip_address": client_host})
     
     return deleted_plan
@@ -390,7 +390,7 @@ def restore_subscription_plan(
     
     restored_plan = crud_subscription_plan.restore(db, db_plan)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="SubscriptionPlan", entity_id=restored_plan.id, details={"name": restored_plan.name, "ip_address": client_host})
     
     return restored_plan
@@ -406,7 +406,7 @@ def onboard_customer(
     """
     Onboard a new customer, including their initial entities and a Corporate Admin user.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     # This is a good practice for debugging, but doesn't fix the issue
     if customer_in.initial_entities and customer_in.initial_entities[0].contact_email:
@@ -466,7 +466,7 @@ def update_customer(
     Only provided fields will be updated (partial update is supported).
     Returns 404 if the customer is not found or is soft-deleted.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     db_customer = crud_customer.get_with_relations(db, customer_id)
     if db_customer is None:
@@ -541,7 +541,7 @@ def update_customer(
 
     updated_customer = crud_customer.update(db, db_obj=db_customer, obj_in=customer_in, user_id=current_user.user_id)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="Customer", entity_id=updated_customer.id, details={"name": updated_customer.name, "ip_address": client_host, "updated_fields": customer_in.model_dump(exclude_unset=True)})
     
     return crud_customer.get_with_relations(db, updated_customer.id)
@@ -573,7 +573,7 @@ def delete_customer(
         if not user.is_deleted:
             crud_user.soft_delete(db, user, user_id=current_user.user_id)
 
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="Customer", entity_id=deleted_customer.id, details={"name": deleted_customer.name, "ip_address": client_host})
 
     db.refresh(deleted_customer)
@@ -632,7 +632,7 @@ def restore_customer(
         if user.is_deleted:
             crud_user.restore(db, user, user_id=current_user.user_id)
 
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Customer", entity_id=restored_customer.id, details={"name": restored_customer.name, "ip_address": client_host})
 
     db.refresh(restored_customer)
@@ -645,7 +645,7 @@ def create_customer_entity(
     current_user: TokenData = Depends(HasPermission("customer_entity:create")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     customer_check = crud_customer.get_with_relations(db, id=entity_in.customer_id)
     if not customer_check:
@@ -723,7 +723,7 @@ def update_customer_entity(
     Update an existing customer entity by ID.
     Returns 404 if the entity is not found or is soft-deleted.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     db_entity = crud_customer_entity.get(db, id=entity_id)
     if db_entity is None:
@@ -773,7 +773,7 @@ def delete_customer_entity(
     Soft-delete a customer entity by ID.
     Returns 404 if the entity is not found or already deleted.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     db_entity = crud_customer_entity.get(db, id=entity_id)
     if db_entity is None:
@@ -813,7 +813,7 @@ def restore_customer_entity(
     Restore a soft-deleted customer entity by ID.
     Returns 404 if the entity is not found or is not soft-deleted.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     db_entity = db.query(CustomerEntity).filter(
         CustomerEntity.id == entity_id, 
@@ -861,7 +861,7 @@ def create_customer_entity(
     current_user: TokenData = Depends(HasPermission("customer_entity:create")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     # CORRECTED: Use 'customer_id' as the keyword argument.
     customer_check = crud_customer.get_with_relations(db, customer_id=customer_id)
@@ -910,6 +910,147 @@ def create_customer_entity(
     
     return db_entity
 
+@router.post("/customers/{customer_id}/users/", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def create_customer_user_by_system_owner(
+    customer_id: int,
+    user_in: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("user:create")),
+    request: Request = None
+):
+    """
+    Allows a System Owner to create a new user for a specific customer.
+    This can be used to add additional Corporate Admins after the initial onboarding.
+    """
+    client_host = get_client_ip(request) if request else None
+
+    # Check if the customer exists and is not deleted
+    customer_check = crud_customer.get_with_relations(db, customer_id=customer_id)
+    if not customer_check:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found or is deleted.")
+    
+    # We should not rely on user_in.customer_id as it might be missing or wrong.
+    # Instead, we use the customer_id from the URL path.
+    user_in.customer_id = customer_id
+    
+    # Check for existing user with the same email address for the customer
+    existing_user = db.query(User).filter(
+        User.customer_id == customer_id,
+        User.email == user_in.email,
+        User.is_deleted == False
+    ).first()
+    if existing_user:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A user with this email already exists for this customer.")
+
+    try:
+        # Use the existing CRUD method which handles all business logic like user limit checks
+        db_user = crud_user.create_user(db, user_in, user_id_caller=current_user.user_id)
+        return db_user
+    except HTTPException as e:
+        log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
+        raise
+    except Exception as e:
+        log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {e}"
+        )
+
+@router.delete("/users/{user_id}", response_model=UserOut)
+def delete_user(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("user:delete")),
+    request: Request = None
+):
+    """
+    Soft-delete a user by ID.
+    """
+    client_host = get_client_ip(request) if request else None
+
+    # FIX: Explicitly check for the user's existence
+    db_user = crud_user.get(db, id=user_id)
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="User not found or already deleted."
+        )
+
+    # Prevent a System Owner from deleting their own account
+    if db_user.id == current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot delete your own user account."
+        )
+
+    deleted_user = crud_user.soft_delete(db, db_user, user_id=current_user.user_id)
+    
+    log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="User", entity_id=deleted_user.id, details={"email": deleted_user.email, "customer_id": deleted_user.customer_id, "ip_address": client_host})
+    
+    return deleted_user
+    
+@router.post("/users/{user_id}/restore", response_model=UserOut)
+def restore_user(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("user:edit")),
+    request: Request = None
+):
+    """
+    Restore a soft-deleted user by ID.
+    """
+    client_host = get_client_ip(request) if request else None
+
+    # FIX: Explicitly query for soft-deleted users
+    db_user = db.query(User).filter(
+        User.id == user_id, 
+        User.is_deleted == True 
+    ).first()
+
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="User not found or not in a soft-deleted state."
+        )
+
+    restored_user = crud_user.restore(db, db_user, user_id=current_user.user_id)
+    
+    log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="User", entity_id=restored_user.id, details={"email": restored_user.email, "customer_id": restored_user.customer_id, "ip_address": client_host})
+    
+    return restored_user
+
+@router.put("/users/{user_id}", response_model=UserOut)
+def update_user_by_system_owner(
+    user_id: int, 
+    user_in: UserUpdate, 
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("user:edit")),
+    request: Request = None
+):
+    """
+    Allows a System Owner to update an existing user's details by ID.
+    """
+    client_host = get_client_ip(request) if request else None
+    
+    db_user = crud_user.get(db, id=user_id)
+    if not db_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found or is deleted.")
+
+    if user_in.email is not None and user_in.email != db_user.email:
+        existing_user = crud_user.get_by_email(db, email=user_in.email)
+        if existing_user and existing_user.id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"User with email '{user_in.email}' already exists."
+            )
+            
+    # FIX: Change 'db_obj' to 'db_user' to match the function signature in crud_user.py
+    updated_user = crud_user.update_user(db, db_user=db_user, user_in=user_in, user_id_caller=current_user.user_id)
+    
+    log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="User", entity_id=updated_user.id, details={"email": updated_user.email, "ip_address": client_host, "updated_fields": user_in.model_dump(exclude_unset=True)})
+    
+    return updated_user
+           
 @router.post("/global-configurations/", response_model=GlobalConfigurationOut, status_code=status.HTTP_201_CREATED)
 def create_global_configuration(
     config_in: GlobalConfigurationCreate,
@@ -928,7 +1069,7 @@ def create_global_configuration(
         )
     db_config = crud_global_configuration.create(db, obj_in=config_in)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="GlobalConfiguration", entity_id=db_config.id, details={"key": db_config.key, "value_default": db_config.value_default, "ip_address": client_host})
 
     return db_config
@@ -1012,7 +1153,7 @@ def update_global_configuration(
 
     updated_config = crud_global_configuration.update(db, db_obj=db_config, obj_in=config_in)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="GlobalConfiguration", entity_id=updated_config.id, details={"key": updated_config.key, "ip_address": client_host, "updated_fields": config_in.model_dump(exclude_unset=True)})
     
     if trigger_revalidation:
@@ -1039,7 +1180,7 @@ def delete_global_configuration(
         )
     deleted_config = crud_global_configuration.soft_delete(db, db_config)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="GlobalConfiguration", entity_id=deleted_config.id, details={"key": deleted_config.key, "ip_address": client_host})
     
     return deleted_config
@@ -1067,7 +1208,7 @@ def restore_global_configuration(
         )
     restored_config = crud_global_configuration.restore(db, db_config)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="GlobalConfiguration", entity_id=restored_config.id, details={"key": restored_config.key, "ip_address": client_host})
     return restored_config
 
@@ -1087,7 +1228,7 @@ def create_currency(
             detail=f"Currency with ISO code '{currency_in.iso_code}' already exists."
         )
     db_currency = crud_currency.create(db, obj_in=currency_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="Currency", entity_id=db_currency.id, details={"name": db_currency.name, "iso_code": db_currency.iso_code, "ip_address": client_host})
     return db_currency
 
@@ -1128,7 +1269,7 @@ def update_currency(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Currency with ISO code '{currency_in.iso_code}' already exists.")
             
     updated_currency = crud_currency.update(db, db_obj=db_currency, obj_in=currency_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="Currency", entity_id=updated_currency.id, details={"name": updated_currency.name, "ip_address": client_host, "updated_fields": currency_in.model_dump(exclude_unset=True)})
     return updated_currency
 
@@ -1143,7 +1284,7 @@ def delete_currency(
     if db_currency is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Currency not found or already deleted")
     db_currency = crud_currency.soft_delete(db, db_currency)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="Currency", entity_id=db_currency.id, details={"name": db_currency.name, "ip_address": client_host})
     return db_currency
 
@@ -1158,7 +1299,7 @@ def restore_currency(
     if db_currency is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Currency not found or not in a soft-deleted state.")
     db_currency = crud_currency.restore(db, db_currency)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Currency", entity_id=db_currency.id, details={"name": db_currency.name, "ip_address": client_host})
     return db_currency
 
@@ -1176,7 +1317,7 @@ def create_lg_type(
             detail=f"LG Type with name '{lg_type_in.name}' already exists."
         )
     db_lg_type = crud_lg_type.create(db, obj_in=lg_type_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="LgType", entity_id=db_lg_type.id, details={"name": db_lg_type.name, "ip_address": client_host})
     return db_lg_type
 
@@ -1217,7 +1358,7 @@ def update_lg_type(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"LG Type with name '{lg_type_in.name}' already exists.")
             
     updated_lg_type = crud_lg_type.update(db, db_obj=db_lg_type, obj_in=lg_type_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="LgType", entity_id=updated_lg_type.id, details={"name": updated_lg_type.name, "ip_address": client_host, "updated_fields": lg_type_in.model_dump(exclude_unset=True)})
     return updated_lg_type
 
@@ -1232,7 +1373,7 @@ def delete_lg_type(
     if db_lg_type is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Type not found or already deleted")
     db_lg_type = crud_lg_type.soft_delete(db, db_lg_type)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="LgType", entity_id=db_lg_type.id, details={"name": db_lg_type.name, "ip_address": client_host})
     return db_lg_type
 
@@ -1247,7 +1388,7 @@ def restore_lg_type(
     if db_lg_type is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Type not found or not in a soft-deleted state.")
     db_lg_type = crud_lg_type.restore(db, db_lg_type)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="LgType", entity_id=db_lg_type.id, details={"name": db_lg_type.name, "ip_address": client_host})
     return db_lg_type
 
@@ -1265,7 +1406,7 @@ def create_rule(
             detail=f"Rule with name '{rule_in.name}' already exists."
         )
     db_rule = crud_rule.create(db, obj_in=rule_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="Rule", entity_id=db_rule.id, details={"name": db_rule.name, "ip_address": client_host})
     return db_rule
 
@@ -1306,7 +1447,7 @@ def update_rule(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Rule with name '{rule_in.name}' already exists.")
             
     updated_rule = crud_rule.update(db, db_obj=db_rule, obj_in=rule_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="Rule", entity_id=updated_rule.id, details={"name": updated_rule.name, "ip_address": client_host, "updated_fields": rule_in.model_dump(exclude_unset=True)})
     return updated_rule
 
@@ -1321,7 +1462,7 @@ def delete_rule(
     if db_rule is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found or already deleted")
     db_rule = crud_rule.soft_delete(db, db_rule)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="Rule", entity_id=db_rule.id, details={"name": db_rule.name, "ip_address": client_host})
     return db_rule
 
@@ -1336,7 +1477,7 @@ def restore_rule(
     if db_rule is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found or not in a soft-deleted state.")
     db_rule = crud_rule.restore(db, db_rule)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Rule", entity_id=db_rule.id, details={"name": db_rule.name, "ip_address": client_host})
     return db_rule
 
@@ -1354,7 +1495,7 @@ def create_issuing_method(
             detail=f"Issuing Method with name '{method_in.name}' already exists."
         )
     db_method = crud_issuing_method.create(db, obj_in=method_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="IssuingMethod", entity_id=db_method.id, details={"name": db_method.name, "ip_address": client_host})
     return db_method
 
@@ -1395,7 +1536,7 @@ def update_issuing_method(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Issuing Method with name '{method_in.name}' already exists.")
             
     updated_method = crud_issuing_method.update(db, db_obj=db_method, obj_in=method_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="IssuingMethod", entity_id=updated_method.id, details={"name": updated_method.name, "ip_address": client_host, "updated_fields": method_in.model_dump(exclude_unset=True)})
     return updated_method
 
@@ -1410,7 +1551,7 @@ def delete_issuing_method(
     if db_method is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issuing Method not found or already deleted")
     db_method = crud_issuing_method.soft_delete(db, db_method)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="IssuingMethod", entity_id=db_method.id, details={"name": db_method.name, "ip_address": client_host})
     return db_method
 
@@ -1425,7 +1566,7 @@ def restore_issuing_method(
     if db_method is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issuing Method not found or not in a soft-deleted state.")
     db_method = crud_issuing_method.restore(db, db_method)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="IssuingMethod", entity_id=db_method.id, details={"name": db_method.name, "ip_address": client_host})
     return db_method
 
@@ -1443,7 +1584,7 @@ def create_lg_status(
             detail=f"LG Status with name '{status_in.name}' already exists."
         )
     db_status = crud_lg_status.create(db, obj_in=status_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="LgStatus", entity_id=db_status.id, details={"name": db_status.name, "ip_address": client_host})
     return db_status
 
@@ -1484,7 +1625,7 @@ def update_lg_status(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"LG Status with name '{status_in.name}' already exists.")
             
     updated_status = crud_lg_status.update(db, db_obj=db_status, obj_in=status_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="LgStatus", entity_id=updated_status.id, details={"name": updated_status.name, "ip_address": client_host, "updated_fields": status_in.model_dump(exclude_unset=True)})
     return updated_status
 
@@ -1499,7 +1640,7 @@ def delete_lg_status(
     if db_status is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Status not found or already deleted")
     db_status = crud_lg_status.soft_delete(db, db_status)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="LgStatus", entity_id=db_status.id, details={"name": db_status.name, "ip_address": client_host})
     return db_status
 
@@ -1514,7 +1655,7 @@ def restore_lg_status(
     if db_status is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Status not found or not in a soft-deleted state.")
     db_status = crud_lg_status.restore(db, db_status)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="LgStatus", entity_id=db_status.id, details={"name": db_status.name, "ip_address": client_host})
     return db_status
 
@@ -1532,7 +1673,7 @@ def create_lg_operational_status(
             detail=f"LG Operational Status with name '{op_status_in.name}' already exists."
         )
     db_op_status = crud_lg_operational_status.create(db, obj_in=op_status_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="LgOperationalStatus", entity_id=db_op_status.id, details={"name": db_op_status.name, "ip_address": client_host})
     return db_op_status
 
@@ -1573,7 +1714,7 @@ def update_lg_operational_status(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"LG Operational Status with name '{op_status_in.name}' already exists.")
             
     updated_op_status = crud_lg_operational_status.update(db, db_obj=db_op_status, obj_in=op_status_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="LgOperationalStatus", entity_id=updated_op_status.id, details={"name": updated_op_status.name, "ip_address": client_host, "updated_fields": op_status_in.model_dump(exclude_unset=True)})
     return updated_op_status
 
@@ -1588,7 +1729,7 @@ def delete_lg_operational_status(
     if db_op_status is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Operational Status not found or already deleted")
     db_op_status = crud_lg_operational_status.soft_delete(db, db_op_status)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="LgOperationalStatus", entity_id=db_op_status.id, details={"name": db_op_status.name, "ip_address": client_host})
     return db_op_status
 
@@ -1603,7 +1744,7 @@ def restore_lg_operational_status(
     if db_op_status is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Operational Status not found or not in a soft-deleted state.")
     db_op_status = crud_lg_operational_status.restore(db, db_op_status)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="LgOperationalStatus", entity_id=db_op_status.id, details={"name": db_op_status.name, "ip_address": client_host})
     return db_op_status
 
@@ -1615,7 +1756,7 @@ def create_universal_category(
     request: Request = None
 ):
     """Create a new Universal Category entry."""
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     # Enforce universal scope by setting customer_id to None
     category_in.customer_id = None
@@ -1692,7 +1833,7 @@ def update_universal_category(
     request: Request = None
 ):
     """Update an existing Universal Category by ID."""
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     
     db_category = crud_lg_category.get(db, id=category_id)
     if not db_category or db_category.customer_id is not None:
@@ -1805,7 +1946,7 @@ def create_bank(
                 detail=f"Bank with SWIFT code '{bank_in.swift_code}' already exists."
             )
     db_bank = crud_bank.create(db, obj_in=bank_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="Bank", entity_id=db_bank.id, details={"name": db_bank.name, "swift_code": db_bank.swift_code, "ip_address": client_host})
     return db_bank
 
@@ -1852,7 +1993,7 @@ def update_bank(
             )
             
     updated_bank = crud_bank.update(db, db_obj=db_bank, obj_in=bank_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="Bank", entity_id=updated_bank.id, details={"name": updated_bank.name, "ip_address": client_host, "updated_fields": bank_in.model_dump(exclude_unset=True)})
     return updated_bank
 
@@ -1867,7 +2008,7 @@ def delete_bank(
     if db_bank is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
     db_bank = crud_bank.soft_delete(db, db_bank)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="Bank", entity_id=db_bank.id, details={"name": db_bank.name, "ip_address": client_host})
     return db_bank
 
@@ -1882,7 +2023,7 @@ def restore_bank(
     if db_bank is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or not in a soft-deleted state.")
     db_bank = crud_bank.restore(db, db_bank)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Bank", entity_id=db_bank.id, details={"name": db_bank.name, "ip_address": client_host})
     return db_bank
 
@@ -1907,7 +2048,7 @@ def create_template(
             detail=f"Template with name '{template_in.name}' and action type '{template_in.action_type}' already exists for this scope and purpose."
         )
     db_template = crud_template.create(db, obj_in=template_in)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="Template", entity_id=db_template.id, details={"name": db_template.name, "action_type": db_template.action_type, "is_global": db_template.is_global, "customer_id": db_template.customer_id, "is_notification_template": db_template.is_notification_template, "ip_address": client_host})
     return db_template
 
@@ -2011,7 +2152,7 @@ def update_template(
 
     updated_template = crud_template.update(db, db_obj=db_template, obj_in=template_in)
     
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="Template", entity_id=updated_template.id, details={"name": updated_template.name, "ip_address": client_host, "updated_fields": template_in.model_dump(exclude_unset=True)})
     
     return updated_template
@@ -2028,7 +2169,7 @@ def delete_template(
     if db_template is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found or already deleted")
     deleted_template = crud_template.soft_delete(db, db_template)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="SOFT_DELETE", entity_type="Template", entity_id=deleted_template.id, details={"name": deleted_template.name, "ip_address": client_host})
     return deleted_template
 
@@ -2044,7 +2185,7 @@ def restore_template(
     if db_template is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found or not in a soft-deleted state.")
     restored_template = crud_template.restore(db, db_template)
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Template", entity_id=restored_template.id, details={"name": restored_template.name, "ip_address": client_host})
     return restored_template
 
@@ -2203,7 +2344,7 @@ def create_system_notification(
     Creates a new system-wide notification.
     Requires: content, start_date, end_date, and optionally a link and target_customer_ids.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip(request) if request else None
 
     if notification_in.start_date >= notification_in.end_date:
         raise HTTPException(

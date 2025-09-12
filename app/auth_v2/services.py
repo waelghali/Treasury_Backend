@@ -37,6 +37,7 @@ from app.constants import (
     GlobalConfigKey, # Added for password policy config retrieval
     AUDIT_ACTION_TYPE_LOGIN_SUCCESS,
     AUDIT_ACTION_TYPE_LOGIN_FAILED,
+    AUDIT_ACTION_TYPE_ACCOUNT_LOCKED, # NEW
     AUDIT_ACTION_TYPE_PASSWORD_CHANGE_FIRST_LOGIN_SUCCESS,
     AUDIT_ACTION_TYPE_PASSWORD_CHANGE_FIRST_LOGIN_FAILED,
     AUDIT_ACTION_TYPE_PASSWORD_RESET_INITIATED,
@@ -77,6 +78,22 @@ class AuthService:
                 policy_config[key_enum.value] = value.lower() == 'true'
         return policy_config
 
+    async def _get_login_policy_config(self, db: Session) -> Dict[str, Any]:
+        """NEW: Fetches login policy settings from GlobalConfiguration."""
+        from app.crud.crud import crud_global_configuration
+        
+        policy_config = {}
+        for key_enum, default_value in [
+            (GlobalConfigKey.LOGIN_MAX_FAILED_ATTEMPTS, "5"),
+            (GlobalConfigKey.LOGIN_LOCKOUT_DURATION_MINUTES, "15")
+        ]:
+            config_value = crud_global_configuration.get_by_key(db, key_enum)
+            value = config_value.value_default if config_value else default_value
+            
+            policy_config[key_enum.value] = int(value)
+        return policy_config
+
+
     async def _validate_password_policy(self, password: str, db: Session) -> None:
         """Validates a password against the configured policy."""
         policy = await self._get_password_policy_config(db)
@@ -116,6 +133,7 @@ class AuthService:
         
         user = crud_user.get_by_email(db, email)
         
+        # Check for user existence first
         if not user:
             log_action(
                 db,
@@ -131,21 +149,93 @@ class AuthService:
                 detail="Incorrect email or password."
             )
 
-        if not verify_password(password, user.password_hash):
+        current_time = datetime.now(timezone.utc)
+        
+        # NEW LOGIC START: Check if the lockout period has expired and reset
+        if user.locked_until and user.locked_until <= current_time:
+            # Lockout period has passed. Reset attempts and clear lock.
+            user.failed_login_attempts = 0
+            user.locked_until = None
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        # NEW LOGIC END
+        
+        # Check for account lockout before password verification
+        if user.locked_until and user.locked_until > current_time:
+            time_remaining = user.locked_until - current_time
+            minutes, seconds = divmod(time_remaining.total_seconds(), 60)
+            formatted_time = f"{int(minutes)} minutes and {int(seconds)} seconds"
+            
             log_action(
                 db,
                 user_id=user.id,
                 action_type=AUDIT_ACTION_TYPE_LOGIN_FAILED,
                 entity_type="User",
                 entity_id=user.id,
-                details={"email": user.email, "reason": "Incorrect password"},
+                details={"email": user.email, "reason": "Account is locked"},
                 ip_address=request_ip,
                 customer_id=user.customer_id,
             )
+            
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect email or password."
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Account is locked. Please try again after {formatted_time}."
             )
+            
+        # Refactored Logic: Verify password and handle failed attempts
+        if not verify_password(password, user.password_hash):
+            user.failed_login_attempts += 1
+            login_policy = await self._get_login_policy_config(db)
+            max_attempts = login_policy.get(GlobalConfigKey.LOGIN_MAX_FAILED_ATTEMPTS.value, 5)
+            lockout_duration = login_policy.get(GlobalConfigKey.LOGIN_LOCKOUT_DURATION_MINUTES.value, 15)
+
+            log_details = {"email": user.email, "reason": "Incorrect password", "failed_attempts": user.failed_login_attempts}
+            log_action_type = AUDIT_ACTION_TYPE_LOGIN_FAILED
+
+            # Check if this failed attempt triggers a lockout
+            if user.failed_login_attempts >= max_attempts:
+                user.locked_until = current_time + timedelta(minutes=lockout_duration)
+                log_action_type = AUDIT_ACTION_TYPE_ACCOUNT_LOCKED
+                log_details["reason"] = f"Account locked after {max_attempts} failed attempts."
+                # The exception is now raised at the end of this block
+            
+            db.add(user)
+            db.commit() # The fix is here: change flush() to commit()
+            db.refresh(user)
+
+            log_action(
+                db,
+                user_id=user.id,
+                action_type=log_action_type,
+                entity_type="User",
+                entity_id=user.id,
+                details=log_details,
+                ip_address=request_ip,
+                customer_id=user.customer_id,
+            )
+            
+            # This is the key change: now we raise the appropriate exception based on the lockout status
+            if log_action_type == AUDIT_ACTION_TYPE_ACCOUNT_LOCKED:
+                time_remaining = user.locked_until - current_time
+                minutes, seconds = divmod(time_remaining.total_seconds(), 60)
+                formatted_time = f"{int(minutes)} minutes and {int(seconds)} seconds"
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Account is locked. Please try again after {formatted_time}."
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Incorrect email or password."
+                )
+
+        # On successful login, reset failed attempts and unlock the account
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        db.add(user)
+        db.commit() # The get_db generator handles the commit, so just flush here
+        db.refresh(user)
 
         from app.crud.crud import crud_role_permission # Late import
         db_permissions = crud_role_permission.get_permissions_for_role(db, user.role.value)
@@ -189,6 +279,7 @@ class AuthService:
             "token_type": "bearer",
             "must_change_password": user.must_change_password
         }
+        
 
     async def change_password(
         self, db: Session, user: TokenData, request_body: ChangePasswordRequest, request_ip: Optional[str],
@@ -197,6 +288,7 @@ class AuthService:
         """
         Allows an authenticated user to change their password.
         Clears the must_change_password flag on success.
+        This function now relies solely on the configured password policy.
         """
         from app.crud.crud import crud_user # Late import
 
@@ -219,6 +311,7 @@ class AuthService:
             )
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect current password.")
 
+        # The password policy is now enforced here, using the business logic layer.
         await self._validate_password_policy(request_body.new_password, db)
 
         # Update password using crud_user's internal logic or directly if no custom logic is there
@@ -374,6 +467,7 @@ class AuthService:
     async def reset_password(self, db: Session, request_body: ResetPasswordRequest, request_ip: Optional[str]) -> None:
         """
         Resets the user's password using a valid reset token.
+        This function now relies solely on the configured password policy.
         """
         from app.crud.crud import crud_user # Late import
 
@@ -431,6 +525,7 @@ class AuthService:
             )
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Associated user not found or inactive.")
 
+        # The password policy is now enforced here, using the business logic layer.
         await self._validate_password_policy(request_body.new_password, db)
 
         # Update user's password and mark token as used
@@ -494,6 +589,7 @@ class AuthService:
         """
         Allows an admin (SO or CA) to set/reset a user's password and force change.
         Enforces role hierarchy and customer scope.
+        This function now relies solely on the configured password policy.
         """
         from app.crud.crud import crud_user # Late import
 
@@ -540,6 +636,7 @@ class AuthService:
             )
         # --- End Role Hierarchy Enforcement ---
 
+        # The password policy is now enforced here, using the business logic layer.
         await self._validate_password_policy(request_body.new_password, db)
 
         # Update password
@@ -611,6 +708,8 @@ class AuthService:
             AUDIT_ACTION_TYPE_ADMIN_PASSWORD_RESET,
             # For general updates that include password changes in details
             AUDIT_ACTION_TYPE_UPDATE,
+            # NEW: Add the new action type
+            AUDIT_ACTION_TYPE_ACCOUNT_LOCKED,
         ]
 
         query_filters = []

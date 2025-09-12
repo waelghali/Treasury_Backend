@@ -43,6 +43,9 @@ import app.models as models
 from app.models import (
     InternalOwnerContact, LGCategory, Bank, IssuingMethod, Rule,User,
     ApprovalRequest,CustomerEntity,
+    UserCustomerEntityAssociation,
+    LGCategoryCustomerEntityAssociation,
+    Customer
 )
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, SubscriptionStatus
 
@@ -65,7 +68,8 @@ try:
         HasPermission,
         get_current_active_user,
         get_current_corporate_admin_context,
-        get_current_user
+        get_current_user,
+        get_client_ip,
     )
 except Exception as e:
     print(f"FATAL ERROR (corporate_admin.py): Could not import core.security module directly. Error: {e}")
@@ -166,7 +170,7 @@ def change_password_on_first_login(
     After successful change, issues a new JWT token with must_change_password set to False.
     This endpoint explicitly bypasses the get_current_active_user check.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
 
     db_user = db.query(User).filter(User.id == current_user_token_data.user_id, User.is_deleted == False).first()
     if not db_user:
@@ -223,7 +227,7 @@ def create_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:create")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -269,10 +273,10 @@ def create_customer_entity(
         
         return db_entity
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="CustomerEntity", entity_id=None, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="CustomerEntity", entity_id=None, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="CustomerEntity", entity_id=None, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="CustomerEntity", entity_id=None, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -307,7 +311,7 @@ def update_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -335,10 +339,10 @@ def update_customer_entity(
         
         return updated_entity
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": entity_in.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -351,7 +355,7 @@ def delete_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:delete")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -378,10 +382,10 @@ def delete_customer_entity(
         
         return deleted_entity
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -394,7 +398,7 @@ def restore_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -425,17 +429,17 @@ def restore_customer_entity(
                 restored_entity.is_active = False
                 db.add(restored_entity)
                 
-                log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_INACTIVE", entity_type="CustomerEntity", entity_id=restored_entity.id, details={"entity_name": restored_entity.entity_name, "reason": "Single-entity plan limit met"}, customer_id=customer_id)
+                log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_INACTIVE", entity_type="CustomerEntity", entity_id=restored_entity.id, details={"entity_name": restored_entity.entity_name, "reason": "Single-entity plan limit met"}, customer_id=customer_id, ip_address=client_host)
                 return restored_entity
                 
         restored_entity = crud_customer_entity.restore(db, db_entity, user_id=corporate_admin_context.user_id)
         
         return restored_entity
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEntity", entity_id=entity_id, details={"entity_name": db_entity.entity_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -453,7 +457,7 @@ def create_user(
     Allows a Corporate Admin to create a new user under their customer organization.
     Enforces subscription plan limits and prevents assignment of the SYSTEM_OWNER role.
     """
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -484,10 +488,10 @@ def create_user(
         db_user = crud_user.create_user_by_corporate_admin(db, user_in, customer_id, corporate_admin_context.user_id)
         return db_user
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -528,7 +532,7 @@ def update_user(
     corporate_admin_context: TokenData = Depends(HasPermission("user:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -543,10 +547,10 @@ def update_user(
         
         return updated_user
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="User", entity_id=user_id, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="User", entity_id=user_id, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="User", entity_id=user_id, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="User", entity_id=user_id, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -559,7 +563,7 @@ def delete_user(
     corporate_admin_context: TokenData = Depends(HasPermission("user:delete")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -579,10 +583,10 @@ def delete_user(
         
         return deleted_user
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -596,7 +600,7 @@ def restore_user(
     corporate_admin_context: TokenData = Depends(HasPermission("user:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -616,10 +620,10 @@ def restore_user(
         
         return restored_user
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="User", entity_id=user_id, details={"email": db_user.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -637,7 +641,7 @@ def create_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:create")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     # CRITICAL FIX: Explicitly set the customer_id from the authenticated user's context.
@@ -661,10 +665,10 @@ def create_lg_category(
             }
         )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"name": lg_category_in.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"name": lg_category_in.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"name": lg_category_in.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="LGCategory", entity_id=None, details={"name": lg_category_in.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
 # In api/v1/endpoints/corporate_admin.py
@@ -748,7 +752,7 @@ def update_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -776,12 +780,12 @@ def update_lg_category(
     except HTTPException as e:
         # FIX: Use getattr to safely access `lg_category_in.name`
         category_name = getattr(lg_category_in, 'name', 'N/A')
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": category_name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
         # FIX: Use getattr to safely access `lg_category_in.name`
         category_name = getattr(lg_category_in, 'name', 'N/A')
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": category_name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -794,7 +798,7 @@ def delete_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:delete")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -815,10 +819,10 @@ def delete_lg_category(
             }
         )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -831,7 +835,7 @@ def restore_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -865,10 +869,10 @@ def restore_lg_category(
             }
         )
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="LGCategory", entity_id=category_id, details={"name": db_lg_category.name, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -893,7 +897,7 @@ def update_customer_configuration(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_config:edit")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -933,13 +937,13 @@ def update_customer_configuration(
         
         return response_data
     except ValueError as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -955,7 +959,7 @@ def create_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -994,10 +998,10 @@ def create_customer_email_settings(
             db.refresh(db_settings)
             return db_settings
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -1025,7 +1029,7 @@ def update_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1036,10 +1040,10 @@ def update_customer_email_settings(
         updated_settings = crud_customer_email_setting.update(db, db_settings, settings_in, corporate_admin_context.user_id)
         return updated_settings
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -1052,7 +1056,7 @@ def delete_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1063,10 +1067,10 @@ def delete_customer_email_settings(
         deleted_settings = crud_customer_email_setting.soft_delete(db, db_settings, corporate_admin_context.user_id)
         return deleted_settings
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -1079,7 +1083,7 @@ def restore_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = request.client.host if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1098,10 +1102,10 @@ def restore_customer_email_settings(
         restored_settings = crud_customer_email_setting.restore(db, db_settings, corporate_admin_context.user_id)
         return restored_settings
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="RESTORE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -1212,10 +1216,10 @@ async def approve_approval_request(
         
         return ApprovalRequestOut.model_validate(approved_request)
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -1269,10 +1273,10 @@ async def reject_approval_request(
         )
         return ApprovalRequestOut.model_validate(rejected_request)
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"

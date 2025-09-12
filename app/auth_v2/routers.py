@@ -11,6 +11,8 @@ from app.database import get_db
 import app.core.security as security
 # NEW: Import the custom token creation function with a specific name
 from app.core.security import create_access_token as create_fresh_access_token 
+# NEW: Import the new centralized IP resolution function
+from app.core.security import get_client_ip
 
 # Auth_v2 specific schemas and services
 from app.schemas.all_schemas import (
@@ -37,10 +39,9 @@ async def login_for_access_token(
     Redirects to change-password if must_change_password = True.
     """
     try:
-        # Call service to authenticate user and get a fresh token
-        # The authenticate_user function in the service layer will be updated to include subscription status in the payload.
+        # Pass the resolved client IP to the service layer
         auth_response = await auth_service.authenticate_user(
-            db, form_data.username, form_data.password, request.client.host
+            db, form_data.username, form_data.password, get_client_ip(request)
         )
 
         if auth_response.get("must_change_password"):
@@ -88,7 +89,7 @@ async def change_password(
             db,
             current_user,
             request_body,
-            request.client.host,
+            get_client_ip(request),
             is_first_login_change=is_first_login_change
         )
         # Note: The `get_current_user` dependency already added a new token to the response header.
@@ -115,7 +116,7 @@ async def forgot_password(
     """
     try:
         await auth_service.initiate_password_reset(
-            db, request_body.email, request.client.host
+            db, request_body.email, get_client_ip(request)
         )
         return {"message": "If an account with that email exists, a password reset link has been sent."}
     except HTTPException as e:
@@ -141,7 +142,7 @@ async def reset_password(
         await auth_service.reset_password(
             db,
             request_body, # Pass the entire request_body object
-            request.client.host # Pass the IP address
+            get_client_ip(request) # Pass the IP address
         )
         return {"message": "Password has been successfully reset."}
     except HTTPException as e:
@@ -200,7 +201,7 @@ async def admin_set_user_password(
             user_id,
             request_body,
             admin_user,
-            request.client.host
+            get_client_ip(request)
         )
         return updated_user
     except HTTPException as e:

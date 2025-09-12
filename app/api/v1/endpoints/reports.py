@@ -46,7 +46,7 @@ try:
     from app.core.security import (
         TokenData,
         HasPermission,
-        get_current_active_user,
+        get_current_active_user, get_client_ip
     )
 except Exception as e:
     logger.critical(f"FATAL ERROR (reports.py): Could not import core.security module directly. Error: {e}", exc_info=True)
@@ -91,10 +91,12 @@ async def get_current_report_user_context(
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for report access.")
 
+# MODIFIED: Add ip_address parameter
 def _log_report_access(
     db: Session,
     user_context: Dict[str, Any],
     report_name: str,
+    ip_address: Optional[str],
     export_format: Optional[str] = None,
     filters: Optional[Dict[str, Any]] = None
 ):
@@ -115,7 +117,8 @@ def _log_report_access(
         entity_id=None,
         details=log_details,
         customer_id=user_context['customer_id'],
-        lg_record_id=None
+        lg_record_id=None,
+        ip_address=ip_address # Pass the new ip_address parameter
     )
 
 def _export_to_csv(data: List[Dict[str, Any]], filename: str) -> Response:
@@ -167,6 +170,7 @@ async def get_system_usage_overview(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
     export_format: Optional[str] = Query(None, description="Set to 'csv' to export as CSV. Default: JSON."),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     """
     **Report: System Usage Overview**
@@ -175,7 +179,8 @@ async def get_system_usage_overview(
     if user_context['role'] != UserRole.SYSTEM_OWNER:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only System Owners can access this report.")
 
-    _log_report_access(db, user_context, "System Usage Overview", export_format)
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "System Usage Overview", client_ip, export_format) # MODIFIED: Pass ip_address
 
     report_data_out = crud_reports.get_system_usage_overview_report(db, user_context)
 
@@ -189,10 +194,14 @@ async def get_system_usage_overview(
 def get_customer_lg_type_mix(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
     
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "LG Type Mix", client_ip) # MODIFIED: Pass ip_address
+
     customer_data = crud_reports.get_chart_data(db, "lg_type_mix", user_context)
     global_user_context = {"role": UserRole.SYSTEM_OWNER} 
     global_data = crud_reports.get_chart_data(db, "lg_type_mix", global_user_context)
@@ -209,9 +218,13 @@ def get_customer_lg_type_mix(
 def get_avg_bank_processing_time(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     if user_context['role'] not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "Avg Bank Processing Time", client_ip) # MODIFIED: Pass ip_address
 
     # Modified logic: Check the user's role and fetch global data if the user is a CORPORATE_ADMIN
     if user_context['role'] == UserRole.CORPORATE_ADMIN:
@@ -227,9 +240,13 @@ def get_avg_bank_processing_time(
 def get_bank_market_share(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     if user_context['role'] not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+    
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "Bank Market Share", client_ip) # MODIFIED: Pass ip_address
 
     customer_data = crud_reports.get_chart_data(db, "bank_market_share", user_context)
     global_user_context = {"role": UserRole.SYSTEM_OWNER} 
@@ -249,7 +266,8 @@ async def get_customer_lg_performance(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
     export_format: Optional[str] = Query(None, description="Set to 'csv' to export as CSV. Default: JSON."),
-    customer_id: Optional[int] = Query(None, description="Filter by customer ID (System Owner only).")
+    customer_id: Optional[int] = Query(None, description="Filter by customer ID (System Owner only)."),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     """
     **Report: Customer LG Performance**
@@ -262,7 +280,8 @@ async def get_customer_lg_performance(
     elif user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
 
-    _log_report_access(db, user_context, "Customer LG Performance", export_format)
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "Customer LG Performance", client_ip, export_format) # MODIFIED: Pass ip_address
 
     report_data_out = crud_reports.get_customer_lg_performance_report(db, user_context)
 
@@ -279,6 +298,7 @@ async def get_my_lg_dashboard(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
     export_format: Optional[str] = Query(None, description="Set to 'csv' to export as CSV. Default: JSON."),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     """
     **Report: My LG Dashboard**
@@ -287,7 +307,8 @@ async def get_my_lg_dashboard(
     if user_context['role'] != UserRole.END_USER:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only End Users can access this report.")
 
-    _log_report_access(db, user_context, "My LG Dashboard", export_format)
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "My LG Dashboard", client_ip, export_format) # MODIFIED: Pass ip_address
 
     report_data_out = crud_reports.get_my_lg_dashboard_report(db, user_context)
 
@@ -303,9 +324,13 @@ async def get_my_lg_dashboard(
 def get_avg_delivery_days(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+    
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "Avg Delivery Days", client_ip) # MODIFIED: Pass ip_address
     
     # Corrected: Pass user_context unconditionally to let crud handle the filter
     customer_avg_data = crud_reports.get_chart_data(db, "avg_delivery_days", user_context) # Pass the user_context here
@@ -324,9 +349,13 @@ def get_avg_delivery_days(
 def get_avg_days_to_action(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+    request: Request = None # MODIFIED: Add request dependency
 ):
     if user_context['role'] not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
+
+    client_ip = get_client_ip(request) # MODIFIED: Get the client IP
+    _log_report_access(db, user_context, "Avg Days to Action", client_ip) # MODIFIED: Pass ip_address
 
     # Corrected: Pass user_context unconditionally to let crud handle the filter
     customer_avg_data = crud_reports.get_chart_data(db, "avg_days_to_action", user_context) # Pass the user_context here
@@ -362,7 +391,8 @@ async def submit_demo_request(
         # Prepare the data with a timestamp and IP address
         data_to_store = demo_request.model_dump()
         data_to_store['timestamp'] = datetime.now().isoformat()
-        data_to_store['ip_address'] = request.client.host if request else None
+        # MODIFIED: Use the IP resolution function for the public endpoint
+        data_to_store['ip_address'] = get_client_ip(request) if request else None
 
         # Append the JSON data to the file
         with open(file_path, 'a') as f:
@@ -377,7 +407,8 @@ async def submit_demo_request(
             entity_id=None,
             details=data_to_store,
             customer_id=None,
-            lg_record_id=None
+            lg_record_id=None,
+            ip_address=data_to_store['ip_address'] # MODIFIED: Pass ip_address to log_action
         )
 
         return {"message": "Demo request submitted successfully."}
