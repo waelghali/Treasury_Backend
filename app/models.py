@@ -128,7 +128,11 @@ class User(BaseModel):
 
     must_change_password = Column(Boolean, default=True, nullable=False, comment="True if user must change password on next login")
     has_all_entity_access = Column(Boolean, default=True, nullable=False, comment="True if user has access to all entities under their customer, False if restricted to specific entities")
-
+    
+    # NEW FIELDS: Account Lockout
+    failed_login_attempts = Column(Integer, default=0, nullable=False, comment="Consecutive failed login attempts")
+    locked_until = Column(DateTime(timezone=True), nullable=True, comment="Timestamp until which the account is locked")
+    
     entity_associations = relationship("UserCustomerEntityAssociation", back_populates="user", cascade="all, delete-orphan")
     entities_with_access = relationship("CustomerEntity", secondary="user_customer_entity_association", viewonly=True)
     password_reset_tokens = relationship("PasswordResetToken", back_populates="user", cascade="all, delete-orphan")

@@ -111,6 +111,7 @@ class CRUDUser(CRUDBase):
         )
         return db_user
 
+
     def create_user_by_corporate_admin(self, db: Session, user_in: UserCreateCorporateAdmin, customer_id: int, user_id_caller: int) -> User:
         # Check for existing user with the same email address
         existing_user = self.get_by_email(db, user_in.email)
@@ -144,7 +145,7 @@ class CRUDUser(CRUDBase):
         if user_in.role == UserRole.SYSTEM_OWNER:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Corporate Admins cannot create users with 'SYSTEM_OWNER' role.",
+                detail="Corporate Admins cannot create users with 'SYSTEM_OWNER' role."
             )
 
         user_data = user_in.model_dump(exclude_unset=True)
@@ -204,6 +205,7 @@ class CRUDUser(CRUDBase):
             customer_id=db_user.customer_id,
         )
         return db_user
+
 
     def update_user(self, db: Session, db_user: User, user_in: UserUpdate, user_id_caller: Optional[int] = None) -> User:
         old_data_for_log = user_in.model_dump(exclude_unset=True)
