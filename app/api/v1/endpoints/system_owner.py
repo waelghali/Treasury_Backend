@@ -26,16 +26,17 @@ from app.schemas.all_schemas import (
     LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
     AuditLogOut,
     SystemNotificationCreate, SystemNotificationUpdate, SystemNotificationOut,
+    LegalArtifactCreate, LegalArtifactOut,
 )
 from app.crud.crud import (
     crud_subscription_plan, crud_customer, crud_customer_entity, crud_user,
     crud_global_configuration, crud_bank, crud_template,
     crud_currency, crud_lg_type, crud_rule, crud_issuing_method,
     crud_lg_status, crud_lg_operational_status,
-    # MODIFIED: Use new unified crud_lg_category
     crud_lg_category,
     crud_audit_log, log_action,
     crud_system_notification,
+    crud_legal_artifact,
 )
 from app.models import (
     SubscriptionPlan, Customer, CustomerEntity, User,
@@ -78,7 +79,7 @@ except Exception as e:
     raise
 
 
-from app.constants import UserRole
+from app.constants import UserRole, LegalArtifactType, GlobalConfigKey
 
 router = APIRouter()
 
@@ -2538,3 +2539,77 @@ def read_users(
     """
     users = crud_user.get_all(db, skip=skip, limit=limit)
     return users
+    
+# NEW ENDPOINTS FOR MANAGING LEGAL ARTIFACTS
+
+@router.post("/legal-artifacts", response_model=LegalArtifactOut, status_code=status.HTTP_201_CREATED)
+def create_legal_artifact(
+    artifact_in: LegalArtifactCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("legal_artifact:create")),
+    request: Request = None,
+):
+    """
+    Allows a System Owner to create a new legal artifact and update its global version.
+    This action will trigger a re-acceptance for all users on next login.
+    """
+    client_host = get_client_ip(request) if request else None
+
+    # Enforce one of the two legal artifact types
+    if artifact_in.artifact_type not in [LegalArtifactType.TERMS_AND_CONDITIONS, LegalArtifactType.PRIVACY_POLICY]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid legal artifact type. Must be one of: {LegalArtifactType.TERMS_AND_CONDITIONS}, {LegalArtifactType.PRIVACY_POLICY}"
+        )
+    
+    # Create the new legal artifact in the database
+    db_artifact = crud_legal_artifact.create_artifact(db, obj_in=artifact_in)
+
+    # Update the global configuration with the new version number
+    if db_artifact.artifact_type == LegalArtifactType.TERMS_AND_CONDITIONS:
+        config_key = GlobalConfigKey.TC_VERSION
+    else:
+        config_key = GlobalConfigKey.PP_VERSION
+
+    # Retrieve or create the global config entry
+    db_config = crud_global_configuration.get_by_key(db, key=config_key)
+    if db_config:
+        # CORRECTED: Create a schema object to update with the new value
+        config_update_in = GlobalConfigurationUpdate(value_default=str(db_artifact.version))
+        crud_global_configuration.update(db, db_obj=db_config, obj_in=config_update_in)
+    else:
+        # If config key doesn't exist, create it
+        new_config_in = GlobalConfigurationCreate(
+            key=config_key,
+            value_default=str(db_artifact.version),
+            description=f"Current version of the {db_artifact.artifact_type.replace('_', ' ')}."
+        )
+        crud_global_configuration.create(db, obj_in=new_config_in)
+    
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="CREATE",
+        entity_type="LegalArtifact",
+        entity_id=db_artifact.id,
+        details={"artifact_type": db_artifact.artifact_type, "version": db_artifact.version, "ip_address": client_host}
+    )
+
+    return db_artifact
+
+@router.get("/legal-artifacts/{artifact_type}", response_model=LegalArtifactOut)
+def read_legal_artifact(
+    artifact_type: LegalArtifactType,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("legal_artifact:view"))
+):
+    """
+    Retrieves the latest version of a legal artifact by its type.
+    """
+    db_artifact = crud_legal_artifact.get_by_artifact_type(db, artifact_type=artifact_type)
+    if not db_artifact:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Legal artifact of type '{artifact_type}' not found."
+        )
+    return db_artifact

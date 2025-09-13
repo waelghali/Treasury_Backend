@@ -9,8 +9,8 @@ class UserRole(str, Enum):
     CORPORATE_ADMIN = "corporate_admin"
     END_USER = "end_user"
     CHECKER = "checker"
+    VIEWER = "viewer"
 
-# NEW: Defines the status of a customer's subscription.
 class SubscriptionStatus(str, Enum):
     ACTIVE = "active"
     GRACE = "grace"
@@ -46,6 +46,9 @@ class GlobalConfigKey(str, Enum):
     LOGIN_LOCKOUT_DURATION_MINUTES = "LOGIN_LOCKOUT_DURATION_MINUTES"
     # NEW: Number of days for the subscription grace period.
     GRACE_PERIOD_DAYS = "GRACE_PERIOD_DAYS"
+    # NEW: Keys for legal artifact versions
+    TC_VERSION = "TC_VERSION"
+    PP_VERSION = "PP_VERSION"
 
 # NEW: Defines the types of subscription-related email notifications.
 class SubscriptionNotificationType(str, Enum):
@@ -147,12 +150,6 @@ INSTRUCTION_TYPE_CODE_TO_FULL_ACTION_MAP = {
     InstructionTypeCode.CNC: ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION,
 }
 
-# --- LG Category Codes (for new serial format) ---
-# This is NOT an enum, but a list of common LG Category Codes to be used in the serial.
-# Should correspond to codes in LGCategory and UniversalCategory models.
-# Example: AP for Advance Payment, PB for Performance Bond, etc.
-# The actual value used will come from the LGRecord.lg_category.code.
-
 # --- Audit Log Action Types (specific to audit logs for clarity, if distinct from general actions) ---
 AUDIT_ACTION_TYPE_CREATE = "CREATE"
 AUDIT_ACTION_TYPE_UPDATE = "UPDATE"
@@ -172,6 +169,7 @@ AUDIT_ACTION_TYPE_AI_SCAN_FAILED = "AI_SCAN_FAILED"
 AUDIT_ACTION_TYPE_NOTIFICATION_SENT = "NOTIFICATION_SENT"
 AUDIT_ACTION_TYPE_NOTIFICATION_FAILED = "NOTIFICATION_FAILED"
 AUDIT_ACTION_TYPE_INSTRUCTION_ACCESSED_FOR_PRINT = "INSTRUCTION_ACCESSED_FOR_PRINT"
+AUDIT_ACTION_TYPE_LEGAL_ARTIFACT_ACCEPTED = "LEGAL_ARTIFACT_ACCEPTED"
 
 # Approval-specific Audit Actions
 AUDIT_ACTION_TYPE_APPROVAL_REQUEST_SUBMITTED = "APPROVAL_REQUEST_SUBMITTED"
@@ -180,11 +178,11 @@ AUDIT_ACTION_TYPE_APPROVAL_REQUEST_REJECTED = "APPROVAL_REQUEST_REJECTED"
 AUDIT_ACTION_TYPE_APPROVAL_REQUEST_WITHDRAWN = "APPROVAL_REQUEST_WITHDRAWN"
 AUDIT_ACTION_TYPE_APPROVAL_REQUEST_AUTO_REJECTED = "APPROVAL_REQUEST_AUTO_REJECTED"
 AUDIT_ACTION_TYPE_APPROVAL_INVALIDATED_BY_OTHER_APPROVAL = "APPROVAL_INVALIDATED_BY_OTHER_APPROVAL"
-AUDIT_ACTION_TYPE_APPROVAL_LG_STATE_CHANGED = "APPROVAL_LG_STATE_CHANGED"
 AUDIT_ACTION_TYPE_APPROVAL_INVALIDATED_LG_MISSING = "APPROVAL_INVALIDATED_LG_MISSING"
 AUDIT_ACTION_TYPE_APPROVAL_REJECTED_SELF_APPROVAL = "APPROVAL_REJECTED_SELF_APPROVAL"
 AUDIT_ACTION_TYPE_APPROVAL_INVALIDATED_ENTITY_MISSING = "APPROVAL_INVALIDATED_ENTITY_MISSING"
 AUDIT_ACTION_TYPE_APPROVAL_ENTITY_STATE_CHANGED = "APPROVAL_ENTITY_STATE_CHANGED"
+AUDIT_ACTION_TYPE_APPROVAL_LG_STATE_CHANGED = "APPROVAL_LG_STATE_CHANGED"
 
 # LG Transactional Audit Actions
 AUDIT_ACTION_TYPE_LG_EXTENDED = "LG_EXTENDED"
@@ -234,6 +232,11 @@ AUDIT_ACTION_TYPE_ADMIN_PASSWORD_RESET = "ADMIN_PASSWORD_RESET"
 AUDIT_ACTION_TYPE_LG_INSTRUCTION_CANCELED = "LG_INSTRUCTION_CANCELED"
 AUDIT_ACTION_TYPE_LG_INSTRUCTION_CANCELLATION_FAILED = "LG_INSTRUCTION_CANCELLATION_FAILED"
 
+# --- Legal Artifacts ---
+class LegalArtifactType(str, Enum):
+    TERMS_AND_CONDITIONS = "terms_and_conditions"
+    PRIVACY_POLICY = "privacy_policy"
+
 # --- LG Status IDs (MUST match the actual INTEGER IDs in your lg_statuses table) ---
 class LgStatusEnum(int, Enum): # Base class changed to int
     VALID = 1
@@ -261,3 +264,4 @@ class MigrationRecordStatusEnum(str, Enum):
     ERROR = "ERROR"
     EXPIRED = "EXPIRED"
     DUPLICATE = "DUPLICATE"
+

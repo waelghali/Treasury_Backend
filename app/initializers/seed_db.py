@@ -308,6 +308,7 @@ INITIAL_PERMISSIONS = [
     {"name": "system_notification:edit", "description": "Allows editing a notification."},
     {"name": "system_notification:delete", "description": "Allows deleting a notification."},
     {"name": "system_owner:run_scheduler_job", "description": "Allows running scheduled jobs."},
+    {"name": "legal_artifact:create", "description": "Allows posting new terms and conditions and privacy policy."},
     {"name": "subscription_plan:view", "description": "Allows viewing subscription plans."},
     {"name": "subscription_plan:create", "description": "Allows creating new subscription plans."},
     {"name": "subscription_plan:edit", "description": "Allows editing existing subscription plans."},
@@ -438,6 +439,9 @@ ROLE_PERMISSIONS_MAPPING = {
     UserRole.CHECKER.value: [
         "lg_record:view_own", "maker_checker:approve", "system_notification:view",
         "approval_request:view_all"
+    ],
+    UserRole.VIEWER.value: [
+        "lg_record:view_all", "lg_document:view", "lg_record:view_own"
     ]
 }
 

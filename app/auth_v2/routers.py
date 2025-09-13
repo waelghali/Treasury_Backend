@@ -17,7 +17,8 @@ from app.core.security import get_client_ip
 # Auth_v2 specific schemas and services
 from app.schemas.all_schemas import (
     LoginRequest, ChangePasswordRequest, ForgotPasswordRequest,
-    ResetPasswordRequest, UserAccountOut, AdminUserUpdate, Token
+    ResetPasswordRequest, UserAccountOut, AdminUserUpdate, Token,
+    UserLegalAcceptanceRequest
 )
 from app.auth_v2.services import auth_service # Import the instantiated service
 
@@ -44,19 +45,12 @@ async def login_for_access_token(
             db, form_data.username, form_data.password, get_client_ip(request)
         )
 
-        if auth_response.get("must_change_password"):
-            # If must_change_password is true, return a 307 redirect status
-            # or a specific header for the frontend to handle.
-            # Returning 200 OK with must_change_password flag is a common pattern.
-            # The frontend should interpret this and redirect accordingly.
-            return Token(
-                access_token=auth_response["access_token"],
-                token_type=auth_response["token_type"]
-            )
-
+        # NEW LOGIC: Check for both must_change_password and must_accept_policies
+        # and include them in the response. The frontend decides the flow.
         return Token(
             access_token=auth_response["access_token"],
-            token_type=auth_response["token_type"]
+            token_type=auth_response["token_type"],
+            must_accept_policies=auth_response.get("must_accept_policies", False)
         )
     except HTTPException as e:
         raise e
@@ -259,4 +253,33 @@ async def admin_view_auth_logs(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while fetching audit logs."
+        )
+
+@router.post("/policies/accept", status_code=status.HTTP_200_OK)
+async def accept_policies(
+    request: Request,
+    request_body: UserLegalAcceptanceRequest,  # <-- CRITICAL FIX: Add the request body parameter
+    current_user: security.TokenData = Depends(security.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Allows an authenticated user to record their acceptance of the latest legal policies.
+    """
+    try:
+        # Pass the request body and user data to the service layer for processing
+        await auth_service.accept_legal_policies(
+            db, 
+            current_user,
+            request_body,
+            get_client_ip(request)
+        )
+        
+        return {"message": "Legal policies accepted successfully."}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to accept policies for user {current_user.email}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while accepting policies."
         )

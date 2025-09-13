@@ -47,6 +47,8 @@ from app.models import (
     LGMigrationStaging,
     MigrationBatch,
     LGChangeLog,
+    LegalArtifact,
+    UserLegalAcceptance
 )
 # NEW: Import SubscriptionStatus for checking against models and schemas
 from app.constants import SubscriptionStatus
@@ -223,6 +225,7 @@ from .crud_reports import CRUDReports
 from .crud_system_notification import CRUDSystemNotification
 from . import subscription_tasks
 from .crud_migration import CRUDLGMigration
+from .crud_legal import CRUDLegalArtifact, CRUDUserLegalAcceptance # NEW IMPORT
 
 # NEW IMPORTS for historical reconstruction
 from .crud_migration_history import CRUDMigrationBatch, CRUDLGChangeLog
@@ -260,7 +263,10 @@ crud_customer = CRUDCustomer(
 crud_customer_email_setting = CRUDCustomerEmailSetting(models.CustomerEmailSetting)
 crud_lg_category = CRUDLGCategory(models.LGCategory)
 
-crud_lg_document = CRUDLGDocument(models.LGDocument, crud_customer_configuration_instance=crud_customer_configuration)
+crud_lg_document = CRUDLGDocument(
+    models.LGDocument,
+    crud_customer_configuration_instance=crud_customer_configuration
+)
 
 crud_lg_instruction = CRUDLGInstruction(
     models.LGInstruction,
@@ -303,6 +309,10 @@ crud_migration_batch = CRUDMigrationBatch(models.MigrationBatch)
 crud_lg_change_log = CRUDLGChangeLog(models.LGChangeLog)
 migration_history_service = MigrationHistoryService()
 
+# NEW CRUDS for legal artifacts
+crud_legal_artifact = CRUDLegalArtifact(models.LegalArtifact)
+crud_user_legal_acceptance = CRUDUserLegalAcceptance(models.UserLegalAcceptance)
+
 
 __all__ = [ 
     "CRUDBase", 
@@ -341,4 +351,6 @@ __all__ = [
     "crud_migration_batch",
     "crud_lg_change_log",
     "migration_history_service",
+    "crud_legal_artifact", # NEW EXPORT
+    "crud_user_legal_acceptance", # NEW EXPORT
 ]
