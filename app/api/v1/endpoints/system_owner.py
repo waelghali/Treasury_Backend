@@ -2543,6 +2543,7 @@ def read_users(
 # NEW ENDPOINTS FOR MANAGING LEGAL ARTIFACTS
 
 @router.post("/legal-artifacts", response_model=LegalArtifactOut, status_code=status.HTTP_201_CREATED)
+@router.post("/legal-artifacts/", response_model=LegalArtifactOut, status_code=status.HTTP_201_CREATED)
 def create_legal_artifact(
     artifact_in: LegalArtifactCreate,
     db: Session = Depends(get_db),
