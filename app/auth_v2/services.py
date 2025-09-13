@@ -28,7 +28,8 @@ from app.schemas.all_schemas import (
     ResetPasswordRequest,
     AdminUserUpdate,
     UserAccountOut,
-    Token
+    Token,
+    UserLegalAcceptanceRequest
 )
 
 # NEW: Import ALL necessary AUDIT_ACTION_TYPE and GlobalConfigKey constants
@@ -45,7 +46,8 @@ from app.constants import (
     AUDIT_ACTION_TYPE_PASSWORD_RESET_FAILED,
     AUDIT_ACTION_TYPE_ADMIN_PASSWORD_SET,
     AUDIT_ACTION_TYPE_ADMIN_PASSWORD_RESET,
-    AUDIT_ACTION_TYPE_UPDATE
+    AUDIT_ACTION_TYPE_UPDATE,
+    AUDIT_ACTION_TYPE_LEGAL_ARTIFACT_ACCEPTED
 )
 
 
@@ -93,6 +95,23 @@ class AuthService:
             policy_config[key_enum.value] = int(value)
         return policy_config
 
+    async def _get_legal_artifact_versions(self, db: Session) -> Dict[str, float]:
+        """
+        NEW: Fetches the latest version of all legal artifacts from GlobalConfiguration.
+        Returns 0.0 if a version key is not found.
+        """
+        from app.crud.crud import crud_global_configuration
+        
+        tc_config = crud_global_configuration.get_by_key(db, GlobalConfigKey.TC_VERSION)
+        pp_config = crud_global_configuration.get_by_key(db, GlobalConfigKey.PP_VERSION)
+        
+        tc_version = float(tc_config.value_default) if tc_config and tc_config.value_default else 0.0
+        pp_version = float(pp_config.value_default) if pp_config and pp_config.value_default else 0.0
+
+        return {
+            "tc_version": tc_version,
+            "pp_version": pp_version,
+        }
 
     async def _validate_password_policy(self, password: str, db: Session) -> None:
         """Validates a password against the configured policy."""
@@ -124,15 +143,16 @@ class AuthService:
                 detail="Password must contain at least one digit."
             )
 
+
     async def authenticate_user(self, db: Session, email: str, password: str, request_ip: Optional[str]) -> Dict[str, Any]:
         """
         Authenticates a user and generates a JWT token.
         Returns the token and a flag indicating if password change is required.
         """
-        from app.crud.crud import crud_user # Late import
-        
-        user = crud_user.get_by_email(db, email)
-        
+        from app.crud.crud import crud_user  # Late import
+
+        user = db.query(User).options(selectinload(User.customer)).filter(User.email == email, User.is_deleted == False).first()
+
         # Check for user existence first
         if not user:
             log_action(
@@ -144,29 +164,19 @@ class AuthService:
                 details={"email": email, "reason": "User not found or inactive"},
                 ip_address=request_ip,
             )
+            print("DEBUG: User not found or inactive, returning authentication error.") # 🕵️‍♀️ DEBUG POINT
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password."
             )
 
         current_time = datetime.now(timezone.utc)
-        
-        # NEW LOGIC START: Check if the lockout period has expired and reset
-        if user.locked_until and user.locked_until <= current_time:
-            # Lockout period has passed. Reset attempts and clear lock.
-            user.failed_login_attempts = 0
-            user.locked_until = None
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-        # NEW LOGIC END
-        
-        # Check for account lockout before password verification
+
         if user.locked_until and user.locked_until > current_time:
             time_remaining = user.locked_until - current_time
             minutes, seconds = divmod(time_remaining.total_seconds(), 60)
             formatted_time = f"{int(minutes)} minutes and {int(seconds)} seconds"
-            
+
             log_action(
                 db,
                 user_id=user.id,
@@ -177,13 +187,12 @@ class AuthService:
                 ip_address=request_ip,
                 customer_id=user.customer_id,
             )
-            
+            print(f"DEBUG: Account for user {user.email} is locked. Locked until: {user.locked_until}. Time remaining: {formatted_time}.") # 🕵️‍♀️ DEBUG POINT
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Account is locked. Please try again after {formatted_time}."
             )
-            
-        # Refactored Logic: Verify password and handle failed attempts
+
         if not verify_password(password, user.password_hash):
             user.failed_login_attempts += 1
             login_policy = await self._get_login_policy_config(db)
@@ -193,16 +202,15 @@ class AuthService:
             log_details = {"email": user.email, "reason": "Incorrect password", "failed_attempts": user.failed_login_attempts}
             log_action_type = AUDIT_ACTION_TYPE_LOGIN_FAILED
 
-            # Check if this failed attempt triggers a lockout
             if user.failed_login_attempts >= max_attempts:
                 user.locked_until = current_time + timedelta(minutes=lockout_duration)
                 log_action_type = AUDIT_ACTION_TYPE_ACCOUNT_LOCKED
                 log_details["reason"] = f"Account locked after {max_attempts} failed attempts."
-                # The exception is now raised at the end of this block
-            
+
             db.add(user)
-            db.commit() # The fix is here: change flush() to commit()
+            db.commit()
             db.refresh(user)
+            print(f"DEBUG: Failed login attempt for user {user.email}. Attempts: {user.failed_login_attempts}. Max: {max_attempts}.") # 🕵️‍♀️ DEBUG POINT
 
             log_action(
                 db,
@@ -214,8 +222,7 @@ class AuthService:
                 ip_address=request_ip,
                 customer_id=user.customer_id,
             )
-            
-            # This is the key change: now we raise the appropriate exception based on the lockout status
+
             if log_action_type == AUDIT_ACTION_TYPE_ACCOUNT_LOCKED:
                 time_remaining = user.locked_until - current_time
                 minutes, seconds = divmod(time_remaining.total_seconds(), 60)
@@ -230,37 +237,52 @@ class AuthService:
                     detail="Incorrect email or password."
                 )
 
-        # On successful login, reset failed attempts and unlock the account
         user.failed_login_attempts = 0
         user.locked_until = None
         db.add(user)
-        db.commit() # The get_db generator handles the commit, so just flush here
+        db.commit()
         db.refresh(user)
 
-        from app.crud.crud import crud_role_permission # Late import
+        from app.crud.crud import crud_role_permission
         db_permissions = crud_role_permission.get_permissions_for_role(db, user.role.value)
         permission_names = [p.name for p in db_permissions]
 
-        # NEW CODE TO ADD: Fetch customer name and add to token data
         customer_name = None
-        if user.customer_id:
-            customer = db.query(Customer).filter(Customer.id == user.customer_id).first()
-            if customer:
-                customer_name = customer.name
+        if user.customer_id and user.customer:
+            customer_name = user.customer.name
 
-        # Prepare data for token
+        must_accept_policies = False
+        if user.role != UserRole.SYSTEM_OWNER:
+            latest_versions = await self._get_legal_artifact_versions(db)
+            latest_tc_version = latest_versions.get("tc_version", 0.0)
+            latest_pp_version = latest_versions.get("pp_version", 0.0)
+            
+            # 🐛 FIX: Compare against the latest available version
+            latest_system_version = max(latest_tc_version, latest_pp_version)
+            
+            print(f"DEBUG: User {user.email} last accepted version: {user.last_accepted_legal_version}. Latest system version: {latest_system_version}") # 🕵️‍♀️ DEBUG POINT
+
+            # 🐛 FIX: Correct the comparison logic to check if the last accepted version is less than the latest system version.
+            if user.last_accepted_legal_version is None or user.last_accepted_legal_version < latest_system_version:
+                must_accept_policies = True
+                print("DEBUG: must_accept_policies set to True. User needs to accept policies.") # 🕵️‍♀️ DEBUG POINT
+            else:
+                print("DEBUG: User's accepted version is up to date. No need to accept policies.") # 🕵️‍♀️ DEBUG POINT
+
         token_data = {
             "sub": user.email,
             "user_id": user.id,
             "role": user.role.value,
             "permissions": permission_names,
             "customer_id": user.customer_id,
-            "customer_name": customer_name, # <-- ADD THIS LINE
+            "customer_name": customer_name,
             "has_all_entity_access": user.has_all_entity_access,
             "entity_ids": [assoc.customer_entity_id for assoc in user.entity_associations] if not user.has_all_entity_access else [],
             "must_change_password": user.must_change_password,
+            "must_accept_policies": must_accept_policies,
+            "last_accepted_legal_version": user.last_accepted_legal_version
         }
-        
+
         access_token = create_access_token(data=token_data)
 
         log_action(
@@ -277,10 +299,10 @@ class AuthService:
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "must_change_password": user.must_change_password
+            "must_accept_policies": must_accept_policies
         }
-        
 
+    
     async def change_password(
         self, db: Session, user: TokenData, request_body: ChangePasswordRequest, request_ip: Optional[str],
         is_first_login_change: bool = False # Flag to distinguish forced change vs. self-service
@@ -339,6 +361,8 @@ class AuthService:
             "has_all_entity_access": db_user.has_all_entity_access,
             "entity_ids": [assoc.customer_entity_id for assoc in db_user.entity_associations] if not db_user.has_all_entity_access else [],
             "must_change_password": False, # Explicitly false now
+            "must_accept_policies": user.must_accept_policies,
+            "last_accepted_legal_version": user.last_accepted_legal_version
         }
         new_access_token = create_access_token(data=new_token_data)
 
@@ -710,6 +734,7 @@ class AuthService:
             AUDIT_ACTION_TYPE_UPDATE,
             # NEW: Add the new action type
             AUDIT_ACTION_TYPE_ACCOUNT_LOCKED,
+            AUDIT_ACTION_TYPE_LEGAL_ARTIFACT_ACCEPTED
         ]
 
         query_filters = []
@@ -778,6 +803,61 @@ class AuthService:
             })
         
         return {"total_count": total_count, "logs": formatted_logs}
+
+    async def accept_legal_policies(self, db: Session, user: TokenData, request_body: UserLegalAcceptanceRequest, request_ip: Optional[str]) -> Dict[str, Any]:
+        """NEW: Service method to handle legal artifact acceptance."""
+        from app.crud.crud import crud_user, crud_legal_artifact, crud_user_legal_acceptance
+        
+        db_user = crud_user.get(db, user.user_id)
+        if not db_user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        
+        latest_versions = await self._get_legal_artifact_versions(db)
+        if request_body.tc_version != latest_versions.get("tc_version") or \
+           request_body.pp_version != latest_versions.get("pp_version"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Versions provided do not match the latest legal artifact versions.")
+
+        tc_artifact = crud_legal_artifact.get_by_artifact_type(db, artifact_type="terms_and_conditions")
+        pp_artifact = crud_legal_artifact.get_by_artifact_type(db, artifact_type="privacy_policy")
+        
+        if not tc_artifact or not pp_artifact:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Legal artifacts not found in the system.")
+            
+        # 🐛 FIX: Check if acceptance already exists before recording
+        if not crud_user_legal_acceptance.has_accepted(db, user_id=db_user.id, artifact_id=tc_artifact.id):
+            crud_user_legal_acceptance.record_acceptance(
+                db, user_id=db_user.id, artifact_id=tc_artifact.id, ip_address=request_ip
+            )
+        
+        if not crud_user_legal_acceptance.has_accepted(db, user_id=db_user.id, artifact_id=pp_artifact.id):
+            crud_user_legal_acceptance.record_acceptance(
+                db, user_id=db_user.id, artifact_id=pp_artifact.id, ip_address=request_ip
+            )
+        
+        # Update user's last accepted version to the latest
+        db_user.last_accepted_legal_version = max(tc_artifact.version, pp_artifact.version)
+        db_user.updated_at = func.now()
+        db.add(db_user)
+        db.flush()
+        db.refresh(db_user)
+        
+        # Log the acceptance event
+        log_action(
+            db,
+            user_id=db_user.id,
+            action_type=AUDIT_ACTION_TYPE_LEGAL_ARTIFACT_ACCEPTED,
+            entity_type="User",
+            entity_id=db_user.id,
+            details={
+                "email": db_user.email,
+                "tc_version_accepted": request_body.tc_version,
+                "pp_version_accepted": request_body.pp_version
+            },
+            ip_address=request_ip,
+            customer_id=db_user.customer_id
+        )
+
+        return {"message": "Legal policies accepted successfully."}
 
 
 auth_service = AuthService()

@@ -133,6 +133,9 @@ class User(BaseModel):
     failed_login_attempts = Column(Integer, default=0, nullable=False, comment="Consecutive failed login attempts")
     locked_until = Column(DateTime(timezone=True), nullable=True, comment="Timestamp until which the account is locked")
     
+    # NEW FIELD: Tracks the version of the last accepted legal artifacts.
+    last_accepted_legal_version = Column(Float, nullable=True, comment="The last version of the legal artifacts (T&C and PP) accepted by the user.")
+    
     entity_associations = relationship("UserCustomerEntityAssociation", back_populates="user", cascade="all, delete-orphan")
     entities_with_access = relationship("CustomerEntity", secondary="user_customer_entity_association", viewonly=True)
     password_reset_tokens = relationship("PasswordResetToken", back_populates="user", cascade="all, delete-orphan")
@@ -709,3 +712,39 @@ class LGChangeLog(BaseModel):
         UniqueConstraint('lg_id', 'change_index', name='uq_lg_change_log_index'),
         Index('ix_lg_change_log_lg_id', 'lg_id'),
     )
+
+# =====================================================================================
+# NEW MODELS FOR T&C AND PRIVACY POLICY
+# =====================================================================================
+
+class LegalArtifact(BaseModel):
+    __tablename__ = "legal_artifacts"
+    artifact_type = Column(String, nullable=False, index=True, comment="e.g. 'privacy_policy', 'terms_and_conditions'")
+    version = Column(Float, nullable=False, comment="Version number of the artifact")
+    content = Column(Text, nullable=False, comment="Full content of the artifact")
+    url = Column(String, nullable=True, comment="External URL to the artifact if available")
+
+    user_acceptances = relationship("UserLegalAcceptance", back_populates="artifact")
+
+    __table_args__ = (
+        UniqueConstraint('artifact_type', 'version', name='_artifact_type_version_uc'),
+        Index('idx_legal_artifacts_type_version', 'artifact_type', 'version'),
+    )
+
+class UserLegalAcceptance(Base):
+    __tablename__ = "user_legal_acceptance"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    artifact_id = Column(Integer, ForeignKey("legal_artifacts.id"), nullable=False)
+    accepted_at = Column(DateTime(timezone=True), server_default=func.now())
+    ip_address = Column(String, nullable=True)
+
+    user = relationship("User", back_populates="legal_acceptances")
+    artifact = relationship("LegalArtifact", back_populates="user_acceptances")
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'artifact_id', name='_user_artifact_uc'),
+        Index('idx_user_legal_acceptance_user_id', 'user_id'),
+    )
+
+User.legal_acceptances = relationship("UserLegalAcceptance", back_populates="user", cascade="all, delete-orphan")

@@ -1,18 +1,16 @@
 # app/schemas/all_schemas.py
 from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, Union # ADDED Union
+from typing import Optional, List, Dict, Any, Union
 from enum import Enum
 from uuid import UUID
 import os
 import logging
 from decimal import Decimal
 import re
+from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus, DOCUMENT_TYPE_ORIGINAL_LG, LegalArtifactType
 
-logger = logging.getLogger(__name__) # Get logger instance for the module
-
-from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus, DOCUMENT_TYPE_ORIGINAL_LG
-
+logger = logging.getLogger(__name__)
 
 class BaseSchema(BaseModel):
     id: int
@@ -135,7 +133,7 @@ class UserAccountOut(BaseModel):
     updated_at: Optional[datetime] = None
 
     class Config:
-        from_attributes = True # Allow mapping from ORM models
+        from_attributes = True
 
 class AdminUserUpdate(BaseModel):
     new_password: str = Field(..., description="New password for the user.")
@@ -199,14 +197,14 @@ class UserCreateCorporateAdmin(UserBase):
 
     @model_validator(mode='after')
     def validate_corporate_admin_create(self):
-        if self.role == UserRole.SYSTEM_OWNER:
-            raise ValueError("Corporate Admins cannot create users with 'SYSTEM_OWNER' role.")
+        if self.role not in [UserRole.CORPORATE_ADMIN, UserRole.END_USER, UserRole.CHECKER, UserRole.VIEWER]:
+            raise ValueError(f"Corporate Admins cannot create users with '{self.role.value}' role.")
         if self.has_all_entity_access and self.entity_ids:
             raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
         if not self.has_all_entity_access and not self.entity_ids:
             raise ValueError("Must provide specific entity_ids when has_all_entity_access is False.")
         return self
-
+        
 class UserUpdateCorporateAdmin(UserBase):
     email: Optional[EmailStr] = Field(None, description="User's email address")
     role: Optional[UserRole] = Field(None, description="Role of the user within the system (cannot be SYSTEM_OWNER)")
@@ -216,14 +214,16 @@ class UserUpdateCorporateAdmin(UserBase):
     must_change_password: Optional[bool] = Field(None, description="True if user must change password on next login")
 
     @model_validator(mode='after')
-    def validate_entity_access(self):
+    def validate_corporate_admin_update(self):
+        if self.role is not None and self.role not in [UserRole.CORPORATE_ADMIN, UserRole.END_USER, UserRole.CHECKER, UserRole.VIEWER]:
+            raise ValueError(f"Corporate Admins cannot update users to have the '{self.role.value}' role.")
         if self.has_all_entity_access is not None:
             if self.has_all_entity_access and self.entity_ids:
                 raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
-            if not self.has_all_entity_access and not self.entity_ids:
+            if not self.has_all_entity_access and self.entity_ids is None:
                 raise ValueError("Must provide specific entity_ids when has_all_entity_access is False.")
         return self
-
+        
 class UserOut(UserBase, BaseSchema):
     customer_id: Optional[int] = None
     has_all_entity_access: bool
@@ -688,6 +688,8 @@ class AuditLogOut(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    # NEW: Add the flag for legal artifact acceptance.
+    must_accept_policies: Optional[bool] = Field(False, description="True if the user must accept the latest T&C and Privacy Policy before proceeding.")
 
 class TokenData(BaseModel):
     email: Optional[EmailStr] = None
@@ -700,6 +702,8 @@ class TokenData(BaseModel):
     must_change_password: Optional[bool] = Field(False, description="True if user must change password on next login.")
     # NEW: Add subscription status to the token payload
     subscription_status: Optional[SubscriptionStatus] = Field(None, description="Current subscription status of the customer.")
+    # NEW: Add a legal version to the token payload so it's readily available on the frontend.
+    last_accepted_legal_version: Optional[float] = Field(None, description="The version of the legal artifacts last accepted by this user.")
 
 class LGDocumentBase(BaseModel):
     document_type: str = Field(..., description="Type of document (e.g., 'AI_SCAN', 'INTERNAL_SUPPORTING', 'BANK_REPLY', 'AMENDMENT_LETTER', 'DELIVERY_PROOF')") # Added 'AMENDMENT_LETTER', 'DELIVERY_PROOF'
@@ -1278,6 +1282,61 @@ class MyLGDashboardReportItemOut(BaseModel):
 class MyLGDashboardReportOut(BaseModel):
     report_date: date
     data: MyLGDashboardReportItemOut
+
+# =====================================================================================
+# NEW SCHEMAS FOR LEGAL ARTIFACTS
+# =====================================================================================
+
+class LegalArtifactBase(BaseModel):
+    artifact_type: LegalArtifactType = Field(..., description="Type of legal artifact, e.g., 'privacy_policy' or 'terms_and_conditions'.")
+    version: float = Field(..., ge=0.1, description="Version number of the legal artifact.")
+    content: str = Field(..., description="The full content of the legal artifact.")
+    url: Optional[str] = Field(None, description="External URL where the artifact can be viewed.")
+
+class LegalArtifactCreate(LegalArtifactBase):
+    pass
+
+class LegalArtifactUpdate(BaseModel):
+    version: Optional[float] = Field(None, ge=0.1)
+    content: Optional[str] = None
+    url: Optional[str] = None
+
+class LegalArtifactOut(LegalArtifactBase, BaseSchema):
+    pass
+
+# ADD THIS NEW CLASS
+class LegalArtifactVersionsOut(BaseModel):
+    """
+    Schema for the response from the public endpoint that provides
+    the latest versions of legal policies.
+    """
+    tc_version: float
+    pp_version: float
+
+class UserLegalAcceptanceRequest(BaseModel):
+    tc_version: float = Field(..., description="The version of the Terms and Conditions the user is accepting.")
+    pp_version: float = Field(..., description="The version of the Privacy Policy the user is accepting.")
+    ip_address: Optional[str] = Field(None, description="IP address of the user at the time of acceptance.")
+    
+    @model_validator(mode='after')
+    def validate_versions(self):
+        if self.tc_version <= 0:
+            raise ValueError("T&C version must be greater than 0.")
+        if self.pp_version <= 0:
+            raise ValueError("Privacy Policy version must be greater than 0.")
+        return self
+
+class UserLegalAcceptanceOut(BaseModel):
+    accepted_at: datetime
+    ip_address: Optional[str] = None
+    artifact: LegalArtifactOut
+
+    class Config:
+        from_attributes = True
+
+# =====================================================================================
+# REBUILD MODELS WITH NEW RELATIONSHIPS
+# =====================================================================================
 
 LGRecordMinimalOut.model_rebuild()
 ApprovalRequestOut.model_rebuild()
