@@ -1360,6 +1360,62 @@ async def seed_db():
                 is_notification_template=True,
                 subject="Action Required: Non-Auto-Renew LG {{lg_number}} Nearing Expiry"
             ),
+            TemplateCreate(
+                name="Print Reminder",
+                template_type="EMAIL",
+                action_type="PRINT_REMINDER",
+                content="""
+                <html>
+                <body>
+                    <p>Dear {{maker_name}},</p>
+                    <p>This is a friendly reminder that an approved Letter of Guarantee instruction is pending printing.</p>
+                    <ul>
+                        <li><b>LG Number:</b> {{lg_number}}</li>
+                        <li><b>Instruction Serial:</b> {{instruction_serial_number}}</li>
+                        <li><b>Action Type:</b> {{action_type}}</li>
+                        <li><b>Days Overdue:</b> {{days_overdue}} days</li>
+                    </ul>
+                    <p>Please click the link below to view and print the relevant bank letter to finalize this action.</p>
+                    <p><a href="{{print_link}}">View and Print Letter</a></p>
+                    <p>You can also find this request in your action center: <a href="{{action_center_link}}">Go to Action Center</a></p>
+                    <p>Thank you,</p>
+                    <p>The {{platform_name}} Team</p>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=True,
+                subject="Reminder: Please Print Letter for LG #{{lg_number}}"
+            ),
+            TemplateCreate(
+                name="Print Escalation",
+                template_type="EMAIL",
+                action_type="PRINT_ESCALATION",
+                content="""
+                <html>
+                <body>
+                    <p>Dear {{maker_name}},</p>
+                    <p>This is an urgent notification regarding an approved Letter of Guarantee instruction that remains unprinted. This issue has been escalated to your Checker ({{checker_email}}) for their attention.</p>
+                    <ul>
+                        <li><b>LG Number:</b> {{lg_number}}</li>
+                        <li><b>Instruction Serial:</b> {{instruction_serial_number}}</li>
+                        <li><b>Action Type:</b> {{action_type}}</li>
+                        <li><b>Days Overdue:</b> {{days_overdue}} days</li>
+                    </ul>
+                    <p>Please click the link below to view and print the bank letter immediately to avoid further delays.</p>
+                    <p><a href="{{print_link}}">View and Print Letter</a></p>
+                    <p>You can also find this request in your action center: <a href="{{action_center_link}}">Go to Action Center</a></p>
+                    <p>Thank you,</p>
+                    <p>The {{platform_name}} Team</p>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=True,
+                subject="Urgent: Print Escalation for LG #{{lg_number}}"
+            ),
         ]
 
         for template_data in templates_to_seed:
