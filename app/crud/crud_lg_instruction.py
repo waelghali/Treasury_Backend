@@ -452,6 +452,7 @@ class CRUDLGInstruction(CRUDBase):
             selectinload(self.model.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
             selectinload(self.model.lg_record).selectinload(models.LGRecord.internal_owner_contact),
             selectinload(self.model.lg_record).selectinload(models.LGRecord.lg_category),
+            selectinload(self.model.lg_record).selectinload(models.LGRecord.communication_bank), # NEW: Eager load communication_bank
             selectinload(self.model.template)
         ).filter(
             self.model.id == original_instruction_id,
@@ -507,6 +508,10 @@ class CRUDLGInstruction(CRUDBase):
             sub_instruction_code=sub_instruction_code
         )
         
+        # Determine the correct recipient using the helper from crud_lg_record
+        from app.crud.crud import crud_lg_record
+        recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record)
+
         # NEW LOGIC: Get entity and customer details with fallback
         customer = lg_record.customer
         entity = lg_record.beneficiary_corporate
@@ -533,6 +538,8 @@ class CRUDLGInstruction(CRUDBase):
             "days_overdue": days_overdue,
             "original_instruction_details_summary": str(original_instruction.details)[:200] if original_instruction.details else "No specific details.",
             "original_instruction_template_name": original_instruction.template.name if original_instruction.template else "N/A",
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
         }
         generated_html = reminder_template.content
         for key, value in template_data.items():
@@ -596,7 +603,7 @@ class CRUDLGInstruction(CRUDBase):
         logger.info(f"Bank reminder issued successfully for original instruction '{original_instruction.serial_number}' (Reminder Serial: {new_reminder_instruction.serial_number}).")
         db.refresh(new_reminder_instruction)
         return lg_record, new_reminder_instruction.id, generated_pdf_bytes
-
+        
     async def generate_all_eligible_bank_reminders_pdf(
         self, db: Session, customer_id: int, user_id: int
         ) -> Tuple[Optional[bytes], int, List[int]]:
@@ -652,6 +659,7 @@ class CRUDLGInstruction(CRUDBase):
             selectinload(self.model.maker_user),
             selectinload(self.model.lg_record).selectinload(models.LGRecord.internal_owner_contact),
             selectinload(self.model.lg_record).selectinload(models.LGRecord.lg_category),
+            selectinload(self.model.lg_record).selectinload(models.LGRecord.communication_bank), # NEW: Eager load communication_bank
             selectinload(self.model.template),
             selectinload(self.model.documents)
         ).filter(
@@ -685,6 +693,8 @@ class CRUDLGInstruction(CRUDBase):
         customer = customer_obj
         customer_address = customer.address
         customer_contact_email = customer.contact_email
+        
+        from app.crud.crud import crud_lg_record
 
         for original_instruction in eligible_instructions:
             existing_reminder = db.query(self.model).filter(
@@ -702,6 +712,9 @@ class CRUDLGInstruction(CRUDBase):
             entity = lg_record.beneficiary_corporate
             customer_address_final = entity.address if entity.address else customer_address
             customer_contact_email_final = entity.contact_email if entity.contact_email else customer_contact_email
+            
+            # Determine the correct recipient using the helper from crud_lg_record
+            recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record)
 
             days_overdue = (date.today() - original_instruction.instruction_date.date()).days
             
@@ -742,6 +755,8 @@ class CRUDLGInstruction(CRUDBase):
                 "days_overdue": days_overdue,
                 "original_instruction_details_summary": str(original_instruction.details)[:200] if original_instruction.details else "No specific details.",
                 "original_instruction_template_name": original_instruction.template.name if original_instruction.template else "N/A",
+                "recipient_name": recipient_name,
+                "recipient_address": recipient_address,
             }
             generated_html = reminder_template.content
             for key, value in template_data.items():
