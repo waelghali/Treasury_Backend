@@ -26,7 +26,7 @@ from app.schemas.all_schemas import (
     LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
     AuditLogOut,
     SystemNotificationCreate, SystemNotificationUpdate, SystemNotificationOut,
-    LegalArtifactCreate, LegalArtifactOut,
+    LegalArtifactCreate, LegalArtifactOut, TrialRegistrationOut,UserCreateCorporateAdmin
 )
 from app.crud.crud import (
     crud_subscription_plan, crud_customer, crud_customer_entity, crud_user,
@@ -36,7 +36,7 @@ from app.crud.crud import (
     crud_lg_category,
     crud_audit_log, log_action,
     crud_system_notification,
-    crud_legal_artifact,
+    crud_legal_artifact, crud_trial_registration
 )
 from app.models import (
     SubscriptionPlan, Customer, CustomerEntity, User,
@@ -45,9 +45,12 @@ from app.models import (
     # MODIFIED: Use new unified LGCategory model
     LGCategory,
     AuditLog,
-    SystemNotification, UserCustomerEntityAssociation,
+    SystemNotification, UserCustomerEntityAssociation, TrialRegistration,
 )
+
 import app.core.background_tasks as background_tasks_module 
+from app.core.email_service import get_global_email_settings, send_email, EmailAttachment # NEW IMPORTS
+from app.core.document_generator import generate_pdf_from_html # NEW IMPORT
 import logging
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,7 @@ except Exception as e:
 from app.constants import UserRole, LegalArtifactType, GlobalConfigKey
 
 router = APIRouter()
+trial_router = APIRouter()
 
 @router.get("/status")
 async def get_system_status():
@@ -2614,3 +2618,134 @@ def read_legal_artifact(
             detail=f"Legal artifact of type '{artifact_type}' not found."
         )
     return db_artifact
+    
+@trial_router.get("/trial-registrations/", response_model=List[TrialRegistrationOut])
+def read_trial_registrations(
+    status: Optional[str] = Query(None, description="Filter by registration status (e.g., 'pending', 'approved', 'rejected')"),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_owner:view_trial_registrations"))
+):
+    """
+    Retrieves a list of trial registrations, with optional status filtering.
+    """
+    # Fetch all registrations with the requested status.
+    registrations = crud_trial_registration.get_by_status(db, status=status)
+
+    # Use a list comprehension to explicitly validate and return the data
+    # against the Pydantic schema. This ensures all fields, including the
+    # IP and date, are included in the JSON response.
+    return [TrialRegistrationOut.model_validate(reg) for reg in registrations]
+
+@trial_router.post("/trial-registrations/{registration_id}/approve", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
+async def approve_trial_registration(
+    registration_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_owner:approve_trial_registration")),
+    request: Request = None,
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Approves a pending trial registration, creates a new customer and initial user,
+    and sends a welcome email.
+    """
+    registration = crud_trial_registration.get(db, id=registration_id)
+    if not registration or registration.status != "pending":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or not in pending state.")
+
+    try:
+        # Step 1: Create a new customer and user
+        subscription_plan = crud_subscription_plan.get_by_name(db, name="Free Trial Plan")
+        if not subscription_plan:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="'Free Trial Plan' subscription plan not found. System configuration error.")
+        
+        # NEW: Generate a random password for the new user
+        generated_password = 'Password123!'
+
+        customer_in = CustomerCreate(
+            name=registration.organization_name,
+            address=registration.organization_address,
+            contact_email=registration.admin_email,
+            contact_phone=registration.contact_phone,
+            subscription_plan_id=subscription_plan.id,
+            initial_corporate_admin=UserCreate(
+                email=registration.admin_email,
+                password=generated_password,
+                role=UserRole.CORPORATE_ADMIN,
+                must_change_password=True,
+                has_all_entity_access=True,
+                entity_ids=[],
+            ),
+            initial_entities=[]
+        )
+        if registration.entities_count == 'One':
+            entity_name = registration.organization_name + " Main Entity"
+            customer_in.initial_entities.append(CustomerEntityCreate(
+                entity_name=entity_name,
+                code="TEMP", # This will be replaced with a generated code in the CRUD layer
+                contact_person=registration.contact_admin_name,
+                contact_email=registration.admin_email
+            ))
+
+        db_customer = crud_customer.onboard_customer(db, customer_in, user_id_caller=current_user.user_id)
+        
+        # Step 2: Update the registration status
+        crud_trial_registration.update(db, registration, {"status": "approved", "customer_id": db_customer.id})
+
+        # Step 3: Send approval email
+        email_settings = get_global_email_settings()
+        subject = "Your LG Custody Free Trial is Ready!"
+        body = f"""
+            <html><body>
+                <p>Hello {registration.contact_admin_name},</p>
+                <p>We're excited to confirm that your free trial account for the LG Custody Platform is now active!</p>
+                <p>To get started, please use the following temporary password to log in: <strong>{generated_password}</strong>. We highly recommend that you change this password immediately after your first login.</p>
+                <p><strong>Login Link:</strong> <a href="{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/login">{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/login</a></p>
+                <p>Your free trial will be active for {subscription_plan.duration_months} months, expiring on {db_customer.end_date.strftime('%Y-%m-%d')}.</p>
+                <p><strong>Quick Start Guide:</strong> Please find a quick-start guide attached to help you get started with the platform's core features.</p>
+                <p>Best regards,</p>
+                <p>The LG Custody Team</p>
+            </body></html>
+        """
+        if registration.entities_count == 'Multiple':
+            body = body.replace("</body>", f"""
+                <p>Since you indicated multiple entities, please reply to this email with the details and documents for each additional entity (similar to the documents you submitted for the main entity). Once received, we will add them to your account.</p>
+                </body>
+            """)
+
+        try:
+            with open("quick_start_guide.pdf", "rb") as f:
+                attachment = EmailAttachment("Quick_Start_Guide.pdf", f.read(), "application/pdf")
+                background_tasks.add_task(send_email, db, [registration.admin_email], subject, body, {}, email_settings, attachments=[attachment])
+        except FileNotFoundError:
+            logger.warning("Quick start guide PDF not found. Sending email without attachment.")
+            background_tasks.add_task(send_email, db, [registration.admin_email], subject, body, {}, email_settings)
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to approve registration: {e}")
+
+    log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_APPROVED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name, "customer_id": db_customer.id})
+    return crud_customer.get_with_relations(db, db_customer.id)
+
+@trial_router.post("/trial-registrations/{registration_id}/reject", status_code=status.HTTP_200_OK)
+def reject_trial_registration(
+    registration_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_owner:reject_trial_registration")),
+    request: Request = None
+):
+    """
+    Rejects a pending trial registration and sends a rejection email.
+    """
+    registration = crud_trial_registration.get(db, id=registration_id)
+    if not registration or registration.status != "pending":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or not in pending state.")
+
+    crud_trial_registration.update(db, registration, {"status": "rejected"})
+
+    # Send rejection email (logic for this will be in a later step)
+
+    log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_REJECTED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name})
+    return {"message": "Registration rejected successfully."}
+
+router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])

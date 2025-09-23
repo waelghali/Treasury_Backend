@@ -111,7 +111,6 @@ class CRUDLGRecord(CRUDBase):
         )
         # No db.flush() or db.commit() here; the main transaction will handle it.
         return db_lg_instruction.id
-    # --- END MODIFIED HELPER METHOD ---
 
     def get_by_lg_number(self, db: Session, lg_number: str) -> Optional[models.LGRecord]:
         return (
@@ -154,6 +153,12 @@ class CRUDLGRecord(CRUDBase):
                 "manager_email",
             },
         )
+        
+        # CRITICAL FIX: Convert empty strings to None for integer fields
+        # This resolves the `invalid input syntax for type integer: ""` database error.
+        for field in ["communication_bank_id"]:
+            if lg_record_data.get(field) == "":
+                lg_record_data[field] = None
 
         lg_record_data["internal_owner_contact_id"] = db_internal_owner_contact.id
 
@@ -253,6 +258,32 @@ class CRUDLGRecord(CRUDBase):
             lg_record_data["additional_field_values"] = obj_in.additional_field_values
         else:
             lg_record_data["additional_field_values"] = None
+        
+        # NEW LOGIC: Handle Foreign Bank and Advising Status details
+        foreign_bank = db.query(models.Bank).filter(models.Bank.name == "Foreign Bank", models.Bank.is_deleted == False).first()
+        if foreign_bank and obj_in.issuing_bank_id == foreign_bank.id:
+            # For a foreign bank, save the manual details
+            lg_record_data["foreign_bank_name"] = obj_in.foreign_bank_name
+            lg_record_data["foreign_bank_country"] = obj_in.foreign_bank_country
+            lg_record_data["foreign_bank_address"] = obj_in.foreign_bank_address
+            lg_record_data["foreign_bank_swift_code"] = obj_in.foreign_bank_swift_code
+            
+            # FIXED: Provide dummy data instead of None for required fields
+            lg_record_data["issuing_bank_address"] = "Foreign Bank - See foreign_bank_address field"
+            lg_record_data["issuing_bank_phone"] = "N/A - Foreign Bank"
+            lg_record_data["issuing_bank_fax"] = "N/A - Foreign Bank"
+            
+            # Also save the new advising status and communication bank
+            lg_record_data["advising_status"] = obj_in.advising_status
+            lg_record_data["communication_bank_id"] = obj_in.communication_bank_id
+        else:
+            # For a local bank, ensure the new foreign bank and advising fields are null
+            lg_record_data["foreign_bank_name"] = None
+            lg_record_data["foreign_bank_country"] = None
+            lg_record_data["foreign_bank_address"] = None
+            lg_record_data["foreign_bank_swift_code"] = None
+            lg_record_data["advising_status"] = None
+            lg_record_data["communication_bank_id"] = None
 
         # --- NEW LOGIC: Assign lg_sequence_number ---
         # Get the highest lg_sequence_number for the beneficiary corporate (customer entity)
@@ -281,7 +312,7 @@ class CRUDLGRecord(CRUDBase):
                 )
             try:
                 # We explicitly set document_type to ORIGINAL_LG_DOCUMENT for this primary file
-                obj_in.ai_scan_file.document_type = models.DOCUMENT_TYPE_ORIGINAL_LG # Use the new constant
+                obj_in.ai_scan_file.document_type = DOCUMENT_TYPE_ORIGINAL_LG # Use the new constant
                 db_original_lg_document = await self.crud_lg_document_instance.create_document(
                     db,
                     obj_in=obj_in.ai_scan_file, # Contains metadata (name, mime_type)
@@ -369,7 +400,7 @@ class CRUDLGRecord(CRUDBase):
 
             # 2. Find the notification template for a new LG
             notification_template = db.query(models.Template).filter(
-                models.Template.action_type == "LG_RECORDED",
+                models.Template.action_type == ACTION_TYPE_LG_RECORDED,
                 models.Template.is_notification_template == True,
                 models.Template.is_global == True, # Assuming a global template for this
                 models.Template.is_deleted == False
@@ -508,19 +539,7 @@ class CRUDLGRecord(CRUDBase):
             lg_record_id=db_lg_record.id,
         )
         return db_lg_record
-
-        log_action(
-            db,
-            user_id=user_id,
-            action_type="CREATE",
-            entity_type="LGRecord",
-            entity_id=db_lg_record.id,
-            details={"lg_number": db_lg_record.lg_number, "customer_id": customer_id, "lg_sequence_number": db_lg_record.lg_sequence_number},
-            customer_id=customer_id,
-            lg_record_id=db_lg_record.id,
-        )
-        return db_lg_record
-
+        
     async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None) -> Tuple[models.LGRecord, int, str]: # NEW: Add notes parameter
         db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
         if not db_lg_record:
@@ -2992,7 +3011,7 @@ class CRUDLGRecord(CRUDBase):
             "platform_name": "Grow BD Treasury Management Platform",
             "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "internal_owner_email": lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "N/A",
-            "internal_owner_manager_email": lg_record.internal_owner_contact.manager_email if lg_record.internal_owner_contact else "N/A",
+            "manager_email": lg_record.internal_owner_contact.manager_email if lg_record.internal_owner_contact else "N/A",
             "is_urgent_style": "" # Not urgent by default for this reminder type
         }
         template_data["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"

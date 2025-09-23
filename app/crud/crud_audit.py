@@ -5,7 +5,7 @@ from sqlalchemy.sql import func, desc
 from fastapi import HTTPException, status
 
 from app.crud.crud import CRUDBase, log_action
-from app.models import AuditLog, User, LGRecord
+from app.models import AuditLog, User, LGRecord, CustomerEntity, LGCategory, ApprovalRequest, LGInstruction, Customer
 from app.schemas.all_schemas import AuditLogCreate
 
 # =====================================================================================
@@ -19,9 +19,7 @@ class CRUDAuditLog(CRUDBase):
         log_data = log_in.model_dump()
         db_log = self.model(**log_data)
         db.add(db_log)
-        db.commit() # Note: This `commit` is unusual for a log function if the caller is managing a broader transaction.
-                    # It means every log_action will commit its own transaction. Usually, logs are flushed and committed by the outer transaction.
-                    # However, this is existing behavior, so I'm retaining it.
+        db.commit()
         db.refresh(db_log)
         return db_log
 
@@ -43,7 +41,11 @@ class CRUDAuditLog(CRUDBase):
         customer_id: Optional[int] = None,
         lg_record_id: Optional[int] = None,
     ) -> List[AuditLog]:
-        query = db.query(self.model)
+        # MODIFIED: Add eager loading for user and lg_record relationships.
+        query = db.query(self.model).options(
+            selectinload(self.model.user),
+            selectinload(self.model.lg_record)
+        )
         if user_id:
             query = query.filter(self.model.user_id == user_id)
         if action_type:
@@ -74,8 +76,10 @@ class CRUDAuditLog(CRUDBase):
         if action_type: # NEW: Apply action_type filter if provided
             query = query.filter(self.model.action_type == action_type)
 
+        # MODIFIED: Add eager loading for user and lg_record to optimize performance
         return query.options(
-            selectinload(AuditLog.user)
+            selectinload(AuditLog.user),
+            selectinload(AuditLog.lg_record)
         ).order_by(desc(self.model.timestamp)).all()
 
 # Removed local instantiation: crud_audit_log = CRUDAuditLog(AuditLog)

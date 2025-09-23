@@ -61,12 +61,12 @@ async def login_for_access_token(
             detail="An unexpected error occurred during login."
         )
 
-@router.post("/change-password", response_model=Token, status_code=status.HTTP_200_OK)
+@router.post("/change-password", response_model=Dict[str, Any], status_code=status.HTTP_200_OK)
 async def change_password(
     request: Request,
-    response: Response, # NEW: Add response parameter for the sliding expiration
+    response: Response,
     request_body: ChangePasswordRequest,
-    current_user: security.TokenData = Depends(security.get_current_user), # Use get_current_user to allow password change even if must_change_password is true
+    current_user: security.TokenData = Depends(security.get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -79,18 +79,17 @@ async def change_password(
         is_first_login_change = False
 
     try:
-        new_token = await auth_service.change_password(
+        new_token_data = await auth_service.change_password(
             db,
             current_user,
             request_body,
             get_client_ip(request),
             is_first_login_change=is_first_login_change
         )
-        # Note: The `get_current_user` dependency already added a new token to the response header.
-        return new_token
+        return new_token_data
     except HTTPException as e:
         raise e
-    except ValueError as e: # Catch validation errors from schemas or service
+    except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.error(f"Password change failed for user {current_user.email}: {e}", exc_info=True)

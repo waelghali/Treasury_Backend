@@ -48,7 +48,8 @@ from app.models import (
     MigrationBatch,
     LGChangeLog,
     LegalArtifact,
-    UserLegalAcceptance
+    UserLegalAcceptance,
+    TrialRegistration
 )
 # NEW: Import SubscriptionStatus for checking against models and schemas
 from app.constants import SubscriptionStatus
@@ -199,6 +200,21 @@ class CRUDSystemNotificationViewLog(CRUDBase):
         db.refresh(db_log)
         return db_log
 
+# =====================================================================================
+# NEW CRUD FOR TRIAL REGISTRATION
+# =====================================================================================
+class CRUDTrialRegistration(CRUDBase):
+    def get_by_email_and_status(self, db: Session, email: str, status: str) -> Optional[models.TrialRegistration]:
+        return db.query(self.model).filter(
+            self.model.admin_email == email,
+            self.model.status == status
+        ).first()
+
+    def get_by_status(self, db: Session, status: Optional[str] = None) -> List[models.TrialRegistration]:
+        query = db.query(self.model)
+        if status:
+            query = query.filter(self.model.status == status)
+        return query.order_by(self.model.accepted_terms_at.desc()).all()
 
 # =====================================================================================
 # Specific CRUD Class Imports (These files define the classes, not instances)
@@ -301,6 +317,8 @@ crud_reports = CRUDReports(
 
 crud_system_notification = CRUDSystemNotification(models.SystemNotification)
 crud_system_notification_view_log = CRUDSystemNotificationViewLog(models.SystemNotificationViewLog)
+crud_trial_registration = CRUDTrialRegistration(models.TrialRegistration)
+crud_legal_artifact = CRUDLegalArtifact(models.LegalArtifact)
 
 crud_lg_migration = CRUDLGMigration(models.LGMigrationStaging)
 
@@ -353,4 +371,5 @@ __all__ = [
     "migration_history_service",
     "crud_legal_artifact", # NEW EXPORT
     "crud_user_legal_acceptance", # NEW EXPORT
+    "crud_trial_registration",
 ]

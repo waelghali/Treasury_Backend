@@ -1,11 +1,11 @@
 # app/models.py
 from __future__ import annotations
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, UniqueConstraint, Enum as SQLEnum, Text, Index
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, UniqueConstraint, Enum as SQLEnum, Text, Index, Numeric, and_, CheckConstraint, Date
 from sqlalchemy.dialects.postgresql import JSON, JSONB
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 from app.database import Base
-from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus
+from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus, AdvisingStatus
 from app.schemas.migration_schemas import MigrationRecordStatusEnum, MigrationTypeEnum
 
 # --- BASE MODEL DEFINITION ---
@@ -151,6 +151,31 @@ class User(BaseModel):
 
     def __repr__(self: User):
         return f"<User(id={self.id}, email='{self.email}', role='{self.role}')>"
+
+class TrialRegistration(BaseModel): # CHANGE THIS LINE from 'Base' to 'BaseModel'
+    __tablename__ = "trial_registrations"
+    # id, created_at, updated_at, is_deleted, deleted_at are inherited from BaseModel
+    organization_name = Column(String, nullable=False, index=True)
+    organization_address = Column(String, nullable=False)
+    contact_admin_name = Column(String, nullable=False)
+    contact_phone = Column(String, nullable=False)
+    admin_email = Column(String, nullable=False, unique=True)
+    commercial_register_document_path = Column(String, nullable=True)
+    entities_count = Column(String, nullable=False)
+    accepted_terms_version = Column(Float, nullable=False)
+    accepted_terms_at = Column(DateTime(timezone=True), server_default=func.now())
+    accepted_terms_ip = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="pending", index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    
+    customer = relationship("Customer")
+
+    __table_args__ = (
+        Index('idx_trial_registrations_email_status', 'admin_email', 'status'),
+    )
+    
+    def __repr__(self):
+        return f"<TrialRegistration(id={self.id}, org_name='{self.organization_name}', status='{self.status}')>"
 
 # NEW MODEL: PasswordResetToken
 class PasswordResetToken(Base):
@@ -370,7 +395,6 @@ class RolePermission(Base):
 
 class LGRecord(BaseModel):
     __tablename__ = "lg_records"
-
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, comment="Customer this LG belongs to")
     beneficiary_corporate_id = Column(Integer, ForeignKey("customer_entities.id"), nullable=False, comment="Entity benefiting from the LG")
     lg_sequence_number = Column(Integer, nullable=False, default=1, comment="Unique sequential number for LG within a customer entity for new serial format")
@@ -389,7 +413,6 @@ class LGRecord(BaseModel):
     lg_operational_status_id = Column(Integer, ForeignKey("lg_operational_statuses.id"), nullable=True, comment="LG's operational state (conditional)")
     payment_conditions = Column(String, nullable=True, comment="Specific conditions related to payment (conditional)")
     description_purpose = Column(String, nullable=False, comment="General description or purpose of the LG")
-
     issuing_bank_id = Column(Integer, ForeignKey("banks.id"), nullable=False, comment="ID of the bank that issued the LG")
     issuing_bank_address = Column(String, nullable=False, comment="Address of the issuing bank")
     issuing_bank_phone = Column(String, nullable=False, comment="Phone number of the issuing bank")
@@ -398,19 +421,13 @@ class LGRecord(BaseModel):
     applicable_rule_id = Column(Integer, ForeignKey("rules.id"), nullable=False, comment="ID of the set of rules governing the LG")
     applicable_rules_text = Column(String, nullable=True, comment="Free text for rules (conditional)")
     other_conditions = Column(String(8000), nullable=True, comment="Any other specific conditions not covered elsewhere")
-
     internal_owner_contact_id = Column(Integer, ForeignKey("internal_owner_contacts.id"), nullable=False, comment="ID of the internal owner contact person")
-
     lg_category_id = Column(Integer, ForeignKey("lg_categories.id"), nullable=False, comment="LG Category for internal classification")
     additional_field_values = Column(JSON, nullable=True, comment="Dynamic fields based on selected LGCategory's extra_field_name (JSONB)")
     internal_contract_project_id = Column(String, nullable=True, comment="Internal reference ID for contract/project")
     notes = Column(Text, nullable=True, comment="Free-form notes related to the LG")
-    
-    # NEW: Migration-related columns
     migration_source = Column(String, nullable=True, comment="Indicates the source of the LG (e.g., 'LEGACY' for migrated records).")
     migrated_from_staging_id = Column(Integer, ForeignKey('lg_migration_staging.id'), nullable=True, comment="Foreign key to the last staged record used for this LG.")
-
-    # Relationships
     customer = relationship("Customer")
     beneficiary_corporate = relationship("CustomerEntity", foreign_keys=[beneficiary_corporate_id])
     lg_currency = relationship("Currency", foreign_keys=[lg_currency_id])
@@ -418,17 +435,23 @@ class LGRecord(BaseModel):
     lg_type = relationship("LgType")
     lg_status = relationship("LgStatus")
     lg_operational_status = relationship("LgOperationalStatus")
-    issuing_bank = relationship("Bank")
+    issuing_bank = relationship("Bank", foreign_keys=[issuing_bank_id])
+    
+    # NEW FIELDS for Foreign Banks
+    foreign_bank_name = Column(String, nullable=True, comment="Manually entered bank name for foreign banks")
+    foreign_bank_country = Column(String, nullable=True, comment="Manually entered country for foreign banks")
+    foreign_bank_address = Column(String, nullable=True, comment="Manually entered address for foreign banks")
+    foreign_bank_swift_code = Column(String, nullable=True, comment="Manually entered SWIFT code for foreign banks")
+    advising_status = Column(SQLEnum(AdvisingStatus), nullable=True, comment="Status of the LG regarding advising/confirmation")
+    communication_bank_id = Column(Integer, ForeignKey("banks.id"), nullable=True, comment="The Advising or Confirming bank for the LG")
     issuing_method = relationship("IssuingMethod")
     applicable_rule = relationship("Rule")
     internal_owner_contact = relationship("InternalOwnerContact")
     lg_category = relationship("LGCategory")
-
-    # Documents associated with this LG record
+    communication_bank = relationship("Bank", foreign_keys=[communication_bank_id])
     documents = relationship("LGDocument", back_populates="lg_record", cascade="all, delete-orphan")
     instructions = relationship("LGInstruction", back_populates="lg_record")
     change_logs = relationship("LGChangeLog", back_populates="lg_record")
-
     __table_args__ = (
         UniqueConstraint('lg_number', name='uq_lg_record_number'),
         UniqueConstraint('beneficiary_corporate_id', 'lg_sequence_number', name='uq_lg_sequence_per_entity'),
@@ -436,11 +459,10 @@ class LGRecord(BaseModel):
         Index('idx_lg_record_lg_number', 'lg_number'),
         Index('idx_lg_record_expiry_date', 'expiry_date'),
         Index('ix_lg_records_migrated_from_staging_id', 'migrated_from_staging_id'),
-    )
 
+    )
     def __repr__(self: LGRecord):
         return f"<LGRecord(id={self.id}, lg_number='{self.lg_number}', customer_id={self.customer_id})>"
-
 
 class LGDocument(BaseModel):
     __tablename__ = "lg_documents"

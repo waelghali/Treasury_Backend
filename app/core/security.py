@@ -41,6 +41,8 @@ class TokenData(BaseModel):
     entity_ids: List[int] = Field([], description="List of customer entity IDs this user has access to.")
     must_change_password: Optional[bool] = Field(False, description="True if user must change password on next login.")
     subscription_status: Optional[SubscriptionStatus] = Field(None, description="Current subscription status of the customer.")
+    must_accept_policies: Optional[bool] = Field(False, description="True if user needs to accept legal policies.") # ADD THIS LINE
+    last_accepted_legal_version: Optional[float] = Field(None, description="Version of legal artifacts last accepted.") # ADD THIS LINE
 
 
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None):
@@ -113,6 +115,8 @@ async def get_current_user(
         entity_ids: List[int] = payload.get("entity_ids", [])
         must_change_password: Optional[bool] = payload.get("must_change_password")
         subscription_status: Optional[str] = payload.get("subscription_status")
+        must_accept_policies: Optional[bool] = payload.get("must_accept_policies") # ADD THIS LINE
+        last_accepted_legal_version: Optional[float] = payload.get("last_accepted_legal_version") # ADD THIS LINE
 
         if email is None or user_id is None or role is None:
             raise credentials_exception
@@ -132,7 +136,9 @@ async def get_current_user(
             has_all_entity_access=has_all_entity_access,
             entity_ids=entity_ids,
             must_change_password=must_change_password,
-            subscription_status=subscription_status
+            subscription_status=subscription_status,
+            must_accept_policies=must_accept_policies, # ADD THIS LINE
+            last_accepted_legal_version=last_accepted_legal_version # ADD THIS LINE
         )
     except JWTError:
         raise credentials_exception

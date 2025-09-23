@@ -258,6 +258,7 @@ class CRUDReports(CRUDBase):
             data=report_data
         )
         
+
     def get_chart_data(self, db: Session, report_type: str, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Retrieves data for the dashboard charts based on report type and user context.
@@ -299,7 +300,7 @@ class CRUDReports(CRUDBase):
             query = base_lg_query.with_entities(
                 models.Bank.short_name,
                 func.count(models.LGRecord.id)
-            ).join(models.Bank).group_by(models.Bank.short_name)
+            ).join(models.Bank, models.LGRecord.issuing_bank_id == models.Bank.id).group_by(models.Bank.short_name)
 
         # Average Delivery Days
         elif report_type == "avg_delivery_days":

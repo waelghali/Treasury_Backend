@@ -254,6 +254,11 @@ class LgTypeEnum(int, Enum):
     BID_BOND = 2
     ADVANCE_PAYMENT_GUARANTEE = 3
     FINANCIAL_GUARANTEE = 4
+
+class AdvisingStatus(str, Enum):
+    NOT_ADVISED = "Not Advised"
+    ADVISED = "Advised"
+    CONFIRMED = "Confirmed"
     
 class MigrationRecordStatusEnum(str, Enum):
     PENDING = "PENDING"

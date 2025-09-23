@@ -126,6 +126,7 @@ BANKS_CSV_CONTENT = """
 ,Kuwait Finance House - Egypt,KFH,"81, Ninety St., City Center, The Fifth Compound, New Cairo.",Ahli United Bank,KFHHEGCX,00202 2614 9500,00202 2614 9600,Kuwait Finance House
 ,Bank NXT,NXT,"8, Abdel Khalek Sarwat St., (Cairo-Sky Building), Cairo.",Arab Investment Bank,ARIBEGCX,16697,00202 2586 1100,Private investors
 ,Arab Banking Corporation - Egypt S.A.E (ABC Egypt),ABC,"90th St. (North), Fifth settlement, New Cairo",Egypt Arab African Bank - BLOM Bank Egypt,EAABEGCX,00202 2586 1199,00202 2811 1555,"Arab Banking Corporation (ABC) Group, Bahrain"
+,Foreign Bank,OTHER,dummy,dummy,dummy,dummy,dummy,dummy
 """
 
 # FIXED: Replaced CSV content with direct list for robustness
@@ -313,6 +314,9 @@ INITIAL_PERMISSIONS = [
     {"name": "subscription_plan:create", "description": "Allows creating new subscription plans."},
     {"name": "subscription_plan:edit", "description": "Allows editing existing subscription plans."},
     {"name": "subscription_plan:delete", "description": "Allows soft-deleting subscription plans."},
+    {"name": "system_owner:view_trial_registrations", "description": "Allows trial registation view."},
+    {"name": "system_owner:reject_trial_registration", "description": "Allows trial registation rejection."},
+    {"name": "system_owner:approve_trial_registration", "description": "Allows trial registation approval."},
     {"name": "customer:view", "description": "Allows viewing customer details."},
     {"name": "customer:create", "description": "Allows onboarding new customers."},
     {"name": "customer:edit", "description": "Allows editing customer details (basic info, plan)."},

@@ -285,8 +285,23 @@ async def create_lg_record(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Error validating LG record data: {e}"
         )
-
-    # Read file contents if files are provided
+    
+    # NEW LOGIC: Conditional validation for Foreign Bank details and Advising Status
+    foreign_bank = db.query(models.Bank).filter(models.Bank.name == "Foreign Bank", models.Bank.is_deleted == False).first()
+    if foreign_bank and lg_record_in.issuing_bank_id == foreign_bank.id:
+        if not lg_record_in.foreign_bank_name or not lg_record_in.foreign_bank_name.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Foreign bank name is mandatory when 'Foreign Bank' is selected.")
+        if not lg_record_in.foreign_bank_country or not lg_record_in.foreign_bank_country.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Foreign bank country is mandatory when 'Foreign Bank' is selected.")
+        if not lg_record_in.foreign_bank_address or not lg_record_in.foreign_bank_address.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Foreign bank address is mandatory when 'Foreign Bank' is selected.")
+        if not lg_record_in.foreign_bank_swift_code or not lg_record_in.foreign_bank_swift_code.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Foreign bank SWIFT code is mandatory when 'Foreign Bank' is selected.")
+        
+        if lg_record_in.advising_status in [models.AdvisingStatus.ADVISED, models.AdvisingStatus.CONFIRMED]:
+            if not lg_record_in.communication_bank_id:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"A Communication Bank is mandatory when Advising Status is '{lg_record_in.advising_status.value}'.")    # Read file contents if files are provided
+    
     ai_scan_file_bytes = None
     if ai_scan_file:
         ai_scan_file_bytes = await ai_scan_file.read()
