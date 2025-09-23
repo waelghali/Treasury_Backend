@@ -542,6 +542,8 @@ class CRUDLGRecord(CRUDBase):
         
     async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None) -> Tuple[models.LGRecord, int, str]: # NEW: Add notes parameter
         db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
+        recipient_name = "To Whom It May Concern"
+        recipient_address = "N/A"
         if not db_lg_record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or is deleted."
@@ -608,6 +610,8 @@ class CRUDLGRecord(CRUDBase):
             "customer_contact_email": customer_contact_email,
             "current_date": current_date_str,
             "platform_name": "Grow BD Treasury Management Platform",
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
         }
         
         notes_html = ""
@@ -835,6 +839,8 @@ class CRUDLGRecord(CRUDBase):
         """
 
         instruction_maker_user_id = user_id
+        recipient_name = "To Whom It May Concern"
+        recipient_address = "N/A"
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -906,7 +912,9 @@ class CRUDLGRecord(CRUDBase):
             "internal_owner_email": lg_record.internal_owner_contact.email,
             "instruction_wording_documents": instruction_wording_documents,
             "instruction_wording_replies": instruction_wording_replies,
-            "lg_serial_number": lg_record.lg_number
+            "lg_serial_number": lg_record.lg_number,
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
         }
         
         # NEW LOGIC: Add a notes_section with HTML to be replaced in the template
@@ -1100,6 +1108,8 @@ class CRUDLGRecord(CRUDBase):
         """
 
         instruction_maker_user_id = user_id
+        recipient_name = "To Whom It May Concern"
+        recipient_address = "N/A"
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -1190,6 +1200,8 @@ class CRUDLGRecord(CRUDBase):
             "instruction_wording_documents": instruction_wording_documents,
             "instruction_wording_replies": instruction_wording_replies,
             "lg_serial_number": lg_record.lg_number,
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
         }
 
         notes_html = ""
@@ -1380,6 +1392,8 @@ class CRUDLGRecord(CRUDBase):
         and notifies stakeholders. LG status remains 'Valid'.
         """
         instruction_maker_user_id = user_id
+        recipient_name = "To Whom It May Concern"
+        recipient_address = "N/A"
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -1440,6 +1454,8 @@ class CRUDLGRecord(CRUDBase):
                 "customer_contact_email": customer_contact_email,
                 "action_type": "LG Amount Decrease",
                 "internal_owner_email": lg_record.internal_owner_contact.email,
+                "recipient_name": recipient_name,
+                "recipient_address": recipient_address,
             }
 
             notes_html = ""
@@ -1637,6 +1653,8 @@ class CRUDLGRecord(CRUDBase):
         logger.debug(f"[CRUDLGRecord.activate_non_operative_lg] Initiating activation for LG ID: {lg_record.id}")
 
         instruction_maker_user_id = user_id
+        recipient_name = "To Whom It May Concern"
+        recipient_address = "N/A"
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -1712,7 +1730,9 @@ class CRUDLGRecord(CRUDBase):
             "payment_date": payment_details.payment_date.isoformat(),
             "original_lg_status_id": models.LgOperationalStatusEnum.NON_OPERATIVE.value,
             "new_lg_status_id": models.LgOperationalStatusEnum.OPERATIVE.value,
-            "lg_type_id": models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value
+            "lg_type_id": models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value,
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
         }
 
         notes_html = ""
@@ -3163,3 +3183,48 @@ class CRUDLGRecord(CRUDBase):
             lg_record_id=db_lg_record.id,
         )
         return db_lg_record
+
+    def _get_recipient_details(self, db: Session, lg_record: models.LGRecord) -> Tuple[str, str]:
+        """
+        Determines the correct recipient name and address based on the LG's type and advising status.
+        """
+        # Debug print to confirm incoming data. This line can be removed once the issue is fixed.
+        print(f"DEBUG: LG {lg_record.lg_number} - Advising Status: '{lg_record.advising_status}', Communication Bank ID: {lg_record.communication_bank_id}")
+
+        # Case 1: Local Guarantee (issuing_bank is NOT "Foreign Bank")
+        # This check is now robust and case-insensitive.
+        if lg_record.issuing_bank.name and lg_record.issuing_bank.name.strip().upper() != "FOREIGN BANK":
+            return lg_record.issuing_bank.name, lg_record.issuing_bank.address
+
+        # Case 2: Counter Guarantee
+        # Sub-case 2.1: Advised or Confirmed Counter Guarantee
+        # Directly compare the AdvisingStatus enum object with its members.
+        if lg_record.advising_status in [models.AdvisingStatus.ADVISED, models.AdvisingStatus.CONFIRMED]:
+            if lg_record.communication_bank_id:
+                try:
+                    # Use the provided 'db' session to query the database.
+                    communication_bank = db.query(models.Bank).get(lg_record.communication_bank_id)
+                    if communication_bank:
+                        recipient_name = communication_bank.name
+                        recipient_address = communication_bank.address
+                        return recipient_name, recipient_address
+                    else:
+                        # Fallback if the communication bank record is missing.
+                        logger.error(f"LG {lg_record.lg_number} has advising status '{lg_record.advising_status}' but communication_bank_id {lg_record.communication_bank_id} does not match any bank record. Falling back to foreign bank details.")
+                        return lg_record.foreign_bank_name, lg_record.foreign_bank_address
+                except Exception as e:
+                    # Handle potential database errors during the query.
+                    logger.error(f"Error fetching communication bank for LG {lg_record.lg_number}: {e}. Falling back.")
+                    return lg_record.foreign_bank_name, lg_record.foreign_bank_address
+            else:
+                # Fallback if communication bank ID is missing.
+                logger.error(f"LG {lg_record.lg_number} has advising status '{lg_record.advising_status}' but no communication_bank_id defined. Falling back to foreign bank details.")
+                return lg_record.foreign_bank_name, lg_record.foreign_bank_address
+
+        # Sub-case 2.2: Unadvised or Unconfirmed Counter Guarantee
+        else:  # Assumes AdvisingStatus.NOT_ADVISED or any other value
+            recipient_name = lg_record.foreign_bank_name
+            recipient_address = lg_record.foreign_bank_address
+            return recipient_name, recipient_address
+            
+        return "To Whom It May Concern", "N/A" # Final default fallback
