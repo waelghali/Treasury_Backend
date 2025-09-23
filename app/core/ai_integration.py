@@ -147,7 +147,6 @@ def _get_gemini_model():
     return _gemini_model_global
 
 # Initial client setup
-# These calls ensure clients are attempted to be set up on module import
 _get_google_credentials()
 _get_gcs_client()
 _get_vision_client()
@@ -181,18 +180,14 @@ async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_
     try:
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
-        # Use asyncio.to_thread to run blocking I/O in a separate thread
         await asyncio.to_thread(blob.upload_from_string, data, content_type=content_type)
         logger.info(f"File {blob_name} uploaded to gs://{bucket_name}/{blob_name}.")
         return f"gs://{bucket_name}/{blob_name}"
     except GoogleAPIError as e:
         logger.error(f"Failed to upload {blob_name} to GCS: {e}")
-        # Only re-raise if it's a critical, unrecoverable error for the caller.
-        # For document upload within a larger process, consider handling more gracefully.
-        raise # Re-raise if the caller expects to catch specific GCS errors
+        raise
     except Exception as e:
         logger.error(f"An unexpected error occurred during GCS upload for {blob_name}: {e}")
-        # Consider converting to HTTPException or a custom exception if appropriate for API context
         raise
 
 
@@ -224,14 +219,6 @@ async def _cleanup_gcs_files(bucket_name: str, prefix: str):
 async def generate_signed_gcs_url(gs_uri: str, valid_for_seconds: int = 900) -> Optional[str]:
     """
     Generates a time-limited signed URL for a private GCS object.
-    
-    Args:
-        gs_uri: The Google Cloud Storage URI of the object (e.g., 'gs://your-bucket/path/to/object.pdf').
-        valid_for_seconds: The duration (in seconds) for which the signed URL will be valid.
-                           Defaults to 15 minutes (900 seconds).
-
-    Returns:
-        A string containing the signed URL, or None if an error occurs.
     """
     if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         logger.error("Google Cloud client libraries are not available. Cannot generate signed URL.")
@@ -243,7 +230,6 @@ async def generate_signed_gcs_url(gs_uri: str, valid_for_seconds: int = 900) -> 
         return None
 
     try:
-        # Parse the gs:// URI to get bucket name and blob name
         if not gs_uri.startswith("gs://"):
             logger.error(f"Invalid GCS URI format: {gs_uri}. Must start with 'gs://'.")
             return None
@@ -259,7 +245,6 @@ async def generate_signed_gcs_url(gs_uri: str, valid_for_seconds: int = 900) -> 
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
 
-        # Generate the signed URL
         signed_url = await asyncio.to_thread(
             blob.generate_signed_url,
             version="v4",
@@ -287,38 +272,30 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
     try:
         image_source = vision.ImageSource(image_uri=file_uri)
         image = vision.Image(source=image_source)
-        response = await asyncio.to_thread(vision_client.document_text_detection, image=image) # Make blocking call asynchronous
+        response = await asyncio.to_thread(vision_client.document_text_detection, image=image)
         full_text_annotation = response.full_text_annotation
 
         if full_text_annotation:
             text_content = full_text_annotation.text
             logger.info(f"OCR extracted {len(text_content)} characters from {file_uri}.")
-            logger.info(f"--- FULL OCR TEXT START ({file_uri}) ---")
-            # Log snippet, not full text, unless debugging is very specific
             logger.debug(text_content[:500] + "..." if len(text_content) > 500 else text_content)
-            logger.info(f"--- FULL OCR TEXT END ({file_uri}) ---")
             
-            # CRITICAL FIX: Sanitize the filename to remove invalid path characters
             sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
             ocr_output_filename = os.path.join(OCR_INPUT_DIR, f"ocr_input_to_gemini_{sanitized_file_id}.txt")
             
-            # Save OCR text to local file
             with open(ocr_output_filename, "w", encoding="utf-8") as f:
                 f.write(text_content)
             logger.info(f"OCR input for Gemini saved to {ocr_output_filename}")
-            # Log OCR cost metric (character count)
             logger.info(f"OCR Cost Metric: {len(text_content)} characters processed by Google Vision.")
             return text_content
         else:
             logger.warning(f"No text detected by OCR from {file_uri}.")
-            return None # Ensure None is returned if no text is found.
+            return None
     except GoogleAPIError as e:
         logger.error(f"Google Vision API error during OCR for {file_uri}: {e}", exc_info=True)
-        # CRITICAL FIX: Reraise the exception or explicitly return None on failure
         return None
     except Exception as e:
         logger.error(f"An unexpected error occurred during Google Vision OCR for {file_uri}: {e}", exc_info=True)
-        # CRITICAL FIX: Reraise the exception or explicitly return None on failure
         return None
 
 # --- PyMuPDF PDF to Image Conversion and GCS Upload ---
@@ -361,13 +338,10 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
 
 # --- Text Sanitization Utility ---
 def _sanitize_text_for_json(text: str) -> str:
-    # Remove control characters and ensure proper JSON escaping
     text = text.encode('unicode_escape').decode('utf-8')
     text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
     text = text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
     return text
-
-
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), reraise=True)
 async def extract_structured_data_with_gemini(text_content: str, unique_file_id: str, context: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
@@ -449,7 +423,15 @@ Document Text:
                 "purpose": { "type": "STRING" },
                 "issuanceDate": { "type": "STRING", "format": "date-time" }, 
                 "expiryDate": { "type": "STRING", "format": "date-time" },   
-                "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" } }
+                "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" } },
+                "issuingBankCountry": { "type": "STRING", "description": "The country of the issuing bank. Use 'Egypt' if from a local Egyptian bank."},
+                "advisingBankName": { "type": "STRING", "description": "The name of the advising or confirming bank, if present."},
+                "applicableRule": { "type": "STRING", "description": "The name of the applicable rule, e.g., 'URDG 758' or 'ISP98'."},
+                # NEW FIELDS FOR FOREIGN BANKS
+                "foreign_bank_name": {"type": "STRING", "description": "Manually entered bank name for foreign banks. Prioritize this if the issuing bank is explicitly a foreign bank and not found in the list."},
+                "foreign_bank_country": {"type": "STRING", "description": "Manually entered country for foreign banks."},
+                "foreign_bank_address": {"type": "STRING", "description": "Manually entered address for foreign banks."},
+                "foreign_bank_swift_code": {"type": "STRING", "description": "Manually entered SWIFT code for foreign banks."},
             },
             "required": ["issuerName", "beneficiaryName", "issuingBankName", "lgNumber", "lgAmount", "currency", "lgType", "purpose", "issuanceDate", "expiryDate"]
         }
@@ -496,9 +478,31 @@ Return your output as a JSON object with the following fields, based strictly on
 10. **expiryDate**:  
     The date the LG expires. Extract in `YYYY-MM-DD` format.
 
-11. **otherConditions** (optional):  
+11. **issuingBankCountry**:
+    The country of the issuing bank. Use 'Egypt' if from a local Egyptian bank, otherwise, specify the country name.
+
+12. **advisingBankName**:
+    The name of the advising or confirming bank, if mentioned.
+
+13. **applicableRule**:
+    The name of the applicable rule, e.g., 'URDG 758' or 'ISP98'.
+
+14. **otherConditions** (optional):  
     Any additional clauses—e.g., claim period, return conditions, governing law, amendment rules.  
     If present, return as a list of strings. Omit if not found.
+    
+15. **foreign_bank_name**:
+    The name of the foreign bank if the issuing bank is a foreign bank.
+    
+16. **foreign_bank_country**:
+    The country of the foreign bank.
+
+17. **foreign_bank_address**:
+    The address of the foreign bank.
+
+18. **foreign_bank_swift_code**:
+    The SWIFT code of the foreign bank.
+
 
 ---
 
@@ -510,7 +514,8 @@ Return your output as a JSON object with the following fields, based strictly on
 
 -   Dates must be in format: `YYYY-MM-DD`  
 -   Numbers must be plain (no commas or symbols)  
--   Omit any field not found, unless otherwise specified (e.g., `"Not Found"` for currency if unclear)  
+-   Omit any field not found, unless otherwise specified  
+-   Return blank reply for fields not found  
 -   Return **only** the final JSON object—no extra explanations
 
 ---
@@ -546,7 +551,6 @@ Document Text:
         else:
             logger.warning("Gemini usage_metadata not available in response.")
 
-        # CRITICAL FIX: Sanitize the filename to remove invalid path characters
         sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
         gemini_output_filename = os.path.join(GEMINI_OUTPUT_DIR, f"gemini_output_{sanitized_file_id}.json")
         
@@ -564,12 +568,10 @@ Document Text:
         logger.error(f"Error during Gemini AI extraction: {e}. Raw response: {extracted_data_str if 'extracted_data_str' in locals() else 'N/A'}", exc_info=True)
         raise
 
-
 # --- Main AI Processing Function ---
 async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_number_hint: str = "unknown_lg") -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     logger.info(f"Starting AI processing for MIME type: {mime_type}, LG Hint: {lg_number_hint}")
     
-    # Initialize all return values to None or default empty structures
     structured_data = None
     total_usage_metadata = {
         "ocr_characters": 0,
@@ -581,14 +583,13 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
     gcs_uri_for_ocr = None
     temp_files = [] 
     ocr_cost_metric = 0 
-    image_uris = [] # Initialize for PDF processing case
+    image_uris = []
 
     try:
         if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not GCS_BUCKET_NAME:
             logger.error("GCS_BUCKET_NAME is not set or Google Cloud libraries not available. Cannot proceed with file uploads.")
             return structured_data, total_usage_metadata
 
-        # Generate a unique session ID for this scan to avoid file conflicts
         session_id = uuid.uuid4().hex
         unique_file_id = f"{lg_number_hint}_{session_id}"
 
@@ -604,7 +605,7 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
             image_uris = await _convert_pdf_to_images_and_upload_to_gcs(file_bytes, GCS_BUCKET_NAME, unique_file_id)
             if not image_uris:
                 logger.error("Failed to convert PDF to images or upload to GCS for OCR.")
-                return structured_data, total_usage_metadata # Return early with default usage
+                return structured_data, total_usage_metadata
             temp_files.extend([uri.replace(f"gs://{GCS_BUCKET_NAME}/", "") for uri in image_uris])
             all_page_texts = []
             for uri in image_uris:
@@ -616,32 +617,29 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
             total_usage_metadata["total_pages_processed"] = len(image_uris)
         else:
             logger.error(f"Unsupported MIME type for OCR: {mime_type}. Expected image/* or application/pdf.")
-            return structured_data, total_usage_metadata # Return early with default usage
+            return structured_data, total_usage_metadata
 
         if not raw_text:
             logger.error("OCR failed or no text extracted.")
-            return structured_data, total_usage_metadata # Return early with default usage
+            return structured_data, total_usage_metadata
 
         structured_data, gemini_usage_metadata = await extract_structured_data_with_gemini(raw_text, unique_file_id)
         
-        # Update gemini usage in total_usage_metadata
         if gemini_usage_metadata:
             total_usage_metadata["gemini_prompt_tokens"] = gemini_usage_metadata.get("prompt_tokens", 0)
             total_usage_metadata["gemini_completion_tokens"] = gemini_usage_metadata.get("completion_tokens", 0)
 
         if not structured_data:
             logger.error("Gemini AI structured data extraction failed.")
-            return structured_data, total_usage_metadata # Return early with updated gemini usage
+            return structured_data, total_usage_metadata
 
         logger.info("AI processing completed successfully.")
         return structured_data, total_usage_metadata
 
     except Exception as e:
         logger.critical(f"Critical error during AI processing: {e}", exc_info=True)
-        # Ensure total_usage_metadata is returned even on critical failure
-        return None, total_usage_metadata # Return None for data, but return available usage info
+        return None, total_usage_metadata
     finally:
-        # Clean up temporary GCS files
         if temp_files:
             await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS files for session: {unique_file_id}")
@@ -655,7 +653,6 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
     lg_number_hint = lg_record_details.get("lgNumber", "unknown_amendment")
     logger.info(f"Starting AI processing for LG amendment. LG Hint: {lg_number_hint}")
     
-    # Initialize return values
     structured_data = None
     total_usage_metadata = {
         "ocr_characters": 0,
@@ -668,7 +665,6 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
     temp_files = []
     
     try:
-        # Step 1: Upload file and perform OCR (using existing helpers)
         if mime_type.startswith("image/"):
             blob_name = f"lg_amendment_scans_temp/{unique_file_id}/image_{uuid.uuid4().hex}.{mime_type.split('/')[-1]}"
             gcs_uri_for_ocr = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, mime_type)
@@ -692,7 +688,6 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
             
         total_usage_metadata["ocr_characters"] = len(raw_text)
 
-        # Step 2: Extract structured data using Gemini with a contextual prompt
         context = {"lg_record_details": lg_record_details}
         structured_data, gemini_usage_metadata = await extract_structured_data_with_gemini(raw_text, unique_file_id, context=context)
         
@@ -710,7 +705,6 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
         logger.critical(f"Critical error during AI amendment processing: {e}", exc_info=True)
         return None, total_usage_metadata
     finally:
-        # Step 3: Clean up temporary GCS files
         if temp_files:
             await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_amendment_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
@@ -718,7 +712,7 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
 # Example usage (for isolated testing)
 if __name__ == "__main__":
     async def test_ai_integration_local():
-        dummy_pdf_path = "135.PDF" # Ensure this PDF exists for testing
+        dummy_pdf_path = "135.PDF"
 
         print("\n--- Starting Isolated AI Integration Tests ---")
 
@@ -729,7 +723,6 @@ if __name__ == "__main__":
                     pdf_bytes = f.read()
                 for i in range(2):
                     print(f"\n--- PDF Test Run {i+1} ---")
-                    # Using a unique LG hint for each run to ensure distinct temporary files and logs
                     extracted, usage = await process_lg_document_with_ai(pdf_bytes, "application/pdf", f"pdf_run_{i+1}_{uuid.uuid4().hex}")
                     if extracted:
                         print(f"Extracted data from PDF (Run {i+1}): {json.dumps(extracted, indent=2)}")

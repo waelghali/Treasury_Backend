@@ -1281,7 +1281,6 @@ async def reject_approval_request(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
         )
-
 @router.get("/audit-logs/", response_model=List[AuditLogOut], dependencies=[Depends(check_subscription_status)])
 def read_corporate_admin_audit_logs(
     db: Session = Depends(get_db),
@@ -1296,26 +1295,82 @@ def read_corporate_admin_audit_logs(
 ):
     """
     Retrieves a list of audit log entries for the authenticated Corporate Admin's customer.
-    Filters are applied on top of the customer scope.
+    Filters are applied on top of the customer scope. Includes user and entity names.
     """
     customer_id = corporate_admin_context.customer_id
     
-    # Assuming a new function is created in crud_audit.py
-    # that correctly handles timestamp retrieval.
-    logs = crud_audit_log.get_all_logs(
-        db,
-        skip=skip,
-        limit=limit,
-        customer_id=customer_id,
-        user_id=user_id,
-        action_type=action_type,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        lg_record_id=lg_record_id
-    )
+    logs_query = db.query(models.AuditLog).options(
+        selectinload(models.AuditLog.user),
+        selectinload(models.AuditLog.lg_record)
+    ).filter(models.AuditLog.customer_id == customer_id)
     
-    return logs
+    if user_id is not None:
+        logs_query = logs_query.filter(models.AuditLog.user_id == user_id)
+    if action_type:
+        logs_query = logs_query.filter(func.lower(models.AuditLog.action_type) == func.lower(action_type))
+    if entity_type:
+        logs_query = logs_query.filter(func.lower(models.AuditLog.entity_type) == func.lower(entity_type))
+    if entity_id is not None:
+        logs_query = logs_query.filter(models.AuditLog.entity_id == entity_id)
+    if lg_record_id is not None:
+        logs_query = logs_query.filter(models.AuditLog.lg_record_id == lg_record_id)
+        
+    logs = logs_query.order_by(models.AuditLog.timestamp.desc()).offset(skip).limit(limit).all()
+    
+    output_logs = []
+    for log in logs:
+        user_name = log.user.email if log.user else "System"
+        
+        entity_name = None
+        lg_number = None
 
+        if log.lg_record:
+            lg_number = log.lg_record.lg_number
+            entity_name = lg_number
+        elif log.entity_type == "User" and log.entity_id:
+            entity = db.query(models.User).filter(models.User.id == log.entity_id).first()
+            entity_name = entity.email if entity else "Unknown User"
+        elif log.entity_type == "CustomerEntity" and log.entity_id:
+            entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == log.entity_id).first()
+            entity_name = entity.entity_name if entity else "Unknown Entity"
+        elif log.entity_type == "Customer" and log.entity_id:
+            customer = db.query(models.Customer).filter(models.Customer.id == log.entity_id).first()
+            entity_name = customer.name if customer else "Unknown Customer"
+        elif log.entity_type == "LGCategory" and log.entity_id:
+            category = db.query(models.LGCategory).filter(models.LGCategory.id == log.entity_id).first()
+            entity_name = category.name if category else "Unknown Category"
+        elif log.entity_type == "ApprovalRequest" and log.entity_id:
+            # For approval requests, the entity name should be the action type on the LG
+            entity_name = f"{log.action_type.replace('_', ' ').title()}"
+            if log.lg_record:
+                lg_number = log.lg_record.lg_number
+        elif log.entity_type == "LGInstruction" and log.entity_id:
+            # For instructions, the entity name should be the serial number, and LG number should be separate
+            instruction = db.query(models.LGInstruction).filter(models.LGInstruction.id == log.entity_id).first()
+            entity_name = instruction.serial_number if instruction else f"Instruction ID: {log.entity_id}"
+            if log.lg_record:
+                lg_number = log.lg_record.lg_number
+        else:
+            entity_name = log.entity_type
+            
+        # Construct the output object
+        output_logs.append(AuditLogOut(
+            id=log.id,
+            timestamp=log.timestamp,
+            user_id=log.user_id,
+            user_name=user_name,
+            action_type=log.action_type,
+            entity_type=log.entity_type,
+            entity_id=log.entity_id,
+            entity_name=entity_name,
+            lg_number=lg_number,
+            details=log.details,
+            customer_id=log.customer_id,
+            lg_record_id=log.lg_record_id,
+            ip_address=log.ip_address
+        ))
+    
+    return output_logs
 # --- NEW: Action Center Endpoints for Corporate Admin ---
 # All read operations must use check_subscription_status
 @router.get(

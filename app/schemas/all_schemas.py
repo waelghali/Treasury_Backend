@@ -233,6 +233,26 @@ class UserOut(UserBase, BaseSchema):
     maker_user_email: Optional[EmailStr] = None
     checker_user_email: Optional[EmailStr] = None
 
+class TrialRegistrationBase(BaseModel):
+    organization_name: str = Field(..., description="Organization name from the registration form.")
+    organization_address: str = Field(..., description="Organization address from the registration form.")
+    contact_admin_name: str = Field(..., description="Name of the contact person/super admin.")
+    contact_phone: str = Field(..., description="Contact phone number.")
+    admin_email: EmailStr = Field(..., description="Email of the super admin.")
+    entities_count: str = Field(..., description="Number of entities ('One' or 'Multiple').")
+    commercial_register_document_path: str = Field(..., description="Path to the uploaded commercial register document.")
+    accepted_terms_version: float = Field(..., description="Version of the terms accepted by the user.")
+
+class TrialRegistrationCreate(TrialRegistrationBase):
+    pass
+
+class TrialRegistrationOut(TrialRegistrationBase, BaseSchema):
+    status: str
+    commercial_register_document_path: str
+    customer_id: Optional[int] = None
+    accepted_terms_version: float
+    accepted_terms_ip: Optional[str] = None
+
 class CustomerCoreCreate(BaseModel):
     name: str = Field(..., min_length=3, max_length=150, description="Customer organization name")
     address: Optional[str] = Field(None, max_length=250, description="Customer organization address")
@@ -671,11 +691,13 @@ class AuditLogCreate(AuditLogBase):
 
 class AuditLogOut(BaseModel):
     id: int
-
     user_id: Optional[int]
+    user_name: Optional[str] = None
     action_type: str
     entity_type: str
     entity_id: Optional[int]
+    lg_number: Optional[str] = None
+    entity_name: Optional[str] = None
     details: Optional[Dict[str, Any]]
     timestamp: datetime
     ip_address: Optional[str]
@@ -742,7 +764,6 @@ class LGDocumentOut(LGDocumentBase, BaseSchema):
     #         return f"https://storage.googleapis.com/{gcs_bucket_name}/{blob_path_in_bucket}"
     #     return self.file_path
 
-
 class LGRecordBase(BaseModel):
     beneficiary_corporate_id: int = Field(..., description="ID of the entity benefiting from the LG")
     # New: lg_sequence_number for new serial format
@@ -763,10 +784,22 @@ class LGRecordBase(BaseModel):
     payment_conditions: Optional[str] = Field(None, max_length=1024, description="Specific conditions related to payment (conditional)")
     description_purpose: str = Field(..., max_length=516, description="General description or purpose of the LG")
 
+
     issuing_bank_id: int = Field(..., description="ID of the bank that issued the LG")
-    issuing_bank_address: str = Field(..., description="Address of the issuing bank")
-    issuing_bank_phone: str = Field(..., description="Phone number of the issuing bank")
+    issuing_bank_address: Optional[str] = Field(None, description="Address of the issuing bank")
+    issuing_bank_phone: Optional[str] = Field(None, description="Phone number of the issuing bank")
     issuing_bank_fax: Optional[str] = Field(None, max_length=18, description="Fax number of the issuing bank")
+    
+    # NEW FIELDS for Foreign Banks
+    foreign_bank_name: Optional[str] = Field(None, description="Manually entered bank name for foreign banks")
+    foreign_bank_country: Optional[str] = Field(None, description="Manually entered country for foreign banks")
+    foreign_bank_address: Optional[str] = Field(None, description="Manually entered address for foreign banks")
+    foreign_bank_swift_code: Optional[str] = Field(None, description="Manually entered SWIFT code for foreign banks")
+
+    # NEW FIELDS for Advising/Confirming Banks
+    advising_status: Optional[str] = Field(None, description="Status of the LG regarding advising/confirmation: 'Not Advised', 'Advised', or 'Confirmed'")
+    communication_bank_id: Optional[str] = Field(None, description="ID of the bank that serves as the Advising or Confirming bank")
+
     issuing_method_id: int = Field(..., description="ID of the method by which LG was issued")
     applicable_rule_id: int = Field(..., description="ID of the set of rules governing the LG")
     applicable_rules_text: Optional[str] = Field(None, max_length=64, description="Free text for rules (conditional)")
@@ -788,7 +821,7 @@ class LGRecordBase(BaseModel):
     @model_validator(mode='after')
     def validate_conditional_fields(self):
         return self
-
+        
 class LGRecordCreate(LGRecordBase):
     lg_type_id: int = Field(..., description="ID of the LG Type.")  # Add this line
     internal_owner_email: EmailStr = Field(..., description="Email of the internal owner contact person")
@@ -981,7 +1014,7 @@ class LGRecordOut(LGRecordBase, BaseSchema):
     customer_id: int
     lg_period_months: int
     lg_sequence_number: int # New: Expose lg_sequence_number in LGRecordOut
-
+    
     beneficiary_corporate: 'CustomerEntityOut'
     lg_currency: 'CurrencyOut'
     lg_payable_currency: Optional['CurrencyOut'] = None
@@ -992,6 +1025,15 @@ class LGRecordOut(LGRecordBase, BaseSchema):
     issuing_method: 'IssuingMethodOut'
     applicable_rule: 'RuleOut'
     internal_owner_contact: 'InternalOwnerContactOut'
+    # NEW FIELDS for Foreign Banks
+    foreign_bank_name: Optional[str] = None
+    foreign_bank_country: Optional[str] = None
+    foreign_bank_address: Optional[str] = None
+    foreign_bank_swift_code: Optional[str] = None
+    # NEW FIELDS for Advising/Confirming Banks
+    advising_status: Optional[str] = None
+    communication_bank_id: Optional[int] = None
+    communication_bank: Optional['BankOut'] = None
     lg_category: 'LGCategoryOut'
     documents: List['LGDocumentOut'] = []
     instructions: List['LGInstructionOut'] = []

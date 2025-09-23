@@ -306,7 +306,7 @@ class AuthService:
     async def change_password(
         self, db: Session, user: TokenData, request_body: ChangePasswordRequest, request_ip: Optional[str],
         is_first_login_change: bool = False # Flag to distinguish forced change vs. self-service
-    ) -> Token:
+    ) -> Dict[str, Any]:
         """
         Allows an authenticated user to change their password.
         Clears the must_change_password flag on success.
@@ -352,6 +352,13 @@ class AuthService:
         db_permissions = crud_role_permission.get_permissions_for_role(db, db_user.role.value)
         permission_names = [p.name for p in db_permissions]
 
+        # ADDED: Fetch must_accept_policies and last_accepted_legal_version from the db_user object
+        must_accept_policies_status = False
+        latest_versions = await self._get_legal_artifact_versions(db)
+        latest_system_version = max(latest_versions.get("tc_version", 0.0), latest_versions.get("pp_version", 0.0))
+        if db_user.last_accepted_legal_version is None or db_user.last_accepted_legal_version < latest_system_version:
+            must_accept_policies_status = True
+
         new_token_data = {
             "sub": db_user.email,
             "user_id": db_user.id,
@@ -361,8 +368,8 @@ class AuthService:
             "has_all_entity_access": db_user.has_all_entity_access,
             "entity_ids": [assoc.customer_entity_id for assoc in db_user.entity_associations] if not db_user.has_all_entity_access else [],
             "must_change_password": False, # Explicitly false now
-            "must_accept_policies": user.must_accept_policies,
-            "last_accepted_legal_version": user.last_accepted_legal_version
+            "must_accept_policies": must_accept_policies_status, # MODIFIED: Use the newly computed value
+            "last_accepted_legal_version": db_user.last_accepted_legal_version
         }
         new_access_token = create_access_token(data=new_token_data)
 
@@ -380,7 +387,11 @@ class AuthService:
         )
         # Removed db.commit(), `get_db` generator handles it.
 
-        return Token(access_token=new_access_token, token_type="bearer")
+        return {
+            "access_token": new_access_token,
+            "token_type": "bearer",
+            "must_accept_policies": must_accept_policies_status
+        }
 
     async def initiate_password_reset(self, db: Session, email: str, request_ip: Optional[str]) -> None:
         """
