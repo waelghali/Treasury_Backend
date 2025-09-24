@@ -2712,12 +2712,22 @@ async def approve_trial_registration(
                 </body>
             """)
 
+        # NEW CODE: Define a dynamic path to the PDF guide
+        # NEW CODE: Define a dynamic path to the PDF guide
+        current_file_dir = os.path.dirname(os.path.abspath(__file__))
+        # From c:\Grow\app\api\v1\endpoints, go up 3 levels to get to c:\Grow\app
+        app_root = os.path.abspath(os.path.join(current_file_dir, '..', '..', '..'))
+        pdf_path = os.path.join(app_root, 'templates', 'quick_start_guide.pdf')
+
+        logger.info(f"Looking for PDF at: {pdf_path}")
+
         try:
-            with open("quick_start_guide.pdf", "rb") as f:
+            with open(pdf_path, "rb") as f:
                 attachment = EmailAttachment("Quick_Start_Guide.pdf", f.read(), "application/pdf")
                 background_tasks.add_task(send_email, db, [registration.admin_email], subject, body, {}, email_settings, attachments=[attachment])
+                logger.info(f"Successfully found PDF at: {pdf_path}")
         except FileNotFoundError:
-            logger.warning("Quick start guide PDF not found. Sending email without attachment.")
+            logger.warning(f"Quick start guide PDF not found at: {pdf_path}. Sending email without attachment.")
             background_tasks.add_task(send_email, db, [registration.admin_email], subject, body, {}, email_settings)
 
     except Exception as e:
