@@ -2699,7 +2699,7 @@ async def approve_trial_registration(
                 <p>Hello {registration.contact_admin_name},</p>
                 <p>We're excited to confirm that your free trial account for the LG Custody Platform is now active!</p>
                 <p>To get started, please use the following temporary password to log in: <strong>{generated_password}</strong>. We highly recommend that you change this password immediately after your first login.</p>
-                <p><strong>Login Link:</strong> <a href="{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login">{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/login</a></p>
+                <p><strong>Login Link:</strong> <a href="{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login">{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login</a></p>
                 <p>Your free trial will be active for {subscription_plan.duration_months} months, expiring on {db_customer.end_date.strftime('%Y-%m-%d')}.</p>
                 <p><strong>Quick Start Guide:</strong> Please find a quick-start guide attached to help you get started with the platform's core features.</p>
                 <p>Best regards,</p>
