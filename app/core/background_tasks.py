@@ -491,23 +491,30 @@ async def run_daily_print_reminders(db: Session):
                     audit_action_type = None
                     template_action_type = None
 
-                    if (print_notification_status == "NONE" and
-                        days_since_instruction_creation >= days_for_first_reminder):
-                        send_reminder = True
-                        audit_action_type = AUDIT_ACTION_TYPE_PRINT_REMINDER_SENT
-                        template_action_type = "PRINT_REMINDER"
-
-                    elif (print_notification_status == "REMINDER_SENT" and
-                          days_since_instruction_creation >= days_for_escalation):
+                    # Check 1: ESCALATION (Highest Priority)
+                    # Triggers if past escalation days (days_for_escalation) AND status is not yet ESCALATION_SENT.
+                    if (days_since_instruction_creation >= days_for_escalation and
+                        print_notification_status in ["REMINDER_SENT", "NONE"]):
+                        
                         send_escalation = True
                         audit_action_type = AUDIT_ACTION_TYPE_PRINT_ESCALATION_SENT
                         template_action_type = "PRINT_ESCALATION"
+
+                    # Check 2: REMINDER (Lower Priority)
+                    # Only triggers if status is NONE and the instruction hasn't been escalated (because the above 'if' failed).
+                    elif (print_notification_status == "NONE" and
+                          days_since_instruction_creation >= days_for_first_reminder):
+                        
+                        send_reminder = True
+                        audit_action_type = AUDIT_ACTION_TYPE_PRINT_REMINDER_SENT
+                        template_action_type = "PRINT_REMINDER"
 
                     if send_reminder or send_escalation:
                         to_emails = [maker_user.email]
                         cc_emails = []
                         
                         if checker_user and send_escalation:
+                            # Add the checker user to CC for escalation emails
                             cc_emails.append(checker_user.email)
                         
                         common_comm_list_config = crud_customer_configuration.get_customer_config_or_global_fallback(
@@ -604,6 +611,8 @@ async def run_daily_print_reminders(db: Session):
                             if send_reminder:
                                 req.request_details["print_notification_status"] = "REMINDER_SENT"
                                 logger.info(f"Print reminder sent for Approval Request ID: {req.id} (Instruction: {instruction.serial_number}).")
+                            # Update the status to ESCALATION_SENT to prevent re-sending,
+                            # regardless of the previous status (NONE or REMINDER_SENT)
                             elif send_escalation:
                                 req.request_details["print_notification_status"] = "ESCALATION_SENT"
                                 logger.info(f"Print escalation sent for Approval Request ID: {req.id} (Instruction: {instruction.serial_number}).")
