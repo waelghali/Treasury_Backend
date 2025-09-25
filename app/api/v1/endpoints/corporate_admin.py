@@ -6,7 +6,7 @@ import importlib.util
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Body, BackgroundTasks
 
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func
@@ -48,6 +48,16 @@ from app.models import (
     Customer
 )
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, SubscriptionStatus
+
+# FIX: Ensure get_global_email_settings is imported alongside the others.
+# Although you are currently only using get_global_email_settings, keeping 
+# get_customer_email_settings imported is generally safer for a complex file.
+from app.core.email_service import (
+    get_customer_email_settings, 
+    get_global_email_settings, # <-- CRITICAL ADDITION
+    send_email, 
+    EmailSettings
+)
 
 # --- Explicitly load core.security using importlib ---
 try:
@@ -451,47 +461,87 @@ def create_user(
     user_in: UserCreateCorporateAdmin,
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(HasPermission("user:create")),
-    request: Request = None
+    request: Request = None,
+    background_tasks: BackgroundTasks = None
 ):
     """
     Allows a Corporate Admin to create a new user under their customer organization.
     Enforces subscription plan limits and prevents assignment of the SYSTEM_OWNER role.
+    Sends a welcome email upon successful creation.
     """
-    client_host = get_client_ip if request else None
+    client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    
+    new_user_password = user_in.password
+
+    log_details = {"email": user_in.email, "customer_id": customer_id}
 
     try:
         customer_check = crud_customer.get_with_relations(db, customer_id)
         if not customer_check:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found or is deleted.")
         
-        # FIX: Re-synchronize the active_user_count before performing the check
         actual_active_users_count = db.query(User).filter(
             User.customer_id == customer_id,
             User.is_deleted == False
         ).count()
         customer_check.active_user_count = actual_active_users_count
         db.add(customer_check)
-        db.flush() # Ensure the session has the corrected count before the next check
+        db.flush()
         
-        # Check user limit for subscription plan
         if customer_check.active_user_count >= customer_check.subscription_plan.max_users:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Customer's subscription plan '{customer_check.subscription_plan.name}' limit of {customer_check.subscription_plan.max_users} users reached."
             )
 
-        # Ensure role is not SYSTEM_OWNER (already in schema validator, but double check)
         if user_in.role == UserRole.SYSTEM_OWNER:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Corporate Admins cannot create users with 'SYSTEM_OWNER' role.")
 
         db_user = crud_user.create_user_by_corporate_admin(db, user_in, customer_id, corporate_admin_context.user_id)
+        
+        # FIX: Use global email settings, similar to the public registration endpoint
+        email_settings = get_global_email_settings()
+        
+        welcome_subject = f"Welcome to the Platform, {db_user.email}!"
+        user_name = db_user.email 
+        login_url = os.getenv('FRONTEND_LOGIN_URL', 'https://www.growbusinessdevelopment.com/login')
+
+        welcome_body = f"""
+            <html><body>
+                <p>Hello {user_name},</p>
+                <p>A new account has been created for you on the platform with the role: <strong>{db_user.role.value}</strong>.</p>
+                <p><strong>Your login details are:</strong></p>
+                <ul>
+                    <li><strong>Email:</strong> {db_user.email}</li>
+                    <li><strong>Temporary Password:</strong> {new_user_password}</li>
+                </ul>
+                <p>Since this is your first login, you will be prompted to change your password immediately upon signing in for security purposes.</p>
+                <p>Please click here to log in: <a href="{login_url}">{login_url}</a></p>
+                <p>If you did not authorize this, please contact your Corporate Admin immediately.</p>
+                <p>Best regards,</p>
+                <p>Your Corporate Admin</p>
+            </body></html>
+        """
+        
+        background_tasks.add_task(
+            send_email,
+            db,
+            [db_user.email],
+            welcome_subject,
+            welcome_body,
+            {}, # template_data
+            email_settings,
+        )
+        
         return db_user
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
+        log_details["reason"] = str(e.detail)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details=log_details, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
+        log_details["reason"] = str(e)
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details=log_details, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
