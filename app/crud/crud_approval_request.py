@@ -37,7 +37,8 @@ from app.constants import (
     AUDIT_ACTION_TYPE_APPROVAL_REQUEST_REJECTED,
     AUDIT_ACTION_TYPE_APPROVAL_REQUEST_WITHDRAWN,
     AUDIT_ACTION_TYPE_APPROVAL_REQUEST_AUTO_REJECTED,
-    NOTIFICATION_PRINT_CONFIRMATION
+    NOTIFICATION_PRINT_CONFIRMATION,
+    ACTION_TYPE_APPROVAL_REQUEST_PENDING,
 )
 
 from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
@@ -81,7 +82,8 @@ class CRUDApprovalRequest(CRUDBase):
             "manager_email": owner_contact.manager_email,
         }
 
-    def create_approval_request(
+    # CONVERTED TO ASYNC METHOD
+    async def create_approval_request(
         self,
         db: Session,
         obj_in: ApprovalRequestCreate,
@@ -123,8 +125,149 @@ class CRUDApprovalRequest(CRUDBase):
             customer_id=customer_id,
             lg_record_id=db_obj.entity_id if db_obj.entity_type == "LGRecord" else None,
         )
+
+        # --- FIX START: Await the async notification function ---
+        try:
+            # The function signature of _send_pending_approval_notification should remain async
+            await self._send_pending_approval_notification(db, db_obj) # <--- ADDED AWAIT HERE
+        except Exception as e:
+            logger.error(f"Failed to send pending approval notification for request ID {db_obj.id}: {e}", exc_info=True)
+            log_action(
+                db,
+                user_id=maker_user_id,
+                action_type="NOTIFICATION_FAILED",
+                entity_type="ApprovalRequest",
+                entity_id=db_obj.id,
+                details={
+                    "reason": f"Failed to notify checkers about pending request: {e}",
+                    "notification_type": ACTION_TYPE_APPROVAL_REQUEST_PENDING,
+                },
+                customer_id=customer_id,
+                lg_record_id=db_obj.entity_id if db_obj.entity_type == "LGRecord" else None,
+            )
+        # --- FIX END ---
+
         return db_obj
 
+    # The _send_pending_approval_notification helper function remains ASYNC:
+    async def _send_pending_approval_notification(self, db: Session, approval_request: models.ApprovalRequest):
+        """
+        Sends an email notification to all Checkers and Corporate Admins of the customer
+        about a newly submitted approval request.
+        """
+        logger.info(f"Attempting to send 'Pending Approval' notification for Approval Request ID: {approval_request.id}.")
+
+        # 1. Identify all Checkers and Corporate Admins for the customer
+        checker_and_admin_emails = db.query(models.User.email).filter(
+            models.User.customer_id == approval_request.customer_id,
+            models.User.is_deleted == False,  # <--- CORRECTED: Using is_deleted == False for active users
+            models.User.email.isnot(None),
+            models.User.email != "",
+            models.User.role.in_(['corporate_admin', 'checker']) 
+        ).distinct().all()
+        
+        # Filter out the maker user to prevent self-notification
+        # Note: We must ensure maker_user relationship is eagerly loaded or fetched, 
+        # but for simplicity and safety, we'll rely on the DB object refresh done prior to this call.
+        maker_email = approval_request.maker_user.email if approval_request.maker_user else None
+        
+        to_emails = [email[0] for email in checker_and_admin_emails if email[0] != maker_email]
+        cc_emails = [] # No CC list needed for the primary checker alert
+
+        if not to_emails:
+            logger.warning(f"No valid recipients found for pending approval request ID {approval_request.id}. Skipping email.")
+            return
+
+        # 2. Fetch template
+        import app.crud.crud as crud_instances # Import crud instance helper inside the function scope if needed
+        notification_template = db.query(models.Template).filter(
+            models.Template.action_type == ACTION_TYPE_APPROVAL_REQUEST_PENDING,
+            models.Template.is_notification_template == True,
+            models.Template.is_deleted == False,
+            models.Template.is_global == True
+        ).first()
+
+        if not notification_template:
+            logger.error(f"Email notification template for '{ACTION_TYPE_APPROVAL_REQUEST_PENDING}' not found. Cannot send checker alert.")
+            return
+
+        # 3. Prepare template data and email settings
+        email_settings_to_use, email_method_for_log = get_customer_email_settings(db, approval_request.customer_id)
+        
+        lg_record = approval_request.lg_record if approval_request.lg_record else None
+        
+        lg_number = lg_record.lg_number if lg_record else f"Owner Contact ID: {approval_request.entity_id}"
+        lg_currency = lg_record.lg_currency.iso_code if lg_record and lg_record.lg_currency else "N/A"
+        lg_amount = float(lg_record.lg_amount) if lg_record and lg_record.lg_amount is not None else "N/A"
+        
+        template_data = {
+            "maker_email": maker_email if maker_email else "N/A",
+            "maker_name": approval_request.maker_user.email.split('@')[0] if approval_request.maker_user and approval_request.maker_user.email else "N/A",
+            "approval_request_id": approval_request.id,
+            "action_type": approval_request.action_type.replace('_', ' ').title(),
+            "entity_type": approval_request.entity_type,
+            "lg_number": lg_number,
+            "lg_amount": lg_amount,
+            "lg_currency_code": lg_currency,
+            "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "platform_name": "Treasury Management Platform",
+            "action_center_link": "/checker/action-center"
+        }
+
+        template_data["lg_amount_formatted"] = f"{lg_currency} {lg_amount:,.2f}" if isinstance(lg_amount, (float, int, decimal.Decimal)) else lg_amount
+
+
+        email_subject = notification_template.subject if notification_template.subject else f"ACTION REQUIRED: Approval Pending for {{action_type}} on {{lg_number}}"
+        email_body_html = notification_template.content
+        for key, value in template_data.items():
+            str_value = str(value) if value is not None else ""
+            email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
+            email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
+
+        # 4. Send the email
+        email_sent_successfully = await send_email(
+            db=db,
+            to_emails=to_emails,
+            cc_emails=cc_emails,
+            subject_template=email_subject,
+            body_template=email_body_html,
+            template_data=template_data,
+            email_settings=email_settings_to_use,
+        )
+
+        # 5. Log the notification attempt/success
+        if email_sent_successfully:
+            log_action(
+                db,
+                user_id=approval_request.maker_user_id,
+                action_type="NOTIFICATION_SENT",
+                entity_type="ApprovalRequest",
+                entity_id=approval_request.id,
+                details={
+                    "recipient": to_emails,
+                    "subject": email_subject,
+                    "method": email_method_for_log,
+                    "notification_type": "Pending Approval Alert"
+                },
+                customer_id=approval_request.customer_id,
+                lg_record_id=lg_record.id if lg_record else None,
+            )
+            logger.info(f"Pending approval alert sent successfully for AR {approval_request.id} to {len(to_emails)} checker(s).")
+        else:
+            log_action(
+                db,
+                user_id=approval_request.maker_user_id,
+                action_type="NOTIFICATION_FAILED",
+                entity_type="ApprovalRequest",
+                entity_id=approval_request.id,
+                details={"reason": "Email service failed to send pending approval alert", "recipient": to_emails, "subject": email_subject, "method": email_method_for_log},
+                customer_id=approval_request.customer_id,
+                lg_record_id=lg_record.id if lg_record else None,
+            )
+            logger.error(f"Failed to send pending approval alert for Approval Request ID: {approval_request.id}.")
+    # --- UPDATED METHOD END: _send_pending_approval_notification ---
+    
+    
     def get_pending_requests_for_customer(
         self, db: Session, customer_id: int, skip: int = 0, limit: int = 100
     ) -> List[models.ApprovalRequest]:

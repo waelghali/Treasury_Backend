@@ -793,6 +793,9 @@ async def extend_lg_record(
             detail=f"An unexpected error occurred: {e}"
         )
 
+# --------------------------------------------------------------------------------------
+# 1. /lg-records/{lg_record_id}/release
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/{lg_record_id}/release",
     response_model=Dict[str, Any],
@@ -815,7 +818,6 @@ async def release_lg_record(
     """
     client_host = get_client_ip(request) if request else None
     
-    # NEW: Include notes in the release_in object for validation and passing to CRUD
     release_in = LGRecordRelease(reason=reason, notes=notes)
     
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
@@ -875,7 +877,7 @@ async def release_lg_record(
         try:
             lg_snapshot = crud_approval_request._get_lg_record_snapshot(db_lg_record)
             
-            request_details = release_in.model_dump() # NEW: Use the release_in model which contains notes
+            request_details = release_in.model_dump()
             if document_id_for_approval_request:
                 request_details["supporting_document_id"] = document_id_for_approval_request
             
@@ -886,7 +888,9 @@ async def release_lg_record(
                 request_details=request_details,
                 lg_record_snapshot=lg_snapshot
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -906,7 +910,7 @@ async def release_lg_record(
                     "status": db_approval_request.status.value,
                     "maker_email": end_user_context.email,
                     "reason_for_request": release_in.reason,
-                    "notes_for_request": release_in.notes, # NEW: Include notes in the log
+                    "notes_for_request": release_in.notes,
                     "supporting_document_id": document_id_for_approval_request,
                 },
                 customer_id=end_user_context.customer_id,
@@ -936,7 +940,7 @@ async def release_lg_record(
                 user_id=end_user_context.user_id,
                 approval_request_id=None,
                 supporting_document_id=document_id_for_approval_request,
-                notes=release_in.notes # NEW: Pass notes to the crud function
+                notes=release_in.notes
             )
 
             return {
@@ -954,6 +958,9 @@ async def release_lg_record(
                 detail=f"An unexpected error occurred during direct release: {e}"
             )
 
+# --------------------------------------------------------------------------------------
+# 2. /lg-records/{lg_record_id}/liquidate
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/{lg_record_id}/liquidate",
     response_model=Dict[str, Any],
@@ -979,12 +986,11 @@ async def liquidate_lg_record(
     """
     client_host = get_client_ip(request) if request else None
 
-    # FIX: Manually create the Pydantic model for validation
     liquidation_in = LGRecordLiquidation(
         liquidation_type=liquidation_type,
         new_amount=new_amount,
         reason=reason,
-        notes=notes # Now the notes are part of the model
+        notes=notes
     )
 
     db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
@@ -1010,7 +1016,6 @@ async def liquidate_lg_record(
     action_type = ACTION_TYPE_LG_LIQUIDATE
     current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
     
-    # NEW: Handle document upload logic
     document_id_for_approval_request = None
     if internal_supporting_document_file:
         if not customer.subscription_plan.can_image_storage:
@@ -1036,10 +1041,9 @@ async def liquidate_lg_record(
             logger.error(f"Failed to store supporting document for LG {lg_record_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store supporting document: {e}")
 
-    # --- REVISED BLOCKING LOGIC START ---
-    if current_action_requires_maker_checker: # This condition is True
+    if current_action_requires_maker_checker:
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, lg_record_id, end_user_context.customer_id)
-        if existing_pending_requests: # If ANY pending request exists, this block executes and raises HTTPException
+        if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1063,7 +1067,9 @@ async def liquidate_lg_record(
                 request_details=request_details,
                 lg_record_snapshot=lg_snapshot
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -1086,7 +1092,7 @@ async def liquidate_lg_record(
                     "new_amount": liquidation_in.new_amount,
                     "reason_for_request": liquidation_in.reason,
                     "supporting_document_id": document_id_for_approval_request,
-                    "notes": liquidation_in.notes, # ADDED: Log the notes in the submission details
+                    "notes": liquidation_in.notes,
                 },
                 customer_id=end_user_context.customer_id,
                 lg_record_id=lg_record_id,
@@ -1116,9 +1122,8 @@ async def liquidate_lg_record(
                 new_amount=liquidation_in.new_amount,
                 user_id=end_user_context.user_id,
                 approval_request_id=None,
-                # NEW: Pass document ID and file to the crud method
                 supporting_document_id=document_id_for_approval_request,
-                notes=liquidation_in.notes # PASS THE NOTES HERE
+                notes=liquidation_in.notes
             )
 
             return {
@@ -1136,6 +1141,9 @@ async def liquidate_lg_record(
                 detail=f"An unexpected error occurred during direct liquidation: {e}"
             )
 
+# --------------------------------------------------------------------------------------
+# 3. /lg-records/{lg_record_id}/decrease-amount
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/{lg_record_id}/decrease-amount",
     response_model=Dict[str, Any],
@@ -1234,7 +1242,9 @@ async def decrease_lg_amount_record(
                 request_details=request_details,
                 lg_record_snapshot=lg_snapshot
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -1255,7 +1265,7 @@ async def decrease_lg_amount_record(
                     "maker_email": end_user_context.email,
                     "decrease_amount": decrease_in.decrease_amount,
                     "reason_for_request": decrease_in.reason,
-                    "notes": decrease_in.notes, # NEW: Log the notes
+                    "notes": decrease_in.notes,
                     "supporting_document_id": document_id_for_approval_request
                 },
                 customer_id=end_user_context.customer_id,
@@ -1285,7 +1295,7 @@ async def decrease_lg_amount_record(
                 user_id=end_user_context.user_id,
                 approval_request_id=None,
                 supporting_document_id=document_id_for_approval_request,
-                notes=decrease_in.notes # NEW: Pass notes to the crud function
+                notes=decrease_in.notes
             )
             return {
                 "message": f"LG '{updated_lg.lg_number}' amount decreased directly.",
@@ -1302,6 +1312,9 @@ async def decrease_lg_amount_record(
                 detail=f"An unexpected error occurred during direct decrease: {e}"
             )
 
+# --------------------------------------------------------------------------------------
+# 4. /lg-records/{lg_record_id}/activate-non-operative
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/{lg_record_id}/activate-non-operative",
     response_model=Dict[str, Any],
@@ -1411,7 +1424,9 @@ async def activate_non_operative_lg_record(
                 request_details=serialized_payment_details,
                 lg_record_snapshot=lg_snapshot
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -1476,7 +1491,10 @@ async def activate_non_operative_lg_record(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"An unexpected error occurred during direct activation: {e}"
             )
-            
+
+# --------------------------------------------------------------------------------------
+# 5. /lg-records/{lg_record_id}/amend
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/{lg_record_id}/amend",
     response_model=Dict[str, Any],
@@ -1590,7 +1608,9 @@ async def amend_lg_record(
                 },
                 lg_record_snapshot=lg_snapshot
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -1659,7 +1679,6 @@ async def amend_lg_record(
                 detail=f"An unexpected error occurred during direct amendment: {e}"
             )
 
-
 @router.post(
     "/lg-records/{lg_record_id}/toggle-auto-renewal",
     response_model=Dict[str, Any],
@@ -1708,10 +1727,13 @@ async def toggle_lg_auto_renewal_api(
             detail=f"An unexpected error occurred: {e}"
         )
 # NEW ENDPOINT: Update Internal Owner Contact Details (Scenario 1)
+# --------------------------------------------------------------------------------------
+# 6. /internal-owner-contacts/{owner_id} (Update Details)
+# --------------------------------------------------------------------------------------
 @router.put(
     "/internal-owner-contacts/{owner_id}",
     response_model=Dict[str, Any],
-    dependencies=[Depends(HasPermission("lg_record:amend")), Depends(check_for_read_only_mode)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:amend")), Depends(check_for_read_only_mode)],
     summary="Update details of an existing Internal Owner Contact (via Maker-Checker workflow)"
 )
 async def update_internal_owner_contact_details_api(
@@ -1734,18 +1756,20 @@ async def update_internal_owner_contact_details_api(
 
     action_type = ACTION_TYPE_LG_CHANGE_OWNER_DETAILS
     
-    current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL # This will be True
+    current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
 
-    # --- REVISED BLOCKING LOGIC START ---
-    if current_action_requires_maker_checker: # This condition is True
+    if current_action_requires_maker_checker:
+        # NOTE: Using a general placeholder for pending requests here as a specific entity type
+        # is hard to validate against in a generic way for non-LG objects. Assuming `entity_type` and `entity_id` works for ApprovalRequest model.
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, owner_id, end_user_context.customer_id)
-        if existing_pending_requests: # If ANY pending request exists, this block executes and raises HTTPException
+        if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Another action ({first_pending_req.action_type}) is already pending approval for this LG Record (Request ID: {first_pending_req.id}, Status: {first_pending_req.status.value}). This Maker-Checker action cannot be submitted until the pending action is resolved."
+                detail=f"Another action ({first_pending_req.action_type}) is already pending approval for this entity (Request ID: {first_pending_req.id}, Status: {first_pending_req.status.value})."
             )
-    if customer.subscription_plan.can_maker_checker: # Maker-Checker check only if action_type is in ACTION_TYPES_REQUIRING_APPROVAL
+
+    if customer.subscription_plan.can_maker_checker:
         try:
             owner_snapshot = crud_approval_request._get_internal_owner_contact_snapshot(db_owner_contact)
 
@@ -1756,7 +1780,9 @@ async def update_internal_owner_contact_details_api(
                 request_details=owner_details_in.model_dump(),
                 lg_record_snapshot=owner_snapshot,
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -1819,11 +1845,13 @@ async def update_internal_owner_contact_details_api(
                 detail=f"An unexpected error occurred during direct update: {e}"
             )
 
-# NEW ENDPOINT: Change LG Internal Owner (Single or Bulk) (Scenarios 2 & 3)
+# --------------------------------------------------------------------------------------
+# 7. /lg-records/change-owner (Single or Bulk)
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/change-owner",
     response_model=Dict[str, Any],
-    dependencies=[Depends(HasPermission("lg_record:amend")), Depends(check_for_read_only_mode)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:amend")), Depends(check_for_read_only_mode)],
     summary="Change internal owner for LG records (single or bulk, via Maker-Checker workflow)"
 )
 async def change_lg_owner_api(
@@ -1840,9 +1868,11 @@ async def change_lg_owner_api(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer or Subscription Plan not found.")
 
     action_type = ""
+    entity_id = None
 
     if change_in.change_scope == InternalOwnerChangeScope.SINGLE_LG:
         action_type = ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER
+        entity_id = change_in.lg_record_id
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, change_in.lg_record_id, end_user_context.customer_id)
         if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
@@ -1852,10 +1882,11 @@ async def change_lg_owner_api(
             )
     elif change_in.change_scope == InternalOwnerChangeScope.ALL_BY_OLD_OWNER:
         action_type = ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER
+        entity_id = change_in.old_internal_owner_contact_id # Use the owner ID as the entity ID for the AR
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid change scope.")
 
-    if customer.subscription_plan.can_maker_checker: # Maker-Checker check only if action_type is in ACTION_TYPES_REQUIRING_APPROVAL
+    if customer.subscription_plan.can_maker_checker:
         try:
             lg_snapshot = None
             db_lg_record = None
@@ -1867,12 +1898,14 @@ async def change_lg_owner_api(
 
             approval_request_in = ApprovalRequestCreate(
                 entity_type="LGRecord",
-                entity_id=change_in.lg_record_id if change_in.change_scope == InternalOwnerChangeScope.SINGLE_LG else None,
+                entity_id=entity_id,
                 action_type=action_type,
                 request_details=change_in.model_dump(),
                 lg_record_snapshot=lg_snapshot,
             )
-            db_approval_request = crud_approval_request.create_approval_request(
+            
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
@@ -1939,7 +1972,7 @@ async def change_lg_owner_api(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"An unexpected error occurred during direct change: {e}"
             )
-
+            
 @router.post(
     "/lg-records/instructions/{instruction_id}/record-delivery",
     response_model=LGInstructionOut,
@@ -3173,6 +3206,9 @@ def dismiss_system_notification_endpoint(
     return notification
 
 
+# --------------------------------------------------------------------------------------
+# 8. /lg-records/instructions/{instruction_id}/cancel
+# --------------------------------------------------------------------------------------
 @router.post(
     "/lg-records/instructions/{instruction_id}/cancel",
     response_model=Dict[str, Any],
@@ -3224,7 +3260,8 @@ async def cancel_lg_instruction(
                 lg_record_snapshot=lg_snapshot,
             )
             
-            db_approval_request = crud_approval_request.create_approval_request(
+            # **AWAIT** the asynchronous CRUD method call
+            db_approval_request = await crud_approval_request.create_approval_request(
                 db,
                 approval_request_in,
                 end_user_context.user_id,
