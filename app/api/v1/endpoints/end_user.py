@@ -274,15 +274,26 @@ async def create_lg_record(
 
     # Parse the JSON string back into a Pydantic model
     try:
-        lg_record_in = LGRecordCreate.model_validate_json(lg_record_in_json)
+        # Step 1: Load the raw JSON string into a Python dictionary
+        lg_record_data = json.loads(lg_record_in_json)
+
+        # Step 2: Pre-validation fix. Convert the empty string to None.
+        # Pydantic can handle None for an optional integer field, but not "".
+        if lg_record_data.get('lg_payable_currency_id') == '':
+            lg_record_data['lg_payable_currency_id'] = None
+        
+        # Step 3: Now validate the cleaned dictionary with the Pydantic model
+        lg_record_in = LGRecordCreate.model_validate(lg_record_data)
+
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid JSON format for LG record data."
         )
     except Exception as e:
+        # This will now correctly catch any remaining Pydantic validation errors
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Error validating LG record data: {e}"
         )
     

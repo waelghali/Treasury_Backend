@@ -156,9 +156,11 @@ class CRUDLGRecord(CRUDBase):
         
         # CRITICAL FIX: Convert empty strings to None for integer fields
         # This resolves the `invalid input syntax for type integer: ""` database error.
-        for field in ["communication_bank_id"]:
+        for field in ["communication_bank_id", "lg_payable_currency_id"]:
             if lg_record_data.get(field) == "":
                 lg_record_data[field] = None
+            if lg_record_data.get("lg_payable_currency_id") is None:
+                lg_record_data["lg_payable_currency_id"] = lg_record_data["lg_currency_id"]
 
         lg_record_data["internal_owner_contact_id"] = db_internal_owner_contact.id
 
