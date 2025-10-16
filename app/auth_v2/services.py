@@ -151,7 +151,7 @@ class AuthService:
         """
         from app.crud.crud import crud_user  # Late import
 
-        user = db.query(User).options(selectinload(User.customer)).filter(User.email == email, User.is_deleted == False).first()
+        user = db.query(User).options(selectinload(User.customer)).filter(func.lower(User.email) == email.lower(), User.is_deleted == False).first()
 
         # Check for user existence first
         if not user:

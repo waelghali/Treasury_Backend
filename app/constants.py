@@ -16,6 +16,34 @@ class SubscriptionStatus(str, Enum):
     GRACE = "grace"
     EXPIRED = "expired"
 
+# --- NEW: Enums for Facility Management ---
+class FacilityType(str, Enum):
+    FUNDED = "FUNDED"
+    NON_FUNDED = "NON_FUNDED"
+    COUNTER_GUARANTEE = "COUNTER_GUARANTEE"
+
+class FacilityStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    FROZEN = "FROZEN"
+    EXPIRED = "EXPIRED"
+
+class FacilitySelectionParameter(str, Enum):
+    PRICE = "PRICE"
+    SLA = "SLA"
+    EXPIRY_DATE = "EXPIRY_DATE"
+
+# --- NEW: Enums for Issuance Workflow ---
+class LGIssuanceRequestStatus(str, Enum):
+    DRAFT = "DRAFT"
+    PENDING_INTERNAL_APPROVAL = "PENDING_INTERNAL_APPROVAL"
+    REJECTED_INTERNAL = "REJECTED_INTERNAL"
+    APPROVED_INTERNAL = "APPROVED_INTERNAL"
+    SUBMITTED_TO_BANK = "SUBMITTED_TO_BANK"
+    BANK_REJECTED = "BANK_REJECTED"
+    ISSUED = "ISSUED"
+    CANCELED = "CANCELED"
+
+
 class GlobalConfigKey(str, Enum):
     """
     Defines the keys for global configuration settings.
@@ -94,6 +122,8 @@ ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST = "LG_RENEWAL_REMINDER_FIRST"
 ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND = "LG_RENEWAL_REMINDER_SECOND"
 ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION = "LG_CANCEL_LAST_INSTRUCTION"
 ACTION_TYPE_APPROVAL_REQUEST_PENDING = "APPROVAL_REQUEST_PENDING"
+# NEW: Action type for issuance approval
+ACTION_TYPE_LG_ISSUANCE_REQUEST = "LG_ISSUANCE_REQUEST"
 DOCUMENT_TYPE_ORIGINAL_LG = "Original LG"
 DOCUMENT_TYPE_AI_SCAN = "AI Scan"
 DOCUMENT_TYPE_INTERNAL_SUPPORTING = "Internal Supporting Document"
@@ -107,7 +137,7 @@ ACTION_TYPES_REQUIRING_APPROVAL = [
     ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER,
     ACTION_TYPE_LG_AMEND,
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
-    ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION
+    ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION,
 ]
 
 # --- NEW Permissions for Reports ---
@@ -269,4 +299,3 @@ class MigrationRecordStatusEnum(str, Enum):
     ERROR = "ERROR"
     EXPIRED = "EXPIRED"
     DUPLICATE = "DUPLICATE"
-

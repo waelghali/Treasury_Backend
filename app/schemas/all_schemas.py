@@ -8,7 +8,12 @@ import os
 import logging
 from decimal import Decimal
 import re
-from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus, DOCUMENT_TYPE_ORIGINAL_LG, LegalArtifactType
+from app.constants import (
+    UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum,
+    LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus,
+    DOCUMENT_TYPE_ORIGINAL_LG, LegalArtifactType, FacilityType, FacilityStatus,
+    FacilitySelectionParameter, LGIssuanceRequestStatus
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,7 @@ class SubscriptionPlanBase(BaseModel):
     can_image_storage: bool = Field(False, description="Enables image storage features for customers on this plan")
     # NEW: Grace period in days
     grace_period_days: int = Field(30, ge=0, description="Grace period in days after subscription end date.")
+    available_modules: Optional[List[str]] = Field(None, description="List of available module names")
 
 class SubscriptionPlanCreate(SubscriptionPlanBase):
     pass
@@ -54,6 +60,7 @@ class SubscriptionPlanUpdate(SubscriptionPlanBase):
     can_image_storage: Optional[bool] = None
     # NEW: Grace period update
     grace_period_days: Optional[int] = Field(None, ge=0)
+    available_modules: Optional[List[str]] = None
 
 class SubscriptionPlanOut(SubscriptionPlanBase, BaseSchema):
     pass
@@ -81,6 +88,158 @@ class CustomerEntityUpdate(CustomerEntityBase):
     is_active: Optional[bool] = None
 class CustomerEntityOut(CustomerEntityBase, BaseSchema):
     customer_id: int
+
+# --- NEW SCHEMAS FOR FACILITIES HUB ---
+
+class FacilityDocumentBase(BaseModel):
+    document_type: str = Field("FACILITY_AGREEMENT", description="Type of document")
+    file_name: str
+    file_path: str
+    uploaded_by_user_id: int
+
+class FacilityDocumentCreate(FacilityDocumentBase):
+    file_path: Optional[str] = None # Will be set by backend
+    uploaded_by_user_id: Optional[int] = None # Will be set by backend
+
+class FacilityDocumentOut(FacilityDocumentBase, BaseSchema):
+    facility_id: int
+
+class FacilityBase(BaseModel):
+    bank_id: int
+    facility_type: FacilityType
+    total_limit: Decimal
+    currency_id: int
+    expiry_date: date
+    has_all_entity_access: bool = True
+    entity_ids: Optional[List[int]] = Field(None, description="List of entity IDs this facility is available for")
+    pricing_details: Optional[Dict[str, Any]] = Field(None, description="JSON storing pricing info")
+    bank_sla_days: Optional[int] = Field(None, description="Bank's SLA for issuance in days")
+    special_conditions: Optional[str] = Field(None, description="AI-extracted special conditions text")
+    parent_facility_id: Optional[int] = None
+
+class FacilityCreate(FacilityBase):
+    @model_validator(mode='after')
+    def validate_entity_access(self):
+        if self.has_all_entity_access and self.entity_ids:
+            raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
+        if not self.has_all_entity_access and not self.entity_ids:
+            raise ValueError("Must provide specific entity_ids when has_all_entity_access is False.")
+        return self
+
+class FacilityUpdate(FacilityBase):
+    bank_id: Optional[int] = None
+    facility_type: Optional[FacilityType] = None
+    total_limit: Optional[Decimal] = None
+    currency_id: Optional[int] = None
+    expiry_date: Optional[date] = None
+    has_all_entity_access: Optional[bool] = None
+
+class FacilityOut(FacilityBase, BaseSchema):
+    customer_id: int
+    utilized_amount: Decimal
+    status: FacilityStatus
+    entities_with_access: List[CustomerEntityOut] = []
+    documents: List[FacilityDocumentOut] = []
+
+class FacilitySelectionRuleBase(BaseModel):
+    parameter_name: FacilitySelectionParameter
+    priority_rank: int
+
+class FacilitySelectionRuleCreate(FacilitySelectionRuleBase):
+    pass
+
+class FacilitySelectionRuleUpdate(FacilitySelectionRuleBase):
+    pass
+
+class FacilitySelectionRuleOut(FacilitySelectionRuleBase, BaseSchema):
+    customer_id: int
+
+# --- NEW SCHEMAS FOR APPLICANT-SIDE ISSUANCE ---
+
+class LGApplicantRecordBase(BaseModel):
+    applicant_entity_id: int
+    issuing_bank_id: int
+    facility_id: Optional[int] = None
+    beneficiary_name: str
+    beneficiary_address: Optional[str] = None
+    lg_number: str
+    lg_amount: Decimal
+    lg_currency_id: int
+    issuance_date: date
+    expiry_date: date
+    purpose: Optional[str] = None
+
+class LGApplicantRecordCreate(LGApplicantRecordBase):
+    pass
+
+class LGApplicantRecordOut(LGApplicantRecordBase, BaseSchema):
+    customer_id: int
+
+class LGIssuanceRequestBase(BaseModel):
+    applicant_entity_id: int
+    issuing_bank_id: int
+    facility_id: Optional[int] = None
+    beneficiary_name: Optional[str] = None
+    lg_amount: Optional[Decimal] = None
+    lg_currency_id: Optional[int] = None
+    expiry_date: Optional[date] = None
+    purpose: Optional[str] = None
+
+class LGIssuanceRequestCreate(LGIssuanceRequestBase):
+    pass
+
+class LGIssuanceRequestOut(LGIssuanceRequestBase, BaseSchema):
+    status: LGIssuanceRequestStatus
+    created_by_user_id: int
+    created_applicant_lg_id: Optional[int] = None
+
+# --- NEW SCHEMAS FOR ISSUANCE-SPECIFIC APPROVAL MATRIX ---
+
+class IssuanceStepApproverBase(BaseModel):
+    user_id: Optional[int] = None
+    role: Optional[UserRole] = None
+
+class IssuanceStepApproverCreate(IssuanceStepApproverBase):
+    pass
+
+class IssuanceStepApproverOut(IssuanceStepApproverBase, BaseSchema):
+    step_id: int
+
+class IssuanceStepConditionBase(BaseModel):
+    field_name: str
+    operator: str
+    value: str
+
+class IssuanceStepConditionCreate(IssuanceStepConditionBase):
+    pass
+
+class IssuanceStepConditionOut(IssuanceStepConditionBase, BaseSchema):
+    step_id: int
+
+class IssuanceApprovalStepBase(BaseModel):
+    step_number: int
+    approver_type: str
+
+class IssuanceApprovalStepCreate(IssuanceApprovalStepBase):
+    conditions: List[IssuanceStepConditionCreate] = []
+    approvers: List[IssuanceStepApproverCreate] = []
+
+class IssuanceApprovalStepOut(IssuanceApprovalStepBase, BaseSchema):
+    matrix_id: int
+    conditions: List[IssuanceStepConditionOut] = []
+    approvers: List[IssuanceStepApproverOut] = []
+
+class IssuanceApprovalMatrixBase(BaseModel):
+    name: str
+    action_type: str = "LG_ISSUANCE_REQUEST"
+
+class IssuanceApprovalMatrixCreate(IssuanceApprovalMatrixBase):
+    steps: List[IssuanceApprovalStepCreate] = []
+
+class IssuanceApprovalMatrixOut(IssuanceApprovalMatrixBase, BaseSchema):
+    customer_id: int
+    steps: List[IssuanceApprovalStepOut] = []
+
 
 class LoginRequest(BaseModel):
     email: EmailStr = Field(..., description="User's email address")
@@ -1384,3 +1543,7 @@ LGRecordMinimalOut.model_rebuild()
 ApprovalRequestOut.model_rebuild()
 LGRecordOut.model_rebuild()
 LGInstructionOut.model_rebuild()
+FacilityOut.model_rebuild()
+LGApplicantRecordOut.model_rebuild()
+LGIssuanceRequestOut.model_rebuild()
+IssuanceApprovalMatrixOut.model_rebuild()
