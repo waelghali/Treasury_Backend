@@ -78,7 +78,8 @@ def configure_app_instance(fastapi_app: FastAPI):
     from app.api.v1.endpoints import system_owner, corporate_admin, end_user, migration, public
     from app.auth_v2.routers import router as auth_v2_router
     from app.api.v1.endpoints import reports
-    # NEW: Import the subscription tasks module
+    # NEW: Import the facilities router
+    from app.api.v1.endpoints import facilities
     from app.crud.crud import crud_customer, crud_customer_configuration, log_action
 
     # --- DATABASE TABLE CREATION & DIAGNOSTICS ---
@@ -87,7 +88,6 @@ def configure_app_instance(fastapi_app: FastAPI):
         logger.info(f"DIAG: Engine DSN: {engine.url.render_as_string(hide_password=True)}")
 
         import app.models
-        # import app.models.migration # NEW: Import migration models
 
         if Base.metadata.tables:
             logger.info(f"DIAG: Number of models registered with Base.metadata: {len(Base.metadata.tables)}")
@@ -120,12 +120,14 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(system_owner.router, prefix="/api/v1/system-owner")
     fastapi_app.include_router(corporate_admin.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(end_user.router, prefix="/api/v1/end-user")
-    # FIX: Correct the prefix for the migration router to avoid a double prefix in the URL.
     fastapi_app.include_router(migration.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(auth_v2_router, prefix="/api/v1")
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
+    # NEW: Include the facilities router
+    fastapi_app.include_router(facilities.router, prefix="/api/v1/corporate-admin")
+
 
     # --- APScheduler Setup and Event Handlers ---
     scheduler = AsyncIOScheduler()
@@ -146,7 +148,6 @@ def configure_app_instance(fastapi_app: FastAPI):
         logger.info(f"Scheduler triggering {task_func.__name__}.")
         for db_session in get_db_session_for_scheduler():
             try:
-                # Pass the db_session as the first argument, followed by other args
                 await task_func(db_session, *args, **kwargs)
             except Exception as e:
                 logger.error(f"Error in scheduled task {task_func.__name__}: {e}", exc_info=True)
@@ -187,13 +188,11 @@ def configure_app_instance(fastapi_app: FastAPI):
         )
         logger.info("Scheduled 'Daily LG Renewal Reminders' to run every day at 2:10 AM EEST.")
 
-        # NEW: Schedule the subscription status update task
         scheduler.add_job(
             func=job_wrapper,
             trigger=CronTrigger(hour=2, minute=15, timezone=EGYPT_TIMEZONE),
             id='subscription_status_daily_job',
             name='Daily Subscription Status Update',
-            # Pass the dependencies as arguments
             args=[subscription_tasks.run_daily_subscription_status_update, log_action, crud_customer, crud_customer_configuration]
         )
         logger.info("Scheduled 'Daily Subscription Status Update' to run every day at 2:15 AM EEST.")

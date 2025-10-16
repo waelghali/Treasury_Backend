@@ -673,7 +673,7 @@ async def view_lg_document_securely(
     )
     return {"signed_url": signed_url}
 
-@router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
+@router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
 async def list_lg_records(
     skip: int = 0,
     limit: int = 100,
@@ -689,6 +689,9 @@ async def list_lg_records(
     lg_records = crud_lg_record.get_all_lg_records_for_customer(
         db,
         customer_id=end_user_context.customer_id,
+        # ADD these two lines to pass the user's permissions
+        has_all_entity_access=end_user_context.has_all_entity_access,
+        entity_ids=end_user_context.entity_ids,
         internal_owner_contact_id=internal_owner_contact_id,
         skip=skip,
         limit=limit
@@ -698,7 +701,7 @@ async def list_lg_records(
 @router.get(
     "/lg-records/{lg_record_id}",
     response_model=LGRecordOut,
-    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Retrieve a single LG record by ID"
 )
 async def get_lg_record_by_id(
@@ -707,9 +710,16 @@ async def get_lg_record_by_id(
     current_user_context: TokenData = Depends(get_current_end_user_context)
 ):
     """
-    Fetches a single LG record by its ID, ensuring it belongs to the current user's customer.
+    Fetches a single LG record by its ID, ensuring it belongs to the current user's customer and accessible entities.
     """
-    lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, current_user_context.customer_id)
+    lg_record = crud_lg_record.get_lg_record_with_relations(
+        db, 
+        lg_record_id, 
+        current_user_context.customer_id,
+        # ADD these two lines
+        has_all_entity_access=current_user_context.has_all_entity_access,
+        entity_ids=current_user_context.entity_ids
+    )
     if not lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
     return lg_record
