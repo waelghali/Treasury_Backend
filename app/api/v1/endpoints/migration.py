@@ -30,7 +30,7 @@ import app.models as models
 from app.crud.crud import (
     crud_lg_migration, crud_internal_owner_contact, crud_lg_category, crud_bank,
     crud_issuing_method, crud_rule, crud_customer_entity,
-    crud_lg_type, crud_lg_record, crud_migration_batch, crud_lg_change_log, migration_history_service, log_action
+    crud_lg_type, crud_lg_record, crud_migration_batch, crud_lg_change_log, migration_history_service, log_action, crud_currency
 )
 from app.core.lg_validation_service import lg_validation_service
 from app.core.migration_service import migration_service
@@ -83,13 +83,16 @@ column_mapping = {
     "Payout Currency": "lg_payable_currency_id",
 
     "Issuance_Date": "issuance_date",
+    "Issuance Date": "issuance_date",
     "issue_date": "issuance_date",
     "Issue Date": "issuance_date",
     "Start Date": "issuance_date",
     "Opening Date": "issuance_date",
+    "Issuing Date": "issuance_date",
     "Issued Date": "issuance_date",
 
     "Expiry_Date": "expiry_date",
+    "Expiry Date": "expiry_date",
     "Maturity Date": "expiry_date",
     "End Date": "expiry_date",
     "Valid Until": "expiry_date",
@@ -103,6 +106,7 @@ column_mapping = {
     "Renewable": "auto_renewal",
 
     "Type": "lg_type_id",
+    "LG_Type": "lg_type_id",
     "LG Type": "lg_type_id",
     "Guarantee Type": "lg_type_id",
     "Type of LG": "lg_type_id",
@@ -206,7 +210,7 @@ column_mapping = {
 
 def _normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Converts DataFrame columns to snake_case for consistency."""
-    df.columns = df.columns.str.replace(' ', '_').str.lower()
+    df.columns = df.columns.str.strip().str.replace(' ', '_').str.lower()
     return df
     
 def _get_id_from_code(db: Session, model: Any, code: str, code_column: str = 'iso_code') -> Optional[int]:
@@ -459,7 +463,19 @@ async def upload_structured_file_for_staging(
             
             df = _normalize_df_columns(df)
 
-            df.rename(columns={k.lower(): v for k, v in column_mapping.items() if k.lower() in df.columns}, inplace=True)
+            # Build a map of {normalized_header: new_name}
+            # e.g., {"lg_type": "lg_type_id", "issue_date": "issuance_date"}
+            normalized_rename_map = {
+                k.strip().replace(' ', '_').lower(): v 
+                for k, v in column_mapping.items()
+            }
+            df.rename(columns=normalized_rename_map, inplace=True)
+
+            if 'lg_amount' in df.columns:
+                df['lg_amount'] = pd.to_numeric(
+                    df['lg_amount'].astype(str).str.strip().str.replace(',', ''),
+                    errors='coerce' # If it's still not a number, make it (None)
+                )
             
             for col in ['issuance_date', 'expiry_date']:
                 if col in df.columns:

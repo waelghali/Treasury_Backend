@@ -2200,22 +2200,12 @@ class CRUDLGRecord(CRUDBase):
         db.refresh(updated_lg_record)
         return updated_lg_record
         
-
     def get_lg_record_with_relations(
-        self, db: Session, lg_record_id: int, customer_id: Optional[int],
-        # ADD these two parameters to the function definition
-        has_all_entity_access: bool,
-        entity_ids: List[int]
+        self, db: Session, lg_record_id: int, customer_id: Optional[int]
     ) -> Optional[models.LGRecord]:
         query = db.query(self.model).filter(self.model.id == lg_record_id, self.model.is_deleted == False)
         if customer_id is not None:
             query = query.filter(self.model.customer_id == customer_id)
-
-        # ADD this new filtering logic
-        if not has_all_entity_access:
-            if not entity_ids:
-                return None # No entities, no access
-            query = query.filter(self.model.beneficiary_corporate_id.in_(entity_ids))
 
         return (
             query.options(
@@ -2231,59 +2221,33 @@ class CRUDLGRecord(CRUDBase):
                 selectinload(models.LGRecord.internal_owner_contact),
                 selectinload(models.LGRecord.lg_category),
                 selectinload(models.LGRecord.documents),
-                selectinload(models.LGRecord.instructions).selectinload(models.LGInstruction.documents),
-                selectinload(models.LGRecord.customer),
+                selectinload(models.LGRecord.instructions).selectinload(models.LGInstruction.documents), # NEW: Eager load documents for instructions
+                selectinload(models.LGRecord.customer), # Eager load customer for name and email settings access
             )
             .first()
         )
 
-
     def get_all_lg_records_for_customer(
-        self,
-        db: Session,
-        customer_id: int,
-        # ADD these two parameters to the function definition
-        has_all_entity_access: bool,
-        entity_ids: List[int],
-        internal_owner_contact_id: Optional[int] = None,
-        skip: int = 0,
-        limit: int = 100,
+        self, db: Session, customer_id: int, skip: int = 0, limit: int = 100
     ) -> List[LGRecord]:
-        """
-        Retrieves all LG records for a given customer, with optional filtering
-        by internal owner contact ID and now by the user's entity access.
-        """
-        query = (
+        return (
             db.query(self.model)
             .filter(self.model.customer_id == customer_id, self.model.is_deleted == False)
+            .options(
+                selectinload(models.LGRecord.beneficiary_corporate),
+                selectinload(models.LGRecord.lg_currency),
+                selectinload(models.LGRecord.lg_type),
+                selectinload(models.LGRecord.lg_status),
+                selectinload(models.LGRecord.issuing_bank),
+                selectinload(models.LGRecord.internal_owner_contact),
+                selectinload(models.LGRecord.lg_category),
+                selectinload(models.LGRecord.documents),
+                selectinload(models.LGRecord.instructions).selectinload(models.LGInstruction.documents), # NEW: Eager load documents for instructions
+            )
+            .offset(skip)
+            .limit(limit)
+            .all()
         )
-        
-        # ADD this new filtering logic
-        if not has_all_entity_access:
-            if not entity_ids:
-                return [] # If user has specific access but no entities assigned, return nothing
-            query = query.filter(self.model.beneficiary_corporate_id.in_(entity_ids))
-
-        if internal_owner_contact_id is not None:
-            query = query.filter(self.model.internal_owner_contact_id == internal_owner_contact_id)
-
-        # The rest of the function remains the same...
-        query = query.options(
-            selectinload(self.model.beneficiary_corporate),
-            selectinload(self.model.lg_currency),
-            selectinload(self.model.lg_payable_currency),
-            selectinload(self.model.lg_type),
-            selectinload(self.model.lg_status),
-            selectinload(self.model.lg_operational_status),
-            selectinload(self.model.issuing_bank),
-            selectinload(self.model.issuing_method),
-            selectinload(self.model.applicable_rule),
-            selectinload(self.model.internal_owner_contact),
-            selectinload(self.model.lg_category),
-        )
-
-        return query.offset(skip).limit(limit).all()
-        
 
     def create_document_model(self, obj_in: LGDocumentCreate, lg_record_id: int, uploaded_by_user_id: int) -> LGDocument:
         document_data = obj_in.model_dump()
@@ -3135,6 +3099,43 @@ class CRUDLGRecord(CRUDBase):
             logger.error(f"Failed to send internal owner renewal reminder email for LG {lg_record.lg_number}.")
 
 
+    def get_all_lg_records_for_customer(
+        self,
+        db: Session,
+        customer_id: int,
+        internal_owner_contact_id: Optional[int] = None,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> List[LGRecord]:
+        """
+        Retrieves all LG records for a given customer, with optional filtering
+        by internal owner contact ID.
+        """
+        query = (
+            db.query(self.model)
+            .filter(self.model.customer_id == customer_id, self.model.is_deleted == False)
+        )
+        
+        # NEW: Apply the filter if the parameter is provided
+        if internal_owner_contact_id is not None:
+            query = query.filter(self.model.internal_owner_contact_id == internal_owner_contact_id)
+
+        # Apply eager loading to the filtered query
+        query = query.options(
+            selectinload(self.model.beneficiary_corporate),
+            selectinload(self.model.lg_currency),
+            selectinload(self.model.lg_payable_currency),
+            selectinload(self.model.lg_type),
+            selectinload(self.model.lg_status),
+            selectinload(self.model.lg_operational_status),
+            selectinload(self.model.issuing_bank),
+            selectinload(self.model.issuing_method),
+            selectinload(self.model.applicable_rule),
+            selectinload(self.model.internal_owner_contact),
+            selectinload(self.model.lg_category),
+        )
+
+        return query.offset(skip).limit(limit).all()
 
     async def create_from_migration(self, db: Session, obj_in: LGRecordCreate, customer_id: int, user_id: int, migration_source: str, migrated_from_staging_id: int) -> models.LGRecord:
         # Check for existing LG in production before creating a new one (proactive check)

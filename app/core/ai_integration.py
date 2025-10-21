@@ -55,7 +55,6 @@ _google_credentials = None
 _gcs_client = None
 _vision_client = None
 _gemini_model_global = None
-_gemini_vision_model_global = None # NEW: For the vision model used by facility processing
 
 # --- Dynamically set GOOGLE_APPLICATION_CREDENTIALS if JSON is provided ---
 # This block replaces the direct os.environ lookup with a temporary file approach.
@@ -134,45 +133,24 @@ def _get_gemini_model():
         logger.warning("Gemini AI is not available.")
         return None
     if _gemini_model_global is None:
-        gemini_api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+        gemini_api_key = os.environ.get('GEMINI_API_KEY')
         if not gemini_api_key:
-            logger.error("GEMINI_API_KEY or GOOGLE_API_KEY environment variable not set. Gemini features will be disabled.")
+            logger.error("GEMINI_API_KEY environment variable not set. Gemini features will be disabled.")
             return None
         try:
             genai.configure(api_key=gemini_api_key)
             _gemini_model_global = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("Gemini API configured and model 'gemini-2.5-flash' instantiated globally.")
+            logger.info("Gemini API configured and model instantiated globally.")
         except Exception as e:
             logger.error(f"Error configuring Gemini API or instantiating model: {e}. Gemini features will be disabled.")
             _gemini_model_global = None
     return _gemini_model_global
-
-@lru_cache(maxsize=1)
-def _get_gemini_vision_model():
-    global _gemini_vision_model_global
-    if not GEMINI_AVAILABLE:
-        logger.warning("Gemini AI is not available.")
-        return None
-    if _gemini_vision_model_global is None:
-        gemini_api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
-        if not gemini_api_key:
-            logger.error("GEMINI_API_KEY or GOOGLE_API_KEY environment variable not set. Gemini Vision features will be disabled.")
-            return None
-        try:
-            genai.configure(api_key=gemini_api_key)
-            _gemini_vision_model_global = genai.GenerativeModel('gemini-pro-vision')
-            logger.info("Gemini Vision model ('gemini-pro-vision') instantiated globally.")
-        except Exception as e:
-            logger.error(f"Error instantiating Gemini Vision model: {e}. Features will be disabled.")
-            _gemini_vision_model_global = None
-    return _gemini_vision_model_global
 
 # Initial client setup
 _get_google_credentials()
 _get_gcs_client()
 _get_vision_client()
 _get_gemini_model()
-_get_gemini_vision_model() # NEW: Initialize the vision model on startup
 
 # --- Local Output Directory Setup ---
 BASE_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "Output")
@@ -183,15 +161,6 @@ GEMINI_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "Gemini")
 os.makedirs(OCR_INPUT_DIR, exist_ok=True)
 os.makedirs(GEMINI_OUTPUT_DIR, exist_ok=True)
 logger.info(f"Local AI output directories ensured: {OCR_INPUT_DIR}, {GEMINI_OUTPUT_DIR}")
-
-# NEW: Ensure local output directories exist for debugging facility documents
-TEMP_OUTPUT_DIR_FACILITY = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", "Output")
-OCR_DIR_FACILITY = os.path.join(TEMP_OUTPUT_DIR_FACILITY, "OCR_Input_to_Gemini")
-GEMINI_DIR_FACILITY = os.path.join(TEMP_OUTPUT_DIR_FACILITY, "Gemini")
-os.makedirs(OCR_DIR_FACILITY, exist_ok=True)
-os.makedirs(GEMINI_DIR_FACILITY, exist_ok=True)
-logger.info(f"Local AI output directories for Facility module ensured: {OCR_DIR_FACILITY}, {GEMINI_DIR_FACILITY}")
-
 
 # --- GCS Operations ---
 async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_type: str) -> Optional[str]:
@@ -739,87 +708,6 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
         if temp_files:
             await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_amendment_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
-
-
-# --- NEW FUNCTION FOR FACILITY DOCUMENT ANALYSIS ---
-async def process_facility_document_with_ai(file_bytes: bytes, mime_type: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
-    """
-    Analyzes a facility agreement document using Google's Gemini Vision model to extract key information.
-
-    Args:
-        file_bytes: The byte content of the facility document (PDF or image).
-        mime_type: The MIME type of the file.
-
-    Returns:
-        A tuple containing:
-        - A dictionary with the extracted facility data.
-        - A dictionary with AI token usage statistics.
-    """
-    gemini_vision_model = _get_gemini_vision_model()
-    if not gemini_vision_model:
-        logger.error("Gemini Vision model is not initialized. Cannot process facility document.")
-        return None, {}
-
-    logger.info(f"Starting AI processing for facility document with MIME type: {mime_type}")
-
-    # Prepare the prompt for Gemini
-    prompt = """
-    Analyze the following bank facility agreement document. Act as an expert financial analyst.
-    Extract the following information and provide it strictly in JSON format. Do not include any text before or after the JSON block.
-
-    - facilityAmount: The total amount of the facility. Return as a number.
-    - currency: The ISO code of the facility's currency (e.g., "USD", "EGP").
-    - bankName: The name of the bank providing the facility.
-    - expiryDate: The final expiry date of the facility in "YYYY-MM-DD" format.
-    - allowedLgTypes: A list of the specific types of Letters of Guarantee permitted under this facility (e.g., ["Performance Guarantee", "Advance Payment Guarantee", "Bid Bond"]).
-    - specialConditions: Extract any non-standard clauses, specific rules, or unusual conditions as a single block of text. If none, return an empty string.
-
-    Here is the JSON structure to follow:
-    {
-      "facilityAmount": 10000000,
-      "currency": "USD",
-      "bankName": "Example International Bank",
-      "expiryDate": "2028-12-31",
-      "allowedLgTypes": ["Performance Guarantee", "Advance Payment Guarantee"],
-      "specialConditions": "All guarantees issued under this facility must be subject to URDG 758. The total exposure to any single beneficiary may not exceed 25% of the total facility limit."
-    }
-    """
-
-    image_part = {"mime_type": mime_type, "data": file_bytes}
-    
-    try:
-        # Generate content using the multimodal model
-        response = await gemini_vision_model.generate_content_async([prompt, image_part])
-        
-        # --- Token Usage ---
-        usage_metadata = response.usage_metadata
-        token_usage = {
-            "prompt_token_count": usage_metadata.prompt_token_count,
-            "candidates_token_count": usage_metadata.candidates_token_count,
-            "total_token_count": usage_metadata.total_token_count
-        }
-        logger.info(f"Gemini API Usage for Facility Scan: {token_usage}")
-
-        # Extract, clean, and parse the JSON response
-        raw_response_text = response.text
-        # Regex to find a JSON object, either in a markdown code block or raw
-        json_match = re.search(r"```json\s*(\{.*?\})\s*```", raw_response_text, re.DOTALL)
-        if not json_match:
-            json_match = re.search(r"(\{.*?\})", raw_response_text, re.DOTALL)
-
-        if json_match:
-            json_string = json_match.group(1)
-            parsed_data = json.loads(json_string)
-            logger.info("Successfully parsed facility data from AI response.")
-            return parsed_data, token_usage
-        else:
-            logger.error(f"Failed to find valid JSON in AI response for facility scan. Raw response: {raw_response_text}")
-            return None, token_usage
-
-    except Exception as e:
-        logger.exception(f"An error occurred during Gemini API call for facility document processing: {e}")
-        return None, {}
-
 
 # Example usage (for isolated testing)
 if __name__ == "__main__":

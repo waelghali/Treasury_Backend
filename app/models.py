@@ -1,23 +1,13 @@
 # app/models.py
 from __future__ import annotations
-from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, Float, ForeignKey,
-    UniqueConstraint, Enum as SQLEnum, Text, Index, Numeric, and_,
-    CheckConstraint, Date
-)
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, UniqueConstraint, Enum as SQLEnum, Text, Index, Numeric, and_, CheckConstraint, Date
 from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 from app.database import Base
-from app.constants import (
-    UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum,
-    LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG,
-    SubscriptionStatus, AdvisingStatus, FacilityType, FacilityStatus, LGIssuanceRequestStatus,
-    FacilitySelectionParameter
-)
+from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus, AdvisingStatus
 from app.schemas.migration_schemas import MigrationRecordStatusEnum, MigrationTypeEnum
 
-# --- BASE MODEL DEFINITION ---
 class BaseModel(Base):
     __abstract__ = True
 
@@ -52,15 +42,6 @@ class LGCategoryCustomerEntityAssociation(Base):
     lg_category = relationship("LGCategory", back_populates="entity_associations")
     customer_entity = relationship("CustomerEntity", back_populates="lg_categories_with_access")
 
-# --- NEW ASSOCIATION TABLE FOR FACILITIES AND ENTITIES ---
-class FacilityCustomerEntityAssociation(Base):
-    __tablename__ = 'facility_customer_entity_association'
-    facility_id = Column(Integer, ForeignKey('facilities.id'), primary_key=True)
-    customer_entity_id = Column(Integer, ForeignKey('customer_entities.id'), primary_key=True)
-
-    facility = relationship("Facility", back_populates="entity_associations")
-    customer_entity = relationship("CustomerEntity", back_populates="facilities_with_access")
-
 
 # --- CORE MODELS (alphabetical, with dependencies defined first) ---
 
@@ -78,8 +59,6 @@ class SubscriptionPlan(BaseModel):
     can_ai_integration = Column(Boolean, default=False, nullable=False, comment="Allows AI integration features")
     can_image_storage = Column(Boolean, default=False, nullable=False, comment="Allows image storage features")
     grace_period_days = Column(Integer, default=30, nullable=False, comment="Grace period in days after subscription end date")
-    # NEW: Available modules in this plan
-    available_modules = Column(JSONB, nullable=True, comment="JSON array of available module names, e.g., ['beneficiary_custody', 'applicant_issuance']")
 
     customers = relationship("Customer", back_populates="subscription_plan")
 
@@ -108,10 +87,6 @@ class Customer(BaseModel):
     customer_configurations = relationship("CustomerConfiguration", back_populates="customer", cascade="all, delete-orphan")
     customer_email_settings = relationship("CustomerEmailSetting", back_populates="customer", uselist=False, cascade="all, delete-orphan")
     templates = relationship("Template", back_populates="customer")
-    # NEW: Relationships for Issuance Module
-    facilities = relationship("Facility", back_populates="customer")
-    facility_selection_rules = relationship("FacilitySelectionRule", back_populates="customer")
-    issuance_approval_matrices = relationship("IssuanceApprovalMatrix", back_populates="customer")
 
     def __repr__(self: Customer):
         return f"<Customer(id={self.id}, name='{self.name}')>"
@@ -132,9 +107,6 @@ class CustomerEntity(BaseModel):
 
     users_with_access = relationship("UserCustomerEntityAssociation", back_populates="customer_entity")
     lg_categories_with_access = relationship("LGCategoryCustomerEntityAssociation", back_populates="customer_entity")
-    # NEW: Link to facilities
-    facilities_with_access = relationship("FacilityCustomerEntityAssociation", back_populates="customer_entity")
-
 
     __table_args__ = (
         UniqueConstraint('customer_id', 'entity_name', name='_customer_entity_name_uc'),
@@ -179,146 +151,9 @@ class User(BaseModel):
     def __repr__(self: User):
         return f"<User(id={self.id}, email='{self.email}', role='{self.role}')>"
 
-# --- NEW MODELS FOR FACILITIES HUB ---
-
-class Facility(BaseModel):
-    __tablename__ = "facilities"
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    bank_id = Column(Integer, ForeignKey("banks.id"), nullable=False)
-    facility_type = Column(SQLEnum(FacilityType), nullable=False)
-    total_limit = Column(Numeric(18, 2), nullable=False)
-    utilized_amount = Column(Numeric(18, 2), nullable=False, default=0.0)
-    currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=False)
-    status = Column(SQLEnum(FacilityStatus), nullable=False, default=FacilityStatus.ACTIVE)
-    expiry_date = Column(Date, nullable=False)
-    pricing_details = Column(JSONB, nullable=True, comment="Stores pricing tiers, rates, etc.")
-    bank_sla_days = Column(Integer, nullable=True, comment="Bank's Service Level Agreement in days for issuance")
-    special_conditions = Column(Text, nullable=True, comment="AI-extracted text for non-standard conditions")
-    parent_facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True, comment="For creating sub-limits under a master facility")
-
-    has_all_entity_access = Column(Boolean, default=True, nullable=False)
-    customer = relationship("Customer", back_populates="facilities")
-    bank = relationship("Bank")
-    currency = relationship("Currency")
-    entity_associations = relationship("FacilityCustomerEntityAssociation", back_populates="facility", cascade="all, delete-orphan")
-    documents = relationship("FacilityDocument", back_populates="facility")
-
-    def __repr__(self):
-        return f"<Facility(id={self.id}, bank_id={self.bank_id}, limit={self.total_limit})>"
-
-class FacilityDocument(BaseModel):
-    __tablename__ = "facility_documents"
-    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=False)
-    document_type = Column(String, nullable=False, comment="e.g., 'FACILITY_AGREEMENT'")
-    file_name = Column(String, nullable=False)
-    file_path = Column(String, nullable=False, comment="Path in cloud storage")
-    uploaded_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    
-    facility = relationship("Facility", back_populates="documents")
-    uploaded_by_user = relationship("User")
-
-class FacilitySelectionRule(BaseModel):
-    __tablename__ = "facility_selection_rules"
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    parameter_name = Column(SQLEnum(FacilitySelectionParameter), nullable=False)
-    priority_rank = Column(Integer, nullable=False)
-
-    customer = relationship("Customer", back_populates="facility_selection_rules")
-    __table_args__ = (UniqueConstraint('customer_id', 'parameter_name', name='_customer_facility_param_uc'),)
-
-# --- NEW MODELS FOR APPLICANT-SIDE ISSUANCE ---
-
-class LGApplicantRecord(BaseModel):
-    __tablename__ = "lg_applicant_records"
-    # Mirrored from LGRecord, but with applicant/beneficiary fields inverted
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    applicant_entity_id = Column(Integer, ForeignKey("customer_entities.id"), nullable=False)
-    issuing_bank_id = Column(Integer, ForeignKey("banks.id"), nullable=False)
-    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True)
-
-    beneficiary_name = Column(String, nullable=False)
-    beneficiary_address = Column(Text, nullable=True)
-    
-    lg_number = Column(String, unique=True, nullable=False)
-    lg_amount = Column(Numeric(18, 2), nullable=False)
-    lg_currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=False)
-    issuance_date = Column(Date, nullable=False)
-    expiry_date = Column(Date, nullable=False)
-    purpose = Column(Text, nullable=True)
-    # ... other relevant fields from LGRecord ...
-
-    customer = relationship("Customer")
-    applicant_entity = relationship("CustomerEntity")
-    issuing_bank = relationship("Bank")
-    facility = relationship("Facility")
-    currency = relationship("Currency")
-    # Relationship to the request that created it
-    issuance_request = relationship("LGIssuanceRequest", back_populates="created_applicant_lg")
-
-
-class LGIssuanceRequest(BaseModel):
-    __tablename__ = "lg_issuance_requests"
-    status = Column(SQLEnum(LGIssuanceRequestStatus), default=LGIssuanceRequestStatus.DRAFT, nullable=False)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    
-    applicant_entity_id = Column(Integer, ForeignKey("customer_entities.id"), nullable=False)
-    issuing_bank_id = Column(Integer, ForeignKey("banks.id"), nullable=False)
-    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True)
-
-    beneficiary_name = Column(String, nullable=True)
-    # ... other request details mirroring LGApplicantRecord ...
-    
-    created_applicant_lg_id = Column(Integer, ForeignKey("lg_applicant_records.id"), nullable=True)
-    created_applicant_lg = relationship("LGApplicantRecord", back_populates="issuance_request")
-    customer = relationship("Customer")
-    created_by = relationship("User")
-
-# --- NEW MODELS FOR ISSUANCE-SPECIFIC APPROVAL MATRIX ---
-
-class IssuanceApprovalMatrix(BaseModel):
-    __tablename__ = "issuance_approval_matrices"
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    action_type = Column(String, nullable=False, default="LG_ISSUANCE_REQUEST")
-    name = Column(String, nullable=False)
-    customer = relationship("Customer", back_populates="issuance_approval_matrices")
-    steps = relationship("IssuanceApprovalStep", back_populates="matrix", cascade="all, delete-orphan")
-
-class IssuanceApprovalStep(BaseModel):
-    __tablename__ = "issuance_approval_steps"
-    matrix_id = Column(Integer, ForeignKey("issuance_approval_matrices.id"), nullable=False)
-    step_number = Column(Integer, nullable=False)
-    approver_type = Column(String, nullable=False) # e.g., 'USER', 'ROLE'
-    matrix = relationship("IssuanceApprovalMatrix", back_populates="steps")
-    conditions = relationship("IssuanceStepCondition", back_populates="step", cascade="all, delete-orphan")
-    approvers = relationship("IssuanceStepApprover", back_populates="step", cascade="all, delete-orphan")
-
-class IssuanceStepCondition(BaseModel):
-    __tablename__ = "issuance_step_conditions"
-    step_id = Column(Integer, ForeignKey("issuance_approval_steps.id"), nullable=False)
-    field_name = Column(String, nullable=False) # e.g., 'lg_amount'
-    operator = Column(String, nullable=False) # e.g., '>', '<=', '=='
-    value = Column(String, nullable=False)
-    step = relationship("IssuanceApprovalStep", back_populates="conditions")
-
-class IssuanceStepApprover(BaseModel):
-    __tablename__ = "issuance_step_approvers"
-    step_id = Column(Integer, ForeignKey("issuance_approval_steps.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    role = Column(SQLEnum(UserRole), nullable=True)
-    step = relationship("IssuanceApprovalStep", back_populates="approvers")
-
-class IssuanceAction(BaseModel):
-    __tablename__ = "issuance_actions"
-    issuance_request_id = Column(Integer, ForeignKey("lg_issuance_requests.id"), nullable=False)
-    step_approver_id = Column(Integer, ForeignKey("issuance_step_approvers.id"), nullable=False)
-    status = Column(String, default="PENDING") # PENDING, APPROVED, REJECTED
-    acted_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    timestamp = Column(DateTime(timezone=True), nullable=True)
-    comments = Column(Text, nullable=True)
-
-class TrialRegistration(BaseModel):
+class TrialRegistration(BaseModel): # CHANGE THIS LINE from 'Base' to 'BaseModel'
     __tablename__ = "trial_registrations"
+    # id, created_at, updated_at, is_deleted, deleted_at are inherited from BaseModel
     organization_name = Column(String, nullable=False, index=True)
     organization_address = Column(String, nullable=False)
     contact_admin_name = Column(String, nullable=False)
@@ -487,9 +322,11 @@ class LGCategory(BaseModel):
     is_mandatory = Column(Boolean, default=False, nullable=False, comment="Whether the extra field is mandatory for LGs in this category")
     communication_list = Column(JSON, nullable=True, comment="List of email addresses for communication (JSON array of strings)")
     
+    # CRITICAL CHANGE: customer_id is now nullable. NULL means it is a universal category.
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, comment="The ID of the customer. NULL for universal categories.")
     customer = relationship("Customer", back_populates="lg_categories")
     
+    # NEW FIELD: to mark a category as the default for its scope (global or customer-specific)
     is_default = Column(Boolean, default=False, nullable=False, comment="Whether this is the default category for its scope (global or customer-specific).")
 
     has_all_entity_access = Column(Boolean, default=True, nullable=False, comment="True if category applies to all entities under their customer, False if restricted to specific entities")
@@ -599,6 +436,7 @@ class LGRecord(BaseModel):
     lg_operational_status = relationship("LgOperationalStatus")
     issuing_bank = relationship("Bank", foreign_keys=[issuing_bank_id])
     
+    # NEW FIELDS for Foreign Banks
     foreign_bank_name = Column(String, nullable=True, comment="Manually entered bank name for foreign banks")
     foreign_bank_country = Column(String, nullable=True, comment="Manually entered country for foreign banks")
     foreign_bank_address = Column(String, nullable=True, comment="Manually entered address for foreign banks")
@@ -636,6 +474,7 @@ class LGDocument(BaseModel):
     mime_type = Column(String, nullable=True, comment="MIME type of the file (e.g., 'application/pdf', 'image/jpeg')")
     uploaded_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, comment="User who uploaded the document")
 
+    # Relationships
     lg_record = relationship("LGRecord", back_populates="documents")
     lg_instruction = relationship("LGInstruction", back_populates="documents")
     uploaded_by_user = relationship("User")
@@ -671,11 +510,12 @@ class LGInstruction(BaseModel):
     approval_request_id = Column(Integer, ForeignKey("approval_requests.id"), nullable=True, comment="Link to related approval request if Maker-Checker is enabled")
     bank_reply_details = Column(Text, nullable=True, comment="Detailed text of the bank's reply or notes on it.")
 
+    # Relationships
     lg_record = relationship("LGRecord", back_populates="instructions")
     template = relationship("Template")
     maker_user = relationship("User", foreign_keys=[maker_user_id])
     checker_user = relationship("User", foreign_keys=[checker_user_id])
-    documents = relationship("LGDocument", back_populates="lg_instruction", cascade="all, delete-orphan")
+    documents = relationship("LGDocument", back_populates="lg_instruction", cascade="all, delete-orphan") # New relationship
 
     __table_args__ = (
         UniqueConstraint('lg_record_id', 'serial_number', name='uq_lg_instruction_serial'),
@@ -806,6 +646,7 @@ class SystemNotification(BaseModel):
     def __repr__(self: SystemNotification):
         return f"<SystemNotification(id={self.id}, content='{self.content[:30]}...', is_active={self.is_active}, targets={self.target_customer_ids})>"
 
+# Add this new model after the SystemNotification model
 class SystemNotificationViewLog(Base):
     __tablename__ = "system_notification_view_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -824,9 +665,11 @@ class SystemNotificationViewLog(Base):
     def __repr__(self: SystemNotificationViewLog):
         return f"<SystemNotificationViewLog(id={self.id}, user_id={self.user_id}, notification_id={self.notification_id}, view_count={self.view_count})>"
         
+# NEW MIGRATION MODELS - Added to this file
 class LGMigrationStaging(BaseModel):
     __tablename__ = 'lg_migration_staging'
     
+    # The BaseModel already provides: id, created_at, updated_at, is_deleted, deleted_at
     file_name = Column(String, nullable=True, comment="Original name of the uploaded file.")
     record_status = Column(SQLEnum(MigrationRecordStatusEnum), default=MigrationRecordStatusEnum.PENDING, nullable=False, index=True)
     validation_log = Column(JSON, nullable=True, comment="Details of validation errors or warnings.")
@@ -836,8 +679,10 @@ class LGMigrationStaging(BaseModel):
     structured_data_json = Column(JSON, nullable=True, comment="The cleaned, validated, and normalized data ready for import.")
     
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    # NEW: Add migration_type column for records vs instructions
     migration_type = Column(SQLEnum(MigrationTypeEnum), default=MigrationTypeEnum.RECORD, nullable=False, index=True, comment="Distinguishes between a full LG record or a subsequent instruction.")
     
+    # NEW: Historical Reconstruction columns
     history_sequence = Column(Integer, nullable=True, comment="User-provided sequence number for timeline ordering.")
     history_timestamp = Column(DateTime(timezone=True), nullable=True, comment="User-provided timestamp for timeline ordering.")
     production_lg_id = Column(Integer, ForeignKey('lg_records.id'), nullable=True, comment="The ID of the final LG record this staged record was used to create/update.")
@@ -845,6 +690,7 @@ class LGMigrationStaging(BaseModel):
     __table_args__ = (
         Index('idx_lg_migration_staging_customer_id_status', 'customer_id', 'record_status'),
         Index('ix_lg_migration_staging_production_lg_id', 'production_lg_id'),
+        # CORRECTED: Functional Index for faster grouping by lg_number for history reconstruction
         Index('ix_lg_migration_staging_lg_number_lower', func.lower((source_data_json['lg_number'].astext))),
     )
     
@@ -861,6 +707,7 @@ class MigrationBatch(BaseModel):
     source_files = Column(JSONB, nullable=True)
     totals = Column(JSONB, nullable=True)
     notes = Column(Text, nullable=True)
+    # NEW: Add file_hash to the batch for duplicate file detection
     file_hash = Column(String, nullable=True, comment="SHA256 hash of the uploaded file for duplicate detection.")
     
     user = relationship("User")

@@ -180,7 +180,7 @@ def change_password_on_first_login(
     After successful change, issues a new JWT token with must_change_password set to False.
     This endpoint explicitly bypasses the get_current_active_user check.
     """
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
 
     db_user = db.query(User).filter(User.id == current_user_token_data.user_id, User.is_deleted == False).first()
     if not db_user:
@@ -237,7 +237,7 @@ def create_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:create")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -321,7 +321,7 @@ def update_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -365,7 +365,7 @@ def delete_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:delete")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -408,7 +408,7 @@ def restore_customer_entity(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_entity:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -582,7 +582,7 @@ def update_user(
     corporate_admin_context: TokenData = Depends(HasPermission("user:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -613,7 +613,7 @@ def delete_user(
     corporate_admin_context: TokenData = Depends(HasPermission("user:delete")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -650,7 +650,7 @@ def restore_user(
     corporate_admin_context: TokenData = Depends(HasPermission("user:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -691,7 +691,7 @@ def create_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:create")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     # CRITICAL FIX: Explicitly set the customer_id from the authenticated user's context.
@@ -802,7 +802,7 @@ def update_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -848,7 +848,7 @@ def delete_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:delete")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -885,7 +885,7 @@ def restore_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -947,7 +947,7 @@ def update_customer_configuration(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_config:edit")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1009,7 +1009,7 @@ def create_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1079,7 +1079,7 @@ def update_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1106,7 +1106,7 @@ def delete_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1133,7 +1133,7 @@ def restore_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip(request) if request else None
+    client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:

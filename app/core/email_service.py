@@ -288,6 +288,7 @@ async def send_email( # Changed to async function
         if email_settings.smtp_port == 465:
             logger.debug(f"Establishing SMTP_SSL connection to {email_settings.smtp_host}:{email_settings.smtp_port}")
             server = smtplib.SMTP_SSL(email_settings.smtp_host, email_settings.smtp_port)
+        
         else:
             logger.debug(f"Establishing SMTP connection to {email_settings.smtp_host}:{email_settings.smtp_port}")
             server = smtplib.SMTP(email_settings.smtp_host, email_settings.smtp_port)

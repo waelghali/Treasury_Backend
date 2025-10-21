@@ -384,7 +384,7 @@ class CRUDUser(CRUDBase):
                 # If access type changed, clear existing associations
                 db.query(UserCustomerEntityAssociation).filter(
                     UserCustomerEntityAssociation.user_id == db_user.id
-                ).delete(synchronize_session=False) # FIX: Add synchronize_session=False
+                ).delete()
                 db_user.has_all_entity_access = new_has_all_entity_access
                 db.flush() # Flush to ensure deletions are processed before new additions
 
@@ -456,7 +456,7 @@ class CRUDUser(CRUDBase):
                         db.query(UserCustomerEntityAssociation).filter(
                             UserCustomerEntityAssociation.user_id == db_user.id,
                             UserCustomerEntityAssociation.customer_entity_id == entity_id,
-                        ).delete(synchronize_session=False) # FIX: Add synchronize_session=False
+                        ).delete()
                     
                     changed_fields["entities_with_access"] = {
                         "old": sorted(list(old_entity_ids_set)),
