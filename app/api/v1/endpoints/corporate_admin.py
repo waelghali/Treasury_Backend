@@ -6,6 +6,10 @@ import importlib.util
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict
 
+import io
+import csv
+from fastapi.responses import StreamingResponse
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Body, BackgroundTasks
 
 from sqlalchemy.orm import Session, selectinload
@@ -1421,6 +1425,127 @@ def read_corporate_admin_audit_logs(
         ))
     
     return output_logs
+
+@router.get(
+    "/audit-logs/export-csv",
+    response_class=StreamingResponse,
+    dependencies=[Depends(check_subscription_status)],
+    summary="Export corporate admin audit logs to CSV"
+)
+def export_corporate_admin_audit_logs_to_csv(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(HasPermission("audit_log:view")),
+    # --- Filters copied from read_corporate_admin_audit_logs ---
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
+    entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., User, CustomerEntity)"),
+    entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
+    lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)")
+):
+    """
+    Exports a CSV file of audit log entries for the authenticated Corporate Admin's customer,
+    applying the same filters as the main view.
+    """
+    customer_id = corporate_admin_context.customer_id
+    
+    # --- Re-use the query logic from read_corporate_admin_audit_logs ---
+    logs_query = db.query(models.AuditLog).options(
+        selectinload(models.AuditLog.user),
+        selectinload(models.AuditLog.lg_record)
+    ).filter(models.AuditLog.customer_id == customer_id)
+    
+    if user_id is not None:
+        logs_query = logs_query.filter(models.AuditLog.user_id == user_id)
+    if action_type:
+        logs_query = logs_query.filter(func.lower(models.AuditLog.action_type) == func.lower(action_type))
+    if entity_type:
+        logs_query = logs_query.filter(func.lower(models.AuditLog.entity_type) == func.lower(entity_type))
+    if entity_id is not None:
+        logs_query = logs_query.filter(models.AuditLog.entity_id == entity_id)
+    if lg_record_id is not None:
+        logs_query = logs_query.filter(models.AuditLog.lg_record_id == lg_record_id)
+        
+    # Get all logs, not just a page
+    logs = logs_query.order_by(models.AuditLog.timestamp.desc()).all()
+    
+    processed_logs = []
+    # --- Re-use the processing logic from read_corporate_admin_audit_logs ---
+    for log in logs:
+        user_name = log.user.email if log.user else "System"
+        
+        entity_name = None
+        lg_number = None
+
+        if log.lg_record:
+            lg_number = log.lg_record.lg_number
+            # Default entity_name to lg_number if it exists
+            entity_name = lg_number
+        
+        if log.entity_type == "User" and log.entity_id:
+            entity = db.query(models.User).filter(models.User.id == log.entity_id).first()
+            entity_name = entity.email if entity else "Unknown User"
+        elif log.entity_type == "CustomerEntity" and log.entity_id:
+            entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == log.entity_id).first()
+            entity_name = entity.entity_name if entity else "Unknown Entity"
+        elif log.entity_type == "Customer" and log.entity_id:
+            customer = db.query(models.Customer).filter(models.Customer.id == log.entity_id).first()
+            entity_name = customer.name if customer else "Unknown Customer"
+        elif log.entity_type == "LGCategory" and log.entity_id:
+            category = db.query(models.LGCategory).filter(models.LGCategory.id == log.entity_id).first()
+            entity_name = category.name if category else "Unknown Category"
+        elif log.entity_type == "ApprovalRequest" and log.entity_id:
+            entity_name = f"{log.action_type.replace('_', ' ').title()}"
+            # lg_number is already set if log.lg_record exists
+        elif log.entity_type == "LGInstruction" and log.entity_id:
+            instruction = db.query(models.LGInstruction).filter(models.LGInstruction.id == log.entity_id).first()
+            entity_name = instruction.serial_number if instruction else f"Instruction ID: {log.entity_id}"
+            # lg_number is already set if log.lg_record exists
+        elif not entity_name: # Fallback if not set by lg_record or other types
+            entity_name = log.entity_type
+
+        processed_logs.append({
+            "timestamp": log.timestamp.isoformat(),
+            "user_name": user_name,
+            "action_type": log.action_type,
+            "entity_type": log.entity_type,
+            "entity_name": entity_name,
+            "lg_number": lg_number or "N/A",
+            "details": str(log.details), # Flatten details to a string for CSV
+            "ip_address": log.ip_address or "N/A"
+        })
+
+    # --- Create CSV in memory ---
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write the header row
+    headers = ["Timestamp", "User Name", "Action Type", "Entity Type", "Entity Name", "LG Number", "Details", "IP Address"]
+    writer.writerow(headers)
+    
+    # Write the data rows
+    for log in processed_logs:
+        writer.writerow([
+            log["timestamp"],
+            log["user_name"],
+            log["action_type"],
+            log["entity_type"],
+            log["entity_name"],
+            log["lg_number"],
+            log["details"],
+            log["ip_address"]
+        ])
+    
+    output.seek(0)
+    
+    # Return the CSV as a file download
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=corporate_audit_logs_{datetime.now().strftime('%Y-%m-%d')}.csv"
+        }
+    )
+
 # --- NEW: Action Center Endpoints for Corporate Admin ---
 # All read operations must use check_subscription_status
 @router.get(
