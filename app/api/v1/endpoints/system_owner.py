@@ -2928,3 +2928,4 @@ async def download_commercial_register_document(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not securely retrieve the document.")
 
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])
+
