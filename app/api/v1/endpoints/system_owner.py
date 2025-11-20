@@ -5,7 +5,7 @@ import importlib.util
 
 import io
 import csv
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query, Body, BackgroundTasks
@@ -58,6 +58,64 @@ from app.core.email_service import get_global_email_settings, send_email, EmailA
 from app.core.document_generator import generate_pdf_from_html # NEW IMPORT
 import logging
 logger = logging.getLogger(__name__)
+
+
+# *** NEW: Google Cloud Storage Setup ***
+try:
+    from google.cloud import storage
+    # WARNING: Replace 'your-gcs-bucket-name' with your actual bucket name.
+    GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "your-gcs-bucket-name")
+    storage_client = storage.Client()
+    GCS_CLIENT_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"GCS client failed to initialize in system_owner.py. Document download will not work if GCS is required: {e}")
+    GCS_CLIENT_AVAILABLE = False
+
+
+def generate_signed_gcs_url(gcs_uri: str) -> str:
+    """Generates a temporary signed URL for a GCS object."""
+    if not GCS_CLIENT_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloud storage service is not configured or available."
+        )
+        
+    try:
+        if not gcs_uri.startswith("gs://"):
+            raise ValueError("Invalid GCS URI format. Expected 'gs://...'")
+            
+        # Parse the GCS URI
+        path_parts = gcs_uri.replace("gs://", "").split("/", 1)
+        if len(path_parts) < 2:
+            raise ValueError("GCS URI is malformed or points only to a bucket.")
+            
+        bucket_name = path_parts[0]
+        blob_name = path_parts[1]
+        
+        # Security check: Ensure we are only accessing the expected bucket 
+        if bucket_name != GCS_BUCKET_NAME:
+             # In a production setup, you might want to use crud_trial_registration to 
+             # ensure the GCS URI belongs to a known registration before this check.
+             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to specified bucket.")
+
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        
+        # Generate the signed URL, valid for 5 minutes
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=5),
+            method="GET"
+        )
+        return url
+    except Exception as e:
+        logger.error(f"Failed to generate signed URL for {gcs_uri}: {e}")
+        # Reraise as 403 to prevent information leakage if the file doesn't exist
+        # or other access issues occur.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Could not securely access the requested document."
+        )
 
 try:
     current_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2839,5 +2897,34 @@ def reject_trial_registration(
 
     log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_REJECTED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name})
     return {"message": "Registration rejected successfully."}
+
+router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])
+
+@trial_router.get("/download-register-document/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+async def download_commercial_register_document(
+    gcs_uri: str = Query(..., description="The GCS URI (path) to the document to be served."),
+    current_user: TokenData = Depends(HasPermission("system_owner:view_trial_registrations"))
+):
+    """
+    Retrieves the Commercial Register Document from GCS via a temporary signed URL redirect.
+    Requires System Owner view permission.
+    """
+    # Simple validation that the path is a GCS path
+    if not gcs_uri or not gcs_uri.startswith("gs://"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Invalid document path format."
+        )
+
+    try:
+        # The generate_signed_gcs_url function handles validation and GCS interaction
+        signed_url = generate_signed_gcs_url(gcs_uri)
+        # Redirect the client to the temporary, secure GCS URL
+        return RedirectResponse(url=signed_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error serving GCS document via signed URL: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not securely retrieve the document.")
 
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])

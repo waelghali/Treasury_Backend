@@ -1,8 +1,6 @@
-
-
 # app/api/v1/endpoints/public.py
 import os
-import shutil
+# import shutil  <-- REMOVED: No longer needed for local copy
 import uuid
 from typing import Optional
 from datetime import datetime
@@ -22,34 +20,61 @@ from app.core.email_service import get_global_email_settings, send_email, EmailA
 from app.core.document_generator import generate_pdf_from_html
 from app.constants import GlobalConfigKey, LegalArtifactType
 
+# *** NEW: Import for Google Cloud Storage (GCS) ***
+from google.cloud import storage
+
 import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# --- Mock File Storage Utility ---
-async def upload_file_to_storage(file: UploadFile, folder_name: str) -> str:
-    """Mocks file upload to a local 'uploads' directory."""
-    try:
-        # Create the uploads directory if it doesn't exist
-        upload_dir = os.path.join("uploads", folder_name)
-        os.makedirs(upload_dir, exist_ok=True)
-        
-        # Generate a unique filename to prevent conflicts
-        unique_filename = f"{uuid.uuid4()}_{file.filename}"
-        file_path = os.path.join(upload_dir, unique_filename)
-        
-        # Write the file content to the new path
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        logger.info(f"File saved to local path: {file_path}")
-        return file_path
-    except Exception as e:
-        logger.error(f"Failed to save uploaded file: {e}")
+# --- Google Cloud Storage Configuration ---
+# WARNING: Replace 'your-gcs-bucket-name' with your actual bucket name and ensure
+# environment variables/credentials are set up for storage.Client()
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "your-gcs-bucket-name")
+try:
+    storage_client = storage.Client()
+except Exception as e:
+    logger.warning(f"Failed to initialize GCS client: {e}. If running locally, this is normal unless you have GCS credentials configured.")
+
+async def upload_file_to_gcs(file: UploadFile, folder_name: str) -> str:
+    """Uploads file to Google Cloud Storage and returns the GCS URI."""
+    if 'storage_client' not in globals():
+        # Handle case where client failed to initialize (e.g., in a mock testing env)
+        logger.error("GCS client not initialized. Cannot upload.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save the uploaded file."
+            detail="Cloud storage service is unavailable."
+        )
+
+    try:
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        
+        # Define the path within the bucket
+        # Ensure the file stream is at the beginning
+        await file.seek(0)
+        file_content = await file.read()
+
+        unique_filename = f"{uuid.uuid4()}_{file.filename}"
+        destination_blob_name = f"{folder_name}/{unique_filename}"
+        blob = bucket.blob(destination_blob_name)
+        
+        # Upload the file content
+        blob.upload_from_string(
+            file_content,
+            content_type=file.content_type
+        )
+        
+        # Return the GCS URI for persistence in the database
+        gcs_uri = f"gs://{GCS_BUCKET_NAME}/{destination_blob_name}"
+        logger.info(f"File uploaded to GCS URI: {gcs_uri}")
+        return gcs_uri
+        
+    except Exception as e:
+        logger.error(f"Failed to upload file to GCS: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to securely store the uploaded file."
         )
 
 
@@ -144,7 +169,8 @@ async def register_free_trial(
     if existing_registration:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A pending registration with this email already exists.")
 
-    file_path = await upload_file_to_storage(commercial_register_document, "commercial_registers")
+    # *** CHANGE: Use GCS upload function ***
+    file_path = await upload_file_to_gcs(commercial_register_document, "commercial_registers")
     
     latest_tc = crud_legal_artifact.get_by_artifact_type(db, artifact_type=LegalArtifactType.TERMS_AND_CONDITIONS)
     tc_version = latest_tc.version if latest_tc else 0.0
@@ -160,7 +186,8 @@ async def register_free_trial(
         contact_phone=contact_phone,
         admin_email=admin_email,
         entities_count=entities_count,
-        commercial_register_document_path=file_path,
+        # 'file_path' is now the GCS URI
+        commercial_register_document_path=file_path, 
         accepted_terms_version=tc_version,
         accepted_terms_ip=client_ip,
         accepted_terms_at=datetime.now(pytz.timezone('Africa/Cairo')),
@@ -196,11 +223,12 @@ async def serve_document(
     db: Session = Depends(get_db)
 ):
     """
-    Serves a document from the local file system. This endpoint is public for now,
-    but should be secured in a production environment.
+    Serves a document from the local file system. 
+    NOTE: This function is now DEPRECATED for commercial register documents, 
+    as they are stored in GCS. It is only kept here if other files still use 
+    the local 'uploads' directory, but should be removed or refactored.
     """
     # Security check: Ensure the path is within the allowed uploads directory.
-    # This prevents directory traversal attacks.
     base_dir = os.path.abspath("uploads")
     full_path = os.path.abspath(file_path)
 
