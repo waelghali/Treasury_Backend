@@ -17,8 +17,8 @@ from sqlalchemy import func
 
 from app.database import get_db
 from app.schemas.all_schemas import (
-    CustomerEntityCreate, CustomerEntityUpdate, CustomerEntityOut,
-    UserCreateCorporateAdmin, UserUpdateCorporateAdmin, UserOut,
+    CustomerEntityCreate, CustomerEntityUpdate, CustomerOut, CustomerEntityOut,
+    UserCreateCorporateAdmin, UserUpdateCorporateAdmin, UserOut, 
     # MODIFIED: Use new unified LGCategory schemas
     LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
     CustomerConfigurationCreate, CustomerConfigurationUpdate, CustomerConfigurationOut,
@@ -169,6 +169,25 @@ def get_dashboard_metrics(
         "pending_approvals_count": pending_approvals_count,
         "customer_name": customer_name
     }
+
+@router.get("/my-subscription", response_model=CustomerOut, dependencies=[Depends(check_subscription_status)])
+def get_my_subscription_details(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Retrieves full subscription details for the current logged-in Corporate Admin.
+    Includes dates, status, and usage limits vs consumption.
+    """
+    customer_id = corporate_admin_context.customer_id
+    
+    # We use get_with_relations to ensure we load the plan and other nested data
+    customer = crud_customer.get_with_relations(db, customer_id)
+    
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer record not found.")
+        
+    return customer
 
 # --- Password Change Endpoint (Forced Login) ---
 # This endpoint should NOT be protected by subscription status checks
@@ -1005,7 +1024,6 @@ def update_customer_configuration(
 
 
 # --- Customer Email Settings Management (Corporate Admin) (NEW SECTION) ---
-@router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 @router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 def create_customer_email_settings(
     settings_in: CustomerEmailSettingCreate,

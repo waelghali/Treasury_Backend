@@ -250,6 +250,62 @@ class CRUDCustomer(CRUDBase):
         log_action(db, user_id=user_id, action_type=AUDIT_ACTION_TYPE_RESTORE, entity_type="Customer", entity_id=db_obj.id, details={"name": db_obj.name}, customer_id=db_obj.id)
         db.flush() # Final flush for customer and user restorations
         return db_obj
+        
+    def renew_subscription(self, db: Session, customer_id: int, user_id_caller: int) -> models.Customer:
+        """
+        Renews the customer's subscription based on their CURRENT plan.
+        Logic:
+        - If Active: Extends the end_date by the plan duration.
+        - If Expired: Restarts the subscription (Start=Now, End=Now+Duration).
+        """
+        customer = self.get_with_relations(db, customer_id)
+        if not customer:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+        
+        plan = customer.subscription_plan
+        if not plan:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer has no valid subscription plan.")
+
+        now = datetime.now()
+        
+        # Ensure we compare timezone-naive datetimes if necessary (depending on your DB setup)
+        current_end_date = customer.end_date.replace(tzinfo=None) if customer.end_date else now
+
+        # LOGIC: New End Date = Max(Today, Current End) + Duration
+        reference_date = max(now, current_end_date)
+        duration_days = 30 * plan.duration_months # Approximate month as 30 days
+        new_end_date = reference_date + timedelta(days=duration_days)
+
+        # State Change Logic
+        previous_end_date = customer.end_date
+        customer.end_date = new_end_date
+        customer.status = SubscriptionStatus.ACTIVE # Always reactivate on renewal
+
+        # If subscription was expired (Reference was Today), reset the Start Date to represent a "New Term"
+        if now > current_end_date:
+            customer.start_date = now
+
+        db.add(customer)
+        db.flush()
+        db.refresh(customer)
+
+        # Log the action
+        log_action(
+            db,
+            user_id=user_id_caller,
+            action_type="SUBSCRIPTION_RENEWED",
+            entity_type="Customer",
+            entity_id=customer.id,
+            details={
+                "previous_end_date": str(previous_end_date),
+                "new_end_date": str(new_end_date),
+                "plan_name": plan.name,
+                "is_restart": (now > current_end_date) # True if it was expired
+            },
+            customer_id=customer.id
+        )
+
+        return customer
 
 
 class CRUDCustomerEntity(CRUDBase):

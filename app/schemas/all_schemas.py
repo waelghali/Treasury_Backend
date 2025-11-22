@@ -300,6 +300,8 @@ class CustomerOut(CustomerBase, BaseSchema):
     start_date: datetime
     end_date: datetime
     status: SubscriptionStatus
+    active_user_count: int
+    active_lg_count: int
 
 class GlobalConfigurationBase(BaseModel):
     key: GlobalConfigKey = Field(..., description="Unique key for the configuration setting")

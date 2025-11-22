@@ -706,6 +706,32 @@ def restore_customer(
     db.refresh(restored_customer)
     return crud_customer.get_with_relations(db, restored_customer.id)
 
+@router.post("/customers/{customer_id}/renew", response_model=CustomerOut)
+def renew_customer_subscription(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("customer:edit")), # Ensure this permission exists or use 'system_owner:manage_billing'
+):
+    """
+    Manually renews a customer's subscription. 
+    Extends the duration if active, or restarts it if expired.
+    """
+    try:
+        updated_customer = crud_customer.renew_subscription(
+            db, 
+            customer_id=customer_id, 
+            user_id_caller=current_user.user_id
+        )
+        return updated_customer
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to renew subscription for customer {customer_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Failed to renew subscription."
+        )
+
 @router.post("/customer-entities/", response_model=CustomerEntityOut, status_code=status.HTTP_201_CREATED)
 def create_customer_entity(
     entity_in: CustomerEntityCreate, 
@@ -916,10 +942,6 @@ def restore_customer_entity(
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="CustomerEntity", entity_id=restored_entity.id, details={"name": restored_entity.entity_name, "code": restored_entity.code, "customer_id": restored_entity.customer_id, "ip_address": client_host})
     
     return restored_entity
-
-# api/v1/endpoints/system_owner.py
-
-# (Other imports and router definitions remain the same)
 
 @router.post("/customers/{customer_id}/entities/", response_model=CustomerEntityOut, status_code=status.HTTP_201_CREATED)
 def create_customer_entity(
@@ -2899,6 +2921,7 @@ def reject_trial_registration(
     return {"message": "Registration rejected successfully."}
 
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])
+
 
 @trial_router.get("/download-register-document/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 async def download_commercial_register_document(
