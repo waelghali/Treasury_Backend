@@ -1101,7 +1101,7 @@ def update_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip if request else None
+    client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1128,7 +1128,7 @@ def delete_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip if request else None
+    client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:
@@ -1155,7 +1155,7 @@ def restore_customer_email_settings(
     corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
     request: Request = None
 ):
-    client_host = get_client_ip if request else None
+    client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
 
     try:

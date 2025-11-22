@@ -2922,15 +2922,14 @@ def reject_trial_registration(
 
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])
 
-
-@trial_router.get("/download-register-document/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-async def download_commercial_register_document(
+@trial_router.get("/get-document-url/") # Renamed for clarity
+async def get_commercial_register_document_url(
     gcs_uri: str = Query(..., description="The GCS URI (path) to the document to be served."),
     current_user: TokenData = Depends(HasPermission("system_owner:view_trial_registrations"))
 ):
     """
-    Retrieves the Commercial Register Document from GCS via a temporary signed URL redirect.
-    Requires System Owner view permission.
+    Generates a signed URL for the Commercial Register Document.
+    Returns the URL as JSON so the frontend can open it.
     """
     # Simple validation that the path is a GCS path
     if not gcs_uri or not gcs_uri.startswith("gs://"):
@@ -2940,15 +2939,17 @@ async def download_commercial_register_document(
         )
 
     try:
-        # The generate_signed_gcs_url function handles validation and GCS interaction
+        # Generate the signed URL
         signed_url = generate_signed_gcs_url(gcs_uri)
-        # Redirect the client to the temporary, secure GCS URL
-        return RedirectResponse(url=signed_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        
+        # CHANGE: Return JSON object instead of RedirectResponse
+        return {"url": signed_url}
+        
     except HTTPException as e:
         raise e
     except Exception as e:
-        logger.error(f"Error serving GCS document via signed URL: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not securely retrieve the document.")
+        logger.error(f"Error generating GCS URL: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not generate document URL.")
 
+# Make sure the router inclusion remains at the bottom
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])
-

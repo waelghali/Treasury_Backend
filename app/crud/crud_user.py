@@ -385,6 +385,7 @@ class CRUDUser(CRUDBase):
                 db.query(UserCustomerEntityAssociation).filter(
                     UserCustomerEntityAssociation.user_id == db_user.id
                 ).delete()
+                db_user.entity_associations = []
                 db_user.has_all_entity_access = new_has_all_entity_access
                 db.flush() # Flush to ensure deletions are processed before new additions
 
