@@ -379,12 +379,13 @@ class CRUDUser(CRUDBase):
             old_has_all_entity_access = db_user.has_all_entity_access
             old_entity_ids_set = {assoc.customer_entity_id for assoc in db_user.entity_associations}
 
-
             if new_has_all_entity_access != old_has_all_entity_access:
                 # If access type changed, clear existing associations
                 db.query(UserCustomerEntityAssociation).filter(
                     UserCustomerEntityAssociation.user_id == db_user.id
                 ).delete()
+                
+                # Explicitly clear the relationship in memory to match DB
                 db_user.entity_associations = []
                 db_user.has_all_entity_access = new_has_all_entity_access
                 db.flush() # Flush to ensure deletions are processed before new additions
@@ -458,6 +459,10 @@ class CRUDUser(CRUDBase):
                             UserCustomerEntityAssociation.user_id == db_user.id,
                             UserCustomerEntityAssociation.customer_entity_id == entity_id,
                         ).delete()
+                    
+                    # CRITICAL FIX: Expire the relationship so SQLAlchemy reloads it.
+                    # This prevents "Instance has been deleted" errors when db.add(db_user) is called later.
+                    db.expire(db_user, ['entity_associations'])
                     
                     changed_fields["entities_with_access"] = {
                         "old": sorted(list(old_entity_ids_set)),

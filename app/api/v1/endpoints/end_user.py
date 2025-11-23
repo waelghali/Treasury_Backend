@@ -150,6 +150,18 @@ async def get_current_end_user_context(
     return current_user
 
 
+def get_fresh_entity_permissions(db: Session, user_id: int) -> Tuple[bool, List[int]]:
+    """
+    Fetches the user from the DB to ensure we have real-time entity access rights.
+    """
+    user = crud_user.get(db, user_id)
+    if not user:
+        return False, []
+    
+    has_all = user.has_all_entity_access
+    allowed_ids = [assoc.customer_entity_id for assoc in user.entity_associations]
+    return has_all, allowed_ids
+
 # --- Helper for Fuzzy Matching ---
 def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], threshold: int = 75) -> Optional[int]:
     """
@@ -673,7 +685,7 @@ async def view_lg_document_securely(
     )
     return {"signed_url": signed_url}
 
-@router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
+@router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
 async def list_lg_records(
     skip: int = 0,
     limit: int = 100,
@@ -686,19 +698,25 @@ async def list_lg_records(
     Retrieves a list of LG records belonging to the authenticated End User's customer.
     Includes an optional filter for internal owner contact ID.
     """
+    # FIX: Get fresh permissions from DB instead of stale Token
+    fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
     lg_records = crud_lg_record.get_all_lg_records_for_customer(
         db,
         customer_id=end_user_context.customer_id,
         internal_owner_contact_id=internal_owner_contact_id,
         skip=skip,
-        limit=limit
+        limit=limit,
+        # NEW: Pass the FRESH security parameters
+        user_has_all_access=fresh_has_all_access,
+        user_allowed_entity_ids=fresh_entity_ids
     )
     return lg_records
 
 @router.get(
     "/lg-records/{lg_record_id}",
     response_model=LGRecordOut,
-    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Retrieve a single LG record by ID"
 )
 async def get_lg_record_by_id(
@@ -709,7 +727,17 @@ async def get_lg_record_by_id(
     """
     Fetches a single LG record by its ID, ensuring it belongs to the current user's customer.
     """
-    lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, current_user_context.customer_id)
+    # FIX: Get fresh permissions from DB instead of stale Token
+    fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, current_user_context.user_id)
+
+    lg_record = crud_lg_record.get_lg_record_with_relations(
+        db, 
+        lg_record_id, 
+        current_user_context.customer_id,
+        # NEW: Pass the FRESH security parameters
+        user_has_all_access=fresh_has_all_access,
+        user_allowed_entity_ids=fresh_entity_ids
+    )
     if not lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
     return lg_record
@@ -2633,7 +2661,7 @@ async def lookup_system_user_by_email(
 
     return user
 
-@router.get("/customer-entities/", response_model=List[CustomerEntityOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
+@router.get("/customer-entities/", response_model=List[CustomerEntityOut], dependencies=[Depends(check_subscription_status)])
 async def get_customer_entities_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
@@ -2642,15 +2670,18 @@ async def get_customer_entities_for_end_user(
     limit: int = 100
 ):
     """
-    Retrieves a list of active customer entities accessible by the current user's customer.
-    If the user has specific entity access, this list will be filtered by the UI.
-    For now, returns all active entities for the customer.
+    Retrieves a list of active customer entities accessible by the current user.
+    Filtered by real-time DB permissions.
     """
-    if end_user_context.has_all_entity_access:
+    # FIX: Get fresh permissions
+    fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
+    if fresh_has_all_access:
         entities = crud_customer_entity.get_all_for_customer(db, end_user_context.customer_id, skip=skip, limit=limit)
     else:
+        # Only return entities the user is explicitly linked to in the DB
         entities = db.query(crud_customer_entity.model).filter(
-            crud_customer_entity.model.id.in_(end_user_context.entity_ids),
+            crud_customer_entity.model.id.in_(fresh_entity_ids),
             crud_customer_entity.model.customer_id == end_user_context.customer_id,
             crud_customer_entity.model.is_deleted == False
         ).offset(skip).limit(limit).all()
@@ -2960,60 +2991,75 @@ async def generate_all_eligible_bank_reminders_pdf_api(
 @router.get(
     "/action-center/lg-for-renewal",
     response_model=List[LGRecordOut],
-    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Get LG Records approaching expiry/renewal for Action Center"
 )
 async def get_action_center_lg_for_renewal(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
-    """
-    Retrieves LG records for the authenticated user's customer that are
-    approaching their expiry/renewal date based on configured thresholds.
-    """
-    lg_records = crud_lg_record.get_lg_records_for_renewal_reminder(db, end_user_context.customer_id)
+    # 1. Get Fresh Permissions
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
+    # 2. Pass them to the updated CRUD method
+    lg_records = crud_lg_record.get_lg_records_for_renewal_reminder(
+        db, 
+        end_user_context.customer_id,
+        user_has_all_access=has_all,
+        user_allowed_entity_ids=allowed_ids
+    )
     return lg_records
 
 @router.get(
     "/action-center/instructions-undelivered",
     response_model=List[LGInstructionOut],
-    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_subscription_status)],
     summary="Get LG Instructions awaiting delivery confirmation for Action Center"
 )
 async def get_action_center_instructions_undelivered(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
+    # 1. Get Fresh Permissions
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
+    # 2. Fetch Data (This gets ALL undelivered instructions for the customer)
+    # ... (existing config logic) ...
     report_start_days_config = 0
     report_stop_days_config = crud_customer_configuration.get_customer_config_or_global_fallback(
         db, end_user_context.customer_id, GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED
     )
-
-    report_start_days = 0
-    report_stop_days = int(report_stop_days_config['effective_value']) if report_stop_days_config and report_stop_days_config.get('effective_value') else 60
+    report_stop_days = int(report_stop_days_config['effective_value']) if report_stop_days_config else 60
     
-    # FIX: Correct the logical check and assignment
-    if not (0 <= report_start_days < report_stop_days):
-        logger.warning(f"Invalid report start/stop days config for customer {end_user_context.customer_id}. Using default range.")
-        report_start_days = 0
-        report_stop_days = 60
-    # FIX: End of correction
-
     instructions = crud_lg_instruction.get_undelivered_instructions_for_reporting(
-        db, end_user_context.customer_id, report_start_days, report_stop_days
+        db, end_user_context.customer_id, 0, report_stop_days
     )
+
+    # 3. FILTER RESULTS IN PYTHON (Since we can't modify crud_lg_instruction easily right now)
+    if not has_all:
+        allowed_ids_set = set(allowed_ids)
+        instructions = [
+            inst for inst in instructions 
+            if inst.lg_record and inst.lg_record.beneficiary_corporate_id in allowed_ids_set
+        ]
+
     return instructions
 
 @router.get(
     "/action-center/instructions-awaiting-reply",
     response_model=List[LGInstructionOut],
-    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_subscription_status)],
     summary="Get LG Instructions awaiting bank reply for Action Center"
 )
 async def get_action_center_instructions_awaiting_reply(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
+    # 1. Get Fresh Permissions
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
+    # 2. Fetch Data
+    # ... (existing config logic) ...
     days_since_delivery_config = crud_customer_configuration.get_customer_config_or_global_fallback(
         db, end_user_context.customer_id, GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_DELIVERY
     )
@@ -3024,22 +3070,22 @@ async def get_action_center_instructions_awaiting_reply(
         db, end_user_context.customer_id, GlobalConfigKey.REMINDER_TO_BANKS_MAX_DAYS_SINCE_ISSUANCE
     )
 
-    # Use the effective values, falling back to logical defaults if not configured
-    days_since_delivery = int(days_since_delivery_config['effective_value']) if days_since_delivery_config and days_since_delivery_config.get('effective_value') is not None else 0 # FIX: Default to 0
-    days_since_issuance = int(days_since_issuance_config['effective_value']) if days_since_issuance_config and days_since_issuance_config.get('effective_value') is not None else 0 # FIX: Default to 0
-    max_days_since_issuance = int(max_days_since_issuance_config['effective_value']) if max_days_since_issuance_config and max_days_since_issuance_config.get('effective_value') is not None else 90
-
-    # FIX: Relax validation to allow 0 or positive values, and check logical order
-    if not (0 <= days_since_delivery < max_days_since_issuance and 0 <= days_since_issuance < max_days_since_issuance): # FIX: Changed 0 < days to 0 <= days
-        logger.warning(f"Invalid reminder configuration for customer {end_user_context.customer_id}. Using default reminder range.")
-        # FIX: Reset defaults to reasonable values, allowing 0 if desired for immediate reminders
-        days_since_delivery = 0 # Default to 0 for immediate reminders if config is illogical
-        days_since_issuance = 0 # Default to 0 for immediate reminders if config is illogical
-        max_days_since_issuance = 90 # Keep a sane max default
+    days_since_delivery = int(days_since_delivery_config['effective_value']) if days_since_delivery_config else 0
+    days_since_issuance = int(days_since_issuance_config['effective_value']) if days_since_issuance_config else 0
+    max_days_since_issuance = int(max_days_since_issuance_config['effective_value']) if max_days_since_issuance_config else 90
 
     instructions = crud_lg_instruction.get_instructions_for_bank_reminders(
         db, end_user_context.customer_id, days_since_delivery, days_since_issuance, max_days_since_issuance
     )
+
+    # 3. FILTER RESULTS IN PYTHON
+    if not has_all:
+        allowed_ids_set = set(allowed_ids)
+        instructions = [
+            inst for inst in instructions 
+            if inst.lg_record and inst.lg_record.beneficiary_corporate_id in allowed_ids_set
+        ]
+
     return instructions
 
 
@@ -3061,6 +3107,8 @@ async def get_approved_requests_pending_print(
     Decrease Amount, Activate Non-Operative) and has not yet been marked as printed.
     These are tasks for the maker (End User) to follow up on.
     """
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
     # Define instruction types that require printing (consistent with background_tasks)
     INSTRUCTION_TYPES_REQUIRING_PRINTING = [
         ACTION_TYPE_LG_RELEASE,
@@ -3093,53 +3141,72 @@ async def get_approved_requests_pending_print(
         selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.template)
     ).order_by(models.ApprovalRequest.created_at.asc()).offset(skip).limit(limit).all()
 
-    return pending_print_requests
+    if not has_all:
+        allowed_ids_set = set(allowed_ids)
+        pending_print_requests = [
+            req for req in pending_print_requests
+            if req.lg_record and req.lg_record.beneficiary_corporate_id in allowed_ids_set
+        ]
 
-# NEW ENDPOINT: Get Current User's Dashboard/Login Info with Pending Print Count
+    return pending_print_requests[skip : skip + limit]
+
 @router.get(
     "/users/me_dashboard_info",
-    response_model=Dict[str, Any], # Keep as Dict[str, Any] for flexibility
-    dependencies=[Depends(check_subscription_status)], # ADDED dependency
-    summary="Get current user's dashboard information including pending print count and LGs approaching renewal"
+    response_model=Dict[str, Any],
+    dependencies=[Depends(check_subscription_status)],
+    summary="Get current user's dashboard information"
 )
 async def get_current_user_dashboard_info(
     db: Session = Depends(get_db),
     current_user_token: TokenData = Depends(get_current_active_user),
 ):
-    """
-    Retrieves current user details along with a count of pending print instructions
-    and LGs approaching expiry/renewal relevant to this user.
-    """
-    # Fetch the full user object from the DB using the user_id from the token
+    # 1. Get Fresh Permissions
+    has_all, allowed_ids = get_fresh_entity_permissions(db, current_user_token.user_id)
+    
     db_user = crud_user.get(db, current_user_token.user_id)
-    if not db_user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-
-    # Ensure the user belongs to the customer provided in the token
-    if db_user.customer_id != current_user_token.customer_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User does not belong to the expected customer.")
-
-    # Validate the database user object against UserOut schema
     user_info = UserOut.model_validate(db_user)
 
-    # Re-use the logic from get_approved_requests_pending_print for count
-    pending_print_count_query = db.query(models.ApprovalRequest).filter(
+    # 2. Pending Print Count (Filtered)
+    pending_print_requests = db.query(models.ApprovalRequest).filter(
         models.ApprovalRequest.customer_id == current_user_token.customer_id,
         models.ApprovalRequest.status == ApprovalRequestStatusEnum.APPROVED,
         models.ApprovalRequest.entity_type == "LGRecord",
         models.ApprovalRequest.maker_user_id == current_user_token.user_id,
         models.ApprovalRequest.related_instruction_id.isnot(None),
-        models.ApprovalRequest.action_type.in_(INSTRUCTION_TYPES_REQUIRING_PRINTING),
-        models.ApprovalRequest.related_instruction.has(models.LGInstruction.is_printed == False) # Check the linked instruction's printed status
-    )
-    pending_print_count = pending_print_count_query.count()
+        models.ApprovalRequest.related_instruction.has(models.LGInstruction.is_printed == False)
+    ).options(selectinload(models.ApprovalRequest.lg_record)).all()
 
-    # Get count of LGs approaching renewal
-    lg_for_renewal_list = crud_lg_record.get_lg_records_for_renewal_reminder(db, current_user_token.customer_id)
+    if not has_all:
+        allowed_ids_set = set(allowed_ids)
+        pending_print_count = sum(1 for req in pending_print_requests if req.lg_record and req.lg_record.beneficiary_corporate_id in allowed_ids_set)
+    else:
+        pending_print_count = len(pending_print_requests)
+
+    # 3. Renewal Reminders (Updated Call)
+    lg_for_renewal_list = crud_lg_record.get_lg_records_for_renewal_reminder(
+        db, 
+        current_user_token.customer_id,
+        user_has_all_access=has_all,
+        user_allowed_entity_ids=allowed_ids
+    )
     lg_for_renewal_count = len(lg_for_renewal_list)
 
-    # NEW: Get count of active LGs
-    active_lg_count = crud_lg_record.get_active_lg_records_count_for_customer(db, current_user_token.customer_id)
+    # 4. Active LG Count (Filtered)
+    active_lg_query = db.query(models.LGRecord).filter(
+        models.LGRecord.customer_id == current_user_token.customer_id,
+        models.LGRecord.lg_status_id == LgStatusEnum.VALID.value,
+        models.LGRecord.is_deleted == False
+    )
+
+    if not has_all:
+        if not allowed_ids:
+             active_lg_count = 0
+        else:
+             active_lg_count = active_lg_query.filter(
+                 models.LGRecord.beneficiary_corporate_id.in_(allowed_ids)
+             ).count()
+    else:
+        active_lg_count = active_lg_query.count()
 
     return {
         "user_details": user_info.model_dump(),
@@ -3147,7 +3214,7 @@ async def get_current_user_dashboard_info(
         "pending_prints_count": pending_print_count,
         "has_lgs_for_renewal": lg_for_renewal_count > 0,
         "lgs_for_renewal_count": lg_for_renewal_count,
-        "active_lgs_count": active_lg_count, # NEW field
+        "active_lgs_count": active_lg_count,
     }
 
 @router.get(
