@@ -3159,8 +3159,19 @@ class CRUDLGRecord(CRUDBase):
             logger.error(f"Failed to send internal owner renewal reminder email for LG {lg_record.lg_number}.")
 
 
-    async def create_from_migration(self, db: Session, obj_in: LGRecordCreate, customer_id: int, user_id: int, migration_source: str, migrated_from_staging_id: int) -> models.LGRecord:
-        # Check for existing LG in production before creating a new one (proactive check)
+    async def create_from_migration(
+        self, 
+        db: Session, 
+        obj_in: LGRecordCreate, 
+        customer_id: int, 
+        user_id: int, 
+        migration_source: str, 
+        migrated_from_staging_id: int,
+        # NEW ARGUMENT: We accept the ID explicitly to guarantee it is saved
+        internal_owner_contact_id: Optional[int] = None 
+    ) -> models.LGRecord:
+        
+        # 1. Check for duplicate LG Number
         existing_lg = self.get_by_lg_number(db, obj_in.lg_number)
         if existing_lg:
             raise HTTPException(
@@ -3168,29 +3179,68 @@ class CRUDLGRecord(CRUDBase):
                 detail=f"LG with number '{obj_in.lg_number}' already exists in production. Cannot migrate."
             )
 
-        # Get the next LG sequence number
+        # 2. Get the next Sequence Number
         last_lg_sequence = db.query(func.max(self.model.lg_sequence_number)).filter(
             self.model.beneficiary_corporate_id == obj_in.beneficiary_corporate_id,
             self.model.is_deleted == False
         ).scalar()
         next_lg_sequence = (last_lg_sequence if last_lg_sequence is not None else 0) + 1
         
-        # We assume the obj_in already has the correct IDs for owner, bank, etc. from the staging process.
+        # 3. Prepare Data Dictionary
         lg_record_data = obj_in.model_dump(exclude_unset=True)
+        
+        # --- CRITICAL FIX: Remove "Helper Fields" ---
+        # The Pydantic schema asked for these, but the Database Table DOES NOT have them.
+        # We must remove them to avoid "TypeError".
+        invalid_keys = ['internal_owner_email', 'internal_owner_phone', 'manager_email']
+        for key in invalid_keys:
+            lg_record_data.pop(key, None)
+            
+        # --- CRITICAL FIX: Force the Internal Owner ID ---
+        # This ensures the link to the contact table is saved.
+        if internal_owner_contact_id is not None:
+            lg_record_data["internal_owner_contact_id"] = internal_owner_contact_id
+            
+        # --- FAILSAFE: Calculate lg_period_months if missing ---
+        if not lg_record_data.get("lg_period_months"):
+            try:
+                issuance = lg_record_data.get("issuance_date")
+                expiry = lg_record_data.get("expiry_date")
+                
+                if issuance and expiry:
+                    if isinstance(issuance, str):
+                        issuance = datetime.strptime(issuance, "%Y-%m-%d").date()
+                    if isinstance(expiry, str):
+                        expiry = datetime.strptime(expiry, "%Y-%m-%d").date()
+
+                    delta = relativedelta(expiry, issuance)
+                    total_months = delta.years * 12 + delta.months
+                    if delta.days > 0:
+                        total_months += 1
+                        
+                    # Standard logic: Round to nearest 3, clamped between 3 and 12
+                    rounded_months = int(round(total_months / 3)) * 3
+                    final_months = max(3, min(12, rounded_months))
+                    
+                    lg_record_data["lg_period_months"] = final_months
+                else:
+                    lg_record_data["lg_period_months"] = 12 # Default fallback
+            except Exception:
+                lg_record_data["lg_period_months"] = 12
+
+        # 4. Set System Fields
         lg_record_data["customer_id"] = customer_id
         lg_record_data["lg_sequence_number"] = next_lg_sequence
-        
-        # Set the migration-specific flags
         lg_record_data["migration_source"] = migration_source
         lg_record_data["migrated_from_staging_id"] = migrated_from_staging_id
         
+        # 5. Insert into Database
         db_lg_record = self.model(**lg_record_data)
         db.add(db_lg_record)
         db.flush()
-        
         db.refresh(db_lg_record)
         
-        # Log the migration action for this specific record
+        # 6. Audit Log
         log_action(
             db,
             user_id=user_id,
@@ -3201,7 +3251,7 @@ class CRUDLGRecord(CRUDBase):
                 "lg_number": db_lg_record.lg_number,
                 "customer_id": customer_id,
                 "staged_record_id": migrated_from_staging_id,
-                "migration_source": migration_source,
+                "internal_owner_id": internal_owner_contact_id 
             },
             customer_id=customer_id,
             lg_record_id=db_lg_record.id,

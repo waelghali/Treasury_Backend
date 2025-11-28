@@ -168,14 +168,14 @@ class CRUDReports(CRUDBase):
             data=report_data
         )
     
-    # --- NEW: End User Report - My LG Dashboard ---
     def get_my_lg_dashboard_report(
         self, db: Session, user_context: Dict[str, Any]
     ) -> MyLGDashboardReportOut:
         logger.info(f"Generating My LG Dashboard report for End User {user_context['user_id']}.")
 
-        if user_context['role'] != UserRole.END_USER:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only End Users can access this report.")
+        if user_context['role'] not in [UserRole.END_USER, UserRole.CORPORATE_ADMIN]:
+             # Allow Admins to see the dashboard too (for the Safety View)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized role for this report.")
 
         user_id = user_context['user_id']
         customer_id = user_context['customer_id']
@@ -187,8 +187,7 @@ class CRUDReports(CRUDBase):
         if not user_has_all_entity_access:
             lg_filter_conditions.append(LGRecord.beneficiary_corporate_id.in_(user_entity_ids))
         
-        # 1. My LGs List (LGs assigned to this user)
-        # Assuming an LG is "assigned" if the user is the internal owner contact
+        # --- 1. ORIGINAL LOGIC: My LGs List ---
         my_lg_records = db.query(LGRecord).join(InternalOwnerContact).filter(
             InternalOwnerContact.email == user_context['email'],
             *lg_filter_conditions
@@ -200,14 +199,14 @@ class CRUDReports(CRUDBase):
         my_lgs_count = len(my_lg_records)
         
 
-        # 2. LGs Nearing Expiry
-        # Get configurable days from customer config or global fallback
+        # --- 2. ORIGINAL LOGIC: LGs Nearing Expiry ---
         config_key = GlobalConfigKey.AUTO_RENEWAL_DAYS_BEFORE_EXPIRY
         days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
             db, customer_id, config_key
         )
         configurable_days = int(days_config.get('effective_value', 60)) if days_config else 60
         expiry_cutoff_date = date.today() + timedelta(days=configurable_days)
+        
         lgs_near_expiry_query = db.query(LGRecord).filter(
             LGRecord.expiry_date >= date.today(),
             LGRecord.expiry_date <= expiry_cutoff_date,
@@ -215,7 +214,8 @@ class CRUDReports(CRUDBase):
         ).all()
         lgs_near_expiry_count = len(lgs_near_expiry_query)
 
-        # 3. Instructions Not Delivered
+
+        # --- 3. ORIGINAL LOGIC: Instructions Not Delivered ---
         report_start_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
             db, customer_id, GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_REPORT_UNDELIVERED
         )
@@ -231,7 +231,7 @@ class CRUDReports(CRUDBase):
         undelivered_instructions_count = len(undelivered_instructions_query)
         
 
-        # 4. Recent Actions
+        # --- 4. ORIGINAL LOGIC: Recent Actions ---
         recent_actions_query = db.query(AuditLog).filter(
             AuditLog.user_id == user_id
         ).order_by(AuditLog.timestamp.desc()).limit(10).all()
@@ -245,20 +245,70 @@ class CRUDReports(CRUDBase):
                 f"{log.timestamp.strftime('%Y-%m-%d %H:%M')}: {log.action_type} on {log.entity_type} (ID: {log.entity_id}). Details: {details_summary}"
             )
 
+        # =================================================================================
+        # --- NEW LOGIC: UPCOMING EXPIRIES LIST & SAFETY SCORE ---
+        # =================================================================================
+        
+        # A. Fetch the actual list of expiring LGs (Reuse the query from step 2 but sort it)
+        # We sort by date to show the most urgent ones first
+        upcoming_expiries_list = []
+        lgs_sorted = sorted(lgs_near_expiry_query, key=lambda x: x.expiry_date)
+        
+        for lg in lgs_sorted:
+            days_left = (lg.expiry_date - date.today()).days
+            upcoming_expiries_list.append({
+                "lg_number": lg.lg_number,
+                "bank_name": lg.issuing_bank.name if lg.issuing_bank else "Unknown Bank",
+                "expiry_date": lg.expiry_date,
+                "days_remaining": days_left
+            })
 
+        # B. Calculate Safety Score (Simple Logic)
+        # Base score 100. Minus 10 points for every expired item. Minus 2 points for every expiring item.
+        # (You can adjust this formula later)
+        score = 100
+        # Check for *actual* expired items (past today) which are risky
+        actually_expired_count = db.query(LGRecord).filter(
+             LGRecord.expiry_date < date.today(), 
+             LGRecord.status == LgStatusEnum.ACTIVE,
+             *lg_filter_conditions
+        ).count()
+        
+        score -= (actually_expired_count * 10)
+        score -= (lgs_near_expiry_count * 2) 
+        score = max(0, min(100, score)) # Clamp between 0 and 100
+
+        # C. Determine Risk Label
+        if score >= 90:
+            risk_status = "Stable"
+            risk_color = "green"
+        elif score >= 70:
+            risk_status = "Attention"
+            risk_color = "yellow"
+        else:
+            risk_status = "Critical"
+            risk_color = "red"
+
+
+        # --- COMBINE EVERYTHING ---
         report_data = MyLGDashboardReportItemOut(
+            # Original Data
             my_lgs_count=my_lgs_count,
             lgs_near_expiry_count=lgs_near_expiry_count,
             undelivered_instructions_count=undelivered_instructions_count,
-            recent_actions=recent_actions_list
+            recent_actions=recent_actions_list,
+            
+            # New Data
+            safety_score=score,
+            risk_status=risk_status,
+            risk_color=risk_color,
+            upcoming_expiries=upcoming_expiries_list
         )
 
         return MyLGDashboardReportOut(
             report_date=date.today(),
             data=report_data
         )
-        
-
     def get_chart_data(self, db: Session, report_type: str, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Retrieves data for the dashboard charts based on report type and user context.

@@ -179,6 +179,9 @@ column_mapping = {
 
     # Internal Fields
     "Internal_Owner_Email": "internal_owner_email",
+    "responsible": "internal_owner_email",
+    "responsible person": "internal_owner_email",
+    "Owner": "internal_owner_email",
     "Owner Email": "internal_owner_email",
     "Contact Email": "internal_owner_email",
     "Internal Contact": "internal_owner_email",
@@ -205,6 +208,9 @@ column_mapping = {
     "Supplier": "supplier_name",
     "Contractor": "contractor_name",
     "Issuer Company": "issuer_name",
+    "Applicant_Name": "issuer_name",
+    "Applicant": "issuer_name",
+    "Applicant Name": "issuer_name",
 }
 
 
@@ -429,7 +435,7 @@ async def upload_structured_file_for_staging(
     existing_batch = crud_migration_batch.get_by_file_hash(db, file_hash)
     if existing_batch:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_490_CONFLICT,
             detail=f"This file has already been uploaded and processed. Batch ID: {existing_batch.id}."
         )
 
@@ -794,21 +800,79 @@ async def import_historical_records(
                     batch_results['skipped_exists'] += 1
                     continue
                 
-                first_snapshot_data = first_snapshot.source_data_json
+                # --- FIX START: Sanitize and Enrich Data ---
+                first_snapshot_data = first_snapshot.source_data_json.copy()
                 first_snapshot_data.pop('history_sequence', None)
                 first_snapshot_data.pop('history_timestamp', None)
                 
+                # 1. Enrich Owner Details (Phone & Manager Email)
+                owner_id = first_snapshot_data.get("internal_owner_contact_id")
+                if owner_id:
+                    owner_obj = crud_internal_owner_contact.get(db, id=owner_id)
+                    if owner_obj:
+                        # We inject these ONLY so the Validator is happy.
+                        # The CRUD function will strip them out before saving to DB.
+                        if not first_snapshot_data.get("internal_owner_phone"):
+                            first_snapshot_data["internal_owner_phone"] = owner_obj.phone_number
+                        if not first_snapshot_data.get("manager_email"):
+                            first_snapshot_data["manager_email"] = owner_obj.manager_email
+                        if not first_snapshot_data.get("internal_owner_email"):
+                            first_snapshot_data["internal_owner_email"] = owner_obj.email
+
+                # 2. Sanitize "additional_field_values"
+                add_fields = first_snapshot_data.get("additional_field_values")
+                if isinstance(add_fields, str):
+                    clean_val = add_fields.strip().upper()
+                    if clean_val in ['N/A', '0', '', 'NULL']:
+                        first_snapshot_data["additional_field_values"] = None
+                    else:
+                        try:
+                            first_snapshot_data["additional_field_values"] = json.loads(add_fields)
+                        except:
+                            first_snapshot_data["additional_field_values"] = None
+                # --- FIX END ---
+                
+                # 2. Validate Data
                 lg_record_create_payload = LGRecordCreate(**first_snapshot_data)
                 
+                # 3. Create Record (Pass owner_id explicitly!)
                 new_lg = await crud_lg_record.create_from_migration(
                     db=db,
                     obj_in=lg_record_create_payload,
                     customer_id=current_user.customer_id,
                     user_id=current_user.user_id,
                     migration_source='LEGACY',
-                    migrated_from_staging_id=first_snapshot.id
+                    migrated_from_staging_id=first_snapshot.id,
+                    internal_owner_contact_id=owner_id # <--- THIS IS THE KEY
                 )
                 
+                # --- FIX: INSERT FILE UPLOAD LOGIC HERE ---
+                # We extract the URL from the FIRST snapshot's source data
+                if sorted_snapshots:
+                    first_snapshot_for_upload = sorted_snapshots[0]
+                    first_data = first_snapshot_for_upload.source_data_json or {}
+                    attachment_url = first_data.get("attachment_url")
+                    
+                    if attachment_url:
+                        # Clean the URL
+                        clean_url = str(attachment_url).strip().strip("'").strip('"')
+                        logger.info(f"Uploading initial document for LG {lg_num} from {clean_url}")
+                        
+                        try:
+                            from app.constants import DOCUMENT_TYPE_ORIGINAL_LG
+                            
+                            # We can reuse the service method since we have the service instance
+                            await migration_service._create_document_from_url(
+                                db=db,
+                                lg_record_id=new_lg.id,
+                                url=clean_url,
+                                document_type=DOCUMENT_TYPE_ORIGINAL_LG,
+                                uploaded_by_user_id=current_user.user_id
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to upload initial document for {lg_num}: {e}")
+                # ------------------------------------------------------------------
+
                 if len(sorted_snapshots) > 1:
                     for i in range(1, len(sorted_snapshots)):
                         prev_snapshot_data = sorted_snapshots[i-1].source_data_json
@@ -822,6 +886,34 @@ async def import_historical_records(
                                 db, new_lg.id, diff, current_user.user_id, current_snapshot.id
                             )
 
+                # Reload the record from DB to get the latest expiry_date
+
+                # --- FIX: Force Status, Date, AND AMOUNT Refresh ---
+                db.refresh(new_lg)
+                
+                # 1. Date Logic (Existing)
+                expiry_check = new_lg.expiry_date
+                if isinstance(expiry_check, datetime):
+                    expiry_check = expiry_check.date()
+                    
+                if expiry_check and expiry_check >= date.today():
+                    new_lg.lg_status_id = 1 
+                    
+                # 2. NEW: Amount Logic
+                # We look at the LAST snapshot to see the final intended amount
+                if snapshots:
+                    last_snapshot = snapshots[-1]
+                    last_data = last_snapshot.source_data_json
+                    final_amount = last_data.get("lg_amount")
+                    
+                    # If the last snapshot has an amount, force the master record to match it
+                    if final_amount is not None:
+                        new_lg.lg_amount = final_amount
+                        logger.info(f"Refreshed amount for LG {lg_num} to {final_amount}")
+
+                db.add(new_lg)
+                db.flush()
+                # ------------------------------------------------------
                 for snap in snapshots:
                     snap.record_status = MigrationRecordStatusEnum.IMPORTED
                     snap.production_lg_id = new_lg.id
@@ -1108,6 +1200,18 @@ async def get_staged_records(
         limit=limit
     )
     return records
+
+@router.post("/staged/audit", response_model=Dict[str, Any])
+async def audit_staged_data(
+    db: Session = Depends(get_db),
+    # CHANGE: Use the existing corporate admin dependency
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """
+    Triggers the AI Auditor to check the First and Last records of staged groups.
+    """
+    results = await migration_service.audit_staged_records(db, current_user.customer_id)
+    return results
 
 @router.put("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=LGMigrationStagingOut)
 async def update_staged_record(

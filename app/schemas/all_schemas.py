@@ -1018,6 +1018,7 @@ class LGRecordOut(LGRecordBase, BaseSchema):
     lg_sequence_number: int # New: Expose lg_sequence_number in LGRecordOut
     
     beneficiary_corporate: 'CustomerEntityOut'
+    lg_category: Optional['LGCategoryOut'] = []
     lg_currency: 'CurrencyOut'
     lg_payable_currency: Optional['CurrencyOut'] = None
     lg_type: 'LgTypeOut'
@@ -1317,15 +1318,30 @@ class CustomerLGPerformanceReportOut(BaseModel):
     report_date: date
     data: CustomerLGPerformanceReportItemOut
 
+class DashboardExpiryItem(BaseModel):
+    lg_number: str
+    bank_name: str
+    expiry_date: date
+    days_remaining: int
+
+# 2. Update the existing Item class to include the new fields
 class MyLGDashboardReportItemOut(BaseModel):
+    # --- Existing Fields (Do not remove) ---
     my_lgs_count: int
     lgs_near_expiry_count: int
     undelivered_instructions_count: int
     recent_actions: List[str]
+    
+    # --- NEW ADDITIONS (Safe to add) ---
+    safety_score: int = 100
+    risk_status: str = "Stable"
+    risk_color: str = "green"
+    upcoming_expiries: List[DashboardExpiryItem] = []
 
 class MyLGDashboardReportOut(BaseModel):
     report_date: date
     data: MyLGDashboardReportItemOut
+
 
 # =====================================================================================
 # NEW SCHEMAS FOR LEGAL ARTIFACTS

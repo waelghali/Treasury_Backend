@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 Base = declarative_base()
 import app.models # Do not remove this line! It makes the models discoverable.
 from app import models # Do not remove this line! It makes the models discoverable.
+import app.models_issuance
 
 # Load environment variables from .env file
 load_dotenv()

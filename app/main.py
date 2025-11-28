@@ -75,7 +75,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         sys.exit(1)
 
     # Now import API routers using absolute paths from 'app' package
-    from app.api.v1.endpoints import system_owner, corporate_admin, end_user, migration, public
+    from app.api.v1.endpoints import system_owner, corporate_admin, end_user, migration, public, issuance_endpoints, public_issuance
     from app.auth_v2.routers import router as auth_v2_router
     from app.api.v1.endpoints import reports
     # NEW: Import the subscription tasks module
@@ -126,6 +126,19 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
+
+    # New Issuance Module Router
+    fastapi_app.include_router(
+        issuance_endpoints.router, 
+        prefix="/api/v1/issuance", 
+        tags=["Issuance Module"]
+    )
+
+    fastapi_app.include_router(
+        public_issuance.router, 
+        prefix="/api/v1/public-issuance", 
+        tags=["Public Issuance Portal"]
+    )
 
     # --- APScheduler Setup and Event Handlers ---
     scheduler = AsyncIOScheduler()

@@ -436,7 +436,7 @@ Document Text:
             "required": ["issuerName", "beneficiaryName", "issuingBankName", "lgNumber", "lgAmount", "currency", "lgType", "purpose", "issuanceDate", "expiryDate"]
         }
         prompt = f"""
-You are a financial document analyst. Extract structured data from the following Letter of Guarantee (LG) document. The document may contain both English and Arabic. Use only the provided text—do not rely on outside knowledge or assumptions.
+You are a financial document analyst. Extract structured data from the following Letter of Guarantee (LG) document. The document may contain both English and Arabic (reply in the same language as you find in the document). Use only the provided text—do not rely on outside knowledge or assumptions.
 
 Return your output as a JSON object with the following fields, based strictly on the content of the document.
 
