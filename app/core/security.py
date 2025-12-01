@@ -7,23 +7,17 @@ from fastapi import Depends, HTTPException, status, Request, Response
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
-from app.constants import UserRole, SubscriptionStatus
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+
+from app.constants import UserRole, SubscriptionStatus
 from app.database import get_db
 from app.crud.crud import crud_user, crud_role_permission
-from app.models import User, RolePermission
 
-# NEW: Import hashing for password verification
-from app.core.hashing import get_password_hash, verify_password_direct
+# --- Configuration & Environment Variables ---
 
-# Environment variables for JWT
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-# MODIFIED: Increase expiration time for the frontend timer
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
-
-# NEW: Define environment variable for trusted proxies
 TRUST_X_FORWARDED = os.getenv("TRUST_X_FORWARDED", "false").lower() == "true"
 
 if SECRET_KEY is None:
@@ -31,124 +25,116 @@ if SECRET_KEY is None:
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v2/login", auto_error=False)
 
+
+# --- Data Models ---
+
 class TokenData(BaseModel):
     email: Optional[EmailStr] = None
     user_id: Optional[int] = None
     role: Optional[UserRole] = None
     permissions: List[str] = Field([], description="List of permission names associated with the user's role.")
     customer_id: Optional[int] = Field(None, description="Include customer_id in token data")
-    has_all_entity_access: Optional[bool] = Field(True, description="True if user has access to all entities under their customer, False if restricted to specific entities")
+    has_all_entity_access: Optional[bool] = Field(True, description="True if user has access to all entities, False if restricted")
     entity_ids: List[int] = Field([], description="List of customer entity IDs this user has access to.")
     must_change_password: Optional[bool] = Field(False, description="True if user must change password on next login.")
     subscription_status: Optional[SubscriptionStatus] = Field(None, description="Current subscription status of the customer.")
-    must_accept_policies: Optional[bool] = Field(False, description="True if user needs to accept legal policies.") # ADD THIS LINE
-    last_accepted_legal_version: Optional[float] = Field(None, description="Version of legal artifacts last accepted.") # ADD THIS LINE
+    must_accept_policies: Optional[bool] = Field(False, description="True if user needs to accept legal policies.")
+    last_accepted_legal_version: Optional[float] = Field(None, description="Version of legal artifacts last accepted.")
 
 
-def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None):
+# --- Core Functions ---
+
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+    """Creates a JWT access token with an expiration time."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-# NEW FUNCTION: Secure IP resolution
 def get_client_ip(request: Request) -> Optional[str]:
     """
-    Safely retrieves the client's real IP address, handling proxies and load balancers.
-    
-    This function checks for the 'X-Forwarded-For' header, but only if the
-    TRUST_X_FORWARDED environment variable is set to true. This prevents IP spoofing
-    when the application is not behind a known, trusted proxy.
-    
-    Args:
-        request (Request): The FastAPI Request object.
-        
-    Returns:
-        Optional[str]: The resolved client IP address, or None if it cannot be determined.
+    Safely retrieves the client's real IP address, handling proxies if configured.
+    Returns the X-Forwarded-For IP if TRUST_X_FORWARDED is True, otherwise the direct host IP.
     """
-    # IP spoofing protection: Only trust X-Forwarded-For if explicitly configured.
     if TRUST_X_FORWARDED:
-        # The 'X-Forwarded-For' header can contain a list of IPs.
-        # The left-most IP is the original client.
         x_forwarded_for = request.headers.get("x-forwarded-for")
         if x_forwarded_for:
-            # Get the first IP and strip whitespace.
-            ip = x_forwarded_for.split(',')[0].strip()
-            # Basic validation could go here, e.g., regex check for IPv4/IPv6.
-            # For simplicity, we'll assume the proxy provides a valid IP.
-            return ip
+            # The left-most IP is the original client
+            return x_forwarded_for.split(',')[0].strip()
             
-    # Fallback to the direct client's host IP (e.g., the load balancer or direct client).
-    # This is the safest default if proxies are not explicitly trusted.
     return request.client.host
 
 
-# MODIFIED: get_current_user to check query params if header token is missing and to fetch subscription status
+# --- Dependencies ---
+
 async def get_current_user(
     request: Request,
     response: Response,
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
-):
+) -> TokenData:
+    """
+    Validates the JWT token, checks DB for user existence/active status, 
+    and loads permissions. Supports token via Header or Query Param.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
+    # 1. Extract Token (Header preference, fallback to Query Param)
     if token is None:
         token = request.query_params.get("token")
         if token is None:
             raise credentials_exception
 
+    # 2. Decode and Parse Token
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
         email: str = payload.get("sub")
         user_id: int = payload.get("user_id")
         role: str = payload.get("role")
-        customer_id: Optional[int] = payload.get("customer_id")
-        has_all_entity_access: Optional[bool] = payload.get("has_all_entity_access")
-        entity_ids: List[int] = payload.get("entity_ids", [])
-        must_change_password: Optional[bool] = payload.get("must_change_password")
-        subscription_status: Optional[str] = payload.get("subscription_status")
-        must_accept_policies: Optional[bool] = payload.get("must_accept_policies") # ADD THIS LINE
-        last_accepted_legal_version: Optional[float] = payload.get("last_accepted_legal_version") # ADD THIS LINE
-
+        
         if email is None or user_id is None or role is None:
             raise credentials_exception
-        
+
+        # Load permissions from DB based on role (Ensures permissions are always up to date)
         db_permissions = crud_role_permission.get_permissions_for_role(db, role)
         permission_names = [p.name for p in db_permissions]
         
-        if subscription_status:
-             subscription_status = SubscriptionStatus(subscription_status)
+        # Handle Enum conversion safely
+        sub_status = payload.get("subscription_status")
+        if sub_status:
+             sub_status = SubscriptionStatus(sub_status)
 
         token_data = TokenData(
             email=email,
             user_id=user_id,
             role=UserRole(role),
             permissions=permission_names,
-            customer_id=customer_id,
-            has_all_entity_access=has_all_entity_access,
-            entity_ids=entity_ids,
-            must_change_password=must_change_password,
-            subscription_status=subscription_status,
-            must_accept_policies=must_accept_policies, # ADD THIS LINE
-            last_accepted_legal_version=last_accepted_legal_version # ADD THIS LINE
+            customer_id=payload.get("customer_id"),
+            has_all_entity_access=payload.get("has_all_entity_access"),
+            entity_ids=payload.get("entity_ids", []),
+            must_change_password=payload.get("must_change_password"),
+            subscription_status=sub_status,
+            must_accept_policies=payload.get("must_accept_policies"),
+            last_accepted_legal_version=payload.get("last_accepted_legal_version")
         )
-    except JWTError:
-        raise credentials_exception
-    except ValueError:
+    except (JWTError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload or subscription status.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
+    # 3. Verify User Exists and is Active
     user = crud_user.get(db, user_id)
     if user is None or user.is_deleted:
         raise HTTPException(
@@ -157,12 +143,11 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # REMOVED: Sliding Expiration Logic
-    # The frontend will now manage the inactivity timer.
-
     return token_data
 
-async def get_current_active_user(current_user: TokenData = Depends(get_current_user)):
+
+async def get_current_active_user(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    """Ensures user is authenticated and enforces password change policy."""
     if current_user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     
@@ -173,10 +158,9 @@ async def get_current_active_user(current_user: TokenData = Depends(get_current_
         )
     return current_user
 
-# NEW DEPENDENCY: Check subscription status from token
-def check_subscription_status(
-    current_user: TokenData = Depends(get_current_active_user)
-):
+
+def check_subscription_status(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+    """Blocks access if subscription is EXPIRED (skips for System Owner)."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user
         
@@ -187,10 +171,9 @@ def check_subscription_status(
         )
     return current_user
 
-# NEW DEPENDENCY: Check for read-only mode (allows only 'active' status)
-def check_for_read_only_mode(
-    current_user: TokenData = Depends(check_subscription_status)
-):
+
+def check_for_read_only_mode(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Blocks write access if subscription is in GRACE period."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user
         
@@ -201,7 +184,9 @@ def check_for_read_only_mode(
         )
     return current_user
 
-async def get_current_system_owner(current_user: TokenData = Depends(get_current_active_user)):
+
+async def get_current_system_owner(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+    """Restricts access to System Owners only."""
     if current_user.role != UserRole.SYSTEM_OWNER:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -209,10 +194,9 @@ async def get_current_system_owner(current_user: TokenData = Depends(get_current
         )
     return current_user
 
-async def get_current_corporate_admin_context(current_user: TokenData = Depends(check_subscription_status)):
-    """
-    Dependency that ensures the current user is a Corporate Admin and has an associated customer_id.
-    """
+
+async def get_current_corporate_admin_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Restricts access to Corporate Admins and ensures data integrity."""
     if current_user.role != UserRole.CORPORATE_ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -225,15 +209,13 @@ async def get_current_corporate_admin_context(current_user: TokenData = Depends(
         )
     return current_user
 
+
 class HasPermission:
-    """
-    Dependency class to check if the current user has a specific permission.
-    Permissions are loaded from the token (which are pulled from DB on login).
-    """
+    """Dependency to check for specific permissions."""
     def __init__(self, permission_name: str):
         self.permission_name = permission_name
 
-    async def __call__(self, current_user: TokenData = Depends(get_current_active_user)):
+    async def __call__(self, current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
         if self.permission_name not in current_user.permissions:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

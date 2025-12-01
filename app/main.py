@@ -2,41 +2,38 @@
 import sys
 import os
 import logging
+import pytz
 from datetime import datetime, timedelta
 
 # FastAPI imports
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 
 # SQLAlchemy imports
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 
 # APScheduler Imports
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-import pytz
 
 # Database imports
 from app.database import get_db, Base, engine
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+# Defaults to INFO for production, checks env var for DEBUG override
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app GLOBALLY AT THE VERY BEGINNING
+# Initialize FastAPI app
 app = FastAPI(
     title="Treasury Management Platform API",
     description="API for managing financial instruments, primarily Letters of Guarantee.",
     version="1.0.0",
 )
 
-
-# Define a function to configure the app (middleware, routers, event handlers)
 def configure_app_instance(fastapi_app: FastAPI):
-    # CORS Middleware for frontend communication
+    # --- Middleware Configuration ---
     origins = [
         "https://www.growbusinessdevelopment.com/",
         "https://www.growbusinessdevelopment.com",
@@ -58,182 +55,148 @@ def configure_app_instance(fastapi_app: FastAPI):
         allow_headers=["*"],
     )
 
-    # Attempt to load core modules using absolute imports directly from 'app' package
-    try:
-        import app.core.security as app_security
-        import app.core.ai_integration as app_ai_integration
-        import app.core.document_generator as app_document_generator
-        import app.core.hashing as app_hashing
-        import app.core.email_service as app_email_service
-        import app.core.background_tasks as app_background_tasks
-        # NEW: Import subscription_tasks
-        import app.crud.subscription_tasks as subscription_tasks
-
-        logger.info("Core modules (security, ai_integration, document_generator, hashing, email_service, background_tasks, subscription_tasks) pre-loaded using absolute paths.")
-    except Exception as e:
-        logger.critical(f"FATAL ERROR: Could not pre-load core modules. Ensure paths and dependencies are correct. Error: {e}", exc_info=True)
-        sys.exit(1)
-
-    # Now import API routers using absolute paths from 'app' package
-    from app.api.v1.endpoints import system_owner, corporate_admin, end_user, migration, public, issuance_endpoints, public_issuance
+    # --- Module Imports ---
+    # Imports are placed here to ensure app structure is ready or to avoid circular deps.
+    # If these fail, the app will naturally crash with ImportError.
+    import app.core.security as app_security
+    import app.core.ai_integration as app_ai_integration
+    import app.core.document_generator as app_document_generator
+    import app.core.hashing as app_hashing
+    import app.core.email_service as app_email_service
+    import app.core.background_tasks as app_background_tasks
+    import app.crud.subscription_tasks as subscription_tasks
+    
+    # Routers
+    from app.api.v1.endpoints import (
+        system_owner, corporate_admin, end_user, migration, 
+        public, issuance_endpoints, public_issuance, reports
+    )
     from app.auth_v2.routers import router as auth_v2_router
-    from app.api.v1.endpoints import reports
-    # NEW: Import the subscription tasks module
     from app.crud.crud import crud_customer, crud_customer_configuration, log_action
-
-    # --- DATABASE TABLE CREATION & DIAGNOSTICS ---
-    logger.info("Attempting to ensure database tables exist (create if not existing)...")
+    
+    # --- Database Initialization ---
     try:
-        logger.info(f"DIAG: Engine DSN: {engine.url.render_as_string(hide_password=True)}")
-
+        # Import models to register them with Base.metadata
         import app.models
-        # import app.models.migration # NEW: Import migration models
-
+        
         if Base.metadata.tables:
-            logger.info(f"DIAG: Number of models registered with Base.metadata: {len(Base.metadata.tables)}")
-            logger.info(f"DIAG: Tables expected by models: {list(Base.metadata.tables.keys())}")
             Base.metadata.create_all(bind=engine)
-            logger.info("Database tables ensured (created if not existing).")
+            logger.info("Database tables verified/created.")
         else:
-            logger.critical("FATAL ERROR: No SQLAlchemy models were registered with Base.metadata. "
-                            "Database tables cannot be created. Please check app/models.py and its imports in app/database.py.")
+            logger.critical("FATAL: No SQLAlchemy models registered. Tables cannot be created.")
             sys.exit(1)
-
-    except OperationalError as e:
-        logger.critical(f"FATAL ERROR: Database connection failed during table creation. "
-                        f"Please check DATABASE_URL and ensure PostgreSQL is running and accessible. Error: {e}", exc_info=True)
-        sys.exit(1)
-    except ProgrammingError as e:
-        logger.critical(f"FATAL ERROR: Database programming error during table creation. "
-                        f"This could indicate schema definition issues or insufficient user permissions. Error: {e}", exc_info=True)
-        sys.exit(1)
+            
     except SQLAlchemyError as e:
-        logger.critical(f"FATAL ERROR: An SQLAlchemy error occurred during table creation: {e}", exc_info=True)
+        logger.critical(f"FATAL: Database error during table creation: {e}", exc_info=True)
         sys.exit(1)
     except Exception as e:
-        logger.critical(f"FATAL ERROR: An unexpected error occurred during database table creation: {e}", exc_info=True)
+        logger.critical(f"FATAL: Unexpected error during startup: {e}", exc_info=True)
         sys.exit(1)
-    # --- END DATABASE TABLE CREATION & DIAGNOSTICS ---
 
-
-    # Include API routers
+    # --- Router Registration ---
     fastapi_app.include_router(system_owner.router, prefix="/api/v1/system-owner")
     fastapi_app.include_router(corporate_admin.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(end_user.router, prefix="/api/v1/end-user")
-    # FIX: Correct the prefix for the migration router to avoid a double prefix in the URL.
-    fastapi_app.include_router(migration.router, prefix="/api/v1/corporate-admin")
+    fastapi_app.include_router(migration.router, prefix="/api/v1/corporate-admin") # Check if this prefix overlap is intentional
     fastapi_app.include_router(auth_v2_router, prefix="/api/v1")
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
-
-    # New Issuance Module Router
+    
     fastapi_app.include_router(
         issuance_endpoints.router, 
         prefix="/api/v1/issuance", 
         tags=["Issuance Module"]
     )
-
+    
     fastapi_app.include_router(
         public_issuance.router, 
         prefix="/api/v1/public-issuance", 
         tags=["Public Issuance Portal"]
     )
 
-    # --- APScheduler Setup and Event Handlers ---
+    # --- APScheduler Setup ---
     scheduler = AsyncIOScheduler()
     fastapi_app.state.scheduler = scheduler
-
     EGYPT_TIMEZONE = pytz.timezone('Africa/Cairo')
 
-    def get_db_session_for_scheduler():
-        db_session = None
-        try:
-            db_session = next(get_db())
-            yield db_session
-        finally:
-            if db_session:
-                db_session.close()
-
     async def job_wrapper(task_func, *args, **kwargs):
+        """Wraps scheduled tasks to provide a database session."""
         logger.info(f"Scheduler triggering {task_func.__name__}.")
-        for db_session in get_db_session_for_scheduler():
-            try:
-                # Pass the db_session as the first argument, followed by other args
-                await task_func(db_session, *args, **kwargs)
-            except Exception as e:
-                logger.error(f"Error in scheduled task {task_func.__name__}: {e}", exc_info=True)
-            finally:
-                pass
+        
+        # Use a fresh session for every job execution
+        db_session = next(get_db())
+        try:
+            await task_func(db_session, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in scheduled task {task_func.__name__}: {e}", exc_info=True)
+        finally:
+            db_session.close()
 
     @fastapi_app.on_event("startup")
     async def start_scheduler():
-        """Start the APScheduler and schedule tasks to run daily."""
-        if not hasattr(app_background_tasks, 'run_daily_undelivered_instructions_report'):
-            logger.critical("Background tasks module not fully loaded, cannot schedule jobs.")
-            sys.exit(1)
+        """Define and start cron jobs."""
+        
+        # Mapping of jobs to their configuration for cleaner setup
+        jobs = [
+            {
+                "func": app_background_tasks.run_daily_undelivered_instructions_report,
+                "id": "undelivered_report_daily_job",
+                "name": "Daily Undelivered Instructions Report",
+                "minute": 0,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_print_reminders,
+                "id": "print_reminders_daily_job",
+                "name": "Daily Print Reminders",
+                "minute": 5,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_renewal_reminders,
+                "id": "renewal_reminders_daily_job",
+                "name": "Daily Renewal Reminders",
+                "minute": 10,
+                "args": []
+            },
+            {
+                "func": subscription_tasks.run_daily_subscription_status_update,
+                "id": "subscription_status_daily_job",
+                "name": "Daily Subscription Status",
+                "minute": 15,
+                "args": [log_action, crud_customer, crud_customer_configuration]
+            },
+            {
+                "func": app_background_tasks.run_daily_lg_status_update,
+                "id": "lg_status_daily_job",
+                "name": "Daily LG Status Update",
+                "minute": 20,
+                "args": []
+            }
+        ]
 
-        scheduler.add_job(
-            func=job_wrapper,
-            trigger=CronTrigger(hour=2, minute=0, timezone=EGYPT_TIMEZONE),
-            id='undelivered_report_daily_job',
-            name='Daily Undelivered Instructions Report',
-            args=[app_background_tasks.run_daily_undelivered_instructions_report]
-        )
-        logger.info("Scheduled 'Daily Undelivered Instructions Report' to run every day at 2:00 AM EEST.")
-
-        scheduler.add_job(
-            func=job_wrapper,
-            trigger=CronTrigger(hour=2, minute=5, timezone=EGYPT_TIMEZONE),
-            id='print_reminders_daily_job',
-            name='Daily Print Reminders and Escalations',
-            args=[app_background_tasks.run_daily_print_reminders]
-        )
-        logger.info("Scheduled 'Daily Print Reminders and Escalations' to run every day at 2:05 AM EEST.")
-
-        scheduler.add_job(
-            func=job_wrapper,
-            trigger=CronTrigger(hour=2, minute=10, timezone=EGYPT_TIMEZONE),
-            id='renewal_reminders_daily_job',
-            name='Daily LG Renewal Reminders',
-            args=[app_background_tasks.run_daily_renewal_reminders]
-        )
-        logger.info("Scheduled 'Daily LG Renewal Reminders' to run every day at 2:10 AM EEST.")
-
-        # NEW: Schedule the subscription status update task
-        scheduler.add_job(
-            func=job_wrapper,
-            trigger=CronTrigger(hour=2, minute=15, timezone=EGYPT_TIMEZONE),
-            id='subscription_status_daily_job',
-            name='Daily Subscription Status Update',
-            # Pass the dependencies as arguments
-            args=[subscription_tasks.run_daily_subscription_status_update, log_action, crud_customer, crud_customer_configuration]
-        )
-        logger.info("Scheduled 'Daily Subscription Status Update' to run every day at 2:15 AM EEST.")
-
-        scheduler.add_job(
-            func=job_wrapper,
-            trigger=CronTrigger(hour=2, minute=20, timezone=EGYPT_TIMEZONE),
-            id='lg_status_daily_job',
-            name='Daily LG Status Update to Expired',
-            args=[app_background_tasks.run_daily_lg_status_update]
-        )
-        logger.info("Scheduled 'Daily LG Status Update to Expired' to run every day at 2:20 AM EEST.")
+        for job in jobs:
+            scheduler.add_job(
+                func=job_wrapper,
+                trigger=CronTrigger(hour=2, minute=job["minute"], timezone=EGYPT_TIMEZONE),
+                id=job["id"],
+                name=job["name"],
+                args=[job["func"]] + job["args"]
+            )
+            logger.info(f"Scheduled '{job['name']}' at 02:{job['minute']:02d} EEST.")
 
         scheduler.start()
-        logger.info("APScheduler started and daily background tasks have been scheduled.")
+        logger.info("APScheduler started.")
 
     @fastapi_app.on_event("shutdown")
     async def shutdown_scheduler():
-        """Shut down the APScheduler gracefully when the FastAPI application shuts down."""
         scheduler.shutdown()
         logger.info("APScheduler shut down.")
-
-    # --- END APScheduler Setup ---
 
     @fastapi_app.get("/")
     async def root():
         return {"message": "Treasury Management Platform API is running!"}
 
-# Call the configuration function at the module level, passing the 'app' instance
+# Call the configuration
 configure_app_instance(app)

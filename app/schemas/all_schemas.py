@@ -1394,6 +1394,30 @@ class UserLegalAcceptanceOut(BaseModel):
     class Config:
         from_attributes = True
 
+class LGLifecycleHistoryReportItem(BaseModel):
+
+# CRITICAL FIX: Ensure LG ID is present for potential frontend merging
+    lg_record_id: int 
+    lg_number: str
+    beneficiary_name: Optional[str] = None
+    issuing_bank_name: Optional[str] = None
+    user_email: Optional[str] = None
+    action_type: str
+    timestamp: datetime
+    details: Optional[Dict[str, Any]] = None
+    
+    # NEW FIELDS ADDED TO EXPOSE LG RECORD DATA
+    issuer_name: Optional[str] = None
+    lg_amount: Optional[float] = None
+    lg_currency: Optional[str] = None
+    lg_type_name: Optional[str] = None
+    lg_category_name: Optional[str] = None
+    internal_owner_email: Optional[EmailStr] = None
+    issuance_date: Optional[date] = None
+    
+    class Config:
+        from_attributes = True
+
 # =====================================================================================
 # REBUILD MODELS WITH NEW RELATIONSHIPS
 # =====================================================================================

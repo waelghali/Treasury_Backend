@@ -54,14 +54,22 @@ class IssuanceFacilityOut(IssuanceFacilityBase):
     class Config:
         from_attributes = True
 
-# --- 3. SUITABLE FACILITY ---
+# --- 3. SMART DECISION SUPPORT ---
 class SuitableFacilityOut(BaseModel):
     facility_id: int
     facility_bank: str
     sub_limit_id: int
     sub_limit_name: str
     limit_available: float
-    price_commission: float
+    
+    # NEW INTELLIGENCE FIELDS
+    price_commission_rate: float
+    price_cash_margin_pct: float
+    estimated_commission_cost: float
+    required_cash_margin_amount: float
+    
+    # Recommendation Tags (e.g. "BEST_PRICE", "NO_MARGIN")
+    recommendation_tags: List[str] = []
 
 # --- 4. ISSUANCE REQUESTS ---
 class BusinessDetails(BaseModel):
@@ -70,7 +78,6 @@ class BusinessDetails(BaseModel):
     department: Optional[str] = None
 
 class IssuanceRequestBase(BaseModel):
-    # FIX: Made Optional to prevent validation error when DB has null
     requestor_name: Optional[str] = None 
     transaction_type: str = "NEW_ISSUANCE" 
     lg_record_id: Optional[int] = None
@@ -88,7 +95,6 @@ class IssuanceRequestUpdate(BaseModel):
     status: Optional[str] = None
     rejection_reason: Optional[str] = None
 
-
 class IssuanceRequestContentUpdate(BaseModel):
     amount: Optional[float] = None
     beneficiary_name: Optional[str] = None
@@ -103,15 +109,34 @@ class IssuanceRequestOut(IssuanceRequestBase):
     requestor_user_id: Optional[int]
     status: str
     created_at: datetime
-    
-    # Relationships
     currency: Optional[CurrencyOut] = None
     lg_record: Optional[LGRecordOut] = None
 
     class Config:
         from_attributes = True
 
-# --- 5. EXECUTED RECORD WRAPPER ---
 class IssuedLGRecordOut(BaseModel):
     message: str
     lg_record_id: Optional[int] = None
+
+# --- 5. RECONCILIATION SCHEMAS ---
+class BankPositionRow(BaseModel):
+    """Represents one row from the Bank's Excel Sheet"""
+    ref_number: str
+    amount: float
+    currency: str
+    status: str = "ACTIVE"
+
+class ReconciliationRequest(BaseModel):
+    bank_id: int
+    as_of_date: date
+    rows: List[BankPositionRow]
+
+class ReconciliationResult(BaseModel):
+    total_bank_records: int
+    matched_count: int
+    mismatched_amount_count: int
+    missing_in_system_count: int
+    
+    # Detailed discrepancies
+    discrepancies: List[Dict[str, Any]]

@@ -394,3 +394,74 @@ class CRUDReports(CRUDBase):
                 return {'average_days': avg_days} if avg_days is not None else None
             return [{"name": row[0], "value": row[1]} for row in results]
         return []
+    
+def get_all_lg_lifecycle_history(
+    db: Session,
+    user_id: int,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    action_types: Optional[List[str]] = None,
+    lg_record_ids: Optional[List[int]] = None
+) -> List[Dict[str, Any]]:
+    
+    current_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not current_user:
+        return []
+        
+    customer_id = getattr(current_user, 'customer_id', None)
+
+    # 1. Build the Query: MINIMAL SELECTION (only what is reliably available)
+    query = db.query(
+        models.AuditLog,
+        models.LGRecord,
+        models.User
+    ).join(
+        models.LGRecord, models.AuditLog.lg_record_id == models.LGRecord.id
+    ).outerjoin(
+        models.User, models.AuditLog.user_id == models.User.id
+    )
+
+    # 2. Apply Filters
+    if customer_id:
+        query = query.filter(models.LGRecord.customer_id == customer_id)
+    
+    if start_date:
+        query = query.filter(func.date(models.AuditLog.timestamp) >= start_date)
+    
+    if end_date:
+        query = query.filter(func.date(models.AuditLog.timestamp) <= end_date)
+
+    if action_types:
+        query = query.filter(models.AuditLog.action_type.in_(action_types))
+
+    if lg_record_ids:
+        query = query.filter(models.LGRecord.id.in_(lg_record_ids))
+
+    query = query.order_by(models.AuditLog.timestamp.desc())
+
+    # 3. Execute and Format
+    results = []
+    raw_data = query.all()
+
+    for log, lg, user in raw_data:
+        # Safely get beneficiary
+        ben_name = lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else 'N/A'
+        
+        # Safely get bank name
+        bank_name = lg.issuing_bank.name if lg.issuing_bank else lg.foreign_bank_name if lg.foreign_bank_name else 'N/A'
+
+        results.append({
+            # --- CRITICAL FIX: Explicitly returning the LG ID for the frontend merge ---
+            "lg_record_id": lg.id,
+            
+            # --- HISTORY FIELDS ---
+            "lg_number": lg.lg_number,
+            "beneficiary_name": ben_name,
+            "issuing_bank_name": bank_name,
+            "user_email": user.email if user else "System/Unknown",
+            "action_type": log.action_type,
+            "timestamp": log.timestamp,
+            "details": log.details
+        })
+
+    return results

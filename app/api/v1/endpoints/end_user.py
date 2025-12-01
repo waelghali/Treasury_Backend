@@ -15,7 +15,6 @@ from sqlalchemy import func, and_
 from typing import List, Optional, Any, Dict, Tuple
 
 from fuzzywuzzy import fuzz
-
 from app.database import get_db
 
 from app.schemas.all_schemas import (
@@ -46,8 +45,9 @@ from app.schemas.all_schemas import (
     SystemNotificationOut,
     # New schema
     LGInstructionCancelRequest,
+    LGLifecycleHistoryReportItem,
 )
-
+from app.crud import crud_reports
 from app.crud.crud import (
     log_action,
     crud_audit_log,
@@ -3402,3 +3402,38 @@ async def cancel_lg_instruction(
         except Exception as e:
             log_action(db, user_id=end_user_context.user_id, action_type=AUDIT_ACTION_TYPE_LG_INSTRUCTION_CANCELLATION_FAILED, entity_type="LGInstruction", entity_id=instruction_id, details={"reason": f"An unexpected error occurred during direct cancellation: {e}", "lg_record_id": lg_record_id}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during direct cancellation: {e}")
+
+# --- NEW REPORT ENDPOINT ---
+@router.get("/reports/lg-lifecycle-history", response_model=List[LGLifecycleHistoryReportItem])
+def get_lg_lifecycle_history_report(
+    # FIXED: Importing directly from app.database
+    db: Session = Depends(get_db),
+    # FIXED: Importing directly from app.core.security
+    end_user_context = Depends(get_current_end_user_context),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    action_types: Optional[str] = Query(None, description="Comma-separated list of action types"),
+    lg_record_ids: Optional[str] = Query(None, description="Comma-separated list of LG Record IDs")
+):
+    """
+    Retrieve full lifecycle history report for export.
+    """
+    # Parse comma-separated strings into lists
+    action_type_list = action_types.split(",") if action_types else None
+    
+    lg_record_id_list = None
+    if lg_record_ids:
+        try:
+            lg_record_id_list = [int(id_str) for id_str in lg_record_ids.split(",")]
+        except ValueError:
+            pass 
+
+    history = crud_reports.get_all_lg_lifecycle_history(
+        db=db,
+        user_id=end_user_context.user_id,
+        start_date=start_date,
+        end_date=end_date,
+        action_types=action_type_list,
+        lg_record_ids=lg_record_id_list
+    )
+    return history

@@ -23,11 +23,6 @@ async def generate_pdf_from_html(html_content: str, filename_hint: str = "docume
         # Create an HTML object from the string content
         html = HTML(string=html_content)
         
-        # You can optionally add CSS here if your templates use external CSS or need specific print styles
-        # For example:
-        # css = CSS(string='@page { size: A4; margin: 1cm; } body { font-family: sans-serif; }')
-        # pdf_bytes = html.write_pdf(stylesheets=[css])
-
         pdf_bytes = html.write_pdf()
 
         logger.info(f"generate_pdf_from_html: Successfully generated PDF bytes for '{filename_hint}' (size: {len(pdf_bytes)} bytes).")
