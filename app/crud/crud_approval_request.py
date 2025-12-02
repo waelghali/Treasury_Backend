@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from datetime import datetime, date, timedelta
 import json
 import decimal
-
+from app.core.ai_integration import delete_file_from_gcs
 from app.crud.crud import CRUDBase, log_action
 import app.models as models
 from app.schemas.all_schemas import (
@@ -45,6 +45,25 @@ from app.core.email_service import EmailSettings, get_global_email_settings, sen
 
 import logging
 logger = logging.getLogger(__name__)
+
+def _nuke_document(db: Session, request_details: dict):
+    """Finds document ID in details, deletes file from Cloud, deletes record from DB."""
+    doc_id = request_details.get("supporting_document_id") or request_details.get("lg_document_id")
+    
+    if doc_id:
+        try:
+            # 1. Find the document directly
+            doc = db.query(models.LGDocument).get(int(doc_id))
+            if doc:
+                # 2. Delete from GCS
+                if doc.file_path:
+                    delete_file_from_gcs(doc.file_path)
+                
+                # 3. Delete from DB
+                db.delete(doc)
+                # Note: The main transaction will commit this change
+        except Exception as e:
+            logger.error(f"Failed to delete document {doc_id}: {e}")
 
 class CRUDApprovalRequest(CRUDBase):
     def __init__(self, model: Type[models.ApprovalRequest]):
@@ -519,13 +538,14 @@ class CRUDApprovalRequest(CRUDBase):
                 if not db_request.lg_record:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Associated LG Record not loaded for execution.")
                 supporting_document_id = db_request.request_details.get("supporting_document_id")
-
+                notes = db_request.request_details.get("notes")
                 _, instruction_id = await crud_instances.crud_lg_record.release_lg(
                     db,
                     lg_record=db_request.lg_record,
                     user_id=db_request.maker_user_id,
                     approval_request_id=db_request.id,
-                    supporting_document_id=supporting_document_id
+                    supporting_document_id=supporting_document_id,
+                    notes=notes
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"DEBUG: Approval Request {db_request.id}: crud_instances.crud_lg_record.release_lg call completed successfully. Instruction ID: {generated_instruction_id}.")
@@ -540,7 +560,7 @@ class CRUDApprovalRequest(CRUDBase):
                 new_amount = db_request.request_details.get("new_amount")
                 logger.debug(f"Approval Request {db_request.id}: Calling crud_instances.crud_lg_record.liquidate_lg with type {liquidation_type}.")
                 supporting_document_id = db_request.request_details.get("supporting_document_id")
-
+                notes = db_request.request_details.get("notes")
                 _, instruction_id = await crud_instances.crud_lg_record.liquidate_lg(
                     db,
                     lg_record=db_request.lg_record,
@@ -548,7 +568,8 @@ class CRUDApprovalRequest(CRUDBase):
                     new_amount=db_request.request_details.get("new_amount"),
                     user_id=db_request.maker_user_id,
                     approval_request_id=db_request.id,
-                    supporting_document_id=supporting_document_id # NEW: Pass the document ID
+                    supporting_document_id=supporting_document_id,
+                    notes=notes
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.liquidate_lg completed. Instruction ID: {generated_instruction_id}.")
@@ -564,14 +585,15 @@ class CRUDApprovalRequest(CRUDBase):
                 decrease_amount = db_request.request_details["decrease_amount"]
                 supporting_document_id = db_request.request_details.get("supporting_document_id")
                 logger.debug(f"Approval Request {db_request.id}: Decrease amount from request_details: {decrease_amount}. Passing to crud_instances.crud_lg_record.decrease_lg_amount.")
-
+                notes = db_request.request_details.get("notes")
                 _, instruction_id = await crud_instances.crud_lg_record.decrease_lg_amount(
                     db,
                     lg_record=db_request.lg_record,
                     decrease_amount=decrease_amount,
                     user_id=db_request.maker_user_id,
                     approval_request_id=db_request.id,
-                    supporting_document_id=supporting_document_id
+                    supporting_document_id=supporting_document_id,
+                    notes=notes
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.decrease_lg_amount call successfully awaited. Instruction ID: {generated_instruction_id}.")
@@ -609,7 +631,7 @@ class CRUDApprovalRequest(CRUDBase):
 
                 payment_details = LGActivateNonOperativeRequest(**db_request.request_details)
                 supporting_document_id = db_request.request_details.get("supporting_document_id")
-
+                notes = db_request.request_details.get("notes")
                 _, instruction_id = await crud_instances.crud_lg_record.activate_non_operative_lg(
                     db,
                     lg_record=db_request.lg_record,
@@ -617,7 +639,8 @@ class CRUDApprovalRequest(CRUDBase):
                     user_id=db_request.maker_user_id,
                     customer_id=customer_id,
                     approval_request_id=db_request.id,
-                    supporting_document_id=supporting_document_id
+                    supporting_document_id=supporting_document_id,
+                    notes=notes
                 )
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.activate_non_operative_lg call completed. Instruction ID: {generated_instruction_id}.")
@@ -809,7 +832,7 @@ class CRUDApprovalRequest(CRUDBase):
             customer_id=customer_id,
             lg_record_id=db_request.entity_id if db_request.entity_type == "LGRecord" else None,
         )
-
+        _nuke_document(db, db_request.request_details or {})
         db.refresh(db_request)
         return db_request
 
@@ -859,7 +882,7 @@ class CRUDApprovalRequest(CRUDBase):
             customer_id=customer_id,
             lg_record_id=approval_request.entity_id if approval_request.entity_type == "LGRecord" else None,
         )
-
+        _nuke_document(db, approval_request.request_details or {})
         db.refresh(approval_request)
         return approval_request
 
@@ -910,7 +933,7 @@ class CRUDApprovalRequest(CRUDBase):
                 customer_id=req.customer_id,
                 lg_record_id=req.entity_id if req.entity_type == "LGRecord" else None,
             )
-
+            _nuke_document(db, req.request_details or {})
         if auto_rejected_requests:
             db.commit()
             for req in auto_rejected_requests:

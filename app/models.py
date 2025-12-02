@@ -477,6 +477,7 @@ class LGDocument(BaseModel):
     # Relationships
     lg_record = relationship("LGRecord", back_populates="documents")
     lg_instruction = relationship("LGInstruction", back_populates="documents")
+    status = Column(String(50), default="PENDING", nullable=False, index=True)
     uploaded_by_user = relationship("User")
 
     __table_args__ = (

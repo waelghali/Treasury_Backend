@@ -731,6 +731,7 @@ class TokenData(BaseModel):
 
 class LGDocumentBase(BaseModel):
     document_type: str = Field(..., description="Type of document (e.g., 'AI_SCAN', 'INTERNAL_SUPPORTING', 'BANK_REPLY', 'AMENDMENT_LETTER', 'DELIVERY_PROOF')") # Added 'AMENDMENT_LETTER', 'DELIVERY_PROOF'
+    status: Optional[str] = Field("PENDING", max_length=50, description="The processing status of the document (e.g., PENDING, FINAL, REJECTED).")
     file_name: str = Field(..., description="Original file name of the document")
     file_path: str = Field(..., description="Path or URL to the stored file (e.g., cloud storage URL)")
     mime_type: Optional[str] = Field(None, description="MIME type of the file (e.g., 'application/pdf', 'image/jpeg')")

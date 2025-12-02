@@ -215,6 +215,27 @@ async def _cleanup_gcs_files(bucket_name: str, prefix: str):
     except Exception as e:
         logger.error(f"An unexpected error occurred during GCS cleanup for prefix {prefix}: {e}")
 
+def delete_file_from_gcs(gcs_uri: str) -> bool:
+    """Deletes a file directly from GCS using its gs:// URI."""
+    if not gcs_uri or not gcs_uri.startswith("gs://"):
+        return False
+    
+    try:
+        # uri format: gs://bucket_name/path/to/blob
+        parts = gcs_uri[len("gs://"):].split('/', 1)
+        bucket_name = parts[0]
+        blob_name = parts[1]
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        
+        blob.delete()
+        return True
+    except Exception as e:
+        # Just log it, don't crash the app
+        print(f"Error deleting file {gcs_uri}: {e}")
+        return False
 
 async def generate_signed_gcs_url(gs_uri: str, valid_for_seconds: int = 900) -> Optional[str]:
     """
