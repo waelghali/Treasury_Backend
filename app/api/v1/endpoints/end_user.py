@@ -134,6 +134,46 @@ except Exception as e:
     logger.critical(f"FATAL ERROR (end_user.py): Could not import core modules using standard absolute imports. Error: {e}", exc_info=True)
     raise
 
+async def check_and_handle_document(
+    db: Session,
+    customer_id: int,
+    config_key: GlobalConfigKey,
+    document_file: Optional[UploadFile]
+) -> Optional[int]:
+    """
+    Checks if a document is mandatory based on config_key.
+    If mandatory and missing, raises 400.
+    If provided, creates the document record and returns its ID.
+    """
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, customer_id, config_key
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'false').lower() == 'true'
+
+    if is_doc_mandatory and (document_file is None or document_file.filename == ''):
+        action_name = config_key.value.replace('DOC_MANDATORY_', '').replace('_', ' ').title()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Supporting document is mandatory for {action_name} as per Corporate Admin settings."
+        )
+
+    # If document is provided (optional or mandatory)
+    if document_file and document_file.filename != '':
+        # Use existing document creation logic (e.g., crud_lg_document.create_document)
+        document_in = LGDocumentCreate(
+            filename=document_file.filename,
+            file_type=document_file.content_type,
+            # document_type and description can be set based on the action, or left generic
+            document_type=config_key.value, # Using config key as a unique type identifier
+            is_supporting_document=True
+        )
+        lg_document = await crud_lg_document.create_document(
+            db, obj_in=document_in, file_data=await document_file.read(), commit=False
+        )
+        return lg_document.id
+    
+    return None
+
 # --- UPDATED: get_current_end_user_context dependency now checks subscription status ---
 async def get_current_end_user_context(
     current_user: TokenData = Depends(check_subscription_status)
@@ -844,7 +884,7 @@ async def extend_lg_record(
 async def release_lg_record(
     lg_record_id: int,
     reason: str = Form(..., description="Reason for releasing the LG."),
-    notes: Optional[str] = Form(None, description="Additional notes for the action."), # NEW: Add notes field
+    notes: Optional[str] = Form(None, description="Additional notes for the action."),
     internal_supporting_document_file: Optional[UploadFile] = File(None, description="Optional internal supporting document."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -875,14 +915,34 @@ async def release_lg_record(
 
     action_type = ACTION_TYPE_LG_RELEASE
 
+    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RELEASE
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
+
+    # The file is considered 'missing' if it's None OR if it's an empty upload (e.g., from form data without file selection)
+    file_provided = internal_supporting_document_file is not None and internal_supporting_document_file.filename != ''
+    
+    if is_doc_mandatory and not file_provided:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supporting document is mandatory for LG Release as per Corporate Admin settings."
+        )
+    # --- END NEW ENFORCEMENT LOGIC ---
+
     current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
 
     document_id_for_approval_request = None
-    if internal_supporting_document_file:
+    
+    # --- DOCUMENT UPLOAD LOGIC (Executed only if file was provided, mandatory or optional) ---
+    if file_provided:
         if not customer.subscription_plan.can_image_storage:
              raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your subscription plan does not support document storage.")
         
+        # NOTE: File content must be read *after* the mandatory check to ensure it's only read once.
         file_bytes = await internal_supporting_document_file.read()
+        
         document_metadata = LGDocumentCreate(
             document_type="INTERNAL_SUPPORTING",
             file_name=internal_supporting_document_file.filename,
@@ -901,6 +961,7 @@ async def release_lg_record(
         except Exception as e:
             logger.error(f"Failed to store supporting document for LG {lg_record_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store supporting document: {e}")
+    # --- END DOCUMENT UPLOAD LOGIC ---
 
     if current_action_requires_maker_checker:
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, lg_record_id, end_user_context.customer_id)
@@ -918,6 +979,7 @@ async def release_lg_record(
             
             request_details = release_in.model_dump()
             if document_id_for_approval_request:
+                # Store the document ID in the request_details for the corporate admin to review
                 request_details["supporting_document_id"] = document_id_for_approval_request
             
             approval_request_in = ApprovalRequestCreate(
@@ -996,7 +1058,6 @@ async def release_lg_record(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"An unexpected error occurred during direct release: {e}"
             )
-
 # --------------------------------------------------------------------------------------
 # 2. /lg-records/{lg_record_id}/liquidate
 # --------------------------------------------------------------------------------------
@@ -1053,6 +1114,20 @@ async def liquidate_lg_record(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer or Subscription Plan not found.")
 
     action_type = ACTION_TYPE_LG_LIQUIDATE
+    
+    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_LIQUIDATION # <--- NEW KEY
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
+
+    if is_doc_mandatory and internal_supporting_document_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supporting document is mandatory for LG Liquidation as per Corporate Admin settings."
+        )
+    # --- END NEW ENFORCEMENT LOGIC ---
+    
     current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
     
     document_id_for_approval_request = None
@@ -1229,6 +1304,20 @@ async def decrease_lg_amount_record(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer or Subscription Plan not found.")
 
     action_type = ACTION_TYPE_LG_DECREASE_AMOUNT
+
+    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_DECREASE_AMOUNT # <--- NEW KEY
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
+
+    if is_doc_mandatory and internal_supporting_document_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supporting document is mandatory for LG Decrease Amount as per Corporate Admin settings."
+        )
+    # --- END NEW ENFORCEMENT LOGIC ---
+
     current_action_requires_maker_checker = action_type in ACTION_TYPES_REQUIRING_APPROVAL
     
     document_id_for_approval_request = None
@@ -1411,6 +1500,19 @@ async def activate_non_operative_lg_record(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer or Subscription Plan not found.")
 
     action_type = ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE
+
+    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_ACTIVATE # <--- NEW KEY
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
+
+    if is_doc_mandatory and internal_supporting_document_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supporting document is mandatory for LG Activation as per Corporate Admin settings."
+        )
+    # --- END NEW ENFORCEMENT LOGIC ---
     
     document_id_for_approval_request = None
     if internal_supporting_document_file:
@@ -2034,6 +2136,19 @@ async def record_instruction_delivery_api(
     """
     client_host = get_client_ip(request) if request else None
 
+    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RECORD_DELIVERY # <--- NEW KEY
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
+
+    if is_doc_mandatory and delivery_document_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supporting delivery document is mandatory for Recording Delivery as per Corporate Admin settings."
+        )
+    # --- END NEW ENFORCEMENT LOGIC ---
+
     # Manually create the LGInstructionRecordDelivery object
     file_bytes = None
     delivery_document_data = None
@@ -2109,6 +2224,20 @@ async def record_bank_reply_api(
     request: Request = None
 ):
     client_host = get_client_ip(request) if request else None
+
+
+    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RECORD_BANK_REPLY # <--- NEW KEY
+    )
+    is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
+
+    if is_doc_mandatory and bank_reply_document_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supporting bank reply document is mandatory for Recording Bank Reply as per Corporate Admin settings."
+        )
+    # --- END NEW ENFORCEMENT LOGIC ---
 
     file_bytes = None
     bank_reply_document_data = None

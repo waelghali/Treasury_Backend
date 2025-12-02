@@ -18,15 +18,28 @@ from app.schemas.all_schemas import (
 )
 from app.constants import GlobalConfigKey, AUDIT_ACTION_TYPE_UPDATE
 
+from sqlalchemy import cast, String 
+
+
 class CRUDGlobalConfiguration(CRUDBase):
     def get_by_key(
         self, db: Session, key: GlobalConfigKey
     ) -> Optional[GlobalConfiguration]:
+        # REVERT TO ORIGINAL: We rely on the developer to ensure the database value 
+        # exactly matches the GlobalConfigKey enum value string.
         return (
             db.query(self.model)
             .filter(self.model.key == key, self.model.is_deleted == False)
             .first()
         )
+
+    def _validate_config_value(global_config, configured_value):
+        if global_config.unit and global_config.unit.lower() == 'boolean':
+            if configured_value.lower() not in ['true', 'false']:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Value for '{global_config.key.value}' must be 'true' or 'false'."
+                )
 
     def create(self, db: Session, obj_in: BaseModel, **kwargs: Any) -> BaseModel:
         db_obj = super().create(db, obj_in, **kwargs)

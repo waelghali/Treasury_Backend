@@ -963,6 +963,8 @@ def read_customer_configurations(
     configs = crud_customer_configuration.get_all_customer_configs_for_customer(db, customer_id)
     return configs
 
+# app/api/v1/endpoints/corporate_admin.py
+
 @router.put("/customer-configurations/{global_config_key}", response_model=CustomerConfigurationOut, dependencies=[Depends(check_for_read_only_mode)])
 def update_customer_configuration(
     global_config_key: str,
@@ -971,16 +973,36 @@ def update_customer_configuration(
     corporate_admin_context: TokenData = Depends(HasPermission("customer_config:edit")),
     request: Request = None
 ):
+    """
+    Updates or Creates a customer configuration. Uses a robust lookup mechanism 
+    to handle newly added ENUM keys that may cause ORM issues.
+    """
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    key_for_db = global_config_key.upper()
 
     try:
-        config_key_enum = GlobalConfigKey(global_config_key.upper())
+        # 1. Validation: Convert the string key to the Enum instance (This is necessary for the next check)
+        config_key_enum = GlobalConfigKey(key_for_db)
         
-        global_config = crud_global_configuration.get_by_key(db, config_key_enum)
+        # 2. Look up the Global Configuration record
+        global_config = None
+        
+        # Try original method first (most compatible with existing code)
+        try:
+             # Your original line which fails for new keys:
+             global_config = crud_global_configuration.get_by_key(db, config_key_enum) 
+        except Exception:
+             # If the original fails, use the robust string lookup
+             global_config = crud_global_configuration.get_by_key_string_only(db, key_for_db)
+        
         if not global_config:
+            # If the key is not found in the GLOBAL table, it's a true 404.
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Global configuration key not found.")
 
+        # 3. CRITICAL FIX: Upsert the customer configuration record
+        # We need a new CRUD method that handles both CREATE (for new keys) and UPDATE (for old keys)
+        # Assuming you implemented the 'set_customer_config' Upsert logic from the previous step.
         db_customer_config = crud_customer_configuration.set_customer_config(
             db, 
             customer_id=customer_id, 
@@ -989,12 +1011,15 @@ def update_customer_configuration(
             user_id=corporate_admin_context.user_id
         )
         
+        # 4. Build the response data exactly as originally intended.
         response_data = CustomerConfigurationOut(
             id=db_customer_config.id,
             customer_id=db_customer_config.customer_id,
             global_config_id=db_customer_config.global_config_id,
             configured_value=db_customer_config.configured_value,
             
+            # These values come from the relationship to global_configuration
+            # Note: We must still rely on the relationship to populate these fields.
             global_config_key=db_customer_config.global_configuration.key.value,
             effective_value=db_customer_config.configured_value,
             global_value_default=db_customer_config.global_configuration.value_default,
@@ -1010,9 +1035,12 @@ def update_customer_configuration(
         )
         
         return response_data
+    
+    # 5. Log and Handle Exceptions
     except ValueError as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e)}, customer_id=customer_id, ip_address=client_host)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        # This catches failure to instantiate GlobalConfigKey for new keys if constants.py is stale
+        log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": f"Key not recognized by Python Enum: {e}"}, customer_id=customer_id, ip_address=client_host)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Configuration key '{global_config_key}' is invalid or not recognized.")
     except HTTPException as e:
         log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
@@ -1022,7 +1050,6 @@ def update_customer_configuration(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
         )
-
 
 # --- Customer Email Settings Management (Corporate Admin) (NEW SECTION) ---
 @router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
