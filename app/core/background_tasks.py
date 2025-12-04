@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import exc, and_, or_
-
+from app.database import SessionLocal
 # Pydantic
 from pydantic import EmailStr
 
@@ -213,11 +213,15 @@ async def run_daily_undelivered_instructions_report(db: Session):
     logger.info("Finished task: Undelivered LG Instructions Report.")
 
 
-async def proactively_correct_customer_configs(global_config_id: int, db: Session):
+async def proactively_correct_customer_configs(global_config_id: int):
     """
     Triggered by API: Re-validates customer configs against global changes.
+    Creates its own DB session to ensure connection remains open.
     """
     logger.info(f"Starting config correction for GlobalConfig ID: {global_config_id}")
+    
+    # NEW: Create a fresh session specifically for this background task
+    db = SessionLocal()
     
     try:
         corrections = crud_customer_configuration.revalidate_customer_configs_for_global_change(
@@ -239,9 +243,16 @@ async def proactively_correct_customer_configs(global_config_id: int, db: Sessio
     except Exception as e:
         db.rollback()
         logger.error(f"Error in config correction: {e}", exc_info=True)
-        log_action(db, None, "TASK_PROCESSING_FAILED", "GlobalConfiguration", global_config_id,
+        # We try to log the failure, but if the DB is the cause, this might fail too
+        try:
+            log_action(db, None, "TASK_PROCESSING_FAILED", "GlobalConfiguration", global_config_id,
                    {"reason": str(e)})
-        db.commit()
+            db.commit()
+        except:
+            pass
+    finally:
+        # CRITICAL: Always close the session when the background task is done
+        db.close()
 
 async def _send_config_correction_notification(db: Session, customer_id: int, corrections: List[Dict[str, Any]]):
     customer = db.query(models.Customer).filter(models.Customer.id == customer_id).first()

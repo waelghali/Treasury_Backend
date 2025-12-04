@@ -1216,6 +1216,7 @@ def update_global_configuration(
             detail="Global configuration not found or already deleted"
         )
     
+    # --- PRESERVED LOGIC: Check for Duplicate Keys ---
     if config_in.key is not None and config_in.key != db_config.key:
         existing_config = crud_global_configuration.get_by_key(db, key=config_in.key)
         if existing_config and existing_config.id != config_id:
@@ -1224,30 +1225,75 @@ def update_global_configuration(
                 detail=f"Global configuration with key '{config_in.key}' already exists."
             )
     
+    # 1. Capture Old Values
     old_value_min = db_config.value_min
     old_value_max = db_config.value_max
 
-    new_value_min_str = config_in.value_min if config_in.value_min is not None else old_value_min
-    new_value_max_str = config_in.value_max if config_in.value_max is not None else old_value_max
-
-    trigger_revalidation = False
-
+    # 2. Determine New Values (use incoming if present, else keep old)
+    # We treat these as strings/None initially to handle the logic safely
+    new_min_str = config_in.value_min if config_in.value_min is not None else old_value_min
+    new_max_str = config_in.value_max if config_in.value_max is not None else old_value_max
+    
+    # Get numeric values for validation (handling potential None if not set)
     try:
-        if new_value_min_str is not None and old_value_min is not None and float(new_value_min_str) > float(old_value_min):
-            trigger_revalidation = True
+        new_min_val = float(new_min_str) if new_min_str is not None else None
+        new_max_val = float(new_max_str) if new_max_str is not None else None
         
-        if new_value_max_str is not None and old_value_max is not None and float(new_value_max_str) < float(old_value_max):
-            trigger_revalidation = True
+        # Calculate new default (incoming or existing)
+        current_default_str = config_in.value_default if config_in.value_default is not None else db_config.value_default
+        new_default_val = float(current_default_str) if current_default_str is not None else None
+
+        # --- NEW LOGIC: Control Default Value vs Limits ---
+        if new_default_val is not None:
+            # Ensure Default is not less than Min
+            if new_min_val is not None and new_default_val < new_min_val:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Default value ({new_default_val}) cannot be lower than the Minimum limit ({new_min_val})."
+                )
+            # Ensure Default is not greater than Max
+            if new_max_val is not None and new_default_val > new_max_val:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Default value ({new_default_val}) cannot be higher than the Maximum limit ({new_max_val})."
+                )
+    except (ValueError, TypeError):
+        # If values aren't numeric (e.g. boolean/string configs), skip numeric validation
+        pass
+
+    # --- UPDATED LOGIC: Trigger Revalidation (Handling None -> Value) ---
+    trigger_revalidation = False
+    try:
+        # Check Min: Trigger if Min is newly added (None->Val) OR Min increased (Val->Higher Val)
+        if new_min_str is not None:
+            if old_value_min is None:
+                trigger_revalidation = True
+            elif float(new_min_str) > float(old_value_min):
+                trigger_revalidation = True
+        
+        # Check Max: Trigger if Max is newly added (None->Val) OR Max decreased (Val->Lower Val)
+        if new_max_str is not None:
+            if old_value_max is None:
+                trigger_revalidation = True
+            elif float(new_max_str) < float(old_value_max):
+                trigger_revalidation = True
     except (ValueError, TypeError):
         pass
 
+    # 3. Perform Update
     updated_config = crud_global_configuration.update(db, db_obj=db_config, obj_in=config_in)
     
+    # 4. Log Action
     client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="GlobalConfiguration", entity_id=updated_config.id, details={"key": updated_config.key, "ip_address": client_host, "updated_fields": config_in.model_dump(exclude_unset=True)})
     
+    # 5. Trigger Background Task
     if trigger_revalidation:
-        background_tasks.add_task(background_tasks_module.proactively_correct_customer_configs, global_config_id=updated_config.id, db=db)
+        # FIX: Removed 'db=db' argument. The task now opens its own session.
+        background_tasks.add_task(
+            background_tasks_module.proactively_correct_customer_configs, 
+            global_config_id=updated_config.id
+        )
 
     return updated_config
 

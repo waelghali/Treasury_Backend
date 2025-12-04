@@ -330,12 +330,15 @@ class CRUDCustomerConfiguration(CRUDBase):
             corrected_value = None
             is_corrected = False
 
-            # MODIFIED LOGIC: Check for both 'days', 'percentage', and the specific GRACE_PERIOD_DAYS key
-            if (global_config.unit in ["days", "percentage"] or global_config.key == GlobalConfigKey.GRACE_PERIOD_DAYS) and original_value:
+            # FIX: Robust check for 'days', 'percentage' (case-insensitive) OR specifically Grace Period
+            is_valid_unit = global_config.unit and global_config.unit.lower() in ["days", "percentage"]
+            is_grace_period = global_config.key == GlobalConfigKey.GRACE_PERIOD_DAYS
+
+            if (is_valid_unit or is_grace_period) and original_value:
                 try:
                     current_val = float(original_value)
-                    new_min_val = float(global_config.value_min) if global_config.value_min else None
-                    new_max_val = float(global_config.value_max) if global_config.value_max else None
+                    new_min_val = float(global_config.value_min) if global_config.value_min is not None else None
+                    new_max_val = float(global_config.value_max) if global_config.value_max is not None else None
 
                     if new_min_val is not None and current_val < new_min_val:
                         corrected_value = new_min_val
@@ -346,8 +349,9 @@ class CRUDCustomerConfiguration(CRUDBase):
                 except (ValueError, TypeError):
                     # If conversion fails, do not correct the value but log a warning.
                     pass
+
             if is_corrected:
-                # NEW LOGIC: Check if the corrected value is an integer
+                # FIX: Preserve Integer format if the corrected value is effectively an integer
                 if corrected_value == int(corrected_value):
                     cust_config.configured_value = str(int(corrected_value))
                 else:
@@ -360,7 +364,7 @@ class CRUDCustomerConfiguration(CRUDBase):
                     "customer_id": cust_config.customer_id,
                     "global_config_key": global_config.key.value,
                     "old_value": original_value,
-                    "new_value": corrected_value
+                    "new_value": cust_config.configured_value
                 })
         
         db.flush() # Flush to persist changes in the current transaction
