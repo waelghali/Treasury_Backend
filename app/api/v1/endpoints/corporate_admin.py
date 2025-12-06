@@ -1729,6 +1729,36 @@ def get_approved_requests_pending_print(
     
     return result[skip:skip + limit]
 
+@router.post(
+    "/system-notifications/{notification_id}/view", 
+    response_model=dict,
+    dependencies=[Depends(check_for_read_only_mode)],
+    summary="Logs an automatic view for a Corporate Admin system notification banner."
+)
+def log_corporate_admin_notification_view(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """
+    Records a Corporate Admin's view of a system notification, incrementing the view count for display limits.
+    """
+    notification = crud_system_notification.get(db, id=notification_id)
+    if not notification:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="System notification not found."
+        )
+
+    # Call the new CRUD method for display logging
+    log = crud_system_notification.log_notification_display(
+        db,
+        user_id=corporate_admin_context.user_id,
+        notification_id=notification_id
+    )
+    
+    return {"status": "success", "view_count": log.view_count}
+
 @router.get(
     "/system-notifications/",
     response_model=List[SystemNotificationOut],
@@ -1742,22 +1772,15 @@ def get_active_system_notifications(
     """
     Retrieves all active system notifications relevant to the authenticated Corporate Admin.
     """
+    
+    # CRITICAL FIX: Ensure the session reads committed data from the database.
+    db.expire_all() 
+
     customer_id = corporate_admin_context.customer_id
     user_id = corporate_admin_context.user_id
     
-    # Use the updated CRUD function which handles all filtering logic
     notifications = crud_system_notification.get_active_notifications_for_user(
         db, user_id=user_id, customer_id=customer_id
     )
 
-    # Log views for all notifications returned to the user
-    for notification in notifications:
-        try:
-            # This will either create a new log or increment an existing one
-            crud_system_notification_view_log.increment_view_count(db, user_id, notification.id)
-        except Exception as e:
-            # Log the error but don't fail the API call
-            logger.error(f"Failed to log view for notification ID {notification.id} for user {user_id}: {e}")
-            db.rollback() # Rollback any changes in this specific logging action
-    
     return notifications

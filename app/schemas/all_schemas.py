@@ -1205,45 +1205,72 @@ class ReportFilterBase(BaseModel):
             raise ValueError("Cannot use 'As of Date' with 'From Date' or 'To Date'. Choose one date filtering method.")
         return self
 
-# --- NEW: SystemNotification Schemas (for announcement banner) ---
+
+# --- Shared Properties ---
 class SystemNotificationBase(BaseModel):
     content: str = Field(..., description="The plain text message of the notification.")
     link: Optional[str] = Field(None, description="Optional URL to attach to the message.")
     start_date: datetime = Field(..., description="The date and time the notification becomes active.")
     end_date: datetime = Field(..., description="The date and time the notification expires.")
     is_active: bool = Field(True, description="Whether the notification is currently active or disabled.")
-    target_customer_ids: Optional[List[int]] = Field(None, description="List of customer IDs to target. Null or empty list means all customers.")
-    animation_type: Optional[str] = Field(None, description="CSS animation class to apply (e.g., 'fade', 'slide-left')")
-    display_frequency: str = Field("once-per-login", description="Frequency of display (e.g., 'once', 'once-per-login', 'repeat')")
-    max_display_count: Optional[int] = Field(None, description="Max times to display for a repeating notification")
-    target_user_ids: Optional[List[int]] = Field(None, description="List of specific user IDs to target")
-    target_roles: Optional[List[str]] = Field(None, description="List of user roles to target")
+    
+    # Targeting
+    target_customer_ids: Optional[List[int]] = Field(None, description="List of customer IDs.")
+    target_user_ids: Optional[List[int]] = Field(None, description="List of user IDs.")
+    target_roles: Optional[List[str]] = Field(None, description="List of user roles.")
+    
+    # Display & Animation
+    animation_type: Optional[str] = Field("fade", description="CSS animation class.")
+    display_frequency: str = Field("once-per-login", description="Frequency of display.")
+    max_display_count: Optional[int] = Field(None, description="Max times to display.")
+    
+    notification_type: Optional[str] = Field("system_info", description="Type of notification (system_info, critical, cbe, etc.)")
+    is_popup: bool = Field(False, description="If True, shows as a blocking modal instead of a banner.")
+    popup_action_label: Optional[str] = Field(None, description="Label for the acknowledgment button (e.g., 'I Agree').")
 
+# --- Create Schema ---
 class SystemNotificationCreate(SystemNotificationBase):
     pass
 
-class SystemNotificationUpdate(SystemNotificationBase):
+# --- Update Schema ---
+class SystemNotificationUpdate(BaseModel):
+    # explicitly list ALL fields as Optional so partial updates work reliably
     content: Optional[str] = None
     link: Optional[str] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     is_active: Optional[bool] = None
+    target_customer_ids: Optional[List[int]] = None
+    target_user_ids: Optional[List[int]] = None
+    target_roles: Optional[List[str]] = None
+    animation_type: Optional[str] = None
+    display_frequency: Optional[str] = None
+    max_display_count: Optional[int] = None
+    notification_type: Optional[str] = None
+    is_popup: Optional[bool] = None
+    popup_action_label: Optional[str] = None
 
-class SystemNotificationOut(SystemNotificationBase, BaseSchema):
-    created_by_user_id: int
-    animation_type: Optional[str]
-    display_frequency: str
-    max_display_count: Optional[int]
-    target_user_ids: Optional[List[int]]
-    target_roles: Optional[List[str]]
+# --- Output Schema (Response) ---
+class SystemNotificationOut(SystemNotificationBase):
+    id: int
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    created_by_user_id: Optional[int] = None
+    is_deleted: bool = False
 
+    class Config:
+        from_attributes = True
+
+# --- View Log Schemas (Keep as is) ---
 class SystemNotificationViewLogBase(BaseModel):
     user_id: int
     notification_id: int
     view_count: int = Field(1)
 
-class SystemNotificationViewLogOut(SystemNotificationViewLogBase, BaseSchema):
-    pass
+class SystemNotificationViewLogOut(SystemNotificationViewLogBase):
+    id: int
+    class Config:
+        from_attributes = True
 
 # --- NEW: Request a demo ---
 class DemoRequestCreate(BaseModel):

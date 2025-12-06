@@ -175,18 +175,30 @@ async def check_and_handle_document(
     return None
 
 # --- UPDATED: get_current_end_user_context dependency now checks subscription status ---
+
 async def get_current_end_user_context(
     current_user: TokenData = Depends(check_subscription_status)
 ) -> TokenData:
     """
-    Dependency that ensures the current user is an active user (END_USER or CORPORATE_ADMIN acting as end user)
-    and has an associated customer_id. It now correctly depends on the subscription status check.
+    Dependency that ensures the current user is an active user (END_USER or CORPORATE_ADMIN).
+    
+    CRITICAL FIX: Allow SYSTEM_OWNER role to pass through without a customer_id, 
+    as they may be accessing global notifications or debugging.
     """
+    
+    # Allow System Owners to proceed, they will get a customer_id of None,
+    # which the notification fetching logic must safely handle.
+    if current_user.role == "system_owner":
+        return current_user
+        
+    # For all other non-system-owner roles (End User, Corporate Admin, etc.), 
+    # a customer_id is mandatory for the 'end-user' context.
     if current_user.customer_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="User is not associated with a customer. Data integrity error."
         )
+        
     return current_user
 
 
@@ -2959,7 +2971,6 @@ async def get_lg_categories_for_end_user(
     all_categories.sort(key=lambda x: (0 if x.customer_id is None else 1, x.name.lower()))
     return all_categories
 
-
 @router.post(
     "/lg-records/instructions/{original_instruction_id}/send-reminder-to-bank",
     response_class=HTMLResponse,
@@ -2973,19 +2984,18 @@ async def send_reminder_to_bank_api(
     request: Request = None
 ):
     """
-    Allows an End User to manually send a reminder instruction to the bank
-    for an LG instruction that has not yet received a bank reply.
-    Creates a new LGInstruction record of type 'LG_REMINDER_TO_BANKS'.
+    Allows an End User to manually send a reminder instruction to the bank.
     """
-    client_host = get_client_ip(request) if request else None
+    # 1. Fetch instruction first to get valid IDs for logging
+    db_instruction = crud_lg_instruction.get(db, original_instruction_id)
+    if not db_instruction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instruction not found.")
+    
+    # Store the valid LG Record ID for logging
+    valid_lg_record_id = db_instruction.lg_record_id
 
     try:
-        # The crud_lg_instruction.send_bank_reminder function internally
-        # already retrieves the LG record and its details.
-        # We need to capture the LG record object from the crud function if possible,
-        # or retrieve it again here to get the recipient details.
-        
-        # We will assume the crud function returns the LG record. If not, we'll fetch it.
+        # 2. Call the CRUD function (PDF generation happens INSIDE here)
         lg_record, new_instruction_id, generated_pdf_bytes = await crud_lg_instruction.send_bank_reminder(
             db,
             original_instruction_id=original_instruction_id,
@@ -2997,30 +3007,7 @@ async def send_reminder_to_bank_api(
             logger.error(f"PDF bytes were not generated for reminder for original instruction ID {original_instruction_id}.")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate reminder PDF.")
 
-        # CRITICAL FIX: The issue is likely here, where the template rendering happens.
-        # You need to retrieve the recipient details and update the template content.
-        
-        # Assuming `lg_record` is the ORM object for the LG.
-        # Now we'll use the helper from crud_lg_record to get the recipient.
-        recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record)
-
-        # We need to re-render the template with the recipient details.
-        # This part of the code is implicitly happening inside `crud_lg_instruction.send_bank_reminder`.
-        # To avoid re-implementing the full rendering logic here, let's modify `send_bank_reminder`
-        # in `crud_lg_instruction.py` to correctly handle the recipient.
-        #
-        # Since we're trying to fix this in `end_user.py`, a simple and safe way is to
-        # re-inject the details before rendering.
-        # However, the best practice is to fix the source of the problem, which is inside
-        # `crud_lg_instruction.send_bank_reminder` where the template is first populated.
-        
-        # Assuming the fix is to pass the recipient info to the rendering function inside crud.
-        # Let's add that to the `crud_lg_instruction.send_bank_reminder` function itself.
-        
-        # Since I can't edit `crud_lg_instruction.py`, I will assume you will apply the fix
-        # there as well, just like we did for `crud_lg_record.py`'s functions.
-        # The code below will work if that assumption is true.
-        
+        # 3. Return the PDF for printing
         pdf_base64 = base64.b64encode(generated_pdf_bytes).decode('utf-8')
 
         html_content = f"""
@@ -3039,26 +3026,23 @@ async def send_reminder_to_bank_api(
                 window.onload = function() {{
                     setTimeout(function() {{
                         window.print();
-                        # window.close(); // Automatically close the new window/tab after printing
                     }}, 500);
                 }};
             </script>
         </body>
         </html>
         """
-        logger.info(f"Generated individual PDF for reminder for original instruction ID {original_instruction_id}. Returning HTML for print dialog.")
+        logger.info(f"Generated reminder PDF for instruction {original_instruction_id}.")
         return HTMLResponse(content=html_content, status_code=status.HTTP_200_OK)
 
     except HTTPException as e:
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_REMINDER_SENT_TO_BANK_FAILED", entity_type="LGInstruction", entity_id=original_instruction_id, details={"reason": str(e.detail)}, customer_id=end_user_context.customer_id, lg_record_id=original_instruction_id)
+        # FIX: Use valid_lg_record_id to avoid IntegrityError
+        log_action(db, user_id=end_user_context.user_id, action_type="LG_REMINDER_SENT_TO_BANK_FAILED", entity_type="LGInstruction", entity_id=original_instruction_id, details={"reason": str(e.detail)}, customer_id=end_user_context.customer_id, lg_record_id=valid_lg_record_id)
         raise
     except Exception as e:
-        lg_rec_id = original_instruction_id
-        if 'db_instruction' in locals() and db_instruction.lg_record:
-            lg_rec_id = db_instruction.lg_record.id
-
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_REMINDER_SENT_TO_BANK_FAILED", entity_type="LGInstruction", entity_id=original_instruction_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=end_user_context.customer_id, lg_record_id=lg_rec_id)
+        # FIX: Use valid_lg_record_id to avoid IntegrityError
         logger.exception(f"Unexpected error in send_reminder_to_bank_api for instruction {original_instruction_id}: {e}")
+        log_action(db, user_id=end_user_context.user_id, action_type="LG_REMINDER_SENT_TO_BANK_FAILED", entity_type="LGInstruction", entity_id=original_instruction_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=end_user_context.customer_id, lg_record_id=valid_lg_record_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -3346,10 +3330,11 @@ async def get_current_user_dashboard_info(
         "active_lgs_count": active_lg_count,
     }
 
+
 @router.get(
     "/system-notifications/",
     response_model=List[SystemNotificationOut],
-    dependencies=[Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(check_subscription_status)],
     summary="Get active system notifications for the current user's customer"
 )
 def get_active_system_notifications(
@@ -3359,41 +3344,32 @@ def get_active_system_notifications(
     """
     Retrieves all active system notifications relevant to the authenticated user.
     """
+    
+    # CRITICAL FIX: Ensure the session reads committed data from the database.
+    db.expire_all() 
+
     customer_id = end_user_context.customer_id
     user_id = end_user_context.user_id
     
-    # Use the updated CRUD function which handles all filtering logic
     notifications = crud_system_notification.get_active_notifications_for_user(
         db, user_id=user_id, customer_id=customer_id
     )
 
-    # Log views for all notifications returned to the user
-    for notification in notifications:
-        try:
-            # This will either create a new log or increment an existing one
-            crud_system_notification_view_log.increment_view_count(db, user_id, notification.id)
-        except Exception as e:
-            # Log the error but don't fail the API call
-            logger.error(f"Failed to log view for notification ID {notification.id} for user {user_id}: {e}")
-            db.rollback() # Rollback any changes in this specific logging action
-    
     return notifications
 
 @router.post(
-    "/system-notifications/{notification_id}/dismiss",
-    response_model=SystemNotificationOut,
-    dependencies=[Depends(check_for_read_only_mode)], # ADDED dependency
-    summary="Logs a dismissal for a system notification and returns the notification details."
+    "/system-notifications/{notification_id}/view", 
+    response_model=dict,
+    dependencies=[Depends(check_for_read_only_mode)],
+    summary="Logs an automatic view for a system notification banner."
 )
-def dismiss_system_notification_endpoint(
+def log_system_notification_view(
     notification_id: int,
     db: Session = Depends(get_db),
-    end_user_context: TokenData = Depends(get_current_end_user_context),
+    end_user_context = Depends(get_current_end_user_context),
 ):
     """
-    Records a user's dismissal of a system notification, incrementing the view count.
-    This action is idempotent and only increments the count once per user session
-    for 'once-per-login' notifications.
+    Records a user's view of a system notification, incrementing the view count for display limits.
     """
     notification = crud_system_notification.get(db, id=notification_id)
     if not notification:
@@ -3402,16 +3378,47 @@ def dismiss_system_notification_endpoint(
             detail="System notification not found."
         )
 
-    # Use the new CRUD function to log the view count
-    crud_system_notification_view_log.increment_view_count(
+    # Call the new CRUD method for display logging
+    log = crud_system_notification.log_notification_display( 
         db,
         user_id=end_user_context.user_id,
         notification_id=notification_id
     )
     
-    # Return the updated notification object
-    return notification
+    return {"status": "success", "view_count": log.view_count}
 
+
+@router.post(
+    "/system-notifications/{notification_id}/acknowledge", # EXISTING ENDPOINT (Dismiss action)
+    # RESPONSE MODEL CHANGED TO A SIMPLE STATUS OBJECT
+    response_model=dict,
+    dependencies=[Depends(check_for_read_only_mode)],
+    summary="Logs an acknowledgment for a system notification."
+)
+def acknowledge_system_notification( # FUNCTION RENAME
+    notification_id: int,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    """
+    Records a user's acknowledgment of a system notification, incrementing the view count.
+    """
+    notification = crud_system_notification.get(db, id=notification_id)
+    if not notification:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="System notification not found."
+        )
+
+    # Use the dedicated CRUD method for explicit acknowledgment
+    log = crud_system_notification.acknowledge_notification(
+        db,
+        user_id=end_user_context.user_id,
+        notification_id=notification_id
+    )
+    
+    # Return a simple success object
+    return {"status": "success", "view_count": log.view_count}
 
 # --------------------------------------------------------------------------------------
 # 8. /lg-records/instructions/{instruction_id}/cancel

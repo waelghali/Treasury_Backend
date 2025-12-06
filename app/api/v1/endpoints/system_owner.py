@@ -1289,13 +1289,15 @@ def update_global_configuration(
     
     # 5. Trigger Background Task
     if trigger_revalidation:
-        # FIX: Removed 'db=db' argument. The task now opens its own session.
+        # FIX: Removed 'db=db'. We only pass the ID. 
+        # The background task will now create its own session.
         background_tasks.add_task(
             background_tasks_module.proactively_correct_customer_configs, 
             global_config_id=updated_config.id
         )
 
     return updated_config
+    
 
 @router.delete("/global-configurations/{config_id}", response_model=GlobalConfigurationOut)
 def delete_global_configuration(
@@ -2555,32 +2557,29 @@ def create_system_notification(
 ):
     """
     Creates a new system-wide notification.
-    Requires: content, start_date, end_date, and optionally a link and target_customer_ids.
+    Requires: content, start_date, end_date, and optionally a link and targeting options.
     """
     client_host = get_client_ip(request) if request else None
 
+    # 1. Validation: Date Sanity Check
     if notification_in.start_date >= notification_in.end_date:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="End date must be after start date."
         )
 
-    if (notification_in.target_customer_ids is None or len(notification_in.target_customer_ids) == 0) and \
-       (notification_in.target_roles is None or len(notification_in.target_roles) == 0) and \
-       (notification_in.target_user_ids is None or len(notification_in.target_user_ids) == 0):
-        existing_universal_notifications = crud_system_notification.get_active_universal_notifications(db)
-        if any(n.id != notification_id for n in existing_universal_notifications):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A universal notification is already active. Please deactivate it before creating another one."
-            )
+    # 2. (REMOVED) The "Only 1 Active Universal Notification" check is deleted here.
+    # This prevents the 500 error (NameError: notification_id) and allows 
+    # multiple active notifications (e.g., 1 News + 1 Critical Alert).
 
+    # 3. Create Record
     db_notification = crud_system_notification.create(
         db,
         obj_in=notification_in,
         created_by_user_id=current_user.user_id
     )
 
+    # 4. Log Action
     log_action(
         db,
         user_id=current_user.user_id,
@@ -2593,10 +2592,11 @@ def create_system_notification(
             "start_date": db_notification.start_date.isoformat(),
             "end_date": db_notification.end_date.isoformat(),
             "link": db_notification.link,
-            "target_customers": db_notification.target_customer_ids,
+            "notification_type": db_notification.notification_type, # Added this field
             "animation_type": db_notification.animation_type,
             "display_frequency": db_notification.display_frequency,
             "max_display_count": db_notification.max_display_count,
+            "target_customers": db_notification.target_customer_ids,
             "target_user_ids": db_notification.target_user_ids,
             "target_roles": db_notification.target_roles,
             "ip_address": client_host
@@ -2656,6 +2656,7 @@ def update_system_notification(
             detail="System notification not found or already deleted."
         )
 
+    # 1. Validation: Date Sanity Check
     new_start_date = notification_in.start_date or db_notification.start_date
     new_end_date = notification_in.end_date or db_notification.end_date
     
@@ -2665,20 +2666,11 @@ def update_system_notification(
             detail="End date must be after start date."
         )
     
-    new_target_customers = notification_in.target_customer_ids if notification_in.target_customer_ids is not None else db_notification.target_customer_ids
-    new_target_roles = notification_in.target_roles if notification_in.target_roles is not None else db_notification.target_roles
-    new_target_users = notification_in.target_user_ids if notification_in.target_user_ids is not None else db_notification.target_user_ids
+    # 2. (REMOVED) The Conflict check for "Universal Notifications" is deleted.
+    # We now support multiple active notifications (News, Critical, etc.), so this check
+    # is no longer required and was causing the 409 error.
 
-    if (not new_target_customers or len(new_target_customers) == 0) and \
-       (not new_target_roles or len(new_target_roles) == 0) and \
-       (not new_target_users or len(new_target_users) == 0):
-        existing_universal_notifications = crud_system_notification.get_active_universal_notifications(db)
-        if any(n.id != notification_id for n in existing_universal_notifications):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A universal notification is already active. Please deactivate it before updating this one to be universal."
-            )
-
+    # 3. Perform Update
     updated_notification = crud_system_notification.update(
         db,
         db_obj=db_notification,
@@ -2711,6 +2703,7 @@ def delete_system_notification(
     )
     return deleted_notification
 
+
 @router.post("/system-notifications/{notification_id}/restore", response_model=SystemNotificationOut)
 def restore_system_notification(
     notification_id: int,
@@ -2721,20 +2714,25 @@ def restore_system_notification(
     """
     Restores a soft-deleted system notification by ID.
     """
-    db_notification = db.query(SystemNotification).filter(
-        SystemNotification.id == notification_id,
-        SystemNotification.is_deleted == True
-    ).first()
-
+    # 1. Fetch by ID first (ignoring deletion status) to be robust
+    #db_notification = crud_system_notification.get(db, id=notification_id)
+    db_notification = crud_system_notification.get(db, id=notification_id, include_deleted=True)
+    # 2. If it doesn't exist at all, 404
     if db_notification is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="System notification not found or not in a soft-deleted state."
+            detail="System notification not found."
         )
 
+    # 3. If it exists but is NOT deleted, just return it (Idempotency).
+    # This prevents the 404 error if the frontend and backend are out of sync.
+    if not db_notification.is_deleted:
+        return db_notification
+
+    # 4. Perform Restore
     restored_notification = crud_system_notification.restore(
         db,
-        db_notification,
+        db_obj=db_notification,
         user_id=current_user.user_id
     )
     return restored_notification

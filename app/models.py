@@ -627,13 +627,12 @@ class CustomerEmailSetting(BaseModel):
 
 class SystemNotification(BaseModel):
     __tablename__ = "system_notifications"
-
+    notification_type = Column(String, default="system_info")
     content = Column(String, nullable=False, comment="The plain text message of the notification")
     link = Column(String, nullable=True, comment="Optional URL to attach to the message")
     start_date = Column(DateTime(timezone=True), nullable=False, comment="Date/time the notification becomes active")
     end_date = Column(DateTime(timezone=True), nullable=False, comment="Date/time the notification expires")
     is_active = Column(Boolean, default=True, nullable=False, comment="Whether the notification is currently active or disabled by the System Owner")
-    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, comment="The System Owner who created this notification")
 
     animation_type = Column(String, nullable=True, comment="CSS animation class to apply (e.g., 'fade', 'slide-left')")
     display_frequency = Column(String, default="once-per-login", nullable=False, comment="Frequency of display (e.g., 'once', 'once-per-login', 'repeat')")
@@ -642,7 +641,10 @@ class SystemNotification(BaseModel):
     target_roles = Column(JSONB, nullable=True, comment="List of user roles to target")
     target_customer_ids = Column(JSONB, nullable=True, comment="List of customer IDs to target. Null or empty list means all customers.")
 
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, comment="The System Owner who created this notification")
     created_by_user = relationship("User", back_populates="system_notifications_created")
+    is_popup = Column(Boolean, default=False)
+    popup_action_label = Column(String, nullable=True)    
 
     def __repr__(self: SystemNotification):
         return f"<SystemNotification(id={self.id}, content='{self.content[:30]}...', is_active={self.is_active}, targets={self.target_customer_ids})>"
