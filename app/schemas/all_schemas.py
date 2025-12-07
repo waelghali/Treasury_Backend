@@ -1227,6 +1227,7 @@ class SystemNotificationBase(BaseModel):
     notification_type: Optional[str] = Field("system_info", description="Type of notification (system_info, critical, cbe, etc.)")
     is_popup: bool = Field(False, description="If True, shows as a blocking modal instead of a banner.")
     popup_action_label: Optional[str] = Field(None, description="Label for the acknowledgment button (e.g., 'I Agree').")
+    image_url: Optional[str] = Field(None, description="GCS URI or URL for the notification image.")
 
 # --- Create Schema ---
 class SystemNotificationCreate(SystemNotificationBase):

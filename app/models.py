@@ -645,7 +645,7 @@ class SystemNotification(BaseModel):
     created_by_user = relationship("User", back_populates="system_notifications_created")
     is_popup = Column(Boolean, default=False)
     popup_action_label = Column(String, nullable=True)    
-
+    image_url = Column(String, nullable=True, doc="GCS URI (gs://...) or public URL for the notification image")
     def __repr__(self: SystemNotification):
         return f"<SystemNotification(id={self.id}, content='{self.content[:30]}...', is_active={self.is_active}, targets={self.target_customer_ids})>"
 

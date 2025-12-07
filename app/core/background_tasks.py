@@ -2,7 +2,6 @@
 
 import logging
 import json
-import pytz
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -44,7 +43,6 @@ from app.constants import (
 )
 
 # Configuration
-EEST_TIMEZONE = pytz.timezone('Africa/Cairo')
 logger = logging.getLogger(__name__)
 
 
@@ -295,7 +293,8 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
 
 async def run_daily_print_reminders(db: Session):
     logger.info("Running daily print reminders and escalation task...")
-    
+    import pytz
+    EEST_TIMEZONE = pytz.timezone('Africa/Cairo')
     TYPES_TO_PRINT = [
         ACTION_TYPE_LG_RELEASE, ACTION_TYPE_LG_LIQUIDATE,
         ACTION_TYPE_LG_DECREASE_AMOUNT, ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE

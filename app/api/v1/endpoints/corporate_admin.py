@@ -52,7 +52,7 @@ from app.models import (
     Customer
 )
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, SubscriptionStatus
-
+from app.core.ai_integration import generate_signed_gcs_url
 # FIX: Ensure get_global_email_settings is imported alongside the others.
 # Although you are currently only using get_global_email_settings, keeping 
 # get_customer_email_settings imported is generally safer for a complex file.
@@ -1765,7 +1765,7 @@ def log_corporate_admin_notification_view(
     dependencies=[Depends(check_subscription_status)],
     summary="Get active system notifications for the Corporate Admin's customer"
 )
-def get_active_system_notifications(
+async def get_active_system_notifications(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
 ):
@@ -1773,7 +1773,7 @@ def get_active_system_notifications(
     Retrieves all active system notifications relevant to the authenticated Corporate Admin.
     """
     
-    # CRITICAL FIX: Ensure the session reads committed data from the database.
+    # Ensure the session reads committed data from the database.
     db.expire_all() 
 
     customer_id = corporate_admin_context.customer_id
@@ -1782,5 +1782,12 @@ def get_active_system_notifications(
     notifications = crud_system_notification.get_active_notifications_for_user(
         db, user_id=user_id, customer_id=customer_id
     )
+
+    # Sign URLs
+    for n in notifications:
+        if n.image_url and n.image_url.startswith("gs://"):
+            signed_url = await generate_signed_gcs_url(n.image_url)
+            if signed_url:
+                n.image_url = signed_url
 
     return notifications

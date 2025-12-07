@@ -1,18 +1,18 @@
 # app/core/ai_integration.py
 import os
 import io
-from typing import Dict, Any, Optional, List, Tuple
 import json
-import fitz # PyMuPDF
-from dotenv import load_dotenv
 import re
 import asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential
 import logging
 import uuid
-from functools import lru_cache
-from datetime import datetime, timedelta # Added timedelta for signed URL expiry
 import tempfile
+from typing import Dict, Any, Optional, List, Tuple
+from functools import lru_cache
+from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,38 +26,13 @@ GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME')
 if not GCS_BUCKET_NAME:
     logger.warning("Warning: GCS_BUCKET_NAME environment variable not set. GCS integration will be limited.")
 
-# Try to import Google Cloud Vision
-try:
-    from google.cloud import vision_v1p3beta1 as vision
-    from google.cloud import storage
-    from google.oauth2 import service_account
-    from google.api_core.exceptions import GoogleAPIError # Import GoogleAPIError for specific exception handling
-    GOOGLE_CLOUD_LIBRARIES_AVAILABLE = True
-except ImportError:
-    logger.warning("Warning: google-cloud-vision or google-cloud-storage library not found. AI OCR/GCS functionality will be limited.")
-    GOOGLE_CLOUD_LIBRARIES_AVAILABLE = False
-    vision = None
-    storage = None
-    service_account = None
-    GoogleAPIError = Exception # Define dummy for type hinting if not available
-
-# Try to import Google Generative AI
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    logger.warning("Warning: google-generativeai library not found. Gemini AI functionality will be limited.")
-    GEMINI_AVAILABLE = False
-    genai = None
-
-# --- Global Client/Credentials Instantiation ---
+# --- Global Client/Credentials Instantiation (Initialized to None) ---
 _google_credentials = None
 _gcs_client = None
 _vision_client = None
 _gemini_model_global = None
 
 # --- Dynamically set GOOGLE_APPLICATION_CREDENTIALS if JSON is provided ---
-# This block replaces the direct os.environ lookup with a temporary file approach.
 creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
 if creds_json:
     # Use tempfile to create a secure temporary file
@@ -68,13 +43,21 @@ if creds_json:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
     logger.info(f"Google credentials written to temporary file: {tmp_path}")
 else:
-    logger.warning("GOOGLE_CREDENTIALS_JSON environment variable not found. Attempting to use existing GOOGLE_APPLICATION_CREDENTIALS.")
+    # Only warn if explicitly missing, otherwise assume standard path or implicit auth
+    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+        logger.warning("GOOGLE_CREDENTIALS_JSON not found. Ensure GOOGLE_APPLICATION_CREDENTIALS is set if using local file.")
 
 @lru_cache(maxsize=1)
 def _get_google_credentials():
     global _google_credentials
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
+    
+    # Lazy import
+    try:
+        from google.oauth2 import service_account
+    except ImportError:
+        logger.warning("Google Cloud libraries (google-auth) not found. Credentials cannot be loaded.")
         return None
+
     if _google_credentials is None and "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
         try:
             credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"].strip('\'"')
@@ -91,8 +74,14 @@ def _get_google_credentials():
 @lru_cache(maxsize=1)
 def _get_gcs_client():
     global _gcs_client
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
+    
+    # Lazy import
+    try:
+        from google.cloud import storage
+    except ImportError:
+        logger.warning("Google Cloud Storage library not found. GCS client cannot be initialized.")
         return None
+
     if _gcs_client is None:
         try:
             credentials = _get_google_credentials()
@@ -110,8 +99,14 @@ def _get_gcs_client():
 @lru_cache(maxsize=1)
 def _get_vision_client():
     global _vision_client
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
+    
+    # Lazy import
+    try:
+        from google.cloud import vision_v1p3beta1 as vision
+    except ImportError:
+        logger.warning("Google Cloud Vision library not found. Vision client cannot be initialized.")
         return None
+
     if _vision_client is None:
         try:
             credentials = _get_google_credentials()
@@ -129,9 +124,14 @@ def _get_vision_client():
 @lru_cache(maxsize=1)
 def _get_gemini_model():
     global _gemini_model_global
-    if not GEMINI_AVAILABLE:
-        logger.warning("Gemini AI is not available.")
+    
+    # Lazy import
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        logger.warning("Google Generative AI library not found. Gemini AI functionality will be disabled.")
         return None
+
     if _gemini_model_global is None:
         gemini_api_key = os.environ.get('GEMINI_API_KEY')
         if not gemini_api_key:
@@ -145,12 +145,6 @@ def _get_gemini_model():
             logger.error(f"Error configuring Gemini API or instantiating model: {e}. Gemini features will be disabled.")
             _gemini_model_global = None
     return _gemini_model_global
-
-# Initial client setup
-_get_google_credentials()
-_get_gcs_client()
-_get_vision_client()
-_get_gemini_model()
 
 # --- Local Output Directory Setup ---
 BASE_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "Output")
@@ -168,14 +162,17 @@ async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_
     Asynchronously uploads byte data to a specified GCS bucket.
     Returns the gs:// URI of the uploaded object on success.
     """
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not GCS_BUCKET_NAME:
-        logger.error("GCS libraries not available or bucket name not configured. Cannot upload to GCS.")
+    if not GCS_BUCKET_NAME:
+        logger.error("GCS bucket name not configured. Cannot upload to GCS.")
         return None
 
     client = _get_gcs_client()
     if not client:
         logger.error("GCS client not initialized. Cannot upload to GCS.")
         return None
+    
+    # Local import of exception now that we know libraries are present
+    from google.api_core.exceptions import GoogleAPIError
 
     try:
         bucket = client.bucket(bucket_name)
@@ -195,14 +192,16 @@ async def _cleanup_gcs_files(bucket_name: str, prefix: str):
     """
     Asynchronously deletes files from GCS that match a given prefix.
     """
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not GCS_BUCKET_NAME:
-        logger.warning("GCS libraries not available or bucket name not configured. Skipping GCS cleanup.")
+    if not GCS_BUCKET_NAME:
+        logger.warning("GCS bucket name not configured. Skipping GCS cleanup.")
         return
 
     client = _get_gcs_client()
     if not client:
         logger.error("GCS client not initialized. Cannot perform cleanup.")
         return
+    
+    from google.api_core.exceptions import GoogleAPIError
 
     try:
         bucket = client.bucket(bucket_name)
@@ -220,13 +219,22 @@ def delete_file_from_gcs(gcs_uri: str) -> bool:
     if not gcs_uri or not gcs_uri.startswith("gs://"):
         return False
     
+    # Lazy import for the non-async client usage in this synchronous helper
+    try:
+        from google.cloud import storage
+    except ImportError:
+        logger.error("Google Cloud Storage library not available.")
+        return False
+
     try:
         # uri format: gs://bucket_name/path/to/blob
         parts = gcs_uri[len("gs://"):].split('/', 1)
         bucket_name = parts[0]
         blob_name = parts[1]
 
-        storage_client = storage.Client()
+        # Use the cached credentials if possible to avoid re-auth overhead
+        credentials = _get_google_credentials()
+        storage_client = storage.Client(credentials=credentials)
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         
@@ -241,14 +249,12 @@ async def generate_signed_gcs_url(gs_uri: str, valid_for_seconds: int = 900) -> 
     """
     Generates a time-limited signed URL for a private GCS object.
     """
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
-        logger.error("Google Cloud client libraries are not available. Cannot generate signed URL.")
-        return None
-
     client = _get_gcs_client()
     if not client:
         logger.error("GCS client not initialized. Cannot generate signed URL.")
         return None
+    
+    from google.api_core.exceptions import GoogleAPIError
 
     try:
         if not gs_uri.startswith("gs://"):
@@ -288,6 +294,14 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
     if not vision_client:
         logger.error("Google Vision ImageAnnotatorClient is not available.")
         return None
+    
+    # Lazy imports
+    try:
+        from google.cloud import vision_v1p3beta1 as vision
+        from google.api_core.exceptions import GoogleAPIError
+    except ImportError:
+        logger.error("Google Cloud Vision libraries missing.")
+        return None
 
     text_content = ""
     try:
@@ -325,7 +339,11 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
     if not gcs_client or not bucket_name:
         logger.error("GCS client not initialized or bucket name missing. PDF conversion/upload skipped.")
         return []
-    if not fitz:
+    
+    # Lazy import for heavy PDF library
+    try:
+        import fitz # PyMuPDF
+    except ImportError:
         logger.error("PyMuPDF (fitz) not available. Cannot convert PDF.")
         return []
 
@@ -369,6 +387,12 @@ async def extract_structured_data_with_gemini(text_content: str, unique_file_id:
     model = _get_gemini_model()
     if not model:
         logger.error("Gemini AI model is not available or not configured.")
+        return None, None
+    
+    # Lazy import needed for types usage
+    try:
+        import google.generativeai as genai
+    except ImportError:
         return None, None
 
     if not text_content:
@@ -607,7 +631,8 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
     image_uris = []
 
     try:
-        if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not GCS_BUCKET_NAME:
+        # Replaced global flag check with client check
+        if not _get_gcs_client() or not GCS_BUCKET_NAME:
             logger.error("GCS_BUCKET_NAME is not set or Google Cloud libraries not available. Cannot proceed with file uploads.")
             return structured_data, total_usage_metadata
 
@@ -729,32 +754,3 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
         if temp_files:
             await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_amendment_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
-
-# Example usage (for isolated testing)
-if __name__ == "__main__":
-    async def test_ai_integration_local():
-        dummy_pdf_path = "135.PDF"
-
-        print("\n--- Starting Isolated AI Integration Tests ---")
-
-        if os.path.exists(dummy_pdf_path):
-            print(f"\n--- Testing with PDF: {dummy_pdf_path} ---")
-            try:
-                with open(dummy_pdf_path, "rb") as f:
-                    pdf_bytes = f.read()
-                for i in range(2):
-                    print(f"\n--- PDF Test Run {i+1} ---")
-                    extracted, usage = await process_lg_document_with_ai(pdf_bytes, "application/pdf", f"pdf_run_{i+1}_{uuid.uuid4().hex}")
-                    if extracted:
-                        print(f"Extracted data from PDF (Run {i+1}): {json.dumps(extracted, indent=2)}")
-                        print(f"Usage data (Run {i+1}): {json.dumps(usage, indent=2)}")
-                    else:
-                        print(f"Failed to extract data from PDF (Run {i+1}). Check logs above.")
-            except Exception as e:
-                print(f"Error during PDF test: {e}")
-        else:
-            print(f"Dummy PDF not found at {dummy_pdf_path}. Skipping PDF test.")
-
-        print("\n--- AI Integration Tests Finished ---")
-
-    asyncio.run(test_ai_integration_local())

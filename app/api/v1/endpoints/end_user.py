@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, and_
 from typing import List, Optional, Any, Dict, Tuple
 
-from fuzzywuzzy import fuzz
 from app.database import get_db
 
 from app.schemas.all_schemas import (
@@ -108,7 +107,7 @@ from app.constants import (
     # New constants for audit log
     AUDIT_ACTION_TYPE_LG_INSTRUCTION_CANCELLATION_FAILED,
 )
-
+from app.core.ai_integration import generate_signed_gcs_url
 
 # Initialize logger at the module level
 logger = logging.getLogger(__name__)
@@ -126,7 +125,6 @@ try:
     from app.core.ai_integration import process_lg_document_with_ai, generate_signed_gcs_url, process_amendment_with_ai
 
     from app.core.document_generator import generate_pdf_from_html
-    import app.core.hashing
     from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
 
 except Exception as e:
@@ -220,6 +218,7 @@ def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], t
     Finds the best fuzzy match for an extracted name against a list of valid entities (name and ID).
     Returns the ID of the best match if the similarity score is above the threshold.
     """
+    from fuzzywuzzy import fuzz
     if not extracted_name:
         logger.debug(f"Fuzzy Match Debug: Extracted name is empty.")
         return None
@@ -443,6 +442,7 @@ async def scan_lg_file(
     Returns a dictionary of extracted fields for form auto-population.
     This endpoint checks if the customer's plan supports AI integration.
     """
+    from fuzzywuzzy import fuzz
     client_host = get_client_ip(request) if request else None
     ai_usage_metadata = {}
     customer = crud_customer.get_with_relations(db, end_user_context.customer_id)
@@ -3330,14 +3330,13 @@ async def get_current_user_dashboard_info(
         "active_lgs_count": active_lg_count,
     }
 
-
 @router.get(
     "/system-notifications/",
     response_model=List[SystemNotificationOut],
     dependencies=[Depends(check_subscription_status)],
     summary="Get active system notifications for the current user's customer"
 )
-def get_active_system_notifications(
+async def get_active_system_notifications(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -3345,7 +3344,7 @@ def get_active_system_notifications(
     Retrieves all active system notifications relevant to the authenticated user.
     """
     
-    # CRITICAL FIX: Ensure the session reads committed data from the database.
+    # Ensure the session reads committed data from the database.
     db.expire_all() 
 
     customer_id = end_user_context.customer_id
@@ -3355,8 +3354,15 @@ def get_active_system_notifications(
         db, user_id=user_id, customer_id=customer_id
     )
 
-    return notifications
+    # Sign URLs
+    for n in notifications:
+        if n.image_url and n.image_url.startswith("gs://"):
+            signed_url = await generate_signed_gcs_url(n.image_url)
+            if signed_url:
+                n.image_url = signed_url
 
+    return notifications
+        
 @router.post(
     "/system-notifications/{notification_id}/view", 
     response_model=dict,

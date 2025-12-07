@@ -6,12 +6,15 @@ import importlib.util
 import io
 import csv
 from fastapi.responses import StreamingResponse, RedirectResponse
-
+import asyncio
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query, Body, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query, Body, BackgroundTasks, UploadFile, File
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func
 from typing import List, Optional, Any, Dict
+
+import uuid
+from app.core.ai_integration import _upload_to_gcs, generate_signed_gcs_url, GCS_BUCKET_NAME
 
 from app.database import get_db
 from app.schemas.all_schemas import (
@@ -2548,98 +2551,110 @@ async def resume_job(job_id: str, current_user: Any = Depends(HasPermission("sys
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found or could not be resumed. Error: {e}")
 
-@router.post("/system-notifications/", response_model=SystemNotificationOut, status_code=status.HTTP_201_CREATED)
+@router.post("/system-notifications/", response_model=SystemNotificationOut)
 def create_system_notification(
     notification_in: SystemNotificationCreate,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_notification:create")),
-    request: Request = None
 ):
     """
-    Creates a new system-wide notification.
-    Requires: content, start_date, end_date, and optionally a link and targeting options.
+    Creates a new system notification, persisting all fields including image_url.
     """
-    client_host = get_client_ip(request) if request else None
-
-    # 1. Validation: Date Sanity Check
+    # 1. Date Validation (Preserved existing logic)
     if notification_in.start_date >= notification_in.end_date:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="End date must be after start date."
         )
 
-    # 2. (REMOVED) The "Only 1 Active Universal Notification" check is deleted here.
-    # This prevents the 500 error (NameError: notification_id) and allows 
-    # multiple active notifications (e.g., 1 News + 1 Critical Alert).
-
-    # 3. Create Record
+    # 2. Perform Creation (All fields in notification_in, including image_url, are passed)
     db_notification = crud_system_notification.create(
-        db,
-        obj_in=notification_in,
-        created_by_user_id=current_user.user_id
+        db, 
+        obj_in=notification_in, 
+        user_id=current_user.user_id
     )
-
-    # 4. Log Action
-    log_action(
-        db,
-        user_id=current_user.user_id,
-        action_type="CREATE",
-        entity_type="SystemNotification",
-        entity_id=db_notification.id,
-        details={
-            "content_preview": db_notification.content[:50] + "...",
-            "is_active": db_notification.is_active,
-            "start_date": db_notification.start_date.isoformat(),
-            "end_date": db_notification.end_date.isoformat(),
-            "link": db_notification.link,
-            "notification_type": db_notification.notification_type, # Added this field
-            "animation_type": db_notification.animation_type,
-            "display_frequency": db_notification.display_frequency,
-            "max_display_count": db_notification.max_display_count,
-            "target_customers": db_notification.target_customer_ids,
-            "target_user_ids": db_notification.target_user_ids,
-            "target_roles": db_notification.target_roles,
-            "ip_address": client_host
-        }
-    )
+    
+    # NOTE: We do NOT sign the URL here, as the user will hit the GET endpoint
+    # (which is async and handles signing) immediately after creation.
     return db_notification
 
+@router.post("/system-notifications/upload-image", response_model=dict)
+async def upload_notification_image(
+    file: UploadFile = File(...),
+    current_user: TokenData = Depends(HasPermission("system_notification:create"))
+):
+    """
+    Uploads an image to GCS using the shared AI integration logic.
+    """
+    # 1. Validate file type
+    if file.content_type not in ["image/jpeg", "image/png", "image/gif", "image/webp"]:
+        raise HTTPException(status_code=400, detail="Invalid file type. Only images allowed.")
+
+    # 2. Ensure bucket is configured
+    if not GCS_BUCKET_NAME:
+         raise HTTPException(status_code=503, detail="GCS Bucket not configured.")
+
+    try:
+        # 3. Read file content
+        file_bytes = await file.read()
+        
+        # 4. Generate unique path
+        blob_name = f"notification_images/{uuid.uuid4()}_{file.filename}"
+        
+        # 5. Upload using existing AI tool
+        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, file.content_type)
+        
+        if not gcs_uri:
+            raise HTTPException(status_code=500, detail="Upload returned no URL")
+            
+        return {"image_url": gcs_uri}
+    except Exception as e:
+        print(f"Upload Error: {e}")
+        raise HTTPException(status_code=500, detail="Image upload failed.")
+
+
 @router.get("/system-notifications/", response_model=List[SystemNotificationOut])
-def read_system_notifications(
+async def read_system_notifications(
     skip: int = 0,
     limit: int = 100,
-    is_active: Optional[bool] = Query(None, description="Filter notifications by active status."),
+    is_active: Optional[bool] = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_notification:view"))
 ):
-    """
-    Retrieves a list of all system notifications for administration. Can filter by active status.
-    """
+    # Fetch from DB (Synchronous)
     if is_active is True:
         notifications = crud_system_notification.get_all_active(db, skip=skip, limit=limit)
     else:
         notifications = crud_system_notification.get_all(db, skip=skip, limit=limit)
+    
+    # Sign URLs (Run the sync function asynchronously)
+    for n in notifications:
+        if n.image_url and n.image_url.startswith("gs://"):
+            # FIX: Use asyncio.to_thread
+            signed_url = await asyncio.to_thread(generate_signed_gcs_url, n.image_url)
+            if signed_url: n.image_url = signed_url
+                
     return notifications
 
 @router.get("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
-def read_system_notification(
+async def read_system_notification(
     notification_id: int,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_notification:view"))
 ):
-    """
-    Retrieves a single system notification by its ID.
-    """
     db_notification = crud_system_notification.get(db, id=notification_id)
-    if db_notification is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="System notification not found or already deleted."
-        )
+    if not db_notification:
+        raise HTTPException(status_code=404, detail="Not found.")
+    
+    if db_notification.image_url and db_notification.image_url.startswith("gs://"):
+        signed_url = await generate_signed_gcs_url(db_notification.image_url)
+        if signed_url:
+            db_notification.image_url = signed_url
+            
     return db_notification
 
 @router.put("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
-def update_system_notification(
+async def update_system_notification(
     notification_id: int,
     notification_in: SystemNotificationUpdate,
     db: Session = Depends(get_db),
@@ -2647,7 +2662,7 @@ def update_system_notification(
     request: Request = None
 ):
     """
-    Updates an existing system notification by ID.
+    Updates an existing system notification by ID and signs the image URL before returning.
     """
     db_notification = crud_system_notification.get(db, id=notification_id)
     if db_notification is None:
@@ -2656,7 +2671,7 @@ def update_system_notification(
             detail="System notification not found or already deleted."
         )
 
-    # 1. Validation: Date Sanity Check
+    # 1. Date Validation
     new_start_date = notification_in.start_date or db_notification.start_date
     new_end_date = notification_in.end_date or db_notification.end_date
     
@@ -2666,17 +2681,20 @@ def update_system_notification(
             detail="End date must be after start date."
         )
     
-    # 2. (REMOVED) The Conflict check for "Universal Notifications" is deleted.
-    # We now support multiple active notifications (News, Critical, etc.), so this check
-    # is no longer required and was causing the 409 error.
-
-    # 3. Perform Update
+    # 2. Perform Update (The image_url field is included here)
     updated_notification = crud_system_notification.update(
         db,
         db_obj=db_notification,
         obj_in=notification_in,
         user_id=current_user.user_id
     )
+
+    # 3. Sign the URL (Needed so the frontend can display the updated image immediately)
+    if updated_notification.image_url and updated_notification.image_url.startswith("gs://"):
+        signed_url = await generate_signed_gcs_url(updated_notification.image_url)
+        if signed_url:
+            updated_notification.image_url = signed_url
+
     return updated_notification
 
 @router.delete("/system-notifications/{notification_id}", response_model=SystemNotificationOut)

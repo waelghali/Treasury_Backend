@@ -1,7 +1,6 @@
 # app/crud/crud_lg_record.py
 import json
 import os
-import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Type, Tuple
 from fastapi import HTTPException, status, UploadFile

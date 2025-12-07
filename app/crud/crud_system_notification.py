@@ -219,43 +219,38 @@ class CRUDSystemNotification(CRUDBase):
         return view_log
         
         
-    def create(self, db: Session, obj_in: SystemNotificationCreate, created_by_user_id: int) -> SystemNotification:
+    def create(self, db: Session, *, obj_in: SystemNotificationCreate, user_id: int) -> SystemNotification:
         """
-        Creates a new system notification.
+        Creates a new SystemNotification instance, ensuring all fields including image_url are set.
+        Overrides CRUDBase.create to explicitly handle SystemNotificationCreate fields.
         """
-        target_customer_ids = obj_in.target_customer_ids if obj_in.target_customer_ids is not None else []
-        target_roles = obj_in.target_roles if obj_in.target_roles is not None else []
-        target_user_ids = obj_in.target_user_ids if obj_in.target_user_ids is not None else []
-
-        # Convert roles in the input object to uppercase to match DB convention
-        if obj_in.target_roles is not None:
-             target_roles = [role.upper() for role in obj_in.target_roles]
-
-        notif_type = obj_in.notification_type or "system_info"
-
-        db_obj = self.model(
-            content=obj_in.content,
-            link=obj_in.link,
-            start_date=obj_in.start_date,
-            end_date=obj_in.end_date,
-            is_active=obj_in.is_active,
-            created_by_user_id=created_by_user_id,
-            notification_type=notif_type,
-            target_customer_ids=target_customer_ids, 
-            animation_type=obj_in.animation_type,
-            display_frequency=obj_in.display_frequency,
-            max_display_count=obj_in.max_display_count,
-            target_user_ids=target_user_ids,
-            target_roles=target_roles, # Use the uppercased list
-            
-            # --- NEW FIELDS ---
-            is_popup=obj_in.is_popup,
-            popup_action_label=obj_in.popup_action_label
-        )
+        # Convert Pydantic object to a dictionary
+        # We use .model_dump() (or .dict() if using older Pydantic) to get the fields
+        obj_in_data = obj_in.model_dump(exclude_unset=True)
+        
+        # 1. Create the database object
+        db_obj = self.model(**obj_in_data)
+        
+        # 2. Add system audit fields
+        db_obj.created_by_user_id = user_id
+        
+        # 3. Save to database
         db.add(db_obj)
-        db.flush()
+        db.commit()
         db.refresh(db_obj)
 
+        # 4. Log the action (based on your existing structure)
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="CREATE",
+            entity_type="SystemNotification",
+            entity_id=db_obj.id,
+            details={
+                "content_preview": db_obj.content[:50] + "...",
+                "image_url": db_obj.image_url # Include new field in audit log
+            }
+        )
         return db_obj
 
     def update(self, db: Session, db_obj: SystemNotification, obj_in: SystemNotificationUpdate, user_id: int) -> SystemNotification:

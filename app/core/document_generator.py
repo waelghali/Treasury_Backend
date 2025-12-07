@@ -4,9 +4,6 @@ import os
 from typing import Optional
 import logging
 
-# Import WeasyPrint
-from weasyprint import HTML, CSS
-
 logger = logging.getLogger(__name__)
 
 async def generate_pdf_from_html(html_content: str, filename_hint: str = "document") -> Optional[bytes]:
@@ -14,6 +11,7 @@ async def generate_pdf_from_html(html_content: str, filename_hint: str = "docume
     Generates a PDF from HTML content using WeasyPrint.
     Returns the PDF as bytes.
     """
+    from weasyprint import HTML, CSS
     logger.debug(f"generate_pdf_from_html: Attempting to generate PDF for '{filename_hint}'.")
     logger.debug(f"generate_pdf_from_html: HTML content length: {len(html_content)} characters.")
     # You might want to log a snippet of html_content, but be careful with very large content
