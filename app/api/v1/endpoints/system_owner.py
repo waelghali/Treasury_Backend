@@ -2,7 +2,7 @@
 import os
 import sys
 import importlib.util
-
+import re
 import io
 import csv
 from fastapi.responses import StreamingResponse, RedirectResponse
@@ -62,64 +62,6 @@ from app.core.document_generator import generate_pdf_from_html # NEW IMPORT
 import logging
 logger = logging.getLogger(__name__)
 
-
-# *** NEW: Google Cloud Storage Setup ***
-try:
-    from google.cloud import storage
-    # WARNING: Replace 'your-gcs-bucket-name' with your actual bucket name.
-    GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "your-gcs-bucket-name")
-    storage_client = storage.Client()
-    GCS_CLIENT_AVAILABLE = True
-except Exception as e:
-    logger.warning(f"GCS client failed to initialize in system_owner.py. Document download will not work if GCS is required: {e}")
-    GCS_CLIENT_AVAILABLE = False
-
-
-def generate_signed_gcs_url(gcs_uri: str) -> str:
-    """Generates a temporary signed URL for a GCS object."""
-    if not GCS_CLIENT_AVAILABLE:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Cloud storage service is not configured or available."
-        )
-        
-    try:
-        if not gcs_uri.startswith("gs://"):
-            raise ValueError("Invalid GCS URI format. Expected 'gs://...'")
-            
-        # Parse the GCS URI
-        path_parts = gcs_uri.replace("gs://", "").split("/", 1)
-        if len(path_parts) < 2:
-            raise ValueError("GCS URI is malformed or points only to a bucket.")
-            
-        bucket_name = path_parts[0]
-        blob_name = path_parts[1]
-        
-        # Security check: Ensure we are only accessing the expected bucket 
-        if bucket_name != GCS_BUCKET_NAME:
-             # In a production setup, you might want to use crud_trial_registration to 
-             # ensure the GCS URI belongs to a known registration before this check.
-             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to specified bucket.")
-
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        
-        # Generate the signed URL, valid for 5 minutes
-        url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=5),
-            method="GET"
-        )
-        return url
-    except Exception as e:
-        logger.error(f"Failed to generate signed URL for {gcs_uri}: {e}")
-        # Reraise as 403 to prevent information leakage if the file doesn't exist
-        # or other access issues occur.
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Could not securely access the requested document."
-        )
-
 try:
     current_file_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_file_dir, '..', '..', '..'))
@@ -152,6 +94,255 @@ from app.constants import UserRole, LegalArtifactType, GlobalConfigKey
 
 router = APIRouter()
 trial_router = APIRouter()
+
+# --- HELPER: Async Wrapper for URL Signing ---
+async def _safe_generate_signed_url(gcs_uri: str) -> Optional[str]:
+    """
+    Safely generates a signed URL. Handles both async and sync implementations 
+    of generate_signed_gcs_url to prevent 'coroutine' errors.
+    """
+    try:
+        if not gcs_uri: return None
+        
+        result = generate_signed_gcs_url(gcs_uri)
+        
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+    except Exception as e:
+        logger.error(f"Error signing URL: {e}")
+        return None
+
+# --- HELPER: Force Permanent GS URI (The Cleaner) ---
+def _extract_gs_uri(url: str) -> Optional[str]:
+    """
+    Converts a temporary 'https://' link (from Frontend) back to the permanent 'gs://' key.
+    """
+    if not url:
+        return None
+    
+    if url.startswith("gs://"):
+        return url
+
+    # Robust regex search for the bucket name followed by the path segment
+    match = re.search(rf"/{GCS_BUCKET_NAME}/([^?]+)", url)
+    
+    if match and GCS_BUCKET_NAME:
+        clean_path = match.group(1)
+        return f"gs://{GCS_BUCKET_NAME}/{clean_path}"
+    
+    return url
+
+
+# =================================================================================
+# SYSTEM NOTIFICATIONS ENDPOINTS
+# =================================================================================
+
+@router.post("/system-notifications/upload-image")
+async def upload_system_notification_image(
+    file: UploadFile = File(...),
+    current_user: TokenData = Depends(HasPermission("system_notification:edit"))
+):
+    # This check needs to be placed at the very top
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+
+    # --- CLEANED LOGIC: Fixes NameError and double read ---
+    # 1. Read the file bytes ONCE
+    file_bytes = await file.read()
+    mime_type = file.content_type
+
+    # 2. Determine file extension and create the unique GCS path (blob_name)
+    file_extension = mime_type.split('/')[-1] if '/' in mime_type else 'bin'
+    unique_id = uuid.uuid4().hex
+    blob_name = f"system_notifications/images/{unique_id}.{file_extension}"
+    # --- END CLEANED LOGIC ---
+
+    # 3. Upload to GCS
+    gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, mime_type)
+    
+    if not gcs_uri:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="File upload to cloud storage failed.")
+        
+    # 4. Generate Signed URL for Preview
+    # CRITICAL: generate_signed_gcs_url is synchronous in ai_integration.py (we checked this)
+    # It must be called without 'await', and it expects the blob_name, not the full URI.
+    signed_url = await generate_signed_gcs_url(gcs_uri) 
+
+    if not signed_url:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate secure preview URL.")
+    
+    return {
+        "gcs_uri": gcs_uri,
+        "image_url": signed_url
+    }
+
+@router.post("/system-notifications/", response_model=SystemNotificationOut)
+async def create_system_notification( 
+    notification_in: SystemNotificationCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:create")),
+):
+    if notification_in.start_date >= notification_in.end_date:
+        raise HTTPException(status_code=400, detail="End date must be after start date.")
+
+    # 1. Clean the URL BEFORE saving to the DB
+    if notification_in.image_url:
+        notification_in.image_url = _extract_gs_uri(notification_in.image_url)
+
+    # 2. Create the record (DB now has the permanent gs:// link)
+    db_notification = crud_system_notification.create(
+        db, 
+        obj_in=notification_in, 
+        user_id=current_user.user_id
+    )
+    
+    # FIX: Explicitly detach the ORM object from the session.
+    # This prevents SQLAlchemy from tracking subsequent modifications.
+    db.expunge(db_notification) 
+
+    # 3. Create a detached Pydantic copy for the response
+    response_data = SystemNotificationOut.from_orm(db_notification)
+
+    # 4. Sign the URL on the DETACHED COPY for the client response
+    if response_data.image_url and response_data.image_url.startswith("gs://"):
+        signed = await _safe_generate_signed_url(response_data.image_url)
+        if signed:
+            response_data.image_url = signed
+
+    return response_data
+
+
+@router.put("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
+async def update_system_notification(
+    notification_id: int,
+    notification_in: SystemNotificationUpdate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:edit")),
+):
+    db_notification = crud_system_notification.get(db, id=notification_id)
+    if not db_notification:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    
+    # 1. Clean the URL BEFORE saving to the DB
+    if notification_in.image_url:
+        notification_in.image_url = _extract_gs_uri(notification_in.image_url)
+
+    # 2. Update the record (DB now has the permanent gs:// link)
+    db_notification = crud_system_notification.update(
+        db,
+        db_obj=db_notification,
+        obj_in=notification_in,
+        user_id=current_user.user_id
+    )
+
+    # FIX: Explicitly detach the ORM object from the session.
+    db.expunge(db_notification) 
+
+    # 3. Create a detached Pydantic copy for the response
+    response_data = SystemNotificationOut.from_orm(db_notification)
+
+    # 4. Sign the URL on the DETACHED COPY for the client response
+    if response_data.image_url and response_data.image_url.startswith("gs://"):
+        signed = await _safe_generate_signed_url(response_data.image_url)
+        if signed:
+            response_data.image_url = signed
+
+    return response_data
+
+
+@router.get("/system-notifications/", response_model=List[SystemNotificationOut])
+async def read_system_notifications(
+    skip: int = 0,
+    limit: int = 100,
+    is_active: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:view"))
+):
+    if is_active is True:
+        notifications = crud_system_notification.get_all_active(db, skip=skip, limit=limit)
+    else:
+        notifications = crud_system_notification.get_all(db, skip=skip, limit=limit)
+    
+    # DYNAMIC SIGNING: Generate FRESH links for every view
+    results = []
+    for n in notifications:
+        # FIX: Explicitly detach each object before mutation
+        db.expunge(n)
+        
+        if n.image_url and n.image_url.startswith("gs://"):
+            signed = await _safe_generate_signed_url(n.image_url)
+            if signed:
+                n.image_url = signed
+        results.append(n)
+                
+    return results
+
+
+@router.get("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
+async def read_system_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:view"))
+):
+    db_notification = crud_system_notification.get(db, id=notification_id)
+    if not db_notification:
+        raise HTTPException(status_code=404, detail="Not found.")
+    
+    # FIX: Explicitly detach the object
+    db.expunge(db_notification) 
+
+    # Use the now detached object for the response model (no need for .from_orm here, can reuse ORM object)
+    response_data = db_notification
+    
+    if response_data.image_url and response_data.image_url.startswith("gs://"):
+        signed = await _safe_generate_signed_url(response_data.image_url)
+        if signed:
+            response_data.image_url = signed
+            
+    return response_data
+
+
+    
+@router.delete("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
+def delete_system_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:delete")),
+    request: Request = None
+):
+    """
+    Soft-deletes a system notification by ID.
+    """
+    db_notification = crud_system_notification.get(db, id=notification_id)
+    if db_notification is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="System notification not found or already deleted."
+        )
+
+    deleted_notification = crud_system_notification.soft_delete(
+        db,
+        db_notification,
+        user_id=current_user.user_id
+    )
+    return deleted_notification
+
+
+@router.post("/system-notifications/{notification_id}/restore", response_model=SystemNotificationOut)
+def restore_system_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:delete"))
+):
+    db_notification = crud_system_notification.get(db, id=notification_id, include_deleted=True)
+    if not db_notification:
+        raise HTTPException(status_code=404, detail="Not found.")
+    
+    if not db_notification.is_deleted:
+        raise HTTPException(status_code=400, detail="Notification is not deleted.")
+
+    return crud_system_notification.restore(db, db_obj=db_notification, user_id=current_user.user_id)
 
 @router.get("/status")
 async def get_system_status():
@@ -2551,209 +2742,6 @@ async def resume_job(job_id: str, current_user: Any = Depends(HasPermission("sys
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found or could not be resumed. Error: {e}")
 
-@router.post("/system-notifications/", response_model=SystemNotificationOut)
-def create_system_notification(
-    notification_in: SystemNotificationCreate,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("system_notification:create")),
-):
-    """
-    Creates a new system notification, persisting all fields including image_url.
-    """
-    # 1. Date Validation (Preserved existing logic)
-    if notification_in.start_date >= notification_in.end_date:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="End date must be after start date."
-        )
-
-    # 2. Perform Creation (All fields in notification_in, including image_url, are passed)
-    db_notification = crud_system_notification.create(
-        db, 
-        obj_in=notification_in, 
-        user_id=current_user.user_id
-    )
-    
-    # NOTE: We do NOT sign the URL here, as the user will hit the GET endpoint
-    # (which is async and handles signing) immediately after creation.
-    return db_notification
-
-@router.post("/system-notifications/upload-image", response_model=dict)
-async def upload_notification_image(
-    file: UploadFile = File(...),
-    current_user: TokenData = Depends(HasPermission("system_notification:create"))
-):
-    """
-    Uploads an image to GCS using the shared AI integration logic.
-    """
-    # 1. Validate file type
-    if file.content_type not in ["image/jpeg", "image/png", "image/gif", "image/webp"]:
-        raise HTTPException(status_code=400, detail="Invalid file type. Only images allowed.")
-
-    # 2. Ensure bucket is configured
-    if not GCS_BUCKET_NAME:
-         raise HTTPException(status_code=503, detail="GCS Bucket not configured.")
-
-    try:
-        # 3. Read file content
-        file_bytes = await file.read()
-        
-        # 4. Generate unique path
-        blob_name = f"notification_images/{uuid.uuid4()}_{file.filename}"
-        
-        # 5. Upload using existing AI tool
-        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, file.content_type)
-        
-        if not gcs_uri:
-            raise HTTPException(status_code=500, detail="Upload returned no URL")
-            
-        return {"image_url": gcs_uri}
-    except Exception as e:
-        print(f"Upload Error: {e}")
-        raise HTTPException(status_code=500, detail="Image upload failed.")
-
-
-@router.get("/system-notifications/", response_model=List[SystemNotificationOut])
-async def read_system_notifications(
-    skip: int = 0,
-    limit: int = 100,
-    is_active: Optional[bool] = None,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("system_notification:view"))
-):
-    # Fetch from DB (Synchronous)
-    if is_active is True:
-        notifications = crud_system_notification.get_all_active(db, skip=skip, limit=limit)
-    else:
-        notifications = crud_system_notification.get_all(db, skip=skip, limit=limit)
-    
-    # Sign URLs (Run the sync function asynchronously)
-    for n in notifications:
-        if n.image_url and n.image_url.startswith("gs://"):
-            # FIX: Use asyncio.to_thread
-            signed_url = await asyncio.to_thread(generate_signed_gcs_url, n.image_url)
-            if signed_url: n.image_url = signed_url
-                
-    return notifications
-
-@router.get("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
-async def read_system_notification(
-    notification_id: int,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("system_notification:view"))
-):
-    db_notification = crud_system_notification.get(db, id=notification_id)
-    if not db_notification:
-        raise HTTPException(status_code=404, detail="Not found.")
-    
-    if db_notification.image_url and db_notification.image_url.startswith("gs://"):
-        signed_url = await generate_signed_gcs_url(db_notification.image_url)
-        if signed_url:
-            db_notification.image_url = signed_url
-            
-    return db_notification
-
-@router.put("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
-async def update_system_notification(
-    notification_id: int,
-    notification_in: SystemNotificationUpdate,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("system_notification:edit")),
-    request: Request = None
-):
-    """
-    Updates an existing system notification by ID and signs the image URL before returning.
-    """
-    db_notification = crud_system_notification.get(db, id=notification_id)
-    if db_notification is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="System notification not found or already deleted."
-        )
-
-    # 1. Date Validation
-    new_start_date = notification_in.start_date or db_notification.start_date
-    new_end_date = notification_in.end_date or db_notification.end_date
-    
-    if new_start_date >= new_end_date:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="End date must be after start date."
-        )
-    
-    # 2. Perform Update (The image_url field is included here)
-    updated_notification = crud_system_notification.update(
-        db,
-        db_obj=db_notification,
-        obj_in=notification_in,
-        user_id=current_user.user_id
-    )
-
-    # 3. Sign the URL (Needed so the frontend can display the updated image immediately)
-    if updated_notification.image_url and updated_notification.image_url.startswith("gs://"):
-        signed_url = await generate_signed_gcs_url(updated_notification.image_url)
-        if signed_url:
-            updated_notification.image_url = signed_url
-
-    return updated_notification
-
-@router.delete("/system-notifications/{notification_id}", response_model=SystemNotificationOut)
-def delete_system_notification(
-    notification_id: int,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("system_notification:delete")),
-    request: Request = None
-):
-    """
-    Soft-deletes a system notification by ID.
-    """
-    db_notification = crud_system_notification.get(db, id=notification_id)
-    if db_notification is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="System notification not found or already deleted."
-        )
-
-    deleted_notification = crud_system_notification.soft_delete(
-        db,
-        db_notification,
-        user_id=current_user.user_id
-    )
-    return deleted_notification
-
-
-@router.post("/system-notifications/{notification_id}/restore", response_model=SystemNotificationOut)
-def restore_system_notification(
-    notification_id: int,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("system_notification:edit")),
-    request: Request = None
-):
-    """
-    Restores a soft-deleted system notification by ID.
-    """
-    # 1. Fetch by ID first (ignoring deletion status) to be robust
-    #db_notification = crud_system_notification.get(db, id=notification_id)
-    db_notification = crud_system_notification.get(db, id=notification_id, include_deleted=True)
-    # 2. If it doesn't exist at all, 404
-    if db_notification is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="System notification not found."
-        )
-
-    # 3. If it exists but is NOT deleted, just return it (Idempotency).
-    # This prevents the 404 error if the frontend and backend are out of sync.
-    if not db_notification.is_deleted:
-        return db_notification
-
-    # 4. Perform Restore
-    restored_notification = crud_system_notification.restore(
-        db,
-        db_obj=db_notification,
-        user_id=current_user.user_id
-    )
-    return restored_notification
 
 @router.get("/users/", response_model=List[UserOut])
 def read_users(
@@ -3002,7 +2990,7 @@ async def get_commercial_register_document_url(
 
     try:
         # Generate the signed URL
-        signed_url = generate_signed_gcs_url(gcs_uri)
+        signed_url = await generate_signed_gcs_url(gcs_uri)
         
         # CHANGE: Return JSON object instead of RedirectResponse
         return {"url": signed_url}

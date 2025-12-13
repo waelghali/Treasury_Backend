@@ -220,21 +220,9 @@ class CRUDSystemNotification(CRUDBase):
         
         
     def create(self, db: Session, *, obj_in: SystemNotificationCreate, user_id: int) -> SystemNotification:
-        """
-        Creates a new SystemNotification instance, ensuring all fields including image_url are set.
-        Overrides CRUDBase.create to explicitly handle SystemNotificationCreate fields.
-        """
-        # Convert Pydantic object to a dictionary
-        # We use .model_dump() (or .dict() if using older Pydantic) to get the fields
         obj_in_data = obj_in.model_dump(exclude_unset=True)
-        
-        # 1. Create the database object
         db_obj = self.model(**obj_in_data)
-        
-        # 2. Add system audit fields
         db_obj.created_by_user_id = user_id
-        
-        # 3. Save to database
         db.add(db_obj)
         db.commit()
         db.refresh(db_obj)

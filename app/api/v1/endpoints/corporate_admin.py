@@ -5,6 +5,7 @@ import sys
 import importlib.util
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict
+import asyncio
 
 import io
 import csv
@@ -52,7 +53,7 @@ from app.models import (
     Customer
 )
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, SubscriptionStatus
-from app.core.ai_integration import generate_signed_gcs_url
+from app.core.ai_integration import generate_signed_gcs_url, _check_bucket_access
 # FIX: Ensure get_global_email_settings is imported alongside the others.
 # Although you are currently only using get_global_email_settings, keeping 
 # get_customer_email_settings imported is generally safer for a complex file.
@@ -1003,6 +1004,18 @@ def update_customer_configuration(
         # 3. CRITICAL FIX: Upsert the customer configuration record
         # We need a new CRUD method that handles both CREATE (for new keys) and UPDATE (for old keys)
         # Assuming you implemented the 'set_customer_config' Upsert logic from the previous step.
+        
+        # --- VALIDATION: Check Bucket Access ---
+        if global_config_key == GlobalConfigKey.STORAGE_BUCKET_NAME:
+            # Run the async check synchronously since this endpoint is synchronous
+            has_access = asyncio.run(_check_bucket_access(config_in.configured_value))
+            if not has_access:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Access Denied: The system cannot access the bucket '{config_in.configured_value}'. Please ensure the Service Account has 'Storage Object Admin' permissions."
+                )
+        # ---------------------------------------
+        
         db_customer_config = crud_customer_configuration.set_customer_config(
             db, 
             customer_id=customer_id, 
@@ -1728,7 +1741,13 @@ def get_approved_requests_pending_print(
     ]
     
     return result[skip:skip + limit]
+# Assuming this code is in your end_user.py or corporate_admin.py file
 
+# NOTE: You MUST ensure the _safe_generate_signed_url helper (and import asyncio)
+# is defined at the top of this file, as provided in the previous step.
+
+# @router.post("/system-notifications/{notification_id}/view", ...)
+# This endpoint is already correct as it does not deal with image URLs.
 @router.post(
     "/system-notifications/{notification_id}/view", 
     response_model=dict,
@@ -1759,21 +1778,19 @@ def log_corporate_admin_notification_view(
     
     return {"status": "success", "view_count": log.view_count}
 
+# --------------------------------------------------------------------------
+
 @router.get(
     "/system-notifications/",
     response_model=List[SystemNotificationOut],
     dependencies=[Depends(check_subscription_status)],
     summary="Get active system notifications for the Corporate Admin's customer"
 )
-async def get_active_system_notifications(
+async def get_active_system_notifications_corporate_admin( # Use your existing function name
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
 ):
-    """
-    Retrieves all active system notifications relevant to the authenticated Corporate Admin.
-    """
     
-    # Ensure the session reads committed data from the database.
     db.expire_all() 
 
     customer_id = corporate_admin_context.customer_id
@@ -1783,11 +1800,17 @@ async def get_active_system_notifications(
         db, user_id=user_id, customer_id=customer_id
     )
 
-    # Sign URLs
+    results = []
     for n in notifications:
+        # CRITICAL FIX: Explicitly detach the ORM object from the session before mutation
+        db.expunge(n)
+        
         if n.image_url and n.image_url.startswith("gs://"):
-            signed_url = await generate_signed_gcs_url(n.image_url)
+            # Use the safe async wrapper
+            signed_url = await _safe_generate_signed_url(n.image_url)
             if signed_url:
                 n.image_url = signed_url
+        
+        results.append(n)
 
-    return notifications
+    return results

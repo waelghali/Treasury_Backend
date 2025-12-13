@@ -83,7 +83,8 @@ class CRUDLGDocument(CRUDBase):
         lg_record_id: int,
         uploaded_by_user_id: int,
         original_instruction_serial: Optional[str] = None,
-        lg_record_details: Optional[Dict[str, Any]] = None        
+        lg_record_details: Optional[Dict[str, Any]] = None, 
+        bucket_name: str = GCS_BUCKET_NAME      
     ) -> LGDocument:
         logger.debug(f"[CRUDLGDocument.create_document] START. lg_record_id={lg_record_id}, doc_type={obj_in.document_type}, orig_filename={obj_in.file_name}") 
 
@@ -136,7 +137,7 @@ class CRUDLGDocument(CRUDBase):
             
         try:
             # 4. Upload to GCS using the new hierarchical blob path
-            stored_gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, file_content, obj_in.mime_type)
+            stored_gcs_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, obj_in.mime_type)
             if not stored_gcs_uri:
                 raise Exception("GCS upload returned no URI.")
             logger.info(f"Document uploaded to GCS: {stored_gcs_uri}")

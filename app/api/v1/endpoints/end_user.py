@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, and_
 from typing import List, Optional, Any, Dict, Tuple
+import asyncio
 
 from app.database import get_db
 
@@ -462,7 +463,21 @@ async def scan_lg_file(
         )
 
     try:
-        extracted_ai_data, ai_usage_metadata = await process_lg_document_with_ai(await file.read(), file.content_type, file.filename)
+        # 1. Fetch Customer Bucket Preference
+        bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, end_user_context.customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+        )
+        # If no config exists, this returns None, handling the fallback automatically
+        customer_bucket = bucket_config.get("effective_value") if bucket_config else None
+        # 2. Call AI with the specific bucket
+        file_bytes = await file.read()
+        extracted_ai_data, ai_usage_metadata = await process_lg_document_with_ai(
+            file_bytes, 
+            file.content_type, 
+            file.filename,
+            customer_bucket_name=customer_bucket # <--- Pass it here
+        )
+
         if not extracted_ai_data:
             log_action(db, user_id=end_user_context.user_id, action_type="AI_SCAN_FAILED", entity_type="LGRecord", entity_id=None, details={"file_name": file.filename, "reason": "AI extraction failed or returned no data", "ai_token_usage": ai_usage_metadata}, customer_id=end_user_context.customer_id)
             raise HTTPException(
@@ -3330,6 +3345,34 @@ async def get_current_user_dashboard_info(
         "active_lgs_count": active_lg_count,
     }
 
+# --- HELPER: Async Wrapper for URL Signing ---
+# Note: This definition needs to be placed somewhere globally in end_user.py
+# (outside of any route function) and requires 'import asyncio' and 
+# 'from app.core.ai_integration import generate_signed_gcs_url'
+async def _safe_generate_signed_url(gcs_uri: str) -> Optional[str]:
+    """
+    Safely generates a signed URL. This is necessary because generate_signed_gcs_url
+    might return a coroutine that needs to be awaited.
+    """
+    try:
+        if not gcs_uri: return None
+        
+        # Assuming generate_signed_gcs_url is imported from app.core.ai_integration
+        result = generate_signed_gcs_url(gcs_uri)
+        
+        # This is the crucial logic to await if the result is a coroutine
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+    except Exception as e:
+        # Assuming logger is imported globally in end_user.py
+        logger.error(f"Error signing URL for end-user: {e}")
+        return None
+
+# =============================================================================
+# REPLACEMENT ENDPOINTS
+# =============================================================================
+
 @router.get(
     "/system-notifications/",
     response_model=List[SystemNotificationOut],
@@ -3340,28 +3383,26 @@ async def get_active_system_notifications(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
-    """
-    Retrieves all active system notifications relevant to the authenticated user.
-    """
-    
-    # Ensure the session reads committed data from the database.
-    db.expire_all() 
-
-    customer_id = end_user_context.customer_id
-    user_id = end_user_context.user_id
-    
+    db.expire_all()
     notifications = crud_system_notification.get_active_notifications_for_user(
-        db, user_id=user_id, customer_id=customer_id
+        db, user_id=end_user_context.user_id, customer_id=end_user_context.customer_id
     )
 
-    # Sign URLs
+    results = []
     for n in notifications:
+        # CRITICAL FIX: Explicitly detach the ORM object from the session
+        # This prevents the subsequent mutation from being written to the DB.
+        db.expunge(n) 
+        
         if n.image_url and n.image_url.startswith("gs://"):
-            signed_url = await generate_signed_gcs_url(n.image_url)
-            if signed_url:
-                n.image_url = signed_url
+            # Use the safe async wrapper defined previously
+            signed = await _safe_generate_signed_url(n.image_url) 
+            if signed:
+                n.image_url = signed
+        
+        results.append(n)
 
-    return notifications
+    return results
         
 @router.post(
     "/system-notifications/{notification_id}/view", 
@@ -3384,7 +3425,6 @@ def log_system_notification_view(
             detail="System notification not found."
         )
 
-    # Call the new CRUD method for display logging
     log = crud_system_notification.log_notification_display( 
         db,
         user_id=end_user_context.user_id,
@@ -3395,13 +3435,12 @@ def log_system_notification_view(
 
 
 @router.post(
-    "/system-notifications/{notification_id}/acknowledge", # EXISTING ENDPOINT (Dismiss action)
-    # RESPONSE MODEL CHANGED TO A SIMPLE STATUS OBJECT
+    "/system-notifications/{notification_id}/acknowledge", 
     response_model=dict,
     dependencies=[Depends(check_for_read_only_mode)],
     summary="Logs an acknowledgment for a system notification."
 )
-def acknowledge_system_notification( # FUNCTION RENAME
+def acknowledge_system_notification(
     notification_id: int,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -3416,16 +3455,13 @@ def acknowledge_system_notification( # FUNCTION RENAME
             detail="System notification not found."
         )
 
-    # Use the dedicated CRUD method for explicit acknowledgment
     log = crud_system_notification.acknowledge_notification(
         db,
         user_id=end_user_context.user_id,
         notification_id=notification_id
     )
     
-    # Return a simple success object
     return {"status": "success", "view_count": log.view_count}
-
 # --------------------------------------------------------------------------------------
 # 8. /lg-records/instructions/{instruction_id}/cancel
 # --------------------------------------------------------------------------------------
@@ -3572,6 +3608,7 @@ def get_lg_lifecycle_history_report(
 
     history = crud_reports.get_all_lg_lifecycle_history(
         db=db,
+        customer_id=end_user_context.customer_id,
         user_id=end_user_context.user_id,
         start_date=start_date,
         end_date=end_date,

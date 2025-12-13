@@ -1,5 +1,5 @@
 # app/schemas/all_schemas.py
-from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field
+from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field, field_validator
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Union
 from enum import Enum
@@ -774,7 +774,40 @@ class LGRecordBase(BaseModel):
     issuer_name: str = Field(..., description="Name of the LG issuer (person/company bank guarantees)")
     issuer_id: Optional[str] = Field(None, max_length=15, description="Optional identifier for the issuer")
     lg_number: str = Field(..., max_length=64, description="Unique identifier for the Letter of Guarantee")
-    lg_amount: Decimal = Field(..., ge=0, description="Original total amount of the LG (can be 0 for liquidated LGs)")
+    
+    # --- CRITICAL FIX 1: REMOVE 'ge=0' CONSTRAINT ---
+    lg_amount: str = Field(..., description="Original total amount of the LG (can be 0 for liquidated LGs)")
+    
+    # --- ADD DATE CLEANER VALIDATOR ---
+    @field_validator('issuance_date', 'expiry_date', mode='before', check_fields=False)
+    @classmethod
+    def strip_time_from_date(cls, v):
+        """Converts datetime objects (often returned by SQLAlchemy/DBs) to pure date objects."""
+        if isinstance(v, datetime):
+            return v.date()
+        return v
+
+    # --- UPDATED AMOUNT VALIDATOR ---
+    @field_validator('lg_amount', mode='before', check_fields=False)
+    @classmethod
+    def format_lg_amount(cls, v):
+        if v is None:
+            return None
+        try:
+            # 1. Convert to float to check the value
+            val = float(v)
+            
+            # 2. Re-implement the 'ge=0' validation check manually
+            if val < 0:
+                raise ValueError("LG amount cannot be negative.")
+            
+            # 3. Return as formatted string (e.g., "50000.00") to fix 0E-10 issue
+            return f"{val:.2f}"
+        except (ValueError, TypeError):
+            # If it's not convertible to a number, raise an error or return string
+            raise ValueError(f"LG amount must be a valid number, received: {v}")
+
+
     lg_currency_id: int = Field(..., description="ID of the currency of the LG amount")
     lg_payable_currency_id: Optional[int] = Field(None, description="ID of the currency in which LG is payable (defaults to LG Currency)")
     issuance_date: date = Field(..., description="Date the LG was issued (DD/MM/YYYY)")
@@ -1250,6 +1283,7 @@ class SystemNotificationUpdate(BaseModel):
     notification_type: Optional[str] = None
     is_popup: Optional[bool] = None
     popup_action_label: Optional[str] = None
+    image_url: Optional[str] = None
 
 # --- Output Schema (Response) ---
 class SystemNotificationOut(SystemNotificationBase):
@@ -1437,13 +1471,40 @@ class LGLifecycleHistoryReportItem(BaseModel):
     
     # NEW FIELDS ADDED TO EXPOSE LG RECORD DATA
     issuer_name: Optional[str] = None
-    lg_amount: Optional[float] = None
+    lg_amount: Optional[str] = None
     lg_currency: Optional[str] = None
     lg_type_name: Optional[str] = None
     lg_category_name: Optional[str] = None
     internal_owner_email: Optional[EmailStr] = None
     issuance_date: Optional[date] = None
+
+    # The 'details' field remains, but we will use the following fields to store extracted data:
+    instruction_serial: Optional[str] = None # Maps to Instruction Serial
+    delivery_date: Optional[date] = None      # Maps to Delivery Date
+    bank_reply_date: Optional[date] = None    # Maps to Bank Reply Date
+
+    old_expiry_date: Optional[date] = None    # Maps to Old Expiry Date
+    new_expiry_date: Optional[date] = None    # Maps to New Expiry Date
     
+    old_amount: Optional[str] = None        # Changed from float to str
+    new_amount: Optional[str] = None        # Changed from float to str
+    
+    # amount_change can remain float if you want, or be str to be safe. 
+    # Usually, '0E-10' happens on the main amount fields.
+    amount_change: Optional[float] = None    
+    # We will use this to populate the Summary Description field in the final export (not strictly needed in Pydantic, but helpful for structure)
+    summary_description: Optional[str] = None # Maps to Summary Description 
+
+    @field_validator('lg_amount', 'old_amount', 'new_amount', mode='before', check_fields=False)
+    @classmethod
+    def format_amounts(cls, v):
+        if v is None:
+            return None
+        try:
+            return f"{float(v):.2f}"
+        except (ValueError, TypeError):
+            return str(v)
+            
     class Config:
         from_attributes = True
 

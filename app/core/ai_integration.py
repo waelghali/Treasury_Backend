@@ -1,18 +1,18 @@
 # app/core/ai_integration.py
 import os
 import io
+from typing import Dict, Any, Optional, List, Tuple
 import json
+import fitz # PyMuPDF
+from dotenv import load_dotenv
 import re
 import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
 import logging
 import uuid
-import tempfile
-from typing import Dict, Any, Optional, List, Tuple
 from functools import lru_cache
-from datetime import datetime, timedelta
-
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import datetime, timedelta # Added timedelta for signed URL expiry
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,18 +21,59 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env file
 load_dotenv()
 
+async def _check_bucket_access(bucket_name: str) -> bool:
+    """Verifies if the Service Account has access to the specified bucket."""
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
+        return False
+    try:
+        def _check():
+            client = _get_gcs_client()
+            if client:
+                client.bucket(bucket_name).reload()
+                return True
+            return False
+        return await asyncio.to_thread(_check)
+    except Exception as e:
+        logger.warning(f"Access check failed for '{bucket_name}': {e}")
+        return False
+
 # --- Configuration for Google Cloud Storage ---
 GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME')
 if not GCS_BUCKET_NAME:
     logger.warning("Warning: GCS_BUCKET_NAME environment variable not set. GCS integration will be limited.")
 
-# --- Global Client/Credentials Instantiation (Initialized to None) ---
+# Try to import Google Cloud Vision
+try:
+    from google.cloud import vision_v1p3beta1 as vision
+    from google.cloud import storage
+    from google.oauth2 import service_account
+    from google.api_core.exceptions import GoogleAPIError # Import GoogleAPIError for specific exception handling
+    GOOGLE_CLOUD_LIBRARIES_AVAILABLE = True
+except ImportError:
+    logger.warning("Warning: google-cloud-vision or google-cloud-storage library not found. AI OCR/GCS functionality will be limited.")
+    GOOGLE_CLOUD_LIBRARIES_AVAILABLE = False
+    vision = None
+    storage = None
+    service_account = None
+    GoogleAPIError = Exception # Define dummy for type hinting if not available
+
+# Try to import Google Generative AI
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    logger.warning("Warning: google-generativeai library not found. Gemini AI functionality will be limited.")
+    GEMINI_AVAILABLE = False
+    genai = None
+
+# --- Global Client/Credentials Instantiation ---
 _google_credentials = None
 _gcs_client = None
 _vision_client = None
 _gemini_model_global = None
 
 # --- Dynamically set GOOGLE_APPLICATION_CREDENTIALS if JSON is provided ---
+# This block replaces the direct os.environ lookup with a temporary file approach.
 creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
 if creds_json:
     # Use tempfile to create a secure temporary file
@@ -43,21 +84,13 @@ if creds_json:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
     logger.info(f"Google credentials written to temporary file: {tmp_path}")
 else:
-    # Only warn if explicitly missing, otherwise assume standard path or implicit auth
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-        logger.warning("GOOGLE_CREDENTIALS_JSON not found. Ensure GOOGLE_APPLICATION_CREDENTIALS is set if using local file.")
+    logger.warning("GOOGLE_CREDENTIALS_JSON environment variable not found. Attempting to use existing GOOGLE_APPLICATION_CREDENTIALS.")
 
 @lru_cache(maxsize=1)
 def _get_google_credentials():
     global _google_credentials
-    
-    # Lazy import
-    try:
-        from google.oauth2 import service_account
-    except ImportError:
-        logger.warning("Google Cloud libraries (google-auth) not found. Credentials cannot be loaded.")
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         return None
-
     if _google_credentials is None and "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
         try:
             credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"].strip('\'"')
@@ -74,14 +107,8 @@ def _get_google_credentials():
 @lru_cache(maxsize=1)
 def _get_gcs_client():
     global _gcs_client
-    
-    # Lazy import
-    try:
-        from google.cloud import storage
-    except ImportError:
-        logger.warning("Google Cloud Storage library not found. GCS client cannot be initialized.")
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         return None
-
     if _gcs_client is None:
         try:
             credentials = _get_google_credentials()
@@ -99,14 +126,8 @@ def _get_gcs_client():
 @lru_cache(maxsize=1)
 def _get_vision_client():
     global _vision_client
-    
-    # Lazy import
-    try:
-        from google.cloud import vision_v1p3beta1 as vision
-    except ImportError:
-        logger.warning("Google Cloud Vision library not found. Vision client cannot be initialized.")
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         return None
-
     if _vision_client is None:
         try:
             credentials = _get_google_credentials()
@@ -124,14 +145,9 @@ def _get_vision_client():
 @lru_cache(maxsize=1)
 def _get_gemini_model():
     global _gemini_model_global
-    
-    # Lazy import
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        logger.warning("Google Generative AI library not found. Gemini AI functionality will be disabled.")
+    if not GEMINI_AVAILABLE:
+        logger.warning("Gemini AI is not available.")
         return None
-
     if _gemini_model_global is None:
         gemini_api_key = os.environ.get('GEMINI_API_KEY')
         if not gemini_api_key:
@@ -145,6 +161,12 @@ def _get_gemini_model():
             logger.error(f"Error configuring Gemini API or instantiating model: {e}. Gemini features will be disabled.")
             _gemini_model_global = None
     return _gemini_model_global
+
+# Initial client setup
+_get_google_credentials()
+_get_gcs_client()
+_get_vision_client()
+_get_gemini_model()
 
 # --- Local Output Directory Setup ---
 BASE_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "Output")
@@ -162,17 +184,14 @@ async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_
     Asynchronously uploads byte data to a specified GCS bucket.
     Returns the gs:// URI of the uploaded object on success.
     """
-    if not GCS_BUCKET_NAME:
-        logger.error("GCS bucket name not configured. Cannot upload to GCS.")
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not GCS_BUCKET_NAME:
+        logger.error("GCS libraries not available or bucket name not configured. Cannot upload to GCS.")
         return None
 
     client = _get_gcs_client()
     if not client:
         logger.error("GCS client not initialized. Cannot upload to GCS.")
         return None
-    
-    # Local import of exception now that we know libraries are present
-    from google.api_core.exceptions import GoogleAPIError
 
     try:
         bucket = client.bucket(bucket_name)
@@ -192,16 +211,14 @@ async def _cleanup_gcs_files(bucket_name: str, prefix: str):
     """
     Asynchronously deletes files from GCS that match a given prefix.
     """
-    if not GCS_BUCKET_NAME:
-        logger.warning("GCS bucket name not configured. Skipping GCS cleanup.")
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not GCS_BUCKET_NAME:
+        logger.warning("GCS libraries not available or bucket name not configured. Skipping GCS cleanup.")
         return
 
     client = _get_gcs_client()
     if not client:
         logger.error("GCS client not initialized. Cannot perform cleanup.")
         return
-    
-    from google.api_core.exceptions import GoogleAPIError
 
     try:
         bucket = client.bucket(bucket_name)
@@ -219,22 +236,13 @@ def delete_file_from_gcs(gcs_uri: str) -> bool:
     if not gcs_uri or not gcs_uri.startswith("gs://"):
         return False
     
-    # Lazy import for the non-async client usage in this synchronous helper
-    try:
-        from google.cloud import storage
-    except ImportError:
-        logger.error("Google Cloud Storage library not available.")
-        return False
-
     try:
         # uri format: gs://bucket_name/path/to/blob
         parts = gcs_uri[len("gs://"):].split('/', 1)
         bucket_name = parts[0]
         blob_name = parts[1]
 
-        # Use the cached credentials if possible to avoid re-auth overhead
-        credentials = _get_google_credentials()
-        storage_client = storage.Client(credentials=credentials)
+        storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         
@@ -245,47 +253,53 @@ def delete_file_from_gcs(gcs_uri: str) -> bool:
         print(f"Error deleting file {gcs_uri}: {e}")
         return False
 
-async def generate_signed_gcs_url(gs_uri: str, valid_for_seconds: int = 900) -> Optional[str]:
+# --- UPDATED: Generate Signed URL ---
+async def generate_signed_gcs_url(gcs_uri: str, expiration: int = 3600) -> Optional[str]:
     """
-    Generates a time-limited signed URL for a private GCS object.
+    Generates a temporary signed URL for viewing a file using the full GCS URI.
+    Args:
+        gcs_uri: The full GCS URI (e.g., gs://bucket_name/path/to/blob).
+        expiration: Time in seconds until the link expires.
     """
-    client = _get_gcs_client()
-    if not client:
-        logger.error("GCS client not initialized. Cannot generate signed URL.")
+    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         return None
-    
-    from google.api_core.exceptions import GoogleAPIError
+
+    # --- CRITICAL FIX: Robust GCS URI Parsing ---
+    # We must extract bucket_name and blob_name from the full URI
+    if not gcs_uri.startswith("gs://"):
+        logger.error(f"Invalid GCS URI format: {gcs_uri}. Must start with 'gs://'.")
+        return None
+        
+    path_parts = gcs_uri[5:].split('/', 1)
+    if len(path_parts) != 2:
+        logger.error(f"Failed to parse bucket and blob name from URI: {gcs_uri}")
+        return None
+        
+    bucket_name, blob_name = path_parts
+    # ---------------------------------------------
 
     try:
-        if not gs_uri.startswith("gs://"):
-            logger.error(f"Invalid GCS URI format: {gs_uri}. Must start with 'gs://'.")
-            return None
-        
-        path_parts = gs_uri[len("gs://"):].split('/', 1)
-        if len(path_parts) < 2:
-            logger.error(f"Invalid GCS URI format: {gs_uri}. Must contain bucket and blob path.")
-            return None
+        # We run this in a thread because GCS client operations are synchronous
+        def _generate():
+            client = _get_gcs_client()
+            if not client:
+                return None
             
-        bucket_name = path_parts[0]
-        blob_name = path_parts[1]
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            
+            # Generate the signed URL
+            url = blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(seconds=expiration),
+                method="GET"
+            )
+            return url
 
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-
-        signed_url = await asyncio.to_thread(
-            blob.generate_signed_url,
-            version="v4",
-            expiration=timedelta(seconds=valid_for_seconds),
-            method="GET"
-        )
-        logger.info(f"Generated signed URL for gs://{bucket_name}/{blob_name}, valid for {valid_for_seconds} seconds.")
-        return signed_url
-
-    except GoogleAPIError as e:
-        logger.error(f"Failed to generate signed URL for {gs_uri} due to GCS API error: {e}", exc_info=True)
-        return None
+        return await asyncio.to_thread(_generate)
+        
     except Exception as e:
-        logger.error(f"An unexpected error occurred while generating signed URL for {gs_uri}: {e}", exc_info=True)
+        logger.error(f"Error generating signed URL for {gcs_uri}: {e}")
         return None
 
 # --- Google Vision OCR Function ---
@@ -293,14 +307,6 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
     vision_client = _get_vision_client()
     if not vision_client:
         logger.error("Google Vision ImageAnnotatorClient is not available.")
-        return None
-    
-    # Lazy imports
-    try:
-        from google.cloud import vision_v1p3beta1 as vision
-        from google.api_core.exceptions import GoogleAPIError
-    except ImportError:
-        logger.error("Google Cloud Vision libraries missing.")
         return None
 
     text_content = ""
@@ -339,11 +345,7 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
     if not gcs_client or not bucket_name:
         logger.error("GCS client not initialized or bucket name missing. PDF conversion/upload skipped.")
         return []
-    
-    # Lazy import for heavy PDF library
-    try:
-        import fitz # PyMuPDF
-    except ImportError:
+    if not fitz:
         logger.error("PyMuPDF (fitz) not available. Cannot convert PDF.")
         return []
 
@@ -387,12 +389,6 @@ async def extract_structured_data_with_gemini(text_content: str, unique_file_id:
     model = _get_gemini_model()
     if not model:
         logger.error("Gemini AI model is not available or not configured.")
-        return None, None
-    
-    # Lazy import needed for types usage
-    try:
-        import google.generativeai as genai
-    except ImportError:
         return None, None
 
     if not text_content:
@@ -614,8 +610,12 @@ Document Text:
         raise
 
 # --- Main AI Processing Function ---
-async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_number_hint: str = "unknown_lg") -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_number_hint: str = "unknown_lg", customer_bucket_name: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     logger.info(f"Starting AI processing for MIME type: {mime_type}, LG Hint: {lg_number_hint}")
+    target_bucket_name = customer_bucket_name if customer_bucket_name else GCS_BUCKET_NAME
+    if not target_bucket_name:
+        logger.error("No target bucket configured.")
+        return None, None
     
     structured_data = None
     total_usage_metadata = {
@@ -631,8 +631,7 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
     image_uris = []
 
     try:
-        # Replaced global flag check with client check
-        if not _get_gcs_client() or not GCS_BUCKET_NAME:
+        if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE or not target_bucket_name:
             logger.error("GCS_BUCKET_NAME is not set or Google Cloud libraries not available. Cannot proceed with file uploads.")
             return structured_data, total_usage_metadata
 
@@ -641,18 +640,18 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
 
         if mime_type.startswith("image/"):
             blob_name = f"lg_scans_temp/{unique_file_id}/image_{uuid.uuid4().hex}.{mime_type.split('/')[-1]}"
-            gcs_uri_for_ocr = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, mime_type)
+            gcs_uri_for_ocr = await _upload_to_gcs(target_bucket_name, blob_name, file_bytes, mime_type)
             if gcs_uri_for_ocr:
                 temp_files.append(blob_name)
                 raw_text = await perform_ocr_with_google_vision(gcs_uri_for_ocr, unique_file_id)
                 ocr_cost_metric = len(raw_text) if raw_text else 0
                 total_usage_metadata["total_pages_processed"] = 1
         elif mime_type == "application/pdf":
-            image_uris = await _convert_pdf_to_images_and_upload_to_gcs(file_bytes, GCS_BUCKET_NAME, unique_file_id)
+            image_uris = await _convert_pdf_to_images_and_upload_to_gcs(file_bytes, target_bucket_name, unique_file_id)
             if not image_uris:
                 logger.error("Failed to convert PDF to images or upload to GCS for OCR.")
                 return structured_data, total_usage_metadata
-            temp_files.extend([uri.replace(f"gs://{GCS_BUCKET_NAME}/", "") for uri in image_uris])
+            temp_files.extend([uri.replace(f"gs://{target_bucket_name}/", "") for uri in image_uris])
             all_page_texts = []
             for uri in image_uris:
                 page_text = await perform_ocr_with_google_vision(uri, unique_file_id)
@@ -687,18 +686,22 @@ async def process_lg_document_with_ai(file_bytes: bytes, mime_type: str, lg_numb
         return None, total_usage_metadata
     finally:
         if temp_files:
-            await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_scans_temp/{unique_file_id}/")
+            await _cleanup_gcs_files(target_bucket_name, f"lg_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS files for session: {unique_file_id}")
 
 # NEW FUNCTION: For amendment-specific AI processing
-async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record_details: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record_details: Dict[str, Any], customer_bucket_name: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     """
     Dedicated AI function to process a bank amendment letter, confirming its relevance
     and extracting only the amended fields.
     """
     lg_number_hint = lg_record_details.get("lgNumber", "unknown_amendment")
     logger.info(f"Starting AI processing for LG amendment. LG Hint: {lg_number_hint}")
-    
+    target_bucket_name = customer_bucket_name if customer_bucket_name else GCS_BUCKET_NAME
+    if not target_bucket_name:
+        logger.error("No target bucket configured.")
+        return None, None
+        
     structured_data = None
     total_usage_metadata = {
         "ocr_characters": 0,
@@ -713,16 +716,16 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
     try:
         if mime_type.startswith("image/"):
             blob_name = f"lg_amendment_scans_temp/{unique_file_id}/image_{uuid.uuid4().hex}.{mime_type.split('/')[-1]}"
-            gcs_uri_for_ocr = await _upload_to_gcs(GCS_BUCKET_NAME, blob_name, file_bytes, mime_type)
+            gcs_uri_for_ocr = await _upload_to_gcs(target_bucket_name, blob_name, file_bytes, mime_type)
             if gcs_uri_for_ocr:
                 temp_files.append(blob_name)
                 raw_text = await perform_ocr_with_google_vision(gcs_uri_for_ocr, unique_file_id)
                 total_usage_metadata["total_pages_processed"] = 1
         elif mime_type == "application/pdf":
-            image_uris = await _convert_pdf_to_images_and_upload_to_gcs(file_bytes, GCS_BUCKET_NAME, unique_file_id)
+            image_uris = await _convert_pdf_to_images_and_upload_to_gcs(file_bytes, target_bucket_name, unique_file_id)
             if not image_uris:
                 raise Exception("Failed to convert PDF to images for OCR.")
-            temp_files.extend([uri.replace(f"gs://{GCS_BUCKET_NAME}/", "") for uri in image_uris])
+            temp_files.extend([uri.replace(f"gs://{target_bucket_name}/", "") for uri in image_uris])
             all_page_texts = [await perform_ocr_with_google_vision(uri, unique_file_id) for uri in image_uris]
             raw_text = "\\n".join(filter(None, all_page_texts))
             total_usage_metadata["total_pages_processed"] = len(image_uris)
@@ -752,5 +755,34 @@ async def process_amendment_with_ai(file_bytes: bytes, mime_type: str, lg_record
         return None, total_usage_metadata
     finally:
         if temp_files:
-            await _cleanup_gcs_files(GCS_BUCKET_NAME, f"lg_amendment_scans_temp/{unique_file_id}/")
+            await _cleanup_gcs_files(target_bucket_name, f"lg_amendment_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
+
+# Example usage (for isolated testing)
+if __name__ == "__main__":
+    async def test_ai_integration_local():
+        dummy_pdf_path = "135.PDF"
+
+        print("\n--- Starting Isolated AI Integration Tests ---")
+
+        if os.path.exists(dummy_pdf_path):
+            print(f"\n--- Testing with PDF: {dummy_pdf_path} ---")
+            try:
+                with open(dummy_pdf_path, "rb") as f:
+                    pdf_bytes = f.read()
+                for i in range(2):
+                    print(f"\n--- PDF Test Run {i+1} ---")
+                    extracted, usage = await process_lg_document_with_ai(pdf_bytes, "application/pdf", f"pdf_run_{i+1}_{uuid.uuid4().hex}")
+                    if extracted:
+                        print(f"Extracted data from PDF (Run {i+1}): {json.dumps(extracted, indent=2)}")
+                        print(f"Usage data (Run {i+1}): {json.dumps(usage, indent=2)}")
+                    else:
+                        print(f"Failed to extract data from PDF (Run {i+1}). Check logs above.")
+            except Exception as e:
+                print(f"Error during PDF test: {e}")
+        else:
+            print(f"Dummy PDF not found at {dummy_pdf_path}. Skipping PDF test.")
+
+        print("\n--- AI Integration Tests Finished ---")
+
+    asyncio.run(test_ai_integration_local())

@@ -236,6 +236,7 @@ class CRUDLGInstruction(CRUDBase):
             details={
                 "lg_number": db_instruction.lg_record.lg_number,
                 "serial_number": db_instruction.serial_number,
+                "instruction_serial": db_instruction.serial_number,
                 "delivery_date": obj_in.delivery_date.isoformat(),
                 "document_stored": obj_in.delivery_document_file.file_name if obj_in.delivery_document_file else False,
             },
@@ -314,6 +315,7 @@ class CRUDLGInstruction(CRUDBase):
             details={
                 "lg_number": db_instruction.lg_record.lg_number,
                 "serial_number": db_instruction.serial_number,
+                "instruction_serial": db_instruction.serial_number,
                 "bank_reply_date": obj_in.bank_reply_date.isoformat(),
                 "reply_details": obj_in.reply_details,
                 "document_stored": obj_in.bank_reply_document_file.file_name if obj_in.bank_reply_document_file else False,
