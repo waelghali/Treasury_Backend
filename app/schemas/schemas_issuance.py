@@ -34,6 +34,12 @@ class IssuanceFacilityBase(BaseModel):
     expiry_date: Optional[date] = None
     review_date: Optional[date] = None
     is_active: bool = True
+    
+    # New Boundaries
+    sla_agreement_days: Optional[int] = None
+    allow_cross_border: bool = False
+    allow_third_party_issuance: bool = False
+    required_cash_margin_days: int = 0
 
 class IssuanceFacilityCreate(IssuanceFacilityBase):
     sub_limits: List[IssuanceFacilitySubLimitCreate] = []
@@ -54,6 +60,14 @@ class IssuanceFacilityOut(IssuanceFacilityBase):
     class Config:
         from_attributes = True
 
+class BankIssuanceOptionOut(BaseModel):
+    id: int
+    display_name: str
+    strategy_code: str # Frontend might need to know if it's "INSTANT" or "MANUAL" to show icons
+    
+    class Config:
+        from_attributes = True
+
 # --- 3. SMART DECISION SUPPORT ---
 class SuitableFacilityOut(BaseModel):
     facility_id: int
@@ -61,7 +75,7 @@ class SuitableFacilityOut(BaseModel):
     sub_limit_id: int
     sub_limit_name: str
     limit_available: float
-    
+    available_methods: List[BankIssuanceOptionOut] = []
     # NEW INTELLIGENCE FIELDS
     price_commission_rate: float
     price_cash_margin_pct: float
@@ -108,6 +122,9 @@ class IssuanceRequestOut(IssuanceRequestBase):
     customer_id: int
     requestor_user_id: Optional[int]
     status: str
+    current_approval_step: Optional[int] = 0
+    pending_approver_role: Optional[str] = None
+    approval_chain_audit: Optional[List[Dict[str, Any]]] = None
     created_at: datetime
     currency: Optional[CurrencyOut] = None
     lg_record: Optional[LGRecordOut] = None
@@ -140,3 +157,22 @@ class ReconciliationResult(BaseModel):
     
     # Detailed discrepancies
     discrepancies: List[Dict[str, Any]]
+
+# --- 6. WORKFLOW POLICY SCHEMAS ---
+class IssuanceWorkflowPolicyBase(BaseModel):
+    min_amount: float = 0.0
+    max_amount: Optional[float] = None
+    step_sequence: int = 1
+    approver_role_name: str
+    specific_approver_user_id: Optional[int] = None
+
+class IssuanceWorkflowPolicyCreate(IssuanceWorkflowPolicyBase):
+    pass
+
+class IssuanceWorkflowPolicyOut(IssuanceWorkflowPolicyBase):
+    id: int
+    customer_id: int
+
+    class Config:
+        from_attributes = True
+        

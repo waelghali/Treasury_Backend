@@ -534,7 +534,7 @@ async def _send_sub_notification(db: Session, customer: models.Customer, type_en
         return
 
     email_settings, method = get_customer_email_settings(db, customer.id)
-    sent = await send_email(
+    sent, error_reason = await send_email(
         db=db, to_emails=to_emails, subject_template=subject,
         body_template=body_text, template_data={},
         email_settings=email_settings, sender_name=customer.name
@@ -543,7 +543,7 @@ async def _send_sub_notification(db: Session, customer: models.Customer, type_en
     log_action(
         db, None, f"NOTIFICATION_{'SENT' if sent else 'FAILED'}_{type_enum.value}", 
         "Customer", customer.id,
-        {"recipients": to_emails, "subject": subject}, customer.id
+        {"recipients": to_emails, "subject": subject, "reason": error_reason if not sent else None}, customer.id
     )
 
 

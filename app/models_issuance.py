@@ -26,6 +26,13 @@ class IssuanceFacility(BaseModel):
     review_date = Column(Date, nullable=True)
     
     is_active = Column(Boolean, default=True)
+    
+    # SLA & Boundaries
+    sla_agreement_days = Column(Integer, nullable=True, comment="Agreed Service Level Agreement in days")
+    allow_cross_border = Column(Boolean, default=False, comment="Allows issuance to beneficiaries in other countries")
+    allow_third_party_issuance = Column(Boolean, default=False, comment="Allows issuance on behalf of other entities/subsidiaries")
+    required_cash_margin_days = Column(Integer, default=0, comment="Days required to deposit cash margin before issuance")
+    
     contract_document_path = Column(String, nullable=True)
 
     # Relationships
@@ -52,6 +59,24 @@ class IssuanceFacilitySubLimit(BaseModel):
     facility = relationship("IssuanceFacility", back_populates="sub_limits")
     lg_type = relationship("LgType")
 
+class IssuanceWorkflowPolicy(BaseModel):
+    """
+    Defines the 'Org Chart' approval logic per customer.
+    e.g., If Amount between 0-50k -> Require 'Finance Manager'.
+    """
+    __tablename__ = 'issuance_workflow_policies'
+
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    
+    min_amount = Column(Numeric(precision=20, scale=2), default=0)
+    max_amount = Column(Numeric(precision=20, scale=2), nullable=True, comment="Null means infinite/no cap")
+    
+    step_sequence = Column(Integer, default=1, comment="Order of approval (1=First, 2=Second)")
+    approver_role_name = Column(String, nullable=True, comment="Dynamic role name e.g., 'FINANCE_MANAGER'")
+    specific_approver_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="If assigned to a specific person")
+
+    customer = relationship("Customer")
+    specific_approver = relationship("User")
 
 # ==============================================================================
 # 2. TRANSACTIONS (Requests & Records)
@@ -109,9 +134,11 @@ class IssuanceRequest(BaseModel):
     lg_record_id = Column(Integer, ForeignKey("issued_lg_records.id"), nullable=True)
     
     # Workflow Status
-    status = Column(String, default="DRAFT", index=True, 
-                    comment="DRAFT, SUBMITTED, APPROVED_INTERNAL, PROCESSING_BANK, COMPLETED, REJECTED")
-
+    status = Column(String, default="DRAFT", index=True, comment="DRAFT, SUBMITTED, APPROVED_INTERNAL, PROCESSING_BANK, COMPLETED, REJECTED")
+    current_approval_step = Column(Integer, default=0, comment="Current step in the approval chain")
+    pending_approver_role = Column(String, nullable=True, comment="Role currently required to approve (for UI display)")
+    approval_chain_audit = Column(JSONB, nullable=True, comment="Log of who approved and when")
+    
     # Core Data
     amount = Column(Numeric(precision=20, scale=2), nullable=False)
     currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=False)
@@ -119,6 +146,9 @@ class IssuanceRequest(BaseModel):
     
     requested_issue_date = Column(Date, nullable=True)
     requested_expiry_date = Column(Date, nullable=True)
+    
+    selected_issuance_option_id = Column(Integer, ForeignKey("bank_issuance_options.id"), nullable=True)
+    selected_issuance_option = relationship("BankIssuanceOption")
     
     # Complex Business Logic Field (The "Smart" JSON)
     # Stores: project_name, tender_ref, delivery_method, specific_clauses, etc.
@@ -128,3 +158,27 @@ class IssuanceRequest(BaseModel):
     customer = relationship("Customer")
     currency = relationship("Currency")
     lg_record = relationship("IssuedLGRecord", back_populates="requests")
+
+class BankIssuanceOption(BaseModel):
+    """
+    Defines available execution paths for a Bank.
+    Managed by System Owner.
+    """
+    __tablename__ = 'bank_issuance_options'
+
+    bank_id = Column(Integer, ForeignKey("banks.id"), nullable=False)
+    
+    # The technical engine to use (matches the Strategy Factory)
+    # e.g. "MANUAL_PDF", "BANK_API_V1", "SWIFT_MT760"
+    strategy_code = Column(String, nullable=False) 
+    
+    # The label shown to the user
+    # e.g. "Instant Digital Issuance", "Download Paper Form", "Swift Network"
+    display_name = Column(String, nullable=False)
+    
+    # Technical Config (Templates, API URLs, Keys)
+    configuration = Column(JSONB, default={}, nullable=False)
+    
+    is_active = Column(Boolean, default=True)
+
+    bank = relationship("Bank")

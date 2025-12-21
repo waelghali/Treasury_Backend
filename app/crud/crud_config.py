@@ -325,47 +325,64 @@ class CRUDCustomerConfiguration(CRUDBase):
         
         corrected_configs = []
 
+        # 1. Determine validation limits
+        new_min_val = float(global_config.value_min) if global_config.value_min is not None else None
+        new_max_val = float(global_config.value_max) if global_config.value_max is not None else None
+        
+        # 2. Check if this config has numeric constraints
+        # We assume if min/max exist, we must enforce them, regardless of unit name.
+        # We explicitly skip 'boolean' as it doesn't use numeric ranges.
+        is_boolean = global_config.unit and global_config.unit.lower() == 'boolean'
+        has_range_constraints = (new_min_val is not None or new_max_val is not None)
+
+        if not has_range_constraints or is_boolean:
+            return []
+
         for cust_config in customer_configs_to_check:
             original_value = cust_config.configured_value
             corrected_value = None
             is_corrected = False
 
-            # FIX: Robust check for 'days', 'percentage' (case-insensitive) OR specifically Grace Period
-            is_valid_unit = global_config.unit and global_config.unit.lower() in ["days", "percentage"]
-            is_grace_period = global_config.key == GlobalConfigKey.GRACE_PERIOD_DAYS
-
-            if (is_valid_unit or is_grace_period) and original_value:
+            # Only validate if the customer actually has a custom value set
+            if original_value:
                 try:
-                    current_val = float(original_value)
-                    new_min_val = float(global_config.value_min) if global_config.value_min is not None else None
-                    new_max_val = float(global_config.value_max) if global_config.value_max is not None else None
+                    # Clean the string to handle " 5 " or "5 "
+                    clean_val = str(original_value).strip()
+                    current_val = float(clean_val)
 
+                    # Check Min Constraint
                     if new_min_val is not None and current_val < new_min_val:
                         corrected_value = new_min_val
                         is_corrected = True
+                    
+                    # Check Max Constraint
                     elif new_max_val is not None and current_val > new_max_val:
                         corrected_value = new_max_val
                         is_corrected = True
+                        
                 except (ValueError, TypeError):
-                    # If conversion fails, do not correct the value but log a warning.
-                    pass
+                    # LOGGING ADDED: This will tell you if data corruption is the cause
+                    print(f"WARNING: Validation failed. Config ID {cust_config.id} has invalid value '{original_value}' not convertible to float.")
+                    continue
 
             if is_corrected:
-                # FIX: Preserve Integer format if the corrected value is effectively an integer
-                if corrected_value == int(corrected_value):
+                # Format correction: e.g. 5.0 -> "5", 5.5 -> "5.5"
+                if corrected_value.is_integer():
                     cust_config.configured_value = str(int(corrected_value))
                 else:
                     cust_config.configured_value = str(corrected_value)
                 
                 db.add(cust_config)
                 
-                # Collect corrected config for logging and notification
+                # Use a safe way to get the key string
+                key_str = global_config.key.value if hasattr(global_config.key, 'value') else str(global_config.key)
+
                 corrected_configs.append({
                     "customer_id": cust_config.customer_id,
-                    "global_config_key": global_config.key.value,
+                    "global_config_key": key_str,
                     "old_value": original_value,
                     "new_value": cust_config.configured_value
                 })
         
-        db.flush() # Flush to persist changes in the current transaction
+        db.flush() 
         return corrected_configs

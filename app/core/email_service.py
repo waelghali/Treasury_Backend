@@ -171,14 +171,17 @@ async def send_email(
         server.quit()
 
         logger.info(f"Email sent to {to_emails} via {email_settings.smtp_host}")
-        return True
+        return True, None
 
     except smtplib.SMTPConnectError as e:
-        logger.error(f"SMTP Connect Error ({email_settings.smtp_host}): {e}")
-        return False
-    except smtplib.SMTPAuthenticationError:
-        logger.error(f"SMTP Auth Error ({email_settings.smtp_username}): Check credentials.")
-        return False
+        err = f"SMTP Connect Error ({email_settings.smtp_host}): {e}"
+        logger.error(err)
+        return False, err
+    except smtplib.SMTPException as e:
+        err = f"SMTP Error: {e}"
+        logger.error(err)
+        return False, err
     except Exception as e:
-        logger.error(f"Email send failed: {e}", exc_info=True)
-        return False
+        err = f"Unexpected error sending email: {e}"
+        logger.error(err)
+        return False, err

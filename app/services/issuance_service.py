@@ -7,8 +7,9 @@ from fastapi import HTTPException, status
 from sqlalchemy import func
 
 from app.crud.crud_issuance import crud_issuance_request, crud_issuance_facility
-from app.models_issuance import IssuanceRequest, IssuanceFacility, IssuanceFacilitySubLimit, IssuedLGRecord
-from app.schemas.schemas_issuance import IssuanceRequestUpdate
+from app.models_issuance import IssuanceRequest, IssuanceFacility, IssuanceFacilitySubLimit, IssuedLGRecord, IssuanceWorkflowPolicy, BankIssuanceOption
+from app.schemas.schemas_issuance import IssuanceRequestUpdate, SuitableFacilityOut, BankIssuanceOptionOut
+from app.core.issuance_strategies import IssuanceStrategyFactory
 
 from datetime import date
 
@@ -63,21 +64,57 @@ class IssuanceService:
     # ==========================================================================
 
     def submit_for_approval(self, db: Session, request_id: int, user_id: int) -> IssuanceRequest:
-        """ Moves a request from DRAFT to PENDING_APPROVAL. """
+        """ 
+        Moves request from DRAFT to PENDING_APPROVAL. 
+        Calculates the approval chain based on Workflow Policies.
+        """
         request = crud_issuance_request.get(db, id=request_id)
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
         
         if request.status != "DRAFT":
             raise HTTPException(status_code=400, detail="Only DRAFT requests can be submitted")
-        
+
+        # 1. Determine Policies based on Amount
+        policies = db.query(IssuanceWorkflowPolicy).filter(
+            IssuanceWorkflowPolicy.customer_id == request.customer_id,
+            IssuanceWorkflowPolicy.min_amount <= request.amount,
+            (IssuanceWorkflowPolicy.max_amount == None) | (IssuanceWorkflowPolicy.max_amount >= request.amount)
+        ).order_by(IssuanceWorkflowPolicy.step_sequence.asc()).all()
+
+        next_status = "PENDING_APPROVAL"
+        next_role = None
+        next_step = 0
+
+        # 2. Assign First Approver
+        if policies:
+            first_policy = policies[0]
+            next_role = first_policy.approver_role_name
+            next_step = first_policy.step_sequence
+        else:
+            # Fallback: If no policies defined, auto-route to default Admin or just mark pending
+            next_role = "CORPORATE_ADMIN" 
+            next_step = 1
+
         updated_request = crud_issuance_request.update(
-            db, db_obj=request, obj_in=IssuanceRequestUpdate(status="PENDING_APPROVAL")
+            db, db_obj=request, obj_in=IssuanceRequestUpdate(
+                status=next_status
+            )
         )
+        # Update extra fields manually as they might not be in the Schema yet
+        updated_request.current_approval_step = next_step
+        updated_request.pending_approver_role = next_role
+        db.add(updated_request)
+        db.commit()
+        
         return updated_request
 
     def approve_request(self, db: Session, request_id: int, approver_user_id: int) -> IssuanceRequest:
-        """ Moves a request from PENDING_APPROVAL to APPROVED_INTERNAL. """
+        """ 
+        Approves the current step. 
+        If there is a next step in the policy, moves to that.
+        If last step, moves to APPROVED_INTERNAL.
+        """
         request = crud_issuance_request.get(db, id=request_id)
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
@@ -85,10 +122,208 @@ class IssuanceService:
         if request.status != "PENDING_APPROVAL":
             raise HTTPException(status_code=400, detail="Request is not pending approval")
         
-        updated_request = crud_issuance_request.update(
-            db, db_obj=request, obj_in=IssuanceRequestUpdate(status="APPROVED_INTERNAL")
+        # 1. Check for Next Step
+        current_step = request.current_approval_step or 0
+        
+        next_policy = db.query(IssuanceWorkflowPolicy).filter(
+            IssuanceWorkflowPolicy.customer_id == request.customer_id,
+            IssuanceWorkflowPolicy.min_amount <= request.amount,
+            (IssuanceWorkflowPolicy.max_amount == None) | (IssuanceWorkflowPolicy.max_amount >= request.amount),
+            IssuanceWorkflowPolicy.step_sequence > current_step
+        ).order_by(IssuanceWorkflowPolicy.step_sequence.asc()).first()
+
+        # 2. Log this approval (Audit)
+        audit_entry = {
+            "step": current_step,
+            "approver_id": approver_user_id,
+            "role": request.pending_approver_role,
+            "timestamp": str(date.today())
+        }
+        current_audit = request.approval_chain_audit or []
+        current_audit.append(audit_entry)
+        request.approval_chain_audit = current_audit
+
+        # 3. Transition
+        if next_policy:
+            # Move to next approver
+            request.current_approval_step = next_policy.step_sequence
+            request.pending_approver_role = next_policy.approver_role_name
+            # Status remains PENDING_APPROVAL
+        else:
+            # Final Approval
+            request.status = "APPROVED_INTERNAL"
+            request.pending_approver_role = None
+
+        db.add(request)
+        db.commit()
+        db.refresh(request)
+        return request
+
+    # ==========================================================================
+    # 3. SMART FACILITY SELECTION
+    # ==========================================================================
+
+    def get_suitable_facilities(self, db: Session, request_id: int) -> List[SuitableFacilityOut]:
+        """
+        Smart Engine v2:
+        - Iterates through SUB-LIMITS (e.g., "Standard LGs", "Bid Bonds").
+        - Calculates Costs (Commission, Margin).
+        - Generates Tags ("BEST_PRICE", "NO_MARGIN").
+        """
+        request = crud_issuance_request.get(db, id=request_id)
+        if not request:
+            raise HTTPException(status_code=404, detail="Request not found")
+
+        # 1. Fetch Facilities
+        facilities = crud_issuance_facility.get_multi_by_customer(db, customer_id=request.customer_id)
+        
+        candidates = []
+        
+        for fac in facilities:
+            # Basic Facility Filters
+            if fac.currency_id != request.currency_id: 
+                continue
+            if fac.expiry_date and fac.expiry_date < date.today(): 
+                continue
+
+            # 2. Iterate Sub-Limits (The actual buckets where price lives)
+            for sub in fac.sub_limits:
+                # Filter: Does this sub-limit support the requested LG Type?
+                # (Assuming sub.lg_type_id matches request.business_details['lg_type_id'] or similar)
+                # For now, allowing all sub-limits to be candidates if they have space.
+
+                # Calculate Usage
+                # Note: In a real scenario, you'd sum up 'IssuedLGRecord' for this sub_limit_id
+                # For this snippet, we assume full sub-limit is available for simplicity or fetch dynamic usage
+                # usage = self.get_sub_limit_usage(db, sub.id) 
+                # available = sub.limit_amount - usage
+                available = sub.limit_amount # Placeholder: assuming empty for now
+
+                if available < request.amount:
+                    continue
+
+                # 3. Calculate Financials
+                comm_rate = sub.default_commission_rate or 0.0
+                margin_pct = sub.default_cash_margin_pct or 0.0
+                
+                est_comm = float(request.amount) * (comm_rate / 100.0)
+                req_margin = float(request.amount) * (margin_pct / 100.0)
+
+                # 4. Generate Tags
+                tags = []
+                if margin_pct == 0:
+                    tags.append("NO_MARGIN")
+                if comm_rate < 1.0: # Arbitrary threshold for "Cheap"
+                    tags.append("COMPETITIVE_RATE")
+                if fac.sla_agreement_days and fac.sla_agreement_days <= 2:
+                    tags.append("FAST_TRACK")
+
+                # --- NEW: Fetch Issuance Options for this Bank ---
+                bank_options = db.query(BankIssuanceOption).filter(
+                    BankIssuanceOption.bank_id == fac.bank_id,
+                    BankIssuanceOption.is_active == True
+                ).all()
+
+                method_dtos = [
+                    BankIssuanceOptionOut(
+                        id=opt.id, 
+                        display_name=opt.display_name, 
+                        strategy_code=opt.strategy_code
+                    ) for opt in bank_options
+                ]
+
+                candidates.append(SuitableFacilityOut(
+                    facility_id=fac.id,
+                    available_methods=method_dtos,
+                    facility_bank=fac.bank.name,
+                    sub_limit_id=sub.id,
+                    sub_limit_name=sub.limit_name,
+                    limit_available=float(available),
+                    
+                    price_commission_rate=comm_rate,
+                    price_cash_margin_pct=margin_pct,
+                    estimated_commission_cost=est_comm,
+                    required_cash_margin_amount=req_margin,
+                    
+                    recommendation_tags=tags
+                ))
+
+        # 5. Ranking Logic (Sort by Cheapest Commission)
+        # Identify the absolute best price to tag it
+        if candidates:
+            lowest_cost = min(c.estimated_commission_cost for c in candidates)
+            for c in candidates:
+                if c.estimated_commission_cost == lowest_cost:
+                    c.recommendation_tags.insert(0, "BEST_PRICE")
+
+        # Sort: "BEST_PRICE" first, then by Cost Ascending
+        candidates.sort(key=lambda x: x.estimated_commission_cost)
+        
+        return candidates
+
+    # ==========================================================================
+    # 4. FINAL EXECUTION (ISSUANCE)
+    # ==========================================================================
+
+    async def issue_lg_from_request(self, db: Session, request_id: int, facility_id: int, issuance_option_id: int, user_id: int):
+        """
+        Executes Issuance using the specific Option selected by the User.
+        """
+        request = crud_issuance_request.get(db, id=request_id)
+        facility = crud_issuance_facility.get(db, id=facility_id)
+
+        if request.status != "APPROVED_INTERNAL":
+             raise HTTPException(status_code=400, detail="Request must be internally approved first")
+
+        # 1. Fetch the Specific Option the User Chose
+        option = db.query(BankIssuanceOption).filter(BankIssuanceOption.id == issuance_option_id).first()
+        if not option:
+            raise HTTPException(status_code=400, detail="Invalid issuance method selected")
+
+        # 2. Delegate to Strategy Factory using the OPTION's code
+        # e.g., if code is 'BANK_API_V1', we get the BankApiStrategy class
+        strategy = IssuanceStrategyFactory.get_strategy(option.strategy_code)
+        
+        # 3. Execute with Specific Config
+        # We pass option.configuration (e.g. { "api_url": "..." }) instead of the generic facility config
+        execution_result = await strategy.execute(db, request, facility, option.configuration)
+        
+        # 4. Create the Record (Common Part)
+        new_lg = IssuedLGRecord(
+            customer_id=request.customer_id,
+            facility_id=facility.id,
+            lg_type_id=1,
+            ref_number=f"TEMP-{request.id}", 
+            status="ACTIVE",
+            amount=request.amount,
+            currency_id=request.currency_id,
+            issue_date=date.today(),
+            expiry_date=request.requested_expiry_date,
+            beneficiary_name=request.beneficiary_name,
+            created_by_user_id=user_id
         )
-        return updated_request
+        
+        # 5. Handle Artifacts (e.g. Save PDF path if generated)
+        if execution_result.get("output_type") == "FILE":
+            # Assuming you might want to save the path in the business_details or a new column
+            # new_lg.document_path = execution_result["output_data"]
+            pass
+
+        db.add(new_lg)
+        
+        # 6. Close the Request
+        request.status = "COMPLETED"
+        request.lg_record_id = new_lg.id
+        request.selected_issuance_option_id = option.id # Save the choice history
+        
+        db.add(request)
+        db.commit()
+        db.refresh(new_lg)
+        
+        return {
+            "lg_record": new_lg,
+            "execution_result": result # Contains the PDF bytes if generated
+        }
 
     def reject_request(self, db: Session, request_id: int, user_id: int) -> IssuanceRequest:
         """ Rejects the request. """

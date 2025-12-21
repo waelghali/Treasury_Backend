@@ -12,7 +12,7 @@ from app.core.encryption import encrypt_data
 
 # Models
 from app.models import Bank, Currency 
-from app.models_issuance import IssuedLGRecord, IssuanceRequest, IssuanceFacilitySubLimit, IssuanceFacility
+from app.models_issuance import IssuedLGRecord, IssuanceRequest, IssuanceFacilitySubLimit, IssuanceFacility, IssuanceWorkflowPolicy
 # NOTE: Ensure you created app/models_reconciliation.py first!
 from app.models_reconciliation import BankPositionBatch, BankPositionRow 
 
@@ -23,8 +23,10 @@ from app.schemas.schemas_issuance import (
     IssuanceFacilityCreate, IssuanceFacilityOut, SuitableFacilityOut, 
     IssuanceRequestContentUpdate, IssuanceFacilityUpdate,
     IssuedLGRecordOut,
-    ReconciliationRequest, ReconciliationResult
+    ReconciliationRequest, ReconciliationResult,
+    IssuanceWorkflowPolicyCreate, IssuanceWorkflowPolicyOut
 )
+from app.services.issuance_service import issuance_service
 
 # CRUD
 from app.crud.crud_issuance import crud_issuance_facility, crud_issuance_request
@@ -430,4 +432,122 @@ def run_bank_position_reconciliation(
         "mismatched_amount_count": mismatched_amount,
         "missing_in_system_count": missing_system,
         "discrepancies": discrepancies
+    }
+
+# ==============================================================================
+# 5. WORKFLOW CONFIGURATION (Corporate Admin Only)
+# ==============================================================================
+
+@router.post("/workflow-policies", response_model=IssuanceWorkflowPolicyOut)
+def create_workflow_policy(
+    policy_in: IssuanceWorkflowPolicyCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """ Define an approval rule (e.g., Amount > 50k requires 'MANAGER'). """
+    # Simple CRUD creation
+    db_obj = IssuanceWorkflowPolicy(
+        customer_id=current_user.customer_id,
+        **policy_in.dict()
+    )
+    db.add(db_obj)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+
+@router.get("/workflow-policies", response_model=List[IssuanceWorkflowPolicyOut])
+def list_workflow_policies(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """ List all active approval rules for this customer. """
+    return db.query(IssuanceWorkflowPolicy).filter(
+        IssuanceWorkflowPolicy.customer_id == current_user.customer_id
+    ).order_by(IssuanceWorkflowPolicy.step_sequence.asc()).all()
+
+# ==============================================================================
+# 6. APPROVAL ACTIONS
+# ==============================================================================
+
+@router.post("/requests/{request_id}/submit", response_model=IssuanceRequestOut)
+def submit_request_for_approval(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context) # Or EndUser
+):
+    """ User submits DRAFT -> PENDING_APPROVAL """
+    # TODO: Add logic to verify current_user owns the request or is allowed to submit
+    return issuance_service.submit_for_approval(db, request_id, current_user.user_id)
+
+@router.post("/requests/{request_id}/approve", response_model=IssuanceRequestOut)
+def approve_request_action(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """ 
+    Approver (Manager) approves the request. 
+    Moves to Next Step OR 'APPROVED_INTERNAL'.
+    """
+    # Security Check: In a real app, check if current_user.role == request.pending_approver_role
+    return issuance_service.approve_request(db, request_id, current_user.user_id)
+
+@router.post("/requests/{request_id}/reject", response_model=IssuanceRequestOut)
+def reject_request_action(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """ Approver rejects the request. """
+    return issuance_service.reject_request(db, request_id, current_user.user_id)
+
+# ==============================================================================
+# 7. SMART ISSUANCE SUPPORT
+# ==============================================================================
+
+@router.get("/requests/{request_id}/recommendations", response_model=List[SuitableFacilityOut])
+def get_facility_recommendations(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Returns a list of facilities that CAN issue this LG, sorted by SLA.
+    """
+    return issuance_service.get_suitable_facilities(db, request_id)
+
+from fastapi.responses import StreamingResponse
+import io
+
+@router.post("/requests/{request_id}/execute/{facility_id}")
+async def execute_issuance(
+    request_id: int,
+    facility_id: int,
+    method_id: int = Query(...),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
+):
+    # Call Service
+    result_data = await issuance_service.issue_lg_from_request(
+        db, request_id, facility_id, method_id, current_user.user_id
+    )
+    
+    execution_result = result_data["execution_result"]
+    
+    # If the strategy produced a File (Bytes), stream it to user
+    if execution_result.get("output_type") == "BYTES":
+        pdf_bytes = execution_result["output_data"]
+        filename = execution_result.get("filename", "document.pdf")
+        
+        # Return as File Download
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes), 
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    
+    # Otherwise (e.g. API-based issuance), return JSON
+    return {
+        "message": execution_result.get("message"), 
+        "lg_record_id": result_data["lg_record"].id
     }
