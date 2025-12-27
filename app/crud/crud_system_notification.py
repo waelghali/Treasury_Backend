@@ -142,7 +142,41 @@ class CRUDSystemNotification(CRUDBase):
         ).order_by(self.model.created_at.desc())
         
         return query.all()
+    
+    def get_analytics(self, db: Session, notification_id: int) -> Dict[str, Any]:
+        """
+        Retrieves analytics data for a specific notification, including viewer details.
+        """
+        # Join with User to get the email address for better insight
+        results = (
+            db.query(SystemNotificationViewLog, User.email)
+            .join(User, SystemNotificationViewLog.user_id == User.id)
+            .filter(SystemNotificationViewLog.notification_id == notification_id)
+            .order_by(SystemNotificationViewLog.last_viewed_at.desc())
+            .all()
+        )
 
+        logs_data = []
+        total_views = 0
+
+        for view_log, user_email in results:
+            total_views += view_log.view_count
+            logs_data.append({
+                "id": view_log.id,
+                "user_id": view_log.user_id,
+                "notification_id": view_log.notification_id,
+                "view_count": view_log.view_count,
+                "last_viewed_at": view_log.last_viewed_at,
+                "user_email": user_email
+            })
+
+        return {
+            "notification_id": notification_id,
+            "total_views": total_views,
+            "unique_viewers": len(logs_data),
+            "logs": logs_data
+        }
+    
     # --- NEW METHOD: Log Display (Counts against view limit) ---
     def log_notification_display(self, db: Session, user_id: int, notification_id: int) -> SystemNotificationViewLog:
         """

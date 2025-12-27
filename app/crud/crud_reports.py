@@ -255,7 +255,7 @@ class CRUDReports(CRUDBase):
         lgs_sorted = sorted(lgs_near_expiry_query, key=lambda x: x.expiry_date)
         
         for lg in lgs_sorted:
-            days_left = (lg.expiry_date - date.today()).days
+            days_left = (lg.expiry_date.date() - date.today()).days
             upcoming_expiries_list.append({
                 "lg_number": lg.lg_number,
                 "bank_name": lg.issuing_bank.name if lg.issuing_bank else "Unknown Bank",
@@ -270,7 +270,7 @@ class CRUDReports(CRUDBase):
         # Check for *actual* expired items (past today) which are risky
         actually_expired_count = db.query(LGRecord).filter(
              LGRecord.expiry_date < date.today(), 
-             LGRecord.status == LgStatusEnum.ACTIVE,
+             LGRecord.lg_status_id == LgStatusEnum.VALID.value, # Correct field and enum
              *lg_filter_conditions
         ).count()
         

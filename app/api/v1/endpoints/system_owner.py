@@ -34,7 +34,8 @@ from app.schemas.all_schemas import (
     LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
     AuditLogOut,
     SystemNotificationCreate, SystemNotificationUpdate, SystemNotificationOut,
-    LegalArtifactCreate, LegalArtifactOut, TrialRegistrationOut,UserCreateCorporateAdmin
+    LegalArtifactCreate, LegalArtifactOut, TrialRegistrationOut,UserCreateCorporateAdmin,
+    SystemNotificationAnalyticsOut
 )
 from app.crud.crud import (
     crud_subscription_plan, crud_customer, crud_customer_entity, crud_user,
@@ -250,6 +251,20 @@ async def update_system_notification(
 
     return response_data
 
+@router.get("/system-notifications/{notification_id}/analytics", response_model=SystemNotificationAnalyticsOut)
+def get_system_notification_analytics(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:edit"))
+):
+    """
+    Get analytics and view logs for a specific system notification.
+    """
+    notification = crud_system_notification.get(db, id=notification_id, include_deleted=True)
+    if not notification:
+        raise HTTPException(status_code=404, detail="System notification not found")
+        
+    return crud_system_notification.get_analytics(db, notification_id=notification_id)
 
 @router.get("/system-notifications/", response_model=List[SystemNotificationOut])
 async def read_system_notifications(

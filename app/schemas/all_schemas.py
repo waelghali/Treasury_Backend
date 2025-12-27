@@ -1296,6 +1296,23 @@ class SystemNotificationOut(SystemNotificationBase):
     class Config:
         from_attributes = True
 
+class SystemNotificationViewLogOut(BaseModel):
+    id: int
+    user_id: int
+    notification_id: int
+    view_count: int
+    last_viewed_at: datetime
+    user_email: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class SystemNotificationAnalyticsOut(BaseModel):
+    notification_id: int
+    total_views: int
+    unique_viewers: int
+    logs: List[SystemNotificationViewLogOut]
+
 # --- View Log Schemas (Keep as is) ---
 class SystemNotificationViewLogBase(BaseModel):
     user_id: int
