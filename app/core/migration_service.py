@@ -305,8 +305,7 @@ class MigrationService:
         import mimetypes
         
         # Clean up the path (remove quotes if user added them)
-        clean_url = str(url).strip().strip("'").strip('"')
-
+        clean_url = str(url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
         # 1. Handle Local Windows Paths
         if os.path.exists(clean_url):
             try:
@@ -669,7 +668,7 @@ class MigrationService:
         from sqlalchemy import func
         
         print("\n\n=======================================================")
-        print("🕵️ STARTING ENHANCED AI AUDIT")
+        print("STARTING ENHANCED AI AUDIT")
         print("=======================================================")
 
         # 1. DEBUG: Print counts of ALL statuses to see where records went
@@ -694,7 +693,7 @@ class MigrationService:
         ).order_by(LGMigrationStaging.id).all()
 
         if not records:
-            print("❌ STOPPING: No eligible records found (Check statuses above).")
+            print("STOPPING: No eligible records found (Check statuses above).")
             return {"status": "skipped", "message": "No staged records found."}
 
         # --- PRE-FETCH CACHES ---
@@ -745,9 +744,31 @@ class MigrationService:
             discrepancies = []
 
             # --- 1. AUDIT CREATION (First Record) ---
-            first_url = first_rec.source_data_json.get('attachment_url')
+            # --- FIX: Try multiple keys to find the PDF path ---
+            json_data = first_rec.source_data_json or {}
+            
+            # 1. Try JSON 'attachment_url'
+            first_url = json_data.get('attachment_url')
+            
+            # 2. Fallback: Try JSON 'file_path' (Common in CSV/Excel imports)
+            if not first_url:
+                first_url = json_data.get('file_path')
+
+            # 3. Fallback: Try JSON 'file_name'
+            if not first_url:
+                first_url = json_data.get('file_name')
+                
+            # 4. Fallback: Use the DB record's file_name column
+            if not first_url and first_rec.file_name:
+                first_url = first_rec.file_name
+
+            # DEBUG: Print what we found so you can see it in the console
+            print(f"[DEBUG] Record {first_rec.id} | LG: {lg_num}")
+            print(f"   -> JSON Keys Available: {list(json_data.keys())}")
+            print(f"   -> Final Resolved Path: '{first_url}'")
+
             if first_url:
-                clean_url = str(first_url).strip().strip("'").strip('"')
+                clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                 if os.path.exists(clean_url):
                     content, mime = await self._fetch_file_content(clean_url)
                     if content:
