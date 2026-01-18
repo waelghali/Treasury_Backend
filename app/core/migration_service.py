@@ -300,29 +300,72 @@ class MigrationService:
 
     async def _fetch_file_content(self, url: str) -> Tuple[Optional[bytes], Optional[str]]:
         """
-        Fetches actual file content from local disk or URL.
+        Fetches file content from Local Disk. 
+        If not found, falls back to Google Cloud Storage (GCS).
         """
         import mimetypes
+        import os
         
-        # Clean up the path (remove quotes if user added them)
+        # 1. Clean the input path
         clean_url = str(url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
-        # 1. Handle Local Windows Paths
-        if os.path.exists(clean_url):
-            try:
-                # Guess mime type (e.g., 'application/pdf')
-                mime_type, _ = mimetypes.guess_type(clean_url)
-                if not mime_type:
-                    mime_type = "application/pdf"
-                
-                with open(clean_url, "rb") as f:
-                    content = f.read()
-                
-                return content, mime_type
-            except Exception as e:
-                logger.error(f"Failed to read local file '{clean_url}': {e}")
-                return None, None
+        file_name = os.path.basename(clean_url)
 
-        logger.warning(f"File path not found: {clean_url}")
+        # --- STRATEGY 1: Check Local Disk (Fastest) ---
+        if os.path.exists(clean_url):
+            final_path = clean_url
+        elif os.path.exists(file_name):
+            final_path = file_name
+        else:
+            final_path = None
+
+        if final_path:
+            try:
+                mime_type, _ = mimetypes.guess_type(final_path)
+                with open(final_path, "rb") as f:
+                    return f.read(), (mime_type or "application/pdf")
+            except Exception as e:
+                logger.warning(f"Local read failed: {e}")
+
+        # --- STRATEGY 2: Check Google Cloud Storage (GCS) ---
+        # This runs if local file is missing
+        try:
+            from google.cloud import storage
+            bucket_name = os.getenv("GCS_BUCKET_NAME") # Make sure this is in your .env
+            
+            if bucket_name:
+                # We use a synchronous client inside a thread to avoid blocking async loop
+                def fetch_from_gcs():
+                    client = storage.Client()
+                    bucket = client.bucket(bucket_name)
+                    
+                    # Try 1: Exact Filename at Root
+                    blob = bucket.blob(file_name)
+                    if blob.exists():
+                        print(f"[DEBUG] Found '{file_name}' in GCS Root.")
+                        return blob.download_as_bytes()
+                    
+                    # Try 2: Inside a 'migration' folder (Common practice)
+                    blob_folder = bucket.blob(f"migration/{file_name}")
+                    if blob_folder.exists():
+                        print(f"[DEBUG] Found '{file_name}' in GCS 'migration/' folder.")
+                        return blob_folder.download_as_bytes()
+                        
+                    return None
+
+                # Run GCS fetch in a separate thread
+                import asyncio
+                content = await asyncio.to_thread(fetch_from_gcs)
+                
+                if content:
+                    mime_type, _ = mimetypes.guess_type(file_name)
+                    return content, (mime_type or "application/pdf")
+                    
+        except ImportError:
+            logger.error("google-cloud-storage library not installed.")
+        except Exception as e:
+            logger.error(f"GCS Fetch Error: {e}")
+
+        logger.warning(f"File not found locally or in GCS: {file_name}")
         return None, None
         
     async def _create_document_from_url(
