@@ -812,10 +812,13 @@ class MigrationService:
 
             if first_url:
                 clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
-                if os.path.exists(clean_url):
-                    content, mime = await self._fetch_file_content(clean_url)
-                    if content:
-                        print(f"   -> AI Scanning Original Document...")
+                
+                # FIX: Call fetcher DIRECTLY. It handles "Local vs Cloud" logic internally.
+                print(f"   -> Attempting to fetch '{clean_url}' (Local or Cloud)...")
+                content, mime = await self._fetch_file_content(clean_url)
+                
+                if content:
+                    print(f"   -> File retrieved successfully! Scanning...")
                         ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=lg_num)
                         
                         if ai_data:
@@ -901,7 +904,6 @@ class MigrationService:
                 last_url = last_rec.source_data_json.get('attachment_url')
                 if last_url:
                     clean_url_last = str(last_url).strip().strip("'").strip('"')
-                    if os.path.exists(clean_url_last):
                         content, mime = await self._fetch_file_content(clean_url_last)
                         if content:
                             print(f"   -> AI Scanning Amendment...")
