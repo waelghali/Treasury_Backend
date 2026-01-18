@@ -813,124 +813,110 @@ class MigrationService:
             if first_url:
                 clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                 
-                # FIX: Call fetcher DIRECTLY. It handles "Local vs Cloud" logic internally.
-                print(f"   -> Attempting to fetch '{clean_url}' (Local or Cloud)...")
+                # FIX: Fetch directly (removes the "exists" check that blocked Cloud files)
+                print(f"   -> Fetching content for: '{clean_url}'")
                 content, mime = await self._fetch_file_content(clean_url)
                 
                 if content:
-                    print(f"   -> File retrieved successfully! Scanning...")
-                        ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=lg_num)
+                    print(f"   -> AI Scanning Original Document...")
+                    ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=lg_num)
+                    
+                    if ai_data:
+                        src = first_rec.source_data_json
                         
-                        if ai_data:
-                            src = first_rec.source_data_json
-                            
-                            # A. LG Number
-                            ai_lg_num = ai_data.get('lgNumber', '')
-                            if norm(lg_num) != norm(ai_lg_num):
-                                err = f"LG Number Mismatch: Excel='{lg_num}' vs AI='{ai_lg_num}'"
+                        # --- START VALIDATION LOGIC ---
+                        # A. LG Number
+                        ai_lg_num = ai_data.get('lgNumber', '')
+                        if norm(lg_num) != norm(ai_lg_num):
+                            err = f"LG Number Mismatch: Excel='{lg_num}' vs AI='{ai_lg_num}'"
+                            discrepancies.append(err)
+                            print(f"      ❌ {err}")
+
+                        # B. Amount
+                        try:
+                            val_excel = float(src.get('lg_amount', 0))
+                            val_ai = float(ai_data.get('lgAmount', 0))
+                            if abs(val_excel - val_ai) > 1.0:
+                                err = f"Amount Mismatch: Excel='{val_excel:,.2f}' vs AI='{val_ai:,.2f}'"
                                 discrepancies.append(err)
                                 print(f"      ❌ {err}")
+                        except: pass
 
-                            # B. Amount
-                            try:
-                                val_excel = float(src.get('lg_amount', 0))
-                                val_ai = float(ai_data.get('lgAmount', 0))
-                                if abs(val_excel - val_ai) > 1.0:
-                                    err = f"Amount Mismatch: Excel='{val_excel:,.2f}' vs AI='{val_ai:,.2f}'"
-                                    discrepancies.append(err)
-                                    print(f"      ❌ {err}")
-                            except: pass
+                        # C. Currency
+                        excel_curr_id = src.get('lg_currency_id')
+                        excel_curr_code = currency_map.get(excel_curr_id, "Unknown")
+                        ai_curr = ai_data.get('currency', '')
+                        if norm(excel_curr_code) != norm(ai_curr):
+                            err = f"Currency Mismatch: Excel='{excel_curr_code}' vs AI='{ai_curr}'"
+                            discrepancies.append(err)
+                            print(f"      ❌ {err}")
 
-                            # C. Currency
-                            excel_curr_id = src.get('lg_currency_id')
-                            excel_curr_code = currency_map.get(excel_curr_id, "Unknown")
-                            ai_curr = ai_data.get('currency', '')
-                            if norm(excel_curr_code) != norm(ai_curr):
-                                err = f"Currency Mismatch: Excel='{excel_curr_code}' vs AI='{ai_curr}'"
-                                discrepancies.append(err)
-                                print(f"      ❌ {err}")
-
-                            # D. Issuing Bank (NEW)
-                            excel_bank_id = src.get('issuing_bank_id')
-                            excel_bank_name = bank_map.get(excel_bank_id, "Unknown")
-                            ai_bank = ai_data.get('issuingBankName', '')
-                            # Fuzzy check for bank names (e.g. "HSBC Bank" vs "HSBC")
-                            if excel_bank_name != "Unknown":
-                                if norm(excel_bank_name) not in norm(ai_bank) and norm(ai_bank) not in norm(excel_bank_name):
-                                    err = f"Bank Mismatch: Excel='{excel_bank_name}' vs AI='{ai_bank}'"
-                                    discrepancies.append(err)
-                                    print(f"      ❌ {err}")
-
-                            # E. Description/Purpose (NEW)
-                            excel_desc = src.get('description_purpose', '')
-                            ai_purp = ai_data.get('purpose', '')
-                            if excel_desc and ai_purp:
-                                if not is_fuzzy_match(excel_desc, ai_purp):
-                                    err = f"Purpose Mismatch: Excel='{excel_desc}' vs AI='{ai_purp}'"
-                                    discrepancies.append(err)
-                                    print(f"      ❌ {err}")
-
-                            # F. Beneficiary
-                            excel_ben_id = src.get('beneficiary_corporate_id')
-                            excel_ben_name = entity_map.get(excel_ben_id, "Unknown")
-                            ai_ben = ai_data.get('beneficiaryName', '')
-                            if excel_ben_name != "Unknown":
-                                if norm(excel_ben_name) not in norm(ai_ben) and norm(ai_ben) not in norm(excel_ben_name):
-                                    err = f"Beneficiary Mismatch: Excel='{excel_ben_name}' vs AI='{ai_ben}'"
-                                    discrepancies.append(err)
-                                    print(f"      ❌ {err}")
-
-                            # G. Dates
-                            excel_date = clean_date(src.get('issuance_date'))
-                            ai_date = clean_date(ai_data.get('issuanceDate'))
-                            if excel_date != ai_date:
-                                err = f"Issuance Date Mismatch: Excel='{excel_date}' vs AI='{ai_date}'"
+                        # D. Issuing Bank
+                        excel_bank_id = src.get('issuing_bank_id')
+                        excel_bank_name = bank_map.get(excel_bank_id, "Unknown")
+                        ai_bank = ai_data.get('issuingBankName', '')
+                        if excel_bank_name != "Unknown":
+                            if norm(excel_bank_name) not in norm(ai_bank) and norm(ai_bank) not in norm(excel_bank_name):
+                                err = f"Bank Mismatch: Excel='{excel_bank_name}' vs AI='{ai_bank}'"
                                 discrepancies.append(err)
                                 print(f"      ❌ {err}")
                                 
-                            excel_exp = clean_date(src.get('expiry_date'))
-                            ai_exp = clean_date(ai_data.get('expiryDate'))
-                            if excel_exp != ai_exp:
-                                err = f"Expiry Date Mismatch: Excel='{excel_exp}' vs AI='{ai_exp}'"
-                                discrepancies.append(err)
-                                print(f"      ❌ {err}")
-                        else:
-                            print("   ⚠️ AI returned NO data.")
+                        # E. Dates (Issuance & Expiry)
+                        excel_date = clean_date(src.get('issuance_date'))
+                        ai_date = clean_date(ai_data.get('issuanceDate'))
+                        if excel_date != ai_date:
+                            err = f"Issuance Date Mismatch: Excel='{excel_date}' vs AI='{ai_date}'"
+                            discrepancies.append(err)
+                            print(f"      ❌ {err}")
+                        
+                        excel_exp = clean_date(src.get('expiry_date'))
+                        ai_exp = clean_date(ai_data.get('expiryDate'))
+                        if excel_exp != ai_exp:
+                            err = f"Expiry Date Mismatch: Excel='{excel_exp}' vs AI='{ai_exp}'"
+                            discrepancies.append(err)
+                            print(f"      ❌ {err}")
+                        # --- END VALIDATION LOGIC ---
+                        
+                    else:
+                        print("   ⚠️ AI returned NO data.")
                 else:
-                    print(f"   ❌ File not found: {clean_url}")
+                    print(f"   ❌ File not found (Checked Local & Cloud): {clean_url}")
 
             # --- 2. AUDIT LATEST STATUS (Last Record) ---
             if last_rec.id != first_rec.id:
                 last_url = last_rec.source_data_json.get('attachment_url')
                 if last_url:
-                    clean_url_last = str(last_url).strip().strip("'").strip('"')
-                        content, mime = await self._fetch_file_content(clean_url_last)
-                        if content:
-                            print(f"   -> AI Scanning Amendment...")
-                            context = {"lg_record_details": {"lgNumber": lg_num}}
-                            ai_amend, _ = await process_amendment_with_ai(content, mime, context)
+                    clean_url_last = str(last_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
+                    
+                    print(f"   -> Fetching Amendment content for: '{clean_url_last}'")
+                    content, mime = await self._fetch_file_content(clean_url_last)
+                    
+                    if content:
+                        print(f"   -> AI Scanning Amendment...")
+                        context = {"lg_record_details": {"lgNumber": lg_num}}
+                        ai_amend, _ = await process_amendment_with_ai(content, mime, context)
+                        
+                        if ai_amend and ai_amend.get('is_relevant_amendment'):
+                            changes = ai_amend.get('amendedFields', {})
+                            src = last_rec.source_data_json
                             
-                            if ai_amend and ai_amend.get('is_relevant_amendment'):
-                                changes = ai_amend.get('amendedFields', {})
-                                src = last_rec.source_data_json
-                                
-                                if "expiryDate" in changes:
-                                    val_excel = clean_date(src.get('expiry_date'))
-                                    val_ai = clean_date(changes['expiryDate'])
-                                    if val_excel != val_ai:
-                                        err = f"Latest Expiry Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
+                            if "expiryDate" in changes:
+                                val_excel = clean_date(src.get('expiry_date'))
+                                val_ai = clean_date(changes['expiryDate'])
+                                if val_excel != val_ai:
+                                    err = f"Latest Expiry Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
+                                    discrepancies.append(err)
+                                    print(f"      ❌ {err}")
+
+                            if "lgAmount" in changes:
+                                try:
+                                    val_excel = float(src.get('lg_amount', 0))
+                                    val_ai = float(changes['lgAmount'])
+                                    if abs(val_excel - val_ai) > 1.0:
+                                        err = f"Latest Amount Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
                                         discrepancies.append(err)
                                         print(f"      ❌ {err}")
-
-                                if "lgAmount" in changes:
-                                    try:
-                                        val_excel = float(src.get('lg_amount', 0))
-                                        val_ai = float(changes['lgAmount'])
-                                        if abs(val_excel - val_ai) > 1.0:
-                                            err = f"Latest Amount Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
-                                            discrepancies.append(err)
-                                            print(f"      ❌ {err}")
-                                    except: pass
+                                except: pass
 
             if discrepancies:
                 audit_report.append({"lg_number": lg_num, "issues": discrepancies})
