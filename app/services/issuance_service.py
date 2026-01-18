@@ -8,6 +8,7 @@ from sqlalchemy import func
 
 from app.crud.crud_issuance import crud_issuance_request, crud_issuance_facility
 from app.models_issuance import IssuanceRequest, IssuanceFacility, IssuanceFacilitySubLimit, IssuedLGRecord, IssuanceWorkflowPolicy, BankIssuanceOption
+from app.models_reconciliation import BankPositionBatch, BankPositionRow
 from app.schemas.schemas_issuance import IssuanceRequestUpdate, SuitableFacilityOut, BankIssuanceOptionOut
 from app.core.issuance_strategies import IssuanceStrategyFactory
 
@@ -261,80 +262,6 @@ class IssuanceService:
         
         return candidates
 
-    # ==========================================================================
-    # 4. FINAL EXECUTION (ISSUANCE)
-    # ==========================================================================
-
-    async def issue_lg_from_request(self, db: Session, request_id: int, facility_id: int, issuance_option_id: int, user_id: int):
-        """
-        Executes Issuance using the specific Option selected by the User.
-        """
-        request = crud_issuance_request.get(db, id=request_id)
-        facility = crud_issuance_facility.get(db, id=facility_id)
-
-        if request.status != "APPROVED_INTERNAL":
-             raise HTTPException(status_code=400, detail="Request must be internally approved first")
-
-        # 1. Fetch the Specific Option the User Chose
-        option = db.query(BankIssuanceOption).filter(BankIssuanceOption.id == issuance_option_id).first()
-        if not option:
-            raise HTTPException(status_code=400, detail="Invalid issuance method selected")
-
-        # 2. Delegate to Strategy Factory using the OPTION's code
-        # e.g., if code is 'BANK_API_V1', we get the BankApiStrategy class
-        strategy = IssuanceStrategyFactory.get_strategy(option.strategy_code)
-        
-        # 3. Execute with Specific Config
-        # We pass option.configuration (e.g. { "api_url": "..." }) instead of the generic facility config
-        execution_result = await strategy.execute(db, request, facility, option.configuration)
-        
-        # 4. Create the Record (Common Part)
-        new_lg = IssuedLGRecord(
-            customer_id=request.customer_id,
-            facility_id=facility.id,
-            lg_type_id=1,
-            ref_number=f"TEMP-{request.id}", 
-            status="ACTIVE",
-            amount=request.amount,
-            currency_id=request.currency_id,
-            issue_date=date.today(),
-            expiry_date=request.requested_expiry_date,
-            beneficiary_name=request.beneficiary_name,
-            created_by_user_id=user_id
-        )
-        
-        # 5. Handle Artifacts (e.g. Save PDF path if generated)
-        if execution_result.get("output_type") == "FILE":
-            # Assuming you might want to save the path in the business_details or a new column
-            # new_lg.document_path = execution_result["output_data"]
-            pass
-
-        db.add(new_lg)
-        
-        # 6. Close the Request
-        request.status = "COMPLETED"
-        request.lg_record_id = new_lg.id
-        request.selected_issuance_option_id = option.id # Save the choice history
-        
-        db.add(request)
-        db.commit()
-        db.refresh(new_lg)
-        
-        return {
-            "lg_record": new_lg,
-            "execution_result": result # Contains the PDF bytes if generated
-        }
-
-    def reject_request(self, db: Session, request_id: int, user_id: int) -> IssuanceRequest:
-        """ Rejects the request. """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found")
-
-        updated_request = crud_issuance_request.update(
-            db, db_obj=request, obj_in=IssuanceRequestUpdate(status="REJECTED")
-        )
-        return updated_request
 
     # ==========================================================================
     # 3. INTELLIGENT SELECTION
@@ -529,5 +456,150 @@ class IssuanceService:
         </html>
         """
         return html_content
+        
+    # ==========================================================================
+    # 4. FINAL EXECUTION (ISSUANCE)
+    # ==========================================================================
+
+    async def issue_lg_from_request(self, db: Session, request_id: int, facility_id: int, issuance_option_id: int, user_id: int):
+        """
+        Executes Issuance using the specific Option selected by the User.
+        """
+        request = crud_issuance_request.get(db, id=request_id)
+        facility = crud_issuance_facility.get(db, id=facility_id)
+
+        if request.status != "APPROVED_INTERNAL":
+             raise HTTPException(status_code=400, detail="Request must be internally approved first")
+
+        # 1. Fetch the Specific Option the User Chose
+        option = db.query(BankIssuanceOption).filter(BankIssuanceOption.id == issuance_option_id).first()
+        if not option:
+            raise HTTPException(status_code=400, detail="Invalid issuance method selected")
+
+        # 2. Delegate to Strategy Factory using the OPTION's code
+        # e.g., if code is 'BANK_API_V1', we get the BankApiStrategy class
+        strategy = IssuanceStrategyFactory.get_strategy(option.strategy_code)
+        
+        # 3. Execute with Specific Config
+        # We pass option.configuration (e.g. { "api_url": "..." }) instead of the generic facility config
+        execution_result = await strategy.execute(db, request, facility, option.configuration)
+        
+        # 4. Create the Record (Common Part)
+        new_lg = IssuedLGRecord(
+            customer_id=request.customer_id,
+            facility_id=facility.id,
+            lg_type_id=1,
+            ref_number=f"TEMP-{request.id}", 
+            status="ACTIVE",
+            amount=request.amount,
+            currency_id=request.currency_id,
+            issue_date=date.today(),
+            expiry_date=request.requested_expiry_date,
+            beneficiary_name=request.beneficiary_name,
+            created_by_user_id=user_id
+        )
+        
+        # 5. Handle Artifacts (e.g. Save PDF path if generated)
+        if execution_result.get("output_type") == "FILE":
+            # Assuming you might want to save the path in the business_details or a new column
+            # new_lg.document_path = execution_result["output_data"]
+            pass
+
+        db.add(new_lg)
+        
+        # 6. Close the Request
+        request.status = "COMPLETED"
+        request.lg_record_id = new_lg.id
+        request.selected_issuance_option_id = option.id # Save the choice history
+        
+        db.add(request)
+        db.commit()
+        db.refresh(new_lg)
+        
+        return {
+            "lg_record": new_lg,
+            "execution_result": result # Contains the PDF bytes if generated
+        }
+
+    def reject_request(self, db: Session, request_id: int, user_id: int) -> IssuanceRequest:
+        """ Rejects the request. """
+        request = crud_issuance_request.get(db, id=request_id)
+        if not request:
+            raise HTTPException(status_code=404, detail="Request not found")
+
+        updated_request = crud_issuance_request.update(
+            db, db_obj=request, obj_in=IssuanceRequestUpdate(status="REJECTED")
+        )
+        return updated_request
+
+
+    # ==========================================================================
+    # 5. RECONCILIATION SERVICE
+    # ==========================================================================
+
+    def process_reconciliation_batch(self, db: Session, batch_id: int):
+        """
+        Iterates through uploaded bank rows and matches them against IssuedLGRecords.
+        Updates row status: MATCHED, MISMATCH, or MISSING_IN_SYSTEM.
+        """
+        # 1. Get the Batch
+        batch = db.query(BankPositionBatch).filter(BankPositionBatch.id == batch_id).first()
+        if not batch:
+            raise HTTPException(status_code=404, detail="Reconciliation Batch not found")
+
+        # 2. Get all rows in this batch
+        rows = db.query(BankPositionRow).filter(BankPositionRow.batch_id == batch_id).all()
+        
+        matched_count = 0
+        
+        for row in rows:
+            # 3. Clean and Search Reference
+            # Strip whitespace to ensure clean match
+            clean_ref = str(row.ref_number).strip()
+            
+            # Find the system record
+            system_record = db.query(IssuedLGRecord).filter(
+                IssuedLGRecord.lg_ref_number == clean_ref,
+                IssuedLGRecord.customer_id == batch.bank_id  # Assuming validation: Bank should match facility bank, optional check
+            ).first()
+            
+            # Note: Ideally we check if system_record.facility.bank_id == batch.bank_id, 
+            # but simpler lookup on unique Ref Number is usually sufficient.
+            system_record = db.query(IssuedLGRecord).filter(IssuedLGRecord.lg_ref_number == clean_ref).first()
+
+            if not system_record:
+                row.recon_status = "MISSING_IN_SYSTEM"
+                row.recon_note = f"Ref '{clean_ref}' does not exist in our Issued Records."
+            
+            else:
+                # 4. Compare Financials (Amount)
+                # Using a small epsilon for float/decimal comparison safety
+                diff = abs(float(system_record.current_amount) - float(row.amount))
+                
+                if diff < 0.01:
+                    row.recon_status = "MATCHED"
+                    row.recon_note = "Perfect match."
+                    matched_count += 1
+                else:
+                    row.recon_status = "MISMATCH"
+                    row.recon_note = f"Amount mismatch. Bank: {row.amount:,.2f}, System: {system_record.current_amount:,.2f}"
+
+                # Optional: Check Validity Status
+                # If Bank says 'Expired' but we say 'Active', flag it? 
+                # (Can be added here later)
+
+        # 5. Update Batch Statistics
+        batch.total_records = len(rows)
+        batch.matched_records = matched_count
+        
+        db.commit()
+        db.refresh(batch)
+        
+        return {
+            "batch_id": batch.id,
+            "total": batch.total_records,
+            "matched": batch.matched_records,
+            "status": "COMPLETED"
+        }
 
 issuance_service = IssuanceService()

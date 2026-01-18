@@ -277,7 +277,7 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     # --- Step 1: Autofill Internal Owner Contact by Email ---
     internal_owner_email = record_data.pop("internal_owner_email", None)
     if internal_owner_email:
-        owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, internal_owner_email)
+        owner = crud_internal_owner_contact.get_by_email_for_customer(db, current_user.customer_id, clean_email)
         if owner:
             record_data["internal_owner_contact_id"] = owner.id
             logger.debug(f"Autofilled internal_owner_contact_id from email: {owner.id}")
@@ -808,7 +808,13 @@ async def import_historical_records(
                 # 1. Enrich Owner Details (Phone & Manager Email)
                 owner_id = first_snapshot_data.get("internal_owner_contact_id")
                 if owner_id:
-                    owner_obj = crud_internal_owner_contact.get(db, id=owner_id)
+                    owner_obj = None
+                    if isinstance(owner_id, int):
+                        owner_obj = crud_internal_owner_contact.get(db, id=owner_id)
+                    elif isinstance(owner_id, str):
+                        clean_email = owner_id.strip()
+                        if clean_email:
+                            owner = crud_internal_owner_contact.get_by_email_for_customer(db, current_user.customer_id, clean_email)
                     if owner_obj:
                         # We inject these ONLY so the Validator is happy.
                         # The CRUD function will strip them out before saving to DB.
@@ -833,6 +839,19 @@ async def import_historical_records(
                 # --- FIX END ---
                 
                 # 2. Validate Data
+                # PATCH: Populate required owner fields from the resolved object
+                if owner_obj:
+                    first_snapshot_data['internal_owner_contact_id'] = owner_obj.id
+                    first_snapshot_data['internal_owner_email'] = owner_obj.email
+                    first_snapshot_data['internal_owner_phone'] = owner_obj.phone_number
+                    first_snapshot_data['manager_email'] = owner_obj.manager_email
+
+                # PATCH: Resolve Operational Status string (e.g., 'Operative') to ID
+                if isinstance(first_snapshot_data.get('lg_operational_status_id'), str):
+                    status_name = first_snapshot_data['lg_operational_status_id']
+                    status_obj = db.query(models.LgOperationalStatus).filter(func.lower(models.LgOperationalStatus.name) == func.lower(status_name)).first()
+                    if status_obj:
+                        first_snapshot_data['lg_operational_status_id'] = status_obj.id
                 lg_record_create_payload = LGRecordCreate(**first_snapshot_data)
                 
                 # 3. Create Record (Pass owner_id explicitly!)
