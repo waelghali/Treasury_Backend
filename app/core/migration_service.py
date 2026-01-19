@@ -65,7 +65,6 @@ def calculate_lg_period_months(issuance_date: date, expiry_date: date) -> Option
 
     return clamped_months
 
-
 def _apply_defaults_and_autofill(
     db: Session, 
     record_data: Dict[str, Any], 
@@ -87,213 +86,145 @@ def _apply_defaults_and_autofill(
     logger.debug(f"Autofill started for record: {record_data.get('lg_number', 'N/A')}")
     
     # --- Step 1: Autofill Internal Owner Contact (ROBUST FIX) ---
-    
-    # Extract values safely
-    existing_id = record_data.get("internal_owner_contact_id")
+    existing_owner_id = record_data.get("internal_owner_contact_id")
     email_input = record_data.get("internal_owner_email")
     
-    # Logic 1: Priority to Existing Valid ID
-    # If we already have a valid Integer ID (e.g. manually set by user via UI), 
-    # we TRUST it and SKIP the lookup. This prevents the "Destructive Overwrite".
-    if isinstance(existing_id, int) and existing_id > 0:
-        logger.debug(f"Internal Owner ID {existing_id} already exists. Skipping lookup to preserve manual selection.")
-        
-    # Logic 2: Lookup by Email (Only if ID is missing)
-    elif email_input and isinstance(email_input, str):
-        # Sanitize: Strip whitespace which often causes lookup failures
-        clean_email = email_input.strip()
-        
-        # Attempt lookup
+    # If ID is a string (e.g. from Excel), or missing, attempt lookup by email
+    if not isinstance(existing_owner_id, int) and email_input:
+        clean_email = str(email_input).strip()
         owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, clean_email)
-        
         if owner:
             record_data["internal_owner_contact_id"] = owner.id
-            # Also normalize the email in the JSON to match the DB
             record_data["internal_owner_email"] = owner.email 
-            logger.debug(f"Autofilled internal_owner_contact_id from email '{clean_email}': {owner.id}")
+            logger.debug(f"Autofilled internal_owner_contact_id: {owner.id}")
+
+    # --- Step 2: Resolve Operational Status (NEW FIX) ---
+    op_status_val = record_data.get("lg_operational_status_id")
+    if isinstance(op_status_val, str):
+        # Map common string names to your specific database IDs
+        # Update these integer IDs (1, 2, 3...) to match your LGOperationalStatus table
+        status_map = {
+            "OPERATIVE": 1,
+            "CLOSED": 2,
+            "EXPIRED": 3,
+            "CANCELLED": 4,
+            "PENDING": 5
+        }
+        clean_status = op_status_val.strip().upper()
+        if clean_status in status_map:
+            record_data["lg_operational_status_id"] = status_map[clean_status]
+            logger.debug(f"Resolved operational status '{op_status_val}' to ID: {status_map[clean_status]}")
         else:
-            # Logic 3: Non-Destructive Failure
-            # If lookup fails, we Log it, but we DO NOT set the ID to None explicitly.
-            # This ensures that if there was a partial value or a mismatch, it remains 'as is'
-            # rather than being wiped out, allowing the validator to flag it properly later.
-            logger.warning(f"Internal owner lookup failed for email: '{clean_email}'. Keeping existing data.")
-            
-    # --- Step 2: Autofill other IDs from names/codes ---
-    # Simplified lookup map
+            # Default to Operative (ID 1) if unknown string provided
+            record_data["lg_operational_status_id"] = 1
+
+    # --- Step 3: Generic Lookups (LG Type, Issuing Method, Rules) ---
     lookup_map = {
-        "lg_type_id": crud_lg_type,
-        "issuing_method_id": crud_issuing_method,
-        "applicable_rule_id": crud_rule,
+        "lg_type_id": (crud_lg_type, "lg_type"),
+        "issuing_method_id": (crud_issuing_method, "issuing_method"),
+        "applicable_rule_id": (crud_rule, "applicable_rule"),
     }
     
-    for field, crud_obj in lookup_map.items():
-        value = record_data.get(field)
-        if isinstance(value, str):
-            lookup_obj = crud_obj.get_by_name(db, value)
-            if lookup_obj:
-                record_data[field] = lookup_obj.id
-                logger.debug(f"Autofilled {field} ID from name '{value}' to: {lookup_obj.id}")
-            else:
-                record_data[field] = None
-                logger.warning(f"Could not find a matching ID for {field} with value: '{value}'")
-                
-    # Handle Issuing Bank (uses fuzzy matching)
+    for id_field, (crud_obj, name_field) in lookup_map.items():
+        val = record_data.get(id_field)
+        # If ID is missing or is a string name, look it up
+        if not isinstance(val, int):
+            lookup_val = val if val else record_data.get(name_field)
+            if lookup_val and isinstance(lookup_val, str):
+                obj = crud_obj.get_by_name(db, lookup_val.strip())
+                if obj:
+                    record_data[id_field] = obj.id
+
+    # --- Step 4: Handle Issuing Bank (Fuzzy/Cleaned lookup) ---
     issuing_bank_val = record_data.get("issuing_bank_id")
     if isinstance(issuing_bank_val, str):
-        # FIX: Look up by Name OR Short Name OR Former Names
+        # This uses the helper you likely have in migration_service or core
+        from app.models import Bank
+        from sqlalchemy import func, or_, cast
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        bank_name_clean = issuing_bank_val.strip()
         bank = db.query(Bank).filter(
             or_(
-                func.lower(Bank.name) == func.lower(issuing_bank_val),
-                func.lower(Bank.short_name) == func.lower(issuing_bank_val),
-                cast(Bank.former_names, JSONB).op('?')(issuing_bank_val)
+                func.lower(Bank.name) == func.lower(bank_name_clean),
+                func.lower(Bank.short_name) == func.lower(bank_name_clean),
+                cast(Bank.former_names, JSONB).op('?')(bank_name_clean)
             )
         ).first()
         
         if bank:
             record_data["issuing_bank_id"] = bank.id
-            logger.debug(f"Autofilled issuing_bank_id from name '{issuing_bank_name}' to: {bank.id}")
+            # Fill secondary bank details
+            record_data["issuing_bank_address"] = record_data.get("issuing_bank_address") or bank.address
+            record_data["issuing_bank_phone"] = record_data.get("issuing_bank_phone") or bank.phone_number
+            record_data["issuing_bank_fax"] = record_data.get("issuing_bank_fax") or bank.fax
         else:
             record_data["issuing_bank_id"] = None
-            logger.warning(f"Could not find a matching ID for issuing_bank_id with value: '{issuing_bank_name}'")
 
-    # Handle Beneficiary Corporate (customer-specific lookup)
-    beneficiary_name = record_data.get("beneficiary_corporate_id")
-    if isinstance(beneficiary_name, str):
-        entity = crud_customer_entity.get_by_name_for_customer(db, customer_id, beneficiary_name)
+    # --- Step 5: Handle Beneficiary Corporate (Customer Specific) ---
+    beneficiary_val = record_data.get("beneficiary_corporate_id")
+    if isinstance(beneficiary_val, str):
+        entity = crud_customer_entity.get_by_name_for_customer(db, customer_id, beneficiary_val.strip())
         if entity:
             record_data["beneficiary_corporate_id"] = entity.id
-            logger.debug(f"Autofilled beneficiary_corporate_id from name '{beneficiary_name}' to: {entity.id}")
         else:
-            record_data["beneficiary_corporate_id"] = None
-            logger.warning(f"Could not find a matching ID for beneficiary_corporate_id with value: '{beneficiary_name}'")
-
-    # NEW: Consolidated LG Category Autofill Logic (Unified)
-    lg_category_input = record_data.get("lg_category_id")
-    resolved_category = None
-
-    if not record_data.get("beneficiary_corporate_id"):
-        # Case A: User provided a Name -> Try to lookup ID
-        if record_data.get("beneficiary_name"):
-            bene_id = _get_id_by_name(db, CustomerEntity, record_data["beneficiary_name"])
-            if bene_id:
-                record_data["beneficiary_corporate_id"] = bene_id
-        
-        # Case B: Name is MISSING -> Check if Customer has exactly ONE Entity
-        else:
-            # Check DB for entities belonging to this customer
-            # We filter by customer_id and ensure not deleted
+            # Fallback: if name lookup fails, check if customer has exactly one entity
+            from app.models import CustomerEntity
             entities = db.query(CustomerEntity).filter(
                 CustomerEntity.customer_id == customer_id, 
                 CustomerEntity.is_deleted == False
             ).all()
-            
             if len(entities) == 1:
-                # Success! Only one entity exists, so it MUST be this one.
                 record_data["beneficiary_corporate_id"] = entities[0].id
-                # Optional: Autofill the name for clarity in logs/UI
-                # record_data["beneficiary_name"] = entities[0].name
 
-    if lg_category_input:
-        if isinstance(lg_category_input, str):
-            # Check for customer-specific category first
-            resolved_category = crud_lg_category.get_by_code(db, lg_category_input, customer_id)
-            if not resolved_category:
-                resolved_category = crud_lg_category.get_by_name(db, lg_category_input, customer_id)
-            
-            # If not found, fall back to universal categories (customer_id=None)
-            if not resolved_category:
-                resolved_category = crud_lg_category.get_by_code(db, lg_category_input, None)
-            if not resolved_category:
-                resolved_category = crud_lg_category.get_by_name(db, lg_category_input, None)
-        elif isinstance(lg_category_input, int):
-            # If it's an ID, just check the single table
-            resolved_category = crud_lg_category.get(db, lg_category_input)
-
-    if not record_data.get("lg_type_id") and record_data.get("lg_type"):
-        val = str(record_data["lg_type"]).strip()
-        if val.isdigit():
-            # User provided an ID directly in the 'lg_type' column
-            record_data["lg_type_id"] = int(val)
+    # --- Step 6: LG Category (Customer Specific vs Universal) ---
+    cat_val = record_data.get("lg_category_id")
+    if isinstance(cat_val, str):
+        clean_cat = cat_val.strip()
+        # Try Customer Category -> Try Universal Category
+        cat_obj = crud_lg_category.get_by_name(db, clean_cat, customer_id) or \
+                  crud_lg_category.get_by_name(db, clean_cat, None)
+        
+        if cat_obj:
+            record_data["lg_category_id"] = cat_obj.id
         else:
-            # User provided a Name
-            type_id = _get_id_by_name(db, LgType, val)
-            if type_id:
-                record_data["lg_type_id"] = type_id
+            # Force Default Category (usually ID 1)
+            default_cat = crud_lg_category.get_default_category(db, None)
+            record_data["lg_category_id"] = default_cat.id if default_cat else None
 
-    if resolved_category:
-        record_data["lg_category_id"] = resolved_category.id
-        logger.debug(f"Autofilled lg_category_id from input '{lg_category_input}' to: {resolved_category.id}")
-    else:
-        # Fallback to the default universal category if no input or no match
-        default_category = crud_lg_category.get_default_category(db, None)
-        if default_category:
-            record_data["lg_category_id"] = default_category.id
-            logger.warning(f"Could not find a matching ID for lg_category_id with value: '{lg_category_input}'. Defaulting to universal category ID {default_category.id}.")
-        else:
-            # This case indicates a critical system configuration error.
-            logger.error("No default universal category configured. Cannot autofill.")
-            record_data["lg_category_id"] = None
-
-    # Handle Currencies (by ISO code)
-    for currency_field in ["lg_currency_id", "lg_payable_currency_id"]:
-        currency_code = record_data.get(currency_field)
-        if isinstance(currency_code, str):
-            currency = crud_currency.get_by_iso_code(db, currency_code)
+    # --- Step 7: Currencies ---
+    for cur_field in ["lg_currency_id", "lg_payable_currency_id"]:
+        cur_val = record_data.get(cur_field)
+        if isinstance(cur_val, str):
+            currency = crud_currency.get_by_iso_code(db, cur_val.strip().upper())
             if currency:
-                record_data[currency_field] = currency.id
-                logger.debug(f"Autofilled {currency_field} from ISO code '{currency_code}' to: {currency.id}")
-            else:
-                record_data[currency_field] = None
-                logger.warning(f"Could not find a matching ID for {currency_field} with value: '{currency_code}'")
+                record_data[cur_field] = currency.id
 
-    # --- Step 3: Autofill secondary bank details based on ID lookup ---
-    bank_id = record_data.get("issuing_bank_id")
-    if isinstance(bank_id, int):
-        bank = crud_bank.get(db, bank_id)
-        if bank:
-            if not record_data.get("issuing_bank_address"):
-                record_data["issuing_bank_address"] = bank.address
-                logger.debug(f"Autofilled issuing_bank_address: {bank.address}")
-            if not record_data.get("issuing_bank_phone"):
-                record_data["issuing_bank_phone"] = bank.phone_number
-                logger.debug(f"Autofilled issuing_bank_phone: {bank.phone_number}")
-            if not record_data.get("issuing_bank_fax"):
-                record_data["issuing_bank_fax"] = bank.fax
-                logger.debug(f"Autofilled issuing_bank_fax: {bank.fax}")
-        else:
-            logger.warning(f"Bank object not found in database for ID: {bank_id}. Cannot autofill secondary details.")
-            
-    # --- Step 4: Apply defaults and calculate dynamic fields ---
-    
+    # --- Step 8: Dynamic Calculations (Dates and Periods) ---
     issuance_date_str = record_data.get("issuance_date")
     expiry_date_str = record_data.get("expiry_date")
     if issuance_date_str and expiry_date_str:
         try:
-            issuance_date = datetime.strptime(str(issuance_date_str), "%Y-%m-%d").date()
-            expiry_date = datetime.strptime(str(expiry_date_str), "%Y-%m-%d").date()
-            record_data['lg_period_months'] = calculate_lg_period_months(issuance_date, expiry_date)
-            logger.debug(f"Calculated lg_period_months: {record_data['lg_period_months']}")
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Failed to calculate LG period months: {e}")
-            pass
+            from datetime import datetime
+            # Ensure we are working with date objects for the calculation
+            i_date = datetime.strptime(str(issuance_date_str).split(' ')[0], "%Y-%m-%d").date()
+            e_date = datetime.strptime(str(expiry_date_str).split(' ')[0], "%Y-%m-%d").date()
             
-    if not record_data.get("lg_payable_currency_id") and isinstance(record_data.get("lg_currency_id"), int):
-        record_data["lg_payable_currency_id"] = record_data["lg_currency_id"]
-    
-    manual_delivery_method = db.query(IssuingMethod).filter(IssuingMethod.name == "Manual Delivery").first()
-    if manual_delivery_method and not record_data.get("issuing_method_id"):
-        record_data["issuing_method_id"] = manual_delivery_method.id
-    
-    urdg_rule = db.query(Rule).filter(Rule.name == "URDG 758").first()
-    if urdg_rule and not record_data.get("applicable_rule_id"):
-        record_data["applicable_rule_id"] = urdg_rule.id
-    
+            # Assuming calculate_lg_period_months is imported or available in scope
+            from app.api.v1.endpoints.migration import calculate_lg_period_months
+            record_data['lg_period_months'] = calculate_lg_period_months(i_date, e_date)
+        except Exception as e:
+            logger.warning(f"Period calculation failed: {e}")
+
+    # Set hard defaults if still missing
     record_data["auto_renewal"] = record_data.get("auto_renewal", True)
     
-    logger.debug(f"Autofill process complete. Final data: {record_data}")
+    # Ensure payable currency matches if not specified
+    if not record_data.get("lg_payable_currency_id"):
+        record_data["lg_payable_currency_id"] = record_data.get("lg_currency_id")
+
     return record_data
-
-
+    
 class MigrationService:
     def __init__(self):
         pass
@@ -500,7 +431,7 @@ class MigrationService:
         # --- DEBUG PRINT ---
         print("\n\n============================================")
         print(">>> ENTERING MIGRATE_RECORD FUNCTION <<<")
-        source_data = staged_record.get('source_data_json', {})
+        source_data = staged_record.source_data_json or {}
         raw_url = source_data.get("attachment_url")
         print(f">>> RAW ATTACHMENT URL: {raw_url}")
         print("============================================\n\n")
@@ -519,7 +450,17 @@ class MigrationService:
         owner_email = source_data.get("internal_owner_email")
         
         if owner_id and (not owner_phone or not manager_email):
-            owner_obj = crud_internal_owner_contact.get(db, id=owner_id)
+            owner_obj = None
+            if isinstance(owner_id, int):
+                owner_obj = crud_internal_owner_contact.get(db, id=owner_id)
+            elif isinstance(owner_id, str):
+                clean_owner_email = owner_id.strip()
+                if clean_owner_email:
+                    owner_obj = crud_internal_owner_contact.get_by_email_for_customer(
+                        db, 
+                        customer_id=staged_record.customer_id, 
+                        email=clean_owner_email
+                    )
             if owner_obj:
                 owner_phone = owner_obj.phone_number
                 manager_email = owner_obj.manager_email
@@ -582,7 +523,7 @@ class MigrationService:
             )
             
             new_lg_record.migration_source = 'LEGACY'
-            new_lg_record.migrated_from_staging_id = staged_record.get('id')
+            new_lg_record.migrated_from_staging_id = staged_record.id
             db.add(new_lg_record)
             db.flush() 
             
@@ -627,7 +568,7 @@ class MigrationService:
         Migrates a single staged LG instruction into the production LGInstruction table.
         """
         from app.crud.crud import crud_lg_record, crud_lg_instruction, crud_internal_owner_contact
-        source_data = staged_instruction.get('source_data_json', {})
+        source_data = staged_record.source_data_json or {}
 
         lg_number = source_data.get("lg_number")
         if not lg_number:

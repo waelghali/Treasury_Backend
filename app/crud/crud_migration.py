@@ -164,7 +164,29 @@ class CRUDLGMigration(CRUDBase):
         old_data = db_record.source_data_json or {}
         
         # Replace the entire source_data_json with the new complete data
-        db_record.source_data_json = complete_record_data
+        # CRITICAL FIX: Re-apply autofill to resolve strings (like emails) to IDs before validation
+        from app.crud.crud import (
+            crud_internal_owner_contact, crud_lg_type, crud_issuing_method, 
+            crud_rule, crud_bank, crud_customer_entity, crud_lg_category, crud_currency
+        )
+        
+        enhanced_data = _apply_defaults_and_autofill(
+            db, 
+            complete_record_data, 
+            customer_id,
+            crud_internal_owner_contact,
+            crud_lg_type,
+            crud_issuing_method,
+            crud_rule,
+            crud_bank,
+            crud_customer_entity,
+            crud_lg_category,
+            crud_currency
+        )
+        
+        db_record.source_data_json = enhanced_data
+        # Explicitly mark as modified for SQLAlchemy
+        flag_modified(db_record, "source_data_json")
         
         # Run comprehensive validation on the new data
         validation_errors = lg_validation_service.validate_lg_data(db_record.source_data_json, context='migration', db=db, customer_id=customer_id)
