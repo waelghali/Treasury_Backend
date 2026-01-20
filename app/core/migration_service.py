@@ -85,11 +85,21 @@ def _apply_defaults_and_autofill(
     """
     logger.debug(f"Autofill started for record: {record_data.get('lg_number', 'N/A')}")
     
-    # --- Step 1: Autofill Internal Owner Contact (ROBUST FIX) ---
+    # --- Step 1: Autofill Internal Owner Contact (FIXED) ---
     existing_owner_id = record_data.get("internal_owner_contact_id")
     email_input = record_data.get("internal_owner_email")
+
+    # FIX 1: If ID is a digit string (e.g. "5"), convert it to int immediately
+    if isinstance(existing_owner_id, str) and existing_owner_id.isdigit():
+        existing_owner_id = int(existing_owner_id)
+        record_data["internal_owner_contact_id"] = existing_owner_id
+
+    # FIX 2: If ID looks like an email, move it to email_input
+    elif isinstance(existing_owner_id, str) and "@" in existing_owner_id:
+        email_input = existing_owner_id
+        record_data["internal_owner_contact_id"] = None # Clear invalid ID
     
-    # If ID is a string (e.g. from Excel), or missing, attempt lookup by email
+    # Now run the lookup if we have an email but no valid numeric ID
     if not isinstance(existing_owner_id, int) and email_input:
         clean_email = str(email_input).strip()
         owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, clean_email)
@@ -105,10 +115,7 @@ def _apply_defaults_and_autofill(
         # Update these integer IDs (1, 2, 3...) to match your LGOperationalStatus table
         status_map = {
             "OPERATIVE": 1,
-            "CLOSED": 2,
-            "EXPIRED": 3,
-            "CANCELLED": 4,
-            "PENDING": 5
+            "NON-OPERATIVE": 2
         }
         clean_status = op_status_val.strip().upper()
         if clean_status in status_map:

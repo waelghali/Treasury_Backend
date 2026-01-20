@@ -32,7 +32,7 @@ class CRUDCustomer(CRUDBase):
         return db.query(self.model).filter(func.lower(self.model.contact_email) == func.lower(email), self.model.is_deleted == False).first()
 
     def get_all_with_relations(self, db: Session, skip: int = 0, limit: int = 100) -> List[models.Customer]:
-        return db.query(self.model).filter(self.model.is_deleted == False).options(
+        return db.query(self.model).options(
             selectinload(self.model.subscription_plan),
             selectinload(self.model.entities),
             selectinload(self.model.users),
