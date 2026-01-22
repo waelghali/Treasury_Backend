@@ -755,7 +755,7 @@ async def view_lg_document_securely(
 @router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
 async def list_lg_records(
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 200,
     internal_owner_contact_id: Optional[int] = Query(None, description="Filter LG records by the ID of the internal owner contact"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:view_own")),
