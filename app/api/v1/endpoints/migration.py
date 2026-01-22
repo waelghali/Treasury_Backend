@@ -273,16 +273,36 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     """
     logger.debug(f"Autofill started for record: {record_data.get('lg_number', 'N/A')}")
     logger.debug(f"Initial record data: {record_data}")
-    # --- Step 1: Autofill Internal Owner Contact by Email ---
-    internal_owner_email = record_data.pop("internal_owner_email", None)
-    if internal_owner_email:
+    # --- Step 1: Autofill Internal Owner Contact (FINAL) ---
+    existing_owner_id = record_data.get("internal_owner_contact_id")
+    email_input = record_data.get("internal_owner_email")
+
+    # A. Logic to handle ID vs Email string in the ID column
+    if isinstance(existing_owner_id, str) and existing_owner_id.isdigit():
+        existing_owner_id = int(existing_owner_id)
+        record_data["internal_owner_contact_id"] = existing_owner_id
+    elif isinstance(existing_owner_id, str) and "@" in existing_owner_id:
+        # If user put email in the ID column, move it to email variable
+        email_input = existing_owner_id
+        record_data["internal_owner_contact_id"] = None
+
+    # B. Logic to lookup by Email if ID is missing
+    if not isinstance(existing_owner_id, int) and email_input:
+        
+        # FIX: Force lowercase and remove spaces to ensure match
+        clean_email = str(email_input).strip().lower()
+        
+        logger.info(f"🔍 Looking up Internal Owner for email: '{clean_email}' (Customer {customer_id})")
+        
         owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, clean_email)
+        
         if owner:
             record_data["internal_owner_contact_id"] = owner.id
-            logger.debug(f"Autofilled internal_owner_contact_id from email: {owner.id}")
+            record_data["internal_owner_email"] = owner.email
+            logger.info(f"✅ FOUND Owner: {clean_email} -> ID: {owner.id}")
         else:
-            record_data["internal_owner_contact_id"] = None
-            logger.warning(f"Internal owner not found for email: {internal_owner_email}")
+            logger.warning(f"❌ OWNER NOT FOUND: No internal owner found with email '{clean_email}' for Customer {customer_id}")
+            # This will result in 'Missing Internal Owner' validation error
 
     # --- Step 2: Autofill other IDs from names/codes ---
     # This block is the core of the fix. It uses a single, consistent loop
