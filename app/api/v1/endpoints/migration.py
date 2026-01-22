@@ -273,11 +273,10 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     """
     logger.debug(f"Autofill started for record: {record_data.get('lg_number', 'N/A')}")
     logger.debug(f"Initial record data: {record_data}")
-    current_user: TokenData = Depends(get_current_corporate_admin_context),
     # --- Step 1: Autofill Internal Owner Contact by Email ---
     internal_owner_email = record_data.pop("internal_owner_email", None)
     if internal_owner_email:
-        owner = crud_internal_owner_contact.get_by_email_for_customer(db, current_user.customer_id, clean_email)
+        owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, clean_email)
         if owner:
             record_data["internal_owner_contact_id"] = owner.id
             logger.debug(f"Autofilled internal_owner_contact_id from email: {owner.id}")
