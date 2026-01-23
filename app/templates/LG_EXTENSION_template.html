@@ -8,7 +8,7 @@
         body {
             font-family: 'Inter', sans-serif; /* Use Inter font if available, fallback to generic sans-serif */
             font-size: 10pt; /* Keep slightly reduced font size for single page */
-            line-height: 1.5;
+            line-height: 1.2;
             color: #333;
             margin: 0;
             padding: 0; /* Ensure no body padding interferes with @page margins */
@@ -17,14 +17,14 @@
             /* REMOVED explicit width: 19cm;
                This allows the container to naturally fit within the @page margins. */
             margin: 0 auto; /* Keep for centering if needed, though @page margins define print area */
-            padding: 0.5cm; /* Keep some internal padding within the container */
+            padding: 0.4cm; /* Keep some internal padding within the container */
             /* Optional: for visual debugging - remove in production */
             /* border: 1px solid #eee; */
             /* box-shadow: 0 0 10px rgba(0,0,0,0.05); */
         }
         h1, h2, h3 {
             color: #2c3e50;
-            margin-top: 1em;
+            margin-top: 0.8em;
             margin-bottom: 0.4em;
         }
         h1 {
@@ -115,7 +115,7 @@
             <p><strong>Subject: Instruction to Extend Letter of Guarantee #<span class="highlight">{{lg_number}}</span></strong></p>
         </div>
 
-        <p>Kindly arrange to extend Letter of Guarantee number <strong>{{lg_number}}</strong> with original expiry date <strong>{{old_expiry_date}}</strong> until <strong>{{new_expiry_date}}</strong>.</p>
+        <p>Kindly arrange to extend Letter of Guarantee number <strong>{{lg_number}}</strong> with current expiry date <strong>{{old_expiry_date}}</strong> until <strong>{{new_expiry_date}}</strong>.</p>
         
         <p>The applicant, <strong>{{lg_issuer_name}}</strong>, continues to fulfill their obligations under the guarantee. If the extension is not possible, please proceed to liquidate the guarantee.</p>
 
@@ -127,7 +127,7 @@
                 <td>{{lg_number}}</td>
             </tr>
             <tr>
-                <th>Original Expiry Date:</th>
+                <th>Current Expiry Date:</th>
                 <td>{{old_expiry_date}}</td>
             </tr>
             <tr>
@@ -136,7 +136,7 @@
             </tr>
             <tr>
                 <th>Amount:</th>
-                <td>{{lg_amount}} {{lg_currency}}</td>
+                <td>{{lg_amount_formatted}} {{lg_currency}}</td>
             </tr>
             <tr>
                 <th>Issued By:</th>

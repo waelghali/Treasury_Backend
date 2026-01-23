@@ -296,7 +296,28 @@ class CRUDLGRecord(CRUDBase):
         ).scalar()
         next_lg_sequence = (last_lg_sequence if last_lg_sequence is not None else 0) + 1
         lg_record_data["lg_sequence_number"] = next_lg_sequence
+        
+        # --- FINAL SANITATION BEFORE DATABASE INSERT ---
+        # This ensures that any empty strings (which often come from frontend forms) 
+        # are converted to NULL (None) so the database doesn't crash on integer columns.
+        # This must happen AFTER the Foreign Bank logic to prevent re-assignment of "".
+        int_fields = [
+            "communication_bank_id", 
+            "lg_payable_currency_id", 
+            "issuing_bank_id", 
+            "issuing_method_id", 
+            "lg_currency_id"
+        ]
+        for field in int_fields:
+            if lg_record_data.get(field) == "":
+                lg_record_data[field] = None
 
+        # Ensure lg_payable_currency_id is not null if it was missing or emptied
+        if lg_record_data.get("lg_payable_currency_id") is None:
+            lg_record_data["lg_payable_currency_id"] = lg_record_data.get("lg_currency_id")
+        # -----------------------------------------------
+
+        # Now it is safe to create the record
         db_lg_record = self.model(**lg_record_data)
         db.add(db_lg_record)
         db.flush() # Flush to assign ID and lg_sequence_number for further use
@@ -595,9 +616,7 @@ class CRUDLGRecord(CRUDBase):
             "old_expiry_date": old_expiry_date_for_log,
             "new_expiry_date": new_expiry_date.isoformat(),
             "lg_number": db_lg_record.lg_number,
-            "lg_amount": float(
-                db_lg_record.lg_amount
-            ),
+            "lg_amount": f"{float(db_lg_record.lg_amount):,.2f}",
             "lg_currency": db_lg_record.lg_currency.iso_code,
             "issuing_bank_name": db_lg_record.issuing_bank.name,
             "internal_owner_email": db_lg_record.internal_owner_contact.email,
@@ -737,7 +756,7 @@ class CRUDLGRecord(CRUDBase):
                 "lg_number": updated_lg_record.lg_number,
                 "old_expiry_date": instruction_details["old_expiry_date"],
                 "new_expiry_date": instruction_details["new_expiry_date"],
-                "lg_amount": float(db_lg_record.lg_amount),
+                "lg_amount": f"{float(db_lg_record.lg_amount):,.2f}",
                 "lg_currency": db_lg_record.lg_currency.iso_code,
                 "issuing_bank_name": updated_lg_record.issuing_bank.name,
                 "internal_owner_email": db_lg_record.internal_owner_contact.email,
