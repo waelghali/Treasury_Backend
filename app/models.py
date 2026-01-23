@@ -400,7 +400,7 @@ class LGRecord(BaseModel):
     issuer_name = Column(String, nullable=False, comment="Name of the LG issuer (person/company bank guarantees)")
     issuer_id = Column(String, nullable=True, comment="Optional identifier for the issuer")
     lg_number = Column(String, unique=True, nullable=False, comment="Unique identifier for the Letter of Guarantee")
-    lg_amount = Column(Float(precision=18, asdecimal=True), nullable=False, comment="Original total amount of the LG (can be 0 for liquidated LGs)")
+    lg_amount = Column(Numeric(28, 2), nullable=False, comment="Original total amount of the LG (can be 0 for liquidated LGs)")
     lg_currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=False, comment="Currency of the LG amount")
     lg_payable_currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=True, comment="Currency in which LG is payable (defaults to LG Currency)")
     issuance_date = Column(DateTime(timezone=True), nullable=False, comment="Date the LG was issued (DD/MM/YYYY)")

@@ -1014,7 +1014,7 @@ class LGInstructionUpdate(BaseModel):
 
 class LGRecordMinimalOut(BaseSchema):
     lg_number: str
-    lg_amount: float
+    lg_amount: Union[str, Decimal]
     lg_currency_id: int
     beneficiary_corporate_id: int
     lg_sequence_number: int # New: Expose lg_sequence_number
@@ -1049,8 +1049,8 @@ class LGInstructionOut(LGInstructionBase, BaseSchema):
 class LGRecordOut(LGRecordBase, BaseSchema):
     customer_id: int
     lg_period_months: int
+    lg_amount: Optional[str] = None
     lg_sequence_number: int # New: Expose lg_sequence_number in LGRecordOut
-    
     beneficiary_corporate: 'CustomerEntityOut'
     lg_category: Optional['LGCategoryOut'] = []
     lg_currency: 'CurrencyOut'
@@ -1517,13 +1517,9 @@ class LGLifecycleHistoryReportItem(BaseModel):
     def format_amounts(cls, v):
         if v is None:
             return None
-        try:
-            return f"{float(v):.2f}"
-        except (ValueError, TypeError):
-            return str(v)
-            
-    class Config:
-        from_attributes = True
+        # SURGICAL FIX: Convert directly to string to preserve DB precision. 
+        # Do NOT cast to float.
+        return str(v)
 
 # =====================================================================================
 # REBUILD MODELS WITH NEW RELATIONSHIPS
