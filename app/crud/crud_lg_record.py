@@ -756,7 +756,7 @@ class CRUDLGRecord(CRUDBase):
                 "lg_number": updated_lg_record.lg_number,
                 "old_expiry_date": instruction_details["old_expiry_date"],
                 "new_expiry_date": instruction_details["new_expiry_date"],
-                "lg_amount": f"{float(db_lg_record.lg_amount):,.2f}",
+                "lg_amount": float(db_lg_record.lg_amount),
                 "lg_currency": db_lg_record.lg_currency.iso_code,
                 "issuing_bank_name": updated_lg_record.issuing_bank.name,
                 "internal_owner_email": db_lg_record.internal_owner_contact.email,
