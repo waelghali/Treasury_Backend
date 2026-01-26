@@ -214,7 +214,7 @@ def get_fresh_entity_permissions(db: Session, user_id: int) -> Tuple[bool, List[
     return has_all, allowed_ids
 
 # --- Helper for Fuzzy Matching ---
-def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], threshold: int = 75) -> Optional[int]:
+def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], threshold: int = 70) -> Optional[int]:
     """
     Finds the best fuzzy match for an extracted name against a list of valid entities (name and ID).
     Returns the ID of the best match if the similarity score is above the threshold.

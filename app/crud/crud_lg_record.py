@@ -564,8 +564,8 @@ class CRUDLGRecord(CRUDBase):
         
     async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None) -> Tuple[models.LGRecord, int, str]: # NEW: Add notes parameter
         db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
-        recipient_name = "To Whom It May Concern"
-        recipient_address = "N/A"
+        recipient_name = db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "To Whom It May Concern"
+        recipient_address = db_lg_record.issuing_bank.address if db_lg_record.issuing_bank and db_lg_record.issuing_bank.address else "N/A"
         if not db_lg_record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or is deleted."
