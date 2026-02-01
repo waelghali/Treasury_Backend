@@ -1399,7 +1399,7 @@ def read_corporate_admin_audit_logs(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(HasPermission("audit_log:view")),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., User, CustomerEntity)"),

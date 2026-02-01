@@ -9,7 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-
+from email.header import Header
 from sqlalchemy.orm import Session, selectinload
 
 # App Imports
@@ -130,7 +130,13 @@ async def send_email(
 
     # Logic to handle display name override
     display_name = sender_name if sender_name else email_settings.sender_display_name
-    sender_header = f"{display_name} <{email_settings.sender_email}>" if display_name else email_settings.sender_email
+    if display_name:
+        # This encodes Arabic names into a format like =?utf-8?b?...?= 
+        # which SMTP servers accept as valid ASCII.
+        encoded_name = Header(display_name, 'utf-8').encode()
+        sender_header = f"{encoded_name} <{email_settings.sender_email}>"
+    else:
+        sender_header = email_settings.sender_email
 
     try:
         # 1. Build Message

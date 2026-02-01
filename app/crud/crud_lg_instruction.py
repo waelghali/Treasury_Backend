@@ -335,8 +335,6 @@ class CRUDLGInstruction(CRUDBase):
         logger.debug(f"Reporting window: instructions issued on or before today, and on or after {report_stop_days} days ago.")
 
         current_date = date.today()
-        min_age_cutoff_date = current_date - timedelta(days=report_start_days)
-        max_age_cutoff_date = current_date - timedelta(days=report_stop_days)
         date_for_oldest_to_include = current_date - timedelta(days=report_start_days)
         date_for_newest_to_exclude = current_date - timedelta(days=report_stop_days)
 

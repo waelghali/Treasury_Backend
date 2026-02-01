@@ -2539,7 +2539,7 @@ def restore_template(
 @router.get("/audit-logs/", response_model=List[AuditLogOut])
 def read_audit_logs(
     skip: int = 0, 
-    limit: int = 100,
+    limit: int = 1000,
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., Customer, SubscriptionPlan)"),
@@ -2560,6 +2560,9 @@ def read_audit_logs(
         entity_type=entity_type,
         entity_id=entity_id
     )
+    for log in logs:
+        setattr(log, 'user_name', log.user.email if log.user else "System")
+
     return logs
 
 @router.get(

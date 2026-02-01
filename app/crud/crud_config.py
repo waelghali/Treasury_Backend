@@ -386,3 +386,6 @@ class CRUDCustomerConfiguration(CRUDBase):
         
         db.flush() 
         return corrected_configs
+
+crud_global_configuration = CRUDGlobalConfiguration(GlobalConfiguration)
+crud_customer_configuration = CRUDCustomerConfiguration(CustomerConfiguration, crud_global_configuration)

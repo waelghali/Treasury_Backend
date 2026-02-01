@@ -1,7 +1,7 @@
 # app/crud/crud_reports.py
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, date
 import decimal
 from typing import Any, Dict, List, Optional, Tuple, Type
 from sqlalchemy.orm import Session, selectinload
@@ -20,7 +20,7 @@ from app.schemas.all_schemas import (
     ReportFilterBase,
     SystemUsageOverviewReportOut, SystemUsageOverviewReportItemOut,
     CustomerLGPerformanceReportOut, CustomerLGPerformanceReportItemOut,
-    MyLGDashboardReportOut, MyLGDashboardReportItemOut
+    MyLGDashboardReportOut, MyLGDashboardReportItemOut, OpsHealthFlowOut, OpsHealthReportOut
 )
 from app.constants import (
     UserRole, LgStatusEnum, GlobalConfigKey,
@@ -28,10 +28,9 @@ from app.constants import (
     ACTION_TYPE_LG_DECREASE_AMOUNT, ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
     AUDIT_ACTION_TYPE_LG_INSTRUCTION_DELIVERED, AUDIT_ACTION_TYPE_LG_BANK_REPLY_RECORDED, ACTION_TYPE_LG_RECORD_DELIVERY, ACTION_TYPE_LG_RECORD_BANK_REPLY
 )
-
+from dateutil.relativedelta import relativedelta
 import logging
 logger = logging.getLogger(__name__)
-
 
 class CRUDReports(CRUDBase):
     def __init__(self, model: Type[LGRecord], crud_customer_configuration_instance: Any, crud_user_instance: Any):
@@ -309,6 +308,247 @@ class CRUDReports(CRUDBase):
             report_date=date.today(),
             data=report_data
         )
+
+    def get_ops_health_report(self, db: Session, user_context: Dict[str, Any], start_date: date, end_date: date) -> Any:
+        customer_id = user_context.get("customer_id")
+        today = date.today()
+        from app.crud.crud_config import crud_customer_configuration
+        from app.constants import GlobalConfigKey
+        import app.models as models
+        
+        # Internal helper to keep code clean
+        def get_counts(sd, ed):
+            query_new = db.query(models.LGRecord).filter(
+                models.LGRecord.is_deleted == False, 
+                func.date(models.LGRecord.created_at).between(sd, ed)
+            )
+            if customer_id:
+                query_new = query_new.filter(models.LGRecord.customer_id == customer_id)
+            new_c = query_new.count()
+            
+            query_ops = db.query(models.LGInstruction.instruction_type, func.count(models.LGInstruction.id)).join(models.LGRecord).filter(
+                models.LGInstruction.is_deleted == False, 
+                func.date(models.LGInstruction.created_at).between(sd, ed)
+            )
+            if customer_id:
+                query_ops = query_ops.filter(models.LGRecord.customer_id == customer_id)
+            ops = query_ops.group_by(models.LGInstruction.instruction_type).all()
+            
+            stats = {row[0]: row[1] for row in ops}
+            
+            query_amend = db.query(models.AuditLog).filter(
+                models.AuditLog.action_type == 'LG_AMENDED', 
+                func.date(models.AuditLog.timestamp).between(sd, ed)
+            )
+            if customer_id:
+                query_amend = query_amend.filter(models.AuditLog.customer_id == customer_id)
+            amend = query_amend.count()
+
+            data = {
+                "new_issuances_count": new_c,
+                "extensions_delivered_count": stats.get('LG_EXTENSION', 0),
+                "amendments_count": amend,
+                "reductions_count": stats.get('LG_DECREASE_AMOUNT', 0),
+                "releases_count": stats.get('LG_RELEASE', 0),
+                "activations_count": stats.get('LG_ACTIVATE_NON_OPERATIVE', 0),
+                "liquidations_count": stats.get('LG_LIQUIDATE', 0),
+                "reminders_count": stats.get('LG_REMINDER_TO_BANKS', 0),
+            }
+            data["total_activity_count"] = sum(data.values())
+            data["net_activity_score"] = data["total_activity_count"]
+            return data
+
+        # 1. FETCH MAIN FLOW
+        flow_data = get_counts(start_date, end_date)
+        
+        from datetime import datetime, timedelta
+        from dateutil.relativedelta import relativedelta
+        anchor = datetime.now() 
+        four_months_ago = anchor - relativedelta(months=3)
+        
+        history_query_base = db.query(
+            func.date_trunc('month', models.LGInstruction.created_at).label('month_date'),
+            models.LGInstruction.instruction_type,
+            func.count(models.LGInstruction.id)
+        ).join(models.LGRecord).filter(
+            models.LGInstruction.is_deleted == False,
+            func.date(models.LGInstruction.created_at) >= four_months_ago.date()
+        )
+        if customer_id:
+            history_query_base = history_query_base.filter(models.LGRecord.customer_id == customer_id)
+        history_query = history_query_base.group_by('month_date', models.LGInstruction.instruction_type).all()
+
+        history = []
+        for i in range(3, -1, -1):
+            m_start = anchor - relativedelta(months=i)
+            m_label = m_start.strftime("%b %Y")
+            month_data = [r for r in history_query if r[0].month == m_start.month and r[0].year == m_start.year]
+            
+            monthly_stats = {
+                "month": m_label,
+                "new_issuances_count": 0, 
+                "extensions_delivered_count": next((r[2] for r in month_data if r[1] == 'LG_EXTENSION'), 0),
+                "reductions_count": next((r[2] for r in month_data if r[1] == 'LG_DECREASE_AMOUNT'), 0),
+                "releases_count": next((r[2] for r in month_data if r[1] == 'LG_RELEASE'), 0),
+                "activations_count": next((r[2] for r in month_data if r[1] == 'LG_ACTIVATE_NON_OPERATIVE'), 0),
+                "liquidations_count": next((r[2] for r in month_data if r[1] == 'LG_LIQUIDATE'), 0),
+                "reminders_count": next((r[2] for r in month_data if r[1] == 'LG_REMINDER_TO_BANKS'), 0),
+                "amendments_count": 0 
+            }
+            history.append(monthly_stats)
+
+        # 2. RISK & ATTENTION
+        critical_expiry_query = db.query(models.LGRecord).filter(
+            models.LGRecord.is_deleted == False,
+            models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
+            models.LGRecord.expiry_date.between(today, today + timedelta(days=7))
+        )
+        if customer_id:
+            critical_expiry_query = critical_expiry_query.filter(models.LGRecord.customer_id == customer_id)
+        critical_expiry = critical_expiry_query.all()
+        
+        def get_eff_val(key):
+            res = crud_customer_configuration.get_customer_config_or_global_fallback(db, customer_id, key)
+            return int(res["effective_value"]) if res else 0
+
+        min_days_internal = get_eff_val(GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_REPORT_UNDELIVERED)
+        max_days_internal = get_eff_val(GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED)
+        min_days_ghost = get_eff_val(GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_DELIVERY)
+        max_days_ghost = get_eff_val(GlobalConfigKey.REMINDER_TO_BANKS_MAX_DAYS_SINCE_ISSUANCE)
+
+        stalled_internal_base = db.query(models.LGInstruction).join(models.LGRecord).filter(
+            models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
+            models.LGInstruction.is_deleted == False,
+            models.LGInstruction.delivery_date == None,
+            models.LGInstruction.instruction_date <= (today - timedelta(days=min_days_internal))
+        )
+        if customer_id:
+            stalled_internal_base = stalled_internal_base.filter(models.LGRecord.customer_id == customer_id)
+            
+        stalled_recommended = stalled_internal_base.filter(
+            models.LGInstruction.instruction_date >= (today - timedelta(days=max_days_internal))
+        ).all()
+
+        bank_ghosting_base = db.query(models.LGInstruction).join(models.LGRecord).filter(
+            models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
+            models.LGInstruction.is_deleted == False,
+            models.LGInstruction.delivery_date != None,
+            models.LGInstruction.bank_reply_date == None,
+            models.LGInstruction.delivery_date <= (today - timedelta(days=min_days_ghost))
+        )
+        if customer_id:
+            bank_ghosting_base = bank_ghosting_base.filter(models.LGRecord.customer_id == customer_id)
+            
+        ghosting_recommended = bank_ghosting_base.filter(
+            models.LGInstruction.delivery_date >= (today - timedelta(days=max_days_ghost))
+        ).all()
+
+        risks = {
+            "expiry_critical_list": [
+                {
+                    "id": item.id,
+                    "reference_number": item.lg_number,
+                    "date_trigger": item.expiry_date.date() if item.expiry_date else None,
+                    "details": f"Expires on {item.expiry_date.strftime('%Y-%m-%d')}",
+                    "days_remaining": (item.expiry_date.date() - today).days if item.expiry_date else 0
+                } for item in critical_expiry
+            ] if customer_id else [],
+            "expiry_warning_count": len(critical_expiry), 
+            "bank_ghosting_list": [
+                {
+                    "id": i,
+                    "reference_number": item.lg_record.lg_number, 
+                    "date_trigger": item.delivery_date.date() if item.delivery_date else None,
+                    "details": f"Waiting for {item.lg_record.issuing_bank.name if item.lg_record.issuing_bank else 'Bank'}",
+                    "days_remaining": (today - item.delivery_date.date()).days if item.delivery_date else 0
+                } for i, item in enumerate(ghosting_recommended)
+            ] if customer_id else [],
+            "stalled_internal_list": [
+                {
+                    "id": i,
+                    "reference_number": item.lg_record.lg_number, 
+                    "date_trigger": item.instruction_date.date() if item.instruction_date else None,
+                    "details": "Instruction pending delivery",
+                    "days_remaining": (today - item.instruction_date.date()).days if item.instruction_date else 0
+                } for i, item in enumerate(stalled_recommended)
+            ] if customer_id else []
+        }
+
+        approval_base_query = db.query(func.avg(models.ApprovalRequest.updated_at - models.ApprovalRequest.created_at))\
+            .filter(
+                models.ApprovalRequest.updated_at != None,
+                models.ApprovalRequest.status != 'WITHDRAWN',
+                models.ApprovalRequest.updated_at >= models.ApprovalRequest.created_at
+            )
+        internal_base_query = db.query(func.avg(models.LGInstruction.delivery_date - models.LGInstruction.instruction_date))\
+            .join(models.LGRecord).filter(
+                models.LGInstruction.delivery_date != None,
+                models.LGInstruction.delivery_date >= models.LGInstruction.instruction_date
+            )
+        bank_base_query = db.query(func.avg(models.LGInstruction.bank_reply_date - models.LGInstruction.delivery_date))\
+            .join(models.LGRecord).filter(
+                models.LGInstruction.bank_reply_date != None,
+                models.LGInstruction.delivery_date != None,
+                models.LGInstruction.bank_reply_date >= models.LGInstruction.delivery_date
+            )
+            
+        if customer_id:
+            approval_base_query = approval_base_query.filter(models.ApprovalRequest.customer_id == customer_id)
+            internal_base_query = internal_base_query.filter(models.LGRecord.customer_id == customer_id)
+            bank_base_query = bank_base_query.filter(models.LGRecord.customer_id == customer_id)
+
+        lifetime_internal = internal_base_query.scalar()
+        lifetime_bank = bank_base_query.scalar()
+        lifetime_approval = approval_base_query.scalar()
+        period_internal = internal_base_query.filter(func.date(models.LGInstruction.delivery_date).between(start_date, end_date)).scalar()
+        period_bank = bank_base_query.filter(func.date(models.LGInstruction.bank_reply_date).between(start_date, end_date)).scalar()
+        period_approval = approval_base_query.filter(func.date(models.ApprovalRequest.updated_at).between(start_date, end_date)).scalar()
+        
+        def format_days(interval):
+            if not interval: return 0.0
+            return max(0, round(interval.total_seconds() / 86400, 1))
+
+        efficiency = {
+            "avg_internal_days": format_days(period_internal),
+            "avg_bank_days": format_days(period_bank),
+            "avg_approval_days": format_days(period_approval),
+            "lifetime_internal_days": format_days(lifetime_internal),
+            "lifetime_bank_days": format_days(lifetime_bank),
+            "lifetime_approval_days": format_days(lifetime_approval),
+            "internal_change_pct": round(((format_days(period_internal) - format_days(lifetime_internal)) / format_days(lifetime_internal) * 100), 1) if format_days(lifetime_internal) > 0 else 0
+        }
+
+        status_query_base = db.query(models.LGRecord.lg_status_id, func.count(models.LGRecord.id)).filter(models.LGRecord.is_deleted == False)
+        if customer_id:
+            status_query_base = status_query_base.filter(models.LGRecord.customer_id == customer_id)
+        status_query = status_query_base.group_by(models.LGRecord.lg_status_id).all()
+        
+        status_map = {v.value: k.replace('_', ' ').title() for k, v in models.LgStatusEnum.__members__.items()}
+        status_dist = {status_map.get(row[0], f"Status {row[0]}"): row[1] for row in status_query}
+
+        internal_total_items = stalled_internal_base.all()
+        bank_total_items = bank_ghosting_base.all()
+
+        pipeline = {
+            "internal_backlog_count": len(stalled_recommended),
+            "bank_backlog_count": len(ghosting_recommended),
+            "internal_backlog_total": len(internal_total_items), 
+            "bank_backlog_total": len(bank_total_items),
+            "completed_recently_count": flow_data.get("extensions_delivered_count", 0)
+        }
+
+        return {
+            "period_start": start_date,
+            "period_end": end_date,
+            "report_date": today,
+            "flow": flow_data,
+            "history": history,
+            "status_distribution": status_dist,
+            "pipeline": pipeline,
+            "risks": risks,
+            "efficiency": efficiency
+        }
+
     def get_chart_data(self, db: Session, report_type: str, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Retrieves data for the dashboard charts based on report type and user context.
@@ -332,6 +572,8 @@ class CRUDReports(CRUDBase):
                 models.LGInstruction.is_deleted == False,
                 models.LGInstruction.delivery_date.isnot(None),
                 models.LGInstruction.bank_reply_date.isnot(None),
+                # NEW SAFETY FILTER: Ignore "impossible" data where reply is before delivery
+                models.LGInstruction.bank_reply_date >= models.LGInstruction.delivery_date 
             ).join(models.LGRecord)
             
             if customer_id:
@@ -341,7 +583,6 @@ class CRUDReports(CRUDBase):
                 models.Bank.short_name,
                 func.avg(models.LGInstruction.bank_reply_date - models.LGInstruction.delivery_date).label('avg_timedelta')
             ).join(models.Bank, models.LGRecord.issuing_bank_id == models.Bank.id).group_by(models.Bank.short_name)
-
         # Bank Market Share
         elif report_type == "bank_market_share":
             base_lg_query = db.query(models.LGRecord).filter(models.LGRecord.is_deleted == False)
@@ -395,202 +636,203 @@ class CRUDReports(CRUDBase):
             return [{"name": row[0], "value": row[1]} for row in results]
         return []
     
-def get_all_lg_lifecycle_history(
-    db: Session,
-    customer_id: int,
-    user_id: int,
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    action_types: Optional[List[str]] = None,
-    lg_record_ids: Optional[List[int]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Retrieves the full lifecycle history for the given customer.
-    Fixes '0E-10' by converting amounts to formatted strings.
-    """
-    
-    # 1. Base Query
-    query = db.query(models.AuditLog, models.LGRecord, models.User).join(
-        models.LGRecord, models.AuditLog.lg_record_id == models.LGRecord.id
-    ).join(
-        models.User, models.AuditLog.user_id == models.User.id, isouter=True
-    ).filter(
-        models.LGRecord.is_deleted == False
-    ).options(
-        selectinload(models.LGRecord.customer),
-        selectinload(models.LGRecord.beneficiary_corporate),
-        selectinload(models.LGRecord.issuing_bank),
-        selectinload(models.LGRecord.lg_type),
-        selectinload(models.LGRecord.lg_category),
-        selectinload(models.LGRecord.lg_currency), 
-        selectinload(models.LGRecord.internal_owner_contact),
-    )
-    
-    # 2. Filtering
-    query = query.filter(models.LGRecord.customer_id == customer_id)
-    
-    if start_date:
-        query = query.filter(func.date(models.AuditLog.timestamp) >= start_date)
-    
-    if end_date:
-        query = query.filter(func.date(models.AuditLog.timestamp) <= end_date)
+    def get_all_lg_lifecycle_history(
+        self,
+        db: Session,
+        customer_id: int,
+        user_id: int,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        action_types: Optional[List[str]] = None,
+        lg_record_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves the full lifecycle history for the given customer.
+        Fixes '0E-10' by converting amounts to formatted strings.
+        """
+        
+        # 1. Base Query
+        query = db.query(models.AuditLog, models.LGRecord, models.User).join(
+            models.LGRecord, models.AuditLog.lg_record_id == models.LGRecord.id
+        ).join(
+            models.User, models.AuditLog.user_id == models.User.id, isouter=True
+        ).filter(
+            models.LGRecord.is_deleted == False
+        ).options(
+            selectinload(models.LGRecord.customer),
+            selectinload(models.LGRecord.beneficiary_corporate),
+            selectinload(models.LGRecord.issuing_bank),
+            selectinload(models.LGRecord.lg_type),
+            selectinload(models.LGRecord.lg_category),
+            selectinload(models.LGRecord.lg_currency), 
+            selectinload(models.LGRecord.internal_owner_contact),
+        )
+        
+        # 2. Filtering
+        query = query.filter(models.LGRecord.customer_id == customer_id)
+        
+        if start_date:
+            query = query.filter(func.date(models.AuditLog.timestamp) >= start_date)
+        
+        if end_date:
+            query = query.filter(func.date(models.AuditLog.timestamp) <= end_date)
 
-    if action_types:
-        query = query.filter(models.AuditLog.action_type.in_(action_types))
+        if action_types:
+            query = query.filter(models.AuditLog.action_type.in_(action_types))
 
-    if lg_record_ids:
-        query = query.filter(models.LGRecord.id.in_(lg_record_ids))
+        if lg_record_ids:
+            query = query.filter(models.LGRecord.id.in_(lg_record_ids))
 
-    query = query.order_by(models.AuditLog.timestamp.desc())
+        query = query.order_by(models.AuditLog.timestamp.desc())
 
-    # 3. Execute and Format
-    results = []
-    raw_data = query.all()
+        # 3. Execute and Format
+        results = []
+        raw_data = query.all()
 
-    for log, lg, user in raw_data:
-        # Safely get relational data
-        ben_name = lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else None
-        bank_name = lg.issuing_bank.name if lg.issuing_bank else lg.foreign_bank_name if lg.foreign_bank_name else None
-        currency_code = lg.lg_currency.iso_code if lg.lg_currency else None
-        
-        # --- Initialize fields ---
-        instruction_serial = None
-        delivery_date = None
-        bank_reply_date = None
-        old_expiry_date = None
-        new_expiry_date = None
-        
-        # Amounts
-        old_amount_dec: Optional[Decimal] = None
-        new_amount_dec: Optional[Decimal] = None
-        amount_change: Optional[float] = None 
-        
-        reason = None
-        log_details: Dict[str, Any] = log.details if log.details else {}
-        summary_description = log.action_type.replace('_', ' ').title() if log.action_type else "Action Performed"
-        
-        # --- Extraction Logic ---
-        
-        # 1. Logistics Fields 
-        if log.action_type == AUDIT_ACTION_TYPE_LG_INSTRUCTION_DELIVERED:
-            instruction_serial = log_details.get("instruction_serial") or log_details.get("serial_number")
-            date_str = log_details.get("delivery_date")
-            try: delivery_date = date.fromisoformat(date_str) if date_str else None
-            except ValueError: delivery_date = None
+        for log, lg, user in raw_data:
+            # Safely get relational data
+            ben_name = lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else None
+            bank_name = lg.issuing_bank.name if lg.issuing_bank else lg.foreign_bank_name if lg.foreign_bank_name else None
+            currency_code = lg.lg_currency.iso_code if lg.lg_currency else None
             
-            delivery_date_str = delivery_date.isoformat() if delivery_date else "N/A"
-            summary_description = f"LG Instruction Delivered to Bank on {delivery_date_str}."
+            # --- Initialize fields ---
+            instruction_serial = None
+            delivery_date = None
+            bank_reply_date = None
+            old_expiry_date = None
+            new_expiry_date = None
+            
+            # Amounts
+            old_amount_dec: Optional[Decimal] = None
+            new_amount_dec: Optional[Decimal] = None
+            amount_change: Optional[float] = None 
+            
+            reason = None
+            log_details: Dict[str, Any] = log.details if log.details else {}
+            summary_description = log.action_type.replace('_', ' ').title() if log.action_type else "Action Performed"
+            
+            # --- Extraction Logic ---
+            
+            # 1. Logistics Fields 
+            if log.action_type == AUDIT_ACTION_TYPE_LG_INSTRUCTION_DELIVERED:
+                instruction_serial = log_details.get("instruction_serial") or log_details.get("serial_number")
+                date_str = log_details.get("delivery_date")
+                try: delivery_date = date.fromisoformat(date_str) if date_str else None
+                except ValueError: delivery_date = None
+                
+                delivery_date_str = delivery_date.isoformat() if delivery_date else "N/A"
+                summary_description = f"LG Instruction Delivered to Bank on {delivery_date_str}."
 
-        elif log.action_type == AUDIT_ACTION_TYPE_LG_BANK_REPLY_RECORDED:
-            instruction_serial = log_details.get("instruction_serial") or log_details.get("serial_number")
-            date_str = log_details.get("bank_reply_date")
-            try: bank_reply_date = date.fromisoformat(date_str) if date_str else None
-            except ValueError: bank_reply_date = None
+            elif log.action_type == AUDIT_ACTION_TYPE_LG_BANK_REPLY_RECORDED:
+                instruction_serial = log_details.get("instruction_serial") or log_details.get("serial_number")
+                date_str = log_details.get("bank_reply_date")
+                try: bank_reply_date = date.fromisoformat(date_str) if date_str else None
+                except ValueError: bank_reply_date = None
+                
+                reason = log_details.get("reply_details", "") or log_details.get("reason", "") 
+                
+                reply_date_str = bank_reply_date.isoformat() if bank_reply_date else "N/A"
+                detail_note = f" (Details: {reason})" if reason else ""
+                summary_description = f"Bank Reply Recorded on {reply_date_str}.{detail_note}"
             
-            reason = log_details.get("reply_details", "") or log_details.get("reason", "") 
-            
-            reply_date_str = bank_reply_date.isoformat() if bank_reply_date else "N/A"
-            detail_note = f" (Details: {reason})" if reason else ""
-            summary_description = f"Bank Reply Recorded on {reply_date_str}.{detail_note}"
-        
-        # 2. Time Amendment Fields
-        elif log.action_type in [ACTION_TYPE_LG_EXTEND, ACTION_TYPE_LG_AMEND]:
-            old_expiry_date_str = log_details.get("old_expiry_date")
-            new_expiry_date_str = log_details.get("new_expiry_date")
-            
-            try: old_expiry_date = date.fromisoformat(old_expiry_date_str) if old_expiry_date_str else None
-            except ValueError: old_expiry_date = None
-            try: new_expiry_date = date.fromisoformat(new_expiry_date_str) if new_expiry_date_str else None
-            except ValueError: new_expiry_date = None
-            
-            reason = log_details.get("reason", "")
-            if reason:
-                 summary_description = f"LG Amended. Reason: {reason}."
-            
-        # 3. Financial Amendment Fields
-        elif log.action_type in [ACTION_TYPE_LG_DECREASE_AMOUNT, ACTION_TYPE_LG_LIQUIDATE]:
-            try:
-                old_amount_dec = Decimal(str(log_details.get("old_amount"))) if log_details.get("old_amount") is not None else None
-                new_amount_dec = Decimal(str(log_details.get("new_amount"))) if log_details.get("new_amount") is not None else None
-            except (decimal.InvalidOperation, TypeError):
-                old_amount_dec = None
-                new_amount_dec = None
-            
-            if old_amount_dec is not None and new_amount_dec is not None:
-                amount_change = float(old_amount_dec - new_amount_dec)
-            else:
-                amount_change = None
-            
-            reason = log_details.get("reason", "")
-            
-            if amount_change is not None and currency_code:
-                new_total_str = f"{new_amount_dec:,.2f}" if new_amount_dec is not None else "N/A"
-                summary_description = (
-                    f"Decreased by {abs(amount_change):,.2f} {currency_code}. "
-                    f"New Total: {new_total_str} {currency_code}."
-                )
-            elif reason:
-                 summary_description = f"LG Decreased/Liquidated. Reason: {reason}."
-            else:
-                summary_description = "LG Financial Change (Details N/A)."
+            # 2. Time Amendment Fields
+            elif log.action_type in [ACTION_TYPE_LG_EXTEND, ACTION_TYPE_LG_AMEND]:
+                old_expiry_date_str = log_details.get("old_expiry_date")
+                new_expiry_date_str = log_details.get("new_expiry_date")
+                
+                try: old_expiry_date = date.fromisoformat(old_expiry_date_str) if old_expiry_date_str else None
+                except ValueError: old_expiry_date = None
+                try: new_expiry_date = date.fromisoformat(new_expiry_date_str) if new_expiry_date_str else None
+                except ValueError: new_expiry_date = None
+                
+                reason = log_details.get("reason", "")
+                if reason:
+                     summary_description = f"LG Amended. Reason: {reason}."
+                
+            # 3. Financial Amendment Fields
+            elif log.action_type in [ACTION_TYPE_LG_DECREASE_AMOUNT, ACTION_TYPE_LG_LIQUIDATE]:
+                try:
+                    old_amount_dec = Decimal(str(log_details.get("old_amount"))) if log_details.get("old_amount") is not None else None
+                    new_amount_dec = Decimal(str(log_details.get("new_amount"))) if log_details.get("new_amount") is not None else None
+                except (decimal.InvalidOperation, TypeError):
+                    old_amount_dec = None
+                    new_amount_dec = None
+                
+                if old_amount_dec is not None and new_amount_dec is not None:
+                    amount_change = float(old_amount_dec - new_amount_dec)
+                else:
+                    amount_change = None
+                
+                reason = log_details.get("reason", "")
+                
+                if amount_change is not None and currency_code:
+                    new_total_str = f"{new_amount_dec:,.2f}" if new_amount_dec is not None else "N/A"
+                    summary_description = (
+                        f"Decreased by {abs(amount_change):,.2f} {currency_code}. "
+                        f"New Total: {new_total_str} {currency_code}."
+                    )
+                elif reason:
+                     summary_description = f"LG Decreased/Liquidated. Reason: {reason}."
+                else:
+                    summary_description = "LG Financial Change (Details N/A)."
 
-        # --- Summary Cleanup ---
-        summary_description = log_details.get("summary_description") or log_details.get("summary") or summary_description
-        
-        if "N/A" in summary_description or "n/a" in summary_description:
-            if "Reason: N/A" in summary_description and reason:
-                 summary_description = summary_description.replace("Reason: N/A.", f"Reason: {reason}.")
-            elif "Decreased by N/A" in summary_description and amount_change is not None and currency_code:
-                summary_description = summary_description.replace("Decreased by N/A.", f"Decreased by {abs(amount_change):,.2f} {currency_code}.")
-            elif "Serial: N/A" in summary_description and instruction_serial:
-                summary_description = summary_description.replace("Serial: N/A.", f"Serial: {instruction_serial}.")
-        
-        
-        # --- CRITICAL FIX: CONVERT TO STRING TO STOP 0E-10 ---
-        def format_amount_to_string(value: Optional[Decimal]) -> Optional[str]:
-            if value is None:
-                return None
-            try:
-                val_dec = Decimal(str(value))
-                return f"{val_dec:.2f}"
-            except:
-                return str(value)
+            # --- Summary Cleanup ---
+            summary_description = log_details.get("summary_description") or log_details.get("summary") or summary_description
+            
+            if "N/A" in summary_description or "n/a" in summary_description:
+                if "Reason: N/A" in summary_description and reason:
+                     summary_description = summary_description.replace("Reason: N/A.", f"Reason: {reason}.")
+                elif "Decreased by N/A" in summary_description and amount_change is not None and currency_code:
+                    summary_description = summary_description.replace("Decreased by N/A.", f"Decreased by {abs(amount_change):,.2f} {currency_code}.")
+                elif "Serial: N/A" in summary_description and instruction_serial:
+                    summary_description = summary_description.replace("Serial: N/A.", f"Serial: {instruction_serial}.")
+            
+            
+            # --- CRITICAL FIX: CONVERT TO STRING TO STOP 0E-10 ---
+            def format_amount_to_string(value: Optional[Decimal]) -> Optional[str]:
+                if value is None:
+                    return None
+                try:
+                    val_dec = Decimal(str(value))
+                    return f"{val_dec:.2f}"
+                except:
+                    return str(value)
 
-        lg_amount_str = format_amount_to_string(lg.lg_amount)
-        old_amount_str = format_amount_to_string(old_amount_dec)
-        new_amount_str = format_amount_to_string(new_amount_dec)
-        
-        results.append({
-            "lg_record_id": lg.id,
-            "lg_number": lg.lg_number,
-            "issuer_name": lg.customer.name if lg.customer else None,
-            "beneficiary_name": ben_name,
-            "internal_owner_email": lg.internal_owner_contact.email if lg.internal_owner_contact else None,
-            "issuing_bank_name": bank_name,
-            "issuance_date": lg.issuance_date.date() if lg.issuance_date else None,
-            "lg_type_name": lg.lg_type.name if lg.lg_type else None,
-            "lg_category_name": lg.lg_category.name if lg.lg_category else None,
+            lg_amount_str = format_amount_to_string(lg.lg_amount)
+            old_amount_str = format_amount_to_string(old_amount_dec)
+            new_amount_str = format_amount_to_string(new_amount_dec)
             
-            # These are now Strings, so they will export exactly as "0.00" or "500.00"
-            "lg_amount": lg_amount_str,
-            "lg_currency": currency_code,
-            
-            "action_type": log.action_type,
-            "timestamp": log.timestamp,
-            "user_email": user.email if user else None,
-            "details": log_details, 
-            
-            "instruction_serial": instruction_serial,
-            "delivery_date": delivery_date,
-            "bank_reply_date": bank_reply_date,
-            "old_expiry_date": old_expiry_date,
-            "new_expiry_date": new_expiry_date,
-            
-            "old_amount": old_amount_str, 
-            "new_amount": new_amount_str,
-            
-            "amount_change": amount_change,
-            "summary_description": summary_description, 
-        })
+            results.append({
+                "lg_record_id": lg.id,
+                "lg_number": lg.lg_number,
+                "issuer_name": lg.customer.name if lg.customer else None,
+                "beneficiary_name": ben_name,
+                "internal_owner_email": lg.internal_owner_contact.email if lg.internal_owner_contact else None,
+                "issuing_bank_name": bank_name,
+                "issuance_date": lg.issuance_date.date() if lg.issuance_date else None,
+                "lg_type_name": lg.lg_type.name if lg.lg_type else None,
+                "lg_category_name": lg.lg_category.name if lg.lg_category else None,
+                
+                # These are now Strings, so they will export exactly as "0.00" or "500.00"
+                "lg_amount": lg_amount_str,
+                "lg_currency": currency_code,
+                
+                "action_type": log.action_type,
+                "timestamp": log.timestamp,
+                "user_email": user.email if user else None,
+                "details": log_details, 
+                
+                "instruction_serial": instruction_serial,
+                "delivery_date": delivery_date,
+                "bank_reply_date": bank_reply_date,
+                "old_expiry_date": old_expiry_date,
+                "new_expiry_date": new_expiry_date,
+                
+                "old_amount": old_amount_str, 
+                "new_amount": new_amount_str,
+                
+                "amount_change": amount_change,
+                "summary_description": summary_description, 
+            })
 
-    return results
+        return results

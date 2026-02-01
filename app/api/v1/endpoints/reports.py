@@ -22,7 +22,7 @@ from app.schemas.all_schemas import (
     AvgDeliveryDaysReportOut,
     AvgDaysToActionEventReportOut,
     AvgDaysToActionEventOut,
-    DemoRequestCreate,
+    DemoRequestCreate,OpsHealthReportOut
 )
 from app.crud.crud import crud_reports, log_action
 from app.constants import UserRole, GlobalConfigKey
@@ -447,3 +447,31 @@ async def get_all_demo_requests(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while retrieving the demo requests."
         )
+        
+@router.get("/ops-health", response_model=OpsHealthReportOut, summary="Treasury Operational Health Report")
+def get_treasury_ops_health(
+    db: Session = Depends(get_db),
+    user_context: Dict[str, Any] = Depends(get_current_report_user_context),
+    start_date: Optional[date] = Query(None, description="Start date for flow metrics (default: 30 days ago)"),
+    end_date: Optional[date] = Query(None, description="End date for flow metrics (default: today)"),
+    request: Request = None
+):
+    """
+    **Treasury Health Engine**
+    Returns a holistic view of Volume (Flow), Friction (Backlogs), and Risk (Alerts).
+    """
+    # 1. Defaults: Last 30 Days
+    if not end_date:
+        end_date = date.today()
+    if not start_date:
+        # Subtracting 30 days from end_date for default range
+        start_date = end_date - timedelta(days=30)
+        
+    # 2. Logging
+    client_ip = get_client_ip(request)
+    # Using a helper to log who accessed the report
+    _log_report_access(db, user_context, "Treasury Ops Health", client_ip, filters={"start": start_date, "end": end_date})
+
+    # 3. Execute CRUD
+    # This calls the method we updated in step 1
+    return crud_reports.get_ops_health_report(db, user_context, start_date, end_date)

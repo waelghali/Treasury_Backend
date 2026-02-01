@@ -1188,8 +1188,6 @@ class LGRecordChangeOwner(BaseModel):
         
         return self
 
-print("schemas.py has been loaded and InternalOwnerContactUpdateDetails should be defined.")
-
 class LGInstructionRecordDelivery(BaseModel):
     delivery_date: date = Field(..., description="The date the instruction was physically delivered to the bank.")
     delivery_document_file: Optional[LGDocumentCreate] = Field(None, description="Optional metadata for the document proving delivery.")
@@ -1529,3 +1527,74 @@ LGRecordMinimalOut.model_rebuild()
 ApprovalRequestOut.model_rebuild()
 LGRecordOut.model_rebuild()
 LGInstructionOut.model_rebuild()
+
+
+# =====================================================================================
+# NEW: TREASURY OPS HEALTH REPORT SCHEMAS
+# =====================================================================================
+
+class OpsHealthFlowOut(BaseModel):
+    new_issuances_count: int
+    extensions_delivered_count: int
+    amendments_count: int
+    reductions_count: int   
+    releases_count: int     
+    activations_count: int
+    liquidations_count: int
+    reminders_count: int    # <--- ADD THIS LINE
+    net_activity_score: int 
+    total_activity_count: int
+
+class OpsHealthPipelineOut(BaseModel):
+    internal_backlog_count: int = Field(..., description="Instructions created but not yet sent to bank")
+    bank_backlog_count: int = Field(..., description="Instructions at the bank waiting for reply")
+    
+    internal_backlog_total: int = Field(0, description="Total backlog of internal instructions")
+    bank_backlog_total: int = Field(0, description="Total backlog of bank instructions")
+    
+    completed_recently_count: int = Field(..., description="Instructions completed in this period")
+
+class RiskAlertItem(BaseModel):
+    id: int
+    reference_number: str
+    date_trigger: date
+    days_remaining: int
+    details: Optional[str] = None
+
+class OpsHealthRiskOut(BaseModel):
+    # Critical: Expiry <= 7 days
+    expiry_critical_list: List[RiskAlertItem]
+    # Warning: Expiry <= 30 days
+    expiry_warning_count: int
+    # Stalled: Internal team hasn't sent instruction > 3 days
+    stalled_internal_list: List[RiskAlertItem]
+    # Ghosting: Bank hasn't replied > 10 days
+    bank_ghosting_list: List[RiskAlertItem]
+
+class OpsHealthEfficiencyOut(BaseModel):
+    # Current Period (Speedometer)
+    avg_internal_days: float = Field(0.0, description="Avg time to draft & deliver (selected period)")
+    avg_bank_days: float = Field(0.0, description="Avg time for bank to reply (selected period)")
+    avg_approval_days: float = Field(0.0, description="Avg time for internal approval/checker (selected period)")
+    
+    # Lifetime Comparison (Trend/Indicator)
+    lifetime_internal_days: float = Field(0.0, description="Historical avg for internal processing")
+    lifetime_bank_days: float = Field(0.0, description="Historical avg for bank processing")
+    lifetime_approval_days: float = Field(0.0, description="Historical avg for internal approval")
+    
+    # Trend Score
+    internal_change_pct: float = Field(0.0, description="Percentage change vs lifetime average")
+
+    class Config:
+        from_attributes = True
+
+class OpsHealthReportOut(BaseModel):
+    report_date: date
+    period_start: date
+    period_end: date
+    flow: OpsHealthFlowOut
+    history: List[dict]
+    status_distribution: Dict[str, int]
+    pipeline: OpsHealthPipelineOut
+    risks: OpsHealthRiskOut
+    efficiency: OpsHealthEfficiencyOut

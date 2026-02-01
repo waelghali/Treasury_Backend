@@ -42,6 +42,9 @@ from app.constants import (
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
 )
 
+import pytz
+EEST_TIMEZONE = pytz.timezone('Africa/Cairo')
+
 # Configuration
 logger = logging.getLogger(__name__)
 
@@ -293,8 +296,6 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
 
 async def run_daily_print_reminders(db: Session):
     logger.info("Running daily print reminders and escalation task...")
-    import pytz
-    EEST_TIMEZONE = pytz.timezone('Africa/Cairo')
     TYPES_TO_PRINT = [
         ACTION_TYPE_LG_RELEASE, ACTION_TYPE_LG_LIQUIDATE,
         ACTION_TYPE_LG_DECREASE_AMOUNT, ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE
@@ -437,23 +438,21 @@ async def run_daily_renewal_reminders(db: Session):
     """
     logger.info("Starting renewal reminders.")
     
-    customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
-    for customer in customers:
-        # Feature 1: Reminders to Users/Admins
-        try:
-            await crud_lg_record.run_renewal_reminders_to_users_and_admins(db)
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Error Feature 1 reminders (Cust {customer.id}): {e}", exc_info=True)
+    # Feature 1: Reminders to Users/Admins
+    try:
+        await crud_lg_record.run_renewal_reminders_to_users_and_admins(db)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error Feature 1 reminders (Cust {customer.id}): {e}", exc_info=True)
 
-        # Feature 2: Reminders to Internal Owners
-        try:
-            await crud_lg_record.run_internal_owner_renewal_reminders(db)
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Error Feature 2 reminders (Cust {customer.id}): {e}", exc_info=True)
+    # Feature 2: Reminders to Internal Owners
+    try:
+        await crud_lg_record.run_internal_owner_renewal_reminders(db)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error Feature 2 reminders (Cust {customer.id}): {e}", exc_info=True)
 
     logger.info("Renewal reminders completed.")
 

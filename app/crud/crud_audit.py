@@ -44,7 +44,8 @@ class CRUDAuditLog(CRUDBase):
         # MODIFIED: Add eager loading for user and lg_record relationships.
         query = db.query(self.model).options(
             selectinload(self.model.user),
-            selectinload(self.model.lg_record)
+            selectinload(self.model.lg_record),
+            selectinload(self.model.customer)
         )
         if user_id:
             query = query.filter(self.model.user_id == user_id)
