@@ -130,7 +130,14 @@ class CRUDLGRecord(CRUDBase):
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"LG with number '{obj_in.lg_number}' already exists.",
             )
-
+        # --- STEP 1: Get the bucket name using the Enum key ---
+        customer_bucket_name = None
+        bucket_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+            db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+        )
+        if bucket_config and bucket_config.get('effective_value'):
+            customer_bucket_name = bucket_config['effective_value']
+        # -----------------------------------------------------
         internal_owner_contact_data = InternalOwnerContactCreate(
             email=obj_in.internal_owner_email,
             phone_number=obj_in.internal_owner_phone,
@@ -337,11 +344,11 @@ class CRUDLGRecord(CRUDBase):
                 obj_in.ai_scan_file.document_type = DOCUMENT_TYPE_ORIGINAL_LG # Use the new constant
                 db_original_lg_document = await self.crud_lg_document_instance.create_document(
                     db,
-                    obj_in=obj_in.ai_scan_file, # Contains metadata (name, mime_type)
-                    file_content=ai_scan_file_content, # The actual bytes from the UploadFile
+                    obj_in=obj_in.ai_scan_file,
+                    file_content=ai_scan_file_content,
                     lg_record_id=db_lg_record.id,
                     uploaded_by_user_id=user_id,
-                    # No original_instruction_serial here, as this is the primary LG doc
+                    bucket_name=customer_bucket_name  # <--- ADD THIS
                 )
                 logger.info(f"Original LG Document saved: {db_original_lg_document.file_path}")
             except Exception as e:
@@ -364,6 +371,7 @@ class CRUDLGRecord(CRUDBase):
                     file_content=internal_supporting_document_file_content, # The actual bytes
                     lg_record_id=db_lg_record.id,
                     uploaded_by_user_id=user_id,
+                    bucket_name=customer_bucket_name
                     # No original_instruction_serial here
                 )
                 logger.info(f"Internal Supporting Document saved: {db_internal_supporting_document.file_path}")

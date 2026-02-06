@@ -131,9 +131,24 @@ class CRUDLGDocument(CRUDBase):
         doc_type_slug = _slugify_doc_type(obj_in.document_type)
         blob_path = f"customer_{customer_id}/lg_{lg_record_id}/{doc_type_slug}/{unique_filename}"
 
-        if not GCS_BUCKET_NAME:
-            logger.error("GCS_BUCKET_NAME is not set in environment. Cannot upload document.")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server configuration error: GCS bucket not set for document storage.")
+        # --- CENTRALIZED BUCKET LOOKUP ---
+        # If no bucket_name was passed, try to find the customer-specific one
+        if not bucket_name or bucket_name == GCS_BUCKET_NAME:
+            bucket_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                db, customer_id, models.GlobalConfigKey.STORAGE_BUCKET_NAME
+            )
+            if bucket_config and bucket_config.get('effective_value'):
+                bucket_name = bucket_config['effective_value']
+            else:
+                bucket_name = GCS_BUCKET_NAME # Fallback to .env default
+
+        if not bucket_name:
+            logger.error(f"No storage bucket found for customer {customer_id} and GCS_BUCKET_NAME is not set.")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                detail="Server configuration error: No storage bucket identified."
+            )
+        # ---------------------------------
             
         try:
             # 4. Upload to GCS using the new hierarchical blob path

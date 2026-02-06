@@ -18,7 +18,7 @@ from app.core.security import get_client_ip
 from app.schemas.all_schemas import (
     LoginRequest, ChangePasswordRequest, ForgotPasswordRequest,
     ResetPasswordRequest, UserAccountOut, AdminUserUpdate, Token,
-    UserLegalAcceptanceRequest
+    UserLegalAcceptanceRequest, VerifyMFARequest
 )
 from app.auth_v2.services import auth_service # Import the instantiated service
 
@@ -29,31 +29,39 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-@router.post("/login", response_model=Token, status_code=status.HTTP_200_OK)
+# app/auth_v2/routers.py
+
+@router.post("/login",  status_code=status.HTTP_200_OK)
 async def login_for_access_token(
     request: Request,
-    form_data: OAuth2PasswordRequestForm = Depends(),
+    login_data: LoginRequest, # Change from OAuth2PasswordRequestForm to LoginRequest
     db: Session = Depends(get_db)
 ):
     """
-    Authenticate user and return JWT token.
-    Redirects to change-password if must_change_password = True.
+    Authenticate user and return JWT or MFA requirement.
     """
     try:
-        # Pass the resolved client IP to the service layer
+        # Pass the fields from login_data to the service
         auth_response = await auth_service.authenticate_user(
-            db, form_data.username, form_data.password, get_client_ip(request)
+            db=db,
+            email=login_data.email,
+            password=login_data.password,
+            request_ip=get_client_ip(request),
+            device_id=login_data.device_id,  # This fixes the missing argument error
+            remember_me=login_data.remember_me
         )
 
-        # NEW LOGIC: Check for both must_change_password and must_accept_policies
-        # and include them in the response. The frontend decides the flow.
-        return Token(
-            access_token=auth_response["access_token"],
-            token_type=auth_response["token_type"],
-            must_accept_policies=auth_response.get("must_accept_policies", False)
-        )
-    except HTTPException as e:
-        raise e
+        if not auth_response:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+        return auth_response
+
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.error(f"Login failed: {e}", exc_info=True)
         raise HTTPException(
@@ -282,3 +290,99 @@ async def accept_policies(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while accepting policies."
         )
+
+
+@router.post("/refresh-token", response_model=Token)
+async def refresh_token(
+    current_user: security.TokenData = Depends(security.get_current_active_user)
+):
+    """
+    Generates a new JWT for an already authenticated user to extend their session.
+    """
+    # Map the current TokenData back to a dictionary for encoding
+    new_data = {
+        "sub": current_user.email,
+        "user_id": current_user.user_id,
+        "role": current_user.role.value,
+        "customer_id": current_user.customer_id,
+        "subscription_status": current_user.subscription_status.value if current_user.subscription_status else None,
+        "has_all_entity_access": current_user.has_all_entity_access,
+        "entity_ids": current_user.entity_ids,
+        "must_change_password": current_user.must_change_password,
+        "must_accept_policies": current_user.must_accept_policies,
+        "last_accepted_legal_version": current_user.last_accepted_legal_version
+    }
+    
+    # create_fresh_access_token is the alias for create_access_token
+    new_token = create_fresh_access_token(data=new_data)
+    
+    return Token(
+        access_token=new_token,
+        token_type="bearer",
+        must_accept_policies=current_user.must_accept_policies
+    )
+
+@router.post("/verify-mfa", response_model=Token)
+async def verify_mfa(
+    request: Request,
+    verify_data: VerifyMFARequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Verifies the 6-digit email code. If valid, trusts the device 
+    and returns a full access token.
+    """
+    # 1. Decode the session token to ensure it's a valid MFA attempt
+    
+    try:
+        payload = security.jwt.decode(
+            verify_data.mfa_session_token, 
+            security.SECRET_KEY, 
+            algorithms=[security.ALGORITHM]
+        )
+        if payload.get("is_mfa_verified") is not True: 
+            # Note: We set this to False in Phase 2 for MFA tokens
+            pass 
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid MFA session.")
+
+    # 2. Call the service to validate the code and trust the device
+    user_data = await auth_service.verify_mfa_code(
+        db, 
+        email=verify_data.email, 
+        code=verify_data.mfa_code,
+        device_id=verify_data.device_id,
+        request_ip=get_client_ip(request),
+        remember_me=verify_data.remember_me
+    )
+
+    if not user_data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+
+    return user_data
+
+@router.post("/resend-mfa")
+async def resend_mfa_code(
+    request: Request,
+    verify_data: VerifyMFARequest,
+    db: Session = Depends(get_db)
+):
+    """Generates and sends a new MFA code for an active session."""
+    # SURGICAL FIX: Ensure User is imported
+    from app.models import User 
+
+    # 1. Validate the session token
+    try:
+        security.jwt.decode(verify_data.mfa_session_token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+
+    # 2. Fetch the user 
+    user = db.query(User).filter(User.email == verify_data.email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    # 3. Trigger new flow
+    await auth_service.trigger_mfa_flow(db, user)
+    
+    return {"message": "A new verification code has been sent to your email."}

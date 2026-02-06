@@ -17,7 +17,7 @@ from app.crud.crud import crud_user, crud_role_permission
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 20))
 TRUST_X_FORWARDED = os.getenv("TRUST_X_FORWARDED", "false").lower() == "true"
 
 if SECRET_KEY is None:
@@ -40,7 +40,7 @@ class TokenData(BaseModel):
     subscription_status: Optional[SubscriptionStatus] = Field(None, description="Current subscription status of the customer.")
     must_accept_policies: Optional[bool] = Field(False, description="True if user needs to accept legal policies.")
     last_accepted_legal_version: Optional[float] = Field(None, description="Version of legal artifacts last accepted.")
-
+    is_mfa_verified: bool = Field(True, description="False if the user still needs to enter an email code.")
 
 # --- Core Functions ---
 
@@ -56,21 +56,27 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def get_client_ip(request: Request) -> Optional[str]:
-    """
-    Safely retrieves the client's real IP address, handling proxies if configured.
-    Returns the X-Forwarded-For IP if TRUST_X_FORWARDED is True, otherwise the direct host IP.
-    """
-    if TRUST_X_FORWARDED:
-        x_forwarded_for = request.headers.get("x-forwarded-for")
-        if x_forwarded_for:
-            # The left-most IP is the original client
-            return x_forwarded_for.split(',')[0].strip()
-            
-    return request.client.host
 
+def get_client_ip(request: Request) -> str:
+    # 1. Check for X-Forwarded-For (standard for Render/Vercel)
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        # Grab the first IP in the chain (the actual user)
+        return x_forwarded_for.split(',')[0].strip()
+    
+    # 2. Check for X-Real-IP (used by some proxies)
+    x_real_ip = request.headers.get("x-real-ip")
+    if x_real_ip:
+        return x_real_ip
+
+    # 3. Fallback to the direct connection host
+    if request.client and request.client.host:
+        return request.client.host
+        
+    return "IP_NOT_FOUND"
 
 # --- Dependencies ---
+
 
 async def get_current_user(
     request: Request,
@@ -209,6 +215,15 @@ async def get_current_corporate_admin_context(current_user: TokenData = Depends(
         )
     return current_user
 
+
+async def get_verified_user(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+    """Ensures user has completed MFA if required."""
+    if not current_user.is_mfa_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MFA_REQUIRED: Please verify your device via the code sent to your email."
+        )
+    return current_user
 
 class HasPermission:
     """Dependency to check for specific permissions."""

@@ -1,6 +1,8 @@
 # app/auth_v2/services.py
 import uuid
 import logging
+import secrets
+import string
 import os # Added for os.getenv
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
@@ -143,17 +145,23 @@ class AuthService:
                 detail="Password must contain at least one digit."
             )
 
+    async def authenticate_user(
+        self, db: Session, email: str, password: str, request_ip: str, device_id: str, remember_me: bool
+    ) -> Dict[str, Any]:
+        from app.crud.crud import crud_user, crud_role_permission  # Late import
+        from sqlalchemy.orm import selectinload
+        from sqlalchemy import func
 
-    async def authenticate_user(self, db: Session, email: str, password: str, request_ip: Optional[str]) -> Dict[str, Any]:
-        """
-        Authenticates a user and generates a JWT token.
-        Returns the token and a flag indicating if password change is required.
-        """
-        from app.crud.crud import crud_user  # Late import
+        # 1. Fetch the user with necessary relations
+        user = db.query(User).options(
+            selectinload(User.customer),
+            selectinload(User.entity_associations)
+        ).filter(
+            func.lower(User.email) == email.lower(), 
+            User.is_deleted == False
+        ).first()
 
-        user = db.query(User).options(selectinload(User.customer)).filter(func.lower(User.email) == email.lower(), User.is_deleted == False).first()
-
-        # Check for user existence first
+        # 2. Check for user existence first
         if not user:
             log_action(
                 db,
@@ -164,14 +172,13 @@ class AuthService:
                 details={"email": email, "reason": "User not found or inactive"},
                 ip_address=request_ip,
             )
-            print("DEBUG: User not found or inactive, returning authentication error.") # 🕵️‍♀️ DEBUG POINT
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password."
             )
 
+        # 3. Check for account lockout
         current_time = datetime.now(timezone.utc)
-
         if user.locked_until and user.locked_until > current_time:
             time_remaining = user.locked_until - current_time
             minutes, seconds = divmod(time_remaining.total_seconds(), 60)
@@ -187,12 +194,12 @@ class AuthService:
                 ip_address=request_ip,
                 customer_id=user.customer_id,
             )
-            print(f"DEBUG: Account for user {user.email} is locked. Locked until: {user.locked_until}. Time remaining: {formatted_time}.") # 🕵️‍♀️ DEBUG POINT
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Account is locked. Please try again after {formatted_time}."
             )
 
+        # 4. Verify password
         if not verify_password(password, user.password_hash):
             user.failed_login_attempts += 1
             login_policy = await self._get_login_policy_config(db)
@@ -209,8 +216,6 @@ class AuthService:
 
             db.add(user)
             db.commit()
-            db.refresh(user)
-            print(f"DEBUG: Failed login attempt for user {user.email}. Attempts: {user.failed_login_attempts}. Max: {max_attempts}.") # 🕵️‍♀️ DEBUG POINT
 
             log_action(
                 db,
@@ -237,37 +242,69 @@ class AuthService:
                     detail="Incorrect email or password."
                 )
 
+        # 5. Success: Reset failed attempts
         user.failed_login_attempts = 0
         user.locked_until = None
         db.add(user)
         db.commit()
-        db.refresh(user)
 
-        from app.crud.crud import crud_role_permission
+        # --- START OF MFA / TRUSTED DEVICE LOGIC ---
+        
+        device_record = db.query(models.UserDevice).filter(
+            models.UserDevice.user_id == user.id,
+            models.UserDevice.device_id == device_id
+        ).first()
+
+        is_trusted = device_record.is_trusted if device_record else False
+
+        if not is_trusted:
+            has_any_devices = db.query(models.UserDevice).filter(
+                models.UserDevice.user_id == user.id
+            ).first()
+
+            if not has_any_devices:
+                # GRANDFATHERING: Auto-trust first device ever seen
+                new_device = models.UserDevice(
+                    user_id=user.id,
+                    device_id=device_id,
+                    device_name="Initial Migration Device",
+                    is_trusted=True,
+                    last_ip=request_ip
+                )
+                db.add(new_device)
+                db.commit()
+                is_trusted = True
+
+        if not is_trusted:
+            # Trigger MFA and return immediately; policy check happens AFTER verify-mfa
+            await self.trigger_mfa_flow(db, user)
+            return {
+                "status": "MFA_REQUIRED",
+                "mfa_session_token": create_access_token(
+                    data={
+                        "sub": user.email, 
+                        "user_id": user.id, 
+                        "is_mfa_verified": False,
+                        "role": user.role.value
+                    },
+                    expires_delta=timedelta(minutes=15)
+                )
+            }
+        
+        # --- PROCEED TO FULL LOGIN (Always runs for trusted devices) ---
+
         db_permissions = crud_role_permission.get_permissions_for_role(db, user.role.value)
         permission_names = [p.name for p in db_permissions]
 
-        customer_name = None
-        if user.customer_id and user.customer:
-            customer_name = user.customer.name
+        customer_name = user.customer.name if (user.customer_id and user.customer) else None
 
         must_accept_policies = False
         if user.role != UserRole.SYSTEM_OWNER:
             latest_versions = await self._get_legal_artifact_versions(db)
-            latest_tc_version = latest_versions.get("tc_version", 0.0)
-            latest_pp_version = latest_versions.get("pp_version", 0.0)
+            latest_system_version = max(latest_versions.get("tc_version", 0.0), latest_versions.get("pp_version", 0.0))
             
-            # 🐛 FIX: Compare against the latest available version
-            latest_system_version = max(latest_tc_version, latest_pp_version)
-            
-            print(f"DEBUG: User {user.email} last accepted version: {user.last_accepted_legal_version}. Latest system version: {latest_system_version}") # 🕵️‍♀️ DEBUG POINT
-
-            # 🐛 FIX: Correct the comparison logic to check if the last accepted version is less than the latest system version.
             if user.last_accepted_legal_version is None or user.last_accepted_legal_version < latest_system_version:
                 must_accept_policies = True
-                print("DEBUG: must_accept_policies set to True. User needs to accept policies.") # 🕵️‍♀️ DEBUG POINT
-            else:
-                print("DEBUG: User's accepted version is up to date. No need to accept policies.") # 🕵️‍♀️ DEBUG POINT
 
         token_data = {
             "sub": user.email,
@@ -301,7 +338,6 @@ class AuthService:
             "token_type": "bearer",
             "must_accept_policies": must_accept_policies
         }
-
     
     async def change_password(
         self, db: Session, user: TokenData, request_body: ChangePasswordRequest, request_ip: Optional[str],
@@ -869,6 +905,135 @@ class AuthService:
         )
 
         return {"message": "Legal policies accepted successfully."}
+    
+    def generate_mfa_code(self) -> str:
+        """Generates a secure 6-digit numeric code."""
+        return ''.join(secrets.choice(string.digits) for _ in range(6))
 
+    async def trigger_mfa_flow(self, db: Session, user: models.User):
+        """Generates, hashes, and saves a code, then sends the email."""
+        raw_code = self.generate_mfa_code()
+        
+        # Reuse your existing hashing utility
+        user.mfa_code_hashed = get_password_hash(raw_code)
+        user.mfa_code_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+        user.mfa_attempts = 0
+        
+        db.add(user)
+        db.commit()
 
+        # Get the necessary email settings from your service
+        from app.core.email_service import get_customer_email_settings, send_email
+        email_settings, _ = get_customer_email_settings(db, user.customer_id)
+
+        # Send the email using your existing email_service parameters
+        await send_email(
+            db=db,
+            to_emails=[user.email],
+            subject_template="Your Verification Code",
+            sender_name="Grow BD Security",
+            body_template=f"Your security code is: <b>{raw_code}</b>. It expires in 10 minutes.",
+            template_data={},
+            email_settings=email_settings
+        )
+        
+        # Optional: Print to console so you can test even if SMTP is not configured
+        print(f"DEBUG: MFA Code for {user.email} is {raw_code}")
+
+    def is_device_trusted(self, db: Session, user_id: int, device_id: str) -> bool:
+        """Checks if the device_id is already marked as trusted for this user."""
+        device = db.query(models.UserDevice).filter(
+            models.UserDevice.user_id == user_id,
+            models.UserDevice.device_id == device_id,
+            models.UserDevice.is_trusted == True
+        ).first()
+        return device is not None
+
+    async def verify_mfa_code(
+        self, db: Session, email: str, code: str, device_id: str, request_ip: str, remember_me: bool
+    ) -> Optional[Dict[str, Any]]:
+        user = db.query(User).filter(User.email == email).first()
+        if not user or not user.mfa_code_hashed:
+            return None
+
+        # Check expiration and attempts
+        if datetime.now(timezone.utc) > user.mfa_code_expires_at:
+            return None
+
+        if user.mfa_attempts >= 5:
+            user.mfa_code_hashed = None
+            user.mfa_attempts = 0
+            db.commit()
+            raise HTTPException(
+                status_code=400, 
+                detail="Too many failed attempts. Please log in again to receive a new code."
+            )
+
+        if not verify_password(code, user.mfa_code_hashed):
+            user.mfa_attempts += 1
+            db.commit()
+            remaining = 5 - user.mfa_attempts
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid code. {remaining} attempts remaining."
+            )
+
+        # Success: Only trust device if 'remember_me' was checked
+        device = db.query(models.UserDevice).filter(
+            models.UserDevice.user_id == user.id,
+            models.UserDevice.device_id == device_id
+        ).first()
+
+        if not device:
+            device = models.UserDevice(
+                user_id=user.id, 
+                device_id=device_id, 
+                is_trusted=remember_me, # SURGICAL FIX
+                last_ip=request_ip,
+                device_name="Web Browser"
+            )
+            db.add(device)
+        else:
+            device.is_trusted = remember_me # SURGICAL FIX
+            device.last_ip = request_ip
+
+        # Clear MFA data for next time
+        user.mfa_code_hashed = None
+        user.mfa_attempts = 0
+        db.commit()
+
+        # Generate the final full access token (Ensure this matches the token logic in authenticate_user)
+        # This will now include the must_accept_policies flag
+        return await self.generate_auth_response(db, user, request_ip)
+    async def generate_auth_response(self, db: Session, user: User, request_ip: str) -> Dict[str, Any]:
+        """
+        Helper to generate the final JWT and handle post-login logic (like IP logging).
+        """
+        # 1. Create the access token
+        # Adjust the 'data' dictionary to match what your app currently uses in JWTs
+        access_token = create_access_token(
+            data={
+                "sub": user.email, 
+                "user_id": user.id, 
+                "role": user.role.value,
+                "customer_id": user.customer_id, # CRITICAL: This was missing!
+                "is_mfa_verified": True
+            }
+        )
+
+        # 2. Reset failed attempts
+        user.failed_login_attempts = 0
+        db.commit()
+
+        return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": user.id,
+                    "email": user.email,
+                    "role": user.role.value,
+                    "customer_id": user.customer_id,
+                    "must_change_password": user.must_change_password
+                }
+            }
 auth_service = AuthService()

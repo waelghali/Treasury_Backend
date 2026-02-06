@@ -151,6 +151,10 @@ class User(BaseModel):
     def __repr__(self: User):
         return f"<User(id={self.id}, email='{self.email}', role='{self.role}')>"
 
+    mfa_code_hashed = Column(String, nullable=True)       # The hashed 6-digit code
+    mfa_code_expires_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_attempts = Column(Integer, default=0)             # To prevent brute force
+
 class TrialRegistration(BaseModel): # CHANGE THIS LINE from 'Base' to 'BaseModel'
     __tablename__ = "trial_registrations"
     # id, created_at, updated_at, is_deleted, deleted_at are inherited from BaseModel
@@ -772,3 +776,17 @@ class UserLegalAcceptance(Base):
     )
 
 User.legal_acceptances = relationship("UserLegalAcceptance", back_populates="user", cascade="all, delete-orphan")
+
+class UserDevice(Base):
+    __tablename__ = "user_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    device_id = Column(String, index=True, nullable=False)  # UUID from frontend
+    device_name = Column(String, nullable=True)           # e.g., "Chrome on Windows"
+    is_trusted = Column(Boolean, default=False)          # Becomes True after MFA
+    last_login_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    last_ip = Column(String, nullable=True)               # Captured via get_client_ip
+    
+    # Optional: For extra security
+    browser_fingerprint = Column(String, nullable=True)

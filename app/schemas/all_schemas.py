@@ -85,6 +85,16 @@ class CustomerEntityOut(CustomerEntityBase, BaseSchema):
 class LoginRequest(BaseModel):
     email: EmailStr = Field(..., description="User's email address")
     password: str = Field(..., description="User's password")
+    device_id: str                      # Mandatory for device tracking
+    device_name: Optional[str] = None    # Friendly name for the device
+    remember_me: bool = False            # User choice to trust this device
+
+class VerifyMFARequest(BaseModel):
+    email: EmailStr
+    mfa_code: str
+    device_id: str
+    mfa_session_token: str
+    remember_me: bool = False  
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., description="User's current password")
