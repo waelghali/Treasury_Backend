@@ -1608,3 +1608,6 @@ class OpsHealthReportOut(BaseModel):
     pipeline: OpsHealthPipelineOut
     risks: OpsHealthRiskOut
     efficiency: OpsHealthEfficiencyOut
+
+class RenewRequest(BaseModel):
+    new_subscription_end_date: Optional[datetime] = None

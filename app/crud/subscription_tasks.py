@@ -108,6 +108,7 @@ async def _send_subscription_notification(
             )
 
     except Exception as e:
+        db.rollback()
         logger.error(f"Error sending subscription notification for customer {customer.id}: {e}", exc_info=True)
         log_action(
             db,
@@ -118,8 +119,7 @@ async def _send_subscription_notification(
             details={"reason": str(e), "notification_type": email_type.value},
             customer_id=customer.id
         )
-    finally:
-        db.rollback()
+
 
 async def run_daily_subscription_status_update(
     db: Session,

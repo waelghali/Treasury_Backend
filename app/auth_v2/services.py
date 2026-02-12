@@ -317,7 +317,9 @@ class AuthService:
             "entity_ids": [assoc.customer_entity_id for assoc in user.entity_associations] if not user.has_all_entity_access else [],
             "must_change_password": user.must_change_password,
             "must_accept_policies": must_accept_policies,
-            "last_accepted_legal_version": user.last_accepted_legal_version
+            "last_accepted_legal_version": user.last_accepted_legal_version,
+            "subscription_status": user.customer.status.value if user.customer else None,
+            "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None
         }
 
         access_token = create_access_token(data=token_data)
@@ -336,7 +338,15 @@ class AuthService:
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "must_accept_policies": must_accept_policies
+            "must_accept_policies": must_accept_policies,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "role": user.role.value,
+                "customer_id": user.customer_id,
+                "subscription_status": user.customer.status.value if user.customer else None, # Also add here
+                "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None
+            },
         }
     
     async def change_password(

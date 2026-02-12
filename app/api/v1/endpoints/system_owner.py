@@ -35,7 +35,7 @@ from app.schemas.all_schemas import (
     AuditLogOut,
     SystemNotificationCreate, SystemNotificationUpdate, SystemNotificationOut,
     LegalArtifactCreate, LegalArtifactOut, TrialRegistrationOut,UserCreateCorporateAdmin,
-    SystemNotificationAnalyticsOut
+    SystemNotificationAnalyticsOut, RenewRequest
 )
 from app.crud.crud import (
     crud_subscription_plan, crud_customer, crud_customer_entity, crud_user,
@@ -918,6 +918,7 @@ def restore_customer(
 @router.post("/customers/{customer_id}/renew", response_model=CustomerOut)
 def renew_customer_subscription(
     customer_id: int,
+    data: RenewRequest,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("customer:edit")), # Ensure this permission exists or use 'system_owner:manage_billing'
 ):
@@ -929,7 +930,8 @@ def renew_customer_subscription(
         updated_customer = crud_customer.renew_subscription(
             db, 
             customer_id=customer_id, 
-            user_id_caller=current_user.user_id
+            user_id_caller=current_user.user_id,
+            explicit_expiry=data.new_subscription_end_date
         )
         return updated_customer
     except HTTPException as e:
@@ -2405,7 +2407,7 @@ def read_templates(
     customer_id: Optional[int] = Query(None, description="Filter templates by customer ID (for customer-specific templates)"),
     is_notification_template: Optional[bool] = Query(None, description="Filter templates by whether they are for notifications (True/False)"),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 500,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("template:view"))
 ):
@@ -2421,12 +2423,6 @@ def read_templates(
     if is_notification_template is not None:
         templates_query = templates_query.filter(Template.is_notification_template == is_notification_template)
 
-    if customer_id:
-        templates_query = templates_query.filter(
-            (Template.is_global == True) | (Template.customer_id == customer_id)
-        )
-    else:
-        templates_query = templates_query.filter(Template.is_global == True)
 
     templates = templates_query.offset(skip).limit(limit).all()
 
@@ -2457,21 +2453,30 @@ def update_template(
     current_user: TokenData = Depends(HasPermission("template:edit")),
     request: Request = None
 ):
-    """Update an existing template by ID."""
     db_template = crud_template.get(db, id=template_id)
     if db_template is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found or already deleted")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
+
+    # 1. Determine the new intended state
+    target_is_global = template_in.is_global if template_in.is_global is not None else db_template.is_global
     
+    # 2. FIX: If switching to global, the customer_id MUST be None, 
+    # regardless of what is in the DB or what was sent in the request.
+    if target_is_global:
+        target_customer_id = None
+        # Also update the object being passed to CRUD to ensure it saves as None
+        template_in.customer_id = None 
+    else:
+        # If not global, use the provided ID or fall back to the existing one
+        target_customer_id = template_in.customer_id if template_in.customer_id is not None else db_template.customer_id
+
     target_name = template_in.name if template_in.name is not None else db_template.name
     target_action_type = template_in.action_type if template_in.action_type is not None else db_template.action_type
-    target_customer_id = template_in.customer_id if template_in.customer_id is not None else db_template.customer_id
-    target_is_global = template_in.is_global if template_in.is_global is not None else db_template.is_global
     target_is_notification_template = template_in.is_notification_template if template_in.is_notification_template is not None else db_template.is_notification_template
 
+    # 3. Validation Logic
     if target_is_global:
-        if target_customer_id is not None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id must be null if is_global is true.")
-        
+        # This check is now safe because we forced target_customer_id to None above
         existing_conflict = crud_template.get_by_name_and_action_type(
             db, 
             name=target_name, 
@@ -2481,7 +2486,7 @@ def update_template(
         )
     else:
         if target_customer_id is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id must be provided if is_global is false (customer-specific template).")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id must be provided if is_global is false.")
 
         existing_conflict = crud_template.get_by_name_and_action_type(
             db, 
@@ -2494,7 +2499,7 @@ def update_template(
     if existing_conflict and existing_conflict.id != template_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Template with name '{target_name}' and action type '{target_action_type}' already exists for this scope and purpose."
+            detail=f"Template with name '{target_name}' and action type '{target_action_type}' already exists for this scope."
         )
 
     updated_template = crud_template.update(db, db_obj=db_template, obj_in=template_in)
@@ -2776,7 +2781,6 @@ def read_users(
     
 # NEW ENDPOINTS FOR MANAGING LEGAL ARTIFACTS
 
-@router.post("/legal-artifacts", response_model=LegalArtifactOut, status_code=status.HTTP_201_CREATED)
 @router.post("/legal-artifacts/", response_model=LegalArtifactOut, status_code=status.HTTP_201_CREATED)
 def create_legal_artifact(
     artifact_in: LegalArtifactCreate,

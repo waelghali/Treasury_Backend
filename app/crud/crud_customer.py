@@ -251,7 +251,7 @@ class CRUDCustomer(CRUDBase):
         db.flush() # Final flush for customer and user restorations
         return db_obj
         
-    def renew_subscription(self, db: Session, customer_id: int, user_id_caller: int) -> models.Customer:
+    def renew_subscription(self, db: Session, customer_id: int, user_id_caller: int, explicit_expiry: datetime = None) -> models.Customer:
         """
         Renews the customer's subscription based on their CURRENT plan.
         Logic:
@@ -267,14 +267,18 @@ class CRUDCustomer(CRUDBase):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Customer has no valid subscription plan.")
 
         now = datetime.now()
-        
-        # Ensure we compare timezone-naive datetimes if necessary (depending on your DB setup)
         current_end_date = customer.end_date.replace(tzinfo=None) if customer.end_date else now
-
-        # LOGIC: New End Date = Max(Today, Current End) + Duration
-        reference_date = max(now, current_end_date)
-        duration_days = 30 * plan.duration_months # Approximate month as 30 days
-        new_end_date = reference_date + timedelta(days=duration_days)
+        
+        # 1. Determine New End Date
+        if explicit_expiry:
+            # Ensure the explicit date is in the future
+            if explicit_expiry.replace(tzinfo=None) <= now.replace(tzinfo=None):
+                raise HTTPException(status_code=400, detail="Explicit expiry date must be in the future.")
+            new_end_date = explicit_expiry
+        else:
+            reference_date = max(now, current_end_date)
+            duration_days = 30 * plan.duration_months # Approximate month as 30 days
+            new_end_date = reference_date + timedelta(days=duration_days)
 
         # State Change Logic
         previous_end_date = customer.end_date

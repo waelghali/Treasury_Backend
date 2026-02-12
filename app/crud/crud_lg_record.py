@@ -601,13 +601,37 @@ class CRUDLGRecord(CRUDBase):
         }
         updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
 
-        instruction_template = db.query(models.Template).filter(models.Template.action_type == "LG_EXTENSION", models.Template.is_global == True, models.Template.is_notification_template == False, models.Template.is_deleted == False).first()
+        # --- START TEMPLATE SEARCH ---
+        # 1. Try Customer-Specific
+        instruction_template = db.query(models.Template).filter(
+            models.Template.action_type == "LG_EXTENSION",
+            models.Template.customer_id == db_lg_record.customer_id,
+            models.Template.is_notification_template == False,
+            models.Template.is_deleted == False
+        ).first()
+
+        if instruction_template:
+            print(f"DEBUG: Found CUSTOMER template (ID: {instruction_template.id}) for Customer ID: {db_lg_record.customer_id}")
+        else:
+            # 2. Fallback to Global
+            print(f"DEBUG: No customer-specific template for Customer {db_lg_record.customer_id}. Checking Global...")
+            instruction_template = db.query(models.Template).filter(
+                models.Template.action_type == "LG_EXTENSION",
+                models.Template.is_global == True,
+                models.Template.is_notification_template == False,
+                models.Template.is_deleted == False
+            ).first()
+            
+            if instruction_template:
+                print(f"DEBUG: Using GLOBAL fallback template (ID: {instruction_template.id})")
 
         if not instruction_template:
+            print(f"ERROR: No template found at all for LG_EXTENSION (Customer: {db_lg_record.customer_id})")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="LG Extension Instruction template not found. Please ensure a global 'LG_EXTENSION' template (non-notification) exists."
+                detail="LG Extension Instruction template not found."
             )
+        # --- END TEMPLATE SEARCH ---
         
         customer = db.query(models.Customer).filter(models.Customer.id == db_lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
@@ -2701,7 +2725,9 @@ class CRUDLGRecord(CRUDBase):
             "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "internal_owner_email": lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "N/A",
             "is_urgent_style": "color: red; font-weight: bold;" if is_urgent else "", # For urgent styling
-            "subject_prefix": subject_prefix # Pass prefix for potential use in template subject
+            "subject_prefix": subject_prefix, # Pass prefix for potential use in template subject
+            "issuing_bank_name": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+            "lg_issuer_name": lg_record.issuer_name if lg_record.issuer_name else "N/A",
         }
         template_data["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
 
@@ -2769,244 +2795,172 @@ class CRUDLGRecord(CRUDBase):
             logger.error(f"Failed to send {reminder_type} renewal reminder email for LG {lg_record.lg_number}.")
 
     async def run_renewal_reminders_to_users_and_admins(self, db: Session):
-        """
-        Feature 1: Sends renewal reminders to End Users and Corporate Admins.
-        Checks for auto-renew and non-auto-renew LGs nearing expiry based on configurable thresholds.
-        """
-        logger.info("Starting renewal reminders to End Users & Corporate Admins background task.")
+        logger.info("--- START: Feature 1 (Users/Admins) Renewal Reminders Task ---")
+        current_date = date.today()
         current_datetime_aware = datetime.now(EEST_TIMEZONE)
 
         customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
-        if not customers:
-            logger.info("No active customers found. Skipping renewal reminders.")
-            return
-
+        
         for customer in customers:
             try:
-                # Fetch customer-specific or global configurations
-                auto_renewal_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-                    db, customer.id, GlobalConfigKey.AUTO_RENEWAL_DAYS_BEFORE_EXPIRY
-                )
-                forced_renew_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-                    db, customer.id, GlobalConfigKey.FORCED_RENEW_DAYS_BEFORE_EXPIRY
-                )
-                first_reminder_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                # 1. Fetch Absolute Thresholds from your DB table
+                first_threshold_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.RENEWAL_REMINDER_FIRST_THRESHOLD_DAYS
                 )
-                second_reminder_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                second_threshold_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.RENEWAL_REMINDER_SECOND_THRESHOLD_DAYS
                 )
 
-                auto_renewal_days = int(auto_renewal_days_config.get('effective_value', 30))
-                forced_renew_days = int(forced_renew_days_config.get('effective_value', 15))
-                first_reminder_offset_days = int(first_reminder_days_config.get('effective_value', 7)) # e.g., 7 days before auto_renewal_days
-                second_reminder_offset_days = int(second_reminder_days_config.get('effective_value', 14)) # e.g., 14 days before auto_renewal_days
+                # Convert to integers (e.g., 30 and 10)
+                first_days_limit = int(first_threshold_config.get('effective_value', 30))
+                second_days_limit = int(second_threshold_config.get('effective_value', 14))
 
-                current_date = date.today()
-
-                # Get all relevant LGs for this customer that are VALID and not deleted
-                # Eager load necessary relations for email content
+                # 2. Get all VALID LGs
                 eligible_lgs = db.query(models.LGRecord).filter(
                     models.LGRecord.customer_id == customer.id,
                     models.LGRecord.is_deleted == False,
-                    models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value, # Corrected to models.LgStatusEnum
-                    models.LGRecord.expiry_date >= current_date # Only future expiring LGs
-                ).options(
-                    selectinload(models.LGRecord.internal_owner_contact),
-                    selectinload(models.LGRecord.lg_category),
-                    selectinload(models.LGRecord.customer),
-                    selectinload(models.LGRecord.lg_currency),
-                    selectinload(models.LGRecord.lg_type),
-                    selectinload(models.LGRecord.lg_status)
+                    models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
+                    models.LGRecord.expiry_date >= current_date
                 ).all()
 
                 for lg in eligible_lgs:
-                    days_until_expiry = (lg.expiry_date.date() - current_date).days
+                    days_left = (lg.expiry_date.date() - current_date).days
+                    
+                    # --- ABSOLUTE LOGIC CHECK ---
+                    is_urgent_due = days_left <= second_days_limit  # e.g., 17 <= 10? False
+                    is_normal_due = days_left <= first_days_limit   # e.g., 17 <= 30? True
 
-                    # Determine if a first reminder is due
-                    is_first_reminder_due = False
-                    if lg.auto_renewal and (days_until_expiry <= (auto_renewal_days - first_reminder_offset_days)):
-                        is_first_reminder_due = True
-                    elif not lg.auto_renewal and (days_until_expiry <= (forced_renew_days - first_reminder_offset_days)):
-                        is_first_reminder_due = True
+                    if not is_normal_due:
+                        continue 
 
-                    # Determine if a second (escalation) reminder is due
-                    is_second_reminder_due = False
-                    if lg.auto_renewal and (days_until_expiry <= (auto_renewal_days - second_reminder_offset_days)):
-                        is_second_reminder_due = True
-                    elif not lg.auto_renewal and (days_until_expiry <= (forced_renew_days - second_reminder_offset_days)):
-                        is_second_reminder_due = True
-
-                    # Retrieve the last sent reminder timestamp from AuditLog
-                    # We need to query audit logs to avoid sending duplicate reminders within the same reminder window.
-                    # This approach assumes that a renewal reminder is logged with the lg_record_id and specific audit_action_type
-                    # and that we only need to check the most recent reminder of that type.
-                    last_first_reminder = db.query(models.AuditLog).filter(
+                    # 3. Anti-Spam Check (Audit Logs)
+                    last_first = db.query(models.AuditLog).filter(
                         models.AuditLog.lg_record_id == lg.id,
                         models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT
                     ).order_by(models.AuditLog.timestamp.desc()).first()
 
-                    last_second_reminder = db.query(models.AuditLog).filter(
+                    last_second = db.query(models.AuditLog).filter(
                         models.AuditLog.lg_record_id == lg.id,
                         models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT
                     ).order_by(models.AuditLog.timestamp.desc()).first()
 
-                    # Logic to send reminders:
-                    # Send second reminder only if it's due and a second reminder hasn't been sent,
-                    # or if the last second reminder was more than 7 days ago (to allow periodic re-reminders if needed, though usually one is enough for escalation).
-                    # For this task, we will consider it sent if recorded once.
-                    if is_second_reminder_due and (not last_second_reminder or (current_datetime_aware - last_second_reminder.timestamp).days >= 7):
-                        await self._send_renewal_reminder_email(
-                            db, lg, "second", "auto-renew" if lg.auto_renewal else "non-auto-renew",
-                            days_until_expiry, "URGENT: ", ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND,
-                            AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT, is_urgent=True
-                        )
-                    # Send first reminder only if it's due, and a second reminder is NOT due yet,
-                    # and a first reminder hasn't been sent, or if the last first reminder was more than 7 days ago.
-                    elif is_first_reminder_due and not is_second_reminder_due and \
-                         (not last_first_reminder or (current_datetime_aware - last_first_reminder.timestamp).days >= 7):
-                        await self._send_renewal_reminder_email(
-                            db, lg, "first", "auto-renew" if lg.auto_renewal else "non-auto-renew",
-                            days_until_expiry, "", ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST,
-                            AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT, is_urgent=False
-                        )
+                    # 4. Priority Sending
+                    if is_urgent_due:
+                        if not last_second or (current_datetime_aware - last_second.timestamp).days >= 7:
+                            logger.info(f" -> LG {lg.lg_number}: Sending SECOND (URGENT) reminder. {days_left} days left.")
+                            await self._send_renewal_reminder_email(db, lg, "second", "auto-renew" if lg.auto_renewal else "non-auto-renew", days_left, "URGENT: ", ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT, is_urgent=True)
+                    
+                    elif is_normal_due:
+                        if not last_first or (current_datetime_aware - last_first.timestamp).days >= 7:
+                            logger.info(f" -> LG {lg.lg_number}: Sending FIRST (NORMAL) reminder. {days_left} days left.")
+                            await self._send_renewal_reminder_email(db, lg, "first", "auto-renew" if lg.auto_renewal else "non-auto-renew", days_left, "", ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT, is_urgent=False)
 
             except Exception as e:
-                db.rollback()
-                logger.error(f"Error processing renewal reminders for customer {customer.id} ({customer.name}): {e}", exc_info=True)
-                log_action(
-                    db,
-                    user_id=None,
-                    action_type="TASK_PROCESSING_FAILED",
-                    entity_type="Customer",
-                    entity_id=customer.id,
-                    details={"reason": f"Unhandled error in renewal reminders task: {e}", "task": "Renewal Reminders to Users/Admins"},
-                    customer_id=customer.id,
-                    lg_record_id=None
-                )
-            finally:
-                db.commit() # Commit after each customer's reminders are processed
+                logger.error(f"Error in Feature 1 for customer {customer.id}: {e}", exc_info=True)
 
-        logger.info("Finished renewal reminders to End Users & Corporate Admins background task.")
-
+        logger.info("--- FINISHED: Feature 1 Task ---")
     async def run_internal_owner_renewal_reminders(self, db: Session):
         """
-        Feature 2: Sends renewal reminders to Internal Owners and related contacts for NON-AUTO-RENEW LGs.
-        Sends follow-up reminders until action is recorded.
+        Feature 2: Sends renewal reminders to Internal Owners for NON-AUTO-RENEW LGs.
+        Includes enhanced debugging logs to trace filtering logic.
         """
-        logger.info("Starting internal owner renewal reminders background task for non-auto-renew LGs.")
-        current_date_aware = datetime.now(EEST_TIMEZONE) # Use EEST_TIMEZONE or import from shared constant
+        logger.info("--- START: Internal Owner Renewal Reminders Task ---")
+        current_date_aware = datetime.now(EEST_TIMEZONE)
+        current_date_only = current_date_aware.date()
 
         customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
         if not customers:
-            logger.info("No active customers found. Skipping internal owner renewal reminders.")
+            logger.info("No active customers found. Task ending.")
             return
 
         for customer in customers:
             try:
-                auto_renew_reminder_start_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                # 1. Fetch Configurations
+                auto_renew_reminder_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.AUTO_RENEW_REMINDER_START_DAYS_BEFORE_EXPIRY
                 )
-                number_of_days_for_next_reminder_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                next_reminder_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.NUMBER_OF_DAYS_FOR_NEXT_REMINDER
                 )
 
-                initial_reminder_days_before_expiry = int(auto_renew_reminder_start_days_config.get('effective_value', 60))
-                follow_up_reminder_interval_days = int(number_of_days_for_next_reminder_config.get('effective_value', 7))
+                initial_days = int(auto_renew_reminder_config.get('effective_value', 60))
+                interval_days = int(next_reminder_config.get('effective_value', 7))
+                
+                lookahead_date = current_date_only + timedelta(days=initial_days)
 
-                current_date = datetime.now() # Use datetime for precise comparison with last_renewal_reminder_sent_at
+                logger.info(f"[Customer: {customer.name}] Config: Start reminders {initial_days} days before. Lookahead until: {lookahead_date}")
 
-                eligible_lgs = db.query(models.LGRecord).filter(
+                # 2. Query Eligible LGs
+                query = db.query(models.LGRecord).filter(
                     models.LGRecord.customer_id == customer.id,
                     models.LGRecord.is_deleted == False,
-                    models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value, # Corrected to models.LgStatusEnum
-                    models.LGRecord.auto_renewal == False, # Only non-auto-renew LGs
-                    models.LGRecord.expiry_date >= current_date.date(), # Only future expiring LGs
-                    models.LGRecord.expiry_date <= (current_date.date() + timedelta(days=initial_reminder_days_before_expiry))
-                ).options(
+                    models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
+                    models.LGRecord.auto_renewal == False, # MUST be False for Feature 2
+                    models.LGRecord.expiry_date >= current_date_only,
+                    models.LGRecord.expiry_date <= lookahead_date
+                )
+                
+                eligible_lgs = query.options(
                     selectinload(models.LGRecord.internal_owner_contact),
                     selectinload(models.LGRecord.lg_category),
                     selectinload(models.LGRecord.customer),
                     selectinload(models.LGRecord.lg_currency),
                     selectinload(models.LGRecord.lg_type),
                     selectinload(models.LGRecord.lg_status),
-                    selectinload(models.LGRecord.instructions) # Load instructions to check for relevant actions
+                    selectinload(models.LGRecord.instructions)
                 ).all()
 
-                for lg in eligible_lgs:
-                    days_until_expiry = (lg.expiry_date.date() - current_date.date()).days
+                logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} LGs in the date window.")
 
-                    # Check if a relevant action (Extend, Release, Liquidate) has been recorded since last reminder
-                    # Or, more simply, check if such an action exists at all.
-                    # For Feature 2, the reminders *stop* if these actions are recorded.
-                    relevant_actions_recorded = db.query(models.AuditLog).filter(
+                for lg in eligible_lgs:
+                    days_until_expiry = (lg.expiry_date - current_date_only).days
+                    
+                    # 3. Check for Actions (The "Stop" Button)
+                    relevant_action = db.query(models.AuditLog).filter(
                         models.AuditLog.lg_record_id == lg.id,
                         models.AuditLog.action_type.in_([
-                            ACTION_TYPE_LG_EXTEND, # Changed from AUDIT_ACTION_TYPE_LG_EXTENDED
-                            ACTION_TYPE_LG_RELEASE, # Changed from AUDIT_ACTION_TYPE_LG_RELEASED
-                            ACTION_TYPE_LG_LIQUIDATE # Covers both full/partial
+                            ACTION_TYPE_LG_EXTEND,
+                            ACTION_TYPE_LG_RELEASE,
+                            ACTION_TYPE_LG_LIQUIDATE
                         ])
                     ).order_by(models.AuditLog.timestamp.desc()).first()
 
-                    if relevant_actions_recorded:
-                        logger.info(f"LG {lg.lg_number} has recorded a relevant action ({relevant_actions_recorded.action_type}). Skipping further internal owner renewal reminders.")
-                        continue # Skip sending reminders if action has been taken
+                    if relevant_action:
+                        logger.info(f" -> LG {lg.lg_number}: SKIPPED. Action '{relevant_action.action_type}' already exists.")
+                        continue
 
-                    # Retrieve the last internal owner renewal reminder sent via ApprovalRequest.last_renewal_reminder_sent_at
-                    # or from AuditLog if ApprovalRequest isn't the right place (which it isn't for *this* reminder type based on doc).
-                    # Instead of ApprovalRequest, we query AuditLog directly for this specific reminder type.
-                    last_owner_reminder_log = db.query(models.AuditLog).filter(
+                    # 4. Check Last Sent Reminder
+                    last_reminder = db.query(models.AuditLog).filter(
                         models.AuditLog.lg_record_id == lg.id,
                         models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
                     ).order_by(models.AuditLog.timestamp.desc()).first()
 
-                    should_send_reminder = False
-                    if not last_owner_reminder_log:
-                        # Send initial reminder if within the window and no reminder sent yet
-                        if days_until_expiry <= initial_reminder_days_before_expiry:
-                            should_send_reminder = True
+                    should_send = False
+                    if not last_reminder:
+                        logger.info(f" -> LG {lg.lg_number}: Initial reminder due ({days_until_expiry} days left).")
+                        should_send = True
                     else:
-                        # Send follow-up reminder if enough days have passed since the last one
-                        if (current_date_aware - last_owner_reminder_log.timestamp).days >= follow_up_reminder_interval_days:
-                            should_send_reminder = True
+                        days_since_last = (current_date_aware - last_reminder.timestamp).days
+                        if days_since_last >= interval_days:
+                            logger.info(f" -> LG {lg.lg_number}: Follow-up due. Last sent {days_since_last} days ago.")
+                            should_send = True
                         else:
-                            logger.info(f"LG {lg.lg_number}: Internal owner reminder sent recently ({last_owner_reminder_log.timestamp.strftime('%Y-%m-%d %H:%M:%S')}). Skipping this run.")
-                            log_action( # Log that a reminder was skipped due to recent sending
-                                db, user_id=None, action_type=AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SKIPPED_RECENTLY_SENT,
-                                entity_type="LGRecord", entity_id=lg.id,
-                                details={"lg_number": lg.lg_number, "reason": "Reminder sent recently", "last_sent_at": last_owner_reminder_log.timestamp.isoformat()},
-                                customer_id=lg.customer_id, lg_record_id=lg.id
-                            )
+                            logger.info(f" -> LG {lg.lg_number}: SKIPPED. Last reminder was only {days_since_last} days ago (Interval: {interval_days}).")
 
-
-                    if should_send_reminder:
+                    if should_send:
                         await self._send_internal_owner_renewal_reminder_email(
                             db, lg, days_until_expiry,
                             ACTION_TYPE_LG_REMINDER_TO_INTERNAL_OWNER,
                             AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
                         )
-                        # Update the last_renewal_reminder_sent_at on the LGRecord itself for simpler tracking
-                        # or on the ApprovalRequest if it was tied to the LG lifecycle, which it's not directly here.
-                        # For now, just logging the audit action is enough for "sent" status.
 
             except Exception as e:
                 db.rollback()
-                logger.error(f"Error processing internal owner renewal reminders for customer {customer.id} ({customer.name}): {e}", exc_info=True)
-                log_action(
-                    db,
-                    user_id=None,
-                    action_type="TASK_PROCESSING_FAILED",
-                    entity_type="Customer",
-                    entity_id=customer.id,
-                    details={"reason": f"Unhandled error in internal owner renewal reminders task: {e}", "task": "Internal Owner Renewal Reminders"},
-                    customer_id=customer.id,
-                    lg_record_id=None
-                )
+                logger.error(f"Error processing reminders for Customer {customer.id}: {e}", exc_info=True)
             finally:
-                db.commit() # Commit after each customer's reminders are processed
+                db.commit()
 
-        logger.info("Finished internal owner renewal reminders background task.")
-
+        logger.info("--- FINISHED: Internal Owner Renewal Reminders Task ---")
     async def _send_internal_owner_renewal_reminder_email(self,
                                                            db: Session,
                                                            lg_record: models.LGRecord,
@@ -3120,7 +3074,9 @@ class CRUDLGRecord(CRUDBase):
             "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "internal_owner_email": lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "N/A",
             "manager_email": lg_record.internal_owner_contact.manager_email if lg_record.internal_owner_contact else "N/A",
-            "is_urgent_style": "" # Not urgent by default for this reminder type
+            "is_urgent_style": "", # Not urgent by default for this reminder type
+            "issuing_bank_name": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+            "lg_issuer_name": lg_record.issuer_name if lg_record.issuer_name else "N/A",
         }
         template_data["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
 
