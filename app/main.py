@@ -185,20 +185,25 @@ def configure_app_instance(fastapi_app: FastAPI):
         ]
 
         for job in jobs:
-            # If it's the CBE job, run it every hour at minute 0
+            # 1. Define the correct trigger based on job type
             if job.get("trigger_type") == "hourly":
-                trigger = CronTrigger(minute=0, timezone=EGYPT_TIMEZONE)
-            # Otherwise, keep your existing daily 2:00 AM schedule
+                # Removing 'hour' makes it run every hour
+                trigger = CronTrigger(minute=job["minute"], timezone=EGYPT_TIMEZONE)
+                schedule_desc = f"every hour at minute {job['minute']}"
             else:
+                # Daily jobs run at 2:00 AM
                 trigger = CronTrigger(hour=2, minute=job["minute"], timezone=EGYPT_TIMEZONE)
+                schedule_desc = f"daily at 02:{job['minute']:02d}"
+
+            # 2. Add the job using the 'trigger' variable we just defined
             scheduler.add_job(
                 func=job_wrapper,
-                trigger=CronTrigger(hour=2, minute=job["minute"], timezone=EGYPT_TIMEZONE),
+                trigger=trigger, # <-- Use the variable here!
                 id=job["id"],
                 name=job["name"],
                 args=[job["func"]] + job["args"]
             )
-            logger.info(f"Scheduled '{job['name']}' at 02:{job['minute']:02d} EEST.")
+            logger.info(f"Scheduled '{job['name']}' {schedule_desc} EEST.")
 
         scheduler.start()
         logger.info("APScheduler started.")
