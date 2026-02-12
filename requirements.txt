@@ -87,3 +87,4 @@ websockets==15.0.1
 zopfli==0.2.3.post1
 pandas
 openpyxl
+beautifulsoup4

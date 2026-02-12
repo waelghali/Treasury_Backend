@@ -11,6 +11,12 @@ from app.database import SessionLocal
 # Pydantic
 from pydantic import EmailStr
 
+from app.schemas.all_schemas import SystemNotificationCreate
+from app.crud.crud import crud_system_notification
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
 # Application Imports
 import app.models as models
 from app.core.email_service import (
@@ -583,3 +589,104 @@ async def run_daily_lg_status_update(db: Session):
 
     db.commit()
     logger.info(f"Updated {count} LG records to EXPIRED.")
+
+
+async def run_hourly_cbe_news_sync(db: Session):
+    """
+    This task automatically grabs news from the CBE website
+    and puts it into your system notifications.
+    """
+    logger.info("Starting CBE News Scraper...")
+    
+    url = "https://www.cbe.org.eg/ar/news-publications/news"
+    base_url = "https://www.cbe.org.eg"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+
+    try:
+        # 1. Get the news from the website
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, "html.parser")
+        news_items = soup.find_all("h3")
+
+        for item in news_items[:3]:
+            link_tag = item.find("a")
+            if not link_tag:
+                continue
+
+            title = item.get_text(strip=True)
+            link = urljoin(base_url, link_tag.get("href"))
+
+            # 2. Check if we already added this news (to avoid duplicates)
+            exists = db.query(models.SystemNotification).filter(
+                models.SystemNotification.link == link,
+                models.SystemNotification.is_deleted == False
+            ).first()
+
+            if not exists:
+                # 3. Prepare the notification settings
+                # Start is set to yesterday to ensure it shows up immediately
+                start_dt = datetime.now() - timedelta(days=1) 
+                # End is set to 1 week from now
+                end_dt = datetime.now() + timedelta(days=7)
+
+                new_notif = SystemNotificationCreate(
+                    content=title,
+                    link=link,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    is_active=True,
+                    notification_type="cbe",
+                    animation_type="fade",
+                    display_frequency="repeat-x-times",
+                    max_display_count=2,
+                    is_popup=False,
+                    popup_action_label="Acknowledge",
+                    target_customer_ids=[], # Empty means 'Show to All Customers'
+                    target_user_ids=[],     # Empty means 'Show to All Users'
+                    target_roles=[]         # Empty means 'Show to All Roles'
+                )
+
+                # 4. Save it to your database
+                crud_system_notification.create(
+                    db, 
+                    obj_in=new_notif, 
+                    user_id=1 # Using System Admin ID
+                )
+                
+                # 3. Prepare the notification settings
+                # Start is set to yesterday to ensure it shows up immediately
+                start_dt = datetime.now() - timedelta(days=1) 
+                # End is set to 1 week from now
+                end_dt = datetime.now() + timedelta(days=7)
+
+                new_notif = SystemNotificationCreate(
+                    content=title,
+                    link=link,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    is_active=True,
+                    notification_type="cbe",
+                    animation_type="fade",
+                    display_frequency="repeat-x-times",
+                    max_display_count=1,
+                    is_popup=True,
+                    popup_action_label="Acknowledge",
+                    image_url="gs://lg_custody_bucket/system_notifications/images/CBE_Logo.jpg",
+                    target_customer_ids=[], # Empty means 'Show to All Customers'
+                    target_user_ids=[],     # Empty means 'Show to All Users'
+                    target_roles=[]         # Empty means 'Show to All Roles'
+                )
+
+                # 4. Save it to your database
+                crud_system_notification.create(
+                    db, 
+                    obj_in=new_notif, 
+                    user_id=1 # Using System Admin ID
+                )
+        
+        db.commit()
+        logger.info("CBE News Sync complete.")
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to sync CBE news: {e}")

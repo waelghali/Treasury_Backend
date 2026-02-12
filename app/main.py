@@ -173,10 +173,24 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "name": "Daily LG Status Update",
                 "minute": 20,
                 "args": []
+            },
+            {
+                "func": app_background_tasks.run_hourly_cbe_news_sync,
+                "id": "cbe_news_hourly_job",
+                "name": "Hourly CBE News Sync",
+                "minute": 0,         # Run at the start of the hour
+                "trigger_type": "hourly",
+                "args": []
             }
         ]
 
         for job in jobs:
+            # If it's the CBE job, run it every hour at minute 0
+            if job.get("trigger_type") == "hourly":
+                trigger = CronTrigger(minute=0, timezone=EGYPT_TIMEZONE)
+            # Otherwise, keep your existing daily 2:00 AM schedule
+            else:
+                trigger = CronTrigger(hour=2, minute=job["minute"], timezone=EGYPT_TIMEZONE)
             scheduler.add_job(
                 func=job_wrapper,
                 trigger=CronTrigger(hour=2, minute=job["minute"], timezone=EGYPT_TIMEZONE),
