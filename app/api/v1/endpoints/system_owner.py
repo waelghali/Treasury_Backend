@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query, Body, BackgroundTasks, UploadFile, File
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import func
+from sqlalchemy import select, func
 from typing import List, Optional, Any, Dict
 
 import uuid
@@ -2444,6 +2444,18 @@ def read_template(
     if db_template.customer:
         db_template.customer_name = db_template.customer.name
     return db_template
+
+@router.get("/template-metadata")
+def get_template_metadata(db: Session = Depends(get_db)):
+    # 1. Get unique action types currently used in your DB
+    # This ensures "LG_EXTENSION", "PRINT_REMINDER", etc. show up automatically
+    distinct_actions = db.execute(select(Template.action_type).distinct()).scalars().all()
+    
+    # 2. Hardcode the types here (since these change much less often)
+    return {
+        "template_types": ["EMAIL", "LETTER", "PDF_ATTACHMENT"],
+        "action_types": sorted(list(set(distinct_actions))) 
+    }
 
 @router.put("/templates/{template_id}", response_model=TemplateOut)
 def update_template(
