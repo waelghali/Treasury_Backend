@@ -181,24 +181,36 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "minute": 0,         # Run at the start of the hour
                 "trigger_type": "hourly",
                 "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_exchange_rate_sync,
+                "id": "exchange_rate_daily_job",
+                "name": "Daily CBE Exchange Rate Sync",
+                "hours": [15, 23], # Run at 3 PM and 11 PM
+                "minute": 0,
+                "args": []
             }
         ]
 
         for job in jobs:
-            # 1. Define the correct trigger based on job type
             if job.get("trigger_type") == "hourly":
-                # Removing 'hour' makes it run every hour
                 trigger = CronTrigger(minute=job["minute"], timezone=EGYPT_TIMEZONE)
                 schedule_desc = f"every hour at minute {job['minute']}"
             else:
-                # Daily jobs run at 2:00 AM
-                trigger = CronTrigger(hour=2, minute=job["minute"], timezone=EGYPT_TIMEZONE)
-                schedule_desc = f"daily at 02:{job['minute']:02d}"
+                # NEW LOGIC: Support multiple hours
+                # If 'hours' is a list, join them (e.g., "15,23"), else use default 2
+                run_hours = job.get("hours", 2)
+                if isinstance(run_hours, list):
+                    run_hours_str = ",".join(map(str, run_hours))
+                else:
+                    run_hours_str = str(run_hours)
+                
+                trigger = CronTrigger(hour=run_hours_str, minute=job["minute"], timezone=EGYPT_TIMEZONE)
+                schedule_desc = f"daily at hours [{run_hours_str}] at minute {job['minute']}"
 
-            # 2. Add the job using the 'trigger' variable we just defined
             scheduler.add_job(
                 func=job_wrapper,
-                trigger=trigger, # <-- Use the variable here!
+                trigger=trigger,
                 id=job["id"],
                 name=job["name"],
                 args=[job["func"]] + job["args"]

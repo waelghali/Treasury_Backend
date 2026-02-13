@@ -700,3 +700,80 @@ async def run_hourly_cbe_news_sync(db: Session):
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to sync CBE news: {e}")
+
+
+async def run_daily_exchange_rate_sync(db: Session):
+    logger.info("Starting Daily CBE Exchange Rate Sync...")
+    
+    url = "https://www.cbe.org.eg/en/economic-research/statistics/cbe-exchange-rates"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    # Map CBE names to your Currency.iso_code
+    mapping = {
+        "US Dollar": "USD", "Euro": "EUR", "Pound Sterling": "GBP",
+        "Swiss Franc": "CHF", "Japanese Yen 100": "JPY", "Saudi Riyal": "SAR",
+        "Kuwaiti Dinar": "KWD", "UAE Dirham": "AED", "Chinese Yuan": "CNY",
+        "Canadian Dollar": "CAD", "Danish Krone": "DKK", "Norwegian Krone": "NOK",
+        "Swedish Krona": "SEK", "Australian Dollar": "AUD", "Bahraini Dinar": "BHD",
+        "Omani Riyal": "OMR", "Qatari Riyal": "QAR", "Jordanian Dinar": "JOD"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        table = soup.find("table")
+        if not table:
+            logger.error("CBE Exchange Rate table not found on page.")
+            return
+
+        rows = table.find_all("tr")
+        today_date = datetime.now(EEST_TIMEZONE).date()
+        sync_count = 0
+
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) >= 3:
+                cbe_name = cols[0].get_text(strip=True)
+                iso_code = mapping.get(cbe_name)
+
+                if not iso_code:
+                    continue # Skip if currency not in our mapping
+
+                try:
+                    buy = float(cols[1].get_text(strip=True))
+                    sell = float(cols[2].get_text(strip=True))
+                except ValueError:
+                    continue # Skip if rates are not numbers (headers)
+
+                # 1. Get the currency ID from your existing table
+                currency = db.query(models.Currency).filter(models.Currency.iso_code == iso_code).first()
+                if not currency:
+                    logger.warning(f"Currency {iso_code} found on CBE but not in our database. Skipping.")
+                    continue
+
+                # 2. Prevent Duplication: Check if rate already exists for today
+                existing_rate = db.query(models.CurrencyExchangeRate).filter(
+                    models.CurrencyExchangeRate.currency_id == currency.id,
+                    models.CurrencyExchangeRate.rate_date == today_date
+                ).first()
+
+                if not existing_rate:
+                    new_rate = models.CurrencyExchangeRate(
+                        currency_id=currency.id,
+                        buy_rate=buy,
+                        sell_rate=sell,
+                        rate_date=today_date
+                    )
+                    db.add(new_rate)
+                    sync_count += 1
+        
+        db.commit()
+        logger.info(f"CBE Exchange Rate Sync complete. Added {sync_count} new rates.")
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error syncing CBE exchange rates: {e}", exc_info=True)

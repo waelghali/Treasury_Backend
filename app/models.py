@@ -7,6 +7,7 @@ from sqlalchemy.sql import func
 from app.database import Base
 from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus, AdvisingStatus
 from app.schemas.migration_schemas import MigrationRecordStatusEnum, MigrationTypeEnum
+from datetime import datetime
 
 class BaseModel(Base):
     __abstract__ = True
@@ -276,6 +277,19 @@ class Currency(BaseModel):
 
     def __repr__(self: Currency):
         return f"<Currency(id={self.id}, name='{self.name}', iso_code='{self.iso_code}')>"
+
+class CurrencyExchangeRate(Base):
+    __tablename__ = "currency_exchange_rates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=False)
+    buy_rate = Column(Float, nullable=False)
+    sell_rate = Column(Float, nullable=False)
+    rate_date = Column(Date, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Optional relationship to your existing Currency model
+    currency = relationship("Currency")
 
 class LgType(BaseModel):
     __tablename__ = "lg_types"
