@@ -333,19 +333,29 @@ async def run_daily_print_reminders(db: Session):
                 selectinload(models.ApprovalRequest.checker_user),
             ).all()
 
+            # 1. This is "Aware" (has Egypt Timezone)
             current_time = datetime.now(EEST_TIMEZONE)
 
             for req in requests:
                 inst = req.related_instruction
-                # Skip if already printed or invalid data
                 if not inst or inst.is_printed or not req.maker_user:
                     continue
 
-                # Calculate Age
+                # 2. Get the date from the database
                 created_at = inst.instruction_date
+                
+                # 3. If it's a simple 'date', turn it into a 'datetime' first
+                if isinstance(created_at, date) and not isinstance(created_at, datetime):
+                    created_at = datetime.combine(created_at, datetime.min.time())
+
+                # 4. If it has no timezone (Naive), give it the Egypt Timezone (Aware)
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=EEST_TIMEZONE)
-                
+                # If it already has a timezone, move it to Egypt Timezone to be sure
+                else:
+                    created_at = created_at.astimezone(EEST_TIMEZONE)
+
+                # 5. NOW they match perfectly. Both are Datetimes, both are Egypt Time.
                 days_old = (current_time - created_at).days
                 
                 req_details = req.request_details or {}
