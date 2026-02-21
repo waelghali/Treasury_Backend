@@ -2913,13 +2913,14 @@ class CRUDLGRecord(CRUDBase):
                 logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} LGs in the date window.")
 
                 for lg in eligible_lgs:
-                    days_until_expiry = (lg.expiry_date - current_date_only).days
+                    # SAFE CONVERSION: Ensure lg.expiry_date is a date object for subtraction
+                    lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') else lg.expiry_date
+                    days_until_expiry = (lg_expiry_val - current_date_only).days
                     
                     # 3. Check for Actions (The "Stop" Button)
                     relevant_action = db.query(models.AuditLog).filter(
                         models.AuditLog.lg_record_id == lg.id,
                         models.AuditLog.action_type.in_([
-                            ACTION_TYPE_LG_EXTEND,
                             ACTION_TYPE_LG_RELEASE,
                             ACTION_TYPE_LG_LIQUIDATE
                         ])
@@ -2940,7 +2941,10 @@ class CRUDLGRecord(CRUDBase):
                         logger.info(f" -> LG {lg.lg_number}: Initial reminder due ({days_until_expiry} days left).")
                         should_send = True
                     else:
-                        days_since_last = (current_date_aware - last_reminder.timestamp).days
+                        # SAFE CONVERSION: Compare date to date to avoid timezone/offset-aware crashes
+                        last_rem_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
+                        days_since_last = (current_date_only - last_rem_date).days
+                        
                         if days_since_last >= interval_days:
                             logger.info(f" -> LG {lg.lg_number}: Follow-up due. Last sent {days_since_last} days ago.")
                             should_send = True
