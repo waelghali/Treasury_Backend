@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import exc, and_, or_
+from sqlalchemy import exc, and_, or_, func
 from app.database import SessionLocal
 # Pydantic
 from pydantic import EmailStr
@@ -46,6 +46,13 @@ from app.constants import (
     ACTION_TYPE_LG_LIQUIDATE,
     ACTION_TYPE_LG_DECREASE_AMOUNT,
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
+    # A1/A2/A3/A7 new constants
+    AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_FIRST,
+    AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_SECOND,
+    AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRED_NOTIFICATION,
+    AUDIT_ACTION_TYPE_REFERENCE_EXPIRY_REMINDER,
+    AUDIT_ACTION_TYPE_LG_REFERENCE_VALIDITY_FLAGGED,
+    AUDIT_ACTION_TYPE_FACILITY_UTILIZATION_ALERT,
 )
 
 import pytz
@@ -457,18 +464,16 @@ async def run_daily_renewal_reminders(db: Session):
     # Feature 1: Reminders to Users/Admins
     try:
         await crud_lg_record.run_renewal_reminders_to_users_and_admins(db)
-        db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"Error Feature 1 reminders (Cust {customer.id}): {e}", exc_info=True)
+        logger.error(f"Error in Feature 1 (Users/Admins) reminders: {e}", exc_info=True)
 
     # Feature 2: Reminders to Internal Owners
     try:
         await crud_lg_record.run_internal_owner_renewal_reminders(db)
-        db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"Error Feature 2 reminders (Cust {customer.id}): {e}", exc_info=True)
+        logger.error(f"Error in Feature 2 (Internal Owners) reminders: {e}", exc_info=True)
 
     logger.info("Renewal reminders completed.")
 
@@ -565,16 +570,20 @@ async def _send_sub_notification(db: Session, customer: models.Customer, type_en
 async def run_daily_lg_status_update(db: Session):
     """
     Updates LG records to 'EXPIRED' if past expiry date.
+    A2: Also sends notification when an LG expires.
     """
     logger.info("Starting LG status update to EXPIRED.")
     
     today = datetime.now(EEST_TIMEZONE).date()
     
-    # Batch query for expired LGs
+    # Batch query for expired LGs with eager-loaded relationships
     expired_lgs = db.query(models.LGRecord).filter(
         models.LGRecord.expiry_date < today,
         models.LGRecord.lg_status_id == LgStatusEnum.VALID.value,
         models.LGRecord.is_deleted == False
+    ).options(
+        selectinload(models.LGRecord.customer),
+        selectinload(models.LGRecord.lg_currency),
     ).all()
     
     if not expired_lgs:
@@ -592,6 +601,37 @@ async def run_daily_lg_status_update(db: Session):
                 {"old_status": "VALID", "new_status": "EXPIRED", "reason": "Expiry date passed"},
                 lg.customer_id, lg.id
             )
+
+            # A2: Send in-app notification for expired LG
+            try:
+                users = db.query(models.User).filter(
+                    models.User.customer_id == lg.customer_id,
+                    models.User.is_deleted == False,
+                    models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
+                ).all()
+                start_dt = datetime.now() - timedelta(days=1)
+                end_dt = datetime.now() + timedelta(days=30)
+                for user in users:
+                    notif = SystemNotificationCreate(
+                        content=f"LG {lg.lg_number} ({lg.lg_currency.iso_code if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}) has expired.",
+                        notification_type="LG_EXPIRED",
+                        link=f"/lg-records/{lg.id}",
+                        start_date=start_dt,
+                        end_date=end_dt,
+                        target_user_ids=[user.id],
+                        target_customer_ids=[lg.customer_id],
+                        display_frequency="once-per-login",
+                    )
+                    crud_system_notification.create(db, obj_in=notif, user_id=1)
+                log_action(
+                    db, None, AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRED_NOTIFICATION,
+                    "LGRecord", lg.id,
+                    {"lg_number": lg.lg_number, "notified_users": len(users)},
+                    lg.customer_id, lg.id
+                )
+            except Exception as notif_err:
+                logger.error(f"Failed to send expiry notification for LG {lg.id}: {notif_err}")
+
             count += 1
         except Exception as e:
             logger.error(f"Failed to expire LG {lg.id}: {e}")
@@ -599,6 +639,7 @@ async def run_daily_lg_status_update(db: Session):
 
     db.commit()
     logger.info(f"Updated {count} LG records to EXPIRED.")
+
 
 
 async def run_hourly_cbe_news_sync(db: Session):
@@ -777,3 +818,338 @@ async def run_daily_exchange_rate_sync(db: Session):
     except Exception as e:
         db.rollback()
         logger.error(f"Error syncing CBE exchange rates: {e}", exc_info=True)
+
+
+# ==============================================================================
+# A1: ISSUANCE LG EXPIRY REMINDERS
+# ==============================================================================
+
+async def run_daily_issuance_lg_expiry_reminders(db: Session):
+    """
+    A1: Sends 2-tier expiry reminders for Issued LGs (issuance module).
+    Mirrors the custody reminder logic from Feature 1.
+    Uses ISSUANCE_LG_EXPIRY_FIRST_REMINDER_DAYS / SECOND / INTERVAL configs.
+    """
+    from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
+    logger.info("--- START: Issuance LG Expiry Reminders ---")
+    current_date_only = date.today()
+
+    customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
+    if not customers:
+        logger.info("No active customers found.")
+        return
+
+    for customer in customers:
+        try:
+            first_cfg = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_FIRST_REMINDER_DAYS, 30)
+            second_cfg = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_SECOND_REMINDER_DAYS, 14)
+            interval_cfg = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_REMINDER_INTERVAL, 7)
+
+            logger.info(f"[Customer: {customer.name}] Issuance expiry config: 1st={first_cfg}d, 2nd={second_cfg}d, interval={interval_cfg}d")
+
+            eligible_lgs = db.query(IssuedLGRecord).filter(
+                IssuedLGRecord.customer_id == customer.id,
+                IssuedLGRecord.status == "ACTIVE",
+                IssuedLGRecord.expiry_date != None,
+                IssuedLGRecord.expiry_date >= current_date_only
+            ).options(
+                selectinload(IssuedLGRecord.customer),
+                selectinload(IssuedLGRecord.currency),
+                selectinload(IssuedLGRecord.bank),
+                selectinload(IssuedLGRecord.current_owner),
+            ).all()
+
+            logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} active issued LGs.")
+
+            start_dt = datetime.now() - timedelta(days=1)
+            end_dt = datetime.now() + timedelta(days=30)
+
+            for lg in eligible_lgs:
+                lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
+                days_left = (lg_expiry_val - current_date_only).days
+
+                is_urgent = days_left <= second_cfg
+                is_normal = days_left <= first_cfg
+
+                if not is_normal:
+                    continue
+
+                # Determine which tier and audit type
+                if is_urgent:
+                    audit_type = AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_SECOND
+                    prefix = "URGENT: "
+                else:
+                    audit_type = AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_FIRST
+                    prefix = ""
+
+                # Anti-spam check
+                last_reminder = db.query(models.AuditLog).filter(
+                    models.AuditLog.entity_id == lg.id,
+                    models.AuditLog.entity_type == "IssuedLGRecord",
+                    models.AuditLog.action_type == audit_type
+                ).order_by(models.AuditLog.timestamp.desc()).first()
+
+                should_send = False
+                if not last_reminder:
+                    should_send = True
+                else:
+                    last_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
+                    if (current_date_only - last_date).days >= interval_cfg:
+                        should_send = True
+
+                if should_send:
+                    logger.info(f" -> Issued LG {lg.lg_ref_number}: Sending {prefix or 'NORMAL '}expiry reminder. {days_left} days left.")
+                    # Create in-app notification
+                    users = db.query(models.User).filter(
+                        models.User.customer_id == customer.id,
+                        models.User.is_deleted == False,
+                        models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
+                    ).all()
+                    for user in users:
+                        notif = SystemNotificationCreate(
+                            content=f"{prefix}Issued LG {lg.lg_ref_number} ({lg.currency.iso_code if lg.currency else ''} {float(lg.current_amount):,.2f}) expires in {days_left} days.",
+                            notification_type="ISSUANCE_LG_EXPIRY",
+                            link=f"/issuance/issued-lgs/{lg.id}",
+                            start_date=start_dt,
+                            end_date=end_dt,
+                            target_user_ids=[user.id],
+                            target_customer_ids=[customer.id],
+                            display_frequency="once-per-login",
+                        )
+                        crud_system_notification.create(db, obj_in=notif, user_id=1)
+                    log_action(
+                        db, None, audit_type, "IssuedLGRecord", lg.id,
+                        {"lg_ref": lg.lg_ref_number, "days_left": days_left, "tier": "URGENT" if is_urgent else "NORMAL"},
+                        customer.id
+                    )
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error in issuance expiry reminders for customer {customer.id}: {e}", exc_info=True)
+        finally:
+            db.commit()
+
+    logger.info("--- FINISHED: Issuance LG Expiry Reminders ---")
+
+
+# ==============================================================================
+# A3: REFERENCE / CONTRACT EXPIRY CHECK
+# ==============================================================================
+
+async def run_daily_reference_expiry_check(db: Session):
+    """
+    A3: Checks if any Issued LG's expiry date exceeds its originating
+    request's reference_end_date (contract validity). If so, flags it.
+    Also sends reminder when a reference (contract) is about to expire.
+    """
+    from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
+    logger.info("--- START: Reference Expiry Check ---")
+    current_date_only = date.today()
+
+    customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
+
+    for customer in customers:
+        try:
+            reminder_days = _get_int_config(db, customer.id, GlobalConfigKey.REFERENCE_EXPIRY_REMINDER_DAYS, 30)
+
+            # Find all active issued LGs with a linked request that has a reference_end_date
+            lgs_with_ref = db.query(IssuedLGRecord).join(
+                IssuanceRequest, IssuedLGRecord.request_id == IssuanceRequest.id
+            ).filter(
+                IssuedLGRecord.customer_id == customer.id,
+                IssuedLGRecord.status == "ACTIVE",
+                IssuanceRequest.reference_end_date != None
+            ).options(
+                selectinload(IssuedLGRecord.customer),
+                selectinload(IssuedLGRecord.currency),
+            ).all()
+
+            for lg in lgs_with_ref:
+                # Get the originating request's reference_end_date
+                request = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
+                if not request or not request.reference_end_date:
+                    continue
+
+                ref_end = request.reference_end_date
+                lg_expiry = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
+
+                # Flag LGs that extend beyond reference validity
+                if lg_expiry and lg_expiry > ref_end:
+                    if lg.reference_validity_flag != "EXCEEDED":
+                        lg.reference_validity_flag = "EXCEEDED"
+                        db.add(lg)
+                        log_action(
+                            db, None, AUDIT_ACTION_TYPE_LG_REFERENCE_VALIDITY_FLAGGED,
+                            "IssuedLGRecord", lg.id,
+                            {"lg_ref": lg.lg_ref_number, "lg_expiry": str(lg_expiry),
+                             "reference_end": str(ref_end), "reference_type": request.reference_type},
+                            customer.id
+                        )
+                        logger.info(f" -> Flagged LG {lg.lg_ref_number}: expiry {lg_expiry} > reference end {ref_end}")
+                else:
+                    if lg.reference_validity_flag == "EXCEEDED":
+                        lg.reference_validity_flag = "VALID"
+                        db.add(lg)
+
+                # Reference expiry reminder
+                if ref_end >= current_date_only:
+                    days_to_ref_expiry = (ref_end - current_date_only).days
+                    if days_to_ref_expiry <= reminder_days:
+                        # Anti-spam: check if already sent today
+                        last_ref_reminder = db.query(models.AuditLog).filter(
+                            models.AuditLog.entity_id == lg.id,
+                            models.AuditLog.entity_type == "IssuedLGRecord",
+                            models.AuditLog.action_type == AUDIT_ACTION_TYPE_REFERENCE_EXPIRY_REMINDER
+                        ).order_by(models.AuditLog.timestamp.desc()).first()
+
+                        send_ref_reminder = False
+                        if not last_ref_reminder:
+                            send_ref_reminder = True
+                        else:
+                            last_date = last_ref_reminder.timestamp.date() if hasattr(last_ref_reminder.timestamp, 'date') else last_ref_reminder.timestamp
+                            if (current_date_only - last_date).days >= 7:
+                                send_ref_reminder = True
+
+                        if send_ref_reminder:
+                            start_dt = datetime.now() - timedelta(days=1)
+                            end_dt = datetime.now() + timedelta(days=14)
+                            users = db.query(models.User).filter(
+                                models.User.customer_id == customer.id,
+                                models.User.is_deleted == False,
+                                models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
+                            ).all()
+                            for user in users:
+                                notif = SystemNotificationCreate(
+                                    content=f"{request.reference_type or 'Reference'} '{request.reference_number}' expires in {days_to_ref_expiry} days. LG {lg.lg_ref_number} is linked to it.",
+                                    notification_type="REFERENCE_EXPIRY",
+                                    link=f"/issuance/issued-lgs/{lg.id}",
+                                    start_date=start_dt,
+                                    end_date=end_dt,
+                                    target_user_ids=[user.id],
+                                    target_customer_ids=[customer.id],
+                                    display_frequency="once-per-login",
+                                )
+                                crud_system_notification.create(db, obj_in=notif, user_id=1)
+                            log_action(
+                                db, None, AUDIT_ACTION_TYPE_REFERENCE_EXPIRY_REMINDER,
+                                "IssuedLGRecord", lg.id,
+                                {"lg_ref": lg.lg_ref_number, "ref_number": request.reference_number,
+                                 "days_to_ref_expiry": days_to_ref_expiry},
+                                customer.id
+                            )
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error in reference expiry check for customer {customer.id}: {e}", exc_info=True)
+        finally:
+            db.commit()
+
+    logger.info("--- FINISHED: Reference Expiry Check ---")
+
+
+# ==============================================================================
+# A7: FACILITY UTILIZATION ALERTS
+# ==============================================================================
+
+async def run_daily_facility_utilization_alerts(db: Session):
+    """
+    A7: Sends notifications when facility utilization reaches 80%, 90%, or 100%.
+    Anti-spam: only sends once per threshold crossing (tracked via AuditLog).
+    """
+    from app.models.models_issuance import IssuanceFacility, IssuanceFacilitySubLimit, IssuanceExposureEntry
+    logger.info("--- START: Facility Utilization Alerts ---")
+
+    customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
+
+    for customer in customers:
+        try:
+            # Get threshold configs (boolean toggles, all default to True)
+            alert_80 = _get_int_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_80, 1)
+            alert_90 = _get_int_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_90, 1)
+            alert_100 = _get_int_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_100, 1)
+
+            facilities = db.query(IssuanceFacility).filter(
+                IssuanceFacility.customer_id == customer.id,
+                IssuanceFacility.status == "ACTIVE",
+                IssuanceFacility.is_deleted == False
+            ).options(
+                selectinload(IssuanceFacility.sub_limits),
+                selectinload(IssuanceFacility.bank),
+                selectinload(IssuanceFacility.currency),
+            ).all()
+
+            for facility in facilities:
+                # Calculate total utilization across all sub-limits
+                total_utilized = db.query(
+                    func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)
+                ).filter(
+                    IssuanceExposureEntry.facility_id == facility.id,
+                    IssuanceExposureEntry.is_active == True
+                ).scalar()
+
+                total_limit = float(facility.total_limit_amount) if facility.total_limit_amount else 0
+                if total_limit <= 0:
+                    continue
+
+                utilization_pct = (float(total_utilized) / total_limit) * 100
+
+                # Check thresholds (highest first)
+                thresholds = []
+                if alert_100 and utilization_pct >= 100:
+                    thresholds.append(100)
+                elif alert_90 and utilization_pct >= 90:
+                    thresholds.append(90)
+                elif alert_80 and utilization_pct >= 80:
+                    thresholds.append(80)
+
+                for threshold in thresholds:
+                    # Anti-spam: check if already alerted for this threshold
+                    already_sent = db.query(models.AuditLog).filter(
+                        models.AuditLog.entity_id == facility.id,
+                        models.AuditLog.entity_type == "IssuanceFacility",
+                        models.AuditLog.action_type == AUDIT_ACTION_TYPE_FACILITY_UTILIZATION_ALERT,
+                        models.AuditLog.details["threshold"].astext == str(threshold)
+                    ).first()
+
+                    if already_sent:
+                        continue
+
+                    logger.info(f" -> Facility '{facility.facility_name}' at {utilization_pct:.1f}% — alerting at {threshold}%")
+
+                    start_dt = datetime.now() - timedelta(days=1)
+                    end_dt = datetime.now() + timedelta(days=7)
+                    users = db.query(models.User).filter(
+                        models.User.customer_id == customer.id,
+                        models.User.is_deleted == False,
+                        models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
+                    ).all()
+                    severity = "CRITICAL" if threshold == 100 else "WARNING"
+                    for user in users:
+                        notif = SystemNotificationCreate(
+                            content=f"{severity}: Facility '{facility.facility_name}' ({facility.bank.name if facility.bank else 'N/A'}) is at {utilization_pct:.1f}% utilization (threshold: {threshold}%).",
+                            notification_type="FACILITY_UTILIZATION",
+                            link=f"/facilities/{facility.id}",
+                            start_date=start_dt,
+                            end_date=end_dt,
+                            target_user_ids=[user.id],
+                            target_customer_ids=[customer.id],
+                            display_frequency="once-per-login",
+                        )
+                        crud_system_notification.create(db, obj_in=notif, user_id=1)
+
+                    log_action(
+                        db, None, AUDIT_ACTION_TYPE_FACILITY_UTILIZATION_ALERT,
+                        "IssuanceFacility", facility.id,
+                        {"facility_name": facility.facility_name, "threshold": threshold,
+                         "utilization_pct": round(utilization_pct, 2),
+                         "utilized": float(total_utilized), "limit": total_limit},
+                        customer.id
+                    )
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error in facility utilization alerts for customer {customer.id}: {e}", exc_info=True)
+        finally:
+            db.commit()
+
+    logger.info("--- FINISHED: Facility Utilization Alerts ---")

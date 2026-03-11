@@ -2691,7 +2691,7 @@ class CRUDLGRecord(CRUDBase):
             models.Template.is_notification_template == True,
             models.Template.is_deleted == False,
             (models.Template.customer_id == lg_record.customer_id) | (models.Template.is_global == True)
-        ).order_by(models.Template.is_global.desc(), models.Template.is_default.desc()).first() # Prefer customer-specific, then global, then default.
+        ).order_by(models.Template.is_global.asc(), models.Template.is_default.desc()).first()  # Prefer customer-specific (is_global=False first), then global
 
         if not notification_template:
             logger.error(f"Renewal reminder template '{template_name}' not found for customer {lg_record.customer.name} or globally. Cannot send renewal reminder for LG {lg_record.lg_number}.")
@@ -2796,44 +2796,63 @@ class CRUDLGRecord(CRUDBase):
 
     async def run_renewal_reminders_to_users_and_admins(self, db: Session):
         logger.info("--- START: Feature 1 (Users/Admins) Renewal Reminders Task ---")
-        current_date = date.today()
+        current_date_only = date.today()
         current_datetime_aware = datetime.now(EEST_TIMEZONE)
 
         customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
-        
+        if not customers:
+            logger.info("No active customers found. Task ending.")
+            return
+
         for customer in customers:
             try:
-                # 1. Fetch Absolute Thresholds from your DB table
+                # 1. Fetch Thresholds + Anti-Spam Interval from config
                 first_threshold_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.RENEWAL_REMINDER_FIRST_THRESHOLD_DAYS
                 )
                 second_threshold_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.RENEWAL_REMINDER_SECOND_THRESHOLD_DAYS
                 )
+                next_reminder_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                    db, customer.id, GlobalConfigKey.NUMBER_OF_DAYS_FOR_NEXT_REMINDER
+                )
 
-                # Convert to integers (e.g., 30 and 10)
                 first_days_limit = int(first_threshold_config.get('effective_value', 30))
                 second_days_limit = int(second_threshold_config.get('effective_value', 14))
+                interval_days = int(next_reminder_config.get('effective_value', 7))
 
-                # 2. Get all VALID LGs
+                logger.info(f"[Customer: {customer.name}] Config: 1st={first_days_limit}d, 2nd={second_days_limit}d, interval={interval_days}d")
+
+                # 2. Get all VALID LGs with eager-loaded relationships
                 eligible_lgs = db.query(models.LGRecord).filter(
                     models.LGRecord.customer_id == customer.id,
                     models.LGRecord.is_deleted == False,
                     models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
-                    models.LGRecord.expiry_date >= current_date
+                    models.LGRecord.expiry_date >= current_date_only
+                ).options(
+                    selectinload(models.LGRecord.internal_owner_contact),
+                    selectinload(models.LGRecord.customer),
+                    selectinload(models.LGRecord.lg_currency),
+                    selectinload(models.LGRecord.lg_type),
+                    selectinload(models.LGRecord.lg_status),
+                    selectinload(models.LGRecord.issuing_bank),
                 ).all()
 
+                logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} VALID LGs with future expiry.")
+
                 for lg in eligible_lgs:
-                    days_left = (lg.expiry_date.date() - current_date).days
-                    
-                    # --- ABSOLUTE LOGIC CHECK ---
-                    is_urgent_due = days_left <= second_days_limit  # e.g., 17 <= 10? False
-                    is_normal_due = days_left <= first_days_limit   # e.g., 17 <= 30? True
+                    # SAFE CONVERSION: Handle both date and datetime expiry_date columns
+                    lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
+                    days_left = (lg_expiry_val - current_date_only).days
+
+                    # --- THRESHOLD CHECK ---
+                    is_urgent_due = days_left <= second_days_limit
+                    is_normal_due = days_left <= first_days_limit
 
                     if not is_normal_due:
-                        continue 
+                        continue
 
-                    # 3. Anti-Spam Check (Audit Logs)
+                    # 3. Anti-Spam Check using configurable interval
                     last_first = db.query(models.AuditLog).filter(
                         models.AuditLog.lg_record_id == lg.id,
                         models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT
@@ -2844,19 +2863,38 @@ class CRUDLGRecord(CRUDBase):
                         models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT
                     ).order_by(models.AuditLog.timestamp.desc()).first()
 
-                    # 4. Priority Sending
+                    # 4. Priority Sending (urgent > normal) with configurable interval
                     if is_urgent_due:
-                        if not last_second or (current_datetime_aware - last_second.timestamp).days >= 7:
+                        should_send = False
+                        if not last_second:
+                            should_send = True
+                        else:
+                            last_rem_date = last_second.timestamp.date() if hasattr(last_second.timestamp, 'date') else last_second.timestamp
+                            if (current_date_only - last_rem_date).days >= interval_days:
+                                should_send = True
+
+                        if should_send:
                             logger.info(f" -> LG {lg.lg_number}: Sending SECOND (URGENT) reminder. {days_left} days left.")
                             await self._send_renewal_reminder_email(db, lg, "second", "auto-renew" if lg.auto_renewal else "non-auto-renew", days_left, "URGENT: ", ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT, is_urgent=True)
-                    
+
                     elif is_normal_due:
-                        if not last_first or (current_datetime_aware - last_first.timestamp).days >= 7:
+                        should_send = False
+                        if not last_first:
+                            should_send = True
+                        else:
+                            last_rem_date = last_first.timestamp.date() if hasattr(last_first.timestamp, 'date') else last_first.timestamp
+                            if (current_date_only - last_rem_date).days >= interval_days:
+                                should_send = True
+
+                        if should_send:
                             logger.info(f" -> LG {lg.lg_number}: Sending FIRST (NORMAL) reminder. {days_left} days left.")
                             await self._send_renewal_reminder_email(db, lg, "first", "auto-renew" if lg.auto_renewal else "non-auto-renew", days_left, "", ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT, is_urgent=False)
 
             except Exception as e:
-                logger.error(f"Error in Feature 1 for customer {customer.id}: {e}", exc_info=True)
+                db.rollback()
+                logger.error(f"Error in Feature 1 for customer {customer.id} ({customer.name}): {e}", exc_info=True)
+            finally:
+                db.commit()
 
         logger.info("--- FINISHED: Feature 1 Task ---")
     async def run_internal_owner_renewal_reminders(self, db: Session):
