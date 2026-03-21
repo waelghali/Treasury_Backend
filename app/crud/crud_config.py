@@ -260,6 +260,45 @@ class CRUDCustomerConfiguration(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Configured value '{configured_value}' is not valid for type '{global_config.unit}' of config '{global_config.key.value}'. Error: {e}",
             )
+
+        # --- Cross-Key Validations ---
+        # These ensure logically related config pairs maintain valid relationships.
+        CROSS_KEY_RULES = [
+            # (key_being_set, paired_key, operator_description, comparison_func)
+            (GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED,
+             GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_REPORT_UNDELIVERED,
+             "greater than", lambda new_val, paired_val: new_val > paired_val),
+            (GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_REPORT_UNDELIVERED,
+             GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED,
+             "less than", lambda new_val, paired_val: new_val < paired_val),
+            (GlobalConfigKey.REMINDER_TO_BANKS_MAX_DAYS_SINCE_ISSUANCE,
+             GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE,
+             "greater than", lambda new_val, paired_val: new_val > paired_val),
+            (GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE,
+             GlobalConfigKey.REMINDER_TO_BANKS_MAX_DAYS_SINCE_ISSUANCE,
+             "less than", lambda new_val, paired_val: new_val < paired_val),
+            (GlobalConfigKey.DAYS_FOR_PRINT_ESCALATION,
+             GlobalConfigKey.DAYS_FOR_FIRST_PRINT_REMINDER,
+             "greater than", lambda new_val, paired_val: new_val > paired_val),
+            (GlobalConfigKey.DAYS_FOR_FIRST_PRINT_REMINDER,
+             GlobalConfigKey.DAYS_FOR_PRINT_ESCALATION,
+             "less than", lambda new_val, paired_val: new_val < paired_val),
+        ]
+
+        for rule_key, paired_key, op_desc, check_fn in CROSS_KEY_RULES:
+            if global_config.key == rule_key:
+                try:
+                    new_numeric = float(configured_value)
+                    paired_config = self.get_customer_config_or_global_fallback(db, customer_id, paired_key)
+                    if paired_config:
+                        paired_val = float(paired_config.get('effective_value', 0))
+                        if not check_fn(new_numeric, paired_val):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"'{rule_key.value}' ({configured_value}) must be {op_desc} '{paired_key.value}' (currently {int(paired_val)}).",
+                            )
+                except (ValueError, TypeError):
+                    pass  # Non-numeric — skip cross validation
         
         customer_config = self.get_by_customer_and_global_config_id(
             db, customer_id, global_config_id

@@ -310,7 +310,9 @@ async def refresh_token(
         "entity_ids": current_user.entity_ids,
         "must_change_password": current_user.must_change_password,
         "must_accept_policies": current_user.must_accept_policies,
-        "last_accepted_legal_version": current_user.last_accepted_legal_version
+        "last_accepted_legal_version": current_user.last_accepted_legal_version,
+        "has_custody_module": current_user.has_custody_module,
+        "has_issuance_module": current_user.has_issuance_module,
     }
     
     # create_fresh_access_token is the alias for create_access_token

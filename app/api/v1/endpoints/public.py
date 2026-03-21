@@ -153,6 +153,7 @@ async def register_free_trial(
     contact_phone: str = Form(...),
     admin_email: str = Form(...),
     entities_count: str = Form(...),
+    requested_modules: str = Form("custody", description="Comma-separated list of requested modules: custody, issuance, or both"),
     commercial_register_document: UploadFile = File(...),
     accepted_terms: str = Form(...),
 ):
@@ -178,6 +179,13 @@ async def register_free_trial(
     # CORRECTED: Use the direct client host from the request object
     client_ip = request.client.host if request.client else None
     
+    # Parse and validate requested modules
+    valid_modules = {"custody", "issuance"}
+    parsed_modules = [m.strip().lower() for m in requested_modules.split(",") if m.strip()]
+    parsed_modules = [m for m in parsed_modules if m in valid_modules]
+    if not parsed_modules:
+        parsed_modules = ["custody"]  # Default fallback
+
     # Corrected section: Create an instance of the Pydantic model and pass the data
     registration_in = TrialRegistrationCreate(
         organization_name=organization_name,
@@ -186,6 +194,7 @@ async def register_free_trial(
         contact_phone=contact_phone,
         admin_email=admin_email,
         entities_count=entities_count,
+        requested_modules=parsed_modules,
         # 'file_path' is now the GCS URI
         commercial_register_document_path=file_path, 
         accepted_terms_version=tc_version,
@@ -195,16 +204,24 @@ async def register_free_trial(
 
     db_registration = crud_trial_registration.create(db, obj_in=registration_in)
 
+    # Build module-aware email text
+    module_names = []
+    if "custody" in parsed_modules:
+        module_names.append("LG Custody")
+    if "issuance" in parsed_modules:
+        module_names.append("LG Issuance")
+    modules_text = " & ".join(module_names)
+
     email_settings = get_global_email_settings()
-    subject = "LG Custody Free Trial Registration Confirmation"
+    subject = f"{modules_text} Free Trial Registration Confirmation"
     body = f"""
         <html><body>
             <p>Dear {contact_admin_name},</p>
-            <p>Thank you for registering for a free trial of the LG Custody Platform.</p>
+            <p>Thank you for registering for a free trial of our <strong>{modules_text}</strong> platform.</p>
             <p>Your registration has been submitted and will be reviewed and activated within 2 working days. We will notify you via email as soon as your account is ready.</p>
             <p>Please find a copy of our Terms & Conditions and Free Trial Disclaimer attached for your records.</p>
             <p>Best regards,</p>
-            <p>The LG Custody Team</p>
+            <p>The Grow Business Development Team</p>
         </body></html>
     """
 

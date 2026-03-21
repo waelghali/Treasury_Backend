@@ -86,6 +86,19 @@ class CRUDCustomer(CRUDBase):
             end_date=end_date,      # NEW
             status=SubscriptionStatus.ACTIVE # NEW
         )
+        # Auto-populate domains from corporate admin email
+        admin_domain = customer_in.initial_corporate_admin.email.split("@")[-1].lower()
+        # Validate domain uniqueness across all customers
+        existing = db.query(models.Customer).filter(
+            models.Customer.domains.contains([admin_domain]),
+            models.Customer.is_deleted == False
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Domain '{admin_domain}' is already associated with customer '{existing.name}'."
+            )
+        db_customer.domains = [admin_domain]
         db.add(db_customer)
         db.flush()
 
@@ -146,6 +159,24 @@ class CRUDCustomer(CRUDBase):
         return db_obj
 
     def update(self, db: Session, db_obj: models.Customer, obj_in: CustomerUpdate, user_id: Optional[int] = None) -> models.Customer:
+        # Validate domain uniqueness if domains are being updated
+        new_domains = getattr(obj_in, 'domains', None)
+        if new_domains is not None:
+            for domain in new_domains:
+                domain_lower = domain.lower()
+                existing = db.query(models.Customer).filter(
+                    models.Customer.domains.contains([domain_lower]),
+                    models.Customer.is_deleted == False,
+                    models.Customer.id != db_obj.id
+                ).first()
+                if existing:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Domain '{domain_lower}' is already associated with customer '{existing.name}'."
+                    )
+            # Normalize domains to lowercase
+            obj_in.domains = [d.lower() for d in new_domains]
+
         # Check for changes in subscription plan
         old_plan_id = db_obj.subscription_plan_id
         new_plan_id = obj_in.subscription_plan_id if obj_in.subscription_plan_id is not None else old_plan_id
@@ -172,9 +203,7 @@ class CRUDCustomer(CRUDBase):
                             continue
                         logger.warning(f"Customer {db_obj.name} downgraded to single-entity plan. Deactivating excess entity: {entity.entity_name} (ID: {entity.id})")
                         self.crud_customer_entity_instance.soft_delete(db, entity, user_id)
-                        # We must flush here to ensure log_action is committed before next entity and to ensure DB state
-                        # is updated for other operations in this loop. No db.commit() as it's part of a larger transaction.
-                        db.flush() # Ensure soft-delete action is persisted to session
+                        db.flush()
 
             # NEW LOGIC: When a plan is changed, reset the subscription start date, end date, and status.
             db_obj.start_date = datetime.now()

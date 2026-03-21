@@ -6,7 +6,7 @@ import pytz
 from datetime import datetime, timedelta
 
 # FastAPI imports
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # SQLAlchemy imports
@@ -66,10 +66,11 @@ def configure_app_instance(fastapi_app: FastAPI):
     import app.core.background_tasks as app_background_tasks
     import app.crud.subscription_tasks as subscription_tasks
     
-    # Routers
     from app.api.v1.endpoints import (
         system_owner, corporate_admin, end_user, migration, 
-        public, issuance_endpoints, public_issuance, reports
+        public, issuance_endpoints, public_issuance, reports, facility_endpoints,
+        quotations_endpoints, public_quotations, reconciliation_endpoints,
+        notification_endpoints
     )
     from app.auth_v2.routers import router as auth_v2_router
     from app.crud.crud import crud_customer, crud_customer_configuration, log_action
@@ -77,7 +78,10 @@ def configure_app_instance(fastapi_app: FastAPI):
     # --- Database Initialization ---
     try:
         # Import models to register them with Base.metadata
-        import app.models
+        import app.models.models
+        import app.models.models_quotation
+        import app.models.models_reconciliation_v2
+        import app.models.models_notification
         
         if Base.metadata.tables:
             Base.metadata.create_all(bind=engine)
@@ -102,17 +106,38 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
+    from app.core.security import require_issuance_module, require_custody_module
+    fastapi_app.include_router(issuance_endpoints.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_module)])
+    fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])
+    fastapi_app.include_router(public_issuance.router, prefix="/api/v1/public-issuance", tags=["Public Issuance Portal"])
+    fastapi_app.include_router(notification_endpoints.router, prefix="/api/v1/notifications", tags=["Notifications"])
     
+    # Feature Toggle Dependency logic
+    from app.core.security import get_current_user
+    def require_customer_one(current_user = Depends(get_current_user)):
+        if getattr(current_user, "customer_id", None) != 1:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Module is currently disabled under feature flag."
+            )
+
     fastapi_app.include_router(
-        issuance_endpoints.router, 
-        prefix="/api/v1/issuance", 
-        tags=["Issuance Module"]
+        quotations_endpoints.router, 
+        prefix="/api/v1/end-user/quotations", 
+        tags=["Quotation Module"],
+        dependencies=[Depends(require_customer_one)]
     )
-    
     fastapi_app.include_router(
-        public_issuance.router, 
-        prefix="/api/v1/public-issuance", 
-        tags=["Public Issuance Portal"]
+        public_quotations.router, 
+        prefix="/api/v1/public-quotation", 
+        tags=["Public Quotation Webhooks"]
+        # Intentionally leaving out the dependency here so bank callbacks still function in background for existing records
+    )
+    fastapi_app.include_router(
+        reconciliation_endpoints.router, 
+        prefix="/api/v1/reconciliation", 
+        tags=["Reconciliation Engine"],
+        dependencies=[Depends(require_customer_one)]
     )
 
     # --- APScheduler Setup ---
@@ -136,6 +161,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     @fastapi_app.on_event("startup")
     async def start_scheduler():
         """Define and start cron jobs."""
+        from app.crud.crud_quotation import crud_quotation
         
         # Mapping of jobs to their configuration for cleaner setup
         jobs = [
@@ -189,6 +215,63 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "hours": [15, 23], # Run at 3 PM and 11 PM
                 "minute": 0,
                 "args": []
+            },
+            {
+                "func": crud_quotation.process_quotation_timeouts,
+                "id": "quotation_timeouts_minute_job",
+                "name": "Quotation Processing (5-hourly)",
+                "hours": [0, 5, 10, 15, 20],
+                "minute": 0,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_issuance_lg_expiry_reminders,
+                "id": "issuance_lg_expiry_reminders_daily_job",
+                "name": "Daily Issuance LG Expiry Reminders",
+                "minute": 25,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_reference_expiry_check,
+                "id": "reference_expiry_check_daily_job",
+                "name": "Daily Reference Expiry Check",
+                "minute": 30,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_facility_utilization_alerts,
+                "id": "facility_utilization_alerts_daily_job",
+                "name": "Daily Facility Utilization Alerts",
+                "minute": 35,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_sla_breach_alerts,
+                "id": "sla_breach_alerts_daily_job",
+                "name": "Daily SLA Breach Alerts",
+                "minute": 40,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_maintenance_delivery_reminders,
+                "id": "maintenance_delivery_reminders_daily_job",
+                "name": "Daily Maintenance Delivery Reminders",
+                "minute": 45,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_reconciliation_reminders,
+                "id": "reconciliation_reminders_daily_job",
+                "name": "Daily Reconciliation Overdue Reminders",
+                "minute": 50,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_issuance_maintenance_reminders,
+                "id": "issuance_maintenance_reminders_daily_job",
+                "name": "Daily Issuance Maintenance Reminders",
+                "minute": 55,
+                "args": []
             }
         ]
 
@@ -196,6 +279,9 @@ def configure_app_instance(fastapi_app: FastAPI):
             if job.get("trigger_type") == "hourly":
                 trigger = CronTrigger(minute=job["minute"], timezone=EGYPT_TIMEZONE)
                 schedule_desc = f"every hour at minute {job['minute']}"
+            elif job.get("trigger_type") == "minutely":
+                trigger = CronTrigger(minute='*', timezone=EGYPT_TIMEZONE)
+                schedule_desc = "every minute"
             else:
                 # NEW LOGIC: Support multiple hours
                 # If 'hours' is a list, join them (e.g., "15,23"), else use default 2

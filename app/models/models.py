@@ -1,6 +1,6 @@
 # app/models.py
 from __future__ import annotations
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, UniqueConstraint, Enum as SQLEnum, Text, Index, Numeric, and_, CheckConstraint, Date
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, UniqueConstraint, Enum as SQLEnum, Text, Index, Numeric, and_, CheckConstraint, Date, Table
 from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -31,6 +31,8 @@ class UserCustomerEntityAssociation(Base):
     __tablename__ = 'user_customer_entity_association'
     user_id = Column(Integer, ForeignKey('users.id'), primary_key=True)
     customer_entity_id = Column(Integer, ForeignKey('customer_entities.id'), primary_key=True)
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="entity_associations")
     customer_entity = relationship("CustomerEntity", back_populates="users_with_access")
@@ -43,6 +45,12 @@ class LGCategoryCustomerEntityAssociation(Base):
     lg_category = relationship("LGCategory", back_populates="entity_associations")
     customer_entity = relationship("CustomerEntity", back_populates="lg_categories_with_access")
 
+user_approval_group_association = Table(
+    'user_approval_group_association',
+    Base.metadata,
+    Column('user_id', Integer, ForeignKey('users.id', ondelete="CASCADE"), primary_key=True),
+    Column('approval_group_id', Integer, ForeignKey('approval_groups.id', ondelete="CASCADE"), primary_key=True)
+)
 
 # --- CORE MODELS (alphabetical, with dependencies defined first) ---
 
@@ -53,12 +61,19 @@ class SubscriptionPlan(BaseModel):
     duration_months = Column(Integer, nullable=False, comment="Duration of the plan in months (e.g., 1 for monthly, 12 for annual)")
     monthly_price = Column(Float, nullable=False, comment="Monthly price of the plan")
     annual_price = Column(Float, nullable=False, comment="Annual price of the plan (should be less than monthly_price * duration_months)")
-    max_users = Column(Integer, nullable=False, comment="Maximum number of users allowed under this plan")
-    max_records = Column(Integer, nullable=False, comment="Maximum number of records (e.g., LGs) allowed under this plan")
+    max_users = Column(Integer, default=5, comment="Maximum number of active users allowed")
+    max_checker_users = Column(Integer, default=0, comment="Maximum number of users allowed with the CHECKER role specifically")
+    max_records = Column(Integer, default=50, comment="Maximum number of active CG/LG records allowed (for Custody phase)")
     can_maker_checker = Column(Boolean, default=False, nullable=False, comment="Allows maker-checker workflow")
     can_multi_entity = Column(Boolean, default=False, nullable=False, comment="Allows multiple entities under one customer")
     can_ai_integration = Column(Boolean, default=False, nullable=False, comment="Allows AI integration features")
     can_image_storage = Column(Boolean, default=False, nullable=False, comment="Allows image storage features")
+    
+    # NEW: Modular Subscription Toggles
+    has_custody_module = Column(Boolean, default=True, nullable=False, comment="Allows access to Phase 1: LG Custody module")
+    has_issuance_module = Column(Boolean, default=False, nullable=False, comment="Allows access to Phase 2: LG Issuance module")
+    max_issuance_records = Column(Integer, default=0, nullable=False, comment="Maximum number of Issued LG records allowed under this plan")
+    
     grace_period_days = Column(Integer, default=30, nullable=False, comment="Grace period in days after subscription end date")
 
     customers = relationship("Customer", back_populates="subscription_plan")
@@ -77,8 +92,10 @@ class Customer(BaseModel):
     end_date = Column(DateTime(timezone=True), nullable=False, comment="Date the current subscription period ends")
     status = Column(SQLEnum(SubscriptionStatus), default=SubscriptionStatus.ACTIVE, nullable=False, comment="Current subscription status (active, grace, expired)")
 
-    active_user_count = Column(Integer, default=0, nullable=False, comment="Current count of active (non-deleted) users for this customer")
-    active_lg_count = Column(Integer, default=0, nullable=False, comment="Current count of active LG records for this customer")
+    active_user_count = Column(Integer, default=0, nullable=False, comment="Number of currently active users under this customer")
+    active_checker_count = Column(Integer, default=0, nullable=False, comment="Number of currently active CHECKER users under this customer")
+    active_lg_count = Column(Integer, default=0, nullable=False, comment="Number of valid/active Custody CG/LG records for this customer")
+    active_issuance_lg_count = Column(Integer, default=0, nullable=False, comment="Number of valid/active Issued LG records for this customer")
 
     subscription_plan = relationship("SubscriptionPlan", back_populates="customers")
     entities = relationship("CustomerEntity", back_populates="customer", cascade="all, delete-orphan")
@@ -88,7 +105,9 @@ class Customer(BaseModel):
     customer_configurations = relationship("CustomerConfiguration", back_populates="customer", cascade="all, delete-orphan")
     customer_email_settings = relationship("CustomerEmailSetting", back_populates="customer", uselist=False, cascade="all, delete-orphan")
     templates = relationship("Template", back_populates="customer")
-
+    departments = relationship("Department", back_populates="customer", cascade="all, delete-orphan")
+    approval_groups = relationship("ApprovalGroup", back_populates="customer", cascade="all, delete-orphan")
+    domains = Column(JSONB, default=list, nullable=True, comment="List of email domains associated with this customer")
     def __repr__(self: Customer):
         return f"<Customer(id={self.id}, name='{self.name}')>"
 
@@ -106,7 +125,11 @@ class CustomerEntity(BaseModel):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
     customer = relationship("Customer", back_populates="entities")
 
-    users_with_access = relationship("UserCustomerEntityAssociation", back_populates="customer_entity")
+    users_with_access = relationship(
+        "UserCustomerEntityAssociation", 
+        primaryjoin="and_(CustomerEntity.id==UserCustomerEntityAssociation.customer_entity_id, UserCustomerEntityAssociation.is_deleted==False)",
+        back_populates="customer_entity"
+    )
     lg_categories_with_access = relationship("LGCategoryCustomerEntityAssociation", back_populates="customer_entity")
 
     __table_args__ = (
@@ -136,10 +159,22 @@ class User(BaseModel):
     # NEW FIELD: Tracks the version of the last accepted legal artifacts.
     last_accepted_legal_version = Column(Float, nullable=True, comment="The last version of the legal artifacts (T&C and PP) accepted by the user.")
     
-    entity_associations = relationship("UserCustomerEntityAssociation", back_populates="user", cascade="all, delete-orphan")
-    entities_with_access = relationship("CustomerEntity", secondary="user_customer_entity_association", viewonly=True)
+    entity_associations = relationship(
+        "UserCustomerEntityAssociation", 
+        primaryjoin="and_(User.id==UserCustomerEntityAssociation.user_id, UserCustomerEntityAssociation.is_deleted==False)",
+        back_populates="user", 
+        cascade="all, delete-orphan"
+    )
+    entities_with_access = relationship(
+        "CustomerEntity", 
+        secondary="user_customer_entity_association",
+        primaryjoin="User.id==user_customer_entity_association.c.user_id",
+        secondaryjoin="and_(user_customer_entity_association.c.customer_entity_id==CustomerEntity.id, user_customer_entity_association.c.is_deleted==False)",
+        viewonly=True
+    )
     password_reset_tokens = relationship("PasswordResetToken", back_populates="user", cascade="all, delete-orphan")
     system_notifications_created = relationship("SystemNotification", back_populates="created_by_user")
+    approval_groups = relationship("ApprovalGroup", secondary=user_approval_group_association, back_populates="users")
 
     def set_password(self, password: str):
         from app.core.hashing import get_password_hash
@@ -169,6 +204,7 @@ class TrialRegistration(BaseModel): # CHANGE THIS LINE from 'Base' to 'BaseModel
     accepted_terms_version = Column(Float, nullable=False)
     accepted_terms_at = Column(DateTime(timezone=True), server_default=func.now())
     accepted_terms_ip = Column(String, nullable=True)
+    requested_modules = Column(JSONB, nullable=False, default=["custody"], comment="List of requested modules: custody, issuance, or both")
     status = Column(String, nullable=False, default="pending", index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     
@@ -592,14 +628,14 @@ class ApprovalRequest(Base):
                                           foreign_keys=[entity_id],
                                           remote_side=[InternalOwnerContact.id],
                                           overlaps="lg_record, internal_owner_contact")
-
+    
     related_instruction = relationship(
         "LGInstruction",
         foreign_keys=[related_instruction_id],
         post_update=True,
         overlaps="approval_request"
     )
-
+    steps = relationship("ApprovalRequestStep", back_populates="approval_request", cascade="all, delete-orphan")
     def __repr__(self: ApprovalRequest):
         return f"<ApprovalRequest(id={self.id}, entity_type='{self.entity_type}', action_type='{self.action_type}', status='{self.status}')>"
 
@@ -804,3 +840,116 @@ class UserDevice(Base):
     
     # Optional: For extra security
     browser_fingerprint = Column(String, nullable=True)
+
+class ApprovalMatrix(BaseModel): # Inherits from your BaseModel
+    __tablename__ = "approval_matrices"
+    
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    entity_id = Column(Integer, ForeignKey("customer_entities.id"), nullable=True) # Your corrected FK
+    
+    module = Column(String, nullable=False, default="CUSTODY") # CUSTODY or ISSUANCE
+    action_type = Column(String, nullable=True) # Null = All actions
+    
+    name = Column(String, nullable=False)
+    priority = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    
+    # Example logic: {"amount_gt": 50000}
+    conditions_json = Column(JSON, nullable=True)
+
+    levels = relationship("ApprovalMatrixLevel", back_populates="matrix", cascade="all, delete-orphan")
+
+
+class ApprovalMatrixLevel(BaseModel):
+    __tablename__ = "approval_matrix_levels"
+    
+    matrix_id = Column(Integer, ForeignKey("approval_matrices.id"), nullable=False)
+    level_order = Column(Integer, nullable=False) # 1, 2, 3...
+    approver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    matrix = relationship("ApprovalMatrix", back_populates="levels")
+
+
+class ApprovalRequestStep(BaseModel):
+    __tablename__ = "approval_request_steps"
+    
+    approval_request_id = Column(Integer, ForeignKey("approval_requests.id"), nullable=False)
+    approver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    step_order = Column(Integer, nullable=False)
+    
+    status = Column(String, nullable=False, default="PENDING")
+    comment = Column(String, nullable=True)
+    action_date = Column(DateTime(timezone=True), nullable=True)
+
+    approval_request = relationship("ApprovalRequest", back_populates="steps")
+
+class ExternalRequestToken(BaseModel):
+    __tablename__ = "external_request_tokens"
+    
+    token = Column(String, unique=True, index=True)
+    recipient_email = Column(String, nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    is_used = Column(Boolean, default=False)
+    # Track who sent it
+    sender_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+class ExternalOTP(BaseModel):
+    __tablename__ = "external_otps"
+    
+    email = Column(String, index=True)
+    otp_code = Column(String(6))
+    customer_id = Column(Integer, ForeignKey("customers.id"))
+    expires_at = Column(DateTime)
+    is_verified = Column(Boolean, default=False)
+
+class Department(BaseModel):
+    __tablename__ = "departments"
+    name = Column(String, nullable=False, comment="Name of the department (e.g., IT, Finance)")
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    manager_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="The User ID of the department head")
+
+    customer = relationship("Customer", back_populates="departments")
+    manager = relationship("User", foreign_keys=[manager_id])
+
+    __table_args__ = (
+        UniqueConstraint('customer_id', 'name', name='_customer_department_name_uc'),
+    )
+
+class ApprovalGroup(BaseModel):
+    __tablename__ = "approval_groups"
+    name = Column(String, nullable=False, comment="Name of the custom approval list (e.g., Senior Committee)")
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+
+    customer = relationship("Customer", back_populates="approval_groups")
+    users = relationship("User", secondary=user_approval_group_association, back_populates="approval_groups")
+
+    __table_args__ = (
+        UniqueConstraint('customer_id', 'name', name='_customer_approval_group_name_uc'),
+    )
+
+
+# app/models.py
+
+class AIUsageLog(BaseModel):
+    __tablename__ = "ai_usage_logs"
+
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    doc_name = Column(String, nullable=True, comment="Name of the processed file")
+    model_name = Column(String, nullable=False, default="gemini-3.5-flash")
+    
+    prompt_tokens = Column(Integer, default=0, nullable=False)
+    completion_tokens = Column(Integer, default=0, nullable=False)
+    total_tokens = Column(Integer, default=0, nullable=False)
+    
+    # Optional: track OCR usage if you want to analyze Vision costs too
+    ocr_characters = Column(Integer, default=0, nullable=False)
+    total_pages = Column(Integer, default=0, nullable=False)
+
+    # Relationships
+    customer = relationship("Customer")
+    user = relationship("User")
+
+    def __repr__(self):
+        return f"<AIUsageLog(id={self.id}, customer_id={self.customer_id}, tokens={self.total_tokens})>"

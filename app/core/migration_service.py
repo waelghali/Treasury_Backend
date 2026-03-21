@@ -279,13 +279,13 @@ class MigrationService:
                     # Try 1: Exact Filename at Root
                     blob = bucket.blob(file_name)
                     if blob.exists():
-                        print(f"[DEBUG] Found '{file_name}' in GCS Root.")
+                        logger.debug(f"Found '{file_name}' in GCS Root.")
                         return blob.download_as_bytes()
                     
                     # Try 2: Inside a 'migration' folder (Common practice)
                     blob_folder = bucket.blob(f"migration/{file_name}")
                     if blob_folder.exists():
-                        print(f"[DEBUG] Found '{file_name}' in GCS 'migration/' folder.")
+                        logger.debug(f"Found '{file_name}' in GCS 'migration/' folder.")
                         return blob_folder.download_as_bytes()
                         
                     return None
@@ -436,12 +436,12 @@ class MigrationService:
         import json 
         
         # --- DEBUG PRINT ---
-        print("\n\n============================================")
-        print(">>> ENTERING MIGRATE_RECORD FUNCTION <<<")
+        logger.debug("============================================")
+        logger.debug(">>> ENTERING MIGRATE_RECORD FUNCTION <<<")
         source_data = staged_record.source_data_json or {}
         raw_url = source_data.get("attachment_url")
-        print(f">>> RAW ATTACHMENT URL: {raw_url}")
-        print("============================================\n\n")
+        logger.debug(f">>> RAW ATTACHMENT URL: {raw_url}")
+        logger.debug("============================================")
 
         lg_number = source_data.get("lg_number")
 
@@ -481,7 +481,7 @@ class MigrationService:
             else:
                 try:
                     add_fields = json.loads(add_fields)
-                except:
+                except Exception:
                     add_fields = None 
 
         try:
@@ -540,7 +540,7 @@ class MigrationService:
 
         if raw_url:
             clean_url = str(raw_url).strip().strip("'").strip('"')
-            print(f">>> UPLOADING INITIAL DOCUMENT: {clean_url}")
+            logger.debug(f">>> UPLOADING INITIAL DOCUMENT: {clean_url}")
             try:
                 doc_id = await self._create_document_from_url(
                     db=db,
@@ -551,15 +551,15 @@ class MigrationService:
                 )
                 if doc_id:
                     logger.info(f"Successfully attached document ID {doc_id} to {lg_number}")
-                    print(f">>> UPLOAD SUCCESS. ID: {doc_id}")
+                    logger.info(f">>> UPLOAD SUCCESS. ID: {doc_id}")
                 else:
                     logger.error(f"Failed to attach document to {lg_number}. _create_document_from_url returned None.")
-                    print(">>> UPLOAD RETURNED NONE")
+                    logger.error(f">>> UPLOAD RETURNED NONE for {lg_number}")
             except Exception as e:
                 logger.error(f"Exception during initial attachment upload for {lg_number}: {e}", exc_info=True)
-                print(f">>> UPLOAD EXCEPTION: {e}")
+                logger.error(f">>> UPLOAD EXCEPTION for {lg_number}: {e}", exc_info=True)
         else:
-             print(">>> NO URL FOUND IN RAW DATA")
+             logger.debug(f">>> NO URL FOUND IN RAW DATA for {lg_number}")
         
         db.refresh(new_lg_record)
         return new_lg_record
@@ -658,9 +658,9 @@ class MigrationService:
         from app.core.ai_integration import process_lg_document_with_ai, process_amendment_with_ai
         from sqlalchemy import func
         
-        print("\n\n=======================================================")
-        print("STARTING ENHANCED AI AUDIT")
-        print("=======================================================")
+        logger.debug("=======================================================")
+        logger.debug("STARTING ENHANCED AI AUDIT")
+        logger.debug("=======================================================")
 
         # 1. DEBUG: Print counts of ALL statuses to see where records went
         status_counts = db.query(
@@ -669,9 +669,9 @@ class MigrationService:
             LGMigrationStaging.customer_id == customer_id
         ).group_by(LGMigrationStaging.record_status).all()
         
-        print("-> Current Record Statuses in DB:")
+        logger.debug("-> Current Record Statuses in DB:")
         for status_val, count in status_counts:
-            print(f"   - {status_val}: {count}")
+            logger.debug(f"   - {status_val}: {count}")
 
         # 2. Fetch Eligible Records
         records = db.query(LGMigrationStaging).filter(
@@ -684,7 +684,7 @@ class MigrationService:
         ).order_by(LGMigrationStaging.id).all()
 
         if not records:
-            print("STOPPING: No eligible records found (Check statuses above).")
+            logger.debug("STOPPING: No eligible records found (Check statuses above).")
             return {"status": "skipped", "message": "No staged records found."}
 
         # --- PRE-FETCH CACHES ---
@@ -728,7 +728,7 @@ class MigrationService:
             return len(overlap) / max(len(s1), len(s2)) > 0.4
 
         for lg_num, group in grouped_records.items():
-            print(f"\n[AUDIT] Checking LG: {lg_num}")
+            logger.debug(f"[AUDIT] Checking LG: {lg_num}")
             group.sort(key=lambda x: x.id)
             first_rec = group[0]
             last_rec = group[-1]
@@ -754,19 +754,19 @@ class MigrationService:
                 first_url = first_rec.file_name
 
             # DEBUG: Print what we found so you can see it in the console
-            print(f"[DEBUG] Record {first_rec.id} | LG: {lg_num}")
-            print(f"   -> JSON Keys Available: {list(json_data.keys())}")
-            print(f"   -> Final Resolved Path: '{first_url}'")
+            logger.debug(f"Record {first_rec.id} | LG: {lg_num}")
+            logger.debug(f"   -> JSON Keys Available: {list(json_data.keys())}")
+            logger.debug(f"   -> Final Resolved Path: '{first_url}'")
 
             if first_url:
                 clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                 
                 # FIX: Fetch directly (removes the "exists" check that blocked Cloud files)
-                print(f"   -> Fetching content for: '{clean_url}'")
+                logger.debug(f"   -> Fetching content for: '{clean_url}'")
                 content, mime = await self._fetch_file_content(clean_url)
                 
                 if content:
-                    print(f"   -> AI Scanning Original Document...")
+                    logger.debug(f"   -> AI Scanning Original Document...")
                     ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=lg_num)
                     
                     if ai_data:
@@ -778,7 +778,7 @@ class MigrationService:
                         if norm(lg_num) != norm(ai_lg_num):
                             err = f"LG Number Mismatch: Excel='{lg_num}' vs AI='{ai_lg_num}'"
                             discrepancies.append(err)
-                            print(f"      ❌ {err}")
+                            logger.debug(f"      ❌ {err}")
 
                         # B. Amount
                         try:
@@ -787,8 +787,8 @@ class MigrationService:
                             if abs(val_excel - val_ai) > 1.0:
                                 err = f"Amount Mismatch: Excel='{val_excel:,.2f}' vs AI='{val_ai:,.2f}'"
                                 discrepancies.append(err)
-                                print(f"      ❌ {err}")
-                        except: pass
+                                logger.debug(f"      ❌ {err}")
+                        except Exception: pass
 
                         # C. Currency
                         excel_curr_id = src.get('lg_currency_id')
@@ -797,7 +797,7 @@ class MigrationService:
                         if norm(excel_curr_code) != norm(ai_curr):
                             err = f"Currency Mismatch: Excel='{excel_curr_code}' vs AI='{ai_curr}'"
                             discrepancies.append(err)
-                            print(f"      ❌ {err}")
+                            logger.debug(f"      ❌ {err}")
 
                         # D. Issuing Bank
                         excel_bank_id = src.get('issuing_bank_id')
@@ -807,7 +807,7 @@ class MigrationService:
                             if norm(excel_bank_name) not in norm(ai_bank) and norm(ai_bank) not in norm(excel_bank_name):
                                 err = f"Bank Mismatch: Excel='{excel_bank_name}' vs AI='{ai_bank}'"
                                 discrepancies.append(err)
-                                print(f"      ❌ {err}")
+                                logger.debug(f"      ❌ {err}")
                                 
                         # E. Dates (Issuance & Expiry)
                         excel_date = clean_date(src.get('issuance_date'))
@@ -815,20 +815,19 @@ class MigrationService:
                         if excel_date != ai_date:
                             err = f"Issuance Date Mismatch: Excel='{excel_date}' vs AI='{ai_date}'"
                             discrepancies.append(err)
-                            print(f"      ❌ {err}")
+                            logger.debug(f"      ❌ {err}")
                         
                         excel_exp = clean_date(src.get('expiry_date'))
                         ai_exp = clean_date(ai_data.get('expiryDate'))
                         if excel_exp != ai_exp:
                             err = f"Expiry Date Mismatch: Excel='{excel_exp}' vs AI='{ai_exp}'"
                             discrepancies.append(err)
-                            print(f"      ❌ {err}")
+                            logger.debug(f"      ❌ {err}")
                         # --- END VALIDATION LOGIC ---
                         
-                    else:
-                        print("   ⚠️ AI returned NO data.")
+                        logger.debug("   ⚠️ AI returned NO data.")
                 else:
-                    print(f"   ❌ File not found (Checked Local & Cloud): {clean_url}")
+                    logger.debug(f"   ❌ File not found (Checked Local & Cloud): {clean_url}")
 
             # --- 2. AUDIT LATEST STATUS (Last Record) ---
             if last_rec.id != first_rec.id:
@@ -836,11 +835,11 @@ class MigrationService:
                 if last_url:
                     clean_url_last = str(last_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                     
-                    print(f"   -> Fetching Amendment content for: '{clean_url_last}'")
+                    logger.debug(f"   -> Fetching Amendment content for: '{clean_url_last}'")
                     content, mime = await self._fetch_file_content(clean_url_last)
                     
                     if content:
-                        print(f"   -> AI Scanning Amendment...")
+                        logger.debug(f"   -> AI Scanning Amendment...")
                         context = {"lg_record_details": {"lgNumber": lg_num}}
                         ai_amend, _ = await process_amendment_with_ai(content, mime, context)
                         
@@ -854,7 +853,7 @@ class MigrationService:
                                 if val_excel != val_ai:
                                     err = f"Latest Expiry Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
                                     discrepancies.append(err)
-                                    print(f"      ❌ {err}")
+                                    logger.debug(f"      ❌ {err}")
 
                             if "lgAmount" in changes:
                                 try:
@@ -863,8 +862,8 @@ class MigrationService:
                                     if abs(val_excel - val_ai) > 1.0:
                                         err = f"Latest Amount Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
                                         discrepancies.append(err)
-                                        print(f"      ❌ {err}")
-                                except: pass
+                                        logger.debug(f"      ❌ {err}")
+                                except Exception: pass
 
             if discrepancies:
                 audit_report.append({"lg_number": lg_num, "issues": discrepancies})
@@ -874,9 +873,9 @@ class MigrationService:
                 db.add(first_rec)
         
         db.commit()
-        print(f"=======================================================")
-        print(f"🕵️ AUDIT FINISHED. Issues found: {len(audit_report)}")
-        print(f"=======================================================\n\n")
+        logger.debug(f"=======================================================")
+        logger.debug(f"🕵️ AUDIT FINISHED. Issues found: {len(audit_report)}")
+        logger.debug(f"=======================================================")
         return {"audit_summary": audit_report, "records_checked": len(grouped_records)}
 
 # Initialize the service instance

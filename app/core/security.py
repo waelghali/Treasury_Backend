@@ -41,6 +41,8 @@ class TokenData(BaseModel):
     must_accept_policies: Optional[bool] = Field(False, description="True if user needs to accept legal policies.")
     last_accepted_legal_version: Optional[float] = Field(None, description="Version of legal artifacts last accepted.")
     is_mfa_verified: bool = Field(True, description="False if the user still needs to enter an email code.")
+    has_custody_module: bool = Field(True, description="True if the customer's subscription includes LG Custody.")
+    has_issuance_module: bool = Field(False, description="True if the customer's subscription includes LG Issuance.")
 
 # --- Core Functions ---
 
@@ -131,7 +133,9 @@ async def get_current_user(
             must_change_password=payload.get("must_change_password"),
             subscription_status=sub_status,
             must_accept_policies=payload.get("must_accept_policies"),
-            last_accepted_legal_version=payload.get("last_accepted_legal_version")
+            last_accepted_legal_version=payload.get("last_accepted_legal_version"),
+            has_custody_module=payload.get("has_custody_module", True),
+            has_issuance_module=payload.get("has_issuance_module", False)
         )
     except (JWTError, ValueError):
         raise HTTPException(
@@ -216,6 +220,54 @@ async def get_current_corporate_admin_context(current_user: TokenData = Depends(
     return current_user
 
 
+async def get_current_approver_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Allows Corporate Admins and Checkers to perform approval actions on issuance requests."""
+    allowed_roles = [UserRole.CORPORATE_ADMIN, UserRole.CHECKER]
+    if current_user.role not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough privileges: Requires Corporate Admin or Checker role."
+        )
+    if current_user.customer_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is not associated with a customer. Data integrity error."
+        )
+    return current_user
+
+
+async def get_current_treasury_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Restricts execution actions (reserve, issue, release, submit, cancel) to End Users only.
+    Corporate Admins are managers who view and approve but do not execute."""
+    if current_user.role != UserRole.END_USER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough privileges: Requires End User (Treasury Officer) role to execute this action."
+        )
+    if current_user.customer_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is not associated with a customer. Data integrity error."
+        )
+    return current_user
+
+
+async def get_issuance_read_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Allows End Users, Corporate Admins, and Checkers to view issuance data (read-only access)."""
+    allowed_roles = [UserRole.END_USER, UserRole.CORPORATE_ADMIN, UserRole.CHECKER]
+    if current_user.role not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough privileges: Requires End User, Corporate Admin, or Checker role."
+        )
+    if current_user.customer_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is not associated with a customer. Data integrity error."
+        )
+    return current_user
+
+
 async def get_verified_user(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
     """Ensures user has completed MFA if required."""
     if not current_user.is_mfa_verified:
@@ -237,3 +289,29 @@ class HasPermission:
                 detail=f"Not enough permissions: Missing '{self.permission_name}'."
             )
         return current_user
+
+
+# --- Module Access Guards ---
+
+async def require_issuance_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Blocks access if the customer's subscription does not include the LG Issuance module."""
+    if current_user.role == UserRole.SYSTEM_OWNER:
+        return current_user
+    if not current_user.has_issuance_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your subscription does not include the LG Issuance module."
+        )
+    return current_user
+
+
+async def require_custody_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Blocks access if the customer's subscription does not include the LG Custody module."""
+    if current_user.role == UserRole.SYSTEM_OWNER:
+        return current_user
+    if not current_user.has_custody_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your subscription does not include the LG Custody module."
+        )
+    return current_user

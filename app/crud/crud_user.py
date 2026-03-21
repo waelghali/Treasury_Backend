@@ -50,11 +50,24 @@ class CRUDUser(CRUDBase):
         if not customer:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
 
-        if customer.active_user_count >= customer.subscription_plan.max_users:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"User limit ({customer.subscription_plan.max_users}) exceeded for this customer's subscription plan. Cannot create new user.",
-            )
+        # User/Checker Limit Enforcement
+        if user_in.role == UserRole.CHECKER:
+            if customer.active_checker_count < customer.subscription_plan.max_checker_users:
+                customer.active_checker_count += 1
+            elif customer.active_user_count < customer.subscription_plan.max_users:
+                customer.active_user_count += 1
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Both Checker limit ({customer.subscription_plan.max_checker_users}) and User limit ({customer.subscription_plan.max_users}) exceeded. Cannot create new Checker.",
+                )
+        else:
+            if customer.active_user_count >= customer.subscription_plan.max_users:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"User limit ({customer.subscription_plan.max_users}) exceeded. Cannot create new user.",
+                )
+            customer.active_user_count += 1
 
         user_data = user_in.model_dump(exclude_unset=True)
         password = user_data.pop("password")
@@ -88,7 +101,6 @@ class CRUDUser(CRUDBase):
                 )
                 db.add(association)
 
-        customer.active_user_count += 1
         db.add(customer)
         db.flush()
         db.refresh(db_user)
@@ -130,17 +142,42 @@ class CRUDUser(CRUDBase):
         if not customer:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
 
-        # FIX: Use a fresh count from the database for the user limit check
-        actual_active_user_count = db.query(User).filter(
+        # User/Checker Limit Enforcement using accurate query counts
+        actual_active_checker_count = db.query(User).filter(
             User.customer_id == customer_id,
+            User.role == UserRole.CHECKER,
             User.is_deleted == False
         ).count()
-        
-        if actual_active_user_count >= customer.subscription_plan.max_users:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"User limit ({customer.subscription_plan.max_users}) exceeded for this customer's subscription plan. Cannot create new user.",
-            )
+        actual_active_user_count = db.query(User).filter(
+            User.customer_id == customer_id,
+            User.role != UserRole.CHECKER,
+            User.is_deleted == False
+        ).count()
+
+        checkers_spillover = max(0, actual_active_checker_count - customer.subscription_plan.max_checker_users)
+        effective_active_user_count = actual_active_user_count + checkers_spillover
+        capped_active_checker_count = min(actual_active_checker_count, customer.subscription_plan.max_checker_users)
+
+        if user_in.role == UserRole.CHECKER:
+            if capped_active_checker_count < customer.subscription_plan.max_checker_users:
+                customer.active_checker_count = capped_active_checker_count + 1
+                customer.active_user_count = effective_active_user_count
+            elif effective_active_user_count < customer.subscription_plan.max_users:
+                customer.active_checker_count = capped_active_checker_count
+                customer.active_user_count = effective_active_user_count + 1
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Both Checker limit ({customer.subscription_plan.max_checker_users}) and User limit ({customer.subscription_plan.max_users}) exceeded. Cannot create new Checker.",
+                )
+        else:
+            if effective_active_user_count >= customer.subscription_plan.max_users:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"User limit ({customer.subscription_plan.max_users}) exceeded. Cannot create new user.",
+                )
+            customer.active_checker_count = capped_active_checker_count
+            customer.active_user_count = effective_active_user_count + 1
 
         if user_in.role == UserRole.SYSTEM_OWNER:
             raise HTTPException(
@@ -182,8 +219,7 @@ class CRUDUser(CRUDBase):
                 )
                 db.add(association)
 
-        # FIX: The active_user_count will now be updated directly by the database logic
-        customer.active_user_count = actual_active_user_count + 1
+        # active_user_count and active_checker_count updated dynamically
         db.add(customer)
         db.flush()
         db.refresh(db_user)
@@ -499,17 +535,35 @@ class CRUDUser(CRUDBase):
     def soft_delete(self, db: Session, db_obj: User, user_id: Optional[int] = None) -> User:
         deleted_obj = super().soft_delete(db, db_obj)
 
-        if deleted_obj.customer and not deleted_obj.is_deleted:
-            deleted_obj.customer.active_user_count -= 1
+        if deleted_obj.customer:
+            actual_active_checker_count = db.query(User).filter(
+                User.customer_id == deleted_obj.customer_id,
+                User.role == UserRole.CHECKER,
+                User.is_deleted == False
+            ).count()
+            actual_active_user_count = db.query(User).filter(
+                User.customer_id == deleted_obj.customer_id,
+                User.role != UserRole.CHECKER,
+                User.is_deleted == False
+            ).count()
+
+            checkers_spillover = max(0, actual_active_checker_count - deleted_obj.customer.subscription_plan.max_checker_users)
+            effective_active_user_count = actual_active_user_count + checkers_spillover
+            capped_active_checker_count = min(actual_active_checker_count, deleted_obj.customer.subscription_plan.max_checker_users)
+
+            deleted_obj.customer.active_checker_count = capped_active_checker_count
+            deleted_obj.customer.active_user_count = effective_active_user_count
+            
             db.add(deleted_obj.customer)
             db.flush()
 
-        # CRITICAL FIX: Hard delete UserCustomerEntityAssociation records
-        # as they do not support soft deletion (no is_deleted/deleted_at columns).
-        # This will lead to loss of granular entity access data upon user restoration.
+        # Soft delete UserCustomerEntityAssociation records
         db.query(UserCustomerEntityAssociation).filter(
             UserCustomerEntityAssociation.user_id == deleted_obj.id
-        ).delete(synchronize_session=False) # Perform hard delete
+        ).update(
+            {"is_deleted": True, "deleted_at": func.now()}, 
+            synchronize_session=False
+        )
         db.flush()
 
         log_action(
@@ -537,29 +591,59 @@ class CRUDUser(CRUDBase):
             )
         
         # FIX: Use a fresh count from the database before performing the check
-        actual_active_user_count = db.query(User).filter(
+        actual_active_checker_count = db.query(User).filter(
             User.customer_id == db_obj.customer_id,
+            User.role == UserRole.CHECKER,
             User.is_deleted == False
         ).count()
-        
-        if actual_active_user_count >= customer.subscription_plan.max_users:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"User limit ({customer.subscription_plan.max_users}) exceeded for this customer's subscription plan. Cannot restore user.",
-            )
+        actual_active_user_count = db.query(User).filter(
+            User.customer_id == db_obj.customer_id,
+            User.role != UserRole.CHECKER,
+            User.is_deleted == False
+        ).count()
+
+        checkers_spillover = max(0, actual_active_checker_count - customer.subscription_plan.max_checker_users)
+        effective_active_user_count = actual_active_user_count + checkers_spillover
+        capped_active_checker_count = min(actual_active_checker_count, customer.subscription_plan.max_checker_users)
+
+        if db_obj.role == UserRole.CHECKER:
+            if capped_active_checker_count < customer.subscription_plan.max_checker_users:
+                new_checker_count = capped_active_checker_count + 1
+                new_user_count = effective_active_user_count
+            elif effective_active_user_count < customer.subscription_plan.max_users:
+                new_checker_count = capped_active_checker_count
+                new_user_count = effective_active_user_count + 1
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Both Checker limit ({customer.subscription_plan.max_checker_users}) and User limit ({customer.subscription_plan.max_users}) exceeded. Cannot restore Checker.",
+                )
+        else:
+            if effective_active_user_count >= customer.subscription_plan.max_users:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"User limit ({customer.subscription_plan.max_users}) exceeded for this customer's subscription plan. Cannot restore user.",
+                )
+            new_checker_count = capped_active_checker_count
+            new_user_count = effective_active_user_count + 1
             
         restored_obj = super().restore(db, db_obj)
 
         # FIX: Increment the count after the restoration and before flushing
-        customer.active_user_count = actual_active_user_count + 1
+        customer.active_user_count = new_user_count
+        customer.active_checker_count = new_checker_count
         db.add(customer)
         db.flush()
 
-        # IMPORTANT: UserCustomerEntityAssociation records were hard-deleted during soft_delete.
-        # They are NOT automatically restored here. If the user had granular entity access
-        # (has_all_entity_access=False), that data is lost and must be reconfigured manually by an admin
-        # after restoration. This is a known limitation with the current model design for associations.
-        # Do NOT attempt to update 'is_deleted' on associations here as they don't have that column.
+        # Restore UserCustomerEntityAssociation records
+        db.query(UserCustomerEntityAssociation).filter(
+            UserCustomerEntityAssociation.user_id == db_obj.id,
+            UserCustomerEntityAssociation.is_deleted == True
+        ).update(
+            {"is_deleted": False, "deleted_at": None}, 
+            synchronize_session=False
+        )
+        db.flush()
 
         log_action(
             db,

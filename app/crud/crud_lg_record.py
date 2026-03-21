@@ -2371,20 +2371,16 @@ class CRUDLGRecord(CRUDBase):
         auto_renewal_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
             db, customer_id, GlobalConfigKey.AUTO_RENEWAL_DAYS_BEFORE_EXPIRY
         )
-        force_renew_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-            db, customer_id, GlobalConfigKey.FORCED_RENEW_DAYS_BEFORE_EXPIRY
-        )
         auto_renew_reminder_start_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
             db, customer_id, GlobalConfigKey.AUTO_RENEW_REMINDER_START_DAYS_BEFORE_EXPIRY
         )
 
         auto_renewal_days = int(auto_renewal_days_config.get('effective_value', 30)) if auto_renewal_days_config else 30
-        force_renew_days = int(force_renew_days_config.get('effective_value', 15)) if force_renew_days_config else 15
         auto_renew_reminder_start_days = int(auto_renew_reminder_start_days_config.get('effective_value', 10)) if auto_renew_reminder_start_days_config else 10
 
         current_date = datetime.now(EEST_TIMEZONE).date()
 
-        max_lookahead_days = max(auto_renewal_days, force_renew_days, auto_renew_reminder_start_days)
+        max_lookahead_days = max(auto_renewal_days, auto_renew_reminder_start_days)
 
         query = db.query(self.model).filter(
             self.model.customer_id == customer_id,
@@ -2806,22 +2802,19 @@ class CRUDLGRecord(CRUDBase):
 
         for customer in customers:
             try:
-                # 1. Fetch Thresholds + Anti-Spam Interval from config
-                first_threshold_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-                    db, customer.id, GlobalConfigKey.RENEWAL_REMINDER_FIRST_THRESHOLD_DAYS
-                )
-                second_threshold_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-                    db, customer.id, GlobalConfigKey.RENEWAL_REMINDER_SECOND_THRESHOLD_DAYS
+                # 1. Fetch reminder window + anti-spam interval from config
+                reminder_window_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                    db, customer.id, GlobalConfigKey.AUTO_RENEW_REMINDER_START_DAYS_BEFORE_EXPIRY
                 )
                 next_reminder_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                     db, customer.id, GlobalConfigKey.NUMBER_OF_DAYS_FOR_NEXT_REMINDER
                 )
 
-                first_days_limit = int(first_threshold_config.get('effective_value', 30))
-                second_days_limit = int(second_threshold_config.get('effective_value', 14))
+                first_days_limit = int(reminder_window_config.get('effective_value', 60)) if reminder_window_config else 60
+                second_days_limit = first_days_limit // 2  # Urgent threshold is half the window
                 interval_days = int(next_reminder_config.get('effective_value', 7))
 
-                logger.info(f"[Customer: {customer.name}] Config: 1st={first_days_limit}d, 2nd={second_days_limit}d, interval={interval_days}d")
+                logger.info(f"[Customer: {customer.name}] Config: window={first_days_limit}d, urgent={second_days_limit}d, interval={interval_days}d")
 
                 # 2. Get all VALID LGs with eager-loaded relationships
                 eligible_lgs = db.query(models.LGRecord).filter(
@@ -2933,7 +2926,7 @@ class CRUDLGRecord(CRUDBase):
                     models.LGRecord.customer_id == customer.id,
                     models.LGRecord.is_deleted == False,
                     models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
-                    models.LGRecord.auto_renewal == False, # MUST be False for Feature 2
+                    # Reminders sent to ALL valid LGs nearing expiry (ignore auto_renewal toggle)
                     models.LGRecord.expiry_date >= current_date_only,
                     models.LGRecord.expiry_date <= lookahead_date
                 )

@@ -853,7 +853,7 @@ async def import_historical_records(
                     else:
                         try:
                             first_snapshot_data["additional_field_values"] = json.loads(add_fields)
-                        except:
+                        except Exception:
                             first_snapshot_data["additional_field_values"] = None
                 # --- FIX END ---
                 

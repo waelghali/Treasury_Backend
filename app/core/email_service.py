@@ -49,7 +49,7 @@ def get_global_email_settings() -> EmailSettings:
     
     # Default values
     smtp_port = int(os.getenv("EMAIL_SMTP_PORT", 587))
-    display_name = os.getenv("GLOBAL_SENDER_DISPLAY_NAME", "Treasury Platform Notifications")
+    display_name = os.getenv("GLOBAL_SENDER_DISPLAY_NAME", "Treasury Quotations")
 
     if not all([sender_email, smtp_host, smtp_username, smtp_password]):
         logger.warning("Missing global email env vars. Using dummy fallback.")

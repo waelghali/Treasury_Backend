@@ -22,14 +22,17 @@ from app.schemas.all_schemas import (
     UserCreateCorporateAdmin, UserUpdateCorporateAdmin, UserOut, 
     # MODIFIED: Use new unified LGCategory schemas
     LGCategoryCreate, LGCategoryUpdate, LGCategoryOut,
+    DepartmentCreate, DepartmentUpdate, DepartmentOut,
+    ApprovalGroupCreate, ApprovalGroupUpdate, ApprovalGroupOut,
     CustomerConfigurationCreate, CustomerConfigurationUpdate, CustomerConfigurationOut,
     CustomerEmailSettingCreate, CustomerEmailSettingUpdate, CustomerEmailSettingOut,
     Token,
     ApprovalRequestOut,
     ApprovalRequestUpdate,
     InternalOwnerContactOut, AuditLogOut, LGRecordOut, LGInstructionOut,
-    SystemNotificationOut,
+    SystemNotificationOut, BankOut, CurrencyOut,
 )
+
 from app.crud.crud import (
     crud_customer, crud_customer_entity, crud_user,
     # MODIFIED: Removed crud_universal_category
@@ -43,10 +46,12 @@ from app.crud.crud import (
     crud_internal_owner_contact, crud_lg_instruction,
     crud_system_notification,
     crud_system_notification_view_log,
+    crud_bank, crud_currency,
 )
+from app.crud.crud_org import crud_department, crud_approval_group
 import app.models as models
 from app.models import (
-    InternalOwnerContact, LGCategory, Bank, IssuingMethod, Rule,User,
+    InternalOwnerContact, LGCategory, Bank, Currency, IssuingMethod, Rule,User,
     ApprovalRequest,CustomerEntity,
     UserCustomerEntityAssociation,
     LGCategoryCustomerEntityAssociation,
@@ -85,6 +90,7 @@ try:
         get_current_corporate_admin_context,
         get_current_user,
         get_client_ip,
+        require_issuance_module,
     )
 except Exception as e:
     print(f"FATAL ERROR (corporate_admin.py): Could not import core.security module directly. Error: {e}")
@@ -505,19 +511,7 @@ def create_user(
         if not customer_check:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found or is deleted.")
         
-        actual_active_users_count = db.query(User).filter(
-            User.customer_id == customer_id,
-            User.is_deleted == False
-        ).count()
-        customer_check.active_user_count = actual_active_users_count
-        db.add(customer_check)
-        db.flush()
-        
-        if customer_check.active_user_count >= customer_check.subscription_plan.max_users:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Customer's subscription plan '{customer_check.subscription_plan.name}' limit of {customer_check.subscription_plan.max_users} users reached."
-            )
+        # Limit enforcement is handled entirely within crud_user.create_user_by_corporate_admin
 
         if user_in.role == UserRole.SYSTEM_OWNER:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Corporate Admins cannot create users with 'SYSTEM_OWNER' role.")
@@ -1231,7 +1225,7 @@ def restore_customer_email_settings(
 @router.get(
     "/approval-requests/",
     response_model=List[ApprovalRequestOut],
-    dependencies=[Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
+    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
     summary="List all approval requests for the Corporate Admin's customer"
 )
 def list_approval_requests(
@@ -1262,7 +1256,7 @@ def list_approval_requests(
 @router.get(
     "/approval-requests/{request_id}",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
+    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
     summary="Get details of a specific approval request"
 )
 def get_approval_request_details(
@@ -1287,7 +1281,7 @@ def get_approval_request_details(
 @router.post(
     "/approval-requests/{request_id}/approve",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(HasPermission("approval_request:approve")), Depends(check_for_read_only_mode)],
+    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:approve")), Depends(check_for_read_only_mode)],
     summary="Approve a pending approval request"
 )
 async def approve_approval_request(
@@ -1342,7 +1336,7 @@ async def approve_approval_request(
 @router.post(
     "/approval-requests/{request_id}/reject",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(HasPermission("approval_request:reject")), Depends(check_for_read_only_mode)],
+    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:reject")), Depends(check_for_read_only_mode)],
     summary="Reject a pending approval request"
 )
 async def reject_approval_request(
@@ -1814,3 +1808,550 @@ async def get_active_system_notifications_corporate_admin( # Use your existing f
         results.append(n)
 
     return results
+
+# ==============================================================================
+# QUOTATION MANAGEMENT
+# ==============================================================================
+
+from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationBank
+from app.schemas.schemas_quotation import QuotationRequestOut
+from pydantic import BaseModel
+from app.core.email_service import send_email, get_global_email_settings
+from fastapi import BackgroundTasks
+import os
+from app.schemas.all_schemas import BankOut
+from app.crud.crud import crud_bank
+
+@router.get("/banks", response_model=List[BankOut])
+def get_system_banks(
+    skip: int = 0,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Retrieves all standard system Banks."""
+    return crud_bank.get_all(db, skip=skip, limit=limit)
+
+@router.get("/quotations/pending-approvals", response_model=List[QuotationRequestOut])
+def get_pending_quotation_approvals(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Lists all quotations awaiting internal corporate approval."""
+    return db.query(QuotationRequest).filter(
+        QuotationRequest.customer_id == corporate_admin_context.customer_id,
+        QuotationRequest.status == 'PENDING_APPROVAL'
+    ).order_by(QuotationRequest.created_at.desc()).all()
+
+@router.post("/quotations/{rfq_id}/approve")
+def approve_quotation(
+    rfq_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Approves a quotation and broadcasts it to assigned banks."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+    
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+    
+    if rfq.status != 'PENDING_APPROVAL':
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be approved.")
+
+    rfq.status = 'PENDING'
+    db.commit()
+    
+    # Broadcast emails to banks
+    assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+    
+    # Use Customer Specific Email Settings
+    from app.core.email_service import get_customer_email_settings
+    email_settings, source = get_customer_email_settings(db, rfq.customer_id)
+    
+    base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    
+    # Standard Bank Branding
+    customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+
+    for assignment in assignments:
+        bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+        if bank_row and bank_row.emails:
+            bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
+            link = f"{base_url}/public/quotation/{assignment.token}"
+            
+            subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {rfq.type} - {rfq.ref_no}"
+            body = f"""
+            <html>
+            <body style="font-family: sans-serif; color: #333;">
+                <div style="max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                    <h2 style="color: #000;">New Quotation Request</h2>
+                    <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
+                    <p>You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>.</p>
+                    <div style="background-color: #f9f9f9; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                        <ul style="list-style: none; padding: 0;">
+                            <li><strong>Reference:</strong> {rfq.ref_no}</li>
+                            <li><strong>Product:</strong> {rfq.type}</li>
+                            <li><strong>Direction:</strong> {rfq.direction or 'N/A'}</li>
+                            <li><strong>Amount:</strong> {rfq.amount} {rfq.buy_currency or ''}</li>
+                        </ul>
+                    </div>
+                    <p>Please click the secure link below to view full details and submit your quote:</p>
+                    <div style="text-align: center; margin: 30px 0;">
+                        <a href="{link}" style="padding: 12px 30px; background-color: #000; color: #fff; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">View & Submit Quote</a>
+                    </div>
+                    <p style="font-size: 12px; color: #888;">This link is secure and unique to your institution. It will expire automatically once the quotation window closes.</p>
+                    <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
+                    <p style="font-size: 12px; color: #888;">Best Regards,<br/>Operations Team</p>
+                </div>
+            </body>
+            </html>
+            """
+            background_tasks.add_task(
+                send_email,
+                db,
+                bank_emails,
+                subject,
+                body,
+                {}, 
+                email_settings,
+            )
+            
+    db.commit()
+    
+    # Notify End User
+    from app.models.models_quotation import QuotationNotification
+    db.add(QuotationNotification(
+        user_id=rfq.created_by_user_id,
+        type="RFQ_APPROVED",
+        title=f"RFQ {rfq.ref_no} Approved",
+        message=f"Your {rfq.type} quotation request has been approved and released to banks.",
+        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+        is_read=False
+    ))
+    db.commit()
+    
+    return {"message": "Quotation approved and broadcasted to banks.", "rfq_id": rfq.id}
+
+@router.post("/quotations/{rfq_id}/reject")
+def reject_quotation(
+    rfq_id: str,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Rejects a quotation request."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+    
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+    
+    if rfq.status != 'PENDING_APPROVAL':
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be rejected.")
+
+    rfq.status = 'REJECTED'
+    db.commit()
+    
+    db.commit()
+    
+    # Notify End User
+    from app.models.models_quotation import QuotationNotification
+    db.add(QuotationNotification(
+        user_id=rfq.created_by_user_id,
+        type="RFQ_REJECTED",
+        title=f"RFQ {rfq.ref_no} Rejected",
+        message=f"Your {rfq.type} quotation request has been rejected by the administrator.",
+        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+        is_read=False
+    ))
+    db.commit()
+    
+    return {"message": "Quotation rejected.", "rfq_id": rfq.id}
+
+class QuotationApprovalRequest(BaseModel):
+    status: str
+
+@router.patch("/quotations/{rfq_id}/approval", dependencies=[Depends(check_for_read_only_mode)])
+def approve_quotation_request(
+    rfq_id: str,
+    approval_in: QuotationApprovalRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Allows a Corporate Admin to approve or reject an RFQ that is currently PENDING_APPROVAL.
+    """
+    if approval_in.status not in ["PENDING", "REJECTED"]:
+        raise HTTPException(status_code=400, detail="Invalid approval status. Must be PENDING (for Approved) or REJECTED.")
+
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation Request not found.")
+
+    if rfq.status != "PENDING_APPROVAL":
+        raise HTTPException(status_code=400, detail=f"Cannot approve/reject RFQ in {rfq.status} state.")
+
+    rfq.status = approval_in.status
+    db.commit()
+
+    # Log the action
+    log_action(
+        db,
+        user_id=corporate_admin_context.user_id,
+        action_type=f"QUOTATION_{'APPROVED' if approval_in.status == 'PENDING' else 'REJECTED'}",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={"rfq_id": rfq.id, "ref_no": rfq.ref_no},
+        customer_id=corporate_admin_context.customer_id
+    )
+
+    # Notify End User
+    from app.models.models_quotation import QuotationNotification
+    status_msg = "APPROVED and released to banks" if approval_in.status == "PENDING" else "REJECTED"
+    db.add(QuotationNotification(
+        user_id=rfq.created_by_user_id,
+        type="RFQ_APPROVED" if approval_in.status == "PENDING" else "RFQ_REJECTED",
+        title=f"RFQ {rfq.ref_no} Update",
+        message=f"Your {rfq.type} quotation request has been {status_msg}.",
+        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+        is_read=False
+    ))
+    db.commit()
+
+    # Dispatch Emails if Approved
+    if approval_in.status == "PENDING":
+        email_settings = get_global_email_settings()
+        base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        
+        assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.quotation_request_id == rfq.id).all()
+        for assignment in assignments:
+            bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+            if bank_row and bank_row.emails:
+                bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
+                link = f"{base_url}/quotation-submission?token={assignment.token}"
+                
+                subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
+                body = f"""
+                <html>
+                <body>
+                    <p>Dear {bank_row.bank.bank_name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
+                    <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
+                    <br/>
+                    <ul>
+                        <li><strong>Reference:</strong> {rfq.ref_no}</li>
+                        <li><strong>Product:</strong> {rfq.type}</li>
+                    </ul>
+                    <p>To submit your quote, please click the secure link below. This link is unique to your institution and will expire automatically.</p>
+                    <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Submit Quote Now</a>
+                    <br/><br/>
+                    <p>Best Regards,</p>
+                    <p>Treasury Team</p>
+                </body>
+                </html>
+                """
+                background_tasks.add_task(
+                    send_email,
+                    db,
+                    bank_emails,
+                    subject,
+                    body,
+                    {}, 
+                    email_settings,
+                )
+
+    return {"message": "Quotation status updated successfully.", "status": rfq.status}
+
+
+# ==============================================================================
+# ORGANIZATION & TEAMS (Departments & Approval Groups)
+# ==============================================================================
+
+@router.get("/departments/", response_model=List[DepartmentOut], dependencies=[Depends(require_issuance_module), Depends(check_subscription_status)])
+def list_departments(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    depts = crud_department.get_all_for_customer(db, corporate_admin_context.customer_id)
+    for d in depts:
+        if d.manager:
+            d.manager_email = d.manager.email
+    return depts
+
+@router.post("/departments/", response_model=DepartmentOut, dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def create_department(
+    dept_in: DepartmentCreate,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
+    change_req, auto_approved = _create_governed_change(
+        db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
+        "DEPARTMENT_CREATE", {"new_value": dept_in.model_dump()}
+    )
+    if auto_approved:
+        # Already created by _apply_admin_change — fetch the latest dept
+        from app.models.models import Department
+        dept = db.query(Department).filter(
+            Department.customer_id == corporate_admin_context.customer_id,
+            Department.name == dept_in.name,
+            Department.is_deleted == False
+        ).order_by(Department.id.desc()).first()
+        if dept and dept.manager:
+            dept.manager_email = dept.manager.email
+        return dept
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content={
+        "message": "Department creation submitted for approval.",
+        "change_request_id": change_req.id, "status": "PENDING"
+    })
+
+@router.put("/departments/{dept_id}", response_model=DepartmentOut, dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def update_department(
+    dept_id: int,
+    dept_in: DepartmentUpdate,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    db_dept = crud_department.get(db, id=dept_id)
+    if not db_dept or db_dept.customer_id != corporate_admin_context.customer_id:
+        raise HTTPException(status_code=404, detail="Department not found.")
+
+    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
+    change_req, auto_approved = _create_governed_change(
+        db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
+        "DEPARTMENT_UPDATE", {"entity_id": dept_id, "new_value": dept_in.model_dump(exclude_unset=True)}
+    )
+    if auto_approved:
+        db.refresh(db_dept)
+        if db_dept.manager:
+            db_dept.manager_email = db_dept.manager.email
+        return db_dept
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content={
+        "message": "Department update submitted for approval.",
+        "change_request_id": change_req.id, "status": "PENDING"
+    })
+
+@router.delete("/departments/{dept_id}", dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def delete_department(
+    dept_id: int,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    db_dept = crud_department.get(db, id=dept_id)
+    if not db_dept or db_dept.customer_id != corporate_admin_context.customer_id:
+        raise HTTPException(status_code=404, detail="Department not found.")
+    
+    dept_name = db_dept.name
+
+    # --- CASCADE: Remove any DEPT_MATCH workflow policies for this department ---
+    from app.models.models_issuance import IssuanceWorkflowPolicy
+    orphaned_policies = db.query(IssuanceWorkflowPolicy).filter(
+        IssuanceWorkflowPolicy.customer_id == corporate_admin_context.customer_id,
+        IssuanceWorkflowPolicy.condition_type == "DEPT_MATCH",
+        func.lower(IssuanceWorkflowPolicy.condition_value) == dept_name.lower()
+    ).all()
+    
+    removed_count = len(orphaned_policies)
+    for policy in orphaned_policies:
+        db.delete(policy)
+    
+    crud_department.soft_delete(db, db_dept)
+    log_action(db, user_id=corporate_admin_context.user_id, action_type="DELETE", entity_type="Department", entity_id=dept_id, details={"name": dept_name}, customer_id=corporate_admin_context.customer_id)
+
+    # Audit log the cascade
+    if removed_count > 0:
+        log_action(
+            db, user_id=corporate_admin_context.user_id,
+            action_type="DEPT_APPROVAL_POLICIES_CASCADED",
+            entity_type="Department",
+            entity_id=dept_id,
+            details={
+                "department_name": dept_name,
+                "policies_removed": removed_count
+            },
+            customer_id=corporate_admin_context.customer_id
+        )
+
+    return {
+        "message": "Department deleted successfully.",
+        "cascaded_policies_removed": removed_count
+    }
+
+@router.get("/approval-groups/", response_model=List[ApprovalGroupOut], dependencies=[Depends(require_issuance_module), Depends(check_subscription_status)])
+def list_approval_groups(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    return crud_approval_group.get_all_for_customer(db, corporate_admin_context.customer_id)
+
+@router.post("/approval-groups/", response_model=ApprovalGroupOut, dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def create_approval_group(
+    group_in: ApprovalGroupCreate,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
+    change_req, auto_approved = _create_governed_change(
+        db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
+        "GROUP_CREATE", {"new_value": group_in.model_dump()}
+    )
+    if auto_approved:
+        from app.models.models import ApprovalGroup
+        grp = db.query(ApprovalGroup).filter(
+            ApprovalGroup.customer_id == corporate_admin_context.customer_id,
+            ApprovalGroup.name == group_in.name,
+            ApprovalGroup.is_deleted == False
+        ).order_by(ApprovalGroup.id.desc()).first()
+        return grp
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content={
+        "message": "Approval group creation submitted for approval.",
+        "change_request_id": change_req.id, "status": "PENDING"
+    })
+
+@router.put("/approval-groups/{group_id}", response_model=ApprovalGroupOut, dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def update_approval_group(
+    group_id: int,
+    group_in: ApprovalGroupUpdate,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    db_group = crud_approval_group.get(db, id=group_id)
+    if not db_group or db_group.customer_id != corporate_admin_context.customer_id:
+        raise HTTPException(status_code=404, detail="Group not found.")
+
+    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
+    change_req, auto_approved = _create_governed_change(
+        db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
+        "GROUP_UPDATE", {"entity_id": group_id, "new_value": group_in.model_dump(exclude_unset=True)}
+    )
+    if auto_approved:
+        db.refresh(db_group)
+        return db_group
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content={
+        "message": "Approval group update submitted for approval.",
+        "change_request_id": change_req.id, "status": "PENDING"
+    })
+
+@router.delete("/approval-groups/{group_id}", dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def delete_approval_group(
+    group_id: int,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    db_group = crud_approval_group.get(db, id=group_id)
+    if not db_group or db_group.customer_id != corporate_admin_context.customer_id:
+        raise HTTPException(status_code=404, detail="Group not found.")
+    group_name = db_group.name
+    crud_approval_group.soft_delete(db, db_group)
+    log_action(db, user_id=corporate_admin_context.user_id, action_type="DELETE", entity_type="ApprovalGroup", entity_id=group_id, details={"name": group_name}, customer_id=corporate_admin_context.customer_id)
+    return {"message": "Group deleted successfully."}
+
+# ==============================================================================
+# RECONCILIATION SUPPORT (Banks & Currencies)
+# ==============================================================================
+
+@router.get("/banks", response_model=List[BankOut])
+def list_banks_for_reconciliation(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Returns the list of all active banks for reconciliation purposes.
+    """
+    return crud_bank.get_all(db)
+
+@router.get("/currencies", response_model=List[CurrencyOut])
+def list_currencies_for_reconciliation(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Returns the list of all active currencies for reconciliation purposes.
+    """
+    return crud_currency.get_all(db)
+
+
+# ==============================================================================
+# --- Corporate Projects (for facility dedication) ---
+# ==============================================================================
+from app.models.models_issuance import CorporateProject
+
+@router.get("/projects/", dependencies=[Depends(require_issuance_module), Depends(check_subscription_status)])
+def list_projects(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """List all projects for this customer."""
+    return db.query(CorporateProject).filter(
+        CorporateProject.customer_id == corporate_admin_context.customer_id
+    ).order_by(CorporateProject.name).all()
+
+@router.post("/projects/", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def create_project(
+    project_data: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Create a new project."""
+    project = CorporateProject(
+        customer_id=corporate_admin_context.customer_id,
+        name=project_data["name"],
+        project_type=project_data.get("project_type", "PROJECT"),
+        reference_number=project_data.get("reference_number"),
+        status=project_data.get("status", "ACTIVE"),
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return project
+
+@router.put("/projects/{project_id}", dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def update_project(
+    project_id: int,
+    project_data: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Update a project."""
+    project = db.query(CorporateProject).filter(
+        CorporateProject.id == project_id,
+        CorporateProject.customer_id == corporate_admin_context.customer_id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    for key in ["name", "project_type", "reference_number", "status"]:
+        if key in project_data:
+            setattr(project, key, project_data[key])
+    db.commit()
+    db.refresh(project)
+    return project
+
+@router.delete("/projects/{project_id}", dependencies=[Depends(require_issuance_module), Depends(check_for_read_only_mode)])
+def delete_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Delete a project."""
+    project = db.query(CorporateProject).filter(
+        CorporateProject.id == project_id,
+        CorporateProject.customer_id == corporate_admin_context.customer_id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    db.delete(project)
+    db.commit()
+    return {"ok": True}

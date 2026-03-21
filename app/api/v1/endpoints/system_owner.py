@@ -82,7 +82,6 @@ try:
         HasPermission,
         TokenData, get_client_ip
     )
-    from app.main import app as fastapi_app
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.date import DateTrigger
 
@@ -508,6 +507,39 @@ def get_template_placeholders(
             {"name": "{{original_instruction_type}}", "description": "Type of the original instruction."},
         ]
         placeholders.extend(reminder_placeholders)
+    elif action_type == "LG_ISSUANCE_REQUEST":
+        issuance_placeholders = [
+            {"name": "{{beneficiary_name}}", "description": "Name of the LG beneficiary."},
+            {"name": "{{beneficiary_address}}", "description": "Address of the LG beneficiary."},
+            {"name": "{{amount}}", "description": "LG amount in figures (formatted with commas)."},
+            {"name": "{{amount_in_words}}", "description": "LG amount written in words."},
+            {"name": "{{currency_code}}", "description": "Currency ISO code (e.g., EGP, USD)."},
+            {"name": "{{currency_name}}", "description": "Full currency name (e.g., Egyptian Pound)."},
+            {"name": "{{lg_type}}", "description": "Type of guarantee (e.g., Bid Bond, Performance)."},
+            {"name": "{{issue_date}}", "description": "Requested issue date of the LG."},
+            {"name": "{{expiry_date}}", "description": "Requested expiry date of the LG."},
+            {"name": "{{bank_name}}", "description": "Name of the issuing bank."},
+            {"name": "{{branch_name}}", "description": "Bank branch name."},
+            {"name": "{{account_name}}", "description": "Customer account name at the bank."},
+            {"name": "{{account_number}}", "description": "Customer bank account number."},
+            {"name": "{{customer_number}}", "description": "Customer CIF / reference number at the bank."},
+            {"name": "{{reference_type}}", "description": "Underlying reference type (Contract, PO, Tender)."},
+            {"name": "{{reference_number}}", "description": "Underlying reference/contract number."},
+            {"name": "{{serial_number}}", "description": "Issuance request serial number."},
+            {"name": "{{purpose}}", "description": "Purpose/description of the guarantee."},
+            {"name": "{{lg_wording_clause}}", "description": "Bank's Standard Format or As Per Attached Special Wording."},
+            {"name": "{{other_instructions}}", "description": "Free-text other instructions from the request."},
+            {"name": "{{other_instructions_section}}", "description": "Other instructions rendered as styled block (auto-hidden if empty)."},
+            {"name": "{{conditions_acceptance}}", "description": "Standard conditions acceptance clause."},
+            {"name": "{{customer_address}}", "description": "Customer/entity registered address."},
+            {"name": "{{entity_name}}", "description": "Issuing entity name."},
+            {"name": "{{requestor_name}}", "description": "Name of the person making the request."},
+            {"name": "{{custom_field_1_label}}", "description": "Label of custom field 1 (if configured)."},
+            {"name": "{{custom_field_1_value}}", "description": "Value of custom field 1."},
+            {"name": "{{custom_field_2_label}}", "description": "Label of custom field 2 (if configured)."},
+            {"name": "{{custom_field_2_value}}", "description": "Value of custom field 2."},
+        ]
+        placeholders.extend(issuance_placeholders)
 
     return placeholders
 
@@ -547,13 +579,18 @@ def create_subscription_plan(
 def read_subscription_plans(
     skip: int = 0, 
     limit: int = 100, 
+    include_deleted: Optional[bool] = Query(False, description="If true, includes soft-deleted plans in the response."),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("subscription_plan:view"))
 ):
     """
-    Retrieve a list of all active subscription plans.
+    Retrieve a list of subscription plans. Optionally includes soft-deleted plans.
     """
-    plans = crud_subscription_plan.get_all(db, skip=skip, limit=limit)
+    if include_deleted:
+        from app.models import SubscriptionPlan
+        plans = db.query(SubscriptionPlan).offset(skip).limit(limit).all()
+    else:
+        plans = crud_subscription_plan.get_all(db, skip=skip, limit=limit)
     return plans
 
 @router.get("/subscription-plans/{plan_id}", response_model=SubscriptionPlanOut)
@@ -2448,13 +2485,15 @@ def read_template(
 @router.get("/template-metadata")
 def get_template_metadata(db: Session = Depends(get_db)):
     # 1. Get unique action types currently used in your DB
-    # This ensures "LG_EXTENSION", "PRINT_REMINDER", etc. show up automatically
     distinct_actions = db.execute(select(Template.action_type).distinct()).scalars().all()
     
-    # 2. Hardcode the types here (since these change much less often)
+    # 2. Ensure issuance-related action types always appear even before any templates are created
+    all_action_types = set(distinct_actions)
+    all_action_types.add("LG_ISSUANCE_REQUEST")  # Always available for issuance signed letters
+    
     return {
         "template_types": ["EMAIL", "LETTER", "PDF_ATTACHMENT"],
-        "action_types": sorted(list(set(distinct_actions))) 
+        "action_types": sorted(list(all_action_types)) 
     }
 
 @router.put("/templates/{template_id}", response_model=TemplateOut)
@@ -2899,11 +2938,35 @@ async def approve_trial_registration(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or not in pending state.")
 
     try:
-        # Step 1: Create a new customer and user
-        subscription_plan = crud_subscription_plan.get_by_name(db, name="Free Trial Plan")
-        if not subscription_plan:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="'Free Trial Plan' subscription plan not found. System configuration error.")
-        
+        # Step 1: Dynamically find a subscription plan matching the requested modules
+        requested = registration.requested_modules or ["custody"]
+        wants_custody = "custody" in requested
+        wants_issuance = "issuance" in requested
+
+        # Query all active plans and find the best match
+        from app.models import SubscriptionPlan
+        all_plans = db.query(SubscriptionPlan).filter(
+            SubscriptionPlan.is_deleted == False,
+            SubscriptionPlan.has_custody_module == wants_custody,
+            SubscriptionPlan.has_issuance_module == wants_issuance,
+        ).all()
+
+        if not all_plans:
+            # Fallback: try the legacy "Free Trial Plan" for backward compatibility
+            subscription_plan = crud_subscription_plan.get_by_name(db, name="Free Trial Plan")
+            if not subscription_plan:
+                module_desc = " & ".join(m.replace("custody", "LG Custody").replace("issuance", "LG Issuance") for m in requested)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"No subscription plan found matching the requested modules ({module_desc}). "
+                           f"Please create a plan with has_custody_module={wants_custody} and has_issuance_module={wants_issuance} first."
+                )
+        else:
+            # Pick the cheapest plan (lowest monthly_price) — free trial plans would be 0
+            subscription_plan = sorted(all_plans, key=lambda p: p.monthly_price)[0]
+
+        logger.info(f"Matched subscription plan '{subscription_plan.name}' (ID: {subscription_plan.id}) for trial registration {registration_id}")
+
         # NEW: Generate a random password for the new user
         generated_password = 'Password123!'
 
@@ -2937,19 +3000,28 @@ async def approve_trial_registration(
         # Step 2: Update the registration status
         crud_trial_registration.update(db, registration, {"status": "approved", "customer_id": db_customer.id})
 
+        # Build module-aware text for the email
+        module_names = []
+        if wants_custody:
+            module_names.append("LG Custody")
+        if wants_issuance:
+            module_names.append("LG Issuance")
+        modules_text = " & ".join(module_names)
+
         # Step 3: Send approval email
         email_settings = get_global_email_settings()
-        subject = "Your LG Custody Free Trial is Ready!"
+        subject = f"Your {modules_text} Free Trial is Ready!"
         body = f"""
             <html><body>
                 <p>Hello {registration.contact_admin_name},</p>
-                <p>We're excited to confirm that your free trial account for the LG Custody Platform is now active!</p>
+                <p>We're excited to confirm that your free trial account for <strong>{modules_text}</strong> is now active!</p>
                 <p>To get started, please use the following temporary password to log in: <strong>{generated_password}</strong>. We highly recommend that you change this password immediately after your first login.</p>
                 <p><strong>Login Link:</strong> <a href="{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login">{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login</a></p>
                 <p>Your free trial will be active for {subscription_plan.duration_months} months, expiring on {db_customer.end_date.strftime('%Y-%m-%d')}.</p>
+                <p><strong>Plan:</strong> {subscription_plan.name}</p>
                 <p><strong>Quick Start Guide:</strong> Please find a quick-start guide attached to help you get started with the platform's core features.</p>
                 <p>Best regards,</p>
-                <p>The LG Custody Team</p>
+                <p>The Grow Business Development Team</p>
             </body></html>
         """
         if registration.entities_count == 'Multiple':
@@ -3034,6 +3106,96 @@ async def get_commercial_register_document_url(
     except Exception as e:
         logger.error(f"Error generating GCS URL: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not generate document URL.")
+
+# ==============================================================================
+# BANK FORM ISSUE REPORTS (System Owner — Cross-Customer View)
+# ==============================================================================
+
+@router.get("/bank-form-issues")
+def list_all_bank_form_issues(
+    status_filter: Optional[str] = Query(None, description="OPEN, IN_PROGRESS, RESOLVED, CLOSED, WONT_FIX"),
+    bank_id: Optional[int] = Query(None),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """System Owner: View all bank form issue reports across all customers."""
+    from app.models.models_issuance import BankFormIssueReport
+    from app.models import Bank, User
+
+    query = db.query(BankFormIssueReport)
+
+    if status_filter:
+        query = query.filter(BankFormIssueReport.status == status_filter)
+    if bank_id:
+        query = query.filter(BankFormIssueReport.bank_id == bank_id)
+
+    issues = query.order_by(BankFormIssueReport.created_at.desc()).offset(skip).limit(limit).all()
+
+    results = []
+    for issue in issues:
+        bank = db.query(Bank).filter(Bank.id == issue.bank_id).first()
+        reporter = db.query(User).filter(User.id == issue.reported_by_user_id).first()
+        customer = db.query(Customer).filter(Customer.id == issue.customer_id).first()
+        results.append({
+            "id": issue.id,
+            "customer_id": issue.customer_id,
+            "customer_name": customer.name if customer else None,
+            "reported_by_user_id": issue.reported_by_user_id,
+            "reported_by_email": reporter.email if reporter else None,
+            "bank_id": issue.bank_id,
+            "bank_name": bank.name if bank else None,
+            "form_config_id": issue.form_config_id,
+            "issue_type": issue.issue_type,
+            "description": issue.description,
+            "field_name": issue.field_name,
+            "severity": issue.severity,
+            "status": issue.status,
+            "resolution_notes": issue.resolution_notes,
+            "created_at": issue.created_at.isoformat() if issue.created_at else None,
+            "resolved_at": issue.resolved_at.isoformat() if issue.resolved_at else None,
+        })
+
+    return results
+
+
+@router.patch("/bank-form-issues/{issue_id}")
+def resolve_bank_form_issue(
+    issue_id: int,
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """System Owner: Update status and resolution notes for a bank form issue report."""
+    from app.models.models_issuance import BankFormIssueReport
+
+    issue = db.query(BankFormIssueReport).filter(BankFormIssueReport.id == issue_id).first()
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue report not found.")
+
+    if "status" in payload:
+        issue.status = payload["status"]
+    if "resolution_notes" in payload:
+        issue.resolution_notes = payload["resolution_notes"]
+    if payload.get("status") in ("RESOLVED", "CLOSED"):
+        issue.resolved_at = datetime.utcnow()
+
+    log_action(db, current_user.user_id, "BANK_FORM_ISSUE_RESOLVED",
+               "BankFormIssueReport", issue.id,
+               {"status": issue.status, "resolution_notes": issue.resolution_notes},
+               issue.customer_id)
+
+    db.commit()
+    db.refresh(issue)
+
+    return {
+        "message": f"Issue #{issue.id} updated to {issue.status}",
+        "id": issue.id,
+        "status": issue.status,
+        "resolution_notes": issue.resolution_notes,
+    }
+
 
 # Make sure the router inclusion remains at the bottom
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])

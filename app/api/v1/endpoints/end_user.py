@@ -471,11 +471,23 @@ async def scan_lg_file(
         customer_bucket = bucket_config.get("effective_value") if bucket_config else None
         # 2. Call AI with the specific bucket
         file_bytes = await file.read()
+        # 1. FETCH THE USER OBJECT
+        from app.models import User
+        user_obj = db.query(User).filter(User.id == end_user_context.user_id).first()
+        
+        # 2. VALIDATE USER EXISTS
+        if not user_obj:
+            logger.error(f"User ID {end_user_context.user_id} not found in database.")
+            raise HTTPException(status_code=404, detail="User context not found.")
+
+        # 3. CALL AI FUNCTION (Ensure variables match perfectly)
         extracted_ai_data, ai_usage_metadata = await process_lg_document_with_ai(
-            file_bytes, 
-            file.content_type, 
-            file.filename,
-            customer_bucket_name=customer_bucket # <--- Pass it here
+            file_bytes=file_bytes, 
+            mime_type=file.content_type, 
+            db=db,                         # Pass with name
+            current_user=user_obj,         # Pass with name
+            file_name=file.filename,       # Pass with name
+            customer_bucket_name=customer_bucket
         )
 
         if not extracted_ai_data:
@@ -586,6 +598,13 @@ async def scan_amendment_letter_file(
     if not lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
+    # --- SURGERY: Fetch User object for AI Logging ---
+    from app.models import User
+    user_obj = db.query(User).filter(User.id == end_user_context.user_id).first()
+    if not user_obj:
+        raise HTTPException(status_code=404, detail="User context not found.")
+    # ------------------------------------------------
+
     customer = crud_customer.get_with_relations(db, end_user_context.customer_id)
     if not customer or not customer.subscription_plan or not customer.subscription_plan.can_ai_integration:
         raise HTTPException(
@@ -604,39 +623,41 @@ async def scan_amendment_letter_file(
     lg_record_details_for_ai = {
         "lgNumber": lg_record.lg_number,
         "lgAmount": float(lg_record.lg_amount),
-        "expiryDate": lg_record.expiry_date.isoformat(),
-        "issuingBankName": lg_record.issuing_bank.name,
-        "beneficiaryName": lg_record.beneficiary_corporate.entity_name,
+        "expiryDate": lg_record.expiry_date.isoformat() if lg_record.expiry_date else None,
+        "issuingBankName": lg_record.issuing_bank.name if lg_record.issuing_bank else None,
+        "beneficiaryName": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else None,
         "issuerName": lg_record.issuer_name
     }
     
     try:
-        # Use the new, dedicated AI function for amendments
-        extracted_ai_data, _ = await process_amendment_with_ai(file_bytes, amendment_letter_file.content_type, lg_record_details=lg_record_details_for_ai)
+        # --- SURGERY: Call with required DB and User arguments ---
+        extracted_ai_data, _ = await process_amendment_with_ai(
+            file_bytes=file_bytes, 
+            mime_type=amendment_letter_file.content_type, 
+            db=db,                         # Required for logging
+            current_user=user_obj,         # Required for customer_id/user_id link
+            lg_record_details=lg_record_details_for_ai,
+            file_name=amendment_letter_file.filename
+        )
 
         if not extracted_ai_data:
-            # If AI returns no data, we raise a generic error for the frontend.
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="AI could not determine the amendment type. Please complete the form manually."
             )
 
-        # New logic to confirm relevance
-        # FIX: Check the 'is_relevant_amendment' flag returned by the AI.
         if not extracted_ai_data.get('is_relevant_amendment', False):
             return {"message": "AI could not confirm amendment is related to this specific LG. Please make sure you are amending the correct LG."}
 
-        # Filter out fields that didn't change according to AI
         ai_suggested_details = extracted_ai_data.get('amendedFields', {})
         
-        # Check if the AI successfully extracted any fields
         if not ai_suggested_details:
             return {"message": "AI analysis complete, but no amendments were detected. Please fill the details manually."}
 
         return {"ai_suggested_details": ai_suggested_details}
         
     except HTTPException as e:
-        logger.error(f"AI processing failed for amendment letter on LG {lg_record.lg_number}: {e.detail}", exc_info=True)
+        logger.error(f"AI processing failed for amendment letter on LG {lg_record.lg_number}: {e.detail}")
         raise e
     except Exception as e:
         logger.error(f"AI processing failed for amendment letter on LG {lg_record.lg_number}: {e}", exc_info=True)
@@ -644,7 +665,6 @@ async def scan_amendment_letter_file(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred during AI analysis. Please try again or proceed manually."
         )
-
 @router.get("/internal-owner-contacts/lookup-by-email/", response_model=Optional[InternalOwnerContactOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
 async def lookup_internal_owner_by_email(
     email: str = Query(..., description="Email of the internal owner contact to lookup"),

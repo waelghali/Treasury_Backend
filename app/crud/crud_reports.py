@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, date
 import decimal
 from typing import Any, Dict, List, Optional, Tuple, Type
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import func, and_, case, Date, cast, or_
+from sqlalchemy import func, and_, case, Date, cast, or_, text
 from fastapi import HTTPException, status
 from sqlalchemy.sql import func as sql_func
 from decimal import Decimal
@@ -96,6 +96,59 @@ class CRUDReports(CRUDBase):
             report_date=date.today(),
             data=report_data
         )
+
+
+    def get_ai_usage_summary(self, db: Session, start_date: date, end_date: date, customer_id: Optional[int] = None):
+        # Prepare the dynamic filter
+        customer_filter = "AND l.customer_id = :cid" if customer_id else ""
+        
+        # SQL using l.user_id and proper grouping
+        query_string = f"""
+            SELECT 
+                l.user_id,
+                l.customer_id,
+                COUNT(*) as request_count, 
+                SUM(l.prompt_tokens) as total_prompt_tokens, 
+                SUM(l.completion_tokens) as total_completion_tokens, 
+                SUM(l.total_tokens) as total_tokens
+            FROM ai_usage_logs l
+            WHERE DATE(l.created_at) >= :start 
+              AND DATE(l.created_at) <= :end
+              AND l.is_deleted = false
+              {customer_filter}
+            GROUP BY l.user_id, l.customer_id
+        """
+        
+        sql = text(query_string)
+        params = {"start": start_date, "end": end_date}
+        if customer_id:
+            params["cid"] = customer_id
+            
+        result = db.execute(sql, params).mappings().all()
+        
+        return [
+            {
+                "user_id": row["user_id"],
+                "customer_id": row["customer_id"],
+                "request_count": row["request_count"],
+                "prompt_tokens": row["total_prompt_tokens"] or 0,
+                "completion_tokens": row["total_completion_tokens"] or 0,
+                "total_tokens": row["total_tokens"] or 0
+            }
+            for row in result
+        ]
+        
+        return [
+            {
+                "user_id": row["user_id"],
+                "customer_id": row["customer_id"],
+                "request_count": row["request_count"],
+                "prompt_tokens": row["total_prompt_tokens"] or 0,
+                "completion_tokens": row["total_completion_tokens"] or 0,
+                "total_tokens": row["total_tokens"] or 0
+            }
+            for row in result
+        ]
 
     # --- NEW: Corporate Admin Report - Customer LG Performance ---
     def get_customer_lg_performance_report(
@@ -528,7 +581,6 @@ class CRUDReports(CRUDBase):
 
         internal_total_items = stalled_internal_base.all()
         bank_total_items = bank_ghosting_base.all()
-
         pipeline = {
             "internal_backlog_count": len(stalled_recommended),
             "bank_backlog_count": len(ghosting_recommended),
@@ -536,7 +588,7 @@ class CRUDReports(CRUDBase):
             "bank_backlog_total": len(bank_total_items),
             "completed_recently_count": flow_data.get("extensions_delivered_count", 0)
         }
-
+        ai_usage = self.get_ai_usage_summary(db, start_date, end_date, customer_id)
         return {
             "period_start": start_date,
             "period_end": end_date,
@@ -546,7 +598,8 @@ class CRUDReports(CRUDBase):
             "status_distribution": status_dist,
             "pipeline": pipeline,
             "risks": risks,
-            "efficiency": efficiency
+            "efficiency": efficiency,
+            "ai_usage": ai_usage
         }
 
     def get_chart_data(self, db: Session, report_type: str, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -795,7 +848,7 @@ class CRUDReports(CRUDBase):
                 try:
                     val_dec = Decimal(str(value))
                     return f"{val_dec:.2f}"
-                except:
+                except Exception:
                     return str(value)
 
             lg_amount_str = format_amount_to_string(lg.lg_amount)

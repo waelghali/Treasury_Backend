@@ -3,6 +3,7 @@
 from typing import List, Optional, Type, Dict, Any, Union # <-- ADD Union
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func, desc
+from sqlalchemy import and_, or_
 from fastapi import HTTPException, status
 from datetime import datetime, date, timedelta
 import json
@@ -10,6 +11,7 @@ import decimal
 from app.core.ai_integration import delete_file_from_gcs
 from app.crud.crud import CRUDBase, log_action
 import app.models as models
+
 from app.schemas.all_schemas import (
     ApprovalRequestCreate, ApprovalRequestUpdate, LGRecordUpdate, LGInstructionUpdate,
     LGRecordChangeOwner, InternalOwnerContactUpdateDetails,
@@ -45,6 +47,47 @@ from app.core.email_service import EmailSettings, get_global_email_settings, sen
 
 import logging
 logger = logging.getLogger(__name__)
+
+def get_best_matching_matrix(
+    db: Session, 
+    customer_id: int, 
+    module: str, 
+    entity_id: Optional[int] = None, 
+    action_type: Optional[str] = None
+) -> Optional[models.ApprovalMatrix]:
+    # Query active matrices for this customer and module
+    candidates = db.query(models.ApprovalMatrix).filter(
+        models.ApprovalMatrix.customer_id == customer_id,
+        models.ApprovalMatrix.module == module,
+        models.ApprovalMatrix.is_active == True
+    ).all()
+    
+    if not candidates:
+        return None
+
+    best_score = -1
+    selected_matrix = None
+
+    for matrix in candidates:
+        score = 0
+        # Entity Match check
+        if matrix.entity_id:
+            if matrix.entity_id == entity_id:
+                score += 10
+            else:
+                continue
+        # Action Type Match check
+        if matrix.action_type:
+            if matrix.action_type == action_type:
+                score += 5
+            else:
+                continue
+        
+        score += (matrix.priority / 100)
+        if score > best_score:
+            best_score = score
+            selected_matrix = matrix
+    return selected_matrix
 
 def _nuke_document(db: Session, request_details: dict):
     """Finds document ID in details, deletes file from Cloud, deletes record from DB."""
@@ -101,7 +144,6 @@ class CRUDApprovalRequest(CRUDBase):
             "manager_email": owner_contact.manager_email,
         }
 
-    # CONVERTED TO ASYNC METHOD
     async def create_approval_request(
         self,
         db: Session,
@@ -111,6 +153,7 @@ class CRUDApprovalRequest(CRUDBase):
         lg_record: Optional[models.LGRecord] = None,
         internal_owner_contact: Optional[models.InternalOwnerContact] = None
     ) -> models.ApprovalRequest:
+        # 1. Prepare data exactly as before
         create_data = obj_in.model_dump()
         create_data["maker_user_id"] = maker_user_id
         create_data["customer_id"] = customer_id
@@ -123,11 +166,56 @@ class CRUDApprovalRequest(CRUDBase):
         else:
             create_data["lg_record_snapshot"] = {}
 
+        # 2. Create the main object
         db_obj = self.model(**create_data)
         db.add(db_obj)
-        db.flush()
-        db.refresh(db_obj)
+        db.flush() # Secure the ID for the steps
 
+        # 3. WORKFLOW ENGINE: Identify Module and find Matrix
+        module_type = "ISSUANCE" if obj_in.action_type == "LG_ISSUANCE_REQUEST" else "CUSTODY"
+        current_entity_id = obj_in.entity_id if obj_in.entity_id else None
+        
+        matrix = get_best_matching_matrix(
+            db, 
+            customer_id=customer_id,
+            module=module_type,
+            entity_id=current_entity_id,
+            action_type=obj_in.action_type
+        )
+
+        if matrix and matrix.levels:
+            # MATRIX PATH: Create steps based on the matrix
+            sorted_levels = sorted(matrix.levels, key=lambda x: x.level_order)
+            for level in sorted_levels:
+                new_step = models.ApprovalRequestStep(
+                    approval_request_id=db_obj.id,
+                    approver_id=level.approver_id,
+                    step_order=level.level_order,
+                    status=ApprovalRequestStatusEnum.PENDING if level.level_order == 1 else "WAITING"
+                )
+                db.add(new_step)
+            # Use the first person in the matrix as the primary checker
+            db_obj.checker_user_id = sorted_levels[0].approver_id
+        else:
+            # LEGACY PATH: Do EXACTLY what the code did before
+            # If obj_in.checker_user_id is None, db_obj.checker_user_id will be None.
+            # This is how your Liquidation/Custody worked before.
+            db_obj.checker_user_id = obj_in.checker_user_id
+            
+            # Only create a tracking step if we actually have an ID to track
+            if db_obj.checker_user_id:
+                legacy_step = models.ApprovalRequestStep(
+                    approval_request_id=db_obj.id,
+                    approver_id=db_obj.checker_user_id,
+                    step_order=1,
+                    status=ApprovalRequestStatusEnum.PENDING
+                )
+                db.add(legacy_step)
+
+        # No more HTTPExceptions, no more mandatory role checks.
+        db.flush()
+
+        # 4. Log and Notify (Remaining identical to your original code)
         log_action(
             db,
             user_id=maker_user_id,
@@ -139,16 +227,15 @@ class CRUDApprovalRequest(CRUDBase):
                 "entity_id_requested": db_obj.entity_id,
                 "action_type_requested": db_obj.action_type,
                 "request_details_summary": str(db_obj.request_details)[:200],
-                "snapshot_at_request": db_obj.lg_record_snapshot
+                "snapshot_at_request": db_obj.lg_record_snapshot,
+                "workflow_type": "MATRIX" if matrix else "LEGACY"
             },
             customer_id=customer_id,
             lg_record_id=db_obj.entity_id if db_obj.entity_type == "LGRecord" else None,
         )
 
-        # --- FIX START: Await the async notification function ---
         try:
-            # The function signature of _send_pending_approval_notification should remain async
-            await self._send_pending_approval_notification(db, db_obj) # <--- ADDED AWAIT HERE
+            await self._send_pending_approval_notification(db, db_obj) 
         except Exception as e:
             logger.error(f"Failed to send pending approval notification for request ID {db_obj.id}: {e}", exc_info=True)
             log_action(
@@ -164,7 +251,6 @@ class CRUDApprovalRequest(CRUDBase):
                 customer_id=customer_id,
                 lg_record_id=db_obj.entity_id if db_obj.entity_type == "LGRecord" else None,
             )
-        # --- FIX END ---
 
         return db_obj
 

@@ -319,7 +319,10 @@ class AuthService:
             "must_accept_policies": must_accept_policies,
             "last_accepted_legal_version": user.last_accepted_legal_version,
             "subscription_status": user.customer.status.value if user.customer else None,
-            "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None
+            "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None,
+            # Module access flags from subscription plan
+            "has_custody_module": user.customer.subscription_plan.has_custody_module if user.customer and user.customer.subscription_plan else True,
+            "has_issuance_module": user.customer.subscription_plan.has_issuance_module if user.customer and user.customer.subscription_plan else False,
         }
 
         access_token = create_access_token(data=token_data)

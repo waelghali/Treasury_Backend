@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
-from app.models_issuance import IssuanceRequest, IssuanceFacility, IssuedLGRecord
+from app.models.models_issuance import IssuanceRequest, IssuanceFacility, IssuedLGRecord
 from sqlalchemy.orm import Session
 from app.core.document_generator import generate_pdf_from_html
 import datetime
@@ -61,16 +61,17 @@ class ManualPdfStrategy(IssuanceStrategy):
 
 # --- STRATEGY 2: API INTEGRATION (Bank B) ---
 class BankApiStrategy(IssuanceStrategy):
-    def execute(self, db: Session, request: IssuanceRequest, facility: IssuanceFacility, user_id: int) -> Dict[str, Any]:
-        endpoint = facility.issuance_method_config.get("api_endpoint")
+    async def execute(self, db: Session, request: IssuanceRequest, facility: IssuanceFacility, config: Dict[str, Any]) -> Dict[str, Any]:
+        endpoint = config.get("api_endpoint")
+        if not endpoint:
+            raise Exception("API endpoint not configured for this bank method")
         
-        # 1. Call External Bank API
-        # response = requests.post(endpoint, json=request.business_details)
-        # bank_ref = response.json().get("id")
-        bank_ref = f"BANK-API-{request.id}" # Placeholder
+        # 1. Call External Bank API (Placeholder for actual implementation)
+        # In a real scenario, use httpx.AsyncClient here
+        bank_ref = f"BANK-API-{request.id}"
         
         return {
-            "status": "PROCESSING_BANK", # Automatically sent
+            "status": "PROCESSING_BANK", 
             "output_type": "API_REF",
             "output_data": bank_ref,
             "message": "Request submitted to Bank Portal. Authorized Signatory must approve there."
@@ -78,9 +79,9 @@ class BankApiStrategy(IssuanceStrategy):
 
 # --- STRATEGY 3: PRE-PRINTED FORM (Bank D) ---
 class PrePrintedFormStrategy(IssuanceStrategy):
-    def execute(self, db: Session, request: IssuanceRequest, facility: IssuanceFacility, user_id: int) -> Dict[str, Any]:
+    async def execute(self, db: Session, request: IssuanceRequest, facility: IssuanceFacility, config: Dict[str, Any]) -> Dict[str, Any]:
         # 1. Generate PDF with NO Background (Just text overlay)
-        # coordinate_map = facility.issuance_method_config.get("coordinates")
+        # coordinate_map = config.get("coordinates")
         pdf_path = f"generated_lgs/overlay_{request.id}.pdf"
         
         return {
@@ -96,7 +97,7 @@ class IssuanceStrategyFactory:
     def get_strategy(method_name: str) -> IssuanceStrategy:
         if method_name == "MANUAL_PDF":
             return ManualPdfStrategy()
-        elif method_name == "BANK_API_V1":
+        elif method_name in ["BANK_API_V1", "BANK_API"]:
             return BankApiStrategy()
         elif method_name == "PRE_PRINTED_FORM":
             return PrePrintedFormStrategy()

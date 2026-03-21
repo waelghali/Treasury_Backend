@@ -1,5 +1,5 @@
 # app/schemas/all_schemas.py
-from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field, field_validator
+from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field, field_validator, ConfigDict
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Union
 from enum import Enum
@@ -34,6 +34,13 @@ class SubscriptionPlanBase(BaseModel):
     can_multi_entity: bool = Field(False, description="Enables multi-entity support for customers on this plan")
     can_ai_integration: bool = Field(False, description="Enables AI integration features for customers on this plan")
     can_image_storage: bool = Field(False, description="Enables image storage features for customers on this plan")
+    
+    # NEW: Modular Subscription Toggles
+    has_custody_module: bool = Field(True, description="Allows access to Phase 1: LG Custody module")
+    has_issuance_module: bool = Field(False, description="Allows access to Phase 2: LG Issuance module")
+    max_issuance_records: int = Field(0, ge=0, description="Maximum number of Issued LG records allowed under this plan")
+    max_checker_users: int = Field(0, ge=0, description="Maximum number of users allowed with the CHECKER role specifically")
+    
     # NEW: Grace period in days
     grace_period_days: int = Field(30, ge=0, description="Grace period in days after subscription end date.")
 
@@ -52,6 +59,13 @@ class SubscriptionPlanUpdate(SubscriptionPlanBase):
     can_multi_entity: Optional[bool] = None
     can_ai_integration: Optional[bool] = None
     can_image_storage: Optional[bool] = None
+    
+    # NEW: Modular Subscription Toggles
+    has_custody_module: Optional[bool] = None
+    has_issuance_module: Optional[bool] = None
+    max_issuance_records: Optional[int] = Field(None, ge=0)
+    max_checker_users: Optional[int] = Field(None, ge=0)
+    
     # NEW: Grace period update
     grace_period_days: Optional[int] = Field(None, ge=0)
 
@@ -250,6 +264,7 @@ class TrialRegistrationBase(BaseModel):
     contact_phone: str = Field(..., description="Contact phone number.")
     admin_email: EmailStr = Field(..., description="Email of the super admin.")
     entities_count: str = Field(..., description="Number of entities ('One' or 'Multiple').")
+    requested_modules: List[str] = Field(default=["custody"], description="List of requested modules: 'custody', 'issuance', or both.")
     commercial_register_document_path: str = Field(..., description="Path to the uploaded commercial register document.")
     accepted_terms_version: float = Field(..., description="Version of the terms accepted by the user.")
 
@@ -295,6 +310,7 @@ class CustomerUpdate(CustomerBase):
     contact_email: Optional[EmailStr] = None
     contact_phone: Optional[str] = Field(None, max_length=50)
     subscription_plan_id: Optional[int] = None
+    domains: Optional[List[str]] = Field(None, description="List of email domains for this customer (e.g., ['acmecorp.com', 'acme-group.com'])")
     # NEW: Prevent updating these fields via API as they are managed by the system
     start_date: Any = Field(None, exclude=True)
     end_date: Any = Field(None, exclude=True)
@@ -306,12 +322,15 @@ class CustomerOut(CustomerBase, BaseSchema):
     users: List[UserOut] = []
     customer_email_settings: Optional["CustomerEmailSettingOut"] = None
     templates: List["TemplateOut"] = []
+    domains: Optional[List[str]] = Field(None, description="List of email domains for this customer")
     # NEW: Expose subscription lifecycle fields
     start_date: datetime
     end_date: datetime
     status: SubscriptionStatus
     active_user_count: int
+    active_checker_count: int
     active_lg_count: int
+    active_issuance_lg_count: int
 
 class GlobalConfigurationBase(BaseModel):
     key: GlobalConfigKey = Field(..., description="Unique key for the configuration setting")
@@ -1598,6 +1617,17 @@ class OpsHealthEfficiencyOut(BaseModel):
     class Config:
         from_attributes = True
 
+class AiUsageSummary(BaseModel):
+    user_id: int  # Changed from str to int to match database input: 5
+    customer_id: Optional[int]
+    request_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+    class Config:
+        from_attributes = True
+
 class OpsHealthReportOut(BaseModel):
     report_date: date
     period_start: date
@@ -1608,6 +1638,94 @@ class OpsHealthReportOut(BaseModel):
     pipeline: OpsHealthPipelineOut
     risks: OpsHealthRiskOut
     efficiency: OpsHealthEfficiencyOut
+    ai_usage: List[AiUsageSummary]
 
 class RenewRequest(BaseModel):
     new_subscription_end_date: Optional[datetime] = None
+
+# --- Matrix Level Schemas ---
+class ApprovalMatrixLevelBase(BaseModel):
+    level_order: int
+    approver_id: int
+
+class ApprovalMatrixLevelCreate(ApprovalMatrixLevelBase):
+    pass
+
+class ApprovalMatrixLevel(ApprovalMatrixLevelBase):
+    id: int
+    model_config = ConfigDict(from_attributes=True) # Pydantic V2 style
+
+# --- Matrix Schemas ---
+class ApprovalMatrixBase(BaseModel):
+    name: str
+    module: str = "CUSTODY"
+    action_type: Optional[str] = None
+    entity_id: Optional[int] = None
+    priority: int = 0
+    is_active: bool = True
+    conditions_json: Optional[Dict[str, Any]] = None
+
+class ApprovalMatrixCreate(ApprovalMatrixBase):
+    customer_id: int
+    levels: List[ApprovalMatrixLevelCreate]
+
+class ApprovalMatrix(ApprovalMatrixBase):
+    id: int
+    customer_id: int
+    levels: List[ApprovalMatrixLevel]
+    model_config = ConfigDict(from_attributes=True) # Pydantic V2 style
+
+# --- NEW: Organization & Teams Schemas ---
+
+class DepartmentBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Name of the department")
+    manager_id: Optional[int] = Field(None, description="User ID of the department manager")
+
+class DepartmentCreate(DepartmentBase):
+    pass
+
+class DepartmentUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    manager_id: Optional[int] = None
+
+class DepartmentOut(DepartmentBase, BaseSchema):
+    customer_id: int
+    manager_email: Optional[str] = None # Helpful for UI display
+
+    class Config:
+        from_attributes = True
+
+class ApprovalGroupBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Name of the custom approval group")
+
+class ApprovalGroupCreate(ApprovalGroupBase):
+    user_ids: List[int] = Field(default_factory=list, description="List of User IDs to include in this group")
+
+class ApprovalGroupUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    user_ids: Optional[List[int]] = Field(None, description="List of User IDs to include in this group")
+
+class ApprovalGroupOut(ApprovalGroupBase, BaseSchema):
+    customer_id: int
+    users: List[UserOut] = [] # Full user objects for the UI dual-listbox
+
+    class Config:
+        from_attributes = True
+
+# app/schemas/all_schemas.py
+
+class AIUsageLogBase(BaseModel):
+    doc_name: Optional[str] = None
+    model_name: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    ocr_characters: int
+    total_pages: int
+
+class AIUsageLogOut(AIUsageLogBase, BaseSchema):
+    customer_id: int
+    user_id: int
+
+    class Config:
+        from_attributes = True

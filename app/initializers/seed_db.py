@@ -587,8 +587,7 @@ async def seed_db():
             {"key": GlobalConfigKey.DAYS_FOR_FIRST_PRINT_REMINDER, "value_min": "1", "value_max": "10", "value_default": "2", "unit": "days", "description": "Days after approval when the first reminder to print a bank letter is sent to the maker."},
             {"key": GlobalConfigKey.DAYS_FOR_PRINT_ESCALATION, "value_min": "3", "value_max": "15", "value_default": "5", "unit": "days", "description": "Days after approval when an escalation email is sent to the maker and checker if the bank letter is still not printed."},
             # NEW: Global Configs for Renewal Reminders to Users & Admins (Feature 1)
-            {"key": GlobalConfigKey.RENEWAL_REMINDER_FIRST_THRESHOLD_DAYS, "value_min": "1", "value_max": "30", "value_default": "7", "unit": "days", "description": "Number of days BEFORE auto/forced renewal threshold to send the first renewal reminder to users/admins. (e.g., if auto-renew is 30 days, and this is 7 days, first reminder is at 37 days)."},
-            {"key": GlobalConfigKey.RENEWAL_REMINDER_SECOND_THRESHOLD_DAYS, "value_min": "1", "value_max": "30", "value_default": "14", "unit": "days", "description": "Number of days BEFORE auto/forced renewal threshold to send the second (escalation) renewal reminder to users/admins. (e.g., if auto-renew is 30 days, and this is 14 days, second reminder is at 44 days)."},
+
             # NEW: Auth V2 password policy configs
             {"key": GlobalConfigKey.PASSWORD_MIN_LENGTH, "value_min": "8", "value_max": "64", "value_default": "8", "unit": "characters", "description": "Minimum length for user passwords."},
             {"key": GlobalConfigKey.PASSWORD_REQUIRE_UPPERCASE, "value_min": "false", "value_max": "true", "value_default": "true", "unit": "boolean", "description": "Require at least one uppercase letter in passwords."},
@@ -596,19 +595,19 @@ async def seed_db():
             {"key": GlobalConfigKey.PASSWORD_REQUIRE_DIGIT, "value_min": "false", "value_max": "true", "value_default": "true", "unit": "boolean", "description": "Require at least one digit in passwords."},
             {"key": GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES, "value_min": "5", "value_max": "120", "value_default": "15", "unit": "minutes", "description": "Expiration time for password reset tokens in minutes."},
             {"key": GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_REPORT_UNDELIVERED, "value_min": "1", "value_max": "60", "value_default": "3", "unit": "days", "description": "Minimum days after instruction issuance to stop suggesting undelivered report."},
-            {"key": GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED, "value_min": "1", "value_max": "60", "value_default": "3", "unit": "days", "description": "Minimum days after instruction issuance to stop suggesting undelivered report."},
+            {"key": GlobalConfigKey.NUMBER_OF_DAYS_SINCE_ISSUANCE_TO_STOP_REPORTING_UNDELIVERED, "value_min": "1", "value_max": "60", "value_default": "30", "unit": "days", "description": "Maximum days after instruction issuance to stop reporting undelivered. Must be greater than REPORT_UNDELIVERED."},
             {"key": GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE, "value_min": "1", "value_max": "60", "value_default": "3", "unit": "days", "description": "Minimum days after instruction issuance to send reminder to bank."},
             {"key": GlobalConfigKey.DAYS_FOR_FIRST_PRINT_REMINDER, "value_min": "1", "value_max": "10", "value_default": "2", "unit": "days", "description": "Days after approval when the first reminder to print a bank letter is sent to the maker."},
             {"key": GlobalConfigKey.DAYS_FOR_PRINT_ESCALATION, "value_min": "3", "value_max": "15", "value_default": "5", "unit": "days", "description": "Days after approval when an escalation email is sent to the maker and checker if the bank letter is still not printed."},
-            {"key": GlobalConfigKey.RENEWAL_REMINDER_FIRST_THRESHOLD_DAYS, "value_min": "1", "value_max": "30", "value_default": "7", "unit": "days", "description": "Number of days BEFORE auto/forced renewal threshold to send the first renewal reminder to users/admins."},
-            {"key": GlobalConfigKey.RENEWAL_REMINDER_SECOND_THRESHOLD_DAYS, "value_min": "1", "value_max": "30", "value_default": "14", "unit": "days", "description": "Number of days BEFORE auto/forced renewal threshold to send the second (escalation) renewal reminder to users/admins."},
             {"key": GlobalConfigKey.GRACE_PERIOD_DAYS, "value_min": "30", "value_max": "30", "value_default": "30", "unit": "days", "description": "Number of days after subscription end date to remain in a read-only state."},
             {"key": GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE, "value_min": "1", "value_max": "60", "value_default": "3", "unit": "days", "description": "Minimum days after instruction issuance to send reminder to bank."},
             {"key": GlobalConfigKey.DAYS_FOR_FIRST_PRINT_REMINDER, "value_min": "1", "value_max": "10", "value_default": "2", "unit": "days", "description": "Days after approval when the first reminder to print a bank letter is sent to the maker."},
             {"key": GlobalConfigKey.DAYS_FOR_PRINT_ESCALATION, "value_min": "3", "value_max": "15", "value_default": "5", "unit": "days", "description": "Days after approval when an escalation email is sent to the maker and checker if the bank letter is still not printed."},
-            {"key": GlobalConfigKey.RENEWAL_REMINDER_FIRST_THRESHOLD_DAYS, "value_min": "1", "value_max": "30", "value_default": "7", "unit": "days", "description": "Number of days BEFORE auto/forced renewal threshold to send the first renewal reminder to users/admins."},
-            {"key": GlobalConfigKey.RENEWAL_REMINDER_SECOND_THRESHOLD_DAYS, "value_min": "1", "value_max": "30", "value_default": "14", "unit": "days", "description": "Number of days BEFORE auto/forced renewal threshold to send the second (escalation) renewal reminder to users/admins."},
-            {"key": GlobalConfigKey.GRACE_PERIOD_DAYS, "value_min": "1", "value_max": "90", "value_default": "30", "unit": "days", "description": "Number of days after subscription end date to remain in a read-only state."}
+
+            {"key": GlobalConfigKey.GRACE_PERIOD_DAYS, "value_min": "1", "value_max": "90", "value_default": "30", "unit": "days", "description": "Number of days after subscription end date to remain in a read-only state."},
+
+            # G5: Reconciliation overdue reminder
+            {"key": GlobalConfigKey.DAYS_FOR_RECONCILIATION_REMINDER, "value_min": "7", "value_max": "365", "value_default": "60", "unit": "days", "description": "Days since last completed reconciliation before sending an overdue alert to Corp Admin."},
         ]
         for config_data in global_configs_to_seed:
             try:
@@ -1419,6 +1418,215 @@ async def seed_db():
                 customer_id=None,
                 is_notification_template=True,
                 subject="Urgent: Print Escalation for LG #{{lg_number}}"
+            ),
+            # ── ISSUANCE MAINTENANCE TEMPLATES (F1) ─────────────────
+            TemplateCreate(
+                name="Issuance - Extension Request Letter",
+                template_type="LETTER",
+                action_type="LG_EXTEND_REQUEST",
+                content="""
+                <html>
+                <body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 40px;">
+                    <div style="max-width: 700px; margin: auto;">
+                        <p style="text-align: right;">Date: {{current_date}}</p>
+                        <p style="text-align: right;">Serial: {{serial_number}}</p>
+                        <h2>Instruction to Extend Letter of Guarantee</h2>
+                        <p>To: <strong>{{bank_name}}</strong></p>
+                        <p>From: <strong>{{customer_name}}</strong> ({{entity_name}})</p>
+                        <hr/>
+                        <p>Kindly arrange to extend Letter of Guarantee referenced below:</p>
+                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">LG Reference</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{lg_ref_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Bank LG Number</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{bank_lg_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Current Expiry Date</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{old_expiry_date}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">New Expiry Date</td>
+                                <td style="padding:8px;border:1px solid #ddd;color:#059669;font-weight:bold;">{{new_expiry_date}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{current_amount}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Beneficiary</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{beneficiary_name}}</td></tr>
+                        </table>
+                        <p>{{action_notes}}</p>
+                        <p>Your prompt attention to this matter is appreciated.</p>
+                        <br/><p>Sincerely,<br/>{{customer_name}}</p>
+                    </div>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=False,
+                subject="Instruction to Extend LG {{lg_ref_number}}"
+            ),
+            TemplateCreate(
+                name="Issuance - Increase Amount Request Letter",
+                template_type="LETTER",
+                action_type="LG_INCREASE_REQUEST",
+                content="""
+                <html>
+                <body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 40px;">
+                    <div style="max-width: 700px; margin: auto;">
+                        <p style="text-align: right;">Date: {{current_date}}</p>
+                        <p style="text-align: right;">Serial: {{serial_number}}</p>
+                        <h2>Instruction to Increase Letter of Guarantee Amount</h2>
+                        <p>To: <strong>{{bank_name}}</strong></p>
+                        <p>From: <strong>{{customer_name}}</strong> ({{entity_name}})</p>
+                        <hr/>
+                        <p>Kindly arrange to increase the amount of Letter of Guarantee referenced below:</p>
+                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">LG Reference</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{lg_ref_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Bank LG Number</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{bank_lg_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Current Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{old_amount}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">New Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;color:#059669;font-weight:bold;">{{new_amount}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Increase By</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{increase_delta}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Beneficiary</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{beneficiary_name}}</td></tr>
+                        </table>
+                        <p>{{action_notes}}</p>
+                        <p>Your prompt attention to this matter is appreciated.</p>
+                        <br/><p>Sincerely,<br/>{{customer_name}}</p>
+                    </div>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=False,
+                subject="Instruction to Increase LG Amount {{lg_ref_number}}"
+            ),
+            TemplateCreate(
+                name="Issuance - Close/Return Request Letter",
+                template_type="LETTER",
+                action_type="LG_CLOSE_REQUEST",
+                content="""
+                <html>
+                <body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 40px;">
+                    <div style="max-width: 700px; margin: auto;">
+                        <p style="text-align: right;">Date: {{current_date}}</p>
+                        <p style="text-align: right;">Serial: {{serial_number}}</p>
+                        <h2>Instruction to Close/Return Letter of Guarantee</h2>
+                        <p>To: <strong>{{bank_name}}</strong></p>
+                        <p>From: <strong>{{customer_name}}</strong> ({{entity_name}})</p>
+                        <hr/>
+                        <p>Please be advised that Letter of Guarantee referenced below is no longer required and should be closed/returned:</p>
+                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">LG Reference</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{lg_ref_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Bank LG Number</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{bank_lg_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{current_amount}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Beneficiary</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{beneficiary_name}}</td></tr>
+                        </table>
+                        <p>{{action_notes}}</p>
+                        <p>Kindly confirm the closure and return the original LG to us.</p>
+                        <br/><p>Sincerely,<br/>{{customer_name}}</p>
+                    </div>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=False,
+                subject="Instruction to Close LG {{lg_ref_number}}"
+            ),
+            TemplateCreate(
+                name="Issuance - Amendment Request Letter",
+                template_type="LETTER",
+                action_type="LG_AMENDMENT_REQUEST",
+                content="""
+                <html>
+                <body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 40px;">
+                    <div style="max-width: 700px; margin: auto;">
+                        <p style="text-align: right;">Date: {{current_date}}</p>
+                        <p style="text-align: right;">Serial: {{serial_number}}</p>
+                        <h2>Instruction to Amend Letter of Guarantee</h2>
+                        <p>To: <strong>{{bank_name}}</strong></p>
+                        <p>From: <strong>{{customer_name}}</strong> ({{entity_name}})</p>
+                        <hr/>
+                        <p>Kindly arrange to amend Letter of Guarantee referenced below as detailed:</p>
+                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">LG Reference</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{lg_ref_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Bank LG Number</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{bank_lg_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Current Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{current_amount}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Beneficiary</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{beneficiary_name}}</td></tr>
+                        </table>
+                        <h3>Amendment Details:</h3>
+                        <p>{{amendment_details}}</p>
+                        <p>{{action_notes}}</p>
+                        <p>Kindly confirm the amendment and process accordingly.</p>
+                        <br/><p>Sincerely,<br/>{{customer_name}}</p>
+                    </div>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=False,
+                subject="Instruction to Amend LG {{lg_ref_number}}"
+            ),
+            TemplateCreate(
+                name="Issuance - Activate Non-Operative Request Letter",
+                template_type="LETTER",
+                action_type="LG_ACTIVATE_REQUEST",
+                content="""
+                <html>
+                <body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 40px;">
+                    <div style="max-width: 700px; margin: auto;">
+                        <p style="text-align: right;">Date: {{current_date}}</p>
+                        <p style="text-align: right;">Serial: {{serial_number}}</p>
+                        <h2>Instruction to Activate Non-Operative Letter of Guarantee</h2>
+                        <p>To: <strong>{{bank_name}}</strong></p>
+                        <p>From: <strong>{{customer_name}}</strong> ({{entity_name}})</p>
+                        <hr/>
+                        <p>Please arrange to activate the non-operative Advance Payment LG referenced below. This guarantee becomes operative upon receipt of payment as follows:</p>
+                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">LG Reference</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{lg_ref_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Bank LG Number</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{bank_lg_number}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">LG Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{current_amount}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Beneficiary</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{beneficiary_name}}</td></tr>
+                        </table>
+                        <h3>Payment Details:</h3>
+                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Payment Method</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{payment_method}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Payment Amount</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{payment_amount_formatted}} {{currency_code}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Payment Reference</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{payment_reference}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Payment Date</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{payment_date}}</td></tr>
+                            <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Issuing Bank</td>
+                                <td style="padding:8px;border:1px solid #ddd;">{{payment_issuing_bank_name}}</td></tr>
+                        </table>
+                        <p>{{action_notes}}</p>
+                        <p>Kindly confirm the activation of this guarantee.</p>
+                        <br/><p>Sincerely,<br/>{{customer_name}}</p>
+                    </div>
+                </body>
+                </html>
+                """,
+                is_global=True,
+                customer_id=None,
+                is_notification_template=False,
+                subject="Instruction to Activate LG {{lg_ref_number}}"
             ),
         ]
 
