@@ -1225,7 +1225,7 @@ def restore_customer_email_settings(
 @router.get(
     "/approval-requests/",
     response_model=List[ApprovalRequestOut],
-    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
+    dependencies=[Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
     summary="List all approval requests for the Corporate Admin's customer"
 )
 def list_approval_requests(
@@ -1256,7 +1256,7 @@ def list_approval_requests(
 @router.get(
     "/approval-requests/{request_id}",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
+    dependencies=[Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
     summary="Get details of a specific approval request"
 )
 def get_approval_request_details(
@@ -1281,7 +1281,7 @@ def get_approval_request_details(
 @router.post(
     "/approval-requests/{request_id}/approve",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:approve")), Depends(check_for_read_only_mode)],
+    dependencies=[Depends(HasPermission("approval_request:approve")), Depends(check_for_read_only_mode)],
     summary="Approve a pending approval request"
 )
 async def approve_approval_request(
@@ -1336,7 +1336,7 @@ async def approve_approval_request(
 @router.post(
     "/approval-requests/{request_id}/reject",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(require_issuance_module), Depends(HasPermission("approval_request:reject")), Depends(check_for_read_only_mode)],
+    dependencies=[Depends(HasPermission("approval_request:reject")), Depends(check_for_read_only_mode)],
     summary="Reject a pending approval request"
 )
 async def reject_approval_request(
