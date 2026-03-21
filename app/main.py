@@ -106,8 +106,8 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
-    from app.core.security import require_issuance_module, require_custody_module
-    fastapi_app.include_router(issuance_endpoints.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_module)])
+    from app.core.security import require_issuance_module, require_custody_module, require_issuance_or_custody_module
+    fastapi_app.include_router(issuance_endpoints.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_or_custody_module)])
     fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])
     fastapi_app.include_router(public_issuance.router, prefix="/api/v1/public-issuance", tags=["Public Issuance Portal"])
     fastapi_app.include_router(notification_endpoints.router, prefix="/api/v1/notifications", tags=["Notifications"])

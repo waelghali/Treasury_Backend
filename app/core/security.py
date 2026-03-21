@@ -315,3 +315,16 @@ async def require_custody_module(current_user: TokenData = Depends(check_subscri
             detail="Your subscription does not include the LG Custody module."
         )
     return current_user
+
+
+async def require_issuance_or_custody_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Allows access if the customer has EITHER the Issuance or Custody module.
+    Used as the router-level guard for shared endpoints (Approval Center, change requests, etc.)."""
+    if current_user.role == UserRole.SYSTEM_OWNER:
+        return current_user
+    if not current_user.has_issuance_module and not current_user.has_custody_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your subscription does not include any active modules."
+        )
+    return current_user
