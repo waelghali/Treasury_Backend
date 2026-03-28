@@ -221,7 +221,7 @@ class CRUDCustomer(CRUDBase):
         # Soft delete related entities and users
         for entity in db_obj.entities:
             if not entity.is_deleted:
-                self.crud_customer_entity_instance.soft_delete(db, entity, user_id)
+                self.crud_customer_entity_instance.soft_delete(db, entity, user_id, force=True)
         for user in db_obj.users:
             if not user.is_deleted:
                 self.crud_user_instance.soft_delete(db, user, user_id)
@@ -456,10 +456,10 @@ class CRUDCustomerEntity(CRUDBase):
         log_action(db, user_id=user_id, action_type=AUDIT_ACTION_TYPE_UPDATE, entity_type="CustomerEntity", entity_id=db_obj.id, details={"name": db_obj.entity_name, "changes": updated_entity._changed_fields_for_log}, customer_id=db_obj.customer_id)
         return updated_entity
 
-    def soft_delete(self, db: Session, db_obj: models.CustomerEntity, user_id: Optional[int] = None) -> models.CustomerEntity:
-        # Check if it's the last active entity on a single-entity plan
+    def soft_delete(self, db: Session, db_obj: models.CustomerEntity, user_id: Optional[int] = None, force: bool = False) -> models.CustomerEntity:
+        # Check if it's the last active entity on a single-entity plan (skip when deleting entire customer)
         customer = db.query(models.Customer).options(selectinload(models.Customer.subscription_plan)).filter(models.Customer.id == db_obj.customer_id).first()
-        if customer and not customer.subscription_plan.can_multi_entity:
+        if not force and customer and not customer.subscription_plan.can_multi_entity:
             active_entities_count = db.query(self.model).filter(
                 self.model.customer_id == db_obj.customer_id,
                 self.model.is_deleted == False,

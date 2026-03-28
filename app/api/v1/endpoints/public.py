@@ -20,62 +20,37 @@ from app.core.email_service import get_global_email_settings, send_email, EmailA
 from app.core.document_generator import generate_pdf_from_html
 from app.constants import GlobalConfigKey, LegalArtifactType
 
-# *** NEW: Import for Google Cloud Storage (GCS) ***
-from google.cloud import storage
-
+# *** FIXED: Use storage.Client() inside function (not at module level) ***
 import logging
+from google.cloud import storage as gcs_storage
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# --- Google Cloud Storage Configuration ---
-# WARNING: Replace 'your-gcs-bucket-name' with your actual bucket name and ensure
-# environment variables/credentials are set up for storage.Client()
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "your-gcs-bucket-name")
-try:
-    storage_client = storage.Client()
-except Exception as e:
-    logger.warning(f"Failed to initialize GCS client: {e}. If running locally, this is normal unless you have GCS credentials configured.")
-
 async def upload_file_to_gcs(file: UploadFile, folder_name: str) -> str:
-    """Uploads file to Google Cloud Storage and returns the GCS URI."""
-    if 'storage_client' not in globals():
-        # Handle case where client failed to initialize (e.g., in a mock testing env)
-        logger.error("GCS client not initialized. Cannot upload.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Cloud storage service is unavailable."
-        )
+    """Uploads file to GCS. Client is created per-call to avoid module-level crashes."""
+    import asyncio
+
+    await file.seek(0)
+    file_content = await file.read()
+    unique_filename = f"{uuid.uuid4()}_{file.filename}"
+    blob_name = f"{folder_name}/{unique_filename}"
+    
+    bucket_name = os.environ.get("GCS_BUCKET_NAME", "")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME not configured.")
 
     try:
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
-        
-        # Define the path within the bucket
-        # Ensure the file stream is at the beginning
-        await file.seek(0)
-        file_content = await file.read()
-
-        unique_filename = f"{uuid.uuid4()}_{file.filename}"
-        destination_blob_name = f"{folder_name}/{unique_filename}"
-        blob = bucket.blob(destination_blob_name)
-        
-        # Upload the file content
-        blob.upload_from_string(
-            file_content,
-            content_type=file.content_type
-        )
-        
-        # Return the GCS URI for persistence in the database
-        gcs_uri = f"gs://{GCS_BUCKET_NAME}/{destination_blob_name}"
-        logger.info(f"File uploaded to GCS URI: {gcs_uri}")
+        client = gcs_storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        await asyncio.to_thread(blob.upload_from_string, file_content, content_type=file.content_type)
+        gcs_uri = f"gs://{bucket_name}/{blob_name}"
+        logger.info(f"File uploaded to GCS: {gcs_uri}")
         return gcs_uri
-        
     except Exception as e:
-        logger.error(f"Failed to upload file to GCS: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to securely store the uploaded file."
-        )
+        logger.error(f"GCS upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload to cloud storage: {e}")
 
 
 @router.get("/legal-versions", response_model=LegalArtifactVersionsOut)
@@ -166,9 +141,23 @@ async def register_free_trial(
     if not commercial_register_document.filename.endswith(('.pdf', '.jpg', '.jpeg', '.png')):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Commercial register document must be a PDF, JPG, or PNG.")
 
-    existing_registration = crud_trial_registration.get_by_email_and_status(db, admin_email, "pending")
-    if existing_registration:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A pending registration with this email already exists.")
+    # Check for existing registrations with this email
+    from app.models import TrialRegistration
+    existing = db.query(TrialRegistration).filter(
+        TrialRegistration.admin_email == admin_email,
+        TrialRegistration.is_deleted == False
+    ).first()
+    
+    if existing:
+        if existing.status in ("pending", "approved"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A {existing.status} registration with this email already exists."
+            )
+        else:
+            # Rejected or failed — allow re-application by removing the old record
+            db.delete(existing)
+            db.flush()
 
     # *** CHANGE: Use GCS upload function ***
     file_path = await upload_file_to_gcs(commercial_register_document, "commercial_registers")

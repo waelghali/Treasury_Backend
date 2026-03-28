@@ -1,0 +1,19 @@
+FACILITY AGREEMENT — BANK B (NBE)
+=====================================
+[PLACEHOLDER — Convert to PDF before use]
+
+Facility Name: NBE Multi-Purpose LG Line
+Bank: National Bank of Egypt (NBE)
+Agreement Date: January 1, 2026
+Total Facility Limit: EGP 80,000,000
+Currency: Egyptian Pounds (EGP)
+Validity Period: January 1, 2026 – December 31, 2026
+SLA for Bank Reply: 7 Business Days
+
+Sub-Facilities:
+1. Advance Payment Bonds: EGP 30,000,000 — Max/LG: EGP 10,000,000 — Commission: 1.00%
+2. Maintenance Bonds: EGP 20,000,000 — Max/LG: EGP 8,000,000 — Commission: 0.80%
+3. Performance Bonds EGP: EGP 30,000,000 — Max/LG: EGP 15,000,000 — Commission: 0.75%
+
+Signed by: [Bank Authorized Signatory]
+Date: 2026-01-01

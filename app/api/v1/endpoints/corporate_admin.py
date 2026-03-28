@@ -88,6 +88,7 @@ try:
         HasPermission,
         get_current_active_user,
         get_current_corporate_admin_context,
+        get_current_approver_context,
         get_current_user,
         get_client_ip,
         require_issuance_module,
@@ -1225,12 +1226,12 @@ def restore_customer_email_settings(
 @router.get(
     "/approval-requests/",
     response_model=List[ApprovalRequestOut],
-    dependencies=[Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
-    summary="List all approval requests for the Corporate Admin's customer"
+    dependencies=[Depends(check_subscription_status)],
+    summary="List approval requests for the Corporate Admin's customer"
 )
 def list_approval_requests(
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    current_user: TokenData = Depends(get_current_approver_context),
     status: Optional[ApprovalRequestStatusEnum] = Query(None, description="Filter by status (e.g., PENDING, APPROVED, REJECTED)"),
     action_type: Optional[str] = Query(None, description="Filter by action type (e.g., LG_RELEASE, LG_LIQUIDATE)"),
     skip: int = 0,
@@ -1240,7 +1241,7 @@ def list_approval_requests(
     Retrieves a list of approval requests for the authenticated Corporate Admin's customer.
     Allows filtering by status and action type. Eager-loads related LGRecord and User data.
     """
-    customer_id = corporate_admin_context.customer_id
+    customer_id = current_user.customer_id
     
     requests = crud_approval_request.get_all_for_customer(
         db,
@@ -1248,7 +1249,8 @@ def list_approval_requests(
         status_filter=status,
         action_type_filter=action_type,
         skip=skip,
-        limit=limit
+        limit=limit,
+        approver_id=current_user.user_id
     )
     
     return [ApprovalRequestOut.model_validate(req) for req in requests]
@@ -1256,19 +1258,19 @@ def list_approval_requests(
 @router.get(
     "/approval-requests/{request_id}",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(HasPermission("approval_request:view_all")), Depends(check_subscription_status)],
+    dependencies=[Depends(check_subscription_status)],
     summary="Get details of a specific approval request"
 )
 def get_approval_request_details(
     request_id: int,
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(get_current_approver_context)
 ):
     """
     Retrieves the details of a specific approval request, including the LG record snapshot
     and current LG record details for comparison.
     """
-    customer_id = corporate_admin_context.customer_id
+    customer_id = current_user.customer_id
 
     db_request = crud_approval_request.get_approval_request_by_id(db, request_id, customer_id)
     
@@ -1281,13 +1283,13 @@ def get_approval_request_details(
 @router.post(
     "/approval-requests/{request_id}/approve",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(HasPermission("approval_request:approve")), Depends(check_for_read_only_mode)],
+    dependencies=[Depends(check_for_read_only_mode)],
     summary="Approve a pending approval request"
 )
 async def approve_approval_request(
     request_id: int,
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    current_user: TokenData = Depends(get_current_approver_context),
     request_info: Request = None
 ):
     """
@@ -1295,19 +1297,19 @@ async def approve_approval_request(
     This executes the underlying action (Release, Liquidation, etc.) and invalidates other pending requests.
     """
     client_host = request_info.client.host if request_info else None
-    customer_id = corporate_admin_context.customer_id
+    customer_id = current_user.customer_id
 
     try:
         approved_request = await crud_approval_request.approve_request(
             db, 
             request_id=request_id,
-            checker_user_id=corporate_admin_context.user_id,
+            checker_user_id=current_user.user_id,
             customer_id=customer_id
         )
         
         log_action(
             db,
-            user_id=corporate_admin_context.user_id,
+            user_id=current_user.user_id,
             action_type="APPROVAL_REQUEST_APPROVED",
             entity_type="ApprovalRequest",
             entity_id=approved_request.id,
@@ -1315,7 +1317,7 @@ async def approve_approval_request(
                 "lg_record_id": approved_request.entity_id if approved_request.entity_type == "LGRecord" else None,
                 "action_type": approved_request.action_type,
                 "status": approved_request.status.value,
-                "checker_email": corporate_admin_context.email,
+                "checker_email": current_user.email,
             },
             customer_id=customer_id,
             lg_record_id=approved_request.entity_id if approved_request.entity_type == "LGRecord" else None,
@@ -1323,10 +1325,10 @@ async def approve_approval_request(
         
         return ApprovalRequestOut.model_validate(approved_request)
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
+        log_action(db, user_id=current_user.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id, ip_address=client_host)
+        log_action(db, user_id=current_user.user_id, action_type="APPROVAL_REQUEST_APPROVED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -1336,14 +1338,14 @@ async def approve_approval_request(
 @router.post(
     "/approval-requests/{request_id}/reject",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(HasPermission("approval_request:reject")), Depends(check_for_read_only_mode)],
+    dependencies=[Depends(check_for_read_only_mode)],
     summary="Reject a pending approval request"
 )
 async def reject_approval_request(
     request_id: int,
     reason: str = Body(..., embed=True, description="Reason for rejecting the approval request"),
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    current_user: TokenData = Depends(get_current_approver_context),
     request_info: Request = None
 ):
     """
@@ -1351,20 +1353,20 @@ async def reject_approval_request(
     A reason for rejection is mandatory.
     """
     client_host = request_info.client.host if request_info else None
-    customer_id = corporate_admin_context.customer_id
+    customer_id = current_user.customer_id
 
     try:
         rejected_request = crud_approval_request.reject_request(
             db, 
             request_id=request_id,
-            checker_user_id=corporate_admin_context.user_id,
+            checker_user_id=current_user.user_id,
             customer_id=customer_id,
             reason=reason
         )
         
         log_action(
             db,
-            user_id=corporate_admin_context.user_id,
+            user_id=current_user.user_id,
             action_type="APPROVAL_REQUEST_REJECTED",
             entity_type="ApprovalRequest",
             entity_id=rejected_request.id,
@@ -1372,7 +1374,7 @@ async def reject_approval_request(
                 "lg_record_id": rejected_request.entity_id if rejected_request.entity_type == "LGRecord" else None,
                 "action_type": rejected_request.action_type,
                 "status": rejected_request.status.value,
-                "checker_email": corporate_admin_context.email,
+                "checker_email": current_user.email,
                 "rejection_reason": reason,
             },
             customer_id=customer_id,
@@ -1380,10 +1382,10 @@ async def reject_approval_request(
         )
         return ApprovalRequestOut.model_validate(rejected_request)
     except HTTPException as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
+        log_action(db, user_id=current_user.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
     except Exception as e:
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id, ip_address=client_host)
+        log_action(db, user_id=current_user.user_id, action_type="APPROVAL_REQUEST_REJECTED_FAILED", entity_type="ApprovalRequest", entity_id=request_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=customer_id, ip_address=client_host)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
@@ -2093,10 +2095,12 @@ def create_department(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
-    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
-    change_req, auto_approved = _create_governed_change(
+    from app.core.governance import create_governed_change
+    from app.api.v1.endpoints.issuance.base import _apply_admin_change
+    change_req, auto_approved = create_governed_change(
         db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
-        "DEPARTMENT_CREATE", {"new_value": dept_in.model_dump()}
+        "DEPARTMENT_CREATE", {"new_value": dept_in.model_dump()},
+        apply_fn=_apply_admin_change,
     )
     if auto_approved:
         # Already created by _apply_admin_change — fetch the latest dept
@@ -2126,10 +2130,12 @@ def update_department(
     if not db_dept or db_dept.customer_id != corporate_admin_context.customer_id:
         raise HTTPException(status_code=404, detail="Department not found.")
 
-    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
-    change_req, auto_approved = _create_governed_change(
+    from app.core.governance import create_governed_change
+    from app.api.v1.endpoints.issuance.base import _apply_admin_change
+    change_req, auto_approved = create_governed_change(
         db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
-        "DEPARTMENT_UPDATE", {"entity_id": dept_id, "new_value": dept_in.model_dump(exclude_unset=True)}
+        "DEPARTMENT_UPDATE", {"entity_id": dept_id, "new_value": dept_in.model_dump(exclude_unset=True)},
+        apply_fn=_apply_admin_change,
     )
     if auto_approved:
         db.refresh(db_dept)
@@ -2201,10 +2207,12 @@ def create_approval_group(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
-    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
-    change_req, auto_approved = _create_governed_change(
+    from app.core.governance import create_governed_change
+    from app.api.v1.endpoints.issuance.base import _apply_admin_change
+    change_req, auto_approved = create_governed_change(
         db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
-        "GROUP_CREATE", {"new_value": group_in.model_dump()}
+        "GROUP_CREATE", {"new_value": group_in.model_dump()},
+        apply_fn=_apply_admin_change,
     )
     if auto_approved:
         from app.models.models import ApprovalGroup
@@ -2231,10 +2239,12 @@ def update_approval_group(
     if not db_group or db_group.customer_id != corporate_admin_context.customer_id:
         raise HTTPException(status_code=404, detail="Group not found.")
 
-    from app.api.v1.endpoints.issuance_endpoints import _create_governed_change
-    change_req, auto_approved = _create_governed_change(
+    from app.core.governance import create_governed_change
+    from app.api.v1.endpoints.issuance.base import _apply_admin_change
+    change_req, auto_approved = create_governed_change(
         db, corporate_admin_context.customer_id, corporate_admin_context.user_id,
-        "GROUP_UPDATE", {"entity_id": group_id, "new_value": group_in.model_dump(exclude_unset=True)}
+        "GROUP_UPDATE", {"entity_id": group_id, "new_value": group_in.model_dump(exclude_unset=True)},
+        apply_fn=_apply_admin_change,
     )
     if auto_approved:
         db.refresh(db_group)

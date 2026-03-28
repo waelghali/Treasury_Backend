@@ -621,7 +621,7 @@ async def run_daily_lg_status_update(db: Session):
                         end_date=end_dt,
                         target_user_ids=[user.id],
                         target_customer_ids=[lg.customer_id],
-                        display_frequency="once-per-login",
+                        display_frequency="once",
                     )
                     crud_system_notification.create(db, obj_in=notif, user_id=1)
                 log_action(
@@ -923,7 +923,7 @@ async def _check_fx_breach_auto_suspend(db: Session):
                             end_date=datetime.now() + timedelta(days=30),
                             target_user_ids=[admin.id],
                             target_customer_ids=[facility.customer_id],
-                            display_frequency="once-per-login",
+                            display_frequency="once",
                         )
                         crud_system_notification.create(db, obj_in=notif, user_id=1)
                 except Exception as notif_err:
@@ -1033,7 +1033,7 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
                             end_date=end_dt,
                             target_user_ids=[user.id],
                             target_customer_ids=[customer.id],
-                            display_frequency="once-per-login",
+                            display_frequency="once",
                         )
                         crud_system_notification.create(db, obj_in=notif, user_id=1)
                     log_action(
@@ -1146,7 +1146,7 @@ async def run_daily_reference_expiry_check(db: Session):
                                     end_date=end_dt,
                                     target_user_ids=[user.id],
                                     target_customer_ids=[customer.id],
-                                    display_frequency="once-per-login",
+                                    display_frequency="once",
                                 )
                                 crud_system_notification.create(db, obj_in=notif, user_id=1)
                             log_action(
@@ -1252,7 +1252,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                                 end_date=end_dt,
                                 target_user_ids=[user.id],
                                 target_customer_ids=[customer.id],
-                                display_frequency="once-per-login",
+                                display_frequency="once",
                             )
                             crud_system_notification.create(db, obj_in=notif, user_id=1)
 
@@ -1340,7 +1340,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                                 end_date=end_dt,
                                 target_user_ids=[user.id],
                                 target_customer_ids=[customer.id],
-                                display_frequency="once-per-login",
+                                display_frequency="once",
                             )
                             crud_system_notification.create(db, obj_in=notif, user_id=1)
 
@@ -1388,7 +1388,6 @@ def run_daily_sla_breach_alerts():
             IssuedLGRecord.status == "DELIVERED_TO_BANK",
             IssuedLGRecord.bank_reply_type == None,
             IssuedLGRecord.delivery_date != None,
-            IssuedLGRecord.is_deleted == False,
         ).all()
 
         logger.info(f"SLA check: {len(pending_lgs)} LGs pending bank reply")
@@ -1491,7 +1490,7 @@ def run_daily_sla_breach_alerts():
                             end_date=end_dt,
                             target_user_ids=[user_id],
                             target_customer_ids=[cust_id],
-                            display_frequency="once-per-login",
+                            display_frequency="once",
                         )
                         crud_system_notification.create(db, obj_in=notif, user_id=1)
 
@@ -1698,7 +1697,7 @@ async def _send_reservation_notification(
                 end_date=datetime.now() + timedelta(days=7),
                 target_user_ids=[uid],
                 target_customer_ids=[customer.id],
-                display_frequency="once-per-login",
+                display_frequency="once",
             )
             crud_system_notification.create(db, obj_in=notif, user_id=1)
         except Exception as e:
@@ -1776,7 +1775,6 @@ async def run_daily_maintenance_delivery_reminders(db: Session):
                 IssuedLGRecord.id == IssuanceMaintenanceAction.issued_lg_id
             ).filter(
                 IssuedLGRecord.customer_id == customer.id,
-                IssuedLGRecord.is_deleted == False,
             ).all()
 
             for action in pending_actions:
@@ -1902,7 +1900,7 @@ async def run_daily_maintenance_delivery_reminders(db: Session):
                                 end_date=datetime.now() + timedelta(days=1),
                                 target_user_ids=[uid],
                                 target_customer_ids=[customer.id],
-                                display_frequency="once-per-login",
+                                display_frequency="once",
                             )
                             crud_system_notification.create(db, obj_in=notif, user_id=1)
                         except Exception as e:
@@ -1971,13 +1969,11 @@ async def run_daily_reconciliation_reminders(db: Session):
 
             # 2. Find distinct banks with live LGs for this customer
             live_statuses = [
-                "ACTIVE", "CONFIRMED", "HANDED_OVER", "ISSUED",
-                "DELIVERED_TO_BANK", "PENDING_CONFIRMATION", "PENDING_VERIFICATION",
+                "ACTIVE", "LG_ISSUED", "DELIVERED_TO_BANK", "INTERNAL_PROCESSING",
             ]
             bank_ids = db.query(IssuedLGRecord.bank_id).filter(
                 IssuedLGRecord.customer_id == customer.id,
                 IssuedLGRecord.status.in_(live_statuses),
-                IssuedLGRecord.is_deleted == False,
                 IssuedLGRecord.bank_id.isnot(None),
             ).distinct().all()
 
@@ -2018,14 +2014,14 @@ async def run_daily_reconciliation_reminders(db: Session):
             if not overdue_banks:
                 continue
 
-            # 4. Notify Corp Admins
-            corp_admins = db.query(models.User).filter(
+            # 4. Notify Corp Admins and End Users
+            target_users = db.query(models.User).filter(
                 models.User.customer_id == customer.id,
-                models.User.role == "corporate_admin",
+                models.User.role.in_(["corporate_admin", "end_user"]),
                 models.User.is_deleted == False,
             ).all()
 
-            if not corp_admins:
+            if not target_users:
                 continue
 
             bank_list = ", ".join(
@@ -2036,7 +2032,8 @@ async def run_daily_reconciliation_reminders(db: Session):
                 f"reconciled for over {d_threshold} days — {bank_list}"
             )
 
-            admin_ids = [a.id for a in corp_admins]
+            target_ids = [u.id for u in target_users]
+            to_emails = [u.email for u in target_users if u.email]
 
             try:
                 notif = SystemNotificationCreate(
@@ -2044,9 +2041,9 @@ async def run_daily_reconciliation_reminders(db: Session):
                     notification_type="RECONCILIATION_OVERDUE",
                     start_date=datetime.now(),
                     end_date=datetime.now() + timedelta(days=7),
-                    target_user_ids=admin_ids,
+                    target_user_ids=target_ids,
                     target_customer_ids=[customer.id],
-                    display_frequency="once-per-login",
+                    display_frequency="once",
                 )
                 crud_system_notification.create(db, obj_in=notif, user_id=1)
                 db.flush()
@@ -2056,6 +2053,23 @@ async def run_daily_reconciliation_reminders(db: Session):
                 )
             except Exception as notif_err:
                 logger.error(f"Failed to create reconciliation reminder notification: {notif_err}")
+
+            if to_emails:
+                try:
+                    email_settings, _ = get_customer_email_settings(db, customer.id)
+                    cc_emails = _get_common_cc_emails(db, customer.id)
+                    await send_email(
+                        db=db,
+                        to_emails=to_emails,
+                        cc_emails=cc_emails,
+                        subject_template="Action Required: LG Position Reconciliation Overdue",
+                        body_template=f"<html><body style='font-family: Arial, sans-serif; color: #333; padding: 20px;'><p>Dear Treasury Team,</p><p>{message}</p><p>Please log in to the Treasury Management Platform and upload the latest bank position reports to complete the reconciliation process.</p></body></html>",
+                        template_data={},
+                        email_settings=email_settings,
+                        sender_name=customer.name,
+                    )
+                except Exception as email_err:
+                    logger.error(f"Failed to send reconciliation reminder email: {email_err}")
 
         except Exception as e:
             db.rollback()
@@ -2237,3 +2251,162 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
             db.commit()
 
     logger.info("Issuance Maintenance Reminders task completed.")
+
+
+# ==============================================================================
+# AUTO-REJECT EXPIRED CANCEL & EDIT REQUESTS
+# ==============================================================================
+
+async def run_daily_issuance_approval_timeout(db: Session):
+    """
+    Auto-rejects LGs stuck in CANCEL_REQUESTED and IssuanceRequests stuck
+    in EDIT_REQUESTED beyond the configured APPROVAL_REQUEST_MAX_PENDING_DAYS.
+    Mirrors the ApprovalRequest auto-reject pattern.
+    """
+    logger.info("Running daily issuance approval timeout check...")
+
+    from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
+
+    # Get max pending days config
+    max_pending_config = crud_instances.crud_global_configuration.get_by_key(
+        db, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS
+    )
+    if not max_pending_config or not max_pending_config.value_default:
+        logger.info("APPROVAL_REQUEST_MAX_PENDING_DAYS not configured. Skipping issuance timeout.")
+        return
+
+    try:
+        max_days = int(max_pending_config.value_default)
+    except (ValueError, TypeError):
+        logger.warning("Invalid APPROVAL_REQUEST_MAX_PENDING_DAYS value. Skipping.")
+        return
+
+    cutoff = datetime.utcnow() - timedelta(days=max_days)
+    auto_rejected_count = 0
+
+    # 1. Auto-reject CANCEL_REQUESTED LGs
+    pending_cancels = db.query(IssuedLGRecord).filter(
+        IssuedLGRecord.status == "CANCEL_REQUESTED",
+    ).all()
+
+    for lg in pending_cancels:
+        try:
+            meta = dict(lg.metadata_json or {})
+            cancel_meta = meta.get("pending_cancellation", {})
+            requested_at_str = cancel_meta.get("requested_at")
+            if not requested_at_str:
+                continue
+
+            requested_at = datetime.fromisoformat(requested_at_str)
+            if requested_at > cutoff:
+                continue  # Not yet expired
+
+            # Auto-reject: restore previous status
+            previous_status = cancel_meta.get("previous_status", "INTERNAL_PROCESSING")
+            lg.status = previous_status
+
+            # Clean up metadata
+            if "pending_cancellation" in meta:
+                del meta["pending_cancellation"]
+            lg.metadata_json = meta
+
+            # Audit trail
+            ctl = list(lg.custody_transfer_log or [])
+            ctl.append({
+                "action": "CANCEL_AUTO_REJECTED",
+                "reason": f"Auto-rejected: exceeded {max_days} day approval window.",
+                "restored_status": previous_status,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            lg.custody_transfer_log = ctl
+
+            log_action(db, None, "LG_CANCEL_AUTO_REJECTED",
+                       "IssuedLGRecord", lg.id,
+                       {"max_days": max_days, "restored_status": previous_status},
+                       lg.customer_id)
+
+            # Notify requestor
+            try:
+                requestor_id = cancel_meta.get("requested_by_user_id")
+                if requestor_id:
+                    _now = datetime.utcnow()
+                    notif = SystemNotificationCreate(
+                        content=f"Your cancellation request for LG {lg.lg_ref_number} was automatically "
+                                f"rejected — no admin response within {max_days} days.",
+                        notification_type="LG_CANCEL_AUTO_REJECTED",
+                        start_date=_now,
+                        end_date=_now + timedelta(days=30),
+                        target_user_ids=[requestor_id],
+                        target_customer_ids=[lg.customer_id],
+                    )
+                    crud_system_notification.create(db, obj_in=notif, user_id=1)
+            except Exception:
+                pass
+
+            auto_rejected_count += 1
+            logger.info(f"Auto-rejected cancel request for LG {lg.id} ({lg.lg_ref_number})")
+
+        except Exception as e:
+            logger.error(f"Error auto-rejecting cancel for LG {lg.id}: {e}", exc_info=True)
+
+    # 2. Auto-reject EDIT_REQUESTED IssuanceRequests
+    pending_edits = db.query(IssuanceRequest).filter(
+        IssuanceRequest.status == "EDIT_REQUESTED",
+    ).all()
+
+    for req in pending_edits:
+        try:
+            meta = dict(req.metadata_json or {})
+            edit_meta = meta.get("pending_edit", {})
+            requested_at_str = edit_meta.get("requested_at")
+            if not requested_at_str:
+                continue
+
+            requested_at = datetime.fromisoformat(requested_at_str)
+            if requested_at > cutoff:
+                continue
+
+            previous_status = edit_meta.get("previous_status", "APPROVED_INTERNAL")
+            req.status = previous_status
+
+            if "pending_edit" in meta:
+                del meta["pending_edit"]
+            req.metadata_json = meta
+
+            audit = list(req.approval_chain_audit or [])
+            audit.append({
+                "action": "EDIT_AUTO_REJECTED",
+                "reason": f"Auto-rejected: exceeded {max_days} day approval window.",
+                "restored_status": previous_status,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            req.approval_chain_audit = audit
+
+            log_action(db, None, "ISSUANCE_EDIT_AUTO_REJECTED",
+                       "IssuanceRequest", req.id,
+                       {"max_days": max_days, "restored_status": previous_status},
+                       req.customer_id)
+
+            auto_rejected_count += 1
+            logger.info(f"Auto-rejected edit request for request {req.id} ({req.serial_number})")
+
+        except Exception as e:
+            logger.error(f"Error auto-rejecting edit for request {req.id}: {e}", exc_info=True)
+
+    if auto_rejected_count > 0:
+        db.commit()
+        logger.info(f"Auto-rejected {auto_rejected_count} expired issuance approval(s).")
+    else:
+        logger.info("No expired issuance approvals found.")
+
+async def run_daily_auto_reject_expired_requests(db: Session):
+    """
+    Auto-rejects core system approval requests (Maker-Checker) that have exceeded
+    the APPROVAL_REQUEST_MAX_PENDING_DAYS configuration.
+    """
+    logger.info("Running daily auto-rejection of expired core approval requests...")
+    try:
+        from app.crud.crud_approval_request import crud_approval_request
+        crud_approval_request.auto_reject_expired_requests(db)
+    except Exception as e:
+        logger.error(f"Error during auto-rejection of expired requests: {e}", exc_info=True)

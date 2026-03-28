@@ -29,11 +29,12 @@ def list_facilities(
 
     for fac in facilities:
         total_used = Decimal("0")
+        total_reserved = Decimal("0")
         for sub in fac.sub_limits:
             # Active LG amounts
             used_amount = db.query(func.coalesce(func.sum(IssuedLGRecord.current_amount), 0)).filter(
                 IssuedLGRecord.facility_sub_limit_id == sub.id,
-                IssuedLGRecord.status.in_(["ACTIVE", "PENDING_CONFIRMATION"])
+                IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING"])
             ).scalar()
             # Pending exposure
             pending = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)).filter(
@@ -44,7 +45,17 @@ def list_facilities(
             # Add initial utilization
             sub_used += Decimal(str(getattr(sub, 'initial_utilization', 0) or 0))
             total_used += sub_used
+
+            # Reserved amount (RESERVATION entries only)
+            reserved = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)).filter(
+                IssuanceExposureEntry.sub_limit_id == sub.id,
+                IssuanceExposureEntry.entry_type == "RESERVATION",
+                IssuanceExposureEntry.is_active == True
+            ).scalar()
+            total_reserved += Decimal(str(reserved))
+
         fac.utilized_amount = total_used
+        fac.reserved_amount = total_reserved
 
     return facilities
 

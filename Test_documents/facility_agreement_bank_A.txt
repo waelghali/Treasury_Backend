@@ -1,0 +1,30 @@
+FACILITY AGREEMENT — BANK A (HSBC)
+=====================================
+[PLACEHOLDER — Convert to PDF before use]
+
+Facility Name: HSBC Performance & Bid Bond Line
+Bank: HSBC
+Agreement Date: January 1, 2026
+Facility Type: Letter of Guarantee
+Total Facility Limit: USD 5,000,000
+Currency: US Dollars (USD)
+Validity Period: January 1, 2026 – December 31, 2027
+SLA for Bank Reply: 5 Business Days
+
+Sub-Facilities:
+1. Performance Bonds: USD 3,000,000
+   - Max per LG: USD 1,000,000
+   - Commission Rate: 0.75% per annum
+   - Cash Margin: 5%
+
+2. Bid Bonds Line: USD 2,000,000
+   - Max per LG: USD 500,000
+   - Commission Rate: 0.50% per annum
+   - Cash Margin: 0%
+
+Applicable Rules: URDG 758
+Cross-Border: Allowed (with advising bank)
+Third-Party Issuance: Allowed
+
+Signed by: [Bank Authorized Signatory]
+Date: 2026-01-01

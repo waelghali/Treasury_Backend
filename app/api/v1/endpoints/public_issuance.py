@@ -1,8 +1,10 @@
 # app/api/v1/endpoints/public_issuance.py
 
 from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, UploadFile, File
+from datetime import date
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, UploadFile, File, Body
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from pydantic import BaseModel
 
 from app.database import get_db
@@ -173,6 +175,41 @@ def public_verify_domain(
 async def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
     email = payload.get("email", "").lower()
     otp_code = payload.get("otp", "")
+
+    # --- OTP Rate Limiting (brute-force protection) ---
+    # Configurable thresholds via GlobalConfig (defaults: 5 attempts, 15 min lockout)
+    max_attempts = 5
+    lockout_minutes = 15
+    try:
+        from app.models import GlobalConfiguration
+        max_cfg = db.query(GlobalConfiguration).filter(
+            GlobalConfiguration.key == GlobalConfigKey.OTP_MAX_FAILED_ATTEMPTS
+        ).first()
+        if max_cfg and max_cfg.value_default:
+            max_attempts = int(max_cfg.value_default)
+        lock_cfg = db.query(GlobalConfiguration).filter(
+            GlobalConfiguration.key == GlobalConfigKey.OTP_LOCKOUT_DURATION_MINUTES
+        ).first()
+        if lock_cfg and lock_cfg.value_default:
+            lockout_minutes = int(lock_cfg.value_default)
+    except Exception:
+        db.rollback()
+
+    lockout_window = datetime.now(timezone.utc) - timedelta(minutes=lockout_minutes)
+
+    # Count recent failed OTP attempts for this email (verified=False and created within window)
+    recent_failures = db.query(func.count(ExternalOTP.id)).filter(
+        ExternalOTP.email == email,
+        ExternalOTP.is_verified == False,
+        ExternalOTP.created_at >= lockout_window,
+    ).scalar() or 0
+
+    if recent_failures >= max_attempts:
+        log_action(db, None, "OTP_RATE_LIMITED", "OTP", None, {"email": email, "attempts": recent_failures})
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Please try again in {lockout_minutes} minutes."
+        )
 
     record = db.query(ExternalOTP).filter(
         ExternalOTP.email == email,
@@ -435,8 +472,8 @@ def public_update_draft(
 
     if not request:
         raise HTTPException(status_code=404, detail="Request not found")
-    if request.status != "DRAFT":
-        raise HTTPException(status_code=400, detail="Only DRAFT requests can be updated")
+    if request.status not in ("DRAFT", "REVISION_REQUIRED"):
+        raise HTTPException(status_code=400, detail="Only DRAFT or REVISION_REQUIRED requests can be updated")
     if email and request.requestor_email and request.requestor_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Not authorized to update this request")
 
@@ -460,6 +497,23 @@ def public_update_draft(
     for key, value in request_in.items():
         if key in ALLOWED_FIELDS and hasattr(request, key):
             setattr(request, key, value)
+
+    # Capture change_reason for RETURNED_FOR_REVISION requests
+    # Store it on the request itself so submit_for_approval can read it.
+    # We store it in a dedicated JSONB field on the request's approval_chain_audit
+    # as a pending_change_reason entry that submit_for_approval will consume.
+    change_reason = request_in.get("change_reason")
+    if change_reason and request.status == "REVISION_REQUIRED":
+        from sqlalchemy.orm.attributes import flag_modified
+        current_audit = list(request.approval_chain_audit or [])
+        current_audit.append({
+            "action": "EDIT_REASON_PENDING",
+            "reason": change_reason,
+            "user_name": request.requestor_name or request.requestor_email,
+            "timestamp": str(date.today())
+        })
+        request.approval_chain_audit = list(current_audit)
+        flag_modified(request, 'approval_chain_audit')
 
     db.commit()
     db.refresh(request)
@@ -488,8 +542,8 @@ def public_submit_existing_draft(
 
     if not request:
         raise HTTPException(status_code=404, detail="Request not found")
-    if request.status != "DRAFT":
-        raise HTTPException(status_code=400, detail="Only DRAFT requests can be submitted")
+    if request.status not in ("DRAFT", "REVISION_REQUIRED"):
+        raise HTTPException(status_code=400, detail="Only DRAFT or REVISION_REQUIRED requests can be submitted")
     if email and request.requestor_email and request.requestor_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Not authorized to submit this request")
 
@@ -628,6 +682,7 @@ def public_get_my_requests(
         joinedload(IssuanceRequest.lg_type),
         joinedload(IssuanceRequest.currency),
         joinedload(IssuanceRequest.issuing_entity),
+        joinedload(IssuanceRequest.lg_record),
     ).filter(
         IssuanceRequest.customer_id == customer_id,
         IssuanceRequest.requestor_email == email.lower(),
@@ -650,6 +705,8 @@ def public_get_my_requests(
                 "requested_issue_date": str(r.requested_issue_date) if r.requested_issue_date else None,
                 "requested_expiry_date": str(r.requested_expiry_date) if r.requested_expiry_date else None,
                 "is_urgent": r.is_urgent,
+                "revision_notes": r.revision_notes,
+                "lg_ref_number": r.lg_record.lg_ref_number if r.lg_record else None,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "updated_at": r.updated_at.isoformat() if r.updated_at else None,
             }
@@ -709,7 +766,7 @@ def public_get_dictionaries(token: str = Query(...), db: Session = Depends(get_d
     
     return {
         "entities": [{"id": e.id, "name": e.entity_name} for e in entities],
-        "currencies": [{"id": c.id, "iso_code": c.iso_code} for c in currencies],
+        "currencies": [{"id": c.id, "name": c.name, "iso_code": c.iso_code} for c in currencies],
         "lgTypes": [{"id": t.id, "name": t.name} for t in lg_types],
         "departments": [{"id": d.name, "name": d.name} for d in departments],
         "projects": [{"id": p.id, "name": p.name, "project_type": p.project_type, "reference_number": p.reference_number, "status": p.status} for p in projects],
@@ -778,14 +835,19 @@ def public_check_duplicate_reference(
     request_matches = query.order_by(IssuanceRequest.created_at.desc()).limit(3).all()
     
     # Also check against issued LGs (via their linked request's reference)
+    # Exclude LGs whose parent request is already in request_matches (avoid double-counting)
     from app.models.models_issuance import IssuedLGRecord
+    matched_request_ids = {m.id for m in request_matches}
     lg_query = db.query(IssuedLGRecord).join(
         IssuanceRequest, IssuedLGRecord.request_id == IssuanceRequest.id
     ).filter(
         IssuedLGRecord.customer_id == customer_id,
         func.lower(IssuanceRequest.reference_type) == reference_type.lower(),
         func.lower(IssuanceRequest.reference_number) == reference_number.strip().lower(),
-    ).limit(3).all()
+    )
+    if matched_request_ids:
+        lg_query = lg_query.filter(IssuedLGRecord.request_id.notin_(matched_request_ids))
+    lg_results = lg_query.limit(3).all()
 
     all_matches = []
     for m in request_matches:
@@ -798,7 +860,7 @@ def public_check_duplicate_reference(
             "created_at": str(m.created_at) if m.created_at else None,
             "type": "request"
         })
-    for lg in lg_query:
+    for lg in lg_results:
         all_matches.append({
             "id": lg.id,
             "serial_number": lg.lg_ref_number,
@@ -809,10 +871,57 @@ def public_check_duplicate_reference(
             "type": "issued_lg"
         })
 
+    # Build recall data from the most recent request match
+    recall_data = None
+    if request_matches:
+        latest = request_matches[0]  # already ordered by created_at desc
+        recall_data = {
+            "reference_amount": str(latest.reference_amount) if latest.reference_amount else None,
+            "reference_currency_id": latest.reference_currency_id,
+            "reference_start_date": str(latest.reference_start_date) if latest.reference_start_date else None,
+            "reference_end_date": str(latest.reference_end_date) if latest.reference_end_date else None,
+            "project_id": latest.project_id,
+        }
+
     if not all_matches:
-        return {"found": False, "matches": []}
+        return {"found": False, "matches": [], "recall_data": None}
     
-    return {"found": True, "matches": all_matches}
+    return {"found": True, "matches": all_matches, "recall_data": recall_data}
+
+class PublicPreSubmitSimilarityPayload(BaseModel):
+    token: str
+    reference_type: Optional[str] = None
+    reference_number: Optional[str] = None
+    beneficiary_name: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    lg_type_id: Optional[int] = None
+    requested_expiry_date: Optional[date] = None
+    exclude_request_id: Optional[int] = None
+
+@router.post("/pre-submit-similarity")
+def public_pre_submit_similarity_check(
+    payload: PublicPreSubmitSimilarityPayload,
+    db: Session = Depends(get_db)
+):
+    """Realtime check against issued LGs and active requests based on form fields (public portal)."""
+    access_data = verify_portal_token(payload.token)
+    customer_id = access_data["customer_id"]
+    
+    from app.services.issuance_service import issuance_service
+    
+    return issuance_service.get_similarity_matches(
+        db=db,
+        customer_id=customer_id,
+        reference_type=payload.reference_type,
+        reference_number=payload.reference_number,
+        beneficiary_name=payload.beneficiary_name,
+        amount=payload.amount,
+        currency=payload.currency,
+        lg_type_id=payload.lg_type_id,
+        requested_expiry_date=payload.requested_expiry_date,
+        exclude_request_id=payload.exclude_request_id
+    )
 
 
 @router.get("/beneficiary-suggest")
@@ -824,10 +933,12 @@ def public_beneficiary_suggest(
     """Fuzzy match beneficiary names for public portal users."""
     from app.models.models_issuance import IssuanceRequest
     from sqlalchemy import func as sa_func
+    from difflib import SequenceMatcher
     access_data = verify_portal_token(token)
     customer_id = access_data["customer_id"]
     
-    matches = db.query(
+    # Get all distinct beneficiary names for this customer (limited to recent 200)
+    all_names = db.query(
         IssuanceRequest.beneficiary_name,
         IssuanceRequest.beneficiary_id_number,
         IssuanceRequest.beneficiary_country,
@@ -838,7 +949,8 @@ def public_beneficiary_suggest(
         sa_func.max(IssuanceRequest.created_at).label('latest')
     ).filter(
         IssuanceRequest.customer_id == customer_id,
-        IssuanceRequest.beneficiary_name.ilike(f"%{name}%"),
+        IssuanceRequest.beneficiary_name.isnot(None),
+        IssuanceRequest.beneficiary_name != '',
         IssuanceRequest.is_deleted == False
     ).group_by(
         IssuanceRequest.beneficiary_name,
@@ -848,7 +960,26 @@ def public_beneficiary_suggest(
         IssuanceRequest.beneficiary_contact_person,
         IssuanceRequest.beneficiary_phone,
         IssuanceRequest.beneficiary_email,
-    ).order_by(sa_func.max(IssuanceRequest.created_at).desc()).limit(5).all()
+    ).order_by(sa_func.max(IssuanceRequest.created_at).desc()).limit(200).all()
+    
+    # Score each name using fuzzy similarity
+    name_lower = name.lower()
+    scored = []
+    for m in all_names:
+        ben_name = m.beneficiary_name or ''
+        ben_lower = ben_name.lower()
+        
+        if name_lower in ben_lower or ben_lower in name_lower:
+            score = 95
+        else:
+            score = int(SequenceMatcher(None, name_lower, ben_lower).ratio() * 100)
+        
+        # Lowered to 60 to prevent SequenceMatcher length penalties from dropping near matches
+        if score >= 60:
+            scored.append((score, m))
+    
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:5]
     
     return [
         {
@@ -859,8 +990,9 @@ def public_beneficiary_suggest(
             "beneficiary_contact_person": m.beneficiary_contact_person,
             "beneficiary_phone": m.beneficiary_phone,
             "beneficiary_email": m.beneficiary_email,
+            "similarity_score": score,
         }
-        for m in matches
+        for score, m in top
     ]
 
 
@@ -1175,42 +1307,104 @@ def public_get_my_issued_lgs(
         raise HTTPException(status_code=400, detail="Email not available in token.")
 
     # Find all request IDs by this requestor
-    request_ids = [r.id for r in db.query(IssuanceRequest.id).filter(
+    request_rows = db.query(IssuanceRequest.id, IssuanceRequest.serial_number).filter(
         IssuanceRequest.customer_id == customer_id,
         IssuanceRequest.requestor_email == email.lower(),
         IssuanceRequest.is_deleted == False,
-    ).all()]
+    ).all()
+    request_ids = [r.id for r in request_rows]
+    request_serial_map = {r.id: r.serial_number for r in request_rows}
 
     if not request_ids:
-        return {"email": email, "total": 0, "issued_lgs": []}
+        lgs = []
+    else:
+        lgs = db.query(IssuedLGRecord).options(
+            joinedload(IssuedLGRecord.bank),
+            joinedload(IssuedLGRecord.currency),
+        ).filter(
+            IssuedLGRecord.customer_id == customer_id,
+            IssuedLGRecord.request_id.in_(request_ids),
+        ).order_by(IssuedLGRecord.created_at.desc()).all()
 
-    lgs = db.query(IssuedLGRecord).options(
+    # Query incoming handovers (pending acceptance for this email)
+    from sqlalchemy.sql.expression import cast
+    import sqlalchemy
+    
+    # We use cast to String to handle astext properly across different SQL dialects if needed
+    incoming = db.query(IssuedLGRecord).options(
         joinedload(IssuedLGRecord.bank),
         joinedload(IssuedLGRecord.currency),
     ).filter(
         IssuedLGRecord.customer_id == customer_id,
-        IssuedLGRecord.request_id.in_(request_ids),
-    ).order_by(IssuedLGRecord.created_at.desc()).all()
+        IssuedLGRecord.handover_state == "PENDING_ACCEPTANCE",
+        IssuedLGRecord.pending_handover_data['email'].astext.ilike(email)
+    ).all()
+
+    def format_lg(lg, is_incoming=False):
+        return {
+            "id": lg.id,
+            "lg_ref_number": lg.lg_ref_number,
+            "beneficiary_name": lg.beneficiary_name,
+            "current_amount": float(lg.current_amount or 0),
+            "currency": lg.currency.iso_code if lg.currency else "",
+            "bank_name": lg.bank.name if lg.bank else "",
+            "issue_date": str(lg.issue_date) if lg.issue_date else None,
+            "expiry_date": str(lg.expiry_date) if lg.expiry_date else None,
+            "status": lg.status,
+            "bank_lg_number": lg.bank_lg_number,
+            "request_serial_number": request_serial_map.get(lg.request_id) if not is_incoming else None,
+            "created_at": lg.created_at.isoformat() if lg.created_at else None,
+            "handover_state": lg.handover_state,
+            "pending_handover_data": lg.pending_handover_data,
+        }
 
     return {
         "email": email,
         "total": len(lgs),
-        "issued_lgs": [
-            {
-                "id": lg.id,
-                "lg_ref_number": lg.lg_ref_number,
-                "beneficiary_name": lg.beneficiary_name,
-                "current_amount": float(lg.current_amount or 0),
-                "currency": lg.currency.iso_code if lg.currency else "",
-                "bank_name": lg.bank.name if lg.bank else "",
-                "issue_date": str(lg.issue_date) if lg.issue_date else None,
-                "expiry_date": str(lg.expiry_date) if lg.expiry_date else None,
-                "status": lg.status,
-                "bank_lg_number": lg.bank_lg_number,
-                "created_at": lg.created_at.isoformat() if lg.created_at else None,
-            }
-            for lg in lgs
-        ]
+        "issued_lgs": [format_lg(lg) for lg in lgs],
+        "incoming_handovers": [format_lg(lg, is_incoming=True) for lg in incoming],
+    }
+
+
+
+@router.post("/maintenance/upload-document")
+async def public_upload_maintenance_document(
+    token: str = Query(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Public portal: upload a supporting document for a maintenance action."""
+    from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
+    from app.crud import crud_customer_configuration
+    import uuid
+    from datetime import datetime as dt
+
+    access_data = verify_portal_token(token)
+    customer_id = access_data["customer_id"]
+
+    file_content = await file.read()
+    if len(file_content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File size exceeds 10MB limit")
+
+    file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
+    unique_name = f"MAINT_DOC_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
+    blob_path = f"customer_{customer_id}/maintenance_docs/{unique_name}"
+
+    bucket_name = GCS_BUCKET_NAME
+    bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, customer_id, "STORAGE_BUCKET_NAME"
+    )
+    if bucket_config and bucket_config.get('effective_value'):
+        bucket_name = bucket_config['effective_value']
+
+    stored_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, file.content_type)
+    if not stored_uri:
+        raise HTTPException(status_code=500, detail="Failed to upload document")
+
+    return {
+        "uri": stored_uri,
+        "file_name": file.filename,
+        "size_bytes": len(file_content),
     }
 
 
@@ -1250,13 +1444,15 @@ def public_create_maintenance_action(
             raise HTTPException(status_code=403, detail="Not authorized to modify this LG")
 
     action_type = payload.get("action_type", "").upper()
-    allowed_types = ["EXTEND", "INCREASE_AMOUNT", "CLOSE", "AMENDMENT"]
+    allowed_types = ["EXTEND", "INCREASE_AMOUNT", "AMENDMENT"]
     if action_type not in allowed_types:
         raise HTTPException(status_code=400, detail=f"action_type must be one of: {', '.join(allowed_types)}")
 
     action_data = payload.get("action_data", {})
     notes = payload.get("notes")
 
+    # Store requestor email in action_data for traceability (no internal user ID)
+    action_data["requestor_email"] = email
     action = maintenance_service.create_action(
         db, lg_id, action_type, action_data,
         user_id=None,  # Public requestor — no internal user
@@ -1325,6 +1521,7 @@ def public_get_my_maintenance_actions(
                 "id": a.id,
                 "action_type": a.action_type,
                 "status": a.status,
+                "instruction_status": a.instruction_status,
                 "action_data": a.action_data,
                 "notes": a.notes,
                 "lg_ref": a.issued_lg.lg_ref_number if a.issued_lg else None,
@@ -1333,4 +1530,139 @@ def public_get_my_maintenance_actions(
             }
             for a in actions
         ]
-    }
+    }
+
+
+@router.post("/issued-lgs/{lg_id}/maintenance")
+def public_submit_maintenance_action(
+    lg_id: int,
+    payload: dict = Body(...),
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    External requestor submits a maintenance action on their issued LG.
+    Allowed actions: EXTEND, INCREASE_AMOUNT, CLOSE, AMENDMENT.
+    """
+    from app.models.models_issuance import IssuanceRequest, IssuedLGRecord
+    from app.services.issuance_maintenance_service import IssuanceMaintenanceService
+
+    access_data = verify_portal_token(token)
+    customer_id = access_data["customer_id"]
+    email = access_data.get("email")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not available in token.")
+
+    # Verify the LG belongs to a request made by this email
+    lg = db.query(IssuedLGRecord).filter(
+        IssuedLGRecord.id == lg_id,
+        IssuedLGRecord.customer_id == customer_id,
+    ).first()
+    if not lg:
+        raise HTTPException(status_code=404, detail="LG not found")
+
+    request = db.query(IssuanceRequest).filter(
+        IssuanceRequest.id == lg.request_id,
+    ).first()
+    if not request or (request.requestor_email or "").lower() != email.lower():
+        raise HTTPException(status_code=403, detail="You can only manage LGs from your own requests")
+
+    # Validate allowed action types for external requestors
+    allowed_types = {"EXTEND", "INCREASE_AMOUNT", "AMENDMENT"}
+    action_type = payload.get("action_type")
+    if action_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Action type '{action_type}' is not available from the portal")
+
+    svc = IssuanceMaintenanceService()
+    ext_action_data = payload.get("action_data", {})
+    ext_action_data["requestor_email"] = email
+    action = svc.create_action(
+        db=db,
+        issued_lg_id=lg_id,
+        action_type=action_type,
+        action_data=ext_action_data,
+        user_id=None,  # No internal user — external requestor
+        customer_id=customer_id,
+        notes=payload.get("notes"),
+        initiation_source="EXTERNAL_REQUESTOR",
+    )
+    return {"id": action.id, "status": action.status, "action_type": action.action_type}
+
+# ==============================================================================
+# OWNERSHIP HANDOVER ENDPOINTS
+# ==============================================================================
+
+@router.post("/handover/initiate")
+def public_initiate_handover(
+    payload: dict = Body(...),
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Requestor initiates handing over their LG to another Requestor profile.
+    payload: {
+        lg_id: int,
+        new_requestor: { email, name, department, ... }
+    }
+    """
+    from app.crud.crud_issuance_owner import initiate_peer_handover
+    from app.schemas.schemas_issuance import RequestorProfile
+    from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
+    
+    access_data = verify_portal_token(token)
+    customer_id = access_data["customer_id"]
+    email = access_data.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not available in token.")
+
+    lg_id = payload.get("lg_id")
+    new_req_data = payload.get("new_requestor")
+    if not lg_id or not new_req_data:
+        raise HTTPException(status_code=400, detail="lg_id and new_requestor are required.")
+
+    # Guard: ensure LG belongs to this requestor
+    lg = db.query(IssuedLGRecord).filter(
+        IssuedLGRecord.id == lg_id,
+        IssuedLGRecord.customer_id == customer_id,
+    ).first()
+    if not lg:
+        raise HTTPException(status_code=404, detail="LG not found")
+
+    request = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
+    if not request or (request.requestor_email or "").lower() != email.lower():
+        raise HTTPException(status_code=403, detail="You can only hand over LGs from your own requests")
+
+    profile = RequestorProfile(**new_req_data)
+    lg = initiate_peer_handover(db, customer_id, lg_id, profile, email)
+    return {"message": "Handover initiated successfully.", "lg_id": lg.id, "handover_state": lg.handover_state}
+
+
+@router.post("/handover/resolve")
+def public_resolve_handover(
+    payload: dict = Body(...),
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    The target Requestor accepts or rejects the handover.
+    payload: {
+        lg_id: int,
+        action: "ACCEPT" | "REJECT"
+    }
+    """
+    from app.crud.crud_issuance_owner import resolve_peer_handover
+    
+    access_data = verify_portal_token(token)
+    customer_id = access_data["customer_id"]
+    email = access_data.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not available in token.")
+
+    lg_id = payload.get("lg_id")
+    action = payload.get("action")
+    if not lg_id or not action or action not in ["ACCEPT", "REJECT"]:
+        raise HTTPException(status_code=400, detail="lg_id and valid action (ACCEPT/REJECT) are required.")
+
+    lg = resolve_peer_handover(db, customer_id, lg_id, action, email)
+    return {"message": f"Handover {action.lower()}ed successfully.", "lg_id": lg.id}

@@ -68,11 +68,21 @@ except ImportError:
     GEMINI_AVAILABLE = False
     genai = None
 
+# Try to import Google Document AI
+try:
+    from google.cloud import documentai_v1 as documentai
+    DOCUMENT_AI_AVAILABLE = True
+except ImportError:
+    logger.warning("Warning: google-cloud-documentai library not found. Document AI form parsing will be disabled.")
+    DOCUMENT_AI_AVAILABLE = False
+    documentai = None
+
 # --- Global Client/Credentials Instantiation ---
 _google_credentials = None
 _gcs_client = None
 _vision_client = None
 _gemini_model_global = None
+_docai_client = None
 
 # --- Dynamically set GOOGLE_APPLICATION_CREDENTIALS if JSON is provided ---
 # This block replaces the direct os.environ lookup with a temporary file approach.
@@ -116,10 +126,12 @@ def _get_gcs_client():
             credentials = _get_google_credentials()
             if credentials:
                 _gcs_client = storage.Client(credentials=credentials)
-                logger.info("Google Cloud Storage client initialized.")
+                logger.info("Google Cloud Storage client initialized with explicit credentials.")
             else:
-                logger.warning("Cannot initialize GCS client: Credentials not available.")
-                _gcs_client = None
+                # Fallback to Application Default Credentials (ADC)
+                # This works with gcloud CLI auth, GOOGLE_APPLICATION_CREDENTIALS env var, etc.
+                _gcs_client = storage.Client()
+                logger.info("Google Cloud Storage client initialized with Application Default Credentials.")
         except Exception as e:
             logger.error(f"Error initializing GCS client: {e}")
             _gcs_client = None
@@ -170,6 +182,180 @@ _get_gcs_client()
 _get_vision_client()
 _get_gemini_model()
 
+# --- Document AI Configuration ---
+DOCUMENT_AI_PROJECT_ID = os.environ.get('DOCUMENT_AI_PROJECT_ID', '')
+DOCUMENT_AI_PROCESSOR_ID = os.environ.get('DOCUMENT_AI_PROCESSOR_ID', '')
+DOCUMENT_AI_LOCATION = os.environ.get('DOCUMENT_AI_LOCATION', 'us')  # 'us' or 'eu' or full region
+
+logger.info(f"Document AI config: project={DOCUMENT_AI_PROJECT_ID or '(not set)'}, "
+            f"processor={DOCUMENT_AI_PROCESSOR_ID or '(not set)'}, "
+            f"location={DOCUMENT_AI_LOCATION}")
+
+@lru_cache(maxsize=1)
+def _get_docai_client():
+    """Initialize Document AI client using same credentials as other GCP services."""
+    global _docai_client
+    if not DOCUMENT_AI_AVAILABLE:
+        logger.warning("Document AI library not installed.")
+        return None
+    if _docai_client is None:
+        try:
+            from google.api_core.client_options import ClientOptions
+            credentials = _get_google_credentials()
+            opts = ClientOptions(
+                api_endpoint=f"{DOCUMENT_AI_LOCATION}-documentai.googleapis.com"
+            ) if DOCUMENT_AI_LOCATION else None
+            if credentials:
+                _docai_client = documentai.DocumentProcessorServiceClient(
+                    credentials=credentials, client_options=opts
+                )
+            else:
+                _docai_client = documentai.DocumentProcessorServiceClient(
+                    client_options=opts
+                )
+            logger.info(f"Document AI client initialized (location={DOCUMENT_AI_LOCATION}).")
+        except Exception as e:
+            logger.error(f"Error initializing Document AI client: {e}")
+            _docai_client = None
+    return _docai_client
+
+
+async def _detect_fields_with_document_ai(pdf_bytes: bytes) -> list:
+    """
+    Use Google Document AI Form Parser to detect form fields with precise
+    bounding box coordinates. Returns a list of detected field entries:
+    [
+        {
+            "label": "Date",
+            "value_text": "...",
+            "x_pct": 45.2,       # horizontal position as % of page width
+            "y_pct": 12.8,       # vertical position as % of page height (from top)
+            "width_pct": 20.5,   # width as % of page width
+            "height_pct": 3.1,   # height as % of page height
+            "page": 0,
+            "confidence": 0.95,
+            "field_type": "text",
+        },
+        ...
+    ]
+    """
+    client = _get_docai_client()
+    if not client or not DOCUMENT_AI_PROJECT_ID or not DOCUMENT_AI_PROCESSOR_ID:
+        logger.warning("Document AI not configured. Skipping precise field detection.")
+        return []
+
+    try:
+        processor_name = client.processor_path(
+            DOCUMENT_AI_PROJECT_ID, DOCUMENT_AI_LOCATION, DOCUMENT_AI_PROCESSOR_ID
+        )
+
+        raw_document = documentai.RawDocument(
+            content=pdf_bytes,
+            mime_type="application/pdf",
+        )
+
+        request = documentai.ProcessRequest(
+            name=processor_name,
+            raw_document=raw_document,
+        )
+
+        # Run synchronously in a thread to not block the event loop
+        import asyncio
+        result = await asyncio.to_thread(client.process_document, request=request)
+        document = result.document
+
+        detected_fields = []
+
+        for page_idx, page in enumerate(document.pages):
+            page_width = page.dimension.width
+            page_height = page.dimension.height
+
+            if page_width == 0 or page_height == 0:
+                continue
+
+            for form_field in page.form_fields:
+                # Extract field label (the printed text)
+                label_text = ""
+                if form_field.field_name and form_field.field_name.text_anchor:
+                    label_segments = form_field.field_name.text_anchor.text_segments
+                    if label_segments:
+                        for seg in label_segments:
+                            start = int(seg.start_index) if seg.start_index else 0
+                            end = int(seg.end_index) if seg.end_index else 0
+                            label_text += document.text[start:end]
+                label_text = label_text.strip()
+
+                # Extract field value (what's currently written, if anything)
+                value_text = ""
+                if form_field.field_value and form_field.field_value.text_anchor:
+                    val_segments = form_field.field_value.text_anchor.text_segments
+                    if val_segments:
+                        for seg in val_segments:
+                            start = int(seg.start_index) if seg.start_index else 0
+                            end = int(seg.end_index) if seg.end_index else 0
+                            value_text += document.text[start:end]
+                value_text = value_text.strip()
+
+                # Get bounding box of the VALUE area (where we need to write)
+                value_bbox = form_field.field_value.bounding_poly if form_field.field_value else None
+                if not value_bbox or not value_bbox.normalized_vertices:
+                    # Fallback: use the label's bounding box
+                    value_bbox = form_field.field_name.bounding_poly if form_field.field_name else None
+
+                if not value_bbox or not value_bbox.normalized_vertices:
+                    continue
+
+                verts = value_bbox.normalized_vertices
+                if len(verts) < 4:
+                    continue
+
+                # normalized_vertices are 0-1 range, convert to 0-100 percentages
+                x_min = min(v.x for v in verts) * 100
+                x_max = max(v.x for v in verts) * 100
+                y_min = min(v.y for v in verts) * 100
+                y_max = max(v.y for v in verts) * 100
+
+                box_width = x_max - x_min
+                box_height = y_max - y_min
+
+                # GENERIC POSITIONING: use the BOTTOM of the value bounding box.
+                # On ANY form, the bottom edge of the value area IS the baseline/underline
+                # where text naturally sits. This is box-height-independent.
+                field_x_pct = round(x_min + 1.0, 1)  # 1% left padding to clear box edge
+                field_y_pct = round(y_max - 0.3, 1)   # bottom of box, tiny offset above the line
+
+                # Auto-compute font size from box height (in page points)
+                # Typical page height ~842pt (A4), so box_height% * 842/100 ≈ pts
+                estimated_font_pts = max(6, min(14, round(box_height * 8.42 * 0.65)))
+
+                # Determine field type from value type
+                field_type = "text"
+                value_type = getattr(form_field, 'value_type', '')
+                if value_type and 'checkbox' in value_type.lower():
+                    field_type = "checkbox"
+
+                confidence = form_field.field_name.confidence if form_field.field_name else 0.0
+
+                detected_fields.append({
+                    "label": label_text or f"field_{page_idx}_{len(detected_fields)}",
+                    "value_text": value_text,
+                    "x_pct": field_x_pct,
+                    "y_pct": field_y_pct,
+                    "width_pct": round(box_width, 1),
+                    "height_pct": round(box_height, 1),
+                    "page": page_idx,
+                    "confidence": round(confidence, 3),
+                    "field_type": field_type,
+                    "font_size": estimated_font_pts,
+                })
+
+        logger.info(f"Document AI detected {len(detected_fields)} form fields.")
+        return detected_fields
+
+    except Exception as e:
+        logger.error(f"Document AI form detection failed: {e}", exc_info=True)
+        return []
+
 # --- Local Output Directory Setup ---
 BASE_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "Output")
 OCR_INPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "OCR_Input_to_Gemini")
@@ -209,6 +395,7 @@ async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_
         raise
 
 
+
 async def _cleanup_gcs_files(bucket_name: str, prefix: str):
     """
     Asynchronously deletes files from GCS that match a given prefix.
@@ -244,15 +431,17 @@ def delete_file_from_gcs(gcs_uri: str) -> bool:
         bucket_name = parts[0]
         blob_name = parts[1]
 
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(bucket_name)
+        client = _get_gcs_client()
+        if not client:
+            logger.error("GCS client not initialized. Cannot delete file.")
+            return False
+        bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         
         blob.delete()
         return True
     except Exception as e:
-        # Just log it, don't crash the app
-        print(f"Error deleting file {gcs_uri}: {e}")
+        logger.error(f"Error deleting file {gcs_uri}: {e}")
         return False
 
 # --- UPDATED: Generate Signed URL ---
@@ -487,17 +676,21 @@ async def extract_structured_data_with_gemini(text_content: str, unique_file_id:
         }
         
         lg_number = context["lg_record_details"].get("lgNumber", "")
+        alt_lg_number = context["lg_record_details"].get("alternativeLgNumber", "")
+        lg_number_clause = f'LG number: "{lg_number}"'
+        if alt_lg_number:
+            lg_number_clause += f' (alternative reference: "{alt_lg_number}")'
         prompt = f"""
 You are a financial document analyst. You have received a document which may be a bank amendment letter for an existing Letter of Guarantee (LG).
 
 Your task is to:
-1.  Verify if this document is a relevant amendment for LG number: "{lg_number}".
+1.  Verify if this document is a relevant amendment for {lg_number_clause}.
 2.  If it is, extract *only* the fields that are being amended and their new values. Do not include any fields that are not mentioned as changed.
 
 Return your output as a JSON object with the following fields:
 
-1.  **is_relevant_amendment**: A boolean value (true/false). Set this to `true` if the document explicitly refers to the LG number: "{lg_number}". Otherwise, set to `false`.
-2.  **lgNumber**: The LG number as it appears in the amendment document. This should match the provided number for a relevant amendment.
+1.  **is_relevant_amendment**: A boolean value (true/false). Set this to `true` if the document explicitly refers to {lg_number_clause}. If either number matches, set to `true`.
+2.  **lgNumber**: The LG number as it appears in the amendment document.
 3.  **amendedFields**: A JSON object containing only the fields that have been changed. The keys should be the field names (e.g., `lgAmount`, `expiryDate`) and the values should be the new values from the document. The date format for `expiryDate` must be YYYY-MM-DD. Omit this object if no amendments are found or if the document is not relevant.
 
 ---
@@ -1093,14 +1286,81 @@ async def analyze_bank_form_pdf(
     fields_info = ""
     is_overlay = form_type in ("PHYSICAL_OVERLAY", "SCANNED_FILL")
     
+    # Extract page dimensions from PDF for better coordinate accuracy
+    page_dimensions_info = ""
+    try:
+        from pypdf import PdfReader
+        from io import BytesIO
+        reader = PdfReader(BytesIO(pdf_bytes))
+        if reader.pages:
+            first_page = reader.pages[0]
+            mb = first_page.mediabox
+            pw, ph = float(mb.width), float(mb.height)
+            page_dimensions_info = f"""\n## PDF Page Dimensions (IMPORTANT for positioning)
+This PDF page is {pw:.0f} x {ph:.0f} points ({pw/72:.1f} x {ph/72:.1f} inches).
+The page has {len(reader.pages)} page(s).
+"""
+    except Exception as e:
+        logger.warning(f"Could not extract page dimensions: {e}")
+    
     if detected_fields and not is_overlay:
         fields_info = f"""
 The PDF contains the following interactive form fields (extracted programmatically):
 {json.dumps(detected_fields, indent=2)}
 """
     elif is_overlay:
-        fields_info = """This is a PHYSICAL OVERLAY form (non-fillable PDF). There are NO interactive form fields.
-You must analyze the visual layout to identify every fillable area."""
+        # For overlay/scanned forms, try Document AI first for precise coordinates
+        docai_fields = []
+        try:
+            docai_fields = await _detect_fields_with_document_ai(pdf_bytes)
+        except Exception as e:
+            logger.warning(f"Document AI detection failed, falling back to AI estimation: {e}")
+
+        if docai_fields:
+            # Build Document AI reference data for Gemini calibration
+            docai_summary = json.dumps([
+                {
+                    "label": df.get("label", ""),
+                    "x_pct": df["x_pct"],
+                    "y_pct": df["y_pct"],
+                    "width_pct": df["width_pct"],
+                    "height_pct": df.get("height_pct", 2),
+                    "page": df.get("page", 0),
+                    "field_type": df.get("field_type", "text"),
+                    "font_size": df.get("font_size", 10),
+                }
+                for df in docai_fields
+            ], indent=2)
+            
+            # Also get PDFMiner structural blueprint for precise label positions
+            pdfminer_data = _extract_pdf_structure(pdf_bytes)
+            pdfminer_json = json.dumps(pdfminer_data, indent=2, ensure_ascii=False)
+            
+            fields_info = f"""This is a PHYSICAL OVERLAY form (non-fillable PDF). There are NO interactive form fields.
+You must analyze the visual layout to identify every fillable area.
+
+## REFERENCE DATA — Precise Field Positions (from Document AI)
+The following {len(docai_fields)} fields were detected by Document AI with precise bounding box coordinates.
+Use these as **calibration anchor points** when estimating positions for other fields.
+
+**Instructions:**
+1. For fields that MATCH Document AI entries below, USE their exact coordinates (x_pct, y_pct, width_pct, font_size)
+2. For ADDITIONAL fields you find visually that are NOT in this list, ESTIMATE coordinates using these known positions as reference anchors
+3. You MUST still visually scan the ENTIRE form — Document AI may have missed fields
+
+{docai_summary}
+
+## PDFMiner STRUCTURAL BLUEPRINT — Exact positions of EVERY printed label
+This data shows every printed text element's position (100% accurate from the PDF's own data).
+Use it to calculate fill positions: if a label ends at x_end_pct=28%, the fill area starts at ~29%.
+{pdfminer_json}
+
+{page_dimensions_info}"""
+            logger.info(f"Document AI detected {len(docai_fields)} fields — included as calibration data for Gemini.")
+        else:
+            fields_info = f"""This is a PHYSICAL OVERLAY form (non-fillable PDF). There are NO interactive form fields.
+You must analyze the visual layout to identify every fillable area.
+{page_dimensions_info}"""
     else:
         fields_info = "Note: No interactive form fields were detected programmatically. Analyze the visual layout of the form to identify input fields."
 
@@ -1196,7 +1456,7 @@ This means:
 - **"Customer Name"** on the form = the applicant company's name (our field: `entity_name`)
 - **"Branch"** = the bank branch where the customer holds their account (our field: `bank_branch`)  
 - **"Account No."** = the customer's account number at this bank (our field: `bank_account_number`)
-- **"In Favor Of"** or **"\u0644\u0635\u0627\u0644\u062d"** = the beneficiary (our field: `beneficiary_name`)
+- **"In Favor Of"** or **"لصالح"** = the beneficiary (our field: `beneficiary_name`)
 - **"Date"** at the top = today's date / submission date (our field: `current_date`)
 - **"Address"** near "Customer Name" = the customer entity's address (our field: `entity_address`)
 - **"Address"** near "In Favor Of" or "Beneficiary" = the beneficiary's address (our field: `beneficiary_address`)
@@ -1212,29 +1472,78 @@ Map form fields to these system data fields:
     # --- MODE-SPECIFIC TASK + RESPONSE ---
     if is_overlay:
         task_and_response = """
-## Your Task \u2014 PHYSICAL OVERLAY MODE
+## Your Task — PHYSICAL OVERLAY MODE
 
 This is a non-fillable PDF (scanned or flat). You must analyze the visual layout and provide POSITION COORDINATES for each field.
 
-For EACH fillable area you identify on the form (dotted lines, boxes, underscored blanks, text areas):
-1. Identify what the field expects based on its visual label, position, and banking context
+### STEP 1: Analyze the form's visual structure
+Before placing any fields, mentally divide the page into 10 equal horizontal rows (each row = 10% of page height):
+- Row 0-10%: Very top (logo area, bank name, form title)
+- Row 10-20%: Header area (date, branch, ref number fields)
+- Row 20-30%: Customer/applicant info section
+- Row 30-50%: LG details (type checkboxes, amounts, in favor of)
+- Row 50-70%: Guarantee details (purpose, conditions, reference)
+- Row 70-85%: Additional info, terms, signatures
+- Row 85-100%: Footer, final signatures
+
+Identify which visual row each blank/fillable area falls in. This determines `y_pct`.
+
+### STEP 2: For EACH fillable area you identify:
+1. Identify what the field expects based on its visual label and banking context
 2. Map it to the most appropriate system field from the available data fields
 3. Determine the **field_type**: "text", "checkbox", or "date"
-4. **Estimate the x,y position** in PDF points (origin = bottom-left of page):
-   - `x`: horizontal distance in points from the LEFT edge
-   - `y`: vertical distance in points from the BOTTOM edge  
-   - Standard A4 is 595 x 842 points. Letter is 612 x 792 points.
-   - Position the text where it would naturally be written/typed on the form
+4. **Estimate the position as PERCENTAGES of page width and height:**
+   - `x_pct`: horizontal position (0 = left edge, 100 = right edge)
+   - `y_pct`: vertical position (0 = TOP edge, 100 = BOTTOM edge)
+   - Also provide `width_pct` (width of the fillable area as % of page width)
+
+### STEP 3: Positioning Rules (CRITICAL — read carefully)
+
+**WHERE TO PLACE the value:**
+- Find the BLANK AREA (dotted line, empty box, underlined space, or gap between labels)
+- Place `x_pct` at the START of where text would be WRITTEN, NOT on the printed label
+- For "Date: ________" → `x_pct` should be AFTER "Date:", on the blank line
+
+**BILINGUAL FORM LAYOUT (Arabic + English on same page) — VERY IMPORTANT:**
+Many bank forms are bilingual with a SPLIT LAYOUT on each row:
+```
+[English Label: ___EN fill area___|___AR fill area___  :Arabic Label]
+LEFT side (0-50%)                                     RIGHT side (50-100%)
+```
+
+Rules for bilingual forms:
+- The page is divided roughly in HALF: English content on the LEFT, Arabic on the RIGHT
+- For each field row, there is an English label on the LEFT and an Arabic label on the RIGHT
+- **CRITICAL**: When English and Arabic labels are on the SAME ROW (same y position), there is typically ONE shared fill area between them.
+  - Create ONE field entry with `language: "shared"` tag
+  - Position `x_pct` at the start of the fill area (right after the English label ends)
+  - Set `width_pct` to cover the gap between labels (from after English label to before Arabic label)
+  - Do NOT create two separate `_en` and `_ar` fields for the same row
+- **EXCEPTION**: If the form has SEPARATE SECTIONS for each language (e.g., English block on top, Arabic block below, or different pages), then create separate `_en` and `_ar` fields with their own coordinates.
+- For checkboxes: only one entry per checkbox, with `language: "shared"`
+
+If the form is SINGLE LANGUAGE (English or Arabic only), ignore the split layout and use the full page width.
+
+**VERTICAL positioning (y_pct):**
+- Count the visual line number from the top of the page
+- A form with ~30 visible lines: each line ≈ 3.3% height
+- The FIRST fillable line (usually Date/Branch) is typically at y_pct 10-15
+- Each subsequent line adds approximately 2.5-4% depending on spacing
+- Checkbox lines: position at the CENTER of the checkbox square
+
+**HORIZONTAL positioning (x_pct):**
+- For bilingual forms: use the split layout rules above
+- Left-aligned English fields: x_pct ≈ 15-25 (after the English label)
+- Right-aligned Arabic fields: x_pct ≈ 55-75 (near the Arabic label)
+- For single-language forms: x_pct wherever the fill gap starts
+- For checkboxes: position at the CENTER of the checkbox square
+
 5. Set `page` (0-indexed page number) and `font_size` (usually 8-12 for bank forms)
 6. For **date fields**: include `date_format` (e.g., `DD/MM/YYYY`)
 7. For **amount in words** fields: map to `amount_in_words`
-8. Give each field a descriptive `pdf_field_name` (since there are no real PDF field names)
-9. For **strikethrough patterns** (e.g., "IN OUR NAME / IN THE NAME OF ____" where one option must be crossed out):
-   - Set `fill_strategy` to `"strikethrough"`
-   - Map to the boolean that triggers the strikethrough (e.g., `is_third_party` to strike "IN OUR NAME")
-   - Set `x`, `y` to the START of the text to be struck and `width` to the text length in points
-   - The system will draw a line OVER the text when the boolean is true
-10. For **additional conditions / other conditions** fields: map to `additional_conditions`
+8. Give each field a descriptive `pdf_field_name`
+9. For **strikethrough patterns**: set `fill_strategy` to `"strikethrough"`, with `x_pct`, `y_pct`, `width_pct`
+10. For **additional conditions**: map to `additional_conditions`
 
 ## Response Format
 Return a JSON object:
@@ -1250,11 +1559,12 @@ Return a JSON object:
       "field_type": "text",
       "source": "request_data",
       "confidence": 0.85,
-      "x": 120,
-      "y": 780,
+      "x_pct": 20,
+      "y_pct": 8,
+      "width_pct": 25,
       "page": 0,
       "font_size": 10,
-      "notes": "Top-left area, after printed label 'Branch:'"
+      "notes": "Top-left area, after printed label 'Branch:' — blank line starts at ~20% from left"
     }},
     {{
       "pdf_field_name": "date_field",
@@ -1264,8 +1574,9 @@ Return a JSON object:
       "date_format": "DD/MM/YYYY",
       "source": "request_data",
       "confidence": 0.9,
-      "x": 120,
-      "y": 750,
+      "x_pct": 20,
+      "y_pct": 11,
+      "width_pct": 15,
       "page": 0,
       "font_size": 10,
       "notes": "Below branch, date format area"
@@ -1278,16 +1589,16 @@ Return a JSON object:
       "fill_strategy": "strikethrough",
       "source": "request_data",
       "confidence": 0.9,
-      "x": 150,
-      "y": 500,
-      "width": 80,
+      "x_pct": 25,
+      "y_pct": 40,
+      "width_pct": 15,
       "page": 0,
       "font_size": 10,
       "notes": "Strike 'IN OUR NAME' when issuing for third party"
     }}
   ],
   "unmapped_fields": [],
-  "form_notes": "Physical overlay form. Coordinates estimated from visual layout."
+  "form_notes": "Physical overlay form. Coordinates as percentages of page dimensions."
 }}
 ```
 """
@@ -1383,15 +1694,15 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
 6. **Language selection fields** (e.g., "Arabic ☐  English ☐" on the form): map the Arabic checkbox to `lg_language_is_arabic` and the English checkbox to `lg_language_is_english`, tag both as `"shared"`.
 7. **Single-language forms**: If the entire form is in just one language, tag ALL fields as `"shared"`.
 
-**Common Arabic-English field pairs** (map BOTH to the same key, but tag differently):
-   - "Branch" → `bank_branch` (tag `"en"`) / "فرع" → `bank_branch` (tag `"ar"`)
-   - "Customer Name" → `entity_name` (tag `"en"`) / "اسم العميل" → `entity_name` (tag `"ar"`)
-   - "Amount" → `amount` (tag `"en"`) / "بمبلغ" → `amount` (tag `"ar"`)
-   - "Amount in Words" → `amount_in_words` (tag `"en"`) / "المبلغ بالحروف" → `amount_in_words` (tag `"ar"`)
-   - "In Favor Of" → `beneficiary_name` (tag `"en"`) / "لصالح" → `beneficiary_name` (tag `"ar"`)
-   - "Account No." → `bank_account_number` (tag `"shared"` — numeric)
-   - "Date" / "التاريخ" → `current_date` (tag `"shared"` — date)
-   - "Expiry Date" / "تاريخ نهاية الصلاحية" → `requested_expiry_date` (tag `"shared"` — date)
+**Common Arabic-English field pairs** (for bilingual same-row forms, map to ONE entry with `"shared"` tag):
+   - "Branch" / "فرع" → `bank_branch` (tag `"shared"`)
+   - "Customer Name" / "اسم العميل" → `entity_name` (tag `"shared"`)
+   - "Amount" / "بمبلغ" → `amount` (tag `"shared"`)
+   - "Amount in Words" / "المبلغ بالحروف" → `amount_in_words` (tag `"shared"`)
+   - "In Favor Of" / "لصالح" → `beneficiary_name` (tag `"shared"`)
+   - "Account No." → `bank_account_number` (tag `"shared"`)
+   - "Date" / "التاريخ" → `current_date` (tag `"shared"`)
+   - "Expiry Date" / "تاريخ نهاية الصلاحية" → `requested_expiry_date` (tag `"shared"`)
 
 **PDF fields with generic names** like `fill_2_2`, `fill_4`, `Date_2`, `Address_3` are often the Arabic-side equivalents. Determine their language tag from their VISUAL POSITION on the form.
 
@@ -1402,7 +1713,7 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
 **"مع" / "بعملية" / "with" / "in connection with"** — these form fields refer to the contract/project details. Map to `lg_purpose` or `reference_number` based on context.
 
 ## IMPORTANT RULES:
-- **ALWAYS include `"language"` tag** on every field: `"en"`, `"ar"`, or `"shared"`
+- **ALWAYS include `"language"` tag** on every field: `"en"`, `"ar"`, or `"shared"`. Use `"shared"` for bilingual same-row fields.
 - Map EVERY field you can identify — text fields, checkboxes, radio buttons, date fields  
 - For each **date** field, ALWAYS include `date_format` with the detected expected format
 - For **"Amount in Letters"**, **"المبلغ بالحروف"**, or **"Amount & CCY (in letters)"** → map to `amount_in_words`
@@ -1427,6 +1738,7 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
                 {"mime_type": "application/pdf", "data": pdf_bytes}
             ],
             generation_config=genai_module.types.GenerationConfig(
+                temperature=0.0,
                 response_mime_type="application/json",
             )
         )
@@ -1450,8 +1762,87 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
 
         result = json.loads(result_str)
         
-        # Summarize
+        # --- OPTIONAL: Refine Gemini coordinates with Document AI precision ---
+        # Gemini does all detection/mapping. If Document AI found matching fields,
+        # swap in their precise coordinates. Otherwise, keep Gemini's estimates.
         field_mapping = result.get("field_mapping", [])
+        
+        if is_overlay and docai_fields:
+            import re
+            
+            def _normalize_label(text):
+                """Normalize a label for matching: lowercase, strip punctuation/spaces."""
+                text = (text or "").strip().lower()
+                # Remove common suffixes/prefixes/punctuation
+                text = re.sub(r'[:\-–—/\\.,;!?()（）\[\]{}\'\"]+', ' ', text)
+                # Remove Arabic diacritics (tashkeel)
+                text = re.sub(r'[\u0610-\u061A\u064B-\u065F\u0670]', '', text)
+                # Collapse whitespace
+                text = re.sub(r'\s+', ' ', text).strip()
+                return text
+            
+            # Build lookup: normalized_label → Document AI field data
+            docai_lookup = {}
+            docai_entries = []  # Keep original + normalized for multi-strategy matching
+            for df in docai_fields:
+                raw_label = (df.get("label", "") or "").strip()
+                norm = _normalize_label(raw_label)
+                if norm:
+                    docai_lookup[norm] = df
+                    docai_entries.append((norm, raw_label, df))
+            
+            refined_count = 0
+            unmatched_labels = []
+            
+            for field in field_mapping:
+                raw_field_label = (field.get("label", "") or "").strip()
+                field_label = _normalize_label(raw_field_label)
+                if not field_label:
+                    continue
+                
+                # Strategy 1: Exact normalized match
+                matched = docai_lookup.get(field_label)
+                
+                # Strategy 2: Contains / substring match
+                if not matched:
+                    for dk, _, dv in docai_entries:
+                        if dk and (dk in field_label or field_label in dk):
+                            matched = dv
+                            break
+                
+                # Strategy 3: Word-overlap scoring (pick best match)
+                if not matched:
+                    field_words = set(field_label.split())
+                    if len(field_words) >= 1:
+                        best_score = 0
+                        best_match = None
+                        for dk, _, dv in docai_entries:
+                            dk_words = set(dk.split())
+                            overlap = len(field_words & dk_words)
+                            # Require at least 1 overlapping word and >40% overlap
+                            min_len = min(len(field_words), len(dk_words))
+                            if overlap > 0 and min_len > 0 and (overlap / min_len) > 0.4:
+                                if overlap > best_score:
+                                    best_score = overlap
+                                    best_match = dv
+                        matched = best_match
+                
+                if matched:
+                    # Refine with Document AI's precise coordinates
+                    field["x_pct"] = matched["x_pct"]
+                    field["y_pct"] = matched["y_pct"]
+                    field["width_pct"] = matched["width_pct"]
+                    field["height_pct"] = matched.get("height_pct", 3)
+                    field["font_size"] = matched.get("font_size", 10)
+                    field["page"] = matched.get("page", field.get("page", 0))
+                    refined_count += 1
+                else:
+                    unmatched_labels.append(raw_field_label)
+            
+            logger.info(f"Document AI coordinate refinement: {refined_count}/{len(field_mapping)} fields refined with precise coordinates.")
+            if unmatched_labels:
+                logger.info(f"Unmatched fields (kept Gemini estimates): {unmatched_labels[:10]}")
+        
         unmapped = result.get("unmapped_fields", [])
         
         logger.info(
@@ -1477,10 +1868,313 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
         logger.error(f"Bank form AI analysis failed for '{filename}': {e}", exc_info=True)
         raise
 
+# ==============================================================================
+# PDFMiner Structural Blueprint Extraction
+# ==============================================================================
+
+def _extract_pdf_structure(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Uses PDFMiner to extract exact coordinates of every text element in the PDF.
+    Returns a list of text elements per page with percentage-based coordinates.
+    This provides ground-truth label positions for precise fill placement.
+    """
+    import io
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextBox, LTTextLine, LTChar, LTAnno, LAParams
+    
+    pages_data = []
+    
+    try:
+        laparams = LAParams(
+            line_margin=0.3,
+            word_margin=0.15,
+            char_margin=2.0,
+            boxes_flow=0.5,
+            detect_vertical=True,
+        )
+        
+        pdf_stream = io.BytesIO(pdf_bytes)
+        
+        for page_idx, page_layout in enumerate(extract_pages(pdf_stream, laparams=laparams)):
+            if page_idx >= 2:  # Max 2 pages
+                break
+                
+            page_width = page_layout.width
+            page_height = page_layout.height
+            
+            elements = []
+            
+            for element in page_layout:
+                if isinstance(element, (LTTextBox, LTTextLine)):
+                    text = element.get_text().strip()
+                    if not text or len(text) < 1:
+                        continue
+                    
+                    # PDFMiner uses bottom-left origin, so y0 is bottom
+                    x0, y0_bottom, x1, y1_top = element.bbox
+                    
+                    # Convert to top-left origin percentages (matching our coordinate system)
+                    x_pct_start = round((x0 / page_width) * 100, 1)
+                    x_pct_end = round((x1 / page_width) * 100, 1)
+                    # Flip Y: PDFMiner y0=bottom, we want y_pct 0=top
+                    y_pct_top = round(((page_height - y1_top) / page_height) * 100, 1)
+                    y_pct_bottom = round(((page_height - y0_bottom) / page_height) * 100, 1)
+                    
+                    # Get dominant font size from characters
+                    font_sizes = []
+                    if isinstance(element, LTTextBox):
+                        for line in element:
+                            if isinstance(line, LTTextLine):
+                                for char in line:
+                                    if isinstance(char, LTChar):
+                                        font_sizes.append(round(char.size, 1))
+                    elif isinstance(element, LTTextLine):
+                        for char in element:
+                            if isinstance(char, LTChar):
+                                font_sizes.append(round(char.size, 1))
+                    
+                    avg_font_size = round(sum(font_sizes) / len(font_sizes), 1) if font_sizes else 10.0
+                    
+                    elements.append({
+                        "text": text[:100],  # Truncate very long text
+                        "x_start_pct": x_pct_start,
+                        "x_end_pct": x_pct_end,
+                        "y_top_pct": y_pct_top,
+                        "y_bottom_pct": y_pct_bottom,
+                        "font_size": avg_font_size,
+                    })
+            
+            # Sort by y position (top to bottom), then x (left to right)
+            elements.sort(key=lambda e: (e["y_top_pct"], e["x_start_pct"]))
+            
+            pages_data.append({
+                "page": page_idx,
+                "width_pts": round(page_width, 1),
+                "height_pts": round(page_height, 1),
+                "elements_count": len(elements),
+                "elements": elements,
+            })
+        
+        total = sum(p["elements_count"] for p in pages_data)
+        logger.info(f"PDFMiner: extracted {total} text elements from {len(pages_data)} pages")
+        
+    except Exception as e:
+        logger.warning(f"PDFMiner extraction failed: {e}. Continuing without structural data.")
+        pages_data = [{"page": 0, "elements": [], "note": f"Extraction failed: {str(e)}"}]
+    
+    return pages_data
+
 
 # ==============================================================================
-# H1: Facility Agreement AI Verification
+# ENHANCE: Visual Feedback Loop for Coordinate Correction
 # ==============================================================================
+
+
+async def enhance_bank_form_mapping(
+    template_pdf_bytes: bytes,
+    filled_pdf_bytes: bytes,
+    current_mapping: List[Dict[str, Any]],
+    form_type: str = "SCANNED_FILL",
+    filename: str = "form.pdf",
+) -> List[Dict[str, Any]]:
+    """
+    Visual feedback loop: sends the original form + filled preview to Gemini,
+    along with the current mapping AND PDFMiner structural blueprint.
+    Gemini uses exact label positions to calculate precise fill coordinates.
+    
+    Returns: corrected field_mapping list (only positions are updated, 
+             semantic mappings are preserved).
+    """
+    model = _get_gemini_model()
+    if not model:
+        raise Exception("Gemini model not available for enhancement.")
+    
+    import fitz  # PyMuPDF for rendering PDF to image
+    
+    # ── Step 1: Extract structural blueprint via PDFMiner ──
+    structural_data = _extract_pdf_structure(template_pdf_bytes)
+    
+    # ── Step 2: Render original + filled as images ──
+    original_doc = fitz.open(stream=template_pdf_bytes, filetype="pdf")
+    filled_doc = fitz.open(stream=filled_pdf_bytes, filetype="pdf")
+    
+    image_parts = []
+    page_dimensions = []
+    num_pages = min(original_doc.page_count, 2)
+    
+    for pg_idx in range(num_pages):
+        page = original_doc[pg_idx]
+        page_dimensions.append({
+            "page": pg_idx,
+            "width_pts": round(page.rect.width, 1),
+            "height_pts": round(page.rect.height, 1),
+        })
+        
+        orig_pix = page.get_pixmap(dpi=150)
+        orig_bytes = orig_pix.tobytes("png")
+        image_parts.append({"mime_type": "image/png", "data": orig_bytes})
+        
+        if pg_idx < filled_doc.page_count:
+            fill_pix = filled_doc[pg_idx].get_pixmap(dpi=150)
+            fill_bytes = fill_pix.tobytes("png")
+            image_parts.append({"mime_type": "image/png", "data": fill_bytes})
+    
+    original_doc.close()
+    filled_doc.close()
+    
+    # ── Step 3: Build mapping summary ──
+    mapping_summary = json.dumps([
+        {
+            "pdf_field_name": f.get("pdf_field_name", ""),
+            "label": f.get("label", ""),
+            "mapped_to": f.get("mapped_to", ""),
+            "field_type": f.get("field_type", "text"),
+            "x_pct": f.get("x_pct"),
+            "y_pct": f.get("y_pct"),
+            "width_pct": f.get("width_pct"),
+            "page": f.get("page", 0),
+            "font_size": f.get("font_size", 10),
+            "language": f.get("language", ""),
+        }
+        for f in current_mapping
+    ], indent=2)
+    
+    structural_json = json.dumps(structural_data, indent=2, ensure_ascii=False)
+    page_dims_str = json.dumps(page_dimensions, indent=2)
+    
+    # ── Step 4: Build enhanced prompt with structural data ──
+    prompt = f"""You are a precision form-filling coordinate corrector.
+
+## Your Input
+1. ORIGINAL blank bank form image(s)
+2. FILLED preview image(s) — showing where our system placed text
+3. Current field mapping with coordinates (JSON)
+4. **PDFMiner STRUCTURAL BLUEPRINT** — EXACT coordinates of every printed text element in the PDF (labels, headers, boxes). These are 100% accurate — the PDF's own coordinate data.
+
+## Page Dimensions
+{page_dims_str}
+
+## PDFMiner Structural Blueprint (GROUND TRUTH — exact label positions)
+This data shows the precise position of every printed label in the form. Use it to calculate where fill-areas should be:
+- If a label like "Branch:" ends at x_pct=28%, the fill text should START at x_pct≈29%
+- If a label row is at y_pct=15%, the fill text baseline should be at y_pct≈15% (same line)
+- For fields BELOW a label, add ~3-4% to the label's y_pct
+```json
+{structural_json}
+```
+
+## Current Mapping (what we need to fix)
+```json
+{mapping_summary}
+```
+
+## Your Job
+For EACH field in the current mapping:
+1. Find the corresponding label in the structural blueprint
+2. Calculate the correct fill position based on the label's EXACT coordinates
+3. If the current coordinates are wrong, provide corrected values
+
+## CRITICAL Rules
+- x_pct: 0=left edge, 100=right edge. START of where text should be written.
+- y_pct: 0=top edge, 100=bottom edge. BASELINE of text.
+- width_pct: fill area width as % of page width.
+- TRUST the structural blueprint coordinates over visual estimation.
+- For BILINGUAL forms (Arabic + English on same line):
+  - English fill: starts right after the English label ends (left half)
+  - Arabic fill: starts right after the Arabic label ends (right half)
+- Only correct fields that are MISPLACED. Keep correct ones unchanged.
+
+## Response Format
+Return JSON with ONLY fields that need corrections:
+{{
+  "corrections": [
+    {{
+      "pdf_field_name": "field_name",
+      "x_pct": 25.0,
+      "y_pct": 35.2,
+      "width_pct": 20.0,
+      "font_size": 9,
+      "reason": "Label 'Branch:' ends at x=28%, placed fill at x=29%"
+    }}
+  ],
+  "summary": "Brief description of fixes"
+}}
+
+If ALL fields are correctly placed: {{"corrections": [], "summary": "All fields correctly positioned"}}
+"""
+    
+    # Build content: images first, then prompt
+    content_parts = []
+    for i in range(num_pages):
+        content_parts.append(f"--- PAGE {i} ORIGINAL ---")
+        content_parts.append(image_parts[i * 2])  # original
+        content_parts.append(f"--- PAGE {i} FILLED PREVIEW ---")
+        if i * 2 + 1 < len(image_parts):
+            content_parts.append(image_parts[i * 2 + 1])  # filled
+    content_parts.append(prompt)
+    
+    logger.info(f"Enhance: sending {num_pages} page pairs to Gemini for visual correction...")
+    
+    response = model.generate_content(
+        content_parts,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.1,
+            max_output_tokens=16384,
+            response_mime_type="application/json",
+        ),
+    )
+    
+    response_text = response.text.strip()
+    
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError:
+        # Fallback: strip markdown fences
+        clean_text = response_text
+        if '```json' in clean_text:
+            clean_text = clean_text.split('```json', 1)[1]
+            if '```' in clean_text:
+                clean_text = clean_text.split('```', 1)[0]
+        clean_text = clean_text.strip()
+        try:
+            result = json.loads(clean_text)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Enhance: JSON parse failed: {e}. Response: {response_text[:500]}")
+            return current_mapping
+    corrections = result.get("corrections", [])
+    summary = result.get("summary", "")
+    
+    if not corrections:
+        logger.info(f"Enhance: No corrections needed — {summary}")
+        return current_mapping
+    
+    # Apply corrections to the mapping
+    corrections_by_name = {c["pdf_field_name"]: c for c in corrections}
+    corrected_count = 0
+    
+    enhanced_mapping = []
+    for field in current_mapping:
+        field_copy = dict(field)
+        fname = field_copy.get("pdf_field_name", "")
+        if fname in corrections_by_name:
+            corr = corrections_by_name[fname]
+            if "x_pct" in corr:
+                field_copy["x_pct"] = corr["x_pct"]
+            if "y_pct" in corr:
+                field_copy["y_pct"] = corr["y_pct"]
+            if "width_pct" in corr:
+                field_copy["width_pct"] = corr["width_pct"]
+            if "font_size" in corr:
+                field_copy["font_size"] = corr["font_size"]
+            corrected_count += 1
+            logger.debug(f"Enhance: corrected '{fname}' — {corr.get('reason', '')}")
+        enhanced_mapping.append(field_copy)
+    
+    logger.info(f"Enhance complete: {corrected_count}/{len(current_mapping)} fields corrected. {summary}")
+    return enhanced_mapping
+
+
+
 
 # Shared constant: Maximum file size for AI document processing (5 MB)
 AI_DOC_MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB

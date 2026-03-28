@@ -14,11 +14,13 @@ class MigrationRecordStatusEnum(str, Enum):
     ERROR = "ERROR"
     DUPLICATE = "DUPLICATE"
     EXPIRED = "EXPIRED"
+    CONFLICT = "CONFLICT"
 
 # NEW: Enum for migration record type
 class MigrationTypeEnum(str, Enum):
     RECORD = "RECORD"
     INSTRUCTION = "INSTRUCTION"
+    ISSUANCE_RECORD = "ISSUANCE_RECORD"
     
 class MigrationActionTypeEnum(str, Enum):
     LG_RECORD = "LG_RECORD"

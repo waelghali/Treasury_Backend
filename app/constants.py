@@ -70,6 +70,8 @@ class GlobalConfigKey(str, Enum):
     # Public Issuance Portal
     PUBLIC_ISSUANCE_SESSION_EXPIRY_MINUTES = "PUBLIC_ISSUANCE_SESSION_EXPIRY_MINUTES"
     INVITE_LINK_EXPIRY_HOURS = "INVITE_LINK_EXPIRY_HOURS"
+    OTP_MAX_FAILED_ATTEMPTS = "OTP_MAX_FAILED_ATTEMPTS"
+    OTP_LOCKOUT_DURATION_MINUTES = "OTP_LOCKOUT_DURATION_MINUTES"
     # C6: Reservation TTL
     RESERVATION_TTL_DAYS = "RESERVATION_TTL_DAYS"
     # C3: Facility Scoring Weights — Normal Requests
@@ -88,6 +90,10 @@ class GlobalConfigKey(str, Enum):
     FX_DRIFT_WARNING_THRESHOLD = "FX_DRIFT_WARNING_THRESHOLD"
     # G5: Reconciliation overdue notification threshold
     DAYS_FOR_RECONCILIATION_REMINDER = "DAYS_FOR_RECONCILIATION_REMINDER"
+    # Maintenance concurrency control
+    ALLOW_SIMULTANEOUS_MAINTENANCE = "ALLOW_SIMULTANEOUS_MAINTENANCE"
+    # LG Copy verification before handover
+    LG_COPY_VERIFICATION_REQUIRED = "LG_COPY_VERIFICATION_REQUIRED"
 
 # NEW: Defines the types of subscription-related email notifications.
 class SubscriptionNotificationType(str, Enum):

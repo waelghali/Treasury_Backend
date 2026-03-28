@@ -101,3 +101,4 @@ def update_all_templates_sync():
 
 if __name__ == "__main__":
     update_all_templates_sync()
+    

@@ -65,8 +65,7 @@ COLUMN_KEYWORDS: Dict[str, List[str]] = {
 }
 
 LIVE_LG_STATUSES = [
-    "ACTIVE", "CONFIRMED", "HANDED_OVER", "ISSUED",
-    "DELIVERED_TO_BANK", "PENDING_CONFIRMATION", "PENDING_VERIFICATION",
+    "ACTIVE", "LG_ISSUED", "DELIVERED_TO_BANK", "INTERNAL_PROCESSING",
 ]
 
 
@@ -357,8 +356,75 @@ class ReconciliationService:
         result.resolved_at = datetime.utcnow()
 
         if resolution == "ADJUSTED":
-            # Requires corporate admin approval before record update
-            result.approval_status = "PENDING_APPROVAL"
+            # Phase 3 Governance: Context-Aware Auto-Generation
+            converted_to_maintenance = False
+
+            if result.issued_lg_id:
+                from app.models.models_issuance import IssuedLGRecord
+                lg = db.query(IssuedLGRecord).filter(
+                    IssuedLGRecord.id == result.issued_lg_id
+                ).first()
+
+                if lg:
+                    from app.services.issuance_maintenance_service import IssuanceMaintenanceService
+                    maintenance_service = IssuanceMaintenanceService()
+                    
+                    # 1. EXPIRY DATE EXTENSION (Bank > System)
+                    if result.mismatch_type == "EXPIRY" and result.field_name == "expiry_date":
+                        try:
+                            from datetime import date
+                            bank_date = date.fromisoformat(result.bank_value) if result.bank_value and result.bank_value != "None" else None
+                            sys_date = date.fromisoformat(result.system_value) if result.system_value and result.system_value != "None" else None
+                            
+                            if bank_date and sys_date and bank_date > sys_date:
+                                maintenance_service.create_action(
+                                    db=db,
+                                    issued_lg_id=lg.id,
+                                    action_type="EXTEND",
+                                    action_data={"new_expiry_date": str(bank_date)},
+                                    user_id=user_id,
+                                    customer_id=customer_id,
+                                    notes=f"Auto-generated from Reconciliation (Session {session.id}): Expiry extended from {sys_date} to {bank_date}.",
+                                    initiation_source="INTERNAL_USER"
+                                )
+                                converted_to_maintenance = True
+                        except Exception as e:
+                            logger.error(f"Failed to auto-generate EXTEND maintenance action: {e}", exc_info=True)
+
+                    # 2. AMOUNT DECREASE (System > Bank) => PARTIAL LIQUIDATION
+                    elif result.mismatch_type == "AMOUNT" and result.field_name == "amount":
+                        try:
+                            from decimal import Decimal
+                            bank_amt = Decimal(str(result.bank_value)) if result.bank_value and result.bank_value != "None" else Decimal(0)
+                            sys_amt = Decimal(str(result.system_value)) if result.system_value and result.system_value != "None" else Decimal(0)
+                            
+                            if bank_amt > 0 and sys_amt > bank_amt:
+                                reduction = sys_amt - bank_amt
+                                maintenance_service.create_action(
+                                    db=db,
+                                    issued_lg_id=lg.id,
+                                    action_type="LIQUIDATION",
+                                    action_data={
+                                        "liquidation_type": "PARTIAL",
+                                        "liquidation_amount": str(reduction)
+                                    },
+                                    user_id=user_id,
+                                    customer_id=customer_id,
+                                    notes=f"Auto-generated from Reconciliation (Session {session.id}): Amount decreased from {sys_amt} to {bank_amt} (Reduction: {reduction}).",
+                                    initiation_source="INTERNAL_USER"
+                                )
+                                converted_to_maintenance = True
+                        except Exception as e:
+                            logger.error(f"Failed to auto-generate LIQUIDATION maintenance action: {e}", exc_info=True)
+
+            if converted_to_maintenance:
+                result.approval_status = "CONVERTED_TO_MAINTENANCE"
+                if not result.resolution_notes:
+                    result.resolution_notes = ""
+                result.resolution_notes += "\n\n[SYSTEM] Adjusted via auto-generated Maintenance Request."
+            else:
+                # Standard adjustment (Requires corporate admin approval before record update)
+                result.approval_status = "PENDING_APPROVAL"
         else:
             result.approval_status = None
             result.record_updated = False
@@ -500,30 +566,52 @@ class ReconciliationService:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
         ws = wb.active
 
-        rows_iter = ws.iter_rows(values_only=True)
-        headers_raw = next(rows_iter, None)
-        if not headers_raw:
-            raise HTTPException(status_code=400, detail="Empty spreadsheet — no headers found")
+        all_rows = list(ws.iter_rows(values_only=True))
+        if not all_rows:
+            raise HTTPException(status_code=400, detail="Empty spreadsheet")
 
-        headers = [str(h).strip() if h else f"col_{i}" for i, h in enumerate(headers_raw)]
-
-        # Map columns
-        col_map, method = self._map_columns(db, headers, bank_id, customer_id)
-
-        if len(col_map) < 2:
+        best_col_map = {}
+        best_method = ""
+        best_headers = []
+        header_row_idx = 0
+        
+        for idx, row in enumerate(all_rows[:20]):
+            if not row or all(v is None or str(v).strip() == "" for v in row):
+                continue
+                
+            temp_headers = [str(h).strip() if h is not None and str(h).strip() else f"col_{i}" for i, h in enumerate(row)]
+            # Suppress mapping save during header search by running it without saving? 
+            # Actually _map_columns saves if len >= 3. That's fine.
+            temp_col_map, temp_method = self._map_columns(db, temp_headers, bank_id, customer_id)
+            
+            if len(temp_col_map) > len(best_col_map):
+                best_col_map = temp_col_map
+                best_method = temp_method
+                best_headers = temp_headers
+                header_row_idx = idx
+                
+            if len(best_col_map) >= 2:
+                break
+                
+        if len(best_col_map) < 2:
+            first_row = [str(h) for h in all_rows[0]] if all_rows else []
             raise HTTPException(status_code=400,
-                detail=f"Could not map enough columns. Mapped: {col_map}. Headers: {headers}")
+                detail=f"Could not map enough columns. Best attempt mapped: {best_col_map}. First row: {first_row}")
+
+        headers = best_headers
+        col_map = best_col_map
+        method = best_method
 
         # Parse data rows
         rows = []
-        for values in rows_iter:
-            if not values or all(v is None for v in values):
+        for values in all_rows[header_row_idx + 1:]:
+            if not values or all(v is None or str(v).strip() == "" for v in values):
                 continue
             row_dict = {}
             raw = {}
             for i, val in enumerate(values):
                 header = headers[i] if i < len(headers) else f"col_{i}"
-                raw[header] = str(val) if val is not None else None
+                raw[header] = str(val).strip() if val is not None else None
                 field = col_map.get(header)
                 if field:
                     row_dict[field] = val
@@ -541,29 +629,52 @@ class ReconciliationService:
 
         text = file_bytes.decode("utf-8-sig", errors="replace")
         reader = csv.reader(io.StringIO(text))
-        headers_raw = next(reader, None)
-        if not headers_raw:
+        all_rows = list(reader)
+        if not all_rows:
             raise HTTPException(status_code=400, detail="Empty CSV file")
 
-        headers = [h.strip() for h in headers_raw]
-        col_map, method = self._map_columns(db, headers, bank_id, customer_id)
-
-        if len(col_map) < 2:
+        best_col_map = {}
+        best_method = ""
+        best_headers = []
+        header_row_idx = 0
+        
+        for idx, row in enumerate(all_rows[:20]):
+            if not row or all(not v.strip() for v in row):
+                continue
+                
+            temp_headers = [h.strip() if h.strip() else f"col_{i}" for i, h in enumerate(row)]
+            temp_col_map, temp_method = self._map_columns(db, temp_headers, bank_id, customer_id)
+            
+            if len(temp_col_map) > len(best_col_map):
+                best_col_map = temp_col_map
+                best_method = temp_method
+                best_headers = temp_headers
+                header_row_idx = idx
+                
+            if len(best_col_map) >= 2:
+                break
+                
+        if len(best_col_map) < 2:
             raise HTTPException(status_code=400,
-                detail=f"Could not map enough columns. Mapped: {col_map}.")
+                detail=f"Could not map enough columns. Best attempt mapped: {best_col_map}.")
+
+        headers = best_headers
+        col_map = best_col_map
+        method = best_method
 
         rows = []
-        for values in reader:
-            if not values or all(not v.strip() for v in values):
+        for values in all_rows[header_row_idx + 1:]:
+            if not values or all(not str(v).strip() for v in values):
                 continue
             row_dict = {}
             raw = {}
             for i, val in enumerate(values):
                 header = headers[i] if i < len(headers) else f"col_{i}"
-                raw[header] = val.strip() if val else None
+                v_str = str(val).strip() if val else None
+                raw[header] = v_str
                 field = col_map.get(header)
                 if field:
-                    row_dict[field] = val.strip() if val else None
+                    row_dict[field] = val if val else None
             row_dict["_raw"] = raw
             if row_dict.get("bank_lg_number") or row_dict.get("amount"):
                 rows.append(row_dict)

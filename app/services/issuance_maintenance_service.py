@@ -25,11 +25,11 @@ from app.crud.crud import log_action
 logger = logging.getLogger(__name__)
 
 # Action types that require approval matrix
-ACTIONS_REQUIRING_APPROVAL = {"EXTEND", "INCREASE_AMOUNT", "AMENDMENT"}
+ACTIONS_REQUIRING_APPROVAL = {"EXTEND", "INCREASE_AMOUNT", "AMENDMENT", "ACTIVATE"}
 # Action types that generate a bank letter
 ACTIONS_WITH_LETTER = {"EXTEND", "INCREASE_AMOUNT", "CLOSE", "AMENDMENT", "ACTIVATE"}
 # Action types that can be executed directly (no approval, no letter for some)
-ACTIONS_DIRECT_EXECUTE = {"CLOSE", "LIQUIDATION", "ACTIVATE", "CHANGE_OWNERSHIP"}
+ACTIONS_DIRECT_EXECUTE = {"CLOSE", "LIQUIDATION", "CHANGE_OWNERSHIP"}
 
 
 class IssuanceMaintenanceService:
@@ -61,14 +61,80 @@ class IssuanceMaintenanceService:
             raise HTTPException(status_code=404, detail="Issued LG not found")
 
         # Validate LG is in a state that allows maintenance
-        if lg.status not in ("ACTIVE", "CONFIRMED", "PENDING_CLOSE", "HANDED_OVER"):
+        if lg.status != "ACTIVE":
             raise HTTPException(status_code=400,
-                detail=f"Cannot perform {action_type} on LG with status {lg.status}")
+                detail=f"Cannot perform {action_type} on LG with status {lg.status}. Only ACTIVE LGs allow maintenance actions.")
 
         # Validate action type
         valid_types = {"EXTEND", "INCREASE_AMOUNT", "CLOSE", "LIQUIDATION", "AMENDMENT", "ACTIVATE", "CHANGE_OWNERSHIP"}
         if action_type not in valid_types:
             raise HTTPException(status_code=400, detail=f"Invalid action type: {action_type}")
+
+        # ACTIVATE: server-side enforcement — advance payment + non-operative + one-time
+        if action_type == "ACTIVATE":
+            from app.constants import LgTypeEnum
+            if lg.lg_type_id != LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE:
+                raise HTTPException(status_code=400, detail="ACTIVATE is only available for Advance Payment LGs.")
+            # Check operational_status: prefer lg field, fallback to request join
+            op_status = lg.operational_status
+            if not op_status and lg.request_id:
+                from app.models.models_issuance import IssuanceRequest
+                req = db.query(IssuanceRequest.operational_status).filter(
+                    IssuanceRequest.id == lg.request_id
+                ).first()
+                op_status = req.operational_status if req else None
+
+            if not op_status or op_status.strip().lower() not in (
+                "non-operative", "none operative", "non_operative"
+            ):
+                raise HTTPException(status_code=400, detail="ACTIVATE is only available for Non-Operative LGs.")
+            # One-time check
+            existing_activation = db.query(IssuanceMaintenanceAction).filter(
+                IssuanceMaintenanceAction.issued_lg_id == issued_lg_id,
+                IssuanceMaintenanceAction.action_type == "ACTIVATE",
+                IssuanceMaintenanceAction.status.in_(["APPROVED", "EXECUTED", "COMPLETED"]),
+            ).first()
+            if existing_activation:
+                raise HTTPException(status_code=400, detail="This LG has already been activated. ACTIVATE is a one-time action.")
+
+        # ── Guard: block duplicate / simultaneous maintenance actions ──
+        # 1) Same-type always blocked
+        same_type_pending = db.query(IssuanceMaintenanceAction).filter(
+            IssuanceMaintenanceAction.issued_lg_id == issued_lg_id,
+            IssuanceMaintenanceAction.action_type == action_type,
+            IssuanceMaintenanceAction.status == "PENDING_APPROVAL",
+        ).first()
+        if same_type_pending:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {action_type.replace('_', ' ')} action is already pending approval for this LG. "
+                       f"Please wait for it to be approved or rejected before submitting another."
+            )
+
+        # 2) Different-type blocked if config says so
+        from app.crud.crud_config import crud_customer_configuration
+        from app.constants import GlobalConfigKey
+        config_result = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, customer_id, GlobalConfigKey.ALLOW_SIMULTANEOUS_MAINTENANCE
+        )
+        # Default to true (allow) if config not found
+        allow_simultaneous = True
+        if config_result:
+            effective = str(config_result.get("effective_value", "true")).lower()
+            allow_simultaneous = effective == "true"
+        if not allow_simultaneous:
+            any_pending = db.query(IssuanceMaintenanceAction).filter(
+                IssuanceMaintenanceAction.issued_lg_id == issued_lg_id,
+                IssuanceMaintenanceAction.status == "PENDING_APPROVAL",
+            ).first()
+            if any_pending:
+                pending_label = any_pending.action_type.replace("_", " ")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Another maintenance action ({pending_label}) is already pending approval for this LG. "
+                           f"Simultaneous maintenance actions are not allowed. "
+                           f"Please wait for it to be resolved before submitting a new one."
+                )
 
         # Action-specific validation
         self._validate_action_data(db, action_type, action_data, lg)
@@ -345,7 +411,7 @@ class IssuanceMaintenanceService:
         ).first()
         if not action:
             raise HTTPException(status_code=404, detail="Action not found")
-        if action.instruction_status != "Instruction Issued":
+        if action.instruction_status not in ("Instruction Issued", "Printed"):
             raise HTTPException(status_code=400, detail="Action letter has not been issued yet")
 
         # Parse delivery date or default to now
@@ -371,8 +437,13 @@ class IssuanceMaintenanceService:
                 lg = db.query(IssuedLGRecord).filter(IssuedLGRecord.id == action.issued_lg_id).first()
                 cust_id = customer_id or (lg.customer_id if lg else 0)
                 ext = (delivery_document_mime_type or "").split("/")[-1] or "pdf"
-                unique_name = f"delivery_{action.id}_{uuid.uuid4().hex[:8]}.{ext}"
-                blob_path = f"customer_{cust_id}/issuance_maintenance/{action.issued_lg_id}/{unique_name}"
+                import re as _re, datetime as _dt
+                today = _dt.date.today().strftime('%Y%m%d')
+                lg_ref_clean = _re.sub(r'[^\w\-]', '-', (lg.lg_ref_number or str(action.issued_lg_id))) if lg else str(action.issued_lg_id)
+                unique_name = f"DELIVERY_{lg_ref_clean}_{action.action_type}_{today}_{uuid.uuid4().hex[:8]}.{ext}"
+                # Organized: customer / requests / request_id / lg_id / maintenance / delivery
+                req_id = lg.request_id if lg and lg.request_id else "no_request"
+                blob_path = f"customer_{cust_id}/requests/{req_id}/lg_{action.issued_lg_id}/maintenance/delivery/{unique_name}"
 
                 bucket = GCS_BUCKET_NAME
                 if cust_id:
@@ -383,9 +454,13 @@ class IssuanceMaintenanceService:
                     if bucket_cfg and bucket_cfg.get("effective_value"):
                         bucket = bucket_cfg["effective_value"]
 
-                gcs_uri = asyncio.run(
-                    _upload_to_gcs(bucket, blob_path, delivery_document_bytes, delivery_document_mime_type)
-                )
+                loop = asyncio.new_event_loop()
+                try:
+                    gcs_uri = loop.run_until_complete(
+                        _upload_to_gcs(bucket, blob_path, delivery_document_bytes, delivery_document_mime_type)
+                    )
+                finally:
+                    loop.close()
                 if gcs_uri:
                     action.delivery_document_path = gcs_uri
                     logger.info(f"Delivery document uploaded for action {action.id}: {gcs_uri}")
@@ -459,8 +534,13 @@ class IssuanceMaintenanceService:
                 lg = db.query(IssuedLGRecord).filter(IssuedLGRecord.id == action.issued_lg_id).first()
                 cust_id = customer_id or (lg.customer_id if lg else 0)
                 ext = (bank_reply_mime_type or "").split("/")[-1] or "pdf"
-                unique_name = f"bank_reply_{action.id}_{uuid.uuid4().hex[:8]}.{ext}"
-                blob_path = f"customer_{cust_id}/issuance_maintenance/{action.issued_lg_id}/{unique_name}"
+                import re as _re, datetime as _dt
+                today = _dt.date.today().strftime('%Y%m%d')
+                lg_ref_clean = _re.sub(r'[^\w\-]', '-', (lg.lg_ref_number or str(action.issued_lg_id))) if lg else str(action.issued_lg_id)
+                unique_name = f"BANK_REPLY_{lg_ref_clean}_{action.action_type}_{today}_{uuid.uuid4().hex[:8]}.{ext}"
+                # Organized: customer / requests / request_id / lg_id / maintenance / bank_reply
+                req_id = lg.request_id if lg and lg.request_id else "no_request"
+                blob_path = f"customer_{cust_id}/requests/{req_id}/lg_{action.issued_lg_id}/maintenance/bank_reply/{unique_name}"
 
                 bucket = GCS_BUCKET_NAME
                 if cust_id:
@@ -471,9 +551,13 @@ class IssuanceMaintenanceService:
                     if bucket_cfg and bucket_cfg.get("effective_value"):
                         bucket = bucket_cfg["effective_value"]
 
-                gcs_uri = asyncio.run(
-                    _upload_to_gcs(bucket, blob_path, bank_reply_file_bytes, bank_reply_mime_type)
-                )
+                loop = asyncio.new_event_loop()
+                try:
+                    gcs_uri = loop.run_until_complete(
+                        _upload_to_gcs(bucket, blob_path, bank_reply_file_bytes, bank_reply_mime_type)
+                    )
+                finally:
+                    loop.close()
                 if gcs_uri:
                     action.bank_reply_document_path = gcs_uri
                     logger.info(f"Bank reply document uploaded for action {action.id}: {gcs_uri}")
@@ -745,6 +829,21 @@ class IssuanceMaintenanceService:
         # Snapshot before-state for history
         before = self._snapshot_lg(lg)
 
+        # ── Capture "before" values into action_data for letter regeneration ──
+        # This ensures the letter always shows the correct historical
+        # data, even though the LG record has been updated.
+        snapshot_for_letter = {
+            "snapshot_expiry_date": str(lg.expiry_date) if lg.expiry_date else None,
+            "snapshot_amount": str(lg.current_amount) if lg.current_amount else None,
+            "snapshot_beneficiary_name": lg.beneficiary_name,
+            "snapshot_beneficiary_address": getattr(lg, 'beneficiary_address', None),
+            "snapshot_status": lg.status,
+        }
+        updated_data = dict(data)
+        updated_data.update(snapshot_for_letter)
+        action.action_data = updated_data
+        data = updated_data  # refresh local reference
+
         if action.action_type == "LIQUIDATION":
             # Liquidation applies immediately (no bank letter)
             liq_type = data.get("liquidation_type", "FULL")
@@ -761,35 +860,10 @@ class IssuanceMaintenanceService:
             after = self._snapshot_lg(lg)
             self._record_history(lg, action.action_type, before, after, user_id, action.notes)
         else:
-            # For actions with letters, generate the instruction letter (F1)
+            # For actions with letters, mark instruction status (letter is regenerated on-the-fly when viewed)
             if action.action_type in ACTIONS_WITH_LETTER:
                 action.instruction_status = "Instruction Issued"
-                try:
-                    pdf_bytes, filename = self._generate_maintenance_letter(
-                        db, action, lg
-                    )
-                    if pdf_bytes:
-                        # Upload to GCS
-                        import os, uuid
-                        try:
-                            from app.core.ai_integration import _get_gcs_client
-                            gcs_client = _get_gcs_client()
-                            if gcs_client:
-                                bucket_name = os.environ.get("GCS_BUCKET_NAME", "lg_custody_bucket")
-                                bucket = gcs_client.bucket(bucket_name)
-                                gcs_path = f"maintenance_letters/{lg.lg_ref_number}_{action.action_type}_{uuid.uuid4().hex[:8]}.pdf"
-                                blob = bucket.blob(gcs_path)
-                                blob.upload_from_string(pdf_bytes, content_type="application/pdf")
-                                action.letter_generated_path = f"gs://{bucket_name}/{gcs_path}"
-                                logger.info(f"Maintenance letter uploaded: {action.letter_generated_path}")
-                            else:
-                                logger.warning("GCS client not available — maintenance letter not uploaded")
-                        except Exception as gcs_err:
-                            logger.warning(f"Failed to upload maintenance letter to GCS: {gcs_err}")
-                            # Store locally as fallback — letter was generated successfully
-                except Exception as letter_err:
-                    logger.warning(f"Failed to generate maintenance letter: {letter_err}")
-                    # Non-blocking — action still proceeds without letter
+                logger.info(f"Maintenance action {action.id} ({action.action_type}) marked as Instruction Issued")
 
             # For CLOSE: set to PENDING_CLOSE (not CLOSED yet)
             if action.action_type == "CLOSE":
@@ -798,7 +872,7 @@ class IssuanceMaintenanceService:
                 self._record_history(lg, action.action_type, before, after, user_id, action.notes)
 
             # CHANGE_OWNERSHIP: update the current_owner_user_id
-            if action.action_type == "CHANGE_OWNERSHIP":
+            elif action.action_type == "CHANGE_OWNERSHIP":
                 from app.models import User
                 new_owner_id = data.get("new_owner_user_id")
                 if new_owner_id:
@@ -810,6 +884,40 @@ class IssuanceMaintenanceService:
                         after = self._snapshot_lg(lg)
                         self._record_history(lg, action.action_type, before, after, user_id, 
                                             f"Ownership changed to user {new_owner.email or new_owner_id}")
+
+            # EXTEND: DO NOT apply yet — wait for bank confirmation
+            # Changes applied in _apply_confirmed_changes() after bank reply
+            elif action.action_type == "EXTEND":
+                logger.info(f"EXTEND action {action.id} approved for LG {lg.id}. "
+                           f"New expiry: {data.get('new_expiry_date')}. Awaiting bank confirmation.")
+
+            # INCREASE_AMOUNT: DO NOT apply yet — wait for bank confirmation
+            # Changes applied in _apply_confirmed_changes() after bank reply
+            elif action.action_type == "INCREASE_AMOUNT":
+                logger.info(f"INCREASE_AMOUNT action {action.id} approved for LG {lg.id}. "
+                           f"New amount: {data.get('new_amount')}. Awaiting bank confirmation.")
+
+            # AMENDMENT: DO NOT apply yet — wait for bank confirmation
+            # Changes applied in _apply_confirmed_changes() after bank reply
+            elif action.action_type == "AMENDMENT":
+                logger.info(f"AMENDMENT action {action.id} approved for LG {lg.id}. "
+                           f"Awaiting bank confirmation.")
+
+            # ACTIVATE: set LG operational_status to Operative
+            elif action.action_type == "ACTIVATE":
+                lg.operational_status = "Operative"
+                payment_info = {
+                    "payment_method": data.get("payment_method"),
+                    "payment_amount": data.get("payment_amount"),
+                    "payment_reference": data.get("payment_reference"),
+                    "payment_date": data.get("payment_date"),
+                }
+                updated_data = dict(data)
+                updated_data["payment_confirmed"] = True
+                action.action_data = updated_data
+                after = self._snapshot_lg(lg)
+                self._record_history(lg, action.action_type, before, after, user_id, action.notes)
+                logger.info(f"Activated LG {lg.id} with payment: {payment_info}")
 
         db.add(lg)
 
@@ -858,7 +966,7 @@ class IssuanceMaintenanceService:
 
         elif action.action_type == "ACTIVATE":
             # Mark as operative — apply payment details from action_data
-            lg.status = "ACTIVE"
+            lg.operational_status = "Operative"
 
             # Record payment details in the action history (stored in action_data)
             payment_info = {
@@ -1380,6 +1488,14 @@ class IssuanceMaintenanceService:
             from app.core.ai_integration import _cleanup_gcs_files, GCS_BUCKET_NAME
             import uuid
 
+            # Helper: run async function from sync context (FastAPI worker thread has no event loop)
+            def _run_async(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                finally:
+                    loop.close()
+
             lg = db.query(IssuedLGRecord).filter(IssuedLGRecord.id == action.issued_lg_id).first()
             if not lg:
                 return {"status": "error", "message": "LG record not found"}
@@ -1393,20 +1509,20 @@ class IssuanceMaintenanceService:
             if mime_type.startswith("image/"):
                 blob_name = f"lg_scans_temp/{unique_file_id}/image_{uuid.uuid4().hex}.{mime_type.split('/')[-1]}"
                 from app.core.ai_integration import _upload_to_gcs
-                gcs_uri = asyncio.get_event_loop().run_until_complete(
+                gcs_uri = _run_async(
                     _upload_to_gcs(target_bucket, blob_name, file_bytes, mime_type)
                 )
                 if gcs_uri:
-                    raw_text = asyncio.get_event_loop().run_until_complete(
+                    raw_text = _run_async(
                         perform_ocr_with_google_vision(gcs_uri, unique_file_id)
                     ) or ""
             elif mime_type == "application/pdf":
-                image_uris = asyncio.get_event_loop().run_until_complete(
+                image_uris = _run_async(
                     _convert_pdf_to_images_and_upload_to_gcs(file_bytes, target_bucket, unique_file_id)
                 )
                 texts = []
                 for uri in (image_uris or []):
-                    page_text = asyncio.get_event_loop().run_until_complete(
+                    page_text = _run_async(
                         perform_ocr_with_google_vision(uri, unique_file_id)
                     )
                     if page_text:
@@ -1418,21 +1534,27 @@ class IssuanceMaintenanceService:
 
             # Build context for AI extraction — tell it what we expect
             data = action.action_data or {}
+            # Prioritize bank_lg_number (the real bank reference) over lg_ref_number
+            # (system temp reference like LG-TEMP-...). Bank reply documents always
+            # reference the bank's own LG number.
+            primary_lg_number = lg.bank_lg_number or lg.lg_ref_number or ""
+            alt_lg_number = lg.lg_ref_number if lg.bank_lg_number else ""
             context = {
                 "lg_record_details": {
-                    "lgNumber": lg.lg_ref_number or lg.bank_lg_number or "",
+                    "lgNumber": primary_lg_number,
+                    "alternativeLgNumber": alt_lg_number,
                     "expected_action": action.action_type,
                     "expected_changes": data,
                 }
             }
 
-            extracted_data, usage = asyncio.get_event_loop().run_until_complete(
+            extracted_data, usage = _run_async(
                 extract_structured_data_with_gemini(raw_text, unique_file_id, context=context)
             )
 
             # Cleanup temp files
             try:
-                asyncio.get_event_loop().run_until_complete(
+                _run_async(
                     _cleanup_gcs_files(target_bucket, f"lg_scans_temp/{unique_file_id}/")
                 )
             except Exception:
@@ -1458,8 +1580,20 @@ class IssuanceMaintenanceService:
             if action.action_type == "EXTEND":
                 expected_date = data.get("new_expiry_date")
                 ai_date = extracted_data.get("amendedFields", {}).get("expiryDate")
-                if expected_date and ai_date and expected_date == ai_date:
-                    verification["matches"].append(f"Expiry date matches: {expected_date}")
+                if expected_date and ai_date:
+                    # Normalize both to YYYY-MM-DD (AI may return "2027-01-02_00:00:00Z" or similar)
+                    def _normalize_date(d):
+                        """Extract just the YYYY-MM-DD portion from any date/datetime string."""
+                        s = str(d).replace("_", "T").replace("Z", "").strip()
+                        return s[:10]  # first 10 chars = YYYY-MM-DD
+                    norm_expected = _normalize_date(expected_date)
+                    norm_ai = _normalize_date(ai_date)
+                    if norm_expected == norm_ai:
+                        verification["matches"].append(f"Expiry date matches: {norm_expected}")
+                    else:
+                        verification["mismatches"].append(
+                            f"Expiry date mismatch: expected={norm_expected}, extracted={norm_ai}"
+                        )
                 elif ai_date:
                     verification["mismatches"].append(
                         f"Expiry date mismatch: expected={expected_date}, extracted={ai_date}"
@@ -1676,7 +1810,164 @@ class IssuanceMaintenanceService:
         )
 
     # ──────────────────────────────────────────────────
-    # F1: Maintenance Letter PDF Generation
+    # F1a: Regenerate Maintenance Letter HTML (on-the-fly)
+    # ──────────────────────────────────────────────────
+    def regenerate_maintenance_letter_html(
+        self, db: Session, action: IssuanceMaintenanceAction, lg: IssuedLGRecord
+    ) -> str:
+        """
+        Regenerates the instruction letter HTML from template + action_data.
+        Mirrors the LG custody pattern: no file storage, regenerate on demand.
+        Returns rendered HTML string, or None if template not found.
+        """
+        from app.crud.crud import crud_template
+        from sqlalchemy.orm import selectinload
+
+        TEMPLATE_MAP = {
+            "EXTEND": "LG_EXTEND_REQUEST",
+            "INCREASE_AMOUNT": "LG_INCREASE_REQUEST",
+            "CLOSE": "LG_CLOSE_REQUEST",
+            "AMENDMENT": "LG_AMENDMENT_REQUEST",
+            "ACTIVATE": "LG_ACTIVATE_REQUEST",
+        }
+
+        specific_action_type = TEMPLATE_MAP.get(action.action_type, f"LG_{action.action_type}_REQUEST")
+
+        template = None
+        for action_type_key in [specific_action_type, "LG_MAINTENANCE_REQUEST"]:
+            template = crud_template.get_single_template(
+                db, action_type=action_type_key, is_global=False,
+                customer_id=lg.customer_id, is_notification_template=False,
+            )
+            if not template:
+                template = crud_template.get_single_template(
+                    db, action_type=action_type_key, is_global=True,
+                    is_notification_template=False,
+                )
+            if template:
+                break
+
+        if not template:
+            logger.warning(f"No template found for maintenance letter regeneration: {action.action_type}")
+            return None
+
+        lg_with_rels = db.query(IssuedLGRecord).options(
+            selectinload(IssuedLGRecord.currency),
+            selectinload(IssuedLGRecord.bank),
+            selectinload(IssuedLGRecord.customer),
+            selectinload(IssuedLGRecord.issuing_entity),
+            selectinload(IssuedLGRecord.lg_type),
+        ).filter(IssuedLGRecord.id == lg.id).first()
+
+        data = action.action_data or {}
+
+        def amount_to_words(amount) -> str:
+            try:
+                from num2words import num2words
+                amount = float(amount)
+                integer_part = int(amount)
+                decimal_part = round((amount - integer_part) * 100)
+                words = num2words(integer_part).title()
+                if decimal_part > 0:
+                    words += f" and {num2words(decimal_part).title()} Cents"
+                return words
+            except (ImportError, Exception):
+                return f"{float(amount):,.2f}"
+
+        current_amount = float(lg_with_rels.current_amount) if lg_with_rels.current_amount else 0
+        currency_code = lg_with_rels.currency.iso_code if lg_with_rels.currency else "N/A"
+        currency_name = lg_with_rels.currency.name if lg_with_rels.currency else "N/A"
+
+        placeholder_data = {
+            "lg_ref_number": lg_with_rels.lg_ref_number or "",
+            "bank_lg_number": lg_with_rels.bank_lg_number or "N/A",
+            "internal_serial": lg_with_rels.internal_serial or "",
+            "letter_serial_number": action.letter_serial_number or "",
+            "beneficiary_name": lg_with_rels.beneficiary_name or "",
+            "beneficiary_address": lg_with_rels.beneficiary_address or "",
+            "current_amount": f"{current_amount:,.2f}",
+            "current_amount_in_words": amount_to_words(current_amount),
+            "currency_code": currency_code,
+            "currency_name": currency_name,
+            "currency_symbol": lg_with_rels.currency.symbol if lg_with_rels.currency and hasattr(lg_with_rels.currency, 'symbol') else currency_code,
+            "current_amount_formatted": f"{lg_with_rels.currency.symbol if lg_with_rels.currency and hasattr(lg_with_rels.currency, 'symbol') else currency_code} {current_amount:,.2f}",
+            "lg_amount_formatted": f"{lg_with_rels.currency.symbol if lg_with_rels.currency and hasattr(lg_with_rels.currency, 'symbol') else currency_code} {current_amount:,.2f}",
+            "lg_type": lg_with_rels.lg_type.name if lg_with_rels.lg_type else "N/A",
+            "issue_date": str(lg_with_rels.issue_date) if lg_with_rels.issue_date else "N/A",
+            "expiry_date": str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A",
+            "bank_name": lg_with_rels.bank.name if lg_with_rels.bank else "N/A",
+            "bank_address": lg_with_rels.bank.address if lg_with_rels.bank and hasattr(lg_with_rels.bank, 'address') else "N/A",
+            "recipient_name": lg_with_rels.bank.name if lg_with_rels.bank else "To Whom It May Concern",
+            "recipient_address": lg_with_rels.bank.address if lg_with_rels.bank and hasattr(lg_with_rels.bank, 'address') else "N/A",
+            "customer_name": lg_with_rels.customer.name if lg_with_rels.customer else "N/A",
+            "company_name": lg_with_rels.customer.name if lg_with_rels.customer else "N/A",
+            "customer_address": lg_with_rels.customer.address if lg_with_rels.customer and hasattr(lg_with_rels.customer, 'address') else "N/A",
+            "customer_contact_email": lg_with_rels.customer.contact_email if lg_with_rels.customer and hasattr(lg_with_rels.customer, 'contact_email') else "N/A",
+            "entity_name": lg_with_rels.issuing_entity.entity_name if lg_with_rels.issuing_entity else "",
+            "entity_address": lg_with_rels.issuing_entity.address if lg_with_rels.issuing_entity and hasattr(lg_with_rels.issuing_entity, 'address') else "",
+            "action_type": action.action_type.replace("_", " ").title(),
+            "action_notes": action.notes or "",
+            "current_date": date.today().strftime("%d-%b-%Y"),
+            "serial_number": action.letter_serial_number or "",
+            "platform_name": "Treasury Management Platform",
+        }
+
+        # Notes section as HTML block (matches custody pattern)
+        notes_html = ""
+        if action.notes:
+            notes_html = f"<h3>Additional Notes</h3><p>{action.notes}</p>"
+        placeholder_data["notes_section"] = notes_html
+
+        # Action-specific extra placeholders
+        # NOTE: Use snapshot_* values from action_data (captured at execution time)
+        # to ensure the letter shows the correct "before" values, not the current LG state.
+        if action.action_type == "EXTEND":
+            placeholder_data["new_expiry_date"] = data.get("new_expiry_date", "N/A")
+            # Use snapshot (before extension was applied), fallback to current LG data for old actions
+            old_expiry = data.get("snapshot_expiry_date") or (str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A")
+            placeholder_data["old_expiry_date"] = old_expiry
+        elif action.action_type == "INCREASE_AMOUNT":
+            new_amount = data.get("new_amount", 0)
+            new_amount_val = float(new_amount) if new_amount else 0
+            # Use snapshot amount (before increase), fallback to current for old actions
+            old_amount_str = data.get("snapshot_amount")
+            old_amount_val = float(old_amount_str) if old_amount_str else current_amount
+            delta = new_amount_val - old_amount_val
+            placeholder_data["new_amount"] = f"{new_amount_val:,.2f}"
+            placeholder_data["new_amount_in_words"] = amount_to_words(new_amount_val)
+            placeholder_data["increase_delta"] = f"{delta:,.2f}"
+            placeholder_data["old_amount"] = f"{old_amount_val:,.2f}"
+        elif action.action_type == "AMENDMENT":
+            if data.get("new_beneficiary_name"):
+                placeholder_data["new_beneficiary_name"] = data["new_beneficiary_name"]
+            placeholder_data["amendment_details"] = data.get("amendment_text", action.notes or "")
+        elif action.action_type == "CLOSE":
+            placeholder_data["close_reason"] = data.get("close_reason", "")
+        elif action.action_type == "ACTIVATE":
+            placeholder_data["payment_method"] = data.get("payment_method", "N/A")
+            amount_val = float(data.get("payment_amount", 0))
+            placeholder_data["payment_amount"] = f"{amount_val:,.2f}"
+            placeholder_data["payment_amount_formatted"] = f"{amount_val:,.2f}"
+            placeholder_data["payment_reference"] = data.get("payment_reference", "N/A")
+            placeholder_data["payment_date"] = data.get("payment_date", "N/A")
+            payment_bank_id = data.get("payment_bank_id")
+            if payment_bank_id:
+                from app.models.models import Bank
+                payment_bank = db.query(Bank).filter(Bank.id == payment_bank_id).first()
+                placeholder_data["payment_issuing_bank_name"] = payment_bank.name if payment_bank else "N/A"
+            else:
+                placeholder_data["payment_issuing_bank_name"] = placeholder_data.get("bank_name", "N/A")
+
+        # Fill template
+        generated_html = template.content
+        for key, value in placeholder_data.items():
+            str_value = str(value) if value is not None else ""
+            generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
+
+        return generated_html
+
+    # ──────────────────────────────────────────────────
+    # F1b: Maintenance Letter PDF Generation (used during _execute_action)
     # ──────────────────────────────────────────────────
     def _generate_maintenance_letter(
         self, db: Session, action: IssuanceMaintenanceAction, lg: IssuedLGRecord

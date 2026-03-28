@@ -68,21 +68,38 @@ class CRUDIssuanceRequest(CRUDBase):
             entity = db.query(CustomerEntity).filter(CustomerEntity.id == data["issuing_entity_id"]).first()
             if entity and entity.code:
                 entity_code = entity.code
-        serial = self._generate_serial(db, customer_id, entity_code)
         
-        # 3. Create Draft
-        db_obj = IssuanceRequest(
-            **data,
-            customer_id=customer_id,
-            requestor_user_id=user_id,
-            serial_number=serial,
-            status="DRAFT",
-            current_version_number=1,
-            locked_for_issuance=False
-        )
-        
-        db.add(db_obj)
-        db.flush()
+        # 3. Create Draft with collision-safe serial generation
+        from sqlalchemy.exc import IntegrityError as SAIntegrityError
+        max_retries = 10
+        for attempt in range(max_retries):
+            serial = self._generate_serial(db, customer_id, entity_code)
+            # On retry, bump the number to avoid the same collision
+            if attempt > 0:
+                # Parse the serial and increment by attempt
+                parts = serial.rsplit('-', 1)
+                num = int(parts[1]) + attempt
+                serial = f"{parts[0]}-{num:04d}"
+            
+            db_obj = IssuanceRequest(
+                **data,
+                customer_id=customer_id,
+                requestor_user_id=user_id,
+                serial_number=serial,
+                status="DRAFT",
+                current_version_number=1,
+                locked_for_issuance=False
+            )
+            
+            try:
+                db.add(db_obj)
+                db.flush()
+                break  # Success
+            except SAIntegrityError:
+                db.rollback()
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=409, detail="Could not generate a unique serial number. Please try again.")
+                continue
         
         # Log Creation
         log_action(
@@ -95,46 +112,82 @@ class CRUDIssuanceRequest(CRUDBase):
         return db_obj
 
     def submit_request(self, db: Session, request_id: int, customer_id: int, user_id: Optional[int] = None) -> IssuanceRequest:
-        """Transitions DRAFT -> SUBMITTED and captures immutable V1 Snapshot."""
+        """
+        Transitions:
+        - DRAFT → SUBMITTED (initial submission, captures V1 snapshot)
+        - REVISION_REQUIRED → PENDING_APPROVAL (resubmission after revision, resumes at returned step)
+        """
         req = db.query(IssuanceRequest).filter(IssuanceRequest.id == request_id, IssuanceRequest.customer_id == customer_id).first()
         if not req:
             raise HTTPException(status_code=404, detail="Request not found")
-            
-        if req.status != "DRAFT":
-            raise HTTPException(status_code=400, detail="Only DRAFT requests can be submitted")
 
-        # Validation 1: Hard Business Rules
-        if req.lg_type_id == 3 and not req.operational_status: # Assuming 3 is Advance Payment
+        is_resubmit = req.status == "REVISION_REQUIRED"
+
+        if req.status not in ("DRAFT", "REVISION_REQUIRED"):
+            raise HTTPException(status_code=400, detail=f"Cannot submit a request in status '{req.status}'. Expected DRAFT or REVISION_REQUIRED.")
+
+        # Validation: Hard Business Rules
+        if req.lg_type_id == 3 and not req.operational_status:
             raise HTTPException(status_code=400, detail="Advance Payment LGs require operational_status")
-        
-        # (Optional Future Step): Validate against CustomerFormConfiguration here
-        
-        # (Optional Future Step): Validate Documents here
 
-        # 1. Update Status
-        req.status = "SUBMITTED"
-        
-        # 2. Create Immutable Snapshot (V1)
-        # Convert model to dict safely handling Decimals and Dates
-        snapshot_data = {
-            col.name: str(getattr(req, col.name)) if getattr(req, col.name) is not None else None 
-            for col in req.__table__.columns
-        }
-        
-        snapshot = IssuanceRequestSnapshot(
-            request_id=req.id,
-            snapshot_data=snapshot_data
-        )
-        db.add(snapshot)
-        db.flush()
+        if is_resubmit:
+            # === RESUBMISSION: Resume approval from the step that returned it ===
+            from sqlalchemy.orm.attributes import flag_modified
+            from datetime import date as _date
 
-        log_action(db, user_id, "REQUEST_SUBMITTED", "IssuanceRequest", req.id, {"version": req.current_version_number}, customer_id)
+            resume_step = req.returned_from_step or 1
+            req.status = "PENDING_APPROVAL"
+            req.current_approval_step = resume_step
+            req.revision_notes = None
+
+            # Rebuild pending approvers for the resume step
+            try:
+                from app.services.issuance_service import issuance_service
+                next_policy, approver_ids = issuance_service._find_next_step(db, req, start_sequence=resume_step - 1)
+                req.pending_approver_users = approver_ids or []
+                if next_policy:
+                    req.current_approval_step = next_policy.step_sequence
+            except Exception:
+                req.pending_approver_users = []
+
+            audit = list(req.approval_chain_audit or [])
+            audit.append({
+                "action": "RESUBMITTED",
+                "user_id": user_id,
+                "timestamp": str(_date.today()),
+                "reason": "Resubmitted after revision",
+                "step": resume_step,
+            })
+            req.approval_chain_audit = audit
+            flag_modified(req, "approval_chain_audit")
+
+            log_action(db, user_id, "REQUEST_RESUBMITTED", "IssuanceRequest", req.id,
+                       {"resumed_from_step": resume_step, "version": req.current_version_number}, customer_id)
+        else:
+            # === INITIAL SUBMISSION: DRAFT → SUBMITTED ===
+            req.status = "SUBMITTED"
+
+            snapshot_data = {
+                col.name: str(getattr(req, col.name)) if getattr(req, col.name) is not None else None
+                for col in req.__table__.columns
+            }
+            snapshot = IssuanceRequestSnapshot(request_id=req.id, snapshot_data=snapshot_data)
+            db.add(snapshot)
+            db.flush()
+
+            log_action(db, user_id, "REQUEST_SUBMITTED", "IssuanceRequest", req.id,
+                       {"version": req.current_version_number}, customer_id)
+
         db.commit()
         db.refresh(req)
         return req
 
+
     def update_request(self, db: Session, request_id: int, obj_in: IssuanceRequestUpdate, customer_id: int, user_id: int) -> IssuanceRequest:
         """Edit a request. Applies conditional re-approval governance for post-submission edits."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         req = db.query(IssuanceRequest).filter(IssuanceRequest.id == request_id, IssuanceRequest.customer_id == customer_id).first()
         if not req:
             raise HTTPException(status_code=404, detail="Request not found")
@@ -142,11 +195,14 @@ class CRUDIssuanceRequest(CRUDBase):
         if req.locked_for_issuance or req.status == "ISSUED":
             raise HTTPException(status_code=403, detail="Request is locked for execution and cannot be edited.")
 
-        if req.status in ("CANCELLED",):
-            raise HTTPException(status_code=400, detail="Cancelled requests cannot be edited.")
+        if req.status in ("CANCELLED", "EDIT_REQUESTED", "CANCELLATION_REQUESTED"):
+            raise HTTPException(status_code=400, detail=f"Request in status '{req.status}' cannot be edited.")
+
 
         update_data = obj_in.model_dump(exclude_unset=True)
         change_reason = update_data.pop("change_reason", None)
+        
+        logger.info(f"[EDIT] Request {request_id} status={req.status}, fields in payload: {list(update_data.keys())}, change_reason={'YES' if change_reason else 'NO'}")
         
         # 1. Calculate Diff
         changed_fields = {}
@@ -155,9 +211,15 @@ class CRUDIssuanceRequest(CRUDBase):
         
         for field, new_value in update_data.items():
             old_value = getattr(req, field, None)
-            # Normalize for comparison (Decimal vs float, etc.)
-            if isinstance(old_value, Decimal) and isinstance(new_value, (int, float)):
-                new_value = Decimal(str(new_value))
+            # Normalize for comparison (Decimal vs float/string, etc.)
+            if isinstance(old_value, Decimal):
+                if isinstance(new_value, (int, float)):
+                    new_value = Decimal(str(new_value))
+                elif isinstance(new_value, str):
+                    try:
+                        new_value = Decimal(new_value)
+                    except Exception:
+                        pass
             if old_value != new_value:
                 changed_fields[field] = {
                     "old": str(old_value) if old_value is not None else None, 
@@ -167,12 +229,16 @@ class CRUDIssuanceRequest(CRUDBase):
                     has_risky_changes = True
                     risky_fields_changed.append(field)
 
-        if not changed_fields:
+        logger.info(f"[EDIT] Changed fields: {list(changed_fields.keys())}, risky: {risky_fields_changed}, has_risky: {has_risky_changes}")
+        
+        if not changed_fields and not change_reason:
+            logger.info(f"[EDIT] No changes or reason detected, returning as-is")
             return req  # No changes made
 
         # 2. Post-Submission Governance
         re_approval_triggered = False
-        if req.status in ("SUBMITTED", "PENDING_APPROVAL", "APPROVED"):
+        edit_pending_approval = False
+        if req.status in ("SUBMITTED", "PENDING_APPROVAL", "APPROVED", "APPROVED_INTERNAL", "FACILITY_RESERVED"):
             if not change_reason:
                 raise HTTPException(
                     status_code=400, 
@@ -180,30 +246,106 @@ class CRUDIssuanceRequest(CRUDBase):
                 )
             
             if has_risky_changes:
-                # === RE-APPROVAL REQUIRED ===
-                # Reset approval chain so it restarts from step 1
+                # === RE-APPROVAL REQUIRED (blacklist fields) — apply now + reset chain ===
+                logger.info(f"[EDIT] RE-APPROVAL TRIGGERED on {req.status} request. Risky fields: {risky_fields_changed}")
                 req.status = "PENDING_APPROVAL"
-                req.current_approval_step = 1
                 req.signatures_collected = 0
                 re_approval_triggered = True
+                
+                # Recalculate pending_approver_users via issuance service
+                from app.services.issuance_service import issuance_service
+                try:
+                    next_policy, approver_ids = issuance_service._find_next_step(db, req, start_sequence=0)
+                    req.pending_approver_users = approver_ids or []
+                    # Set step to the ACTUAL first applicable step (not hardcoded 1)
+                    req.current_approval_step = next_policy.step_sequence if next_policy else 1
+                except Exception:
+                    req.pending_approver_users = []
+                    req.current_approval_step = 1
+                
+                # Add to approval_chain_audit for Activity Timeline
+                from sqlalchemy.orm.attributes import flag_modified
+                from datetime import date as date_cls
+                audit = list(req.approval_chain_audit or [])
+                user_label = None
+                try:
+                    from app.models.models import User
+                    u = db.query(User).filter(User.id == user_id).first()
+                    user_label = u.email if u else str(user_id)
+                except Exception:
+                    user_label = str(user_id)
+                audit.append({
+                    "action": "RE_APPROVAL_TRIGGERED",
+                    "user_id": user_id,
+                    "user_name": user_label,
+                    "timestamp": str(date_cls.today()),
+                    "reason": change_reason,
+                    "changed_fields": risky_fields_changed
+                })
+                req.approval_chain_audit = audit
+                flag_modified(req, 'approval_chain_audit')
+                
                 log_action(
                     db, user_id, "RE_APPROVAL_TRIGGERED", "IssuanceRequest", req.id, 
                     {"risky_fields": risky_fields_changed, "all_changes": changed_fields, "reason": change_reason},
                     customer_id
                 )
             else:
-                # === SAFE EDIT — notify only ===
+                # === SAFE EDIT — requires admin approval ===
+                # Store pending changes in metadata, do NOT apply yet
+                from sqlalchemy.orm.attributes import flag_modified
+                from datetime import date as date_cls
+                
+                previous_status = req.status
+                
+                # Save pending edit data
+                meta = dict(req.metadata_json or {})
+                meta["pending_edit"] = {
+                    "changes": update_data,  # raw field values to apply on approval
+                    "diff": changed_fields,  # old→new for admin review
+                    "change_reason": change_reason,
+                    "requested_by_user_id": user_id,
+                    "requested_at": datetime.utcnow().isoformat(),
+                    "previous_status": previous_status,
+                }
+                req.metadata_json = meta
+                req.status = "EDIT_REQUESTED"
+                edit_pending_approval = True
+
+                # Audit trail
+                audit = list(req.approval_chain_audit or [])
+                user_label = None
+                try:
+                    from app.models.models import User
+                    u = db.query(User).filter(User.id == user_id).first()
+                    user_label = u.email if u else str(user_id)
+                except Exception:
+                    user_label = str(user_id)
+                audit.append({
+                    "action": "EDIT_REQUESTED",
+                    "user_id": user_id,
+                    "user_name": user_label,
+                    "timestamp": str(date_cls.today()),
+                    "reason": change_reason,
+                    "changed_fields": list(changed_fields.keys())
+                })
+                req.approval_chain_audit = audit
+                flag_modified(req, 'approval_chain_audit')
+                
                 log_action(
-                    db, user_id, "SAFE_EDIT_FYI", "IssuanceRequest", req.id, 
+                    db, user_id, "EDIT_REQUESTED", "IssuanceRequest", req.id, 
                     {"changes": changed_fields, "reason": change_reason},
                     customer_id
                 )
 
-        # 3. Apply Updates to Record
-        for field, new_value in update_data.items():
-            setattr(req, field, new_value)
+                logger.info(f"[EDIT] Edit request stored as pending for admin approval. Status → EDIT_REQUESTED")
+
+        # 3. Apply Updates to Record (only for drafts, revisions, or blacklist re-approval edits)
+        if not edit_pending_approval:
+            for field, new_value in update_data.items():
+                setattr(req, field, new_value)
             
-        # 4. Create Linear Version (N+1)
+        # 4. Create Linear Version (N+1) — always, for history
         req.current_version_number += 1
         
         version_log = IssuanceRequestVersion(
@@ -227,6 +369,7 @@ class CRUDIssuanceRequest(CRUDBase):
         # Attach metadata for the caller (not persisted)
         req._edit_metadata = {
             "re_approval_triggered": re_approval_triggered,
+            "edit_pending_approval": edit_pending_approval,
             "risky_fields_changed": risky_fields_changed,
             "safe_fields_changed": [f for f in changed_fields if f not in RE_APPROVAL_TRIGGER_FIELDS],
             "change_reason": change_reason,

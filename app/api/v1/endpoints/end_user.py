@@ -3636,3 +3636,83 @@ def get_lg_lifecycle_history_report(
         lg_record_ids=lg_record_id_list
     )
     return history
+
+# ==============================================================================
+# ISSUANCE OWNERSHIP MANAGEMENT (END USER / ADMIN)
+# ==============================================================================
+
+@router.get("/issuance/requestors/directory")
+def get_issuance_requestors_directory(
+    db: Session = Depends(get_db),
+    end_user_context = Depends(get_current_end_user_context),
+):
+    """
+    Returns a unified directory of all requestors for the customer.
+    """
+    from app.crud.crud_issuance_owner import get_unique_requestors
+    return get_unique_requestors(db, end_user_context.customer_id)
+
+@router.put("/issuance/requestors/profile")
+def update_issuance_requestor_profile(
+    payload: dict,
+    db: Session = Depends(get_db),
+    end_user_context = Depends(get_current_end_user_context),
+):
+    """
+    Corporate Admin edits a Requestor's profile data across all their active LG requests.
+    payload: { old_email: str, updated_profile: RequestorProfile }
+    """
+    from app.crud.crud_issuance_owner import update_requestor_profile
+    from app.schemas.schemas_issuance import RequestorProfile
+    
+    old_email = payload.get("old_email")
+    prof_data = payload.get("updated_profile")
+    if not old_email or not prof_data:
+        raise HTTPException(status_code=400, detail="old_email and updated_profile required")
+
+    profile = RequestorProfile(**prof_data)
+    update_requestor_profile(db, end_user_context.customer_id, old_email, profile)
+    return {"message": "Requestor profile updated successfully"}
+
+
+@router.post("/issuance/handover/force")
+async def force_issuance_handover(
+    payload: dict,
+    db: Session = Depends(get_db),
+    end_user_context = Depends(get_current_end_user_context),
+):
+    """
+    Corporate Admin initiates a force transfer of LGs to a new requestor.
+    Subject to Maker-Checker approval.
+    """
+    from app.schemas.all_schemas import ApprovalRequestCreate
+    from app.crud.crud import crud_approval_request
+    from app.constants import ApprovalRequestStatusEnum
+
+    # Validate payload through schema if needed, but doing directly here
+    if not payload.get("lg_ids") or not payload.get("new_requestor"):
+        raise HTTPException(status_code=400, detail="lg_ids and new_requestor are required")
+        
+    action_payload = {
+        "lg_ids": payload["lg_ids"],
+        "new_requestor": payload["new_requestor"]
+    }
+
+    approval_request_in = ApprovalRequestCreate(
+        entity_type="IssuedLGRecord",
+        entity_id=payload["lg_ids"][0] if payload["lg_ids"] else None,
+        action_type="ISSUANCE_CHANGE_REQUESTOR",
+        request_details=action_payload,
+        # Default status is PENDING inside the schema
+    )
+
+    approval_request = await crud_approval_request.create_approval_request(
+        db=db,
+        obj_in=approval_request_in,
+        maker_user_id=end_user_context.user_id,
+        customer_id=end_user_context.customer_id
+    )
+
+    db.commit()
+
+    return {"message": "Force handover request submitted for approval", "approval_request_id": approval_request.id}

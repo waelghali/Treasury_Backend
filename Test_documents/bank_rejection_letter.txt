@@ -1,0 +1,19 @@
+BANK REJECTION LETTER
+======================
+[PLACEHOLDER — Convert to PDF before use]
+
+From: HSBC Egypt — Trade Finance Department
+To: Grow Engineering LLC — Treasury
+Date: April 6, 2026
+Re: LG Application — REJECTED
+
+Reference: Internal Ref HSBC-APPL-2026-044 (Bid Bond Request for LG-HSBC-2026-004)
+
+We regret to inform you that we are unable to process the above LG application
+at this time due to the following reason(s):
+
+REASON: Facility limit has been temporarily exhausted. Please contact your
+Relationship Manager, Mr. Khaled Fahmy (k.fahmy@hsbc.com), to arrange
+a temporary limit increase or resubmit once existing LGs are released.
+
+We apologize for any inconvenience caused.

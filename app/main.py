@@ -68,10 +68,11 @@ def configure_app_instance(fastapi_app: FastAPI):
     
     from app.api.v1.endpoints import (
         system_owner, corporate_admin, end_user, migration, 
-        public, issuance_endpoints, public_issuance, reports, facility_endpoints,
+        public, public_issuance, reports, facility_endpoints,
         quotations_endpoints, public_quotations, reconciliation_endpoints,
         notification_endpoints
     )
+    from app.api.v1.endpoints import issuance as issuance_package
     from app.auth_v2.routers import router as auth_v2_router
     from app.crud.crud import crud_customer, crud_customer_configuration, log_action
     
@@ -107,7 +108,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
     from app.core.security import require_issuance_module, require_custody_module, require_issuance_or_custody_module
-    fastapi_app.include_router(issuance_endpoints.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_or_custody_module)])
+    fastapi_app.include_router(issuance_package.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_or_custody_module)])
     fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])
     fastapi_app.include_router(public_issuance.router, prefix="/api/v1/public-issuance", tags=["Public Issuance Portal"])
     fastapi_app.include_router(notification_endpoints.router, prefix="/api/v1/notifications", tags=["Notifications"])
@@ -271,6 +272,20 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "id": "issuance_maintenance_reminders_daily_job",
                 "name": "Daily Issuance Maintenance Reminders",
                 "minute": 55,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_issuance_approval_timeout,
+                "id": "issuance_approval_timeout_daily_job",
+                "name": "Daily Issuance Approval Timeout",
+                "minute": 56,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_auto_reject_expired_requests,
+                "id": "auto_reject_expired_requests_daily_job",
+                "name": "Daily Core Approval Requests Auto-Rejection",
+                "minute": 58,
                 "args": []
             }
         ]

@@ -273,7 +273,8 @@ class MigrationService:
             if bucket_name:
                 # We use a synchronous client inside a thread to avoid blocking async loop
                 def fetch_from_gcs():
-                    client = storage.Client()
+                    from app.core.ai_integration import _get_gcs_client
+                    client = _get_gcs_client()
                     bucket = client.bucket(bucket_name)
                     
                     # Try 1: Exact Filename at Root

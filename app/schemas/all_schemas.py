@@ -75,7 +75,7 @@ class SubscriptionPlanOut(SubscriptionPlanBase, BaseSchema):
 class CustomerEntityBase(BaseModel):
     entity_name: str = Field(..., min_length=1, max_length=100, description="Name of the customer entity")
     # Updated: code is now mandatory and fixed length 4 in the models, reflected in schemas
-    address: Optional[str] = Field(None, max_length=250, description="The physical address of the customer entity")
+    address: str = Field(..., min_length=1, max_length=250, description="The physical address of the customer entity (required for bank form filling)")
     commercial_register_number: Optional[str] = Field(None, max_length=50, description="The commercial register number of the entity")
     tax_id: Optional[str] = Field(None, max_length=50, description="The tax identification number of the entity")
     code: str = Field(..., min_length=4, max_length=4, pattern=r"^[A-Z0-9]{4}$", description="Unique 4-character code for the entity, used in LG instruction serialization")
@@ -88,12 +88,14 @@ class CustomerEntityCreate(CustomerEntityBase):
 
 class CustomerEntityUpdate(CustomerEntityBase):
     entity_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    address: Optional[str] = Field(None, max_length=250, description="The physical address of the customer entity")
     # Updated: code field for update
     code: Optional[str] = Field(None, min_length=4, max_length=4, pattern=r"^[A-Z0-9]{4}$", description="Unique 4-character code for the entity, used in LG instruction serialization (optional on creation, auto-generated)")
     contact_person: Optional[str] = Field(None, max_length=100)
     contact_email: Optional[EmailStr] = None
     is_active: Optional[bool] = None
 class CustomerEntityOut(CustomerEntityBase, BaseSchema):
+    address: Optional[str] = Field(None, max_length=250, description="The physical address of the customer entity")
     customer_id: int
 
 class LoginRequest(BaseModel):
@@ -339,6 +341,7 @@ class GlobalConfigurationBase(BaseModel):
     value_default: Optional[str] = Field(None, description="Default value for this setting (as string)")
     unit: Optional[str] = Field(None, max_length=50, description="Unit of the setting (e.g., 'days', 'percentage', 'boolean')")
     description: Optional[str] = Field(None, max_length=500, description="Description of the configuration setting")
+    module_tags: Optional[List[str]] = Field(None, description="Module tags: null=system, e.g. ['custody'], ['issuance'], ['custody','issuance']")
 
 class GlobalConfigurationCreate(GlobalConfigurationBase):
     pass
@@ -383,6 +386,7 @@ class CustomerConfigurationOut(BaseSchema):
     global_description: Optional[str] = Field(None, description="Description from global config")
     
     effective_value: str = Field(..., description="The effective value for the customer (configured_value if present, else global_value_default)")
+    global_module_tags: Optional[List[str]] = Field(None, description="Module tags from the global configuration")
 
 class BankBase(BaseModel):
     name: str = Field(..., min_length=3, max_length=150, description="Name of the bank")
@@ -1281,7 +1285,7 @@ class SystemNotificationBase(BaseModel):
     
     # Display & Animation
     animation_type: Optional[str] = Field("fade", description="CSS animation class.")
-    display_frequency: str = Field("once-per-login", description="Frequency of display.")
+    display_frequency: str = Field("once", description="Frequency of display.")
     max_display_count: Optional[int] = Field(None, description="Max times to display.")
     
     notification_type: Optional[str] = Field("system_info", description="Type of notification (system_info, critical, cbe, etc.)")

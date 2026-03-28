@@ -1,0 +1,15 @@
+FORMAL REQUEST — NON-OPERATIVE LG
+====================================
+[PLACEHOLDER — Convert to PDF before use]
+
+Date: April 1, 2026
+LG Type: Non-Operative Performance LG
+
+This LG shall remain NON-OPERATIVE until project financial close is confirmed.
+Estimated activation date: Q3 2026.
+
+Beneficiary: National Investment Bank
+Amount: USD 500,000
+Expiry: December 31, 2028
+
+Upon financial close, a formal ACTIVATE instruction will be issued to the bank.

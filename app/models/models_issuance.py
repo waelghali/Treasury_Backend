@@ -109,7 +109,7 @@ class IssuanceFacility(Base):
     # Advanced Risk Controls
     fx_breach_auto_suspend = Column(Boolean, default=False, comment="Suspend if FX movement causes limit breach")
     margin_reduces_exposure = Column(Boolean, default=False, comment="If True, cash margin amount is deducted from utilized limit")
-    exposure_start_trigger = Column(String, default="ON_ISSUANCE", comment="ON_APPROVAL or ON_ISSUANCE")
+    exposure_start_trigger = Column(String, default="ON_ISSUANCE", comment="ON_APPROVAL or ON_ISSUANCE")  # RESERVED_FOR_FUTURE_USE — always ON_ISSUANCE for now
     facility_default_margin_pct = Column(Numeric(precision=5, scale=2), nullable=True)
     
     # SLA & Boundaries
@@ -268,7 +268,7 @@ class IssuedLGRecord(Base):
     
     issue_date = Column(Date, nullable=True, comment="Set from bank reply, NOT at execution")
     expiry_date = Column(Date, nullable=True)
-    status = Column(String, default="PENDING_CONFIRMATION", comment="PENDING_CONFIRMATION, ACTIVE, EXPIRED, CANCELLED")
+    status = Column(String, default="INTERNAL_PROCESSING", comment="INTERNAL_PROCESSING, DELIVERED_TO_BANK, LG_ISSUED, ACTIVE, BANK_REJECTED, SLA_EXCEEDED, EXPIRED, RETURNED, LIQUIDATED, CANCELLED")
     
     # Accountability & Issuance Method
     issued_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -332,9 +332,21 @@ class IssuedLGRecord(Base):
     current_owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True,
                                    comment="Current owner — initially the requestor, can be transferred")
     
+    # D4: Peer Handover tracking
+    pending_handover_data = Column(JSONB, nullable=True, 
+                                   comment="Stores requestor profile while handover is pending acceptance")
+    handover_state = Column(String, nullable=True, 
+                            comment="PENDING_ACCEPTANCE, PENDING_APPROVAL, REJECTED, etc.")
+    handover_initiated_by = Column(String, nullable=True, 
+                                   comment="REQUESTOR or ADMIN")
+    
     # A3: Reference validity flag (set by background task)
     reference_validity_flag = Column(String, nullable=True,
                                      comment="VALID / EXCEEDED — set when LG expiry > reference end date")
+
+    # No-Response Cancellation Notice tracking
+    cancellation_notice = Column(JSONB, nullable=True,
+                                 comment="Tracks formal cancellation letter: {generated_at, pdf_path, template_id, delivery_date, delivery_method, delivery_notes, bank_reply_date, bank_reply_notes}")
 
     # D1: Complete field copy from request (self-contained record — no joins needed)
     issuing_entity_id = Column(Integer, ForeignKey("customer_entities.id"), nullable=True,
@@ -353,6 +365,24 @@ class IssuedLGRecord(Base):
                                     comment="Payable currency (may differ from LG denomination currency)")
     requested_issue_date = Column(Date, nullable=True, comment="Original requested issue date from the request")
 
+    # D1 continued: Fields migrated from IssuanceRequest for self-containment
+    operational_status = Column(String, nullable=True,
+                                comment="Operative / Non-Operative — copied from request for ACTIVATE logic")
+    lg_language = Column(String, nullable=True, default="AR",
+                         comment="AR / EN — language for issuance letters and forms")
+    reference_number = Column(String, nullable=True, comment="Underlying contract/PO/project reference number")
+    reference_amount = Column(Numeric(precision=20, scale=2), nullable=True, comment="Underlying reference amount")
+    reference_currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=True, comment="Currency of the reference amount")
+    reference_start_date = Column(Date, nullable=True, comment="Reference contract start date")
+    reference_end_date = Column(Date, nullable=True, comment="Reference contract end date — used for A3 validity checks")
+    applicable_rules = Column(String, nullable=True,
+                              comment="URDG_758, ISP_98, LOCAL_LAW, or NULL")
+    is_auto_reducing = Column(Boolean, default=False, comment="Whether LG auto-reduces on milestones")
+    reduction_trigger = Column(Text, nullable=True, comment="Description of the reduction trigger condition")
+    beneficiary_contact_person = Column(String, nullable=True, comment="Beneficiary contact name")
+    beneficiary_phone = Column(String, nullable=True, comment="Beneficiary phone number")
+    beneficiary_email = Column(String, nullable=True, comment="Beneficiary email address")
+
     # D3: Manual pricing for "other bank" (no facility) issuances
     manual_pricing = Column(JSONB, nullable=True,
                            comment="{commission_rate, flat_fee, margin_pct, margin_amount, agreed_sla, notes}")
@@ -369,6 +399,7 @@ class IssuedLGRecord(Base):
     lg_type = relationship("LgType")
     project = relationship("CorporateProject", foreign_keys=[project_id])
     payable_currency = relationship("Currency", foreign_keys=[lg_payable_currency_id])
+    reference_currency = relationship("Currency", foreign_keys=[reference_currency_id])
     requests = relationship("IssuanceRequest", back_populates="lg_record", foreign_keys="IssuanceRequest.lg_record_id")
     maintenance_actions = relationship("IssuanceMaintenanceAction", back_populates="issued_lg", cascade="all, delete-orphan")
 
@@ -440,7 +471,7 @@ class IssuanceMaintenanceAction(BaseModel):
                                comment="INTERNAL_USER, REQUESTOR_PORTAL, BANK_INITIATED")
 
     # Tracking
-    initiated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    initiated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     executed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     notes = Column(Text, nullable=True)
 
@@ -480,6 +511,7 @@ class BankFormTemplate(Base):
     # AI-generated mapping (cached — AI runs once, fills use cache)
     # Format: [{"pdf_field_name": "...", "label": "...", "mapped_to": "beneficiary_name", "source": "request_data|customer_data", "confidence": 0.95}, ...]
     field_mapping = Column(JSONB, nullable=True)
+    field_mapping_backup = Column(JSONB, nullable=True, comment="Pre-enhancement mapping snapshot for undo")
 
     # Full AI analysis result for reference/debugging
     ai_analysis = Column(JSONB, nullable=True)
@@ -658,6 +690,7 @@ class IssuanceRequest(BaseModel):
     reference_currency = relationship("Currency", foreign_keys=[reference_currency_id])
     project = relationship("CorporateProject", foreign_keys=[project_id], lazy='joined')
     lg_record = relationship("IssuedLGRecord", back_populates="requests", foreign_keys=[lg_record_id])
+    selected_sub_limit = relationship("IssuanceFacilitySubLimit", foreign_keys=[selected_sub_limit_id], lazy='joined')
     versions = relationship("IssuanceRequestVersion", back_populates="request", cascade="all, delete-orphan")
     documents = relationship("IssuanceRequestDocument", back_populates="request", cascade="all, delete-orphan")
 
@@ -934,12 +967,13 @@ class BankFormIssueReport(BaseModel):
     form_config_id = Column(Integer, nullable=True, comment="FK to CustomerFormConfiguration if applicable")
     
     issue_type = Column(String, nullable=False,
-                        comment="MISSING_FIELD, INCORRECT_FORMAT, OUTDATED_TEMPLATE, LAYOUT_ERROR, OTHER")
+                        comment="MISSING_FIELD, INCORRECT_FORMAT, OUTDATED_TEMPLATE, LAYOUT_ERROR, MISSING_BANK_FORM, OTHER")
     description = Column(Text, nullable=False, comment="Detailed description of the issue")
     field_name = Column(String, nullable=True, comment="Specific field with the issue, if applicable")
     severity = Column(String, default="MEDIUM", comment="LOW, MEDIUM, HIGH, CRITICAL")
     status = Column(String, default="OPEN", comment="OPEN, IN_PROGRESS, RESOLVED, CLOSED, WONT_FIX")
     resolution_notes = Column(Text, nullable=True)
+    attachment_path = Column(String, nullable=True, comment="GCS path to uploaded attachment (image, PDF, document)")
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_at = Column(DateTime, nullable=True)

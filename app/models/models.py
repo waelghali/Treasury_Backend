@@ -247,6 +247,7 @@ class GlobalConfiguration(BaseModel):
     value_default = Column(String, nullable=True, comment="Default value for this setting (as string)")
     unit = Column(String, nullable=True, comment="Unit of the setting (e.g., 'days', 'percentage', 'boolean')")
     description = Column(String, nullable=True, comment="Description of the configuration setting")
+    module_tags = Column(JSONB, nullable=True, comment="Module tags: null=system, e.g. ['custody'], ['issuance'], ['custody','issuance']")
 
     customer_configurations = relationship("CustomerConfiguration", back_populates="global_configuration")
 
@@ -291,6 +292,7 @@ class Template(BaseModel):
     template_type = Column(String, nullable=False, comment="Type of template (e.g., 'EMAIL', 'LETTER', 'PDF_ATTACHMENT')")
     action_type = Column(String, nullable=False, comment="Action it relates to (e.g., 'LG_EXTENSION', 'LG_RELEASE')")
     content = Column(Text, nullable=False, comment="The actual content of the template (e.g., HTML for email, Markdown for letter)")
+    language = Column(String(5), default='EN', nullable=False, server_default='EN', comment="Template language: EN, AR, etc.")
     is_global = Column(Boolean, default=True, nullable=False, comment="True if universal, False if customer-specific")
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, comment="Null if is_global is True, links to Customer if customer-specific")
     customer = relationship("Customer", back_populates="templates")
@@ -299,7 +301,7 @@ class Template(BaseModel):
     is_default = Column(Boolean, default=False, nullable=False, comment="True if this is the default template for its scope and action type.")
 
     __table_args__ = (
-        UniqueConstraint('name', 'action_type', 'customer_id', 'is_notification_template', name='_template_unique_per_scope_and_purpose_and_name'),
+        UniqueConstraint('name', 'action_type', 'customer_id', 'is_notification_template', 'language', name='_template_unique_per_scope_purpose_name_lang'),
     )
 
     def __repr__(self: Template):
@@ -689,7 +691,7 @@ class SystemNotification(BaseModel):
     is_active = Column(Boolean, default=True, nullable=False, comment="Whether the notification is currently active or disabled by the System Owner")
 
     animation_type = Column(String, nullable=True, comment="CSS animation class to apply (e.g., 'fade', 'slide-left')")
-    display_frequency = Column(String, default="once-per-login", nullable=False, comment="Frequency of display (e.g., 'once', 'once-per-login', 'repeat')")
+    display_frequency = Column(String, default="once", nullable=False, comment="Frequency of display (e.g., 'once', 'once-per-login', 'repeat')")
     max_display_count = Column(Integer, nullable=True, comment="Max times to display for a repeating notification")
     target_user_ids = Column(JSONB, nullable=True, comment="List of specific user IDs to target")
     target_roles = Column(JSONB, nullable=True, comment="List of user roles to target")

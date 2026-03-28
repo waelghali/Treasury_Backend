@@ -207,6 +207,7 @@ class CRUDCustomerConfiguration(CRUDBase):
                     global_unit=gc.unit,
                     global_description=gc.description,
                     effective_value=effective_value,
+                    global_module_tags=gc.module_tags,
                 )
             )
         result.sort(key=lambda x: x.global_config_key) # Sort by the string value

@@ -63,8 +63,7 @@ class CRUDFacility(CRUDBase):
             # If sl_schema is a Pydantic object, convert it to dict
             sl_dict = sl_schema.dict() if hasattr(sl_schema, "dict") else sl_schema
             
-            # CRITICAL SAFETY CHECK: 
-            # Only attempt to save if lg_type_id actually has a value
+            # Only attempt to save if lg_type_ids is provided (not None/empty)
             if sl_dict.get("lg_type_ids") is not None:
                 db_limit = IssuanceFacilitySubLimit(
                     **sl_dict,

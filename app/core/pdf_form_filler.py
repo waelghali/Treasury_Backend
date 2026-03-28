@@ -37,6 +37,11 @@ DATE_FORMAT_MAP = {
     "DDMMYY": "%d%m%y",
     "DDMMYYYY": "%d%m%Y",
     "YY/MM/DD": "%y/%m/%d",
+    # Single component variants for split-box forms
+    "DD": "%d",
+    "MM": "%m",
+    "YYYY": "%Y",
+    "YY": "%y",
 }
 
 def _format_date(value, date_format: str = None) -> str:
@@ -231,9 +236,26 @@ def fill_pdf_form(
     if field_values:
         for page_num, page in enumerate(writer.pages):
             try:
+                # Resolve IndirectObject references in annotation /Rect values.
+                # Some PDFs store Rect coordinates as indirect refs, causing
+                # pypdf's arithmetic to fail inside update_page_form_field_values.
+                if '/Annots' in page:
+                    from pypdf.generic import ArrayObject, NameObject as _NO
+                    for annot_ref in page['/Annots']:
+                        try:
+                            annot = annot_ref.get_object() if hasattr(annot_ref, 'get_object') else annot_ref
+                            if '/Rect' in annot:
+                                rect = annot['/Rect']
+                                resolved_rect = ArrayObject([
+                                    (v.get_object() if hasattr(v, 'get_object') else v)
+                                    for v in rect
+                                ])
+                                annot[_NO('/Rect')] = resolved_rect
+                        except Exception:
+                            pass
                 writer.update_page_form_field_values(page, field_values)
             except Exception as page_err:
-                logger.debug(f"Page {page_num}: {page_err}")
+                logger.warning(f"Page {page_num} form fill failed: {page_err}")
     
     # Handle checkboxes separately using low-level annotation manipulation
     if checkbox_values:
@@ -473,7 +495,11 @@ def build_request_data_dict(request, db=None, bank_id=None) -> Dict[str, Any]:
     # Amount with currency & amount in words
     amount_val = float(request.amount) if request.amount else 0
     data["amount_with_currency"] = f"{currency_code} {amount_val:,.2f}".strip()
-    data["amount_in_words"] = _number_to_words(amount_val, currency_code or "EGP")
+    _words_only = _number_to_words(amount_val, currency_code or "EGP")
+    # Always format as: "EGP 100,000.00 — One Hundred Thousand Egyptian Pounds Only"
+    data["amount_in_words"] = (
+        f"{currency_code} {amount_val:,.2f} \u2014 {_words_only}" if currency_code else _words_only
+    )
     
     # LG Type — text AND boolean flags for checkbox matching
     lg_type_name = ""
@@ -648,10 +674,30 @@ def generate_overlay_pdf(
         
         for entry in page_fields:
             mapped_to = entry.get("mapped_to", "")
-            x = entry.get("x")
-            y = entry.get("y")
+            font_size = entry.get("font_size", 10)
             
-            if x is None or y is None or not mapped_to:
+            # --- Resolve coordinates: percentage-based (new) or absolute (legacy) ---
+            x_pct = entry.get("x_pct")
+            y_pct = entry.get("y_pct")
+            x_abs = entry.get("x")
+            y_abs = entry.get("y")
+            
+            if x_pct is not None and y_pct is not None:
+                # Percentage-based: convert to absolute PDF points
+                # x_pct: 0=left, 100=right → multiply by page width
+                # y_pct: 0=TOP, 100=BOTTOM → invert for PDF (origin = bottom-left)
+                x = float(x_pct) / 100.0 * pw
+                y = (1.0 - float(y_pct) / 100.0) * ph  # Invert Y axis (top→bottom to bottom→top)
+                width_abs = float(entry.get("width_pct", 30)) / 100.0 * pw
+            elif x_abs is not None and y_abs is not None:
+                # Legacy absolute PDF points
+                x = float(x_abs)
+                y = float(y_abs)
+                width_abs = float(entry.get("width", 200))
+            else:
+                continue  # No coordinates, skip
+            
+            if not mapped_to:
                 continue
             
             # Language filtering
@@ -660,29 +706,26 @@ def generate_overlay_pdf(
                 if field_lang not in ("shared", lg_language.lower()[:2]):
                     continue
             
-            font_size = entry.get("font_size", 10)
             field_type = entry.get("field_type", "text").lower()
             date_format = entry.get("date_format")
-            max_width = entry.get("width", 200)
             fill_strategy = entry.get("fill_strategy", "").lower()
+            
+            # Get value first (needed for strikethrough check)
+            value = request_data.get(mapped_to, "")
+            if value is None:
+                value = ""
             
             # --- Strikethrough strategy: draw a line to cross out text ---
             if fill_strategy == "strikethrough":
                 is_active = bool(value) and str(value).lower() not in ("", "0", "false", "no", "none")
                 if is_active:
-                    line_width = entry.get("width", 80)
-                    line_y = float(y) + font_size * 0.35  # center of text
+                    line_y = y + font_size * 0.35  # center of text
                     c.setStrokeColorRGB(0, 0, 0)
                     c.setLineWidth(1.5)
-                    c.line(float(x), line_y, float(x) + float(line_width), line_y)
+                    c.line(x, line_y, x + width_abs, line_y)
                     filled_count += 1
-                    logger.debug(f"Overlay: STRIKETHROUGH ({x},{y}) w={line_width} p{page_num} [{mapped_to}]")
+                    logger.debug(f"Overlay: STRIKETHROUGH ({x:.0f},{y:.0f}) w={width_abs:.0f} p{page_num} [{mapped_to}]")
                 continue
-            
-            # Get value
-            value = request_data.get(mapped_to, "")
-            if value is None:
-                value = ""
             
             # Format value based on type
             if field_type == "checkbox":
@@ -707,9 +750,13 @@ def generate_overlay_pdf(
             
             # Draw text at the specified position
             c.setFont("Helvetica", font_size)
-            c.drawString(float(x), float(y), value)
+            c.drawString(x, y, value)
             filled_count += 1
-            logger.debug(f"Overlay: ({x},{y}) p{page_num} → '{value[:40]}' [{mapped_to}]")
+            logger.debug(
+                f"Overlay: p{page_num} '{mapped_to}' → '{value[:30]}' | "
+                f"pct=({x_pct or x_abs},{y_pct or y_abs}) → pts=({x:.1f},{y:.1f}) "
+                f"page=({pw:.0f}x{ph:.0f}) fs={font_size}"
+            )
         
         c.showPage()  # Move to next page
     

@@ -1,0 +1,6 @@
+LG_Number,Beneficiary,Amount,Currency,Expiry_Date,Status,Notes
+HSBC-LG-2026-90041,Cairo Transport Authority,400000,USD,2028-06-30,ACTIVE,Extended expiry
+HSBC-LG-2026-90042,Egyptian Roads Authority,750000,USD,2028-06-01,ACTIVE,Beneficiary name amended
+HSBC-LG-2026-90046,Al-Rajhi Development Co.,300000,USD,2027-06-30,ACTIVE,Cross-border LG
+HSBC-LG-2026-90047,Suez Canal Authority,250000,USD,2027-01-31,ACTIVE,Third-party issuance
+HSBC-LG-2026-90048,National Investment Bank,500000,USD,2028-12-31,ACTIVE,Non-operative - activated

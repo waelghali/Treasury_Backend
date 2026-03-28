@@ -1,0 +1,12 @@
+COURIER DELIVERY RECEIPT
+==========================
+[PLACEHOLDER — Convert to PDF before use]
+
+Courier Company: Aramex Egypt
+Tracking Number: AX-88821-2026
+Date of Delivery: April 3, 2026
+Delivered to: HSBC Bank, Main Branch — Cairo
+
+Package Description: Letter of Guarantee Request Documents
+Received by: Amr Saber — Bank Operations Department
+Signature: [signed]

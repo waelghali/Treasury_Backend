@@ -1,0 +1,6 @@
+LG_Number,Beneficiary,Amount,Currency,Expiry_Date,Status,Notes
+LG-NBE-2026-003,Delta Industrial Supplies Co.,2000000,EGP,2026-12-31,ACTIVE,Increased from 1.5M
+LG-NBE-2026-005,Ministry of Housing,800000,EGP,2027-03-31,RETURNED,Closed/returned
+LG-NBE-2026-009,TechSystems Egypt,600000,EGP,2026-09-30,ACTIVE,External portal
+LG-NBE-2026-011,New Urban Communities Authority,1500000,EGP,2027-12-31,ACTIVE,"MISMATCH: system=1,200,000"
+NBE-PHANTOM-9999,Unknown Entity,500000,EGP,2025-12-31,ACTIVE,BANK-ONLY: not in system

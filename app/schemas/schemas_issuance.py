@@ -89,6 +89,7 @@ class IssuanceRequestBase(BaseModel):
     requested_issue_date: Optional[date] = None
     requested_expiry_date: date
     operational_status: Optional[str] = None
+    lg_language: Optional[str] = "AR"
     is_auto_reducing: bool = False
     reduction_trigger: Optional[str] = None
     other_conditions: Optional[str] = None
@@ -231,6 +232,8 @@ class IssuanceRequestOut(IssuanceRequestBase):
     approval_chain_audit: Optional[List[Dict[str, Any]]] = None
     requestor_user_id: Optional[int] = None
     returned_from_step: Optional[int] = None
+    revision_notes: Optional[str] = None
+    change_reason: Optional[str] = None
     # Nested currency object
     currency: Optional[CurrencyOut] = None
     payable_currency: Optional[CurrencyOut] = None
@@ -270,6 +273,11 @@ class IssuanceExecuteRequest(BaseModel):
 class IssuanceCancelRequest(BaseModel):
     """Request body for cancellation."""
     reason: str
+
+class CancellationResolveIn(BaseModel):
+    """Admin resolves (approve/reject) a cancellation request."""
+    approved: bool
+    note: Optional[str] = None
 
 class IssuedLGRecordDetailOut(BaseModel):
     """Full LG record response with all tracking fields."""
@@ -409,6 +417,7 @@ class IssuanceFacilityOut(IssuanceFacilityBase):
     created_at: datetime
     is_deleted: bool
     utilized_amount: Optional[Decimal] = Decimal("0")
+    reserved_amount: Optional[Decimal] = Decimal("0")
     bank: Optional[BankOut] = None
     currency: Optional[CurrencyOut] = None
     entities: List[CustomerEntityOut] = []
@@ -529,8 +538,8 @@ class AdminChangeRequestAction(BaseModel):
 class BankFormIssueReportCreate(BaseModel):
     bank_id: int
     form_config_id: Optional[int] = None
-    issue_type: str = Field(..., description="MISSING_FIELD, INCORRECT_FORMAT, OUTDATED_TEMPLATE, LAYOUT_ERROR, OTHER")
-    description: str = Field(..., min_length=10)
+    issue_type: str = Field(..., description="MISSING_FIELD, INCORRECT_FORMAT, OUTDATED_TEMPLATE, LAYOUT_ERROR, MISSING_BANK_FORM, OTHER")
+    description: str = Field(..., min_length=3)
     field_name: Optional[str] = None
     severity: str = "MEDIUM"
 
@@ -546,6 +555,7 @@ class BankFormIssueReportOut(BaseModel):
     severity: str
     status: str
     resolution_notes: Optional[str] = None
+    attachment_path: Optional[str] = None
     created_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     reported_by_email: Optional[str] = None
@@ -556,3 +566,30 @@ class BankFormIssueReportUpdate(BaseModel):
     status: Optional[str] = None
     resolution_notes: Optional[str] = None
     severity: Optional[str] = None
+
+# ==============================================================================
+# ISSUANCE OWNERSHIP MANAGEMENT (HANDOVER)
+# ==============================================================================
+
+class RequestorProfile(BaseModel):
+    email: str
+    name: Optional[str] = None
+    department: Optional[str] = None
+    job_title: Optional[str] = None
+    phone_number: Optional[str] = None
+    employee_id: Optional[str] = None
+    manager_email: Optional[str] = None
+    second_line_manager_email: Optional[str] = None
+
+class InitiateHandoverPayload(BaseModel):
+    lg_ids: List[int]
+    new_requestor: RequestorProfile
+
+class ForceHandoverPayload(BaseModel):
+    lg_ids: List[int]
+    new_requestor: RequestorProfile
+
+class EditRequestorProfilePayload(BaseModel):
+    old_email: str
+    updated_profile: RequestorProfile
+    update_all_lgs: bool = True

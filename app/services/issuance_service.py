@@ -6,6 +6,7 @@ logger = logging.getLogger(__name__)
 from typing import List, Optional, Tuple, Dict, Any
 from decimal import Decimal
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from fastapi import HTTPException, status
 from sqlalchemy import func
 
@@ -29,6 +30,16 @@ class IssuanceService:
     # ==========================================================================
     # 0. UTILITIES
     # ==========================================================================
+
+    def _get_user_label(self, db: Session, user_id: int) -> str:
+        """Resolve user_id to a display name for audit trail entries."""
+        if not user_id:
+            return None
+        from app.models import User
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            return user.email
+        return f"User #{user_id}"
 
     def _get_fx_rate(self, db: Session, from_currency_id: int, to_currency_code: str = "EGP") -> Decimal:
         """
@@ -128,7 +139,7 @@ class IssuanceService:
             # This is crucial to prevent "double spending" the limit
             pending_amount = db.query(func.sum(IssuanceRequest.amount)).filter(
                 IssuanceRequest.selected_sub_limit_id == sub_limit.id,
-                IssuanceRequest.status.in_(["APPROVED_INTERNAL", "FACILITY_RESERVED", "PENDING_BANK_CONFIRMATION"]),
+                IssuanceRequest.status.in_(["APPROVED_INTERNAL", "FACILITY_RESERVED", "INTERNAL_PROCESSING"]),
                 IssuanceRequest.transaction_type == "NEW_ISSUANCE"
             ).scalar() or Decimal(0)
 
@@ -308,9 +319,15 @@ class IssuanceService:
         if requestor_user_id and requestor_user_id in approver_ids:
             approver_ids.discard(requestor_user_id)
 
-        # RULE 2: Remove users who have already signed this request (no double-dipping)
+        # RULE 2: Remove users who have already signed this request IN THE CURRENT ROUND (no double-dipping)
+        # Only consider signatures after the last re-approval trigger or resubmission
         current_audit = request.approval_chain_audit or []
-        already_signed_users = {entry.get("user_id") for entry in current_audit if entry.get("action") == "APPROVED_STEP"}
+        last_reset_idx = -1
+        for i, entry in enumerate(current_audit):
+            if entry.get("action") in ("RE_APPROVAL_TRIGGERED", "RESUBMITTED"):
+                last_reset_idx = i
+        current_round_audit = current_audit[last_reset_idx + 1:] if last_reset_idx >= 0 else current_audit
+        already_signed_users = {entry.get("user_id") for entry in current_round_audit if entry.get("action") == "APPROVED_STEP"}
         
         return list(approver_ids - already_signed_users)
 
@@ -318,6 +335,12 @@ class IssuanceService:
         """
         Evaluates policies sequentially. Auto-skips policies that apply but have 0 eligible approvers.
         Applies anti-deadlock: if eligible approvers < required_signatures, lowers the requirement.
+        
+        PRE-DEDUP: Before selecting the first step, looks ahead at ALL applicable steps.
+        If a user appears in multiple steps, removes them from steps where other approvers
+        can still fulfill the requirement, keeping them in steps where they're critical.
+        Priority: remove from multi-approver steps first, then from later steps.
+        
         Returns (next_policy, eligible_approver_ids) or (None, []) if fully approved.
         """
         policies = db.query(IssuanceWorkflowPolicy).filter(
@@ -328,36 +351,129 @@ class IssuanceService:
         
         current_audit = request.approval_chain_audit or []
 
+        # ── PRE-DEDUP PHASE: Look ahead at all applicable steps ──
+        # Collect which policies apply and their raw approver pools
+        applicable = []  # List of (policy, approver_ids_set)
         for policy in policies:
             if self._evaluate_condition(db, request, policy):
-                approver_ids = self._resolve_approvers(db, request, policy, request.requestor_user_id)
-                
-                if approver_ids:
-                    # ANTI-DEADLOCK: If eligible approvers < required signatures,
-                    # lower the requirement to match available approvers
-                    effective_sigs = min(policy.required_signatures, len(approver_ids))
-                    if effective_sigs < policy.required_signatures:
-                        current_audit.append({
-                            "action": "ADJUSTED_SIGNATURES",
-                            "step": policy.step_sequence,
-                            "original_required": policy.required_signatures,
-                            "adjusted_to": effective_sigs,
-                            "reason": f"Only {len(approver_ids)} eligible approvers (requestor excluded or group too small)",
-                            "timestamp": str(date.today())
-                        })
-                        request.approval_chain_audit = list(current_audit)
+                approver_ids = set(self._resolve_approvers(db, request, policy, request.requestor_user_id))
+                applicable.append((policy, approver_ids))
+        
+        if len(applicable) > 1:
+            # Find users appearing in more than one step
+            user_step_map = {}  # user_id -> list of indices in applicable[]
+            for idx, (policy, approvers) in enumerate(applicable):
+                for uid in approvers:
+                    user_step_map.setdefault(uid, []).append(idx)
+            
+            shared_users = {uid: indices for uid, indices in user_step_map.items() if len(indices) > 1}
+            
+            if shared_users:
+                # For each shared user: keep in ALL steps where they're critical,
+                # remove ONLY from steps where other approvers can still fulfill the requirement.
+                # Goal: maximize the number of distinct approvers across the full chain.
+                for uid, indices in shared_users.items():
+                    # Classify each step as safe-to-remove or must-keep
+                    safe_to_remove = []  # Steps where removing this user still leaves enough approvers
+                    must_keep = []       # Steps where this user is critical (sole/essential approver)
                     
-                    return policy, approver_ids
-                else:
-                    # Auto-Skip: Condition met, but no eligible users
+                    for idx in indices:
+                        policy, approvers = applicable[idx]
+                        remaining_after_removal = len(approvers) - 1
+                        if remaining_after_removal >= policy.required_signatures:
+                            safe_to_remove.append(idx)
+                        else:
+                            must_keep.append(idx)
+                    
+                    if must_keep:
+                        # User is critical in some steps — remove from all safe-to-remove steps
+                        for idx in safe_to_remove:
+                            applicable[idx][1].discard(uid)
+                    else:
+                        # User is safe to remove from ALL steps — keep in the most critical one
+                        # (fewest other approvers, earliest step as tiebreak)
+                        safe_to_remove.sort(key=lambda idx: (
+                            len(applicable[idx][1]) - 1,           # fewest other approvers first
+                            applicable[idx][0].step_sequence       # earlier step first
+                        ))
+                        # Keep in the first (most critical), remove from the rest
+                        for idx in safe_to_remove[1:]:
+                            applicable[idx][1].discard(uid)
+                
+                # Log the pre-dedup in audit trail
+                dedup_log = []
+                for uid, indices in shared_users.items():
+                    kept_steps = []
+                    removed_steps = []
+                    for idx in indices:
+                        policy, approvers = applicable[idx]
+                        if uid in approvers:
+                            kept_steps.append(policy.step_sequence)
+                        else:
+                            removed_steps.append(policy.step_sequence)
+                    if removed_steps:
+                        dedup_log.append(f"User {uid}: kept in step(s) {kept_steps}, removed from step(s) {removed_steps}")
+                
+                if dedup_log:
                     current_audit.append({
-                        "action": "SKIPPED_STEP",
-                        "step": policy.step_sequence,
-                        "reason": "No eligible approvers found (requestor excluded, empty group, or all double-dipped)",
+                        "action": "APPROVER_DEDUP",
+                        "details": dedup_log,
+                        "reason": "Shared approvers pre-assigned to steps where they are most critical",
                         "timestamp": str(date.today())
                     })
                     request.approval_chain_audit = list(current_audit)
-                    # Loop continues to the next policy
+                    flag_modified(request, 'approval_chain_audit')
+
+        # ── SEQUENTIAL STEP SELECTION (with pre-deduped pools) ──
+        for policy, approver_ids in applicable:
+            if approver_ids:
+                approver_list = list(approver_ids)
+                # ANTI-DEADLOCK: If eligible approvers < required signatures,
+                # lower the requirement to match available approvers
+                effective_sigs = min(policy.required_signatures, len(approver_list))
+                if effective_sigs < policy.required_signatures:
+                    current_audit.append({
+                        "action": "ADJUSTED_SIGNATURES",
+                        "step": policy.step_sequence,
+                        "original_required": policy.required_signatures,
+                        "adjusted_to": effective_sigs,
+                        "reason": f"Only {len(approver_list)} eligible approvers (requestor excluded or group too small)",
+                        "timestamp": str(date.today())
+                    })
+                    request.approval_chain_audit = list(current_audit)
+                    flag_modified(request, 'approval_chain_audit')
+                
+                return policy, approver_list
+            else:
+                # Auto-Skip: Condition met, but no eligible users
+                current_audit.append({
+                    "action": "SKIPPED_STEP",
+                    "step": policy.step_sequence,
+                    "reason": "No eligible approvers found (requestor excluded, empty group, or all double-dipped)",
+                    "timestamp": str(date.today())
+                })
+                request.approval_chain_audit = list(current_audit)
+                flag_modified(request, 'approval_chain_audit')
+
+                # --- Notify corp admins about the skip ---
+                try:
+                    from app.schemas.all_schemas import SystemNotificationCreate
+                    from app.crud.crud import crud_notification
+                    import datetime as _dt
+                    _now = _dt.datetime.utcnow()
+                    notif = SystemNotificationCreate(
+                        content=f"Approval step {policy.step_sequence} was auto-skipped for request {request.serial_number}: no eligible approvers.",
+                        notification_type="APPROVAL_SKIP",
+                        target_roles=["corporate_admin"],
+                        target_customer_ids=[request.customer_id],
+                        start_date=_now,
+                        end_date=_now + _dt.timedelta(days=14),
+                        link=f"/corporate-admin/issuance/requests"
+                    )
+                    crud_notification.create_notification(db, obj_in=notif)
+                except Exception as e:
+                    logger.warning(f"Failed to create skip notification: {e}")
+                # Loop continues to the next policy
         
         return None, []
 
@@ -382,9 +498,19 @@ class IssuanceService:
         audit = request.approval_chain_audit or []
         is_fully_approved = any(e.get("action") == "FULLY_APPROVED" for e in audit)
         
+        # ── KEY FIX: After a RE_APPROVAL_TRIGGERED, only look at entries from the current round ──
+        # Previous-round approvals should not show as "completed" in the roadmap.
+        last_restart_idx = -1
+        for i, entry in enumerate(audit):
+            if entry.get("action") in ("RE_APPROVAL_TRIGGERED", "RESUBMITTED"):
+                last_restart_idx = i
+        current_round_audit = audit[last_restart_idx + 1:] if last_restart_idx >= 0 else audit
+        # Also check is_fully_approved only in current round
+        is_fully_approved = any(e.get("action") == "FULLY_APPROVED" for e in current_round_audit)
+        
         # Build lookup maps for user names
         all_user_ids = set()
-        for entry in audit:
+        for entry in current_round_audit:
             if entry.get("user_id"):
                 all_user_ids.add(entry["user_id"])
         
@@ -393,9 +519,9 @@ class IssuanceService:
             users = db.query(User).filter(User.id.in_(all_user_ids)).all()
             user_name_map = {u.id: u.email for u in users}
 
-        # Group audit entries by step
+        # Group audit entries by step (current round only)
         step_audit = {}
-        for entry in audit:
+        for entry in current_round_audit:
             s = entry.get("step")
             if s is not None:
                 step_audit.setdefault(s, []).append(entry)
@@ -536,16 +662,19 @@ class IssuanceService:
         Unified submit flow: DRAFT -> creates V1 snapshot -> runs approval matrix
         -> PENDING_APPROVAL or APPROVED_INTERNAL.
         """
-        from app.models.models_issuance import IssuanceRequestSnapshot
+        from app.models.models_issuance import IssuanceRequestSnapshot, IssuanceRequestVersion
 
         request = crud_issuance_request.get(db, id=request_id)
-        if not request or request.status not in ("DRAFT", "RETURNED_FOR_REVISION"):
-            raise HTTPException(status_code=400, detail="Only DRAFT or RETURNED_FOR_REVISION requests can be submitted")
+        if not request or request.status not in ("DRAFT", "REVISION_REQUIRED"):
+            raise HTTPException(status_code=400, detail="Only DRAFT or REVISION_REQUIRED requests can be submitted")
 
         # Determine start step: resume from returned step or start from 0
         resume_from_step = 0
-        if request.status == "RETURNED_FOR_REVISION" and request.returned_from_step is not None:
-            resume_from_step = request.returned_from_step
+        is_resubmission = False
+        if request.status == "REVISION_REQUIRED" and request.returned_from_step is not None:
+            is_resubmission = True
+            # Subtract 1 so _find_next_step (which uses > start_sequence) re-evaluates the returning step
+            resume_from_step = max(0, request.returned_from_step - 1)
             # Clear revision tracking on resubmission
             request.revision_notes = None
             request.returned_from_step = None
@@ -570,12 +699,50 @@ class IssuanceService:
             db.add(snapshot)
             db.flush()
 
-        # --- Initialize Audit Trail ---
-        request.approval_chain_audit = [{
-            "action": "SUBMITTED",
-            "user_id": user_id,
-            "timestamp": str(date.today())
-        }]
+        # --- Initialize/Update Audit Trail ---
+        if is_resubmission:
+            # Resubmission after revision — preserve existing audit trail
+            # Try to get change_reason from:
+            # 1. EDIT_REASON_PENDING entry in audit trail (public portal edits)
+            # 2. IssuanceRequestVersion record (internal edits)
+            current_audit = list(request.approval_chain_audit or [])
+
+            # Check for pending edit reason from public portal
+            resubmit_reason = None
+            cleaned_audit = []
+            for entry in current_audit:
+                if entry.get("action") == "EDIT_REASON_PENDING":
+                    resubmit_reason = entry.get("reason")
+                    # Don't carry the pending entry forward — it's consumed here
+                else:
+                    cleaned_audit.append(entry)
+            current_audit = cleaned_audit
+
+            # Fallback: check IssuanceRequestVersion (internal edit flow)
+            if not resubmit_reason:
+                latest_version = db.query(IssuanceRequestVersion).filter(
+                    IssuanceRequestVersion.request_id == request.id
+                ).order_by(IssuanceRequestVersion.version_number.desc()).first()
+                resubmit_reason = latest_version.change_reason if latest_version else None
+
+            current_audit.append({
+                "action": "RESUBMITTED",
+                "user_id": user_id,
+                "user_name": self._get_user_label(db, user_id) or request.requestor_name or request.requestor_email,
+                "timestamp": str(date.today()),
+                "resumed_from_step": resume_from_step,
+                "reason": resubmit_reason
+            })
+            request.approval_chain_audit = current_audit
+            flag_modified(request, 'approval_chain_audit')
+        else:
+            request.approval_chain_audit = [{
+                "action": "SUBMITTED",
+                "user_id": user_id,
+                "user_name": self._get_user_label(db, user_id) or request.requestor_name or request.requestor_email,
+                "timestamp": str(date.today())
+            }]
+            flag_modified(request, 'approval_chain_audit')
 
         # --- Run Approval Matrix ---
         next_policy, approver_ids = self._find_next_step(db, request, start_sequence=resume_from_step)
@@ -628,6 +795,7 @@ class IssuanceService:
                 "timestamp": str(date.today())
             })
             request.approval_chain_audit = list(current_audit)
+            flag_modified(request, 'approval_chain_audit')
 
         db.add(request)
         db.commit()
@@ -659,6 +827,26 @@ class IssuanceService:
         # 1. Verify Authorization (type-safe: cast JSONB values to int)
         allowed_users = [int(uid) for uid in (request.pending_approver_users or [])]
         
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[APPROVE] Request {request_id}: status={request.status}, step={request.current_approval_step}, pending_approvers={request.pending_approver_users}, approver={approver_user_id}")
+        
+        # Auto-recalculate if pending_approver_users is empty (stale from re-approval)
+        if not allowed_users:
+            logger.info(f"[APPROVE] pending_approver_users is empty, recalculating from step 0 (to include step 1)")
+            try:
+                next_policy, recalc_ids = self._find_next_step(db, request, start_sequence=0)
+                logger.info(f"[APPROVE] Recalculated: policy={next_policy}, approver_ids={recalc_ids}")
+                if recalc_ids:
+                    request.pending_approver_users = recalc_ids
+                    allowed_users = [int(uid) for uid in recalc_ids]
+                    if next_policy:
+                        request.current_approval_step = next_policy.step_sequence
+                    db.flush()
+                    logger.info(f"[APPROVE] Updated pending_approver_users to {recalc_ids}")
+            except Exception as e:
+                logger.error(f"[APPROVE] Recalculation failed: {e}", exc_info=True)
+        
         if approver_user_id not in allowed_users:
             raise HTTPException(status_code=403, detail="You are not authorized to approve this step.")
 
@@ -667,8 +855,15 @@ class IssuanceService:
             raise HTTPException(status_code=403, detail="You cannot approve your own request.")
 
         current_audit = request.approval_chain_audit or []
-        for entry in current_audit:
-            if entry.get("step") == request.current_approval_step and entry.get("user_id") == approver_user_id:
+        # Only check for duplicate signatures AFTER the last resubmission or re-approval trigger
+        # (previous approval-round signatures don't count)
+        last_resubmit_idx = -1
+        for i, entry in enumerate(current_audit):
+            if entry.get("action") in ("RESUBMITTED", "RE_APPROVAL_TRIGGERED"):
+                last_resubmit_idx = i
+        recent_entries = current_audit[last_resubmit_idx + 1:] if last_resubmit_idx >= 0 else current_audit
+        for entry in recent_entries:
+            if entry.get("action") == "APPROVED_STEP" and entry.get("step") == request.current_approval_step and entry.get("user_id") == approver_user_id:
                 raise HTTPException(status_code=400, detail="You have already signed this step.")
 
         # 2. Record Signature
@@ -680,9 +875,11 @@ class IssuanceService:
             "action": "APPROVED_STEP",
             "step": request.current_approval_step,
             "user_id": approver_user_id,
+            "user_name": self._get_user_label(db, approver_user_id),
             "timestamp": str(date.today())
         })
         request.approval_chain_audit = list(current_audit)
+        flag_modified(request, 'approval_chain_audit')
 
         # 3. Check if Step is Complete
         current_policy = db.query(IssuanceWorkflowPolicy).filter(
@@ -695,8 +892,8 @@ class IssuanceService:
         # Anti-deadlock: use effective required signatures if adjusted
         # (set by _find_next_step when eligible approvers < policy requirement)
         effective_sigs = None
-        # Check audit trail for adjustment record for this step
-        for entry in current_audit:
+        # Check audit trail for adjustment record for this step — CURRENT ROUND ONLY
+        for entry in recent_entries:
             if entry.get("action") == "ADJUSTED_SIGNATURES" and entry.get("step") == request.current_approval_step:
                 effective_sigs = entry.get("adjusted_to", policy_sigs)
                 break
@@ -726,6 +923,7 @@ class IssuanceService:
                     "timestamp": str(date.today())
                 })
                 request.approval_chain_audit = list(current_audit)
+                flag_modified(request, 'approval_chain_audit')
         else:
             logger.debug(f"Approve: Request {request_id}: WAITING for more signatures ({request.signatures_collected}/{required_sigs})")
 
@@ -750,7 +948,7 @@ class IssuanceService:
 
         return request
 
-    def reject_request(self, db: Session, request_id: int, user_id: int) -> IssuanceRequest:
+    def reject_request(self, db: Session, request_id: int, user_id: int, rejection_reason: str = None) -> IssuanceRequest:
         """ Rejects the request and clears pending approvers. """
         request = crud_issuance_request.get(db, id=request_id)
         if not request:
@@ -758,14 +956,18 @@ class IssuanceService:
 
         request.status = "REJECTED"
         request.pending_approver_users = []
+        request.revision_notes = rejection_reason  # Store reason for requestor visibility
         
         current_audit = request.approval_chain_audit or []
         current_audit.append({
             "action": "REJECTED",
             "user_id": user_id,
+            "user_name": self._get_user_label(db, user_id),
+            "notes": rejection_reason,
             "timestamp": str(date.today())
         })
         request.approval_chain_audit = list(current_audit)
+        flag_modified(request, 'approval_chain_audit')
 
         db.add(request)
         db.commit()
@@ -778,7 +980,8 @@ class IssuanceService:
             entity_id=request_id,
             details={
                 "serial_number": request.serial_number,
-                "status_after": "REJECTED"
+                "status_after": "REJECTED",
+                "rejection_reason": rejection_reason
             },
             customer_id=request.customer_id
         )
@@ -799,19 +1002,21 @@ class IssuanceService:
         # Store the step that returned it so resubmission resumes here
         request.returned_from_step = request.current_approval_step
         request.revision_notes = revision_notes
-        request.status = "RETURNED_FOR_REVISION"
+        request.status = "REVISION_REQUIRED"
         request.pending_approver_users = []
         request.signatures_collected = 0
         
         current_audit = request.approval_chain_audit or []
         current_audit.append({
-            "action": "RETURNED_FOR_REVISION",
+            "action": "REVISION_REQUIRED",
             "step": request.current_approval_step,
             "user_id": user_id,
+            "user_name": self._get_user_label(db, user_id),
             "notes": revision_notes,
             "timestamp": str(date.today())
         })
         request.approval_chain_audit = list(current_audit)
+        flag_modified(request, 'approval_chain_audit')
 
         db.add(request)
         db.commit()
@@ -893,34 +1098,63 @@ class IssuanceService:
         
         candidates = []
         
+        logger.info(
+            f"[FACILITY MATCH] Request {request_id}: lg_type_id={request.lg_type_id}, "
+            f"currency_id={request.currency_id}, amount={request.amount}, "
+            f"is_cross_border={request.is_cross_border}, is_third_party={request.is_third_party}, "
+            f"total facilities to evaluate={len(facilities)}"
+        )
+
         for fac in facilities:
+            fac_label = f"Fac[{fac.id}] '{fac.facility_name}'"
+
             # ── Hard filters at facility level ──
             if getattr(fac, 'is_deleted', False):
+                logger.info(f"[FACILITY MATCH]   SKIP {fac_label}: is_deleted=True")
                 continue
             if fac.status != 'ACTIVE':
+                logger.info(f"[FACILITY MATCH]   SKIP {fac_label}: status='{fac.status}' (not ACTIVE)")
                 continue
             if fac.expiry_date and fac.expiry_date < date.today(): 
+                logger.info(f"[FACILITY MATCH]   SKIP {fac_label}: expired {fac.expiry_date} < today {date.today()}")
                 continue
             
             # Currency: must match OR facility allows multi-currency
             if fac.currency_id != request.currency_id and not fac.multi_currency_allowed:
+                logger.info(
+                    f"[FACILITY MATCH]   SKIP {fac_label}: currency mismatch "
+                    f"fac.currency_id={fac.currency_id} vs request.currency_id={request.currency_id}, "
+                    f"multi_currency_allowed={fac.multi_currency_allowed}"
+                )
                 continue
             
             # Cross-border: if request is cross-border, facility must allow it
             if getattr(request, 'is_cross_border', False) and not fac.allow_cross_border:
+                logger.info(f"[FACILITY MATCH]   SKIP {fac_label}: cross_border request but facility forbids it")
                 continue
             
             # Third-party: if request is third-party, facility must allow it
             if getattr(request, 'is_third_party', False) and not fac.allow_third_party_issuance:
+                logger.info(f"[FACILITY MATCH]   SKIP {fac_label}: third_party request but facility forbids it")
                 continue
+
+            logger.info(f"[FACILITY MATCH]   PASS {fac_label}: facility-level filters OK, checking {len(fac.sub_limits)} sub-limits")
 
             # 2. Iterate Sub-Limits
             for sub in fac.sub_limits:
+                sub_label = f"Sub[{sub.id}] '{sub.limit_name}'"
+
                 # Filter: LG type (type-safe: JSONB may store strings or ints)
                 if sub.lg_type_ids:
                     str_lg_type_ids = [str(x) for x in sub.lg_type_ids]
                     if str(request.lg_type_id) not in str_lg_type_ids:
+                        logger.info(
+                            f"[FACILITY MATCH]     SKIP {sub_label}: lg_type_id mismatch "
+                            f"request={request.lg_type_id} not in sub={sub.lg_type_ids}"
+                        )
                         continue
+                else:
+                    logger.info(f"[FACILITY MATCH]     WARN {sub_label}: lg_type_ids is empty/null — sub-limit accepts ALL types")
 
                 try:
                     # Filter: Country restrictions on sub-limit
@@ -934,20 +1168,32 @@ class IssuanceService:
                                 country_list_upper = [c.upper() for c in country_list]
                                 req_upper = req_country.upper().strip()
                                 if rule_type == 'ALLOW' and req_upper not in country_list_upper:
+                                    logger.info(
+                                        f"[FACILITY MATCH]     SKIP {sub_label}: country ALLOW filter reject "
+                                        f"req_country='{req_upper}' not in allowed={country_list_upper}"
+                                    )
                                     continue
                                 if rule_type == 'EXCLUDE' and req_upper in country_list_upper:
+                                    logger.info(
+                                        f"[FACILITY MATCH]     SKIP {sub_label}: country EXCLUDE filter reject "
+                                        f"req_country='{req_upper}' in excluded={country_list_upper}"
+                                    )
                                     continue
 
                     # Filter: Dedication — if sub-limit is earmarked for specific projects, only match those
                     if sub.dedicated_project_ids and isinstance(sub.dedicated_project_ids, list):
                         req_project_id = getattr(request, 'project_id', None)
                         if sub.dedicated_project_ids and req_project_id not in sub.dedicated_project_ids:
+                            logger.info(
+                                f"[FACILITY MATCH]     SKIP {sub_label}: dedication mismatch "
+                                f"req_project_id={req_project_id} not in {sub.dedicated_project_ids}"
+                            )
                             continue
 
                     # Calculate REAL Utilization (sub-limit level)
                     used_amount = db.query(func.coalesce(func.sum(IssuedLGRecord.current_amount), 0)).filter(
                         IssuedLGRecord.facility_sub_limit_id == sub.id,
-                        IssuedLGRecord.status.in_(["ACTIVE", "PENDING_CONFIRMATION"])
+                        IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING"])
                     ).scalar()
 
                     pending_exposure = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)).filter(
@@ -1189,6 +1435,15 @@ class IssuanceService:
                 detail=f"Only APPROVED_INTERNAL requests can be reserved. Current: {request.status}"
             )
 
+        # Subscription limit check — fail fast before locking any facility
+        from app.models import Customer as _CustomerModel
+        _customer = db.query(_CustomerModel).filter(_CustomerModel.id == request.customer_id).first()
+        if _customer and _customer.subscription_plan and _customer.active_issuance_lg_count >= _customer.subscription_plan.max_issuance_records:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Issuance LG limit ({_customer.subscription_plan.max_issuance_records}) exceeded for this customer's subscription plan. Cannot reserve a facility."
+            )
+
         # Verify sub-limit exists — WITH ROW LOCK (C7: prevents concurrent over-reservation)
         sub_limit = db.query(IssuanceFacilitySubLimit).filter(
             IssuanceFacilitySubLimit.id == sub_limit_id
@@ -1209,6 +1464,50 @@ class IssuanceService:
                 status_code=400,
                 detail="This facility is suspended due to FX breach. Contact your Corporate Admin."
             )
+
+        # --- DEFENSIVE VALIDATION: Re-check sub-limit constraints (prevents bypass) ---
+        # 1. LG Type check
+        if sub_limit.lg_type_ids:
+            request_lg_type_id = request.lg_type_id
+            # str-coerce both sides: JSONB may return strings OR ints depending on driver
+            str_sub_type_ids = [str(x) for x in sub_limit.lg_type_ids]
+            if request_lg_type_id and str(request_lg_type_id) not in str_sub_type_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This sub-limit does not support the requested LG type. "
+                           f"Allowed LG type IDs: {sub_limit.lg_type_ids}"
+                )
+
+        # 2. Country check (ALLOW / EXCLUDE mode)
+        if sub_limit.allowed_countries:
+            country_rule = sub_limit.allowed_countries
+            rule_type = country_rule.get("type", "ALLOW") if isinstance(country_rule, dict) else "ALLOW"
+            # Frontend saves key as 'list'; older records may use 'countries' — support both
+            country_list = country_rule.get("list", country_rule.get("countries", [])) if isinstance(country_rule, dict) else []
+            request_country = (request.beneficiary_country or "").upper()
+
+            if country_list and request_country:
+                upper_list = [c.upper() for c in country_list]
+                if rule_type == "ALLOW" and request_country not in upper_list:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Beneficiary country '{request_country}' is not in the allowed countries for this sub-limit."
+                    )
+                elif rule_type == "EXCLUDE" and request_country in upper_list:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Beneficiary country '{request_country}' is excluded from this sub-limit."
+                    )
+
+        # 3. Dedicated project check
+        if sub_limit.dedicated_project_ids:
+            request_project_id = getattr(request, 'project_id', None)
+            if request_project_id and request_project_id not in sub_limit.dedicated_project_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This sub-limit is dedicated to specific projects. "
+                           "The request's project does not match."
+                )
 
         # C1: Convert request amount to facility currency for capacity comparison
         from app.services.fx_service import fx_service
@@ -1492,8 +1791,11 @@ class IssuanceService:
         import logging
         logger = logging.getLogger(__name__)
 
-        # --- STEP 1: Fetch & Validate ---
-        request = crud_issuance_request.get(db, id=request_id)
+        # --- STEP 1: Fetch & Validate (with row-level lock to prevent concurrent issuance) ---
+        # Lock only the main table to avoid "FOR UPDATE cannot be applied to nullable outer join"
+        request = db.query(IssuanceRequest).filter(
+            IssuanceRequest.id == request_id
+        ).with_for_update(of=IssuanceRequest).first()
         if not request:
             raise HTTPException(status_code=404, detail="Request not found.")
 
@@ -1503,6 +1805,29 @@ class IssuanceService:
                 detail=f"Request must be APPROVED_INTERNAL or FACILITY_RESERVED before issuance. Current status: {request.status}"
             )
 
+        # Guard: prevent duplicate issuance if LG record already exists
+        if request.lg_record_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This request has already been issued (LG record #{request.lg_record_id}). Cannot issue again."
+            )
+        # Also check by request_id to catch orphaned records — but exclude failed/terminal LGs
+        # (SLA_EXCEEDED, BANK_REJECTED, CANCELLED are closed attempts — retry is allowed)
+        terminal_statuses = ("SLA_EXCEEDED", "BANK_REJECTED", "CANCELLED")
+        existing_lg = db.query(IssuedLGRecord).filter(
+            IssuedLGRecord.request_id == request_id,
+            IssuedLGRecord.status.notin_(terminal_statuses)
+        ).first()
+        if existing_lg:
+            # Auto-heal: link and mark as issued
+            request.lg_record_id = existing_lg.id
+            request.status = "LG_ISSUED"
+            db.flush()
+            raise HTTPException(
+                status_code=409,
+                detail=f"An active LG record already exists for this request (#{existing_lg.id}, status={existing_lg.status}). Request status has been corrected."
+            )
+
         already_reserved = request.status == "FACILITY_RESERVED"
         # If already reserved, use the stored sub_limit_id
         if already_reserved and not sub_limit_id:
@@ -1510,11 +1835,24 @@ class IssuanceService:
 
         # --- STEP 2: Atomic Lock (prevents double-click / concurrent execution) ---
         if request.locked_for_issuance:
-            raise HTTPException(
-                status_code=409,
-                detail="This request is currently being processed by another user. Please wait."
-            )
-        request.locked_for_issuance = True
+            # Check if this was pre-locked by the form endpoint for the same bank
+            meta = dict(request.metadata_json or {})
+            form_locked_bank = meta.get("locked_bank_id")
+            if form_locked_bank and bank_id and int(form_locked_bank) == int(bank_id):
+                # Form-endpoint lock for same bank → proceed (this is the expected flow)
+                pass
+            elif form_locked_bank and bank_id and int(form_locked_bank) != int(bank_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"This request is locked to bank #{form_locked_bank}. Cannot issue from a different bank."
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This request is currently being processed by another user. Please wait."
+                )
+        else:
+            request.locked_for_issuance = True
         db.flush()  # Push lock to DB immediately within this transaction
 
         try:
@@ -1630,8 +1968,17 @@ class IssuanceService:
             # --- STEP 5: Create IssuedLGRecord ---
             # D1: Copy ALL relevant fields from request → LG record (self-contained)
             # D2: issue_date = None (populated from bank reply, not at execution)
+            # Handle retry: if previous failed LGs exist for this request, append suffix
+            final_ref_number = issued_ref_number
+            previous_attempts = db.query(IssuedLGRecord).filter(
+                IssuedLGRecord.request_id == request_id,
+                IssuedLGRecord.status.in_(("SLA_EXCEEDED", "BANK_REJECTED", "CANCELLED"))
+            ).count()
+            if previous_attempts > 0:
+                final_ref_number = f"{issued_ref_number}-R{previous_attempts + 1}"
+
             new_lg_record = IssuedLGRecord(
-                lg_ref_number=issued_ref_number,
+                lg_ref_number=final_ref_number,
                 customer_id=request.customer_id,
                 facility_sub_limit_id=sub_limit_id,
                 bank_id=bank_id,
@@ -1645,7 +1992,7 @@ class IssuanceService:
                 issue_date=None,  # D2: Set to NULL — populated from bank reply
                 requested_issue_date=issue_date or request.requested_issue_date,
                 expiry_date=expiry_date or request.requested_expiry_date,
-                status="PENDING_CONFIRMATION",
+                status="INTERNAL_PROCESSING",
                 # Accountability
                 issued_by_user_id=user_id,
                 issuance_method=issuance_method,
@@ -1661,6 +2008,20 @@ class IssuanceService:
                 reference_type=getattr(request, 'reference_type', None),
                 lg_purpose=getattr(request, 'lg_purpose', None),
                 lg_payable_currency_id=getattr(request, 'payable_currency_id', None),
+                # D1 continued: newly migrated fields
+                operational_status=getattr(request, 'operational_status', None),
+                lg_language=getattr(request, 'lg_language', 'AR'),
+                reference_number=getattr(request, 'reference_number', None),
+                reference_amount=getattr(request, 'reference_amount', None),
+                reference_currency_id=getattr(request, 'reference_currency_id', None),
+                reference_start_date=getattr(request, 'reference_start_date', None),
+                reference_end_date=getattr(request, 'reference_end_date', None),
+                applicable_rules=getattr(request, 'applicable_rules', None),
+                is_auto_reducing=getattr(request, 'is_auto_reducing', False),
+                reduction_trigger=getattr(request, 'reduction_trigger', None),
+                beneficiary_contact_person=getattr(request, 'beneficiary_contact_person', None),
+                beneficiary_phone=getattr(request, 'beneficiary_phone', None),
+                beneficiary_email=getattr(request, 'beneficiary_email', None),
                 # D3: Manual pricing for no-facility LGs
                 manual_pricing=manual_pricing if not sub_limit_id else None,
             )
@@ -1678,7 +2039,7 @@ class IssuanceService:
                 logger.warning(f"Failed to generate internal serial: {e}. LG created without serial.")
 
             # --- STEP 6: Update Request ---
-            request.status = "PENDING_BANK_CONFIRMATION"
+            request.status = "INTERNAL_PROCESSING"
             request.lg_record_id = new_lg_record.id
             request.selected_sub_limit_id = sub_limit_id
             # Lock stays True until bank confirms or request is cancelled
@@ -1727,7 +2088,7 @@ class IssuanceService:
                     "currency_id": request.currency_id,
                     "issuance_method": issuance_method,
                     "status_before": "APPROVED_INTERNAL",
-                    "status_after": "PENDING_BANK_CONFIRMATION"
+                    "status_after": "INTERNAL_PROCESSING"
                 },
                 customer_id=request.customer_id
             )
@@ -1761,7 +2122,7 @@ class IssuanceService:
     ) -> IssuanceRequest:
         """
         Cancels a request and releases any facility reservation.
-        Allowed from: APPROVED_INTERNAL, PENDING_BANK_CONFIRMATION
+        Allowed from: APPROVED_INTERNAL, INTERNAL_PROCESSING
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -1770,7 +2131,7 @@ class IssuanceService:
         if not request:
             raise HTTPException(status_code=404, detail="Request not found.")
 
-        cancellable_statuses = ("APPROVED_INTERNAL", "PENDING_BANK_CONFIRMATION")
+        cancellable_statuses = ("APPROVED_INTERNAL", "INTERNAL_PROCESSING")
         if request.status not in cancellable_statuses:
             raise HTTPException(
                 status_code=400,
@@ -1789,7 +2150,7 @@ class IssuanceService:
         # Cancel the linked LG record if it exists
         if request.lg_record_id:
             lg_record = db.query(IssuedLGRecord).filter(IssuedLGRecord.id == request.lg_record_id).first()
-            if lg_record and lg_record.status == "PENDING_CONFIRMATION":
+            if lg_record and lg_record.status == "INTERNAL_PROCESSING":
                 lg_record.status = "CANCELLED"
             
             # Decrement active issuance count (was incremented at execution)
@@ -1816,12 +2177,199 @@ class IssuanceService:
             entity_id=request_id,
             details={
                 "reason": reason,
-                "status_before": "PENDING_BANK_CONFIRMATION" if request.lg_record_id else "APPROVED_INTERNAL",
+                "status_before": "INTERNAL_PROCESSING" if request.lg_record_id else "APPROVED_INTERNAL",
                 "reservations_released": len(active_entries),
                 "lg_record_cancelled": request.lg_record_id is not None
             },
             customer_id=request.customer_id
         )
+
+        return request
+
+
+    def request_cancellation(
+        self,
+        db: Session,
+        request_id: int,
+        user_id: int,
+        reason: str
+    ) -> IssuanceRequest:
+        """
+        End user or requestor submits a cancellation request (goes to admin for approval).
+        Allowed from: PENDING_APPROVAL, APPROVED_INTERNAL, FACILITY_RESERVED
+        """
+        request = crud_issuance_request.get(db, id=request_id)
+        if not request:
+            raise HTTPException(status_code=404, detail="Request not found.")
+
+        cancellable = ("PENDING_APPROVAL", "APPROVED_INTERNAL", "FACILITY_RESERVED")
+        if request.status not in cancellable:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot request cancellation in status '{request.status}'. Allowed: {cancellable}"
+            )
+
+        # Save previous status so we can restore on rejection
+        meta = request.metadata_json or {}
+        meta["pre_cancel_status"] = request.status
+        request.metadata_json = meta
+
+        request.status = "CANCELLATION_REQUESTED"
+        request.cancellation_reason = reason
+
+        # Audit chain entry
+        audit = request.approval_chain_audit or []
+        audit.append({
+            "action": "CANCELLATION_REQUESTED",
+            "user_id": user_id,
+            "reason": reason,
+            "previous_status": meta["pre_cancel_status"],
+            "timestamp": __import__('datetime').datetime.utcnow().isoformat()
+        })
+        request.approval_chain_audit = audit
+
+        db.commit()
+        db.refresh(request)
+
+        logger.info(f"Cancellation requested for request {request_id} by user {user_id}. Reason: {reason}")
+
+        # Audit log
+        log_action(
+            db, user_id=user_id,
+            action_type="CANCELLATION_REQUESTED",
+            entity_type="IssuanceRequest",
+            entity_id=request_id,
+            details={"reason": reason, "previous_status": meta["pre_cancel_status"]},
+            customer_id=request.customer_id
+        )
+
+        # Notify admins
+        try:
+            from app.schemas.all_schemas import SystemNotificationCreate
+            from app.crud.crud import crud_notification
+            _now = __import__('datetime').datetime.utcnow()
+            notif = SystemNotificationCreate(
+                content=f"Cancellation requested for {request.serial_number}: {reason}",
+                notification_type="CANCELLATION_REQUEST",
+                target_roles=["corporate_admin"],
+                target_customer_ids=[request.customer_id],
+                start_date=_now,
+                end_date=_now + __import__('datetime').timedelta(days=30),
+                link=f"/corporate-admin/issuance/requests"
+            )
+            crud_notification.create_notification(db, obj_in=notif)
+        except Exception as e:
+            logger.warning(f"Failed to create cancellation notification: {e}")
+
+        return request
+
+    def resolve_cancellation(
+        self,
+        db: Session,
+        request_id: int,
+        admin_user_id: int,
+        approved: bool,
+        note: str = None
+    ) -> IssuanceRequest:
+        """
+        Admin approves or rejects a cancellation request.
+        Approve → cancel the request (release reservations, etc.)
+        Reject  → restore previous status
+        """
+        request = crud_issuance_request.get(db, id=request_id)
+        if not request:
+            raise HTTPException(status_code=404, detail="Request not found.")
+
+        if request.status != "CANCELLATION_REQUESTED":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Request is not in CANCELLATION_REQUESTED status (current: {request.status})."
+            )
+
+        meta = request.metadata_json or {}
+        previous_status = meta.get("pre_cancel_status", "APPROVED_INTERNAL")
+
+        if approved:
+            # Release exposure reservations
+            active_entries = db.query(IssuanceExposureEntry).filter(
+                IssuanceExposureEntry.request_id == request_id,
+                IssuanceExposureEntry.is_active == True
+            ).all()
+            for entry in active_entries:
+                entry.is_active = False
+
+            # Cancel linked LG record if any
+            if request.lg_record_id:
+                lg_record = db.query(IssuedLGRecord).filter(
+                    IssuedLGRecord.id == request.lg_record_id
+                ).first()
+                if lg_record and lg_record.status == "INTERNAL_PROCESSING":
+                    lg_record.status = "CANCELLED"
+
+            request.status = "CANCELLED"
+            request.locked_for_issuance = False
+            action_type = "CANCELLATION_APPROVED"
+
+            logger.info(f"Cancellation APPROVED for request {request_id} by admin {admin_user_id}")
+        else:
+            # Reject — restore previous status
+            request.status = previous_status
+            request.cancellation_reason = None  # Clear the reason
+            action_type = "CANCELLATION_REJECTED"
+
+            logger.info(f"Cancellation REJECTED for request {request_id} by admin {admin_user_id}")
+
+        # Clean up metadata
+        meta.pop("pre_cancel_status", None)
+        request.metadata_json = meta
+
+        # Audit chain entry
+        audit = request.approval_chain_audit or []
+        audit.append({
+            "action": action_type,
+            "user_id": admin_user_id,
+            "note": note,
+            "previous_status": previous_status,
+            "timestamp": __import__('datetime').datetime.utcnow().isoformat()
+        })
+        request.approval_chain_audit = audit
+
+        db.commit()
+        db.refresh(request)
+
+        # Audit log
+        log_action(
+            db, user_id=admin_user_id,
+            action_type=action_type,
+            entity_type="IssuanceRequest",
+            entity_id=request_id,
+            details={
+                "approved": approved,
+                "note": note,
+                "cancellation_reason": request.cancellation_reason,
+                "previous_status": previous_status
+            },
+            customer_id=request.customer_id
+        )
+
+        # Notify the requestor
+        try:
+            from app.schemas.all_schemas import SystemNotificationCreate
+            from app.crud.crud import crud_notification
+            _now = __import__('datetime').datetime.utcnow()
+            status_word = "approved" if approved else "rejected"
+            notif = SystemNotificationCreate(
+                content=f"Your cancellation request for {request.serial_number} has been {status_word}." + (f" Note: {note}" if note else ""),
+                notification_type="CANCELLATION_RESOLVED",
+                target_user_ids=[request.requestor_user_id] if request.requestor_user_id else [],
+                target_customer_ids=[request.customer_id],
+                start_date=_now,
+                end_date=_now + __import__('datetime').timedelta(days=30),
+                link=f"/corporate-admin/issuance/requests"
+            )
+            crud_notification.create_notification(db, obj_in=notif)
+        except Exception as e:
+            logger.warning(f"Failed to create cancellation resolution notification: {e}")
 
         return request
 
@@ -1902,6 +2450,7 @@ class IssuanceService:
         customer_id: int,
         additional_text: str = "",
         use_special_wording: bool = False,
+        field_overrides: dict = None,
     ) -> Dict[str, Any]:
         """
         Generates a signed letter PDF for an issuance request.
@@ -1931,13 +2480,15 @@ class IssuanceService:
         if not request:
             raise HTTPException(status_code=404, detail="Issuance request not found.")
 
-        # 2. Resolve template: customer-specific first, then global
+        # 2. Resolve template: customer-specific first, then global (language-aware)
+        lg_lang = getattr(request, 'lg_language', 'EN') or 'EN'
         template = crud_template.get_single_template(
             db,
             action_type="LG_ISSUANCE_REQUEST",
             is_global=False,
             customer_id=customer_id,
             is_notification_template=False,
+            language=lg_lang,
         )
         if not template:
             template = crud_template.get_single_template(
@@ -1945,6 +2496,7 @@ class IssuanceService:
                 action_type="LG_ISSUANCE_REQUEST",
                 is_global=True,
                 is_notification_template=False,
+                language=lg_lang,
             )
         if not template:
             raise HTTPException(
@@ -2088,8 +2640,31 @@ class IssuanceService:
             "custom_field_2_value": request.custom_field_2_value or "",
         }
 
-        # 6. Fill template
+        # 5b. Apply user overrides from missing fields panel
+        if field_overrides:
+            for key, value in field_overrides.items():
+                if key in placeholder_data and value and str(value).strip():
+                    placeholder_data[key] = value
+
+        # 6. Fill template — process conditional blocks first, then placeholders
         generated_html = template.content
+
+        # 6a. Process {{#if key}}...{{/if}} conditional blocks
+        import re
+        def _process_conditionals(html, data):
+            pattern = r'\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}'
+            def replacer(match):
+                field_key = match.group(1)
+                inner_html = match.group(2)
+                val = str(data.get(field_key, '') or '').strip()
+                if val and val not in ('N/A', 'None', ''):
+                    return inner_html
+                return ''  # Strip entire block
+            return re.sub(pattern, replacer, html, flags=re.DOTALL)
+
+        generated_html = _process_conditionals(generated_html, placeholder_data)
+
+        # 6b. Replace {{key}} placeholders
         for key, value in placeholder_data.items():
             str_value = str(value) if value is not None else ""
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
@@ -2112,6 +2687,221 @@ class IssuanceService:
             "filename": f"LG_Issuance_Letter_{request.serial_number}.pdf",
             "template_name": template.name,
             "template_id": template.id,
+        }
+
+    def get_similarity_matches(
+        self,
+        db: Session,
+        customer_id: int,
+        reference_type: Optional[str] = None,
+        reference_number: Optional[str] = None,
+        beneficiary_name: Optional[str] = None,
+        amount: Optional[float] = None,
+        currency: Optional[str] = None,
+        lg_type_id: Optional[int] = None,
+        requested_expiry_date: Optional[date] = None,
+        exclude_request_id: Optional[int] = None
+    ) -> dict:
+        from app.models.models_issuance import IssuanceRequest, IssuedLGRecord
+        from difflib import SequenceMatcher
+        from datetime import datetime, timedelta
+        
+        cutoff = datetime.utcnow() - timedelta(days=365)
+        
+        # 1. Fetch Issued LGs
+        lg_query = db.query(IssuedLGRecord).filter(
+            IssuedLGRecord.customer_id == customer_id,
+            IssuedLGRecord.created_at >= cutoff
+        )
+        if exclude_request_id:
+            lg_query = lg_query.filter(IssuedLGRecord.request_id != exclude_request_id)
+        issued_lgs = lg_query.all()
+        
+        # 2. Fetch Active Requests (Pending / Approved)
+        req_query = db.query(IssuanceRequest).filter(
+            IssuanceRequest.customer_id == customer_id,
+            IssuanceRequest.created_at >= cutoff,
+            IssuanceRequest.status.notin_(["ISSUED", "REJECTED_INTERNAL", "REJECTED_BANK", "CANCELLED", "DRAFT"])
+        )
+        if exclude_request_id:
+            req_query = req_query.filter(IssuanceRequest.id != exclude_request_id)
+        active_requests = req_query.all()
+        
+        results = []
+        
+        # Create a unified list of items to compare against
+        compare_items = []
+        for lg in issued_lgs:
+            linked_req = None
+            if lg.request_id:
+                linked_req = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
+            
+            compare_items.append({
+                "type": "issued_lg",
+                "obj": lg,
+                "linked_req": linked_req,
+                "ref_num": lg.lg_ref_number,
+                "id": lg.id,
+                "ben_name": lg.beneficiary_name,
+                "amt": float(lg.current_amount) if lg.current_amount else 0.0,
+                "currency": lg.currency.iso_code if lg.currency else "",
+                "issue_date": lg.issue_date,
+                "expiry_date": lg.expiry_date,
+                "status": lg.status
+            })
+            
+        for req in active_requests:
+            # Skip if this request already birthed an LG that we are checking
+            if any(item["linked_req"] and item["linked_req"].id == req.id for item in compare_items):
+                continue
+                
+            compare_items.append({
+                "type": "request",
+                "obj": req,
+                "linked_req": req,
+                "ref_num": req.serial_number,
+                "id": req.id,
+                "ben_name": req.beneficiary_name,
+                "amt": float(req.amount) if req.amount else 0.0,
+                "currency": req.currency.iso_code if req.currency else "",
+                "issue_date": req.requested_issue_date,
+                "expiry_date": req.requested_expiry_date,
+                "status": f"PENDING ({req.status})"
+            })
+            
+        for item in compare_items:
+            score = 0.0
+            breakdown = {}
+            total_possible = 100.0
+            linked_req = item["linked_req"]
+            
+            # 1. Reference (10%)
+            if reference_type and reference_number:
+                if linked_req and linked_req.reference_type and linked_req.reference_number:
+                    if (linked_req.reference_type.lower().strip() == reference_type.lower().strip() and 
+                            linked_req.reference_number.lower().strip() == reference_number.lower().strip()):
+                        score += 10
+                        breakdown["reference"] = {"matched": True, "score": 10}
+                    else:
+                        breakdown["reference"] = {"matched": False, "score": 0}
+                else:
+                    # Historical record has no reference to compare against
+                    total_possible -= 10
+                    breakdown["reference"] = {"matched": None, "score": 0, "ignored": True}
+            else:
+                total_possible -= 10
+                breakdown["reference"] = {"matched": None, "score": 0, "ignored": True}
+                
+            # 2. Beneficiary (35%)
+            if beneficiary_name and item["ben_name"]:
+                ratio = SequenceMatcher(
+                    None, 
+                    str(beneficiary_name).lower().strip(),
+                    str(item["ben_name"]).lower().strip()
+                ).ratio()
+                if ratio >= 0.8:
+                    ns = round(ratio * 35, 1)
+                    score += ns
+                    breakdown["beneficiary"] = {"matched": True, "score": ns, "similarity": round(ratio * 100)}
+                else:
+                    breakdown["beneficiary"] = {"matched": False, "score": 0, "similarity": round(ratio * 100)}
+            else:
+                total_possible -= 35
+                breakdown["beneficiary"] = {"matched": None, "score": 0, "ignored": True}
+                
+            # 3. Amount & Currency (30%)
+            if amount and item["amt"]:
+                req_amt = float(amount)
+                item_amt = float(item["amt"])
+                
+                req_curr = currency.upper().strip() if currency else None
+                item_curr = str(item.get("currency", "")).upper().strip() if item.get("currency") else None
+                
+                # Check currency strict match if both are present
+                currency_match = True
+                if req_curr and item_curr and req_curr != item_curr:
+                    currency_match = False
+                
+                if req_amt > 0 and item_amt > 0 and currency_match:
+                    diff_pct = abs(req_amt - item_amt) / max(req_amt, item_amt)
+                    if diff_pct <= 0.05:
+                        ams = round((1 - diff_pct / 0.05) * 30, 1)
+                        score += ams
+                        breakdown["amount"] = {"matched": True, "score": ams, "lg_amount": str(item_amt)}
+                    else:
+                        breakdown["amount"] = {"matched": False, "score": 0, "lg_amount": str(item_amt)}
+                else:
+                    breakdown["amount"] = {"matched": False, "score": 0, "lg_amount": str(item_amt)}
+            else:
+                total_possible -= 30
+                breakdown["amount"] = {"matched": None, "score": 0, "ignored": True}
+                
+            # 4. LG Type (10%)
+            if lg_type_id and linked_req and hasattr(linked_req, 'lg_type_id') and linked_req.lg_type_id:
+                if int(lg_type_id) == int(linked_req.lg_type_id):
+                    score += 10
+                    breakdown["lg_type"] = {"matched": True, "score": 10}
+                else:
+                    breakdown["lg_type"] = {"matched": False, "score": 0}
+            else:
+                total_possible -= 10
+                breakdown["lg_type"] = {"matched": None, "score": 0, "ignored": True}
+                
+            # 5. Expiry (15%)
+            if requested_expiry_date and item["expiry_date"]:
+                req_exp = requested_expiry_date.date() if hasattr(requested_expiry_date, 'date') else requested_expiry_date
+                item_exp = item["expiry_date"].date() if hasattr(item["expiry_date"], 'date') else item["expiry_date"]
+                
+                delta_days = abs((req_exp - item_exp).days)
+                if delta_days <= 30:
+                    es = round((1 - delta_days / 30) * 15, 1)
+                    score += es
+                    breakdown["expiry"] = {"matched": True, "score": es, "days_diff": delta_days}
+                else:
+                    breakdown["expiry"] = {"matched": False, "score": 0, "days_diff": delta_days}
+            else:
+                total_possible -= 15
+                breakdown["expiry"] = {"matched": None, "score": 0, "ignored": True}
+                
+            if total_possible >= 65:
+                final_score = round((score / total_possible) * 100, 1)
+                
+                if final_score >= 70:
+                    exact_ref = False
+                    if (reference_type and reference_number and 
+                        linked_req and linked_req.reference_type and linked_req.reference_number and
+                        linked_req.reference_type.lower() == reference_type.lower() and 
+                        linked_req.reference_number.lower() == reference_number.lower()):
+                        exact_ref = True
+                    
+                    results.append({
+                        "lg_ref_number": item["ref_num"],
+                        "lg_id": item["id"] if item["type"] == "issued_lg" else None,
+                        "request_id": item["id"] if item["type"] == "request" else None,
+                        "match_type": item["type"],
+                        "beneficiary_name": item["ben_name"],
+                        "amount": str(item["amt"]),
+                        "currency": item.get("currency", ""),
+                        "issue_date": str(item["issue_date"]) if item["issue_date"] else None,
+                        "expiry_date": str(item["expiry_date"]) if item["expiry_date"] else None,
+                        "status": item["status"],
+                        "score": final_score,
+                        "breakdown": breakdown,
+                        "exact_ref": exact_ref,
+                        "recall_data": {
+                            "reference_amount": str(linked_req.reference_amount) if linked_req and hasattr(linked_req, 'reference_amount') and linked_req.reference_amount else None,
+                            "reference_currency_id": getattr(linked_req, 'reference_currency_id', None) if linked_req else None,
+                            "reference_start_date": str(linked_req.reference_start_date) if linked_req and hasattr(linked_req, 'reference_start_date') and linked_req.reference_start_date else None,
+                            "reference_end_date": str(linked_req.reference_end_date) if linked_req and hasattr(linked_req, 'reference_end_date') and linked_req.reference_end_date else None,
+                            "project_id": getattr(linked_req, 'project_id', None) if linked_req else None,
+                        } if exact_ref else None
+                    })
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return {
+            "found": len(results) > 0,
+            "matches": results,
+            "total_issued_compared": len(issued_lgs),
+            "total_requests_compared": len(active_requests)
         }
 
 issuance_service = IssuanceService()

@@ -1,0 +1,12 @@
+LETTER OF GUARANTEE — BANK ISSUED COPY (WITH DISCREPANCY)
+============================================================
+[PLACEHOLDER — Scanned LG Copy — Convert to PDF before use]
+
+LG Reference: HSBC-LG-2026-90042
+Issued by: HSBC
+Issue Date: April 5, 2026
+Expiry Date: January 1, 2029  <-- DISCREPANCY: System shows 2028-06-01
+Amount: USD 755,000           <-- DISCREPANCY: System shows USD 750,000
+Beneficiary: Egyptian Roads Authority
+
+[This is a discrepant copy — triggers discrepancy review in system]

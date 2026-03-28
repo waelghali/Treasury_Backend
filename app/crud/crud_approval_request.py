@@ -440,10 +440,14 @@ class CRUDApprovalRequest(CRUDBase):
         skip: int = 0,
         limit: int = 100,
         pending_only: bool = False, # <-- ADD this parameter to handle the special case of pending-only requests
+        approver_id: Optional[int] = None, # <-- NEW parameter to filter history by approver
     ) -> List[models.ApprovalRequest]:
         """
         Retrieves approval requests for a given customer, with optional status and action_type filters.
+        If approver_id is provided, returns all PENDING requests for the customer, but filters historical
+        (non-PENDING) requests to only those where the user acted as the checker.
         """
+        from sqlalchemy import or_
         # FIX: The `is_deleted` filter is removed from this method, as the ApprovalRequest model does not have this column.
         query = db.query(self.model).filter(
             self.model.customer_id == customer_id,
@@ -452,6 +456,15 @@ class CRUDApprovalRequest(CRUDBase):
         # New conditional logic to handle `pending_only` filter from the new endpoints
         if pending_only:
             query = query.filter(self.model.status == ApprovalRequestStatusEnum.PENDING)
+        elif approver_id is not None:
+            # If not pending_only, and we want user-specific history:
+            # Show PENDING requests so they can act on them, PLUS history they approved/rejected
+            query = query.filter(
+                or_(
+                    self.model.status == ApprovalRequestStatusEnum.PENDING,
+                    self.model.checker_user_id == approver_id
+                )
+            )
 
         if status_filter:
             # FIX: Check if status_filter is a list and use the appropriate operator
@@ -790,6 +803,27 @@ class CRUDApprovalRequest(CRUDBase):
                 generated_instruction_id = canceled_instruction.id
                 
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_cancellation.cancel_instruction call completed.")
+
+            elif db_request.entity_type == "IssuedLGRecord" and db_request.action_type == "ISSUANCE_CHANGE_REQUESTOR":
+                logger.debug(f"Approval Request {db_request.id}: Detected 'ISSUANCE_CHANGE_REQUESTOR' action. Calling execute_force_handover.")
+                
+                request_details = db_request.request_details or {}
+                lg_ids = request_details.get("lg_ids", [])
+                new_requestor_data = request_details.get("new_requestor")
+                
+                if not lg_ids or not new_requestor_data:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing lg_ids or new_requestor in request_details.")
+                    
+                from app.schemas.schemas_issuance import RequestorProfile
+                from app.crud.crud_issuance_owner import execute_force_handover
+                profile = RequestorProfile(**new_requestor_data)
+                
+                execute_force_handover(
+                    db, customer_id=customer_id, lg_ids=lg_ids, new_profile=profile, user_id=db_request.maker_user_id
+                )
+                
+                generated_instruction_id = None
+                logger.debug(f"Approval Request {db_request.id}: crud_issuance_owner.execute_force_handover calls completed.")
 
             else:
                 logger.warning(f"Approval Request {db_request.id}: Action type '{db_request.action_type}' not recognized for entity type '{db_request.entity_type}'. No underlying action executed.")

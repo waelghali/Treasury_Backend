@@ -149,24 +149,43 @@ class CRUDTemplate(CRUDBase):
         return query.first()
 
     def get_single_template(
-        self, db: Session, action_type: str, is_global: bool, customer_id: Optional[int] = None, is_notification_template: bool = False
+        self, db: Session, action_type: str, is_global: bool, customer_id: Optional[int] = None, is_notification_template: bool = False, language: Optional[str] = None
     ) -> Optional[Template]:
-        query = db.query(self.model).filter(
+        base_query = db.query(self.model).filter(
             self.model.action_type == action_type,
             self.model.is_global == is_global,
             self.model.is_notification_template == is_notification_template,
             self.model.is_deleted == False,
         )
         if is_global:
-            query = query.filter(self.model.customer_id.is_(None))
+            base_query = base_query.filter(self.model.customer_id.is_(None))
         else:
-            query = query.filter(self.model.customer_id == customer_id)
+            base_query = base_query.filter(self.model.customer_id == customer_id)
 
-        default_template = query.filter(self.model.is_default == True).first()
+        # Try exact language match first
+        if language:
+            lang_query = base_query.filter(self.model.language == language)
+            default_template = lang_query.filter(self.model.is_default == True).first()
+            if default_template:
+                return default_template
+            any_lang = lang_query.first()
+            if any_lang:
+                return any_lang
+
+        # Fallback: EN templates
+        en_query = base_query.filter(self.model.language.in_(('EN', None)))
+        default_template = en_query.filter(self.model.is_default == True).first()
         if default_template:
             return default_template
-        
-        return query.first()
+        any_en = en_query.first()
+        if any_en:
+            return any_en
+
+        # Last resort: any language
+        default_template = base_query.filter(self.model.is_default == True).first()
+        if default_template:
+            return default_template
+        return base_query.first()
         
     def get_all_by_action_type(
         self, db: Session, action_type: Optional[str] = None, customer_id: Optional[int] = None, skip: int = 0, limit: int = 100, is_notification_template: Optional[bool] = None

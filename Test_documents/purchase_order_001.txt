@@ -1,0 +1,14 @@
+PURCHASE ORDER — PO-SUPPLY-2026-088
+======================================
+[PLACEHOLDER — Convert to PDF before use]
+
+PO Number: PO-SUPPLY-2026-088
+Buyer: Grow Engineering LLC
+Supplier: Delta Industrial Supplies Co., 10th of Ramadan Industrial City
+
+Items: Mechanical Pumping Systems — 12 units
+Total PO Value: EGP 5,000,000
+Advance Payment: 30% = EGP 1,500,000 (requires Advance Payment LG)
+Delivery: December 2026
+
+Advance Payment LG Required by Supplier — Expiry: December 31, 2026

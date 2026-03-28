@@ -1,0 +1,18 @@
+BANK CONFIRMATION LETTER
+==========================
+[PLACEHOLDER — Convert to PDF before use]
+
+From: HSBC Egypt — Trade Finance Department
+To: Grow Engineering LLC — Treasury
+Date: April 5, 2026
+Re: Issuance Confirmation — LG Ref HSBC-LG-2026-90041
+
+We confirm issuance of the Letter of Guarantee with the following details:
+LG Number: HSBC-LG-2026-90041
+Amount: USD 400,000
+Issue Date: April 5, 2026
+Expiry Date: December 31, 2027
+Beneficiary: Cairo Transport Authority
+
+The original LG has been forwarded to the beneficiary directly.
+Please collect the bank-certified copy within 3 business days.
