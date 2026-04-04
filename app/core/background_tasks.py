@@ -1365,7 +1365,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
 # 12. DAILY SLA BREACH ALERTS (Issuance requests delivered to bank but unfulfilled)
 # ==============================================================================
 
-def run_daily_sla_breach_alerts():
+async def run_daily_sla_breach_alerts(db: Session):
     """
     Checks for IssuedLGRecords that have been delivered to the bank
     (status=DELIVERED_TO_BANK) but have no bank_reply_type yet.
@@ -1373,7 +1373,6 @@ def run_daily_sla_breach_alerts():
     sends email + in-app notification to end users and corporate admins.
     """
     logger.info("--- STARTING: Daily SLA Breach Alerts ---")
-    db = SessionLocal()
 
     try:
         from app.models.models_issuance import (
@@ -1474,7 +1473,7 @@ def run_daily_sla_breach_alerts():
                 </html>
                 """
 
-                send_email(db, recipient_emails, subject, body, {}, email_settings)
+                await send_email(db, recipient_emails, subject, body, {}, email_settings)
 
                 # In-App Notifications
                 for user_id in recipient_ids:
@@ -1482,10 +1481,9 @@ def run_daily_sla_breach_alerts():
                         start_dt = datetime.now()
                         end_dt = start_dt + timedelta(days=1)
                         notif = SystemNotificationCreate(
-                            title=f"⚠️ SLA Breach: {b['ref']}",
-                            message=f"Bank has not responded for {b['elapsed_days']} days (SLA: {b['sla_days']} days). Please follow up.",
-                            type="WARNING",
-                            module="ISSUANCE",
+                            content=f"⚠️ SLA Breach: {b['ref']} — Bank has not responded for {b['elapsed_days']} days (SLA: {b['sla_days']} days). Please follow up.",
+                            notification_type="SLA_BREACH",
+                            link=f"/issuance/issued-lgs/{b['lg'].id}",
                             start_date=start_dt,
                             end_date=end_dt,
                             target_user_ids=[user_id],
@@ -1512,8 +1510,6 @@ def run_daily_sla_breach_alerts():
 
     except Exception as e:
         logger.error(f"Fatal error in SLA breach alerts: {e}", exc_info=True)
-    finally:
-        db.close()
 
     logger.info("--- FINISHED: Daily SLA Breach Alerts ---")
 
@@ -2111,6 +2107,7 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
                 if cfg_r and cfg_r.get("effective_value"):
                     d_remind = int(cfg_r["effective_value"])
             except Exception:
+                db.rollback()
                 pass
             try:
                 cfg_e = crud_customer_configuration.get_customer_config_or_global_fallback(
@@ -2119,6 +2116,7 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
                 if cfg_e and cfg_e.get("effective_value"):
                     d_escalate = int(cfg_e["effective_value"])
             except Exception:
+                db.rollback()
                 pass
 
             if d_remind >= d_escalate:
@@ -2135,6 +2133,7 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
                 IssuanceMaintenanceAction.status == "EXECUTED",
                 IssuanceMaintenanceAction.instruction_status == "Instruction Issued",
                 IssuanceMaintenanceAction.is_printed == False,
+                IssuanceMaintenanceAction.is_deleted == False,
             ).all()
 
             if not actions:
@@ -2242,6 +2241,7 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
                         db.flush()
 
                 except Exception as action_err:
+                    db.rollback()
                     logger.error(f"Error processing reminder for action {action.id}: {action_err}", exc_info=True)
 
         except Exception as e:
@@ -2268,7 +2268,8 @@ async def run_daily_issuance_approval_timeout(db: Session):
     from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
 
     # Get max pending days config
-    max_pending_config = crud_instances.crud_global_configuration.get_by_key(
+    from app.crud.crud import crud_global_configuration
+    max_pending_config = crud_global_configuration.get_by_key(
         db, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS
     )
     if not max_pending_config or not max_pending_config.value_default:

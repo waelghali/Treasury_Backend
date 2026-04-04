@@ -212,12 +212,12 @@ async def submit_request_for_approval(
     
     # --- Notification (matching corporate_admin.py create_user pattern exactly) ---
     if result.status == "PENDING_APPROVAL" and result.pending_approver_users:
-        from app.core.email_service import send_email, get_global_email_settings
+        from app.core.email_service import send_email, get_customer_email_settings
         from app.services.issuance_notifications import _get_user_emails
         from app.models import User
         import os
         
-        email_settings = get_global_email_settings()
+        email_settings, _ = get_customer_email_settings(db, result.customer_id)
         submitter = db.query(User).filter(User.id == current_user.user_id).first()
         currency = result.currency.iso_code if result.currency else "N/A"
         approver_ids = [int(uid) for uid in result.pending_approver_users]

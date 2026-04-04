@@ -1,0 +1,106 @@
+{
+  "summary": {
+    "pass": 13,
+    "fail": 1,
+    "warn": 2
+  },
+  "results": [
+    {
+      "id": "1.0",
+      "name": "Backend health check",
+      "status": "PASS",
+      "detail": "{\"message\":\"Treasury Management Platform API is running!\"}"
+    },
+    {
+      "id": "1.10",
+      "name": "Environment variables (indirect check)",
+      "status": "PASS",
+      "detail": "Backend started successfully = GCP_PROJECT_ID, GCS_BUCKET_NAME are set"
+    },
+    {
+      "id": "2.21",
+      "name": "AI Doc Verification - Happy Path",
+      "status": "PASS",
+      "detail": "status=OK, fields=7, mismatches=5"
+    },
+    {
+      "id": "2.22",
+      "name": "File > 2MB rejected",
+      "status": "PASS",
+      "detail": "Document is too large for AI analysis (3.0 MB). Maximum is 2 MB."
+    },
+    {
+      "id": "2.6",
+      "name": "MISMATCH/COULD_NOT_VALIDATE verdicts",
+      "status": "PASS",
+      "detail": "mismatches=5, could_not_validate=1, fields=7"
+    },
+    {
+      "id": "15.2",
+      "name": "Corrupt PDF (no server crash)",
+      "status": "PASS",
+      "detail": "HTTP 200, status=ERROR"
+    },
+    {
+      "id": "3.1",
+      "name": "Matched LG verification",
+      "status": "FAIL",
+      "detail": "HTTP 400: {\"detail\":\"Cannot verify \u2014 current status: MATCHED\"}"
+    },
+    {
+      "id": "3.2",
+      "name": "Amount discrepancy detection",
+      "status": "PASS",
+      "detail": "status=DISCREPANCY, discrepancies=1"
+    },
+    {
+      "id": "3.8",
+      "name": "Force accept (admin)",
+      "status": "WARN",
+      "detail": "HTTP 400: {\"detail\":\"Cannot verify \u2014 current status: ACCEPTED\"}"
+    },
+    {
+      "id": "8.1",
+      "name": "Facility agreement AI analysis",
+      "status": "PASS",
+      "detail": "status=OK, fields_compared=5, mismatches=5"
+    },
+    {
+      "id": "11.1",
+      "name": "AI usage log entries exist",
+      "status": "PASS",
+      "detail": "29 |           1 |       2 | [facility_agreement_analysis] facility_agreement_bank_A.pdf     | publishers/google/models/gemini-2.5-flash |          1572 |               323\n 28 |           1 |       2 | [document_verification] [doc_verify] contract_metro_project.pdf | publishers/google/models/gemini-2.5-flash |           923 |               722\n 27 |           1 |       2 | [document_verification]"
+    },
+    {
+      "id": "11.3",
+      "name": "Model name captured (gemini)",
+      "status": "PASS",
+      "detail": "gemini found"
+    },
+    {
+      "id": "11.4",
+      "name": "Token counts recorded",
+      "status": "PASS",
+      "detail": "Token columns present"
+    },
+    {
+      "id": "2.23",
+      "name": "AI result persisted on document",
+      "status": "WARN",
+      "detail": "No documents found for request 112"
+    },
+    {
+      "id": "7.x",
+      "name": "Maintenance actions exist for testing",
+      "status": "PASS",
+      "detail": "26 | EXTEND      | PENDING_APPROVAL | \n 25 | AMENDMENT   | PENDING_APPROVAL | \n 24 | EXTEND      | PENDING_APPROVAL |"
+    },
+    {
+      "id": "15.6",
+      "name": "Unsupported file type (no crash)",
+      "status": "PASS",
+      "detail": "HTTP 200, response={\"status\":\"NO_TEXT\",\"message\":\"Could not extract text from document. Submission will proceed without verification.\"}"
+    }
+  ],
+  "timestamp": "2026-03-30 20:16:56"
+}

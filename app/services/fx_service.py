@@ -231,19 +231,16 @@ class FxService:
 
     def _ask_ai_for_rate(self, from_code: str, to_code: str) -> Tuple[Optional[Decimal], int]:
         """
-        Call Gemini to get the latest closing rate.
+        Call Gemini (via Vertex AI) to get the latest closing rate.
         Returns (rate, tokens_used) or (None, 0).
         """
-        import google.generativeai as genai
-        import json, os
+        import json
+        from app.core.ai_integration import _get_genai_client, GEMINI_MODEL_NAME
 
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            logger.warning("FX AI: GEMINI_API_KEY not set — skipping AI tier")
+        client = _get_genai_client()
+        if not client:
+            logger.warning("FX AI: GenAI client not available -- skipping AI tier")
             return None, 0
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
 
         prompt = (
             f"What is the latest market closing exchange rate for converting "
@@ -254,7 +251,9 @@ class FxService:
         )
 
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME, contents=prompt
+            )
             raw_text = response.text.strip()
 
             # Clean markdown fences if present

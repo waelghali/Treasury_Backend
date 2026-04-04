@@ -519,8 +519,9 @@ def create_user(
 
         db_user = crud_user.create_user_by_corporate_admin(db, user_in, customer_id, corporate_admin_context.user_id)
         
-        # FIX: Use global email settings, similar to the public registration endpoint
-        email_settings = get_global_email_settings()
+        # Use customer-specific email settings (falls back to global if not configured)
+        from app.core.email_service import get_customer_email_settings as _get_cust_email
+        email_settings, _email_source = _get_cust_email(db, customer_id)
         
         welcome_subject = f"Welcome to the Platform, {db_user.email}!"
         user_name = db_user.email 
@@ -972,6 +973,7 @@ def update_customer_configuration(
     """
     Updates or Creates a customer configuration. Uses a robust lookup mechanism 
     to handle newly added ENUM keys that may cause ORM issues.
+    Multi-admin: requires dual-control approval via AdminChangeRequest.
     """
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
@@ -996,11 +998,7 @@ def update_customer_configuration(
             # If the key is not found in the GLOBAL table, it's a true 404.
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Global configuration key not found.")
 
-        # 3. CRITICAL FIX: Upsert the customer configuration record
-        # We need a new CRUD method that handles both CREATE (for new keys) and UPDATE (for old keys)
-        # Assuming you implemented the 'set_customer_config' Upsert logic from the previous step.
-        
-        # --- VALIDATION: Check Bucket Access ---
+        # 3. --- VALIDATION: Check Bucket Access ---
         if global_config_key == GlobalConfigKey.STORAGE_BUCKET_NAME:
             # Run the async check synchronously since this endpoint is synchronous
             has_access = asyncio.run(_check_bucket_access(config_in.configured_value))
@@ -1010,41 +1008,69 @@ def update_customer_configuration(
                     detail=f"Access Denied: The system cannot access the bucket '{config_in.configured_value}'. Please ensure the Service Account has 'Storage Object Admin' permissions."
                 )
         # ---------------------------------------
-        
-        db_customer_config = crud_customer_configuration.set_customer_config(
-            db, 
-            customer_id=customer_id, 
-            global_config_id=global_config.id,
-            configured_value=config_in.configured_value,
-            user_id=corporate_admin_context.user_id
+
+        # 4. Capture old value for audit
+        existing_customer_config = crud_customer_configuration.get_by_customer_and_global_config_id(
+            db, customer_id=customer_id, global_config_id=global_config.id
         )
-        
-        # 4. Build the response data exactly as originally intended.
-        response_data = CustomerConfigurationOut(
-            id=db_customer_config.id,
-            customer_id=db_customer_config.customer_id,
-            global_config_id=db_customer_config.global_config_id,
-            configured_value=db_customer_config.configured_value,
-            
-            # These values come from the relationship to global_configuration
-            # Note: We must still rely on the relationship to populate these fields.
-            global_config_key=db_customer_config.global_configuration.key.value,
-            effective_value=db_customer_config.configured_value,
-            global_value_default=db_customer_config.global_configuration.value_default,
-            global_value_min=db_customer_config.global_configuration.value_min,
-            global_value_max=db_customer_config.global_configuration.value_max,
-            unit=db_customer_config.global_configuration.unit,
-            description=db_customer_config.global_configuration.description,
-            
-            created_at=db_customer_config.created_at,
-            updated_at=db_customer_config.updated_at,
-            is_deleted=db_customer_config.is_deleted,
-            deleted_at=db_customer_config.deleted_at
+        old_value = existing_customer_config.configured_value if existing_customer_config else global_config.value_default
+
+        # 5. Use dual-control governance
+        from app.core.governance import create_governed_change
+        from app.api.v1.endpoints.issuance.base import _apply_admin_change
+
+        change_payload = {
+            "global_config_key": key_for_db,
+            "global_config_id": global_config.id,
+            "configured_value": config_in.configured_value,
+            "old_value": old_value,
+        }
+
+        change_req, auto_approved = create_governed_change(
+            db, customer_id, corporate_admin_context.user_id,
+            "CUSTOMER_CONFIG_UPDATE", change_payload,
+            apply_fn=_apply_admin_change,
         )
-        
-        return response_data
+
+        if auto_approved:
+            # Single-admin: already applied — reload and return the config
+            db_customer_config = crud_customer_configuration.get_by_customer_and_global_config_id(
+                db, customer_id=customer_id, global_config_id=global_config.id
+            )
+
+            response_data = CustomerConfigurationOut(
+                id=db_customer_config.id,
+                customer_id=db_customer_config.customer_id,
+                global_config_id=db_customer_config.global_config_id,
+                configured_value=db_customer_config.configured_value,
+                global_config_key=db_customer_config.global_configuration.key.value,
+                effective_value=db_customer_config.configured_value,
+                global_value_default=db_customer_config.global_configuration.value_default,
+                global_value_min=db_customer_config.global_configuration.value_min,
+                global_value_max=db_customer_config.global_configuration.value_max,
+                unit=db_customer_config.global_configuration.unit,
+                description=db_customer_config.global_configuration.description,
+                created_at=db_customer_config.created_at,
+                updated_at=db_customer_config.updated_at,
+                is_deleted=db_customer_config.is_deleted,
+                deleted_at=db_customer_config.deleted_at
+            )
+            return response_data
+
+        # Multi-admin: return 202 — change is pending approval
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Configuration change submitted for approval by a second administrator.",
+                "change_request_id": change_req.id,
+                "status": "PENDING",
+                "config_key": key_for_db,
+                "new_value": config_in.configured_value,
+            }
+        )
     
-    # 5. Log and Handle Exceptions
+    # 6. Log and Handle Exceptions
     except ValueError as e:
         # This catches failure to instantiate GlobalConfigKey for new keys if constants.py is stale
         log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerConfiguration", entity_id=None, details={"key": global_config_key, "customer_id": customer_id, "reason": f"Key not recognized by Python Enum: {e}"}, customer_id=customer_id, ip_address=client_host)
@@ -1071,40 +1097,74 @@ def create_customer_email_settings(
     customer_id = corporate_admin_context.customer_id
 
     try:
-        # NEW LOGIC: Check for existing settings first, including soft-deleted ones.
+        from app.core.encryption import encrypt_data
+        from app.models import CustomerEmailSetting
+
+        # 1. Check for existing settings (including soft-deleted)
         existing_settings = db.query(CustomerEmailSetting).filter(
             CustomerEmailSetting.customer_id == customer_id
         ).first()
 
+        # 2. Apply password immediately (encrypt and store on the record)
         if existing_settings:
-            # If a record already exists (even if deleted), update it instead of creating a new one.
-            settings_update_payload = CustomerEmailSettingUpdate(
+            existing_settings.smtp_password_encrypted = encrypt_data(settings_in.smtp_password)
+            existing_settings.is_deleted = False
+            db.add(existing_settings)
+            db.flush()
+        else:
+            # Create a stub record with just the encrypted password
+            existing_settings = CustomerEmailSetting(
+                customer_id=customer_id,
                 smtp_host=settings_in.smtp_host,
                 smtp_port=settings_in.smtp_port,
                 smtp_username=settings_in.smtp_username,
-                smtp_password=settings_in.smtp_password,
+                smtp_password_encrypted=encrypt_data(settings_in.smtp_password),
                 sender_email=settings_in.sender_email,
                 sender_display_name=settings_in.sender_display_name,
                 is_active=settings_in.is_active,
             )
-            
-            # Use the update method and explicitly set is_deleted to False to restore it
-            db_settings = crud_customer_email_setting.update(db, existing_settings, settings_update_payload, corporate_admin_context.user_id)
-            db_settings.is_deleted = False # Restore the soft-deleted record
-            db.add(db_settings)
-            
-            # The update method handles flushing and logging internally.
-            # We explicitly commit here to finalize the transaction for this endpoint.
-            db.commit()
-            db.refresh(db_settings)
-            
-            return db_settings
-        else:
-            # If no settings exist at all, proceed with a new creation.
-            db_settings = crud_customer_email_setting.create(db, settings_in, customer_id, corporate_admin_context.user_id)
-            db.commit()
-            db.refresh(db_settings)
-            return db_settings
+            db.add(existing_settings)
+            db.flush()
+
+        # 3. Build non-password fields for governance
+        non_password_values = {
+            "smtp_host": settings_in.smtp_host,
+            "smtp_port": settings_in.smtp_port,
+            "smtp_username": settings_in.smtp_username,
+            "sender_email": settings_in.sender_email,
+            "sender_display_name": settings_in.sender_display_name,
+            "is_active": settings_in.is_active,
+        }
+
+        # 4. Dual-control governance
+        from app.core.governance import create_governed_change
+        from app.api.v1.endpoints.issuance.base import _apply_admin_change
+
+        change_payload = {
+            "setting_id": existing_settings.id,
+            "new_value": non_password_values,
+        }
+
+        change_req, auto_approved = create_governed_change(
+            db, customer_id, corporate_admin_context.user_id,
+            "EMAIL_SETTINGS_CREATE", change_payload,
+            apply_fn=_apply_admin_change,
+        )
+
+        if auto_approved:
+            db.refresh(existing_settings)
+            return existing_settings
+
+        # Multi-admin: return 202
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Email settings creation submitted for approval by a second administrator. Password has been securely stored.",
+                "change_request_id": change_req.id,
+                "status": "PENDING",
+            }
+        )
     except HTTPException as e:
         log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE/UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=None, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
@@ -1144,9 +1204,66 @@ def update_customer_email_settings(
         db_settings = crud_customer_email_setting.get(db, setting_id)
         if not db_settings or db_settings.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email settings not found or do not belong to your customer.")
-        
-        updated_settings = crud_customer_email_setting.update(db, db_settings, settings_in, corporate_admin_context.user_id)
-        return updated_settings
+
+        update_data = settings_in.model_dump(exclude_unset=True)
+
+        # 1. Password is ALWAYS applied immediately (never stored in change_payload)
+        if "smtp_password" in update_data and update_data["smtp_password"] is not None:
+            from app.core.encryption import encrypt_data
+            db_settings.smtp_password_encrypted = encrypt_data(update_data["smtp_password"])
+            db.add(db_settings)
+            db.flush()
+            del update_data["smtp_password"]
+
+        # 2. Collect non-password fields that changed
+        non_password_fields = ("smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active")
+        changed_fields = {}
+        old_fields = {}
+        for field in non_password_fields:
+            if field in update_data:
+                old_val = getattr(db_settings, field, None)
+                new_val = update_data[field]
+                if old_val != new_val:
+                    changed_fields[field] = new_val
+                    old_fields[field] = old_val
+
+        # 3. If no non-password changes, return current settings (password was already applied)
+        if not changed_fields:
+            db.commit()
+            db.refresh(db_settings)
+            return db_settings
+
+        # 4. Dual-control governance for non-password fields
+        from app.core.governance import create_governed_change
+        from app.api.v1.endpoints.issuance.base import _apply_admin_change
+
+        change_payload = {
+            "setting_id": setting_id,
+            "new_value": changed_fields,
+            "old_value": old_fields,
+        }
+
+        change_req, auto_approved = create_governed_change(
+            db, customer_id, corporate_admin_context.user_id,
+            "EMAIL_SETTINGS_UPDATE", change_payload,
+            apply_fn=_apply_admin_change,
+        )
+
+        if auto_approved:
+            db.refresh(db_settings)
+            return db_settings
+
+        # Multi-admin: return 202
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Email settings change submitted for approval by a second administrator.",
+                "change_request_id": change_req.id,
+                "status": "PENDING",
+                "changed_fields": list(changed_fields.keys()),
+            }
+        )
     except HTTPException as e:
         log_action(db, user_id=corporate_admin_context.user_id, action_type="UPDATE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise
@@ -1171,9 +1288,36 @@ def delete_customer_email_settings(
         db_settings = crud_customer_email_setting.get(db, setting_id)
         if not db_settings or db_settings.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email settings not found or do not belong to your customer.")
-        
-        deleted_settings = crud_customer_email_setting.soft_delete(db, db_settings, corporate_admin_context.user_id)
-        return deleted_settings
+
+        # Dual-control governance for deleting email settings
+        from app.core.governance import create_governed_change
+        from app.api.v1.endpoints.issuance.base import _apply_admin_change
+
+        change_payload = {
+            "setting_id": setting_id,
+            "sender_email": db_settings.sender_email,
+        }
+
+        change_req, auto_approved = create_governed_change(
+            db, customer_id, corporate_admin_context.user_id,
+            "EMAIL_SETTINGS_DELETE", change_payload,
+            apply_fn=_apply_admin_change,
+        )
+
+        if auto_approved:
+            db.refresh(db_settings)
+            return db_settings
+
+        # Multi-admin: return 202
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Email settings deletion submitted for approval by a second administrator.",
+                "change_request_id": change_req.id,
+                "status": "PENDING",
+            }
+        )
     except HTTPException as e:
         log_action(db, user_id=corporate_admin_context.user_id, action_type="SOFT_DELETE_FAILED", entity_type="CustomerEmailSetting", entity_id=setting_id, details={"customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
         raise

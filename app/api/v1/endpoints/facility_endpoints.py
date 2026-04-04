@@ -161,7 +161,7 @@ async def analyze_facility_agreement_endpoint(
     Extracts key terms and compares against current facility fields.
     This is ADVISORY only — it highlights potential gaps, never blocks.
     """
-    from app.core.ai_integration import analyze_facility_agreement, AI_DOC_MAX_SIZE_BYTES
+    from app.core.ai_integration import analyze_facility_agreement, FACILITY_DOC_MAX_SIZE_BYTES
     from app.models.models_issuance import IssuanceFacility
 
     # Validate facility
@@ -177,7 +177,7 @@ async def analyze_facility_agreement_endpoint(
     pdf_bytes = await file.read()
 
     # File size guard (friendly message, not an error)
-    if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
+    if len(pdf_bytes) > FACILITY_DOC_MAX_SIZE_BYTES:
         return {
             "status": "TOO_LARGE",
             "message": f"Document is too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Maximum is 5 MB.",

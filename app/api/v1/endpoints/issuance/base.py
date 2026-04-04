@@ -329,7 +329,7 @@ async def record_handover(
     if current_user.role not in (UserRole.END_USER, UserRole.END_USER.value):
         raise HTTPException(status_code=403, detail="Only treasury end users can record handover.")
     from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
-    from app.core.email_service import send_email, get_global_email_settings
+    from app.core.email_service import send_email, get_customer_email_settings
     from app.crud import crud_customer_configuration
     from app.constants import GlobalConfigKey
     from datetime import date as date_type, datetime
@@ -432,7 +432,7 @@ async def record_handover(
 
     # --- Send email notifications ---
     orig_request = db.query(IssuanceRequest).get(lg.request_id) if lg.request_id else None
-    email_settings = get_global_email_settings()
+    email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
     # Collect all email recipients
@@ -497,10 +497,16 @@ async def record_handover(
 # --- Helper: Send requestor status notification ---
 def _send_requestor_status_notification(db, background_tasks, request, event_type, lg=None):
     """Send email to requestor about status change. Covers both approval and post-issuance events."""
-    from app.core.email_service import send_email, get_global_email_settings
+    from app.core.email_service import send_email, get_customer_email_settings
     import os
 
-    email_settings = get_global_email_settings()
+    # Derive customer_id from the request or lg object
+    customer_id = getattr(request, 'customer_id', None) or (getattr(lg, 'customer_id', None) if lg else None)
+    if customer_id:
+        email_settings, _ = get_customer_email_settings(db, customer_id)
+    else:
+        from app.core.email_service import get_global_email_settings
+        email_settings = get_global_email_settings()
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
     # Bank reply / post-issuance events (require lg)
@@ -1277,6 +1283,59 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
         if grp and grp.customer_id == change_req.customer_id:
             update_data = ApprovalGroupUpdate(**payload.get("new_value", {}))
             crud_approval_group.update_group(db, grp, update_data, change_req.requested_by_user_id)
+
+    elif ct == "CUSTOMER_CONFIG_UPDATE":
+        from app.crud.crud import crud_customer_configuration
+        crud_customer_configuration.set_customer_config(
+            db,
+            customer_id=change_req.customer_id,
+            global_config_id=payload.get("global_config_id"),
+            configured_value=payload.get("configured_value"),
+            user_id=change_req.requested_by_user_id,
+        )
+
+    elif ct == "EMAIL_SETTINGS_UPDATE":
+        from app.crud.crud import crud_customer_email_setting
+        db_settings = crud_customer_email_setting.get(db, payload.get("setting_id"))
+        if db_settings and db_settings.customer_id == change_req.customer_id:
+            # Apply only non-password fields (password was applied immediately at request time)
+            for field in ("smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active"):
+                if field in payload.get("new_value", {}):
+                    setattr(db_settings, field, payload["new_value"][field])
+            db.add(db_settings)
+
+    elif ct == "EMAIL_SETTINGS_CREATE":
+        from app.crud.crud import crud_customer_email_setting
+        from app.models import CustomerEmailSetting
+        nv = payload.get("new_value", {})
+        # Check if a record already exists (e.g. password was pre-applied)
+        existing = crud_customer_email_setting.get_by_customer_id(db, change_req.customer_id)
+        if existing:
+            # Update the existing record with the approved non-password fields
+            for field in ("smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active"):
+                if field in nv:
+                    setattr(existing, field, nv[field])
+            existing.is_deleted = False
+            db.add(existing)
+        else:
+            # Create fresh (password would need to be re-set after approval)
+            db_settings = CustomerEmailSetting(
+                customer_id=change_req.customer_id,
+                smtp_host=nv.get("smtp_host", ""),
+                smtp_port=nv.get("smtp_port", 587),
+                smtp_username=nv.get("smtp_username", ""),
+                sender_email=nv.get("sender_email", ""),
+                sender_display_name=nv.get("sender_display_name"),
+                is_active=nv.get("is_active", True),
+            )
+            db.add(db_settings)
+
+    elif ct == "EMAIL_SETTINGS_DELETE":
+        from app.crud.crud import crud_customer_email_setting
+        db_settings = crud_customer_email_setting.get(db, payload.get("setting_id"))
+        if db_settings and db_settings.customer_id == change_req.customer_id:
+            db_settings.soft_delete()
+            db.add(db_settings)
 
     db.flush()
 

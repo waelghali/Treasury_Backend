@@ -1077,14 +1077,12 @@ async def public_analyze_document(
     db: Session = Depends(get_db)
 ):
     """
-    Public: AI-analyze a reference document against the issuance request.
-    Extracts structured fields from the document and compares them to the request.
-    Only fields actually found in the document are compared — missing = pass.
+    Public: AI-driven document verification against the issuance request.
+    Sends document text + request data to AI for per-field comparison.
     """
     from app.models.models_issuance import IssuanceRequest
     from app.core.ai_integration import analyze_supporting_document, AI_DOC_MAX_SIZE_BYTES
     from sqlalchemy.orm import joinedload
-    from decimal import Decimal
 
     access_data = verify_portal_token(token)
     customer_id = access_data["customer_id"]
@@ -1105,167 +1103,29 @@ async def public_analyze_document(
     if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
         return {
             "status": "TOO_LARGE",
-            "message": f"Document too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Max 5 MB.",
+            "message": f"Document too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Max {AI_DOC_MAX_SIZE_BYTES // (1024*1024)} MB.",
             "comparison": None,
         }
 
-    # Run AI extraction
-    ai_result = await analyze_supporting_document(
+    # Build request_data dict with the 9 fields for AI-driven comparison
+    request_data = {
+        "contract_value": float(request_obj.reference_amount) if request_obj.reference_amount else None,
+        "currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
+        "beneficiary_name": request_obj.beneficiary_name,
+        "beneficiary_address": request_obj.beneficiary_address,
+        "lg_type": getattr(request_obj.lg_type, 'name', None) if hasattr(request_obj, 'lg_type') and request_obj.lg_type else None,
+        "lg_value": float(request_obj.amount) if request_obj.amount else None,
+        "lg_currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
+        "lg_expiry_date": str(request_obj.requested_expiry_date) if request_obj.requested_expiry_date else None,
+        "lg_purpose": request_obj.lg_purpose,
+    }
+
+    # Run AI-driven verification
+    result = await analyze_supporting_document(
         pdf_bytes, doc_type.upper(), file.filename,
+        request_data=request_data,
         db=db, customer_id=customer_id, user_id=None,
     )
-
-    if ai_result["status"] != "OK":
-        return ai_result
-
-    extracted = ai_result["extracted_fields"]
-
-    # Build comparison
-    comparison = []
-
-    def _compare(field, request_val, doc_val, label):
-        if doc_val is None:
-            return  # Field not found in document = auto-pass
-        match = False
-        if request_val is not None:
-            if isinstance(request_val, (int, float, Decimal)):
-                try:
-                    match = abs(float(request_val) - float(doc_val)) < 0.01
-                except (ValueError, TypeError):
-                    match = False
-            else:
-                match = str(request_val).strip().lower() == str(doc_val).strip().lower()
-        comparison.append({
-            "field": field, "label": label,
-            "request_value": str(request_val) if request_val is not None else None,
-            "document_value": str(doc_val),
-            "match": match,
-            "severity": "info" if match else ("warning" if request_val is not None else "suggestion"),
-        })
-
-    # Amount
-    amount_key = {"PURCHASE_ORDER": "po_value", "FORMAL_REQUEST": "requested_amount"}.get(doc_type.upper(), "contract_value")
-    _compare("amount", request_obj.amount, extracted.get(amount_key), "Document Amount vs Request Amount")
-
-    # Beneficiary name
-    ben_key = {"PURCHASE_ORDER": "vendor_name", "FORMAL_REQUEST": "requested_beneficiary"}.get(doc_type.upper(), "beneficiary_name")
-    _compare("beneficiary_name", request_obj.beneficiary_name,
-             extracted.get(ben_key) or extracted.get("beneficiary_name"), "Beneficiary Name")
-
-    # Beneficiary address
-    _compare("beneficiary_address", request_obj.beneficiary_address,
-             extracted.get("beneficiary_address"), "Beneficiary Address")
-
-    # Reference number
-    _compare("reference_number", getattr(request_obj, 'reference_number', None),
-             extracted.get("reference_number"), "Reference Number")
-
-    # LG Type — bidirectional fuzzy word match
-    if extracted.get("lg_type_hint") and request_obj.lg_type:
-        lg_name = getattr(request_obj.lg_type, 'name', '')
-        doc_type_val = extracted.get("lg_type_hint", '')
-        # Tokenize both, ignore very short words like "of", "a", "the"
-        req_words = set(w.lower() for w in lg_name.split() if len(w) > 2)
-        doc_words = set(w.lower() for w in doc_type_val.split() if len(w) > 2)
-        # Jaccard-like: require significant overlap in both directions
-        if req_words and doc_words:
-            overlap = len(req_words & doc_words)
-            union = len(req_words | doc_words)
-            lg_match = (overlap / union) >= 0.5 if union > 0 else False
-        else:
-            # Fallback: direct substring containment (either direction)
-            lg_match = lg_name.lower() in doc_type_val.lower() or doc_type_val.lower() in lg_name.lower()
-        comparison.append({"field": "lg_type", "label": "LG Type",
-                           "request_value": lg_name, "document_value": doc_type_val,
-                           "match": lg_match, "severity": "info" if lg_match else "warning"})
-
-    # Currency
-    if extracted.get("currency_code") and request_obj.currency:
-        c_match = getattr(request_obj.currency, 'iso_code', '') == extracted.get("currency_code")
-        comparison.append({"field": "currency", "label": "Currency",
-                           "request_value": getattr(request_obj.currency, 'iso_code', None),
-                           "document_value": extracted.get("currency_code"),
-                           "match": c_match, "severity": "info" if c_match else "warning"})
-
-    # Payable currency
-    if extracted.get("payable_currency") and request_obj.payable_currency:
-        p_match = getattr(request_obj.payable_currency, 'iso_code', '') == extracted.get("payable_currency")
-        comparison.append({"field": "payable_currency", "label": "Payable Currency",
-                           "request_value": getattr(request_obj.payable_currency, 'iso_code', None),
-                           "document_value": extracted.get("payable_currency"),
-                           "match": p_match, "severity": "info" if p_match else "warning"})
-
-    # Maturity / Expiry Date — smart comparison with duration parsing
-    doc_maturity = extracted.get("maturity_date")
-    req_expiry = request_obj.requested_expiry_date
-    if doc_maturity and req_expiry:
-        import re
-        from datetime import date, timedelta
-        expiry_match = False
-        doc_display = doc_maturity
-        req_display = str(req_expiry)
-
-        # Try to parse duration patterns like "6 months", "valid for 1 year", "180 days"
-        duration_pattern = re.search(r'(\d+)\s*(month|year|day|week)s?', doc_maturity, re.IGNORECASE)
-        if duration_pattern:
-            num = int(duration_pattern.group(1))
-            unit = duration_pattern.group(2).lower()
-            today = date.today()
-            if unit in ('month',):
-                expected_expiry = today + timedelta(days=num * 30)
-            elif unit in ('year',):
-                expected_expiry = today + timedelta(days=num * 365)
-            elif unit in ('week',):
-                expected_expiry = today + timedelta(weeks=num)
-            else:
-                expected_expiry = today + timedelta(days=num)
-
-            delta = abs((req_expiry - expected_expiry).days)
-            expiry_match = delta <= 15  # ±15 day tolerance
-            doc_display = f"{doc_maturity} (≈ {expected_expiry.isoformat()}, {delta}d diff)"
-        else:
-            # Try to parse exact date from document
-            try:
-                from dateutil import parser as dateparser
-                doc_date = dateparser.parse(doc_maturity, dayfirst=True).date()
-                delta = abs((req_expiry - doc_date).days)
-                expiry_match = delta <= 7  # ±7 day tolerance for exact dates
-                doc_display = f"{doc_maturity} ({doc_date.isoformat()}, {delta}d diff)"
-            except Exception:
-                # Fallback: simple string match
-                expiry_match = str(req_expiry) in doc_maturity or doc_maturity in str(req_expiry)
-
-        comparison.append({"field": "requested_expiry_date", "label": "Maturity / Expiry Date",
-                           "request_value": req_display, "document_value": doc_display,
-                           "match": expiry_match,
-                           "severity": "info" if expiry_match else "warning"})
-
-    # Purpose
-    if extracted.get("purpose") and request_obj.lg_purpose:
-        req_w = set(w.lower() for w in (request_obj.lg_purpose or '').split() if len(w) > 3)
-        doc_w = set(w.lower() for w in extracted.get("purpose", '').split() if len(w) > 3)
-        p_match = len(req_w & doc_w) >= min(2, len(req_w)) if req_w else False
-        comparison.append({"field": "purpose", "label": "LG Purpose",
-                           "request_value": request_obj.lg_purpose,
-                           "document_value": extracted.get("purpose"),
-                           "match": p_match, "severity": "info" if p_match else "suggestion"})
-
-    # Special conditions
-    if extracted.get("special_conditions"):
-        comparison.append({"field": "special_conditions", "label": "Special Conditions in Document",
-                           "request_value": request_obj.other_conditions or "None specified",
-                           "document_value": "; ".join(extracted["special_conditions"]),
-                           "match": True, "severity": "info"})
-
-    result = {
-        "status": "OK",
-        "message": None,
-        "doc_type": doc_type.upper(),
-        "summary": extracted.get("summary"),
-        "comparison": comparison,
-        "mismatches": len([c for c in comparison if not c["match"]]),
-        "total_fields_compared": len(comparison),
-    }
 
     # Store result on the document for later viewing
     try:

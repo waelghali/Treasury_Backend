@@ -2085,214 +2085,41 @@ async def analyze_supporting_document_endpoint(
     if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
         return {
             "status": "TOO_LARGE",
-            "message": f"Document is too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Maximum is 5 MB.",
+            "message": f"Document is too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Maximum is {AI_DOC_MAX_SIZE_BYTES // (1024*1024)} MB.",
             "comparison": None,
         }
 
-    # Run AI extraction
-    ai_result = await analyze_supporting_document(
+    # Build request_data dict with the 9 fields for AI-driven comparison
+    request_data = {
+        "contract_value": float(request_obj.reference_amount) if request_obj.reference_amount else None,
+        "currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
+        "beneficiary_name": request_obj.beneficiary_name,
+        "beneficiary_address": request_obj.beneficiary_address,
+        "lg_type": getattr(request_obj.lg_type, 'name', None) if hasattr(request_obj, 'lg_type') and request_obj.lg_type else None,
+        "lg_value": float(request_obj.amount) if request_obj.amount else None,
+        "lg_currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
+        "lg_expiry_date": str(request_obj.requested_expiry_date) if request_obj.requested_expiry_date else None,
+        "lg_purpose": request_obj.lg_purpose,
+    }
+
+    # Run AI-driven verification (comparison is done by AI, not rule-based)
+    result = await analyze_supporting_document(
         pdf_bytes, doc_type.upper(), file.filename,
+        request_data=request_data,
         db=db, customer_id=current_user.customer_id, user_id=current_user.user_id,
     )
 
-    if ai_result["status"] != "OK":
-        return ai_result
-
-    extracted = ai_result["extracted_fields"]
-
-    # Build advisory comparison against request fields
-    from decimal import Decimal
-    comparison = []
-
-    def _compare(field, request_val, doc_val, label):
-        if doc_val is None:
-            return
-        match = False
-        if request_val is not None:
-            if isinstance(request_val, (int, float, Decimal)):
-                try:
-                    match = abs(float(request_val) - float(doc_val)) < 0.01
-                except (ValueError, TypeError):
-                    match = False
-            else:
-                match = str(request_val).strip().lower() == str(doc_val).strip().lower()
-        comparison.append({
-            "field": field,
-            "label": label,
-            "request_value": str(request_val) if request_val is not None else None,
-            "document_value": str(doc_val),
-            "match": match,
-            "severity": "info" if match else ("warning" if request_val is not None else "suggestion"),
-        })
-
-    # Cross-reference fields based on doc type — ONLY compare fields found in document
-    doc_type_upper = doc_type.upper()
-
-    # Amount comparison: document contract/PO value → request.reference_amount
-    amount_field = {"CONTRACT": "contract_value", "PURCHASE_ORDER": "po_value", "FORMAL_REQUEST": "requested_amount"}.get(doc_type_upper, "contract_value")
-    _compare("reference_amount", getattr(request_obj, 'reference_amount', None), extracted.get(amount_field), f"Document Value vs Reference Amount")
-
-    # LG Amount comparison: extracted lg_amount → request.amount
-    if extracted.get("lg_amount"):
-        _compare("amount", request_obj.amount, extracted.get("lg_amount"), "LG Amount")
-
-    # Multi-LG advisory: warn when document references multiple LG numbers
-    if extracted.get("lg_references") and len(extracted.get("lg_references", [])) > 1:
-        comparison.append({
-            "field": "multi_lg_warning",
-            "label": "Multiple LG References Detected",
-            "request_value": None,
-            "document_value": f"{len(extracted['lg_references'])} LG references found in document",
-            "match": False,
-            "severity": "advisory",
-        })
-
-    # Beneficiary name
-    ben_field = {"CONTRACT": "parties_involved", "PURCHASE_ORDER": "vendor_name", "FORMAL_REQUEST": "requested_beneficiary"}.get(doc_type_upper, "beneficiary_name")
-    _compare("beneficiary_name", request_obj.beneficiary_name, 
-             extracted.get(ben_field) or extracted.get("beneficiary_name"), "Beneficiary Name")
-
-    # Beneficiary address
-    _compare("beneficiary_address", request_obj.beneficiary_address,
-             extracted.get("beneficiary_address"), "Beneficiary Address")
-
-    # Reference number
-    ref_field = {"PURCHASE_ORDER": "po_number"}.get(doc_type_upper, "reference_number")
-    _compare("reference_number", getattr(request_obj, 'reference_number', None), 
-             extracted.get(ref_field) or extracted.get("reference_number"), "Reference Number")
-
-    # LG Type — bidirectional fuzzy word match
-    if extracted.get("lg_type_hint") and hasattr(request_obj, 'lg_type') and request_obj.lg_type:
-        lg_type_name = getattr(request_obj.lg_type, 'name', '')
-        doc_lg_type = extracted.get("lg_type_hint", '')
-        req_words = set(w.lower() for w in lg_type_name.split() if len(w) > 2)
-        doc_words = set(w.lower() for w in doc_lg_type.split() if len(w) > 2)
-        if req_words and doc_words:
-            overlap = len(req_words & doc_words)
-            union = len(req_words | doc_words)
-            lg_match = (overlap / union) >= 0.5 if union > 0 else False
-        else:
-            lg_match = lg_type_name.lower() in doc_lg_type.lower() or doc_lg_type.lower() in lg_type_name.lower()
-        comparison.append({
-            "field": "lg_type",
-            "label": "LG Type",
-            "request_value": lg_type_name,
-            "document_value": doc_lg_type,
-            "match": lg_match,
-            "severity": "info" if lg_match else "warning",
-        })
-
-    # Currency
-    if extracted.get("currency_code") and hasattr(request_obj, 'currency') and request_obj.currency:
-        currency_match = getattr(request_obj.currency, 'iso_code', '') == extracted.get("currency_code")
-        comparison.append({
-            "field": "currency",
-            "label": "Currency",
-            "request_value": getattr(request_obj.currency, 'iso_code', None),
-            "document_value": extracted.get("currency_code"),
-            "match": currency_match,
-            "severity": "info" if currency_match else "warning",
-        })
-
-    # Payable currency
-    if extracted.get("payable_currency") and hasattr(request_obj, 'payable_currency') and request_obj.payable_currency:
-        pay_match = getattr(request_obj.payable_currency, 'iso_code', '') == extracted.get("payable_currency")
-        comparison.append({
-            "field": "payable_currency",
-            "label": "Payable Currency",
-            "request_value": getattr(request_obj.payable_currency, 'iso_code', None),
-            "document_value": extracted.get("payable_currency"),
-            "match": pay_match,
-            "severity": "info" if pay_match else "warning",
-        })
-
-    # Maturity / Expiry Date — smart comparison with duration parsing
-    doc_maturity = extracted.get("maturity_date")
-    req_expiry = request_obj.requested_expiry_date
-    if doc_maturity and req_expiry:
-        import re
-        from datetime import date, timedelta
-        expiry_match = False
-        doc_display = doc_maturity
-        req_display = str(req_expiry)
-        duration_pattern = re.search(r'(\d+)\s*(month|year|day|week)s?', doc_maturity, re.IGNORECASE)
-        if duration_pattern:
-            num = int(duration_pattern.group(1))
-            unit = duration_pattern.group(2).lower()
-            today = date.today()
-            if unit in ('month',):
-                expected_expiry = today + timedelta(days=num * 30)
-            elif unit in ('year',):
-                expected_expiry = today + timedelta(days=num * 365)
-            elif unit in ('week',):
-                expected_expiry = today + timedelta(weeks=num)
-            else:
-                expected_expiry = today + timedelta(days=num)
-            delta = abs((req_expiry - expected_expiry).days)
-            expiry_match = delta <= 15
-            doc_display = f"{doc_maturity} (≈ {expected_expiry.isoformat()}, {delta}d diff)"
-        else:
-            try:
-                from dateutil import parser as dateparser
-                doc_date = dateparser.parse(doc_maturity, dayfirst=True).date()
-                delta = abs((req_expiry - doc_date).days)
-                expiry_match = delta <= 7
-                doc_display = f"{doc_maturity} ({doc_date.isoformat()}, {delta}d diff)"
-            except Exception:
-                expiry_match = str(req_expiry) in doc_maturity or doc_maturity in str(req_expiry)
-        comparison.append({"field": "requested_expiry_date", "label": "Maturity / Expiry Date",
-                           "request_value": req_display, "document_value": doc_display,
-                           "match": expiry_match,
-                           "severity": "info" if expiry_match else "warning"})
-
-    # Purpose
-    if extracted.get("purpose") and request_obj.lg_purpose:
-        # Fuzzy: check if significant words overlap
-        req_words = set(w.lower() for w in (request_obj.lg_purpose or '').split() if len(w) > 3)
-        doc_words = set(w.lower() for w in extracted.get("purpose", '').split() if len(w) > 3)
-        overlap = len(req_words & doc_words)
-        purpose_match = overlap >= min(2, len(req_words)) if req_words else False
-        comparison.append({
-            "field": "purpose",
-            "label": "LG Purpose",
-            "request_value": request_obj.lg_purpose,
-            "document_value": extracted.get("purpose"),
-            "match": purpose_match,
-            "severity": "info" if purpose_match else "suggestion",
-        })
-
-    # Special conditions (advisory only)
-    if extracted.get("special_conditions"):
-        comparison.append({
-            "field": "special_conditions",
-            "label": "Special Conditions Found in Document",
-            "request_value": request_obj.other_conditions or "None specified",
-            "document_value": "; ".join(extracted["special_conditions"]),
-            "match": True,  # Always informational
-            "severity": "info",
-        })
-
-    result = {
-        "status": "OK",
-        "message": None,
-        "doc_type": doc_type_upper,
-        "summary": extracted.get("summary"),
-        "comparison": comparison,
-        "all_extracted_fields": extracted,
-        "mismatches": len([c for c in comparison if not c["match"]]),
-        "total_fields_compared": len(comparison),
-    }
-
     # Persist the verification result on the matching document
-    from app.models.models_issuance import IssuanceRequestDocument
-    doc_record = db.query(IssuanceRequestDocument).filter(
-        IssuanceRequestDocument.request_id == request_id,
-        IssuanceRequestDocument.document_type == doc_type_upper,
-        IssuanceRequestDocument.is_deleted == False
-    ).order_by(IssuanceRequestDocument.created_at.desc()).first()
-    if doc_record and hasattr(doc_record, 'ai_verification_result'):
-        doc_record.ai_verification_result = result
-        db.commit()
+    if result.get("status") == "OK":
+        from app.models.models_issuance import IssuanceRequestDocument
+        doc_record = db.query(IssuanceRequestDocument).filter(
+            IssuanceRequestDocument.request_id == request_id,
+            IssuanceRequestDocument.document_type == doc_type.upper(),
+            IssuanceRequestDocument.is_deleted == False
+        ).order_by(IssuanceRequestDocument.created_at.desc()).first()
+        if doc_record and hasattr(doc_record, 'ai_verification_result'):
+            doc_record.ai_verification_result = result
+            db.commit()
 
     return result
 

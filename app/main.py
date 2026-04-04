@@ -1,6 +1,7 @@
 # c:\Grow\app\main.py
 import sys
 import os
+import re
 import logging
 import pytz
 from datetime import datetime, timedelta
@@ -19,10 +20,76 @@ from apscheduler.triggers.cron import CronTrigger
 # Database imports
 from app.database import get_db, Base, engine
 
+# ==============================================================================
+# Production-Ready Log Filter: masks sensitive metadata from all log output
+# ==============================================================================
+class SensitiveDataFilter(logging.Filter):
+    """Regex-based filter that replaces sensitive values in log messages."""
+
+    def __init__(self):
+        super().__init__()
+        self._patterns: list = []
+
+        # 1. GCP Project ID (from env)
+        for env_key in ("GCP_PROJECT_ID", "DOCUMENT_AI_PROJECT_ID"):
+            val = os.getenv(env_key, "")
+            if val:
+                self._patterns.append((re.compile(re.escape(val)), "[PROJECT_ID]"))
+
+        # 2. Document AI Processor ID (from env)
+        proc_id = os.getenv("DOCUMENT_AI_PROCESSOR_ID", "")
+        if proc_id:
+            self._patterns.append((re.compile(re.escape(proc_id)), "[PROCESSOR_ID]"))
+
+        # 3. GCS bucket name (from env)
+        bucket = os.getenv("GCS_BUCKET_NAME", "")
+        if bucket:
+            self._patterns.append((re.compile(re.escape(bucket)), "[BUCKET]"))
+
+        # 4. Windows local user paths: C:\Users\<username>\...
+        self._patterns.append((
+            re.compile(r"[A-Z]:\\Users\\[^\\]+\\[^\s\"']+"),
+            "[LOCAL_PATH]",
+        ))
+
+        # 5. Linux/Mac home paths: /home/<user>/...
+        self._patterns.append((
+            re.compile(r"/home/[^/]+/\S+"),
+            "[LOCAL_PATH]",
+        ))
+
+        # 6. Service-account JSON file references
+        self._patterns.append((
+            re.compile(r"[\w./-]+\.json", re.IGNORECASE),
+            "[CREDENTIALS_FILE]",
+        ))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            for pattern, replacement in self._patterns:
+                record.msg = pattern.sub(replacement, record.msg)
+        # Also scrub formatted args if they were already interpolated
+        if record.args:
+            try:
+                formatted = record.getMessage()
+                for pattern, replacement in self._patterns:
+                    formatted = pattern.sub(replacement, formatted)
+                record.msg = formatted
+                record.args = None
+            except Exception:
+                pass
+        return True
+
 # Configure logging
 # Defaults to INFO for production, checks env var for DEBUG override
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+
+# Attach the filter to the root logger so every module inherits it
+_sensitive_filter = SensitiveDataFilter()
+for handler in logging.root.handlers:
+    handler.addFilter(_sensitive_filter)
+
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app

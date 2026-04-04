@@ -779,11 +779,11 @@ class ReconciliationService:
                                          user_id: int = None) -> List[Dict]:
         """Use Gemini AI to extract LG position rows from unstructured content."""
         try:
-            from app.core.ai_integration import _get_gemini_model, log_ai_usage_sync
+            from app.core.ai_integration import _get_genai_client, log_ai_usage_sync, GEMINI_MODEL_NAME
             import fitz  # PyMuPDF
 
-            model = _get_gemini_model()
-            if not model:
+            client = _get_genai_client()
+            if not client:
                 raise HTTPException(status_code=503,
                     detail="AI model not available. Upload Excel/CSV instead.")
 
@@ -827,7 +827,9 @@ Rules:
 Document text:
 {text}"""
 
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME, contents=prompt
+            )
             response_text = response.text.strip()
 
             # H3: Log AI usage

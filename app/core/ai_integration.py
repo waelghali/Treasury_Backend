@@ -59,14 +59,19 @@ except ImportError:
     service_account = None
     GoogleAPIError = Exception # Define dummy for type hinting if not available
 
-# Try to import Google Generative AI
+# Try to import Google GenAI SDK (unified Vertex AI client)
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     GEMINI_AVAILABLE = True
 except ImportError:
-    logger.warning("Warning: google-generativeai library not found. Gemini AI functionality will be limited.")
+    logger.warning("google-genai library not found. Gemini AI functionality will be limited.")
     GEMINI_AVAILABLE = False
     genai = None
+    genai_types = None
+
+# Model name constant — single source of truth
+GEMINI_MODEL_NAME = 'gemini-2.5-flash'
 
 # Try to import Google Document AI
 try:
@@ -81,7 +86,7 @@ except ImportError:
 _google_credentials = None
 _gcs_client = None
 _vision_client = None
-_gemini_model_global = None
+_genai_client_global = None
 _docai_client = None
 
 # --- Dynamically set GOOGLE_APPLICATION_CREDENTIALS if JSON is provided ---
@@ -94,9 +99,9 @@ if creds_json:
         tmp_path = temp_creds_file.name
     # Set the environment variable to point to the temporary file
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
-    logger.info(f"Google credentials written to temporary file: {tmp_path}")
+    logger.info("Google credentials loaded from GOOGLE_CREDENTIALS_JSON env var")
 else:
-    logger.warning("GOOGLE_CREDENTIALS_JSON environment variable not found. Attempting to use existing GOOGLE_APPLICATION_CREDENTIALS.")
+    logger.warning("GOOGLE_CREDENTIALS_JSON not found. Using GOOGLE_APPLICATION_CREDENTIALS.")
 
 @lru_cache(maxsize=1)
 def _get_google_credentials():
@@ -107,10 +112,13 @@ def _get_google_credentials():
         try:
             credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"].strip('\'"')
             if not os.path.exists(credentials_path):
-                logger.error(f"Error: Google Cloud credentials file does NOT exist at: {credentials_path}")
+                logger.error("Credentials file not found at GOOGLE_APPLICATION_CREDENTIALS path")
                 return None
-            _google_credentials = service_account.Credentials.from_service_account_file(credentials_path)
-            logger.info(f"Google Cloud credentials loaded from {credentials_path}")
+            _google_credentials = service_account.Credentials.from_service_account_file(
+                credentials_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            logger.info("Google Cloud credentials loaded successfully")
         except Exception as e:
             logger.error(f"Error loading Google Cloud credentials: {e}")
             _google_credentials = None
@@ -156,39 +164,48 @@ def _get_vision_client():
             _vision_client = None
     return _vision_client
 
+# Vertex AI project & location (reuses DOCUMENT_AI_PROJECT_ID as fallback)
+VERTEX_AI_PROJECT_ID = os.environ.get('GCP_PROJECT_ID') or os.environ.get('DOCUMENT_AI_PROJECT_ID', '')
+VERTEX_AI_LOCATION = os.environ.get('VERTEX_AI_LOCATION', 'us-central1')
+
 @lru_cache(maxsize=1)
-def _get_gemini_model():
-    global _gemini_model_global
+def _get_genai_client():
+    """Initialize the unified google-genai client for Vertex AI."""
+    global _genai_client_global
     if not GEMINI_AVAILABLE:
-        logger.warning("Gemini AI is not available.")
+        logger.warning("google-genai SDK not available. Gemini features disabled.")
         return None
-    if _gemini_model_global is None:
-        gemini_api_key = os.environ.get('GEMINI_API_KEY')
-        if not gemini_api_key:
-            logger.error("GEMINI_API_KEY environment variable not set. Gemini features will be disabled.")
+    if _genai_client_global is None:
+        if not VERTEX_AI_PROJECT_ID:
+            logger.error("GCP_PROJECT_ID not set. Gemini features will be disabled.")
             return None
         try:
-            genai.configure(api_key=gemini_api_key)
-            _gemini_model_global = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("Gemini API configured and model instantiated globally.")
+            credentials = _get_google_credentials()
+            _genai_client_global = genai.Client(
+                vertexai=True,
+                project=VERTEX_AI_PROJECT_ID,
+                location=VERTEX_AI_LOCATION,
+                credentials=credentials,
+            )
+            logger.info(f"Google GenAI client initialized (model={GEMINI_MODEL_NAME})")
         except Exception as e:
-            logger.error(f"Error configuring Gemini API or instantiating model: {e}. Gemini features will be disabled.")
-            _gemini_model_global = None
-    return _gemini_model_global
+            logger.error(f"Error initializing GenAI client: {e}. Gemini features will be disabled.")
+            _genai_client_global = None
+    return _genai_client_global
 
 # Initial client setup
 _get_google_credentials()
 _get_gcs_client()
 _get_vision_client()
-_get_gemini_model()
+_get_genai_client()
 
 # --- Document AI Configuration ---
 DOCUMENT_AI_PROJECT_ID = os.environ.get('DOCUMENT_AI_PROJECT_ID', '')
 DOCUMENT_AI_PROCESSOR_ID = os.environ.get('DOCUMENT_AI_PROCESSOR_ID', '')
 DOCUMENT_AI_LOCATION = os.environ.get('DOCUMENT_AI_LOCATION', 'us')  # 'us' or 'eu' or full region
 
-logger.info(f"Document AI config: project={DOCUMENT_AI_PROJECT_ID or '(not set)'}, "
-            f"processor={DOCUMENT_AI_PROCESSOR_ID or '(not set)'}, "
+logger.info(f"Document AI configured: project={'set' if DOCUMENT_AI_PROJECT_ID else 'not set'}, "
+            f"processor={'set' if DOCUMENT_AI_PROCESSOR_ID else 'not set'}, "
             f"location={DOCUMENT_AI_LOCATION}")
 
 @lru_cache(maxsize=1)
@@ -364,7 +381,7 @@ GEMINI_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "Gemini")
 # Ensure directories exist
 os.makedirs(OCR_INPUT_DIR, exist_ok=True)
 os.makedirs(GEMINI_OUTPUT_DIR, exist_ok=True)
-logger.info(f"Local AI output directories ensured: {OCR_INPUT_DIR}, {GEMINI_OUTPUT_DIR}")
+logger.info("Local AI output directories ensured (OCR_INPUT_DIR, GEMINI_OUTPUT_DIR)")
 
 # --- GCS Operations ---
 async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_type: str) -> Optional[str]:
@@ -385,7 +402,7 @@ async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         await asyncio.to_thread(blob.upload_from_string, data, content_type=content_type)
-        logger.info(f"File {blob_name} uploaded to gs://{bucket_name}/{blob_name}.")
+        logger.info(f"File uploaded to GCS: {blob_name}")
         return f"gs://{bucket_name}/{blob_name}"
     except GoogleAPIError as e:
         logger.error(f"Failed to upload {blob_name} to GCS: {e}")
@@ -509,7 +526,7 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
 
         if full_text_annotation:
             text_content = full_text_annotation.text
-            logger.info(f"OCR extracted {len(text_content)} characters from {file_uri}.")
+            logger.info(f"OCR extracted {len(text_content)} characters from GCS source.")
             logger.debug(text_content[:500] + "..." if len(text_content) > 500 else text_content)
             
             sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
@@ -517,7 +534,7 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
             
             with open(ocr_output_filename, "w", encoding="utf-8") as f:
                 f.write(text_content)
-            logger.info(f"OCR input for Gemini saved to {ocr_output_filename}")
+            logger.info(f"OCR input saved (file_id={sanitized_file_id})")
             logger.info(f"OCR Cost Metric: {len(text_content)} characters processed by Google Vision.")
             return text_content
         else:
@@ -580,9 +597,8 @@ async def _log_ai_usage_to_db(db: Session, current_user: "User", file_name: str,
     try:
         from app.models import AIUsageLog
         
-        # Get model name dynamically from your existing global model object
-        model_instance = _get_gemini_model()
-        model_name = model_instance.model_name if model_instance else "gemini-unknown"
+        # Model name from constant
+        model_name = GEMINI_MODEL_NAME
 
         usage_log = AIUsageLog(
             customer_id=current_user.customer_id, # Driven from user data
@@ -615,8 +631,7 @@ def log_ai_usage_sync(
     """Sync-compatible AI usage logger for non-async callers (reconciliation, etc)."""
     try:
         from app.models import AIUsageLog
-        model_instance = _get_gemini_model()
-        model_name = model_instance.model_name if model_instance else "gemini-unknown"
+        model_name = GEMINI_MODEL_NAME
 
         usage_log = AIUsageLog(
             customer_id=customer_id,
@@ -637,9 +652,9 @@ def log_ai_usage_sync(
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), reraise=True)
 async def extract_structured_data_with_gemini(text_content: str, unique_file_id: str, context: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
-    model = _get_gemini_model()
-    if not model:
-        logger.error("Gemini AI model is not available or not configured.")
+    client = _get_genai_client()
+    if not client:
+        logger.error("GenAI client is not available or not configured.")
         return None, None
 
     if not text_content:
@@ -834,16 +849,18 @@ Document Text:
 """
 
     try:
-        generation_config = genai.types.GenerationConfig(
+        config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=response_schema
         )
 
-        response = await model.generate_content_async(prompt, generation_config=generation_config)
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL_NAME, contents=prompt, config=config
+        )
         extracted_data_str = response.text
-        logger.info(f"--- FULL GEMINI JSON RESPONSE START ---")
-        logger.info(extracted_data_str)
-        logger.info(f"--- FULL GEMINI JSON RESPONSE END ---")
+        logger.debug(f"--- FULL GEMINI JSON RESPONSE START ---")
+        logger.debug(extracted_data_str)
+        logger.debug(f"--- FULL GEMINI JSON RESPONSE END ---")
         
         usage_metadata = None
         if response.usage_metadata:
@@ -860,7 +877,7 @@ Document Text:
         
         with open(gemini_output_filename, "w", encoding="utf-8") as f:
             f.write(extracted_data_str)
-        logger.info(f"Gemini output saved to {gemini_output_filename}")
+        logger.info(f"Gemini output saved (file_id={sanitized_file_id})")
 
         extracted_data = json.loads(extracted_data_str)
         logger.info("Gemini AI extraction successful.")
@@ -1062,47 +1079,49 @@ async def process_amendment_with_ai(
 # Supporting Document AI Analysis (for Issuance Request Verification)
 # ==============================================================================
 
-AI_DOC_MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+AI_DOC_MAX_SIZE_BYTES = 2 * 1024 * 1024  # 2 MB — configurable here
 
 async def analyze_supporting_document(
     pdf_bytes: bytes,
     doc_type: str,
     file_name: str,
+    request_data: Optional[Dict[str, Any]] = None,
     db: Optional[Session] = None,
     customer_id: Optional[int] = None,
     user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Analyze a reference document (Contract, PO, etc.) by extracting structured fields
-    that can be cross-referenced against an issuance request.
-    
+    AI-driven document verification: sends BOTH the document text AND the
+    user-entered issuance request data to Gemini and asks it to compare them.
+
+    Args:
+        pdf_bytes: The document file bytes
+        doc_type: One of CONTRACT, PURCHASE_ORDER, FORMAL_REQUEST
+        file_name: Original filename for logging
+        request_data: Dict with the 9 fields to verify against:
+            - contract_value, currency, beneficiary_name, beneficiary_address,
+              lg_type, lg_value, lg_currency, lg_expiry_date, lg_purpose
+        db, customer_id, user_id: For usage logging
+
     Returns:
         {
             "status": "OK" | "ERROR" | "NO_TEXT",
-            "message": str | None,
-            "extracted_fields": { ... }  # Only present when status == "OK"
+            "comparison": [...],       # Per-field verdicts
+            "mismatches": int,
+            "total_fields_compared": int,
+            "summary": str | None,
         }
-    
-    Fields extracted (only if found in the document — missing fields = auto-pass):
-        - contract_value / po_value / requested_amount (depending on doc_type)
-        - currency_code
-        - beneficiary_name / parties_involved / vendor_name
-        - beneficiary_address
-        - lg_type_hint
-        - maturity_date or duration
-        - purpose
-        - special_conditions
-        - po_number / reference_number
-        - payable_currency
-        - summary
     """
-    model = _get_gemini_model()
-    if not model:
+    client = _get_genai_client()
+    if not client:
         return {"status": "ERROR", "message": "AI model not available. Submission will proceed without verification."}
 
     target_bucket_name = GCS_BUCKET_NAME
     if not target_bucket_name or not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         return {"status": "ERROR", "message": "Cloud storage not configured. Submission will proceed without verification."}
+
+    if not request_data:
+        request_data = {}
 
     unique_file_id = f"doc_analysis_{uuid.uuid4().hex}"
     raw_text = ""
@@ -1111,7 +1130,7 @@ async def analyze_supporting_document(
     try:
         # --- OCR: Extract text from PDF ---
         mime_type = "application/pdf" if file_name.lower().endswith(".pdf") else "image/png"
-        
+
         if mime_type == "application/pdf":
             image_uris = await _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes, target_bucket_name, unique_file_id)
             if not image_uris:
@@ -1133,90 +1152,88 @@ async def analyze_supporting_document(
         if not raw_text or len(raw_text.strip()) < 20:
             return {"status": "NO_TEXT", "message": "Could not extract text from document. Submission will proceed without verification."}
 
-        # --- Gemini: Extract structured fields from reference document ---
-        sanitized_text = _sanitize_text_for_json(raw_text[:80000])  # cap text length
+        # --- Build the AI-driven comparison prompt ---
+        sanitized_text = _sanitize_text_for_json(raw_text[:80000])
 
-        prompt = f"""You are a financial document analyst. Analyze this {doc_type.replace('_', ' ').title()} document and extract any fields relevant to a Letter of Guarantee (LG) issuance request.
+        # Format request data for the prompt
+        request_fields_text = json.dumps({
+            "contract_value": request_data.get("contract_value"),
+            "currency": request_data.get("currency"),
+            "beneficiary_name": request_data.get("beneficiary_name"),
+            "beneficiary_address": request_data.get("beneficiary_address"),
+            "lg_type": request_data.get("lg_type"),
+            "lg_value": request_data.get("lg_value"),
+            "lg_currency": request_data.get("lg_currency"),
+            "lg_expiry_date": request_data.get("lg_expiry_date"),
+            "lg_purpose": request_data.get("lg_purpose"),
+        }, indent=2, ensure_ascii=False)
 
-**IMPORTANT:** Only extract fields that are EXPLICITLY mentioned in the document. If a field is not found, DO NOT include it in your response — omit it entirely. Do NOT guess or infer values.
+        prompt = f"""You are a financial document verification specialist. You are given:
+1. A {doc_type.replace('_', ' ').title()} document (OCR-extracted text)
+2. Data entered by a user for a Letter of Guarantee (LG) issuance request
 
-**Fields to look for:**
+Your task: Compare each user-entered field against the document. For each field, return one of three verdicts:
+- **MATCH**: The document clearly confirms this value (exact or semantically equivalent)
+- **MISMATCH**: The document contains a DIFFERENT value for this field
+- **COULD_NOT_VALIDATE**: The field is not mentioned in the document, or the document is too ambiguous to verify
 
-1. **contract_value**: The monetary value/amount mentioned (as a number, no commas)
-2. **currency_code**: Currency as ISO code (e.g., SAR, USD, EGP, EUR)
-3. **payable_currency**: If a different payment currency is mentioned
-4. **beneficiary_name**: The name of the project owner, employer, or entity requesting the guarantee
-5. **beneficiary_address**: Address of the beneficiary if mentioned
-6. **lg_type_hint**: Any mention of guarantee type (Performance, Advance Payment, Bid Bond, Financial, Retention)
-7. **maturity_date**: LG expiry/maturity DATE in **YYYY-MM-DD format** (DATE ONLY — never include time/hours). If the date is written in words (e.g. "the tenth of September of the year two thousand and thirty"), convert it to YYYY-MM-DD. If the date is numeric, note that in Egypt the common format is DD/MM/YYYY (day first). If only a duration is mentioned (e.g. "valid for 6 months"), return the duration text instead.
-8. **duration_text**: Duration mentioned (e.g., "12 months from contract date", "valid for 6 months")
-9. **purpose**: The purpose or description of the required guarantee
-10. **special_conditions**: Any special terms, conditions, or requirements for the LG (as a list of strings)
-11. **reference_number**: Contract number, PO number, or tender reference
-12. **lg_percentage**: If the LG is expressed as a percentage of contract value
-13. **summary**: A brief 1-2 sentence summary of the document
+**CRITICAL RULES:**
+- `contract_value` is the CONTRACT/PO total value. The `lg_value` is the LG amount, which is often a PERCENTAGE of the contract value (e.g., 5-20%). These are DIFFERENT fields. Do NOT flag a mismatch just because lg_value != contract_value.
+- For `beneficiary_name`: Accept bilingual matches (Arabic ↔ English), abbreviations, and minor variations as MATCH.
+- For `beneficiary_address`: A partial address match (e.g., city matches) counts as MATCH.
+- For `currency` and `lg_currency`: Match ISO codes (EGP, USD, EUR, SAR, etc.)
+- For `lg_expiry_date`: If the document mentions a duration (e.g., "12 months"), calculate approximate date from today and compare. Within 30 days = MATCH.
+- For `lg_type`: Semantic match (e.g., "Performance Bond" = "Performance Guarantee" = "نهائي" = MATCH)
+- For `lg_purpose`: Semantic match. If the document's project scope aligns with the stated purpose, it's a MATCH.
+- If a user field is null/empty, skip it (do NOT include it in results).
 
-Return ONLY a JSON object with the fields listed above that you found. Omit any field not found in the document.
+**USER-ENTERED REQUEST DATA:**
+{request_fields_text}
 
+**DOCUMENT TEXT ({doc_type.replace('_', ' ').title()}):**
 ---
-Document Text:
-
 {sanitized_text}
+---
+
+Return a JSON object with exactly these fields:
+- "comparison": array of objects, each with:
+  - "field": the field name (e.g., "contract_value")
+  - "label": human-readable label (e.g., "Contract Value")
+  - "request_value": what the user entered (as string)
+  - "document_value": what you found in the document (as string), or null if not found
+  - "verdict": one of "MATCH", "MISMATCH", "COULD_NOT_VALIDATE"
+  - "note": brief explanation (e.g., "Contract mentions EGP 3,000,000 which matches", or "Beneficiary not found in document")
+- "summary": 1-2 sentence summary of the document
 """
 
-        response_schema = {
-            "type": "OBJECT",
-            "properties": {
-                "contract_value": {"type": "NUMBER"},
-                "currency_code": {"type": "STRING"},
-                "payable_currency": {"type": "STRING"},
-                "beneficiary_name": {"type": "STRING"},
-                "beneficiary_address": {"type": "STRING"},
-                "lg_type_hint": {"type": "STRING"},
-                "maturity_date": {"type": "STRING"},
-                "duration_text": {"type": "STRING"},
-                "purpose": {"type": "STRING"},
-                "special_conditions": {"type": "ARRAY", "items": {"type": "STRING"}},
-                "reference_number": {"type": "STRING"},
-                "lg_percentage": {"type": "NUMBER"},
-                "summary": {"type": "STRING"},
-            }
-        }
-
-        generation_config = genai.types.GenerationConfig(
+        config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=response_schema
         )
 
-        response = await model.generate_content_async(prompt, generation_config=generation_config)
-        extracted_str = response.text
-        logger.info(f"Supporting document AI analysis result: {extracted_str[:500]}")
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL_NAME, contents=prompt, config=config
+        )
+        result_str = response.text
+        logger.info(f"AI document verification complete ({len(result_str)} chars)")
 
-        extracted = json.loads(extracted_str)
+        result = json.loads(result_str)
 
-        # Map doc_type-specific field names for the comparison layer
-        if doc_type == "PURCHASE_ORDER":
-            if "contract_value" in extracted and "po_value" not in extracted:
-                extracted["po_value"] = extracted["contract_value"]
-            if "beneficiary_name" in extracted and "vendor_name" not in extracted:
-                extracted["vendor_name"] = extracted["beneficiary_name"]
-            if "reference_number" in extracted and "po_number" not in extracted:
-                extracted["po_number"] = extracted["reference_number"]
-        elif doc_type == "FORMAL_REQUEST":
-            if "contract_value" in extracted and "requested_amount" not in extracted:
-                extracted["requested_amount"] = extracted["contract_value"]
-            if "beneficiary_name" in extracted and "requested_beneficiary" not in extracted:
-                extracted["requested_beneficiary"] = extracted["beneficiary_name"]
+        comparison = result.get("comparison", [])
 
-        # Also keep generic aliases for the enhanced comparison
-        if "beneficiary_name" not in extracted and "vendor_name" in extracted:
-            extracted["beneficiary_name"] = extracted["vendor_name"]
-        if "contract_value" not in extracted and "po_value" in extracted:
-            extracted["contract_value"] = extracted["po_value"]
-        
-        # Keep parties_involved as alias for beneficiary_name (for backward compat)
-        if "beneficiary_name" in extracted:
-            extracted["parties_involved"] = extracted["beneficiary_name"]
+        # Map verdict to match boolean and severity for frontend compatibility
+        for item in comparison:
+            verdict = item.get("verdict", "COULD_NOT_VALIDATE")
+            if verdict == "MATCH":
+                item["match"] = True
+                item["severity"] = "info"
+            elif verdict == "MISMATCH":
+                item["match"] = False
+                item["severity"] = "warning"
+            else:  # COULD_NOT_VALIDATE
+                item["match"] = True  # Not a failure — just couldn't check
+                item["severity"] = "suggestion"
+
+        mismatches = len([c for c in comparison if c.get("verdict") == "MISMATCH"])
 
         # Log usage
         if response.usage_metadata and db and customer_id:
@@ -1231,14 +1248,18 @@ Document Text:
         return {
             "status": "OK",
             "message": None,
-            "extracted_fields": extracted,
+            "doc_type": doc_type.upper(),
+            "summary": result.get("summary"),
+            "comparison": comparison,
+            "mismatches": mismatches,
+            "total_fields_compared": len(comparison),
         }
 
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error in supporting doc analysis: {e}")
+        logger.error(f"JSON parse error in AI document verification: {e}")
         return {"status": "ERROR", "message": "AI returned invalid response. Submission will proceed."}
     except Exception as e:
-        logger.error(f"Supporting document AI analysis failed: {e}", exc_info=True)
+        logger.error(f"AI document verification failed: {e}", exc_info=True)
         return {"status": "ERROR", "message": f"AI analysis failed: {str(e)[:100]}. Submission will proceed."}
     finally:
         if temp_files:
@@ -1278,9 +1299,9 @@ async def analyze_bank_form_pdf(
             "mapped_fields": N,
         }
     """
-    model = _get_gemini_model()
-    if not model:
-        raise Exception("Gemini AI model is not available. Cannot analyze bank form.")
+    client = _get_genai_client()
+    if not client:
+        raise Exception("GenAI client is not available. Cannot analyze bank form.")
 
     # Step 1: Build fields_info based on form type
     fields_info = ""
@@ -1729,15 +1750,15 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
 
     try:
         # Upload PDF to Gemini for analysis (it can read PDFs directly)
-        import google.generativeai as genai_module
-        
         # Use Gemini's ability to analyze PDF content
-        response = await model.generate_content_async(
-            [
+        pdf_part = genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=[
                 prompt,
-                {"mime_type": "application/pdf", "data": pdf_bytes}
+                pdf_part,
             ],
-            generation_config=genai_module.types.GenerationConfig(
+            config=genai_types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
             )
@@ -1985,9 +2006,9 @@ async def enhance_bank_form_mapping(
     Returns: corrected field_mapping list (only positions are updated, 
              semantic mappings are preserved).
     """
-    model = _get_gemini_model()
-    if not model:
-        raise Exception("Gemini model not available for enhancement.")
+    client = _get_genai_client()
+    if not client:
+        raise Exception("GenAI client not available for enhancement.")
     
     import fitz  # PyMuPDF for rendering PDF to image
     
@@ -2012,12 +2033,12 @@ async def enhance_bank_form_mapping(
         
         orig_pix = page.get_pixmap(dpi=150)
         orig_bytes = orig_pix.tobytes("png")
-        image_parts.append({"mime_type": "image/png", "data": orig_bytes})
+        image_parts.append(genai_types.Part.from_bytes(data=orig_bytes, mime_type="image/png"))
         
         if pg_idx < filled_doc.page_count:
             fill_pix = filled_doc[pg_idx].get_pixmap(dpi=150)
             fill_bytes = fill_pix.tobytes("png")
-            image_parts.append({"mime_type": "image/png", "data": fill_bytes})
+            image_parts.append(genai_types.Part.from_bytes(data=fill_bytes, mime_type="image/png"))
     
     original_doc.close()
     filled_doc.close()
@@ -2115,9 +2136,10 @@ If ALL fields are correctly placed: {{"corrections": [], "summary": "All fields 
     
     logger.info(f"Enhance: sending {num_pages} page pairs to Gemini for visual correction...")
     
-    response = model.generate_content(
-        content_parts,
-        generation_config=genai.types.GenerationConfig(
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=content_parts,
+        config=genai_types.GenerateContentConfig(
             temperature=0.1,
             max_output_tokens=16384,
             response_mime_type="application/json",
@@ -2176,8 +2198,8 @@ If ALL fields are correctly placed: {{"corrections": [], "summary": "All fields 
 
 
 
-# Shared constant: Maximum file size for AI document processing (5 MB)
-AI_DOC_MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+# Shared constant: Maximum file size for facility agreement AI processing (5 MB)
+FACILITY_DOC_MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
 async def analyze_facility_agreement(
@@ -2192,18 +2214,16 @@ async def analyze_facility_agreement(
     Returns advisory comparison data — never blocks.
     """
     # File size guard
-    if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
+    if len(pdf_bytes) > FACILITY_DOC_MAX_SIZE_BYTES:
         return {
             "status": "TOO_LARGE",
             "message": f"Document is too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Maximum is 5 MB.",
             "extracted_terms": None,
         }
 
-    model = _get_gemini_model()
-    if not model:
+    client = _get_genai_client()
+    if not client:
         return {"status": "AI_UNAVAILABLE", "message": "AI model is not available.", "extracted_terms": None}
-
-    import google.generativeai as genai_module
 
     prompt = """You are a banking document analyst. This PDF is a **bank facility agreement** 
 for Letters of Guarantee (LG). Extract the following key terms as a JSON object:
@@ -2231,9 +2251,10 @@ Rules:
 """
 
     try:
-        response = await model.generate_content_async(
-            [prompt, {"mime_type": "application/pdf", "data": pdf_bytes}],
-            generation_config=genai_module.types.GenerationConfig(
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=[prompt, genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")],
+            config=genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
             )
         )
@@ -2268,106 +2289,4 @@ Rules:
         logger.error(f"Facility agreement AI analysis failed: {e}", exc_info=True)
         return {"status": "AI_ERROR", "message": str(e), "extracted_terms": None}
 
-
-# ==============================================================================
-# H2: Supporting Document Analysis During Request
-# ==============================================================================
-
-SUPPORTED_DOC_TYPES = {
-    "CONTRACT": {
-        "description": "contract or agreement",
-        "fields": "contract_value, parties_involved, contract_dates, project_description",
-    },
-    "PURCHASE_ORDER": {
-        "description": "purchase order or procurement document",
-        "fields": "po_number, po_value, vendor_name, delivery_date, items_description",
-    },
-    "FORMAL_REQUEST": {
-        "description": "formal request or internal memo requesting an LG",
-        "fields": "requested_amount, requested_beneficiary, requested_lg_type, requested_validity_period, purpose",
-    },
-}
-
-
-async def analyze_supporting_document(
-    pdf_bytes: bytes,
-    doc_type: str,
-    filename: str,
-    db: Session = None,
-    customer_id: int = None,
-    user_id: int = None,
-) -> Dict[str, Any]:
-    """
-    H2: Analyzes a supporting document and extracts key fields for cross-reference.
-    Returns advisory data (highlights, not blocks).
-    """
-    # File size guard
-    if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
-        return {
-            "status": "TOO_LARGE",
-            "message": f"Document is too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Maximum is 5 MB.",
-            "extracted_fields": None,
-        }
-
-    doc_config = SUPPORTED_DOC_TYPES.get(doc_type)
-    if not doc_config:
-        return {"status": "UNSUPPORTED_TYPE", "message": f"Document type '{doc_type}' is not supported.", "extracted_fields": None}
-
-    model = _get_gemini_model()
-    if not model:
-        return {"status": "AI_UNAVAILABLE", "message": "AI model is not available.", "extracted_fields": None}
-
-    import google.generativeai as genai_module
-
-    prompt = f"""You are a banking document analyst. This PDF is a **{doc_config['description']}** 
-related to a Letter of Guarantee (LG) issuance request.
-
-Extract the following fields as a flat JSON object:
-{doc_config['fields']}
-
-Additional rules:
-- Return ONLY valid JSON. No explanations.
-- If a field cannot be determined, use null.
-- Amounts must be plain numbers (no commas, no currency symbols).
-- ALL dates must be DATE ONLY in YYYY-MM-DD format (never include time/hours). If dates are written in words (e.g. "the tenth of September two thousand thirty"), convert to YYYY-MM-DD. If dates are numeric, note the Egyptian convention is DD/MM/YYYY (day first).
-- Include a "currency_code" field if any currency is mentioned (3-letter ISO code).
-- Include a "summary" field with a 1-2 sentence summary of the document's purpose.
-"""
-
-    try:
-        response = await model.generate_content_async(
-            [prompt, {"mime_type": "application/pdf", "data": pdf_bytes}],
-            generation_config=genai_module.types.GenerationConfig(
-                response_mime_type="application/json",
-            )
-        )
-
-        result_str = response.text
-        logger.info(f"Supporting document analysis ({doc_type}) complete for '{filename}'")
-
-        # Log AI usage
-        try:
-            usage_meta = getattr(response, 'usage_metadata', None)
-            if usage_meta and db is not None and customer_id is not None and user_id is not None:
-                log_ai_usage_sync(
-                    db, customer_id, user_id, filename,
-                    prompt_tokens=getattr(usage_meta, 'prompt_token_count', 0),
-                    completion_tokens=getattr(usage_meta, 'candidates_token_count', 0),
-                    call_type=f"supporting_doc_{doc_type.lower()}",
-                )
-        except Exception as log_err:
-            logger.warning(f"Failed to log supporting doc AI usage: {log_err}")
-
-        extracted = json.loads(result_str)
-        return {
-            "status": "OK",
-            "message": None,
-            "extracted_fields": extracted,
-        }
-
-    except json.JSONDecodeError as e:
-        logger.error(f"AI returned invalid JSON for supporting doc ({doc_type}): {e}")
-        return {"status": "AI_ERROR", "message": f"AI returned invalid response: {e}", "extracted_fields": None}
-    except Exception as e:
-        logger.error(f"Supporting doc AI analysis failed ({doc_type}): {e}", exc_info=True)
-        return {"status": "AI_ERROR", "message": str(e), "extracted_fields": None}
+

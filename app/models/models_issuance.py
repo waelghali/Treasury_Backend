@@ -934,7 +934,7 @@ class AdminChangeRequest(BaseModel):
     approved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     change_type = Column(String, nullable=False,
-                         comment="CONFIG_UPDATE, APPROVAL_MATRIX_UPDATE, DEPARTMENT_CREATE, DEPARTMENT_UPDATE, GROUP_CREATE, GROUP_UPDATE, etc.")
+                         comment="CONFIG_UPDATE, CUSTOMER_CONFIG_UPDATE, APPROVAL_MATRIX_UPDATE, DEPARTMENT_CREATE, DEPARTMENT_UPDATE, GROUP_CREATE, GROUP_UPDATE, EMAIL_SETTINGS_CREATE, EMAIL_SETTINGS_UPDATE, EMAIL_SETTINGS_DELETE, etc.")
     change_payload = Column(JSONB, nullable=False,
                             comment='{"config_key": "...", "old_value": "...", "new_value": "..."}')
     status = Column(String, default="PENDING",
