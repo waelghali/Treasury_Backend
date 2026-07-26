@@ -492,7 +492,7 @@ class AuthService:
 
         # Send email with the plaintext token
         # Get FRONTEND_URL from environment variable
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000') # Default for local dev
+        frontend_url = os.getenv('FRONTEND_URL', 'http://growbusinessdevelopment.com') # Default for local dev
         reset_link = f"{frontend_url}/reset-password?token={plain_token}" # Updated path based on App.js routing
 
         # Get email settings (customer-specific or global fallback)
