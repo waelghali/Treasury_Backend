@@ -108,6 +108,11 @@ class CRUDQuotation:
                 ).first()
                 
                 if q_bank:
+                    q_base_override = b_data.get('quotationBase') or obj_in.quotationBase
+                    is_doc_vis = b_data.get('isDocumentVisible', True)
+                    if is_doc_vis is None:
+                        is_doc_vis = True
+                    
                     db_assignment = QuotationBankAssignment(
                         id=assignment_id,
                         rfq_id=rfq_id,
@@ -116,10 +121,16 @@ class CRUDQuotation:
                         cost_min=b_data.get('costMin', 0.0),
                         cost_percent=b_data.get('costPercent', 0.0),
                         cost_max=b_data.get('costMax', 0.0),
-                        cost_flat=b_data.get('costFlat', 0.0)
+                        cost_flat=b_data.get('costFlat', 0.0),
+                        quotation_base=q_base_override,
+                        is_document_visible=is_doc_vis
                     )
                     db.add(db_assignment)
-                    assignments.append({"bankId": b_data.get('id'), "token": token})
+                    assignments.append({
+                        "bankId": b_data.get('id'),
+                        "quotation_bank_id": q_bank.id,
+                        "token": token
+                    })
         except Exception as e:
             # Re-raise or handle JSON parsing failure
             raise ValueError(f"Failed to parse selected banks: {e}")
@@ -129,15 +140,26 @@ class CRUDQuotation:
         return db_rfq, assignments
 
     def get_requests(self, db: Session, customer_id: int):
-        return db.query(QuotationRequest).filter(
+        reqs = db.query(QuotationRequest).filter(
             QuotationRequest.customer_id == customer_id
         ).order_by(QuotationRequest.created_at.desc()).all()
+        for r in reqs:
+            if r.creator:
+                r.creator_name = r.creator.email.split('@')[0] if r.creator.email else "End User"
+            else:
+                r.creator_name = "End User"
+        return reqs
 
     def get_request(self, db: Session, rfq_id: str, customer_id: int):
-        return db.query(QuotationRequest).filter(
+        r = db.query(QuotationRequest).filter(
             QuotationRequest.id == rfq_id,
             QuotationRequest.customer_id == customer_id
         ).first()
+        if r and r.creator:
+            r.creator_name = r.creator.email.split('@')[0] if r.creator.email else "End User"
+        elif r:
+            r.creator_name = "End User"
+        return r
 
     # --- Background Processing ---
     async def process_quotation_timeouts(self, db: Session):

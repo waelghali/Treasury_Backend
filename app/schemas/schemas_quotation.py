@@ -35,6 +35,8 @@ class BankSelection(BaseModel):
     costPercent: Optional[float] = 0.0
     costMax: Optional[float] = 0.0
     costFlat: Optional[float] = 0.0
+    quotationBase: Optional[str] = None
+    isDocumentVisible: Optional[bool] = True
 
 class QuotationRequestCreate(BaseModel):
     type: str = "FX_SPOT"
@@ -70,6 +72,7 @@ class QuotationRequestOut(BaseModel):
     status: str
     token_validity_hours: Optional[int]
     created_at: datetime
+    creator_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -99,6 +102,8 @@ class QuotationResultItem(BaseModel):
     submitted_at: Optional[datetime] = None
     token: Optional[str] = None
     offers: Optional[List[dict]] = None # For T-Bills
+    quotation_base: Optional[str] = None
+    is_document_visible: Optional[bool] = True
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

@@ -138,10 +138,11 @@ def create_rfq(
             base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
             
             for assignment in assignments:
-                bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment["bank_id"]).first()
+                q_bank_id = assignment.get("quotation_bank_id")
+                bank_row = db.query(QuotationBank).filter(QuotationBank.id == q_bank_id).first() if q_bank_id else None
                 if bank_row and bank_row.emails:
                     bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-                    link = f"{base_url}/quotation-submission?token={assignment['token']}"
+                    link = f"{base_url}/public-quotation/{assignment['token']}"
                     
                     subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
                     body = f"""
@@ -225,15 +226,18 @@ def get_rfq_history(
 
 @router.get("/stats")
 def get_quotation_stats(
+    trade_type: str = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """Calculates bank performance statistics for the Market Insights dashboard."""
-    # Fetch all completed requests for this customer
-    reqs = db.query(QuotationRequest).filter(
+    query = db.query(QuotationRequest).filter(
         QuotationRequest.customer_id == current_user.customer_id,
         QuotationRequest.status == 'COMPLETED'
-    ).all()
+    )
+    if trade_type:
+        query = query.filter(QuotationRequest.type == trade_type)
+    reqs = query.all()
     
     bank_stats = {}
     
@@ -457,11 +461,14 @@ def get_rfq_results(
             
             results.append({
                 "bank_id": bank_id,
+                "quotation_bank_id": a.quotation_bank_id,
                 "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
                 "bank_emails": q_bank.emails if q_bank else "",
                 "offers": bank_offers,
                 "best_score": best_offer['score'] if best_offer else None,
-                "token": a.token
+                "token": a.token,
+                "quotation_base": a.quotation_base or rfq.quotation_base,
+                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True
             })
 
         # Sort results: Lowest score wins (Lowest price for buy, Lowest DR for sell)
@@ -476,12 +483,15 @@ def get_rfq_results(
             if not offer_db:
                 results.append({
                     "bank_id": q_bank.bank_id if q_bank else 0,
+                    "quotation_bank_id": a.quotation_bank_id,
                     "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
                     "bank_emails": q_bank.emails if q_bank else "",
                     "price": None,
                     "finalPrice": None,
                     "submitted_at": None,
-                    "token": a.token
+                    "token": a.token,
+                    "quotation_base": a.quotation_base or rfq.quotation_base,
+                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True
                 })
                 continue
             
@@ -495,12 +505,15 @@ def get_rfq_results(
                 
             results.append({
                 "bank_id": q_bank.bank_id if q_bank else 0,
+                "quotation_bank_id": a.quotation_bank_id,
                 "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
                 "bank_emails": q_bank.emails if q_bank else "",
                 "price": price,
                 "finalPrice": price + adjustedCost,
                 "submitted_at": offer_db.submitted_at,
-                "token": a.token
+                "token": a.token,
+                "quotation_base": a.quotation_base or rfq.quotation_base,
+                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True
             })
             
         # Filter nulls and sort by direction
@@ -533,10 +546,11 @@ async def send_rfq_results(
     winner_bank_id = None
     if rfq.type == 'FX_SPOT':
         valid = [r for r in results if r.get('finalPrice') is not None]
-        if valid:
-            is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
-            valid.sort(key=lambda x: x['finalPrice'], reverse=is_sell)
-            winner_bank_id = valid[0]['bank_id']
+        if not valid:
+            raise HTTPException(status_code=400, detail="Cannot send result emails: No quotes were submitted for this RFQ.")
+        is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
+        valid.sort(key=lambda x: x['finalPrice'], reverse=is_sell)
+        winner_bank_id = valid[0]['bank_id']
 
     for bank_res in results:
         if not bank_res.get('bank_emails'):
@@ -588,6 +602,68 @@ async def send_rfq_results(
         )
 
     return {"message": "Result emails sent to all participating banks."}
+
+@router.post("/{rfq_id}/resend-invite/{quotation_bank_id}")
+async def resend_rfq_bank_invite(
+    rfq_id: str,
+    quotation_bank_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Resends the secure invite email to a specific bank for an RFQ."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+        
+    assignment = db.query(QuotationBankAssignment).filter(
+        QuotationBankAssignment.rfq_id == rfq.id,
+        QuotationBankAssignment.quotation_bank_id == quotation_bank_id
+    ).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Bank assignment not found for this RFQ")
+        
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == quotation_bank_id).first()
+    if not q_bank or not q_bank.emails:
+        raise HTTPException(status_code=400, detail="No email address configured for this bank")
+        
+    email_settings = get_global_email_settings()
+    base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]
+    link = f"{base_url}/public-quotation/{assignment.token}"
+    
+    subject = f"REMINDER: RFQ Request - {rfq.type} - {rfq.ref_no}"
+    body = f"""
+    <html>
+    <body>
+        <p>Dear {q_bank.bank.name if q_bank.bank else 'Bank Partner'} FX Desk,</p>
+        <p>This is a reminder regarding the Request for Quotation (RFQ) on our Treasury Platform.</p>
+        <br/>
+        <ul>
+            <li><strong>Reference:</strong> {rfq.ref_no}</li>
+            <li><strong>Product:</strong> {rfq.type}</li>
+        </ul>
+        <p>To submit your quote, please click the secure link below. This link is unique to your institution and will expire automatically.</p>
+        <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Submit Quote Now</a>
+        <br/><br/>
+        <p>Best Regards,</p>
+        <p>Treasury Team</p>
+    </body>
+    </html>
+    """
+    background_tasks.add_task(
+        send_email,
+        db,
+        bank_emails,
+        subject,
+        body,
+        {},
+        email_settings,
+    )
+    return {"message": f"Invitation email resent to {q_bank.bank.name if q_bank.bank else 'Bank'}"}
 
 @router.get("/notifications")
 def get_my_notifications(

@@ -61,6 +61,8 @@ class QuotationBankAssignment(BaseModel):
     cost_percent = Column(Float, default=0.0)
     cost_max = Column(Float, default=0.0)
     cost_flat = Column(Float, default=0.0)
+    quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative' override per bank")
+    is_document_visible = Column(Boolean, default=True, comment="Controls document attachment visibility for this bank")
 
     rfq = relationship("QuotationRequest", back_populates="assignments")
     quotation_bank = relationship("QuotationBank")
