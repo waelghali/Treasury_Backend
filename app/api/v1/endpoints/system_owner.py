@@ -2736,7 +2736,11 @@ async def get_scheduled_jobs(current_user: Any = Depends(HasPermission("system_o
     return {"jobs": jobs}
 
 @router.post("/scheduler/run_job/{job_id}")
-async def run_task_now(job_id: str, current_user: Any = Depends(HasPermission("system_owner:run_scheduler_job"))):
+async def run_task_now(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: Any = Depends(HasPermission("system_owner:run_scheduler_job"))
+):
     """
     Manually triggers a scheduled job to run immediately.
     Requires System Owner role with 'system_owner:run_scheduler_job' permission.
@@ -2744,21 +2748,17 @@ async def run_task_now(job_id: str, current_user: Any = Depends(HasPermission("s
     from app.main import app as fastapi_app
     try:
         original_job = fastapi_app.state.scheduler.get_job(job_id)
-        if original_job:
-            fastapi_app.state.scheduler.add_job(
-                func=original_job.func, 
-                trigger='date', 
-                run_date=datetime.now(), 
-                args=original_job.args,
-                kwargs=original_job.kwargs
-            )
-        else:
+        if not original_job:
             raise ValueError(f"Job with id '{job_id}' not found.")
+        
+        # Schedule execution as an immediate background task
+        background_tasks.add_task(original_job.func, *original_job.args, **(original_job.kwargs or {}))
         
         return {"message": f"Job '{job_id}' manually triggered to run now."}
     except Exception as e:
         logger.error(f"Failed to manually run job '{job_id}': {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found or could not be run. Error: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Job '{job_id}' not found or could not be run. Error: {e}")
+
 
 @router.post("/scheduler/reschedule_job/{job_id}")
 async def reschedule_job(

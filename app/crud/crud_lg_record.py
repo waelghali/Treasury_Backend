@@ -45,6 +45,7 @@ from app.constants import (
     ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT,
     ACTION_TYPE_LG_REMINDER_TO_INTERNAL_OWNER, AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT,
     AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SKIPPED_RECENTLY_SENT,
+    AUDIT_ACTION_TYPE_LG_RENEWAL_DIGEST_SENT, AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_DIGEST_SENT,
     # NEW: Import DOCUMENT_TYPE_ORIGINAL_LG
     DOCUMENT_TYPE_ORIGINAL_LG,
     # New constants for new LG record email confirmation
@@ -53,6 +54,8 @@ from app.constants import (
     InstructionTypeCode, SubInstructionCode,
     UserRole # ADDED in the previous turn
 )
+from app.services.email_digest_service import build_lg_renewal_digest_html
+
 from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
 from app.core.document_generator import generate_pdf_from_html
 from app.core.ai_integration import process_lg_document_with_ai, GCS_BUCKET_NAME
@@ -2791,9 +2794,12 @@ class CRUDLGRecord(CRUDBase):
             logger.error(f"Failed to send {reminder_type} renewal reminder email for LG {lg_record.lg_number}.")
 
     async def run_renewal_reminders_to_users_and_admins(self, db: Session):
+        """
+        Feature 1: Sends renewal reminders to Corporate Admins & End Users.
+        Consolidates all eligible LGs per customer into a single daily digest email.
+        """
         logger.info("--- START: Feature 1 (Users/Admins) Renewal Reminders Task ---")
         current_date_only = date.today()
-        current_datetime_aware = datetime.now(EEST_TIMEZONE)
 
         customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
         if not customers:
@@ -2833,6 +2839,8 @@ class CRUDLGRecord(CRUDBase):
 
                 logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} VALID LGs with future expiry.")
 
+                due_lgs_for_digest = []
+
                 for lg in eligible_lgs:
                     # SAFE CONVERSION: Handle both date and datetime expiry_date columns
                     lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
@@ -2867,8 +2875,13 @@ class CRUDLGRecord(CRUDBase):
                                 should_send = True
 
                         if should_send:
-                            logger.info(f" -> LG {lg.lg_number}: Sending SECOND (URGENT) reminder. {days_left} days left.")
-                            await self._send_renewal_reminder_email(db, lg, "second", "auto-renew" if lg.auto_renewal else "non-auto-renew", days_left, "URGENT: ", ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT, is_urgent=True)
+                            due_lgs_for_digest.append({
+                                "lg": lg,
+                                "days_left": days_left,
+                                "urgency_level": "urgent",
+                                "audit_action_type": AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_SECOND_SENT,
+                                "reminder_type": "second"
+                            })
 
                     elif is_normal_due:
                         should_send = False
@@ -2880,8 +2893,20 @@ class CRUDLGRecord(CRUDBase):
                                 should_send = True
 
                         if should_send:
-                            logger.info(f" -> LG {lg.lg_number}: Sending FIRST (NORMAL) reminder. {days_left} days left.")
-                            await self._send_renewal_reminder_email(db, lg, "first", "auto-renew" if lg.auto_renewal else "non-auto-renew", days_left, "", ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST, AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT, is_urgent=False)
+                            due_lgs_for_digest.append({
+                                "lg": lg,
+                                "days_left": days_left,
+                                "urgency_level": "normal",
+                                "audit_action_type": AUDIT_ACTION_TYPE_LG_RENEWAL_REMINDER_FIRST_SENT,
+                                "reminder_type": "first"
+                            })
+
+                if due_lgs_for_digest:
+                    await self._send_consolidated_users_and_admins_renewal_digest(
+                        db=db,
+                        customer=customer,
+                        due_lgs_info=due_lgs_for_digest
+                    )
 
             except Exception as e:
                 db.rollback()
@@ -2890,10 +2915,159 @@ class CRUDLGRecord(CRUDBase):
                 db.commit()
 
         logger.info("--- FINISHED: Feature 1 Task ---")
+
+    async def _send_consolidated_users_and_admins_renewal_digest(
+        self,
+        db: Session,
+        customer: models.Customer,
+        due_lgs_info: List[Dict[str, Any]]
+    ):
+        """
+        Sends a single, consolidated HTML digest email to Corporate Admins, End Users,
+        and internal owners for all LGs due for renewal reminders in Feature 1.
+        """
+        if not due_lgs_info:
+            return
+
+        logger.info(f"Preparing Feature 1 consolidated digest for Customer {customer.name} with {len(due_lgs_info)} LGs.")
+
+        to_emails = []
+        cc_emails = []
+
+        # Collect internal owner emails and managers from due LGs
+        for item in due_lgs_info:
+            lg = item["lg"]
+            if lg.internal_owner_contact and lg.internal_owner_contact.email:
+                to_emails.append(lg.internal_owner_contact.email)
+            if lg.internal_owner_contact and lg.internal_owner_contact.manager_email:
+                cc_emails.append(lg.internal_owner_contact.manager_email)
+
+        # Add all End Users of customer
+        end_users = db.query(models.User).filter(
+            models.User.customer_id == customer.id,
+            models.User.role == models.UserRole.END_USER,
+            models.User.is_deleted == False
+        ).all()
+        for user in end_users:
+            if user.email:
+                to_emails.append(user.email)
+
+        # Add all Corporate Admins of customer
+        corporate_admins = db.query(models.User).filter(
+            models.User.customer_id == customer.id,
+            models.User.role == models.UserRole.CORPORATE_ADMIN,
+            models.User.is_deleted == False
+        ).all()
+        for admin in corporate_admins:
+            if admin.email:
+                cc_emails.append(admin.email)
+
+        to_emails = list(set(to_emails))
+        cc_emails = list(set(cc_emails) - set(to_emails))
+
+        if not to_emails and not cc_emails:
+            logger.warning(f"No valid recipients found for Customer {customer.name} renewal digest. Skipping.")
+            return
+
+        items_for_html = []
+        has_urgent = False
+
+        for item in due_lgs_info:
+            lg = item["lg"]
+            if item["urgency_level"] == "urgent":
+                has_urgent = True
+
+            lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
+
+            items_for_html.append({
+                "lg_number": lg.lg_number,
+                "lg_type": lg.lg_type.name if lg.lg_type else "N/A",
+                "issuing_bank": lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                "currency": lg.lg_currency.iso_code if lg.lg_currency else "EGP",
+                "amount": float(lg.lg_amount),
+                "amount_formatted": f"{lg.lg_currency.symbol if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}",
+                "expiry_date_str": lg_expiry_val.strftime('%Y-%m-%d'),
+                "days_until_expiry": item["days_left"],
+                "urgency_level": item["urgency_level"],
+                "auto_renewal": bool(lg.auto_renewal)
+            })
+
+        subject_prefix = "URGENT: " if has_urgent else ""
+        digest_title = "DAILY EXPIRY & RENEWAL DIGEST"
+        email_subject = f"{subject_prefix}[GROW TREASURY] Renewal Digest - {len(due_lgs_info)} LG(s) Expiring Soon ({customer.name})"
+
+        email_body_html = build_lg_renewal_digest_html(
+            customer_name=customer.name,
+            recipient_name="Treasury Team",
+            digest_title=digest_title,
+            items=items_for_html
+        )
+
+        email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer.id)
+
+        email_sent_successfully, error_reason = await send_email(
+            db=db,
+            to_emails=to_emails,
+            cc_emails=cc_emails,
+            subject_template=email_subject,
+            body_template=email_body_html,
+            template_data={},
+            email_settings=email_settings_to_use,
+            sender_name=customer.name
+        )
+
+        if email_sent_successfully:
+            # 1. Audit log per LG to maintain anti-spam tracking
+            for item in due_lgs_info:
+                lg = item["lg"]
+                log_action(
+                    db,
+                    user_id=None,
+                    action_type=item["audit_action_type"],
+                    entity_type="LGRecord",
+                    entity_id=lg.id,
+                    details={
+                        "lg_number": lg.lg_number,
+                        "reminder_type": item["reminder_type"],
+                        "days_until_expiry": item["days_left"],
+                        "recipients": to_emails,
+                        "cc_recipients": cc_emails,
+                        "email_subject": email_subject,
+                        "email_method": email_method_for_log,
+                        "is_urgent_email": (item["urgency_level"] == "urgent"),
+                        "digest_consolidated": True,
+                        "digest_items_count": len(due_lgs_info)
+                    },
+                    customer_id=customer.id,
+                    lg_record_id=lg.id,
+                )
+
+            # 2. Audit log summary for Customer Digest
+            log_action(
+                db,
+                user_id=None,
+                action_type=AUDIT_ACTION_TYPE_LG_RENEWAL_DIGEST_SENT,
+                entity_type="Customer",
+                entity_id=customer.id,
+                details={
+                    "customer_name": customer.name,
+                    "due_lgs_count": len(due_lgs_info),
+                    "lg_numbers": [item["lg"].lg_number for item in due_lgs_info],
+                    "recipients": to_emails,
+                    "cc_recipients": cc_emails,
+                    "email_subject": email_subject,
+                    "email_method": email_method_for_log
+                },
+                customer_id=customer.id,
+            )
+            logger.info(f"Consolidated Feature 1 renewal digest sent successfully for Customer {customer.name} ({len(due_lgs_info)} LGs).")
+        else:
+            logger.error(f"Failed to send Feature 1 renewal digest email for Customer {customer.name}: {error_reason}")
+
     async def run_internal_owner_renewal_reminders(self, db: Session):
         """
-        Feature 2: Sends renewal reminders to Internal Owners for NON-AUTO-RENEW LGs.
-        Includes enhanced debugging logs to trace filtering logic.
+        Feature 2: Sends renewal reminders to Internal Owners for LGs nearing expiry.
+        LGs are consolidated per internal owner into a single digest email.
         """
         logger.info("--- START: Internal Owner Renewal Reminders Task ---")
         current_date_aware = datetime.now(EEST_TIMEZONE)
@@ -2926,7 +3100,6 @@ class CRUDLGRecord(CRUDBase):
                     models.LGRecord.customer_id == customer.id,
                     models.LGRecord.is_deleted == False,
                     models.LGRecord.lg_status_id == models.LgStatusEnum.VALID.value,
-                    # Reminders sent to ALL valid LGs nearing expiry (ignore auto_renewal toggle)
                     models.LGRecord.expiry_date >= current_date_only,
                     models.LGRecord.expiry_date <= lookahead_date
                 )
@@ -2943,50 +3116,67 @@ class CRUDLGRecord(CRUDBase):
 
                 logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} LGs in the date window.")
 
+                # Group LGs by internal_owner_contact_id
+                owner_groups: Dict[Optional[int], List[models.LGRecord]] = {}
                 for lg in eligible_lgs:
-                    # SAFE CONVERSION: Ensure lg.expiry_date is a date object for subtraction
-                    lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') else lg.expiry_date
-                    days_until_expiry = (lg_expiry_val - current_date_only).days
-                    
-                    # 3. Check for Actions (The "Stop" Button)
-                    relevant_action = db.query(models.AuditLog).filter(
-                        models.AuditLog.lg_record_id == lg.id,
-                        models.AuditLog.action_type.in_([
-                            ACTION_TYPE_LG_RELEASE,
-                            ACTION_TYPE_LG_LIQUIDATE
-                        ])
-                    ).order_by(models.AuditLog.timestamp.desc()).first()
+                    owner_id = lg.internal_owner_contact_id
+                    if owner_id not in owner_groups:
+                        owner_groups[owner_id] = []
+                    owner_groups[owner_id].append(lg)
 
-                    if relevant_action:
-                        logger.info(f" -> LG {lg.lg_number}: SKIPPED. Action '{relevant_action.action_type}' already exists.")
-                        continue
+                for owner_id, lgs in owner_groups.items():
+                    internal_owner = lgs[0].internal_owner_contact if lgs else None
+                    owner_due_lgs = []
 
-                    # 4. Check Last Sent Reminder
-                    last_reminder = db.query(models.AuditLog).filter(
-                        models.AuditLog.lg_record_id == lg.id,
-                        models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
-                    ).order_by(models.AuditLog.timestamp.desc()).first()
-
-                    should_send = False
-                    if not last_reminder:
-                        logger.info(f" -> LG {lg.lg_number}: Initial reminder due ({days_until_expiry} days left).")
-                        should_send = True
-                    else:
-                        # SAFE CONVERSION: Compare date to date to avoid timezone/offset-aware crashes
-                        last_rem_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
-                        days_since_last = (current_date_only - last_rem_date).days
+                    for lg in lgs:
+                        lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') else lg.expiry_date
+                        days_until_expiry = (lg_expiry_val - current_date_only).days
                         
-                        if days_since_last >= interval_days:
-                            logger.info(f" -> LG {lg.lg_number}: Follow-up due. Last sent {days_since_last} days ago.")
+                        # 3. Check for Actions (The "Stop" Button)
+                        relevant_action = db.query(models.AuditLog).filter(
+                            models.AuditLog.lg_record_id == lg.id,
+                            models.AuditLog.action_type.in_([
+                                ACTION_TYPE_LG_RELEASE,
+                                ACTION_TYPE_LG_LIQUIDATE
+                            ])
+                        ).order_by(models.AuditLog.timestamp.desc()).first()
+
+                        if relevant_action:
+                            logger.info(f" -> LG {lg.lg_number}: SKIPPED. Action '{relevant_action.action_type}' already exists.")
+                            continue
+
+                        # 4. Check Last Sent Reminder
+                        last_reminder = db.query(models.AuditLog).filter(
+                            models.AuditLog.lg_record_id == lg.id,
+                            models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
+                        ).order_by(models.AuditLog.timestamp.desc()).first()
+
+                        should_send = False
+                        if not last_reminder:
+                            logger.info(f" -> LG {lg.lg_number}: Initial reminder due ({days_until_expiry} days left).")
                             should_send = True
                         else:
-                            logger.info(f" -> LG {lg.lg_number}: SKIPPED. Last reminder was only {days_since_last} days ago (Interval: {interval_days}).")
+                            last_rem_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
+                            days_since_last = (current_date_only - last_rem_date).days
+                            
+                            if days_since_last >= interval_days:
+                                logger.info(f" -> LG {lg.lg_number}: Follow-up due. Last sent {days_since_last} days ago.")
+                                should_send = True
+                            else:
+                                logger.info(f" -> LG {lg.lg_number}: SKIPPED. Last reminder was only {days_since_last} days ago (Interval: {interval_days}).")
 
-                    if should_send:
-                        await self._send_internal_owner_renewal_reminder_email(
-                            db, lg, days_until_expiry,
-                            ACTION_TYPE_LG_REMINDER_TO_INTERNAL_OWNER,
-                            AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
+                        if should_send:
+                            owner_due_lgs.append({
+                                "lg": lg,
+                                "days_until_expiry": days_until_expiry
+                            })
+
+                    if owner_due_lgs:
+                        await self._send_consolidated_internal_owner_renewal_digest(
+                            db=db,
+                            customer=customer,
+                            internal_owner=internal_owner,
+                            owner_due_lgs=owner_due_lgs
                         )
 
             except Exception as e:
@@ -2996,6 +3186,159 @@ class CRUDLGRecord(CRUDBase):
                 db.commit()
 
         logger.info("--- FINISHED: Internal Owner Renewal Reminders Task ---")
+
+    async def _send_consolidated_internal_owner_renewal_digest(
+        self,
+        db: Session,
+        customer: models.Customer,
+        internal_owner: Optional[models.InternalOwnerContact],
+        owner_due_lgs: List[Dict[str, Any]]
+    ):
+        """
+        Sends a single consolidated HTML digest email to an Internal Owner (and manager)
+        listing all non-auto-renew LGs requiring their action.
+        """
+        if not owner_due_lgs:
+            return
+
+        owner_name = internal_owner.email if (internal_owner and getattr(internal_owner, 'email', None)) else "Internal Owner"
+
+        logger.info(f"Preparing Feature 2 consolidated digest for Internal Owner '{owner_name}' ({customer.name}) with {len(owner_due_lgs)} LGs.")
+
+        email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer.id)
+
+        to_emails = []
+        if internal_owner and internal_owner.email:
+            to_emails.append(internal_owner.email)
+
+        cc_emails = []
+        if internal_owner and internal_owner.manager_email:
+            cc_emails.append(internal_owner.manager_email)
+
+        # Add common communication list
+        common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+            db, customer.id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+        )
+        if common_comm_list_config and common_comm_list_config.get('effective_value'):
+            try:
+                parsed_common_list = json.loads(common_comm_list_config['effective_value'])
+                if isinstance(parsed_common_list, list) and all(isinstance(e, str) and "@" in e for e in parsed_common_list):
+                    cc_emails.extend(parsed_common_list)
+            except json.JSONDecodeError:
+                logger.warning(f"COMMON_COMMUNICATION_LIST for customer {customer.id} is not valid JSON. Skipping.")
+
+        # Add End Users and Corporate Admins
+        end_users = db.query(models.User).filter(
+            models.User.customer_id == customer.id,
+            models.User.role == models.UserRole.END_USER,
+            models.User.is_deleted == False
+        ).all()
+        for user in end_users:
+            if user.email:
+                to_emails.append(user.email)
+
+        corporate_admins = db.query(models.User).filter(
+            models.User.customer_id == customer.id,
+            models.User.role == models.UserRole.CORPORATE_ADMIN,
+            models.User.is_deleted == False
+        ).all()
+        for admin in corporate_admins:
+            if admin.email:
+                cc_emails.append(admin.email)
+
+        to_emails = list(set(to_emails))
+        cc_emails = list(set(cc_emails) - set(to_emails))
+
+        if not to_emails and not cc_emails:
+            logger.warning(f"No valid recipients found for Internal Owner '{owner_name}' renewal digest. Skipping email.")
+            return
+
+        items_for_html = []
+        for item in owner_due_lgs:
+            lg = item["lg"]
+            lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
+
+            items_for_html.append({
+                "lg_number": lg.lg_number,
+                "lg_type": lg.lg_type.name if lg.lg_type else "N/A",
+                "issuing_bank": lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                "currency": lg.lg_currency.iso_code if lg.lg_currency else "EGP",
+                "amount": float(lg.lg_amount),
+                "amount_formatted": f"{lg.lg_currency.symbol if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}",
+                "expiry_date_str": lg_expiry_val.strftime('%Y-%m-%d'),
+                "days_until_expiry": item["days_until_expiry"],
+                "urgency_level": "urgent" if item["days_until_expiry"] <= 30 else "normal",
+                "auto_renewal": bool(lg.auto_renewal)
+            })
+
+        digest_title = "MY ACTION REQUIRED: EXPIRING LGS"
+        email_subject = f"[ACTION REQUIRED] Expiring LGs Digest - {len(owner_due_lgs)} LG(s) Nearing Expiry ({customer.name})"
+
+        email_body_html = build_lg_renewal_digest_html(
+            customer_name=customer.name,
+            recipient_name=owner_name,
+            digest_title=digest_title,
+            items=items_for_html
+        )
+
+        email_sent_successfully, error_reason = await send_email(
+            db=db,
+            to_emails=to_emails,
+            cc_emails=cc_emails,
+            subject_template=email_subject,
+            body_template=email_body_html,
+            template_data={},
+            email_settings=email_settings_to_use,
+            sender_name=customer.name
+        )
+
+        if email_sent_successfully:
+            # 1. Audit log per LG
+            for item in owner_due_lgs:
+                lg = item["lg"]
+                log_action(
+                    db,
+                    user_id=None,
+                    action_type=AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT,
+                    entity_type="LGRecord",
+                    entity_id=lg.id,
+                    details={
+                        "lg_number": lg.lg_number,
+                        "days_until_expiry": item["days_until_expiry"],
+                        "recipients": to_emails,
+                        "cc_recipients": cc_emails,
+                        "email_subject": email_subject,
+                        "email_method": email_method_for_log,
+                        "digest_consolidated": True,
+                        "digest_items_count": len(owner_due_lgs)
+                    },
+                    customer_id=customer.id,
+                    lg_record_id=lg.id,
+                )
+
+            # 2. Audit log summary for Internal Owner Digest
+            log_action(
+                db,
+                user_id=None,
+                action_type=AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_DIGEST_SENT,
+                entity_type="InternalOwnerContact",
+                entity_id=internal_owner.id if internal_owner else None,
+                details={
+                    "customer_name": customer.name,
+                    "internal_owner_name": owner_name,
+                    "due_lgs_count": len(owner_due_lgs),
+                    "lg_numbers": [item["lg"].lg_number for item in owner_due_lgs],
+                    "recipients": to_emails,
+                    "cc_recipients": cc_emails,
+                    "email_subject": email_subject,
+                    "email_method": email_method_for_log
+                },
+                customer_id=customer.id,
+            )
+            logger.info(f"Consolidated Feature 2 renewal digest sent successfully for Internal Owner '{owner_name}' ({len(owner_due_lgs)} LGs).")
+        else:
+            logger.error(f"Failed to send Feature 2 renewal digest email for Internal Owner '{owner_name}': {error_reason}")
+
     async def _send_internal_owner_renewal_reminder_email(self,
                                                            db: Session,
                                                            lg_record: models.LGRecord,

@@ -106,6 +106,24 @@ def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSet
         return get_global_email_settings(), "global_fallback_error"
 
 
+# --- Test Domain Filtering ---
+
+TEST_DOMAINS = ("@acmecorp.com", "@example.com", "@email.com", "@test.com")
+
+def process_recipients(recipient_list: Optional[List[str]]) -> List[str]:
+    """Filters out dummy/test domain email addresses."""
+    if not recipient_list:
+        return []
+    clean_list = []
+    for email in recipient_list:
+        if not email or not isinstance(email, str):
+            continue
+        if any(email.lower().strip().endswith(domain) for domain in TEST_DOMAINS):
+            continue
+        clean_list.append(email)
+    return clean_list
+
+
 # --- Core Sending Logic ---
 
 async def send_email(
@@ -118,15 +136,18 @@ async def send_email(
     cc_emails: Optional[List[str]] = None,
     sender_name: Optional[str] = None,
     attachments: Optional[List[EmailAttachment]] = None
-) -> bool:
+) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using provided settings.
-    Note: `template_data` is kept for API compatibility but the caller 
-    is expected to have already formatted the subject/body strings.
+    Filters out dummy test domain addresses before sending.
     """
-    if not to_emails:
-        logger.warning("Email attempt aborted: No recipients provided.")
-        return False
+    to_emails = process_recipients(to_emails)
+    cc_emails = process_recipients(cc_emails or [])
+
+    if not to_emails and not cc_emails:
+        logger.info("Email delivery suppressed: All recipients belong to dummy/test domains.")
+        return True, None
+
 
     # Logic to handle display name override
     display_name = sender_name if sender_name else email_settings.sender_display_name

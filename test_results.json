@@ -1,8 +1,8 @@
 {
   "summary": {
-    "pass": 13,
-    "fail": 1,
-    "warn": 2
+    "pass": 8,
+    "fail": 4,
+    "warn": 4
   },
   "results": [
     {
@@ -20,56 +20,56 @@
     {
       "id": "2.21",
       "name": "AI Doc Verification - Happy Path",
-      "status": "PASS",
-      "detail": "status=OK, fields=7, mismatches=5"
+      "status": "FAIL",
+      "detail": "HTTP 401: {\"detail\":\"Invalid token payload or subscription status.\"}"
     },
     {
       "id": "2.22",
       "name": "File > 2MB rejected",
-      "status": "PASS",
-      "detail": "Document is too large for AI analysis (3.0 MB). Maximum is 2 MB."
+      "status": "FAIL",
+      "detail": "Expected TOO_LARGE, got: None"
     },
     {
       "id": "2.6",
       "name": "MISMATCH/COULD_NOT_VALIDATE verdicts",
-      "status": "PASS",
-      "detail": "mismatches=5, could_not_validate=1, fields=7"
+      "status": "FAIL",
+      "detail": "status=None: "
     },
     {
       "id": "15.2",
       "name": "Corrupt PDF (no server crash)",
       "status": "PASS",
-      "detail": "HTTP 200, status=ERROR"
+      "detail": "HTTP 401, status=?"
     },
     {
       "id": "3.1",
       "name": "Matched LG verification",
       "status": "FAIL",
-      "detail": "HTTP 400: {\"detail\":\"Cannot verify \u2014 current status: MATCHED\"}"
+      "detail": "HTTP 401: {\"detail\":\"Invalid token payload or subscription status.\"}"
     },
     {
       "id": "3.2",
       "name": "Amount discrepancy detection",
-      "status": "PASS",
-      "detail": "status=DISCREPANCY, discrepancies=1"
+      "status": "WARN",
+      "detail": "HTTP 401: {\"detail\":\"Invalid token payload or subscription status.\"}"
     },
     {
       "id": "3.8",
       "name": "Force accept (admin)",
       "status": "WARN",
-      "detail": "HTTP 400: {\"detail\":\"Cannot verify \u2014 current status: ACCEPTED\"}"
+      "detail": "HTTP 401: {\"detail\":\"Invalid token payload or subscription status.\"}"
     },
     {
       "id": "8.1",
       "name": "Facility agreement AI analysis",
-      "status": "PASS",
-      "detail": "status=OK, fields_compared=5, mismatches=5"
+      "status": "WARN",
+      "detail": "HTTP 401: {\"detail\":\"Invalid token payload or subscription status.\"}"
     },
     {
       "id": "11.1",
       "name": "AI usage log entries exist",
       "status": "PASS",
-      "detail": "29 |           1 |       2 | [facility_agreement_analysis] facility_agreement_bank_A.pdf     | publishers/google/models/gemini-2.5-flash |          1572 |               323\n 28 |           1 |       2 | [document_verification] [doc_verify] contract_metro_project.pdf | publishers/google/models/gemini-2.5-flash |           923 |               722\n 27 |           1 |       2 | [document_verification]"
+      "detail": "31 |           1 |       5 | LG_doc_09.pdf                                               | gemini-2.5-flash                          |          1696 |               276\n 30 |           1 |       5 | LG_doc_18.pdf                                               | gemini-2.5-flash                          |          1699 |               314\n 29 |           1 |       2 | [facility_agreement_analysis] f"
     },
     {
       "id": "11.3",
@@ -99,8 +99,8 @@
       "id": "15.6",
       "name": "Unsupported file type (no crash)",
       "status": "PASS",
-      "detail": "HTTP 200, response={\"status\":\"NO_TEXT\",\"message\":\"Could not extract text from document. Submission will proceed without verification.\"}"
+      "detail": "HTTP 401, response={\"detail\":\"Invalid token payload or subscription status.\"}"
     }
   ],
-  "timestamp": "2026-03-30 20:16:56"
+  "timestamp": "2026-08-01 12:46:14"
 }
