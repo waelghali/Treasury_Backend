@@ -148,7 +148,7 @@ def create_rfq(
                     body = f"""
                     <html>
                     <body>
-                        <p>Dear {bank_row.bank.bank_name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
+                        <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
                         <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
                         <br/>
                         <ul>
@@ -522,7 +522,69 @@ def get_rfq_results(
         valid_results.sort(key=lambda x: x['finalPrice'], reverse=is_sell)
         results = valid_results + [r for r in results if r.get('finalPrice') is None]
         
-    return {"rfq": rfq, "results": results}
+        # --- Evaluation Logic: Execution vs Indicative & Max Tolerance Check ---
+        has_execution_banks = any((r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution' for r in results)
+        
+        winner_bank_id = None
+        is_inconclusive = False
+        inconclusive_reason = None
+        best_indicative_rate = None
+        best_execution_rate = None
+        deviation_percent = None
+
+        if not has_execution_banks:
+            # Scenario B: All banks are Indicative -> pure market sounding
+            is_inconclusive = True
+            inconclusive_reason = "All counterparties were requested on an Indicative basis. No binding winner is selected."
+        else:
+            # Separate valid bids into Indicative and Execution pools
+            indicative_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'indicative']
+            execution_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution']
+            
+            if indicative_bids:
+                best_indicative_rate = indicative_bids[0]['finalPrice'] # Already sorted by direction
+            if execution_bids:
+                best_execution_rate = execution_bids[0]['finalPrice'] # Already sorted by direction
+                
+            if execution_bids:
+                best_exec_item = execution_bids[0]
+                if best_indicative_rate is not None and best_execution_rate is not None:
+                    # Scenario C: Mixed -> Calculate one-directional deviation
+                    if is_sell:
+                        # Sell: Higher rate is better. Deviation is how much lower execution is vs indicative benchmark
+                        deviation_percent = ((best_indicative_rate - best_execution_rate) / best_indicative_rate) * 100.0
+                    else:
+                        # Buy: Lower rate is better. Deviation is how much higher execution is vs indicative benchmark
+                        deviation_percent = ((best_execution_rate - best_indicative_rate) / best_indicative_rate) * 100.0
+                    
+                    if deviation_percent <= 0:
+                        # Execution rate is equal to or better than Indicative benchmark
+                        winner_bank_id = best_exec_item['bank_id']
+                    else:
+                        max_tol = rfq.max_tolerance_percent if rfq.max_tolerance_percent is not None else 0.0
+                        if deviation_percent > max_tol:
+                            is_inconclusive = True
+                            inconclusive_reason = (
+                                f"The best Execution rate ({best_execution_rate:.4f}) exceeded the Indicative benchmark "
+                                f"({best_indicative_rate:.4f}) by {deviation_percent:.2f}%, which is higher than the allowed tolerance of {max_tol:.2f}%."
+                            )
+                        else:
+                            winner_bank_id = best_exec_item['bank_id']
+                else:
+                    # Scenario A: All Execution or no Indicative quotes submitted
+                    winner_bank_id = best_exec_item['bank_id']
+
+    return {
+        "rfq": rfq,
+        "results": results,
+        "winner_bank_id": winner_bank_id,
+        "is_inconclusive": is_inconclusive,
+        "inconclusive_reason": inconclusive_reason,
+        "best_indicative_rate": best_indicative_rate,
+        "best_execution_rate": best_execution_rate,
+        "deviation_percent": deviation_percent,
+        "has_execution_banks": has_execution_banks
+    }
 
 @router.post("/{rfq_id}/send-results")
 async def send_rfq_results(
@@ -530,7 +592,7 @@ async def send_rfq_results(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Sends winner/regret emails to all assigned banks for a completed RFQ."""
+    """Sends winner/regret emails to assigned Execution banks for a completed RFQ."""
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
@@ -538,26 +600,33 @@ async def send_rfq_results(
     # Process results retrieval
     res_data = get_rfq_results(rfq_id, db, current_user)
     results = res_data["results"]
+    is_inconclusive = res_data.get("is_inconclusive", False)
+    inconclusive_reason = res_data.get("inconclusive_reason")
+    winner_bank_id = res_data.get("winner_bank_id")
+
+    if is_inconclusive:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot send deal result emails: {inconclusive_reason or 'RFQ ended without a conclusive winner.'}"
+        )
+        
+    if not winner_bank_id:
+        raise HTTPException(status_code=400, detail="Cannot send result emails: No winning Execution quote found.")
 
     from app.core.email_service import get_customer_email_settings, send_email
     email_settings, source = get_customer_email_settings(db, rfq.customer_id)
 
-    # Determine Winner for FX
-    winner_bank_id = None
-    if rfq.type == 'FX_SPOT':
-        valid = [r for r in results if r.get('finalPrice') is not None]
-        if not valid:
-            raise HTTPException(status_code=400, detail="Cannot send result emails: No quotes were submitted for this RFQ.")
-        is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
-        valid.sort(key=lambda x: x['finalPrice'], reverse=is_sell)
-        winner_bank_id = valid[0]['bank_id']
-
     for bank_res in results:
+        # Indicative banks do not receive execution win/regret emails
+        q_base = (bank_res.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
+        if q_base == 'indicative':
+            continue
+
         if not bank_res.get('bank_emails'):
             continue
         
         bank_emails = [e.strip() for e in bank_res['bank_emails'].split(',') if e.strip()]
-        is_winner = (bank_res['bank_id'] == winner_bank_id) if winner_bank_id else False
+        is_winner = (bank_res['bank_id'] == winner_bank_id)
         
         ref_no = rfq.ref_no
         if is_winner:

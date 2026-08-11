@@ -54,6 +54,7 @@ class QuotationRequestCreate(BaseModel):
     windowStart: datetime
     windowEnd: datetime
     quotationBase: Optional[str] = None
+    maxTolerancePercent: Optional[float] = None
     selectedBanks: str # JSON string matching Node module format, or we can parse it in FastAPI
     token_validity_hours: Optional[int] = 24
 
@@ -73,6 +74,8 @@ class QuotationRequestOut(BaseModel):
     token_validity_hours: Optional[int]
     created_at: datetime
     creator_name: Optional[str] = None
+    quotation_base: Optional[str] = None
+    max_tolerance_percent: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -108,3 +111,10 @@ class QuotationResultItem(BaseModel):
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut
     results: List[QuotationResultItem]
+    winner_bank_id: Optional[int] = None
+    is_inconclusive: bool = False
+    inconclusive_reason: Optional[str] = None
+    best_indicative_rate: Optional[float] = None
+    best_execution_rate: Optional[float] = None
+    deviation_percent: Optional[float] = None
+    has_execution_banks: bool = True

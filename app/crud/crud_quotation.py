@@ -87,6 +87,7 @@ class CRUDQuotation:
             window_start=obj_in.windowStart,
             window_end=obj_in.windowEnd,
             quotation_base=obj_in.quotationBase,
+            max_tolerance_percent=obj_in.maxTolerancePercent,
             document_path=document_path,
             status=initial_status
         )

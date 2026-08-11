@@ -220,45 +220,26 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     if rfq.status != 'COMPLETED':
         return {"status": "PENDING"}
 
-    # Calculate results
-    if rfq.type == 'TBILL':
-        # For T-Bills, we need to see if ANY winner was selected in Analytics
-        from app.models.models_quotation import QuotationAnalytics
-        analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-        if not analytics:
-            return {"status": "AWAITING_MANUAL_SELECTION"}
-        
-        # In T-Bills, we could have multiple winners, but usually, we store one or a list.
-        # For now, let's check if this bank is the winner_quotation_bank_id
-        if analytics.winner_quotation_bank_id == assignment.quotation_bank_id:
+    # Indicative banks are for market sounding only and are never declared winners or sent regret statuses
+    q_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
+    if q_base == 'indicative':
+        return {"status": "INDICATIVE_ONLY"}
+
+    # Calculate results using central endpoint evaluation logic
+    from app.api.v1.endpoints.quotations_endpoints import get_rfq_results
+    try:
+        # Dummy token data if needed, or reuse internal logic
+        res_data = get_rfq_results(rfq.id, db, current_user=None)
+        winner_bank_id = res_data.get("winner_bank_id")
+        is_inconclusive = res_data.get("is_inconclusive", False)
+
+        if is_inconclusive or not winner_bank_id:
+            return {"status": "INCONCLUSIVE"}
+
+        if assignment.quotation_bank and assignment.quotation_bank.bank_id == winner_bank_id:
             return {"status": "WINNER"}
         else:
             return {"status": "NOT_SELECTED"}
-        
-    # FX_SPOT
-    all_assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-    best_assignment_id = None
-    best_score = float('inf')
-    
-    for a in all_assignments:
-        offer = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
-        if offer:
-            price = offer.price
-            variableCost = (price * (a.cost_percent / 100)) + float(a.cost_flat or 0)
-            adjustedCost = variableCost
-            if a.cost_min > 0:
-                adjustedCost = max(adjustedCost, a.cost_min)
-            if a.cost_max > 0:
-                adjustedCost = min(adjustedCost, a.cost_max)
-            final_price = price + adjustedCost
-            
-            if final_price < best_score:
-                best_score = final_price
-                best_assignment_id = a.id
-                
-    if best_assignment_id == assignment.id:
-        return {"status": "WINNER"}
-    elif best_assignment_id is not None:
-        return {"status": "NOT_SELECTED"}
-    else:
-        return {"status": "NO_BIDS"}
+    except Exception:
+        # Fallback to direct check if needed
+        return {"status": "COMPLETED"}

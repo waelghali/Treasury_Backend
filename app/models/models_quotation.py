@@ -41,6 +41,7 @@ class QuotationRequest(BaseModel):
     window_start = Column(DateTime(timezone=True), nullable=False)
     window_end = Column(DateTime(timezone=True), nullable=False)
     quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative'")
+    max_tolerance_percent = Column(Float, nullable=True, comment="Max allowed % deviation for Execution rates vs Indicative benchmark")
     document_path = Column(Text, nullable=True)
     status = Column(String, default="PENDING", comment="'PENDING_APPROVAL', 'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'REJECTED'")
     token_validity_hours = Column(Integer, default=24, comment="Hours the bank link remains valid after window_end")
