@@ -16,6 +16,8 @@ from sqlalchemy import or_
 from app.core.hashing import get_password_hash, verify_password
 from app.core.security import create_access_token, TokenData # We will use TokenData from core.security
 from app.core.email_service import get_customer_email_settings, get_global_email_settings, send_email, EmailSettings
+from app.services.unified_email_builder import build_security_email_html
+
 
 # Database models and CRUD operations
 import app.models as models
@@ -506,20 +508,13 @@ class AuthService:
             email_settings, email_config_source = get_global_email_settings()
         
         email_subject = "Password Reset Request"
-        email_body = f"""
-        <html>
-        <body>
-            <p>Dear {user.email},</p>
-            <p>You have requested to reset your password for the Treasury Management Platform.</p>
-            <p>Please click on the following link to reset your password:</p>
-            <p><a href="{reset_link}">Reset your password here</a></p>
-            <p>This link is valid for {token_expiry_minutes} minutes.</p>
-            <p>If you did not request a password reset, please ignore this email.</p>
-            <p>Regards,</p>
-            <p>The {{platform_name}} Team</p>
-        </body>
-        </html>
-        """
+        email_body = build_security_email_html(
+            title="Password Reset Request",
+            user_email=user.email,
+            message=f"You have requested to reset your password for your Treasury Management account. Click the button below to proceed. This link is valid for {token_expiry_minutes} minutes.",
+            action_url=reset_link,
+            action_text="Reset Password Now"
+        )
 
         send_success = await send_email(
             db=db,
@@ -530,6 +525,7 @@ class AuthService:
             email_settings=email_settings,
             cc_emails=[] # No CC for password reset
         )
+
 
         log_details = {"email": user.email, "token_id": new_reset_token.id, "email_sent": send_success}
         if not send_success:
@@ -939,16 +935,23 @@ class AuthService:
         from app.core.email_service import get_customer_email_settings, send_email
         email_settings, _ = get_customer_email_settings(db, user.customer_id)
 
-        # Send the email using your existing email_service parameters
+        mfa_body = build_security_email_html(
+            title="Security Verification Code",
+            user_email=user.email,
+            message="Please use the verification code below to complete your login. This code is valid for 10 minutes.",
+            otp_code=raw_code
+        )
+
         await send_email(
             db=db,
             to_emails=[user.email],
-            subject_template="Your Verification Code",
-            sender_name="Grow BD Security",
-            body_template=f"Your security code is: <b>{raw_code}</b>. It expires in 10 minutes.",
+            subject_template="Your Security Verification Code",
+            sender_name="Grow Security",
+            body_template=mfa_body,
             template_data={},
             email_settings=email_settings
         )
+
         
         # Optional: Print to console so you can test even if SMTP is not configured
         print(f"DEBUG: MFA Code for {user.email} is {raw_code}")

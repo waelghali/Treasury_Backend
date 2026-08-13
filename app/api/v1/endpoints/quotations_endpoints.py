@@ -10,6 +10,8 @@ from app.database import get_db
 from app.core.security import get_current_active_user, TokenData
 from app.crud.crud import log_action
 from app.core.email_service import send_email, get_global_email_settings
+from app.services.unified_email_builder import build_transaction_email_html, build_standard_email_html
+
 
 from app.schemas.schemas_quotation import (
     QuotationBankCreate, QuotationBankOut,
@@ -674,50 +676,36 @@ async def send_rfq_results(
         ref_no = rfq.ref_no
         customer_name = rfq.customer.name if rfq.customer else "Treasury Client"
         if is_winner:
-            subject = f"Deal Confirmation: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
-            body = f"""
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827;">
-                <div style="background-color: #059669; color: #ffffff; padding: 20px; border-radius: 12px 12px 0 0;">
-                    <h2 style="margin: 0; font-size: 20px;">Trade Execution Confirmation</h2>
-                    <p style="margin: 4px 0 0 0; font-size: 13px; opacity: 0.9;">RFQ Reference: {ref_no}</p>
-                </div>
-                <div style="border: 1px solid #e5e7eb; border-top: none; padding: 24px; border-radius: 0 0 12px 12px; background-color: #ffffff;">
-                    <p>Dear {bank_res['bank_name']} Treasury Desk,</p>
-                    <p>We are pleased to confirm the execution of the following trade with <strong>{customer_name}</strong> based on your winning quote:</p>
-                    
-                    <table style="width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 14px;">
-                        <tr style="background-color: #f9fafb;"><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Pair</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.buy_currency}/{rfq.sell_currency}</td></tr>
-                        <tr><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Direction</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.direction}</td></tr>
-                        <tr style="background-color: #f9fafb;"><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Amount</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.amount:,.2f} {rfq.buy_currency}</td></tr>
-                        <tr><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Executed Rate</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold; color: #059669;">{bank_res['price']:.5f}</td></tr>
-                        <tr style="background-color: #f9fafb;"><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">All-In Effective Rate</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{bank_res['finalPrice']:.5f}</td></tr>
-                        <tr><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Value Date</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.value_date or 'Standard Spot'}</td></tr>
-                    </table>
-                    
-                    <p style="font-size: 13px; color: #4b5563;">Please proceed with the standard settlement instructions.</p>
-                    <hr style="border: none; border-top: 1px solid #f3f4f6; margin: 20px 0;" />
-                    <p style="font-size: 12px; color: #9ca3af; margin: 0;">Best regards,<br/><strong>{customer_name} Treasury Team</strong></p>
-                </div>
-            </div>
-            """
+            subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
+            body = build_transaction_email_html(
+                customer_name=customer_name,
+                title="📈 Trade Execution Confirmation",
+                transaction_ref=ref_no,
+                transaction_type="RFQ Execution",
+                key_value_dict={
+                    "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                    "Direction": rfq.direction,
+                    "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
+                    "Executed Rate": f"<span style='color: #16a34a; font-weight: 700;'>{bank_res['price']:.5f}</span>",
+                    "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
+                    "Value Date": rfq.value_date or 'Standard Spot'
+                },
+                summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
+                recipient_name=f"{bank_res['bank_name']} Treasury Desk"
+            )
         else:
             subject = f"RFQ Result Notification: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
-            body = f"""
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827;">
-                <div style="background-color: #4b5563; color: #ffffff; padding: 20px; border-radius: 12px 12px 0 0;">
-                    <h2 style="margin: 0; font-size: 20px;">RFQ Result Notification</h2>
-                    <p style="margin: 4px 0 0 0; font-size: 13px; opacity: 0.9;">RFQ Reference: {ref_no}</p>
-                </div>
-                <div style="border: 1px solid #e5e7eb; border-top: none; padding: 24px; border-radius: 0 0 12px 12px; background-color: #ffffff;">
-                    <p>Dear {bank_res['bank_name']} Treasury Desk,</p>
-                    <p>Thank you for participating in the Request for Quotation (RFQ) for <strong>{rfq.buy_currency}/{rfq.sell_currency}</strong> with <strong>{customer_name}</strong>.</p>
-                    <p>We are writing to inform you that your quote was not selected for this specific deal as we executed with another counterparty at a more competitive all-in rate.</p>
-                    <p style="font-size: 13px; color: #4b5563;">We appreciate your prompt participation and look forward to receiving your quotes on future requests.</p>
-                    <hr style="border: none; border-top: 1px solid #f3f4f6; margin: 20px 0;" />
-                    <p style="font-size: 12px; color: #9ca3af; margin: 0;">Best regards,<br/><strong>{customer_name} Treasury Team</strong></p>
-                </div>
-            </div>
-            """
+            body = build_standard_email_html(
+                customer_name=customer_name,
+                title="RFQ Result Notification",
+                content_html=f"""
+                <p>Thank you for participating in the Request for Quotation (RFQ) for <strong>{rfq.buy_currency}/{rfq.sell_currency}</strong> with <strong>{customer_name}</strong>.</p>
+                <p>We are writing to inform you that your quote was not selected for this specific deal as we executed with another counterparty at a more competitive all-in rate.</p>
+                <p>We appreciate your prompt participation and look forward to receiving your quotes on future requests.</p>
+                """,
+                recipient_name=f"{bank_res['bank_name']} Treasury Desk"
+            )
+
         
         # Override sender name to "Treasury Quotations" if using system default
         sender_name = "Treasury Quotations" if source != "customer_specific" else email_settings.sender_display_name

@@ -23,6 +23,12 @@ from app.core.email_service import (
     get_customer_email_settings, 
     send_email
 )
+from app.services.unified_email_builder import (
+    build_standard_email_html,
+    build_alert_email_html,
+    build_transaction_email_html
+)
+
 from app.crud.crud import (
     crud_customer,
     crud_customer_configuration,
@@ -555,11 +561,23 @@ async def _send_sub_notification(db: Session, customer: models.Customer, type_en
         return
 
     email_settings, method = get_customer_email_settings(db, customer.id)
+    alert_severity = "critical" if ("7_DAYS" in type_enum.value or "EXPIRED" in type_enum.value) else "warning"
+    
+    body_html = build_alert_email_html(
+        customer_name=customer.name,
+        title=subject,
+        alert_type=alert_severity,
+        message=body_text,
+        cta_text="Manage Subscription",
+        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/subscription"
+    )
+
     sent, error_reason = await send_email(
         db=db, to_emails=to_emails, subject_template=subject,
-        body_template=body_text, template_data={},
+        body_template=body_html, template_data={},
         email_settings=email_settings, sender_name=customer.name
     )
+
 
     log_action(
         db, None, f"NOTIFICATION_{'SENT' if sent else 'FAILED'}_{type_enum.value}", 
@@ -1444,36 +1462,41 @@ async def run_daily_sla_breach_alerts(db: Session):
 
                 # Build email body
                 lg_rows = "".join([
-                    f"<tr><td style='padding:6px;border:1px solid #e5e7eb;'>{b['ref']}</td>"
-                    f"<td style='padding:6px;border:1px solid #e5e7eb;text-align:center;'>{b['sla_days']}</td>"
-                    f"<td style='padding:6px;border:1px solid #e5e7eb;text-align:center;color:#dc2626;font-weight:bold;'>{b['elapsed_days']}</td></tr>"
+                    f"<tr style='border-bottom: 1px solid #e2e8f0;'><td style='padding:10px 12px; font-weight:600;'>{b['ref']}</td>"
+                    f"<td style='padding:10px 12px; text-align:center;'>{b['sla_days']}</td>"
+                    f"<td style='padding:10px 12px; text-align:center; color:#dc2626; font-weight:700;'>{b['elapsed_days']}d</td></tr>"
                     for b in breaches
                 ])
 
+                cust = db.query(models.Customer).filter(models.Customer.id == cust_id).first()
+                cust_name = cust.name if cust else "Grow Treasury"
                 subject = f"⚠️ SLA Breach Alert — {len(breaches)} LG(s) Awaiting Bank Response"
-                body = f"""
-                <html>
-                <body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f5f5f5; padding: 20px;">
-                    <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
-                        <h2 style="color: #dc2626; margin-top: 0;">⚠️ SLA Breach Alert</h2>
-                        <p>The following LG issuance requests have exceeded the agreed SLA with the bank and are still pending a response:</p>
-                        <table style="width:100%; border-collapse:collapse; margin:15px 0;">
-                            <tr style="background:#f9fafb;">
-                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">LG Reference</th>
-                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:center;">SLA (days)</th>
-                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:center;">Elapsed (days)</th>
-                            </tr>
-                            {lg_rows}
-                        </table>
-                        <p>Please follow up with the respective bank(s) to expedite the issuance.</p>
-                        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;" />
-                        <p style="font-size: 12px; color: #999;">Automated notification from Treasury LG Issuance system.</p>
-                    </div>
-                </body>
-                </html>
+                
+                table_html = f"""
+                <table style="width:100%; border-collapse:collapse; text-align:left;">
+                    <thead>
+                        <tr style="background:#f8fafc; border-bottom:2px solid #e2e8f0;">
+                            <th style="padding:10px 12px; font-size:12px; font-weight:700; color:#475569;">LG Reference</th>
+                            <th style="padding:10px 12px; font-size:12px; font-weight:700; color:#475569; text-align:center;">SLA (days)</th>
+                            <th style="padding:10px 12px; font-size:12px; font-weight:700; color:#dc2626; text-align:center;">Elapsed</th>
+                        </tr>
+                    </thead>
+                    <tbody>{lg_rows}</tbody>
+                </table>
                 """
 
+                body = build_alert_email_html(
+                    customer_name=cust_name,
+                    title="⚠️ SLA Breach Alert",
+                    alert_type="critical",
+                    message=f"The following LG issuance request(s) have exceeded the agreed SLA with the bank and are still pending a response. Please follow up with the respective bank(s).",
+                    details_table_html=table_html,
+                    cta_text="Review Pending Requests",
+                    cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/issuance/requests"
+                )
+
                 await send_email(db, recipient_emails, subject, body, {}, email_settings)
+
 
                 # In-App Notifications
                 for user_id in recipient_ids:
@@ -2052,18 +2075,25 @@ async def run_daily_reconciliation_reminders(db: Session):
 
             if to_emails:
                 try:
-                    email_settings, _ = get_customer_email_settings(db, customer.id)
-                    cc_emails = _get_common_cc_emails(db, customer.id)
+                    recon_body_html = build_alert_email_html(
+                        customer_name=customer.name,
+                        title="Action Required: LG Position Reconciliation Overdue",
+                        alert_type="warning",
+                        message=f"{message} Please log in to the Treasury Management Platform and upload the latest bank position reports to complete the reconciliation process.",
+                        cta_text="Perform Position Reconciliation",
+                        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/issuance/reconciliation"
+                    )
                     await send_email(
                         db=db,
                         to_emails=to_emails,
                         cc_emails=cc_emails,
                         subject_template="Action Required: LG Position Reconciliation Overdue",
-                        body_template=f"<html><body style='font-family: Arial, sans-serif; color: #333; padding: 20px;'><p>Dear Treasury Team,</p><p>{message}</p><p>Please log in to the Treasury Management Platform and upload the latest bank position reports to complete the reconciliation process.</p></body></html>",
+                        body_template=recon_body_html,
                         template_data={},
                         email_settings=email_settings,
                         sender_name=customer.name,
                     )
+
                 except Exception as email_err:
                     logger.error(f"Failed to send reconciliation reminder email: {email_err}")
 
@@ -2199,30 +2229,31 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
                     label = "ESCALATION" if is_escalation else "Reminder"
 
                     subject = f"{icon} {label}: LG {ref} — {action.action_type.replace('_', ' ')} letter not yet printed ({days_old} days)"
-                    body = f"""
-                    <html><body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 20px;">
-                    <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);{' border: 2px solid #dc2626;' if is_escalation else ''}">
-                        <h2 style="color: {color};">{icon} Maintenance Letter — Print {label}</h2>
-                        <p>The <strong>{action.action_type.replace('_', ' ')}</strong> letter for LG <strong>{ref}</strong> was issued <strong>{days_old} days ago</strong> but has not been printed yet.</p>
-                        {"<p style='color: #dc2626; font-weight: bold;'>This is an escalation notice. Please ensure the letter is printed and delivered to the bank promptly.</p>" if is_escalation else "<p>Please print and deliver the instruction letter to the bank at your earliest convenience.</p>"}
-                        <div style="background: #f8fafc; border-left: 4px solid {color}; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                            <table style="width: 100%; border-collapse: collapse;">
-                                <tr><td style="padding: 4px 0; color: #666;">LG Reference:</td><td style="padding: 4px 0; font-weight: bold;">{ref}</td></tr>
-                                <tr><td style="padding: 4px 0; color: #666;">Action Type:</td><td style="padding: 4px 0;">{action.action_type.replace('_', ' ')}</td></tr>
-                                <tr><td style="padding: 4px 0; color: #666;">Days Since Issue:</td><td style="padding: 4px 0; font-weight: bold; color: {color};">{days_old} days</td></tr>
-                            </table>
-                        </div>
-                        <div style="text-align: center; margin: 25px 0;">
-                            <a href="{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs" style="padding: 12px 30px; background: {color}; color: #fff; text-decoration: none; border-radius: 8px; font-weight: bold;">View in System</a>
-                        </div>
-                        <hr style="border: none; border-top: 1px solid #eee;" />
-                        <p style="font-size: 12px; color: #999;">Automated notification from Treasury LG Issuance system.</p>
-                    </div></body></html>
+                    
+                    table_details = f"""
+                    <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                        <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 8px 12px; font-weight: 600; color: #475569;">LG Reference:</td><td style="padding: 8px 12px; font-weight: 700;">{ref}</td></tr>
+                        <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 8px 12px; font-weight: 600; color: #475569;">Action Type:</td><td style="padding: 8px 12px;">{action.action_type.replace('_', ' ')}</td></tr>
+                        <tr><td style="padding: 8px 12px; font-weight: 600; color: #475569;">Days Since Issue:</td><td style="padding: 8px 12px; font-weight: 700; color: {color};">{days_old} days</td></tr>
+                    </table>
                     """
+
+                    escalation_msg = "This is an escalation notice. Please ensure the letter is printed and delivered to the bank promptly." if is_escalation else "Please print and deliver the instruction letter to the bank at your earliest convenience."
+
+                    body = build_alert_email_html(
+                        customer_name=customer.name,
+                        title=f"{icon} Maintenance Letter — Print {label}",
+                        alert_type="critical" if is_escalation else "warning",
+                        message=f"The <strong>{action.action_type.replace('_', ' ')}</strong> letter for LG <strong>{ref}</strong> was issued <strong>{days_old} days ago</strong> but has not been printed yet. {escalation_msg}",
+                        details_table_html=table_details,
+                        cta_text="View in Action Center",
+                        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs"
+                    )
 
                     sent = await send_email(
                         db=db, to_emails=to_emails, cc_emails=cc_emails,
                         subject_template=subject, body_template=body, template_data={},
+
                         email_settings=email_settings, sender_name=customer.name
                     )
 
