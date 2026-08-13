@@ -449,6 +449,13 @@ def get_rfq_results(
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq_id).all()
     
     results = []
+    winner_bank_id = None
+    is_inconclusive = False
+    inconclusive_reason = None
+    best_indicative_rate = None
+    best_execution_rate = None
+    deviation_percent = None
+    has_execution_banks = False
     
     if rfq.type == 'TBILL':
         all_tbill_offers = []
@@ -555,6 +562,8 @@ def get_rfq_results(
 
         # Sort results: Lowest score wins (Lowest price for buy, Lowest DR for sell)
         results.sort(key=lambda x: (x['best_score'] is None, x['best_score']))
+        if results and results[0].get('best_score') is not None:
+            winner_bank_id = results[0]['bank_id']
 
     else:
         # FX_SPOT
@@ -864,12 +873,12 @@ def export_quotations_csv(
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """Exports a detailed CSV report containing all RFQs and every bank quote submitted."""
-    rfqs = db.query(QuotationRequest).filter(
-        QuotationRequest.customer_id == current_user.customer_id
-    ).order_by(QuotationRequest.created_at.desc()).all()
+    rfqs = crud_quotation.get_requests(db, customer_id=current_user.customer_id)
     
-    output = io.StringIO()
-    writer = csv.writer(output)
+    output = io.BytesIO()
+    output.write(b'\xef\xbb\xbf')
+    text_wrapper = io.TextIOWrapper(output, encoding='utf-8', newline='')
+    writer = csv.writer(text_wrapper, lineterminator='\r\n')
     
     # Write detailed headers
     writer.writerow([
@@ -881,39 +890,58 @@ def export_quotations_csv(
     ])
     
     for rfq in rfqs:
-        res_data = get_rfq_results(rfq.id, db, current_user)
-        results = res_data.get("results", [])
-        winner_bank_id = res_data.get("winner_bank_id")
-        creator_name = rfq.creator.username if rfq.creator else "End User"
-        
-        if not results:
-            writer.writerow([
-                rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,
-                rfq.buy_currency or "", rfq.sell_currency or "", rfq.value_date or "",
-                rfq.status, rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
-                "No Banks Assigned", "", "", "", "", "", "", "NO",
-                creator_name, rfq.created_at.isoformat() if rfq.created_at else ""
-            ])
-        else:
-            for b in results:
-                is_win = "YES" if (winner_bank_id and b.get("bank_id") == winner_bank_id) else "NO"
+        try:
+            res_data = get_rfq_results(rfq.id, db, current_user)
+            results = res_data.get("results", [])
+            winner_bank_id = res_data.get("winner_bank_id")
+            creator_name = (rfq.creator.email.split('@')[0] if (rfq.creator and rfq.creator.email) else getattr(rfq, 'creator_name', 'End User')) or "End User"
+            
+            if not results:
                 writer.writerow([
                     rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,
                     rfq.buy_currency or "", rfq.sell_currency or "", rfq.value_date or "",
                     rfq.status, rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
-                    b.get("bank_name", ""), b.get("quotation_base", ""),
-                    "YES" if b.get("is_document_visible") else "NO",
-                    b.get("price") if b.get("price") is not None else "No Quote",
-                    b.get("bank_fee_total") if b.get("bank_fee_total") is not None else "",
-                    b.get("finalPrice") if b.get("finalPrice") is not None else "",
-                    b.get("submitted_at").isoformat() if (b.get("submitted_at") and hasattr(b.get("submitted_at"), 'isoformat')) else (b.get("submitted_at") or ""),
-                    is_win, creator_name, rfq.created_at.isoformat() if rfq.created_at else ""
+                    "No Banks Assigned", "", "", "", "", "", "", "NO",
+                    creator_name, rfq.created_at.isoformat() if (rfq.created_at and hasattr(rfq.created_at, 'isoformat')) else str(rfq.created_at or "")
                 ])
-                
-    output.seek(0)
+            else:
+                for b in results:
+                    is_win = "YES" if (winner_bank_id and b.get("bank_id") == winner_bank_id) else "NO"
+                    sub_time = b.get("submitted_at")
+                    if sub_time and hasattr(sub_time, 'isoformat'):
+                        sub_time = sub_time.isoformat()
+                    else:
+                        sub_time = str(sub_time or "")
+
+                    created_at_str = rfq.created_at
+                    if created_at_str and hasattr(created_at_str, 'isoformat'):
+                        created_at_str = created_at_str.isoformat()
+                    else:
+                        created_at_str = str(created_at_str or "")
+
+                    writer.writerow([
+                        rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,
+                        rfq.buy_currency or "", rfq.sell_currency or "", rfq.value_date or "",
+                        rfq.status, rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
+                        b.get("bank_name", ""), b.get("quotation_base", ""),
+                        "YES" if b.get("is_document_visible") else "NO",
+                        b.get("price") if b.get("price") is not None else "No Quote",
+                        b.get("bank_fee_total") if b.get("bank_fee_total") is not None else "",
+                        b.get("finalPrice") if b.get("finalPrice") is not None else "",
+                        sub_time,
+                        is_win, creator_name, created_at_str
+                    ])
+        except Exception as rfq_err:
+            logger.warning(f"Skipping RFQ {rfq.id} in CSV export due to error: {rfq_err}")
+            continue
+
+    text_wrapper.flush()
     filename = f"quotation_detailed_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return Response(
         content=output.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
     )

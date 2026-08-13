@@ -140,10 +140,11 @@ class CRUDQuotation:
         db.refresh(db_rfq)
         return db_rfq, assignments
 
-    def get_requests(self, db: Session, customer_id: int):
-        reqs = db.query(QuotationRequest).filter(
-            QuotationRequest.customer_id == customer_id
-        ).order_by(QuotationRequest.created_at.desc()).all()
+    def get_requests(self, db: Session, customer_id: int = None):
+        query = db.query(QuotationRequest)
+        if customer_id is not None:
+            query = query.filter(QuotationRequest.customer_id == customer_id)
+        reqs = query.order_by(QuotationRequest.created_at.desc()).all()
         for r in reqs:
             if r.creator:
                 r.creator_name = r.creator.email.split('@')[0] if r.creator.email else "End User"
