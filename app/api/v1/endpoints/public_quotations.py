@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
+import os
 
 from app.database import get_db
 from app.models.models_quotation import QuotationBankAssignment, QuotationRequest, QuotationOffer, QuotationTBillOffer, QuotationBank

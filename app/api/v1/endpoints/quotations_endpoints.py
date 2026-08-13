@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response
 from sqlalchemy.orm import Session
 from typing import List, Any
 from datetime import datetime, timezone
 import logging
+import csv
+import io
 import os
 import uuid
 import shutil
@@ -837,3 +839,63 @@ def mark_notification_as_read(
     notif.is_read = True
     db.commit()
     return {"message": "Notification marked as read"}
+
+@router.get("/export-csv")
+def export_quotations_csv(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Exports a detailed CSV report containing all RFQs and every bank quote submitted."""
+    rfqs = db.query(QuotationRequest).filter(
+        QuotationRequest.customer_id == current_user.customer_id
+    ).order_by(QuotationRequest.created_at.desc()).all()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write detailed headers
+    writer.writerow([
+        "RFQ Reference", "Type", "Direction", "Amount", "Buy Currency", "Sell Currency",
+        "Value Date", "RFQ Status", "Master Quotation Base", "Max Tolerance %",
+        "Bank Name", "Bank Base Type", "Document Visible", "Submitted Base Rate",
+        "Bank Fee Total", "All-In Effective Rate", "Submission Time", "Is Winner",
+        "Created By", "Created At"
+    ])
+    
+    for rfq in rfqs:
+        res_data = get_rfq_results(rfq.id, db, current_user)
+        results = res_data.get("results", [])
+        winner_bank_id = res_data.get("winner_bank_id")
+        creator_name = rfq.creator.username if rfq.creator else "End User"
+        
+        if not results:
+            writer.writerow([
+                rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,
+                rfq.buy_currency or "", rfq.sell_currency or "", rfq.value_date or "",
+                rfq.status, rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
+                "No Banks Assigned", "", "", "", "", "", "", "NO",
+                creator_name, rfq.created_at.isoformat() if rfq.created_at else ""
+            ])
+        else:
+            for b in results:
+                is_win = "YES" if (winner_bank_id and b.get("bank_id") == winner_bank_id) else "NO"
+                writer.writerow([
+                    rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,
+                    rfq.buy_currency or "", rfq.sell_currency or "", rfq.value_date or "",
+                    rfq.status, rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
+                    b.get("bank_name", ""), b.get("quotation_base", ""),
+                    "YES" if b.get("is_document_visible") else "NO",
+                    b.get("price") if b.get("price") is not None else "No Quote",
+                    b.get("bank_fee_total") if b.get("bank_fee_total") is not None else "",
+                    b.get("finalPrice") if b.get("finalPrice") is not None else "",
+                    b.get("submitted_at").isoformat() if (b.get("submitted_at") and hasattr(b.get("submitted_at"), 'isoformat')) else (b.get("submitted_at") or ""),
+                    is_win, creator_name, rfq.created_at.isoformat() if rfq.created_at else ""
+                ])
+                
+    output.seek(0)
+    filename = f"quotation_detailed_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
