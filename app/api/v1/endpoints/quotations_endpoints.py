@@ -32,21 +32,35 @@ async def upload_quotation_documents(
     files: List[UploadFile] = File(...),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Uploads supporting documents for a quotation request and returns path objects."""
-    os.makedirs("uploads/quotations", exist_ok=True)
-    uploaded_files = []
+    """Uploads supporting documents for a quotation request to GCS bucket (or local storage fallback)."""
+    from app.core.ai_integration import _upload_to_gcs, generate_signed_gcs_url, GCS_BUCKET_NAME
     
+    uploaded_files = []
     for file in files:
+        file_bytes = await file.read()
         safe_filename = f"{uuid.uuid4().hex[:8]}_{file.filename.replace(' ', '_')}"
-        file_path = os.path.join("uploads", "quotations", safe_filename)
+        blob_path = f"quotations/{safe_filename}"
         
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        rel_path = f"/uploads/quotations/{safe_filename}"
+        doc_url = None
+        if GCS_BUCKET_NAME:
+            try:
+                gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, file_bytes, file.content_type or "application/octet-stream")
+                if gcs_uri:
+                    signed = await generate_signed_gcs_url(gcs_uri, expiration=604800)
+                    doc_url = signed or gcs_uri
+            except Exception as e:
+                logger.warning(f"GCS upload failed for {file.filename}, falling back to local: {e}")
+
+        if not doc_url:
+            os.makedirs("uploads/quotations", exist_ok=True)
+            local_path = os.path.join("uploads", "quotations", safe_filename)
+            with open(local_path, "wb") as buffer:
+                buffer.write(file_bytes)
+            doc_url = f"/uploads/quotations/{safe_filename}"
+
         uploaded_files.append({
             "name": file.filename,
-            "path": rel_path
+            "path": doc_url
         })
         
     return {"documents": uploaded_files}
@@ -414,7 +428,11 @@ def get_rfq_results(
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """Calculates active Quotation standings/results for a given RFQ."""
-    rfq = crud_quotation.get_request(db, rfq_id=rfq_id, customer_id=current_user.customer_id)
+    if current_user:
+        rfq = crud_quotation.get_request(db, rfq_id=rfq_id, customer_id=current_user.customer_id)
+    else:
+        rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
+
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
         

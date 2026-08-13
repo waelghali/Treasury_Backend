@@ -154,6 +154,27 @@ def configure_app_instance(fastapi_app: FastAPI):
         if Base.metadata.tables:
             Base.metadata.create_all(bind=engine)
             logger.info("Database tables verified/created.")
+            try:
+                from sqlalchemy.orm import Session as DBSession
+                from app.models.models import GlobalConfiguration
+                from app.constants import GlobalConfigKey
+                with DBSession(engine) as seed_db:
+                    existing = seed_db.query(GlobalConfiguration).filter(
+                        GlobalConfiguration.key == GlobalConfigKey.QUOTATION_APPROVAL_REQUIRED
+                    ).first()
+                    if not existing:
+                        new_cfg = GlobalConfiguration(
+                            key=GlobalConfigKey.QUOTATION_APPROVAL_REQUIRED,
+                            value_default="false",
+                            unit="boolean",
+                            description="Require Corporate Admin approval before releasing quotation requests to banks",
+                            module_tags=["quotations"]
+                        )
+                        seed_db.add(new_cfg)
+                        seed_db.commit()
+                        logger.info("Seeded QUOTATION_APPROVAL_REQUIRED into global_configurations.")
+            except Exception as seed_err:
+                logger.warning(f"Global configuration seed check skipped: {seed_err}")
         else:
             logger.critical("FATAL: No SQLAlchemy models registered. Tables cannot be created.")
             sys.exit(1)

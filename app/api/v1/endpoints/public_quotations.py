@@ -11,7 +11,7 @@ from app.schemas.schemas_quotation import FXSpotOfferCreate, TBillOfferCreate
 router = APIRouter()
 
 @router.get("/{token}")
-def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
+async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     """Fetch RFQ details securely using token."""
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
@@ -33,26 +33,19 @@ def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
 
     now = datetime.now(timezone.utc)
     
-    # If TimeZone aware datetimes require strict matching, handle offsets
-    try:
-        window_start = rfq.window_start
-        window_end = rfq.window_end
-        is_open = window_start <= now <= window_end
-    except TypeError:
-        # Fallback if naive
-        now_naive = datetime.now()
-        is_open = rfq.window_start <= now_naive <= rfq.window_end
+    # Handle naive vs aware datetimes safely
+    window_start = rfq.window_start
+    window_end = rfq.window_end
+    if window_start and window_start.tzinfo is None:
+        window_start = window_start.replace(tzinfo=timezone.utc)
+    if window_end and window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
 
     # Process Token Validity Expiry
     validity_hours = rfq.token_validity_hours or 24
     from datetime import timedelta
-    try:
-        if now > (rfq.window_end + timedelta(hours=validity_hours)):
-            raise HTTPException(status_code=403, detail="The validity of this link has expired.")
-    except TypeError:
-        now_naive = datetime.now()
-        if now_naive > (rfq.window_end + timedelta(hours=validity_hours)):
-            raise HTTPException(status_code=403, detail="The validity of this link has expired.")
+    if window_end and now > (window_end + timedelta(hours=validity_hours)):
+        raise HTTPException(status_code=403, detail="The validity of this link has expired.")
 
     offers = []
     if rfq.type == 'TBILL':
@@ -72,17 +65,28 @@ def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
 
     parsed_docs = []
     if (assignment.is_document_visible is not False) and rfq.document_path:
+        raw_docs = []
         try:
             import json
             loaded = json.loads(rfq.document_path)
             if isinstance(loaded, list):
-                parsed_docs = loaded
+                raw_docs = loaded
             elif isinstance(loaded, str):
-                parsed_docs = [{"name": os.path.basename(loaded), "path": loaded}]
+                raw_docs = [{"name": os.path.basename(loaded), "path": loaded}]
         except Exception:
             raw_paths = [p.strip() for p in rfq.document_path.split(',') if p.strip()]
-            for p in raw_paths:
-                parsed_docs.append({"name": os.path.basename(p), "path": p})
+            raw_docs = [{"name": os.path.basename(p), "path": p} for p in raw_paths]
+
+        from app.core.ai_integration import generate_signed_gcs_url
+        for d in raw_docs:
+            p_str = d.get("path", "")
+            if p_str.startswith("gs://"):
+                try:
+                    signed_url = await generate_signed_gcs_url(p_str, expiration=604800)
+                    p_str = signed_url or p_str
+                except Exception:
+                    pass
+            parsed_docs.append({"name": d.get("name") or "Document", "path": p_str})
 
     return {
         "id": rfq.id,
