@@ -69,14 +69,6 @@ def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         if offer:
             offers = [{"price": offer.price, "submitted_at": offer.submitted_at}]
 
-    return {
-        "id": rfq.id,
-        "ref_no": rfq.ref_no,
-        "type": rfq.type,
-        "direction": rfq.direction,
-        "value_date": rfq.value_date,
-        "amount": rfq.amount,
-        "min_ticket_amount": rfq.min_ticket_amount,
     parsed_docs = []
     if (assignment.is_document_visible is not False) and rfq.document_path:
         try:
