@@ -41,6 +41,11 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     if window_end and window_end.tzinfo is None:
         window_end = window_end.replace(tzinfo=timezone.utc)
 
+    # Calculate is_open boolean
+    is_open = False
+    if window_start and window_end:
+        is_open = (window_start <= now <= window_end)
+
     # Process Token Validity Expiry
     validity_hours = rfq.token_validity_hours or 24
     from datetime import timedelta
