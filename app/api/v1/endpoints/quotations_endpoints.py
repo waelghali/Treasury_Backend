@@ -1,10 +1,11 @@
-# app/api/v1/endpoints/quotations_endpoints.py
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List, Any
 from datetime import datetime, timezone
 import logging
 import os
+import uuid
+import shutil
 
 from app.database import get_db
 from app.core.security import get_current_active_user, TokenData
@@ -23,6 +24,30 @@ from app.models.models_quotation import QuotationRequest, QuotationBankAssignmen
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+@router.post("/upload-documents")
+async def upload_quotation_documents(
+    files: List[UploadFile] = File(...),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Uploads supporting documents for a quotation request and returns path objects."""
+    os.makedirs("uploads/quotations", exist_ok=True)
+    uploaded_files = []
+    
+    for file in files:
+        safe_filename = f"{uuid.uuid4().hex[:8]}_{file.filename.replace(' ', '_')}"
+        file_path = os.path.join("uploads", "quotations", safe_filename)
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        rel_path = f"/uploads/quotations/{safe_filename}"
+        uploaded_files.append({
+            "name": file.filename,
+            "path": rel_path
+        })
+        
+    return {"documents": uploaded_files}
 
 @router.post("/banks", response_model=QuotationBankOut)
 def create_quotation_bank(

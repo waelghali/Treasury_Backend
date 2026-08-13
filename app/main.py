@@ -208,6 +208,11 @@ def configure_app_instance(fastapi_app: FastAPI):
         dependencies=[Depends(require_customer_one)]
     )
 
+    # --- Static Files Mounting for Supporting Uploads ---
+    from fastapi.staticfiles import StaticFiles
+    os.makedirs("uploads/quotations", exist_ok=True)
+    fastapi_app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
     # --- APScheduler Setup ---
     scheduler = AsyncIOScheduler()
     fastapi_app.state.scheduler = scheduler
