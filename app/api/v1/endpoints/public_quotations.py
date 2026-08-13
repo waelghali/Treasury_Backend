@@ -77,6 +77,28 @@ def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "value_date": rfq.value_date,
         "amount": rfq.amount,
         "min_ticket_amount": rfq.min_ticket_amount,
+    parsed_docs = []
+    if (assignment.is_document_visible is not False) and rfq.document_path:
+        try:
+            import json
+            loaded = json.loads(rfq.document_path)
+            if isinstance(loaded, list):
+                parsed_docs = loaded
+            elif isinstance(loaded, str):
+                parsed_docs = [{"name": os.path.basename(loaded), "path": loaded}]
+        except Exception:
+            raw_paths = [p.strip() for p in rfq.document_path.split(',') if p.strip()]
+            for p in raw_paths:
+                parsed_docs.append({"name": os.path.basename(p), "path": p})
+
+    return {
+        "id": rfq.id,
+        "ref_no": rfq.ref_no,
+        "type": rfq.type,
+        "direction": rfq.direction,
+        "value_date": rfq.value_date,
+        "amount": rfq.amount,
+        "min_ticket_amount": rfq.min_ticket_amount,
         "buy_currency": rfq.buy_currency,
         "sell_currency": rfq.sell_currency,
         "settlement_date_start": rfq.settlement_date_start,
@@ -88,6 +110,7 @@ def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "window_end": rfq.window_end,
         "quotation_base": assignment.quotation_base or rfq.quotation_base,
         "document_path": rfq.document_path if (assignment.is_document_visible is not False) else None,
+        "documents": parsed_docs,
         "status": rfq.status,
         "assignment_id": assignment.id,
         "bank_name": bank_name,

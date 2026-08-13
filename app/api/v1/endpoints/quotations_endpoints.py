@@ -75,6 +75,41 @@ def get_quotation_banks(
 ):
     return crud_quotation.get_quotation_banks(db, customer_id=current_user.customer_id, trade_type=trade_type)
 
+@router.get("/banks/latest-costs")
+def get_latest_bank_costs(
+    bank_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Retrieves cost settings from the most recent approved RFQ for a given bank."""
+    q_banks = db.query(QuotationBank).filter(
+        QuotationBank.customer_id == current_user.customer_id,
+        QuotationBank.bank_id == bank_id
+    ).all()
+    q_bank_ids = [qb.id for qb in q_banks]
+    
+    if not q_bank_ids:
+        return {"cost_min": 0.0, "cost_percent": 0.0, "cost_max": 0.0, "cost_flat": 0.0}
+        
+    latest_assignment = db.query(QuotationBankAssignment).join(
+        QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
+    ).filter(
+        QuotationBankAssignment.quotation_bank_id.in_(q_bank_ids),
+        QuotationRequest.customer_id == current_user.customer_id,
+        QuotationRequest.status.in_(['PENDING', 'EVALUATING', 'COMPLETED'])
+    ).order_by(QuotationRequest.created_at.desc()).first()
+    
+    if latest_assignment:
+        return {
+            "cost_min": latest_assignment.cost_min or 0.0,
+            "cost_percent": latest_assignment.cost_percent or 0.0,
+            "cost_max": latest_assignment.cost_max or 0.0,
+            "cost_flat": latest_assignment.cost_flat or 0.0,
+            "quotation_base": latest_assignment.quotation_base
+        }
+        
+    return {"cost_min": 0.0, "cost_percent": 0.0, "cost_max": 0.0, "cost_flat": 0.0}
+
 @router.post("/", response_model=Any)
 def create_rfq(
     rfq_in: QuotationRequestCreate,
@@ -496,12 +531,18 @@ def get_rfq_results(
                 continue
             
             price = offer_db.price
-            variableCost = (price * (a.cost_percent / 100)) + float(a.cost_flat or 0)
-            adjustedCost = variableCost
-            if a.cost_min > 0:
-                adjustedCost = max(adjustedCost, a.cost_min)
-            if a.cost_max > 0:
-                adjustedCost = min(adjustedCost, a.cost_max)
+            deal_amount = float(rfq.amount or 1.0)
+            base_deal_volume = deal_amount * price
+            raw_fee = (base_deal_volume * (float(a.cost_percent or 0) / 100.0)) + float(a.cost_flat or 0)
+            clamped_fee = raw_fee
+            if a.cost_min and a.cost_min > 0:
+                clamped_fee = max(clamped_fee, float(a.cost_min))
+            if a.cost_max and a.cost_max > 0:
+                clamped_fee = min(clamped_fee, float(a.cost_max))
+                
+            fee_per_unit = clamped_fee / deal_amount if deal_amount > 0 else 0.0
+            is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
+            final_all_in_price = (price - fee_per_unit) if is_sell_dir else (price + fee_per_unit)
                 
             results.append({
                 "bank_id": q_bank.bank_id if q_bank else 0,
@@ -509,7 +550,9 @@ def get_rfq_results(
                 "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
                 "bank_emails": q_bank.emails if q_bank else "",
                 "price": price,
-                "finalPrice": price + adjustedCost,
+                "finalPrice": final_all_in_price,
+                "bank_fee_total": clamped_fee,
+                "fee_per_unit": fee_per_unit,
                 "submitted_at": offer_db.submitted_at,
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
@@ -629,32 +672,51 @@ async def send_rfq_results(
         is_winner = (bank_res['bank_id'] == winner_bank_id)
         
         ref_no = rfq.ref_no
+        customer_name = rfq.customer.name if rfq.customer else "Treasury Client"
         if is_winner:
             subject = f"Deal Confirmation: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
             body = f"""
-            <h3>Deal Confirmation</h3>
-            <p>Dear {bank_res['bank_name']} FX Desk,</p>
-            <p>We are pleased to confirm the execution of the following trade based on your winning quote:</p>
-            <ul>
-                <li><strong>Reference:</strong> {ref_no}</li>
-                <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
-                <li><strong>Amount:</strong> {rfq.amount:,.2f}</li>
-                <li><strong>Executed Rate:</strong> {bank_res['price']:.5f}</li>
-                <li><strong>Value Date:</strong> {rfq.value_date}</li>
-            </ul>
-            <p>Please proceed with the standard settlement instructions.</p>
-            <p>Best regards,<br/>Treasury Team</p>
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827;">
+                <div style="background-color: #059669; color: #ffffff; padding: 20px; border-radius: 12px 12px 0 0;">
+                    <h2 style="margin: 0; font-size: 20px;">Trade Execution Confirmation</h2>
+                    <p style="margin: 4px 0 0 0; font-size: 13px; opacity: 0.9;">RFQ Reference: {ref_no}</p>
+                </div>
+                <div style="border: 1px solid #e5e7eb; border-top: none; padding: 24px; border-radius: 0 0 12px 12px; background-color: #ffffff;">
+                    <p>Dear {bank_res['bank_name']} Treasury Desk,</p>
+                    <p>We are pleased to confirm the execution of the following trade with <strong>{customer_name}</strong> based on your winning quote:</p>
+                    
+                    <table style="width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 14px;">
+                        <tr style="background-color: #f9fafb;"><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Pair</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.buy_currency}/{rfq.sell_currency}</td></tr>
+                        <tr><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Direction</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.direction}</td></tr>
+                        <tr style="background-color: #f9fafb;"><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Amount</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.amount:,.2f} {rfq.buy_currency}</td></tr>
+                        <tr><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Executed Rate</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold; color: #059669;">{bank_res['price']:.5f}</td></tr>
+                        <tr style="background-color: #f9fafb;"><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">All-In Effective Rate</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{bank_res['finalPrice']:.5f}</td></tr>
+                        <tr><td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-weight: bold;">Value Date</td><td style="padding: 10px; border-bottom: 1px solid #f3f4f6;">{rfq.value_date or 'Standard Spot'}</td></tr>
+                    </table>
+                    
+                    <p style="font-size: 13px; color: #4b5563;">Please proceed with the standard settlement instructions.</p>
+                    <hr style="border: none; border-top: 1px solid #f3f4f6; margin: 20px 0;" />
+                    <p style="font-size: 12px; color: #9ca3af; margin: 0;">Best regards,<br/><strong>{customer_name} Treasury Team</strong></p>
+                </div>
+            </div>
             """
         else:
-            subject = f"RFQ Result: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
+            subject = f"RFQ Result Notification: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
             body = f"""
-            <h3>RFQ Result Notification</h3>
-            <p>Dear {bank_res['bank_name']} FX Desk,</p>
-            <p>Thank you for participating in our Request for Quotation (RFQ) for {rfq.buy_currency}/{rfq.sell_currency}.</p>
-            <p><strong>REFERENCE:</strong> {ref_no}</p>
-            <p>We are writing to inform you that your quote was not selected for this specific transaction as we have executed with another counterparty at a more competitive all-in rate.</p>
-            <p>We appreciate your participation and look forward to your quotes on future requests.</p>
-            <p>Best regards,<br/>Treasury Team</p>
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827;">
+                <div style="background-color: #4b5563; color: #ffffff; padding: 20px; border-radius: 12px 12px 0 0;">
+                    <h2 style="margin: 0; font-size: 20px;">RFQ Result Notification</h2>
+                    <p style="margin: 4px 0 0 0; font-size: 13px; opacity: 0.9;">RFQ Reference: {ref_no}</p>
+                </div>
+                <div style="border: 1px solid #e5e7eb; border-top: none; padding: 24px; border-radius: 0 0 12px 12px; background-color: #ffffff;">
+                    <p>Dear {bank_res['bank_name']} Treasury Desk,</p>
+                    <p>Thank you for participating in the Request for Quotation (RFQ) for <strong>{rfq.buy_currency}/{rfq.sell_currency}</strong> with <strong>{customer_name}</strong>.</p>
+                    <p>We are writing to inform you that your quote was not selected for this specific deal as we executed with another counterparty at a more competitive all-in rate.</p>
+                    <p style="font-size: 13px; color: #4b5563;">We appreciate your prompt participation and look forward to receiving your quotes on future requests.</p>
+                    <hr style="border: none; border-top: 1px solid #f3f4f6; margin: 20px 0;" />
+                    <p style="font-size: 12px; color: #9ca3af; margin: 0;">Best regards,<br/><strong>{customer_name} Treasury Team</strong></p>
+                </div>
+            </div>
             """
         
         # Override sender name to "Treasury Quotations" if using system default

@@ -55,6 +55,7 @@ class QuotationRequestCreate(BaseModel):
     windowEnd: datetime
     quotationBase: Optional[str] = None
     maxTolerancePercent: Optional[float] = None
+    documentPath: Optional[str] = None
     selectedBanks: str # JSON string matching Node module format, or we can parse it in FastAPI
     token_validity_hours: Optional[int] = 24
 
@@ -76,6 +77,7 @@ class QuotationRequestOut(BaseModel):
     creator_name: Optional[str] = None
     quotation_base: Optional[str] = None
     max_tolerance_percent: Optional[float] = None
+    document_path: Optional[str] = None
 
     class Config:
         from_attributes = True

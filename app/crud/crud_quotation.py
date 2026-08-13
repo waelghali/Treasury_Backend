@@ -88,7 +88,7 @@ class CRUDQuotation:
             window_end=obj_in.windowEnd,
             quotation_base=obj_in.quotationBase,
             max_tolerance_percent=obj_in.maxTolerancePercent,
-            document_path=document_path,
+            document_path=document_path or obj_in.documentPath,
             status=initial_status
         )
         db.add(db_rfq)
