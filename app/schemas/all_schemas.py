@@ -38,6 +38,8 @@ class SubscriptionPlanBase(BaseModel):
     # NEW: Modular Subscription Toggles
     has_custody_module: bool = Field(True, description="Allows access to Phase 1: LG Custody module")
     has_issuance_module: bool = Field(False, description="Allows access to Phase 2: LG Issuance module")
+    has_quotation_module: bool = Field(False, description="Allows access to FX & T-Bill Quotation module")
+    has_reconciliation_module: bool = Field(False, description="Allows access to Bank Reconciliation module")
     max_issuance_records: int = Field(0, ge=0, description="Maximum number of Issued LG records allowed under this plan")
     max_checker_users: int = Field(0, ge=0, description="Maximum number of users allowed with the CHECKER role specifically")
     
@@ -63,6 +65,8 @@ class SubscriptionPlanUpdate(SubscriptionPlanBase):
     # NEW: Modular Subscription Toggles
     has_custody_module: Optional[bool] = None
     has_issuance_module: Optional[bool] = None
+    has_quotation_module: Optional[bool] = None
+    has_reconciliation_module: Optional[bool] = None
     max_issuance_records: Optional[int] = Field(None, ge=0)
     max_checker_users: Optional[int] = Field(None, ge=0)
     

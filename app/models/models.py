@@ -72,6 +72,8 @@ class SubscriptionPlan(BaseModel):
     # NEW: Modular Subscription Toggles
     has_custody_module = Column(Boolean, default=True, nullable=False, comment="Allows access to Phase 1: LG Custody module")
     has_issuance_module = Column(Boolean, default=False, nullable=False, comment="Allows access to Phase 2: LG Issuance module")
+    has_quotation_module = Column(Boolean, default=False, nullable=False, comment="Allows access to FX & T-Bill Quotation module")
+    has_reconciliation_module = Column(Boolean, default=False, nullable=False, comment="Allows access to Bank Reconciliation module")
     max_issuance_records = Column(Integer, default=0, nullable=False, comment="Maximum number of Issued LG records allowed under this plan")
     
     grace_period_days = Column(Integer, default=30, nullable=False, comment="Grace period in days after subscription end date")

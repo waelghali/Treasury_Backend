@@ -137,8 +137,9 @@ def configure_app_instance(fastapi_app: FastAPI):
         system_owner, corporate_admin, end_user, migration, 
         public, public_issuance, reports, facility_endpoints,
         quotations_endpoints, public_quotations, reconciliation_endpoints,
-        notification_endpoints
+        notification_endpoints, ai_query_assistant
     )
+
     from app.api.v1.endpoints import issuance as issuance_package
     from app.auth_v2.routers import router as auth_v2_router
     from app.crud.crud import crud_customer, crud_customer_configuration, log_action
@@ -200,6 +201,8 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])
     fastapi_app.include_router(public_issuance.router, prefix="/api/v1/public-issuance", tags=["Public Issuance Portal"])
     fastapi_app.include_router(notification_endpoints.router, prefix="/api/v1/notifications", tags=["Notifications"])
+    fastapi_app.include_router(ai_query_assistant.router, prefix="/api/v1/ai-query-assistant", tags=["AI Data Query Assistant (Experimental)"])
+
     
     # Feature Toggle Dependency logic
     from app.core.security import get_current_user

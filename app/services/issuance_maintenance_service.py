@@ -25,9 +25,9 @@ from app.crud.crud import log_action
 logger = logging.getLogger(__name__)
 
 # Action types that require approval matrix
-ACTIONS_REQUIRING_APPROVAL = {"EXTEND", "INCREASE_AMOUNT", "AMENDMENT", "ACTIVATE"}
+ACTIONS_REQUIRING_APPROVAL = {"EXTEND", "INCREASE_AMOUNT", "AMENDMENT", "ACTIVATE", "CANCEL_LIQUIDATION"}
 # Action types that generate a bank letter
-ACTIONS_WITH_LETTER = {"EXTEND", "INCREASE_AMOUNT", "CLOSE", "AMENDMENT", "ACTIVATE"}
+ACTIONS_WITH_LETTER = {"EXTEND", "INCREASE_AMOUNT", "CLOSE", "AMENDMENT", "ACTIVATE", "CANCEL_LIQUIDATION"}
 # Action types that can be executed directly (no approval, no letter for some)
 ACTIONS_DIRECT_EXECUTE = {"CLOSE", "LIQUIDATION", "CHANGE_OWNERSHIP"}
 
@@ -60,15 +60,19 @@ class IssuanceMaintenanceService:
         if not lg:
             raise HTTPException(status_code=404, detail="Issued LG not found")
 
-        # Validate LG is in a state that allows maintenance
-        if lg.status != "ACTIVE":
-            raise HTTPException(status_code=400,
-                detail=f"Cannot perform {action_type} on LG with status {lg.status}. Only ACTIVE LGs allow maintenance actions.")
-
         # Validate action type
-        valid_types = {"EXTEND", "INCREASE_AMOUNT", "CLOSE", "LIQUIDATION", "AMENDMENT", "ACTIVATE", "CHANGE_OWNERSHIP"}
+        valid_types = {"EXTEND", "INCREASE_AMOUNT", "CLOSE", "LIQUIDATION", "AMENDMENT", "ACTIVATE", "CHANGE_OWNERSHIP", "CANCEL_LIQUIDATION"}
         if action_type not in valid_types:
             raise HTTPException(status_code=400, detail=f"Invalid action type: {action_type}")
+
+        # Validate LG is in a state that allows maintenance
+        if action_type == "CANCEL_LIQUIDATION":
+            if lg.status not in ("ACTIVE", "LIQUIDATED"):
+                raise HTTPException(status_code=400,
+                    detail=f"Cannot perform CANCEL_LIQUIDATION on LG with status {lg.status}. LG must be ACTIVE or LIQUIDATED.")
+        elif lg.status != "ACTIVE":
+            raise HTTPException(status_code=400,
+                detail=f"Cannot perform {action_type} on LG with status {lg.status}. Only ACTIVE LGs allow maintenance actions.")
 
         # ACTIVATE: server-side enforcement — advance payment + non-operative + one-time
         if action_type == "ACTIVATE":
@@ -947,6 +951,15 @@ class IssuanceMaintenanceService:
                 self._create_increase_exposure_entry(
                     db, lg, old_amount, Decimal(str(new_amount))
                 )
+
+        elif action.action_type == "CANCEL_LIQUIDATION":
+            target_outcome = data.get("target_outcome", "REACTIVATE")
+            if target_outcome == "RELEASE":
+                lg.status = "RELEASED"
+                logger.info(f"CANCEL_LIQUIDATION executed for LG {lg.id} with outcome RELEASE — status set to RELEASED.")
+            else:
+                lg.status = "ACTIVE"
+                logger.info(f"CANCEL_LIQUIDATION executed for LG {lg.id} with outcome REACTIVATE — status set to ACTIVE.")
 
         elif action.action_type == "CLOSE":
             lg.status = "CLOSED"
@@ -1829,12 +1842,13 @@ class IssuanceMaintenanceService:
             "CLOSE": "LG_CLOSE_REQUEST",
             "AMENDMENT": "LG_AMENDMENT_REQUEST",
             "ACTIVATE": "LG_ACTIVATE_REQUEST",
+            "CANCEL_LIQUIDATION": "LG_CANCEL_LIQUIDATION_REQUEST",
         }
 
         specific_action_type = TEMPLATE_MAP.get(action.action_type, f"LG_{action.action_type}_REQUEST")
 
         template = None
-        for action_type_key in [specific_action_type, "LG_MAINTENANCE_REQUEST"]:
+        for action_type_key in [specific_action_type, "LG_CANCEL_LIQUIDATION", "LG_MAINTENANCE_REQUEST"]:
             template = crud_template.get_single_template(
                 db, action_type=action_type_key, is_global=False,
                 customer_id=lg.customer_id, is_notification_template=False,
@@ -1878,16 +1892,25 @@ class IssuanceMaintenanceService:
         currency_code = lg_with_rels.currency.iso_code if lg_with_rels.currency else "N/A"
         currency_name = lg_with_rels.currency.name if lg_with_rels.currency else "N/A"
 
+        target_outcome_val = data.get("target_outcome", "REACTIVATE")
+        target_outcome_label = "Re-Activate Guarantee (Active)" if target_outcome_val == "REACTIVATE" else "Cancel & Release Guarantee (Released)"
+
         placeholder_data = {
+            "lg_number": lg_with_rels.bank_lg_number or lg_with_rels.lg_ref_number or "N/A",
+            "internal_ref": lg_with_rels.lg_ref_number or lg_with_rels.internal_serial or "",
             "lg_ref_number": lg_with_rels.lg_ref_number or "",
             "bank_lg_number": lg_with_rels.bank_lg_number or "N/A",
             "internal_serial": lg_with_rels.internal_serial or "",
             "letter_serial_number": action.letter_serial_number or "",
             "beneficiary_name": lg_with_rels.beneficiary_name or "",
+            "lg_beneficiary_name": lg_with_rels.beneficiary_name or "",
+            "lg_issuer_name": lg_with_rels.customer.name if lg_with_rels.customer else "N/A",
             "beneficiary_address": lg_with_rels.beneficiary_address or "",
             "current_amount": f"{current_amount:,.2f}",
+            "original_lg_amount_formatted": f"{currency_code} {current_amount:,.2f}",
             "current_amount_in_words": amount_to_words(current_amount),
             "currency_code": currency_code,
+            "lg_currency": currency_code,
             "currency_name": currency_name,
             "currency_symbol": lg_with_rels.currency.symbol if lg_with_rels.currency and hasattr(lg_with_rels.currency, 'symbol') else currency_code,
             "current_amount_formatted": f"{lg_with_rels.currency.symbol if lg_with_rels.currency and hasattr(lg_with_rels.currency, 'symbol') else currency_code} {current_amount:,.2f}",
@@ -1896,6 +1919,7 @@ class IssuanceMaintenanceService:
             "issue_date": str(lg_with_rels.issue_date) if lg_with_rels.issue_date else "N/A",
             "expiry_date": str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A",
             "bank_name": lg_with_rels.bank.name if lg_with_rels.bank else "N/A",
+            "issuing_bank_name": lg_with_rels.bank.name if lg_with_rels.bank else "N/A",
             "bank_address": lg_with_rels.bank.address if lg_with_rels.bank and hasattr(lg_with_rels.bank, 'address') else "N/A",
             "recipient_name": lg_with_rels.bank.name if lg_with_rels.bank else "To Whom It May Concern",
             "recipient_address": lg_with_rels.bank.address if lg_with_rels.bank and hasattr(lg_with_rels.bank, 'address') else "N/A",
@@ -1905,6 +1929,10 @@ class IssuanceMaintenanceService:
             "customer_contact_email": lg_with_rels.customer.contact_email if lg_with_rels.customer and hasattr(lg_with_rels.customer, 'contact_email') else "N/A",
             "entity_name": lg_with_rels.issuing_entity.entity_name if lg_with_rels.issuing_entity else "",
             "entity_address": lg_with_rels.issuing_entity.address if lg_with_rels.issuing_entity and hasattr(lg_with_rels.issuing_entity, 'address') else "",
+            "target_outcome_label": target_outcome_label,
+            "settlement_reference": data.get("settlement_reference") or "N/A",
+            "settlement_date": data.get("settlement_date") or "N/A",
+            "liquidation_date": data.get("liquidation_date") or "N/A",
             "action_type": action.action_type.replace("_", " ").title(),
             "action_notes": action.notes or "",
             "current_date": date.today().strftime("%d-%b-%Y"),

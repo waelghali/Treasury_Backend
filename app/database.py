@@ -53,7 +53,4 @@ def get_db():
         raise
     finally:
         db.close()
-
-# Imports for model discovery
-from app.models import models
-import app.models.models_issuance
+

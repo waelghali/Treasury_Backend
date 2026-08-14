@@ -2166,3 +2166,52 @@ def get_my_maintenance_actions(
             for a in actions
         ]
     }
+
+
+@router.post("/issued-lgs/{issued_lg_id}/record-liquidation-funds")
+def record_liquidation_funds(
+    issued_lg_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(check_subscription_status)
+):
+    """
+    Records completed liquidation fund receipt details (Bank Account, Value Date,
+    Swift/Txn Reference, Net Amount, Bank Charges).
+    """
+    from app.models.models_issuance import IssuedLGRecord
+    from app.crud.crud import log_action
+    from datetime import datetime
+
+    lg = db.query(IssuedLGRecord).filter(
+        IssuedLGRecord.id == issued_lg_id,
+        IssuedLGRecord.customer_id == current_user.customer_id
+    ).first()
+    if not lg:
+        raise HTTPException(status_code=404, detail="Issued LG record not found.")
+
+    fund_details = {
+        "bank_account_id": payload.get("bank_account_id"),
+        "value_date": payload.get("value_date"),
+        "transaction_ref": payload.get("transaction_ref"),
+        "liquidated_amount": payload.get("liquidated_amount"),
+        "bank_charges": payload.get("bank_charges", 0),
+        "notes": payload.get("notes"),
+        "recorded_by_user_id": current_user.user_id,
+        "recorded_at": datetime.utcnow().isoformat()
+    }
+
+    # Store in JSON field or metadata
+    lg.fund_receipt_details = fund_details
+
+    log_action(
+        db, user_id=current_user.user_id,
+        action_type="LG_LIQUIDATION_FUNDS_RECORDED",
+        entity_type="IssuedLGRecord",
+        entity_id=lg.id,
+        details=fund_details,
+        customer_id=current_user.customer_id
+    )
+
+    db.commit()
+    return {"message": "Liquidation fund receipt details recorded successfully.", "fund_receipt_details": fund_details}

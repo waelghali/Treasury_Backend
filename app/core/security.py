@@ -43,6 +43,8 @@ class TokenData(BaseModel):
     is_mfa_verified: bool = Field(True, description="False if the user still needs to enter an email code.")
     has_custody_module: bool = Field(True, description="True if the customer's subscription includes LG Custody.")
     has_issuance_module: bool = Field(False, description="True if the customer's subscription includes LG Issuance.")
+    has_quotation_module: bool = Field(False, description="True if the customer's subscription includes Quotations.")
+    has_reconciliation_module: bool = Field(False, description="True if the customer's subscription includes Bank Reconciliation.")
 
 # --- Core Functions ---
 
@@ -135,7 +137,9 @@ async def get_current_user(
             must_accept_policies=payload.get("must_accept_policies"),
             last_accepted_legal_version=payload.get("last_accepted_legal_version"),
             has_custody_module=payload.get("has_custody_module", True),
-            has_issuance_module=payload.get("has_issuance_module", False)
+            has_issuance_module=payload.get("has_issuance_module", False),
+            has_quotation_module=payload.get("has_quotation_module", True),
+            has_reconciliation_module=payload.get("has_reconciliation_module", True)
         )
     except (JWTError, ValueError):
         raise HTTPException(
@@ -326,5 +330,29 @@ async def require_issuance_or_custody_module(current_user: TokenData = Depends(c
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your subscription does not include any active modules."
+        )
+    return current_user
+
+
+async def require_quotation_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Blocks access if the customer's subscription does not include the Quotations module."""
+    if current_user.role == UserRole.SYSTEM_OWNER:
+        return current_user
+    if not current_user.has_quotation_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your subscription does not include the FX & T-Bill Quotation module."
+        )
+    return current_user
+
+
+async def require_reconciliation_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+    """Blocks access if the customer's subscription does not include the Bank Reconciliation module."""
+    if current_user.role == UserRole.SYSTEM_OWNER:
+        return current_user
+    if not current_user.has_reconciliation_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your subscription does not include the Bank Reconciliation module."
         )
     return current_user

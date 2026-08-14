@@ -313,6 +313,8 @@ async def refresh_token(
         "last_accepted_legal_version": current_user.last_accepted_legal_version,
         "has_custody_module": current_user.has_custody_module,
         "has_issuance_module": current_user.has_issuance_module,
+        "has_quotation_module": current_user.has_quotation_module,
+        "has_reconciliation_module": current_user.has_reconciliation_module,
     }
     
     # create_fresh_access_token is the alias for create_access_token

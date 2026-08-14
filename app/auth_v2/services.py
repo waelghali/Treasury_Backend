@@ -5,7 +5,7 @@ import secrets
 import string
 import os # Added for os.getenv
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 from fastapi import HTTPException, status, Request # Import Request for IP address
 from sqlalchemy.orm import Session, selectinload
@@ -56,6 +56,17 @@ from app.constants import (
 
 
 logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# TEMPORARY MFA / NEW-DEVICE EXEMPTION CONFIGURATION
+# Add emails to bypass new-device MFA email verification during user testing.
+# Remove emails when testing is finished to restore full security.
+# ==============================================================================
+MFA_DEVICE_EXEMPT_EMAILS: Set[str] = {
+    "end.user@cyberdyne.com",
+    "corp.admin@cyberdyne.com",
+}
+
 
 class AuthService:
     def __init__(self):
@@ -252,12 +263,33 @@ class AuthService:
 
         # --- START OF MFA / TRUSTED DEVICE LOGIC ---
         
+        is_exempt = user.email.lower() in {e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS}
+        
         device_record = db.query(models.UserDevice).filter(
             models.UserDevice.user_id == user.id,
             models.UserDevice.device_id == device_id
         ).first()
 
         is_trusted = device_record.is_trusted if device_record else False
+
+        # If user is in the exemption list, bypass MFA and auto-trust the device
+        if is_exempt:
+            is_trusted = True
+            if not device_record:
+                new_device = models.UserDevice(
+                    user_id=user.id,
+                    device_id=device_id,
+                    device_name="Exempted Testing Device",
+                    is_trusted=True,
+                    last_ip=request_ip
+                )
+                db.add(new_device)
+                db.commit()
+            elif not device_record.is_trusted:
+                device_record.is_trusted = True
+                device_record.last_ip = request_ip
+                db.add(device_record)
+                db.commit()
 
         if not is_trusted:
             has_any_devices = db.query(models.UserDevice).filter(
@@ -325,6 +357,8 @@ class AuthService:
             # Module access flags from subscription plan
             "has_custody_module": user.customer.subscription_plan.has_custody_module if user.customer and user.customer.subscription_plan else True,
             "has_issuance_module": user.customer.subscription_plan.has_issuance_module if user.customer and user.customer.subscription_plan else False,
+            "has_quotation_module": user.customer.subscription_plan.has_quotation_module if user.customer and user.customer.subscription_plan else True,
+            "has_reconciliation_module": user.customer.subscription_plan.has_reconciliation_module if user.customer and user.customer.subscription_plan else True,
         }
 
         access_token = create_access_token(data=token_data)
@@ -958,6 +992,10 @@ class AuthService:
 
     def is_device_trusted(self, db: Session, user_id: int, device_id: str) -> bool:
         """Checks if the device_id is already marked as trusted for this user."""
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and user.email.lower() in {e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS}:
+            return True
+
         device = db.query(models.UserDevice).filter(
             models.UserDevice.user_id == user_id,
             models.UserDevice.device_id == device_id,

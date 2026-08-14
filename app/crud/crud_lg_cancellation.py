@@ -64,6 +64,14 @@ class CRUDLGCancellation(CRUDBase):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only the most recent instruction can be canceled.")
 
         # 4. Check eligibility rules
+        # Stop Point: Liquidation cannot be cancelled if bank confirmed payout
+        if db_instruction.instruction_type in ["LG_LIQUIDATE", "LIQUIDATION", "LG_LIQUIDATION"]:
+            if db_instruction.status in ["Confirmed by Bank", "Completed", "Liquidated", "Payout Executed"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Liquidation demand cannot be cancelled because the bank has already confirmed and executed the liquidation payout."
+                )
+
         # Only instructions that generate bank letters are cancellable
         cancellable_instruction_types = list(INSTRUCTION_TYPE_CODE_TO_FULL_ACTION_MAP.values())
         if db_instruction.instruction_type not in cancellable_instruction_types:

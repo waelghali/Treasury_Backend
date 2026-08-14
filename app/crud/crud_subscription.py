@@ -31,6 +31,8 @@ class CRUDSubscriptionPlan(CRUDBase):
                 "grace_period_days": db_obj.grace_period_days,
                 "has_custody_module": db_obj.has_custody_module,
                 "has_issuance_module": db_obj.has_issuance_module,
+                "has_quotation_module": db_obj.has_quotation_module,
+                "has_reconciliation_module": db_obj.has_reconciliation_module,
                 "max_issuance_records": db_obj.max_issuance_records,
                 "max_checker_users": db_obj.max_checker_users
             },

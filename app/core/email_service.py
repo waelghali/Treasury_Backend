@@ -182,22 +182,28 @@ async def send_email(
 
         # 3. Consolidate Recipients
         all_recipients = list(set(to_emails + (cc_emails or [])))
+        if not all_recipients:
+            logger.info("Email delivery suppressed: No valid recipients found after filtering.")
+            return True, None
 
-        # 4. Send via SMTP
+        # 4. Send via SMTP in background worker thread with 10s socket timeout
         logger.debug(f"Connecting to SMTP: {email_settings.smtp_host}:{email_settings.smtp_port}")
-        
-        # Select Connection Type
-        if email_settings.smtp_port == 465:
-            server = smtplib.SMTP_SSL(email_settings.smtp_host, email_settings.smtp_port)
-        else:
-            server = smtplib.SMTP(email_settings.smtp_host, email_settings.smtp_port)
-            server.starttls()
 
-        server.login(email_settings.smtp_username, email_settings.smtp_password)
-        server.send_message(msg, from_addr=email_settings.sender_email, to_addrs=all_recipients)
-        server.quit()
+        def _send_smtp():
+            if email_settings.smtp_port == 465:
+                server = smtplib.SMTP_SSL(email_settings.smtp_host, email_settings.smtp_port, timeout=10)
+            else:
+                server = smtplib.SMTP(email_settings.smtp_host, email_settings.smtp_port, timeout=10)
+                server.starttls()
 
-        logger.info(f"Email sent to {to_emails} via {email_settings.smtp_host}")
+            server.login(email_settings.smtp_username, email_settings.smtp_password)
+            server.send_message(msg, from_addr=email_settings.sender_email, to_addrs=all_recipients)
+            server.quit()
+
+        import asyncio
+        await asyncio.to_thread(_send_smtp)
+
+        logger.info(f"Email sent to {all_recipients} via {email_settings.smtp_host}")
         return True, None
 
     except smtplib.SMTPConnectError as e:

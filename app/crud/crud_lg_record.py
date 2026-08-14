@@ -3,7 +3,7 @@ import json
 import os
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Type, Tuple
-from fastapi import HTTPException, status, UploadFile
+from fastapi import HTTPException, status, UploadFile, BackgroundTasks
 from sqlalchemy import func, desc, exists, and_
 from sqlalchemy.orm import Session, selectinload
 import decimal
@@ -55,6 +55,8 @@ from app.constants import (
     UserRole # ADDED in the previous turn
 )
 from app.services.email_digest_service import build_lg_renewal_digest_html
+from app.services.unified_email_builder import build_transaction_email_html, build_standard_email_html
+
 
 from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
 from app.core.document_generator import generate_pdf_from_html
@@ -573,7 +575,7 @@ class CRUDLGRecord(CRUDBase):
         )
         return db_lg_record
         
-    async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None) -> Tuple[models.LGRecord, int, str]: # NEW: Add notes parameter
+    async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None, background_tasks: Optional[BackgroundTasks] = None) -> Tuple[models.LGRecord, int, str]:
         db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
         recipient_name = db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "To Whom It May Concern"
         recipient_address = db_lg_record.issuing_bank.address if db_lg_record.issuing_bank and db_lg_record.issuing_bank.address else "N/A"
@@ -767,9 +769,57 @@ class CRUDLGRecord(CRUDBase):
                 )
         cc_emails = list(set(cc_emails))
 
-        notification_template = db.query(models.Template).filter(models.Template.action_type == "LG_EXTENSION", models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+        email_subject = f"LG Extension Issued: LG #{updated_lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+        
+        email_body_html = build_transaction_email_html(
+            customer_name=customer.name if customer else "Grow Treasury",
+            title="📋 LG Extension Instruction Issued",
+            transaction_ref=updated_lg_record.lg_number,
+            transaction_type="LG Extension",
+            key_value_dict={
+                "LG Number": updated_lg_record.lg_number,
+                "Instruction Serial": db_lg_instruction.serial_number,
+                "Issuing Bank": updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else "N/A",
+                "Beneficiary": updated_lg_record.beneficiary_corporate.entity_name if updated_lg_record.beneficiary_corporate else "N/A",
+                "Amount": f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}",
+                "Previous Expiry Date": instruction_details["old_expiry_date"],
+                "New Expiry Date": f"<span style='color: #16a34a; font-weight: 700;'>{instruction_details['new_expiry_date']}</span>",
+                "Notes": notes if notes else "None"
+            },
+            summary_text=f"An official LG Extension instruction has been generated and issued to {updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else 'the bank'}.",
+            cta_text="View LG in System",
+            cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+            recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
+        )
 
-        if not notification_template:
+
+        if background_tasks:
+            background_tasks.add_task(
+                send_email,
+                db=db,
+                to_emails=email_to_send_to,
+                subject_template=email_subject,
+                body_template=email_body_html,
+                template_data={},
+                email_settings=email_settings_to_use,
+                cc_emails=cc_emails,
+                sender_name=customer.name
+            )
+            email_sent_successfully = True
+        else:
+            email_sent_successfully, _ = await send_email(
+                db=db,
+                to_emails=email_to_send_to,
+                cc_emails=cc_emails,
+                subject_template=email_subject,
+                body_template=email_body_html,
+                template_data={},
+                email_settings=email_settings_to_use,
+                sender_name=customer.name
+            )
+
+
+        if not email_sent_successfully:
             log_action(
                 db,
                 user_id=user_id,
@@ -778,91 +828,32 @@ class CRUDLGRecord(CRUDBase):
                 entity_id=updated_lg_record.id,
                 details={
                     "recipient": email_to_send_to,
-                    "subject": "N/A",
-                    "reason": "LG_EXTENSION notification template (is_notification_template=True) not found",
-                    "method": "none",
+                    "cc_recipients": cc_emails,
+                    "subject": email_subject,
+                    "reason": "Email service failed to send notification",
+                    "method": email_method_for_log,
                 },
                 customer_id=updated_lg_record.customer_id,
                 lg_record_id=updated_lg_record.id,
             )
-            logger.error(f"LG extended (ID: {updated_lg_record.id}), but failed to send email notification due to missing template.")
+            logger.error(f"LG extended (ID: {updated_lg_record.id}), but failed to send email notification.")
         else:
-            template_data = {
-                "lg_number": updated_lg_record.lg_number,
-                "old_expiry_date": instruction_details["old_expiry_date"],
-                "new_expiry_date": instruction_details["new_expiry_date"],
-                "lg_amount": float(db_lg_record.lg_amount),
-                "lg_currency": db_lg_record.lg_currency.iso_code,
-                "issuing_bank_name": updated_lg_record.issuing_bank.name,
-                "internal_owner_email": db_lg_record.internal_owner_contact.email,
-                "internal_owner_phone": db_lg_record.internal_owner_contact.phone_number,
-                "internal_owner_id": db_lg_record.internal_owner_contact.internal_id,
-                "manager_email": db_lg_record.internal_owner_contact.manager_email,
-                "lg_issuer_name": updated_lg_record.issuer_name,
-                "lg_beneficiary_name": updated_lg_record.beneficiary_corporate.entity_name,
-                "customer_name": customer.name if customer else "N/A",
-                "platform_name": "Grow BD Treasury Management Platform",
-                "current_date": current_date_str,
-                "action_type": "LG Extension",
-                "instruction_serial": db_lg_instruction.serial_number,
-                "issue_date": db_lg_record.issuance_date.date().isoformat(),
-                "lg_serial_number": updated_lg_record.lg_number,
-                "notes": notes, # NEW: Add notes to the email template data
-             }
-
-            template_data["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
-            email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
-            email_body_html = notification_template.content
-            for key, value in template_data.items():
-                str_value = str(value) if value is not None else ""
-                email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
-
-            email_sent_successfully = await send_email(
-                db=db,
-                to_emails=email_to_send_to,
-                cc_emails=cc_emails,
-                subject_template=email_subject,
-                body_template=email_body_html,
-                template_data=template_data,
-                email_settings=email_settings_to_use,
-                sender_name=customer.name
+            log_action(
+                db,
+                user_id=user_id,
+                action_type="NOTIFICATION_SENT",
+                entity_type="LGRecord",
+                entity_id=updated_lg_record.id,
+                details={
+                    "recipient": email_to_send_to,
+                    "cc_recipients": cc_emails,
+                    "subject": email_subject,
+                    "method": email_method_for_log,
+                },
+                customer_id=updated_lg_record.customer_id,
+                lg_record_id=updated_lg_record.id,
             )
 
-            if not email_sent_successfully:
-                log_action(
-                    db,
-                    user_id=user_id,
-                    action_type="NOTIFICATION_FAILED",
-                    entity_type="LGRecord",
-                    entity_id=updated_lg_record.id,
-                    details={
-                        "recipient": email_to_send_to,
-                        "cc_recipients": cc_emails,
-                        "subject": email_subject,
-                        "reason": "Email service failed to send notification",
-                        "method": email_method_for_log,
-                    },
-                    customer_id=updated_lg_record.customer_id,
-                    lg_record_id=updated_lg_record.id,
-                )
-                logger.error(f"LG extended (ID: {updated_lg_record.id}), but failed to send email notification.")
-            else:
-                log_action(
-                    db,
-                    user_id=user_id,
-                    action_type="NOTIFICATION_SENT",
-                    entity_type="LGRecord",
-                    entity_id=updated_lg_record.id,
-                    details={
-                        "recipient": email_to_send_to,
-                        "cc_recipients": cc_emails,
-                        "subject": email_subject,
-                        "method": email_method_for_log,
-                    },
-                    customer_id=updated_lg_record.customer_id,
-                    lg_record_id=updated_lg_record.id,
-                )
 
         log_action(
             db,
@@ -1076,62 +1067,53 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            notification_template = db.query(models.Template).filter(models.Template.action_type == "LG_RELEASE", models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+            email_subject = f"LG Release Issued: LG #{lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+            
+            email_body_html = build_transaction_email_html(
+                customer_name=lg_record.customer.name if lg_record.customer else "Grow Treasury",
+                title="📋 LG Release Instruction Issued",
+                transaction_ref=lg_record.lg_number,
+                transaction_type="LG Release",
+                key_value_dict={
+                    "LG Number": lg_record.lg_number,
+                    "Instruction Serial": db_lg_instruction.serial_number,
+                    "Issuing Bank": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+                    "Beneficiary": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else "N/A",
+                    "Amount": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
+                    "Status": "<span style='color: #16a34a; font-weight: 700;'>Released</span>",
+                    "Notes": notes if notes else "None"
+                },
+                summary_text=f"An official LG Release instruction has been generated to release LG #{lg_record.lg_number} from further claims.",
+                cta_text="View LG in System",
+                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
+            )
 
-            if not notification_template:
-                log_action(
-                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                    details={"recipient": email_to_send_to, "subject": "N/A", "reason": "LG_RELEASE notification template (is_notification_template=True) not found", "method": "none"},
-                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                )
-                logger.error(f"LG released (ID: {lg_record.id}), but failed to send email notification due to missing template.")
-            else:
-                template_data = {
-                    "lg_number": lg_record.lg_number,
-                    "lg_amount": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
-                    "lg_currency": lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": lg_record.issuing_bank.name,
-                    "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-                    "lg_issuer_name": lg_record.issuer_name,
-                    "current_date": datetime.now().strftime("%Y-%m-%d"),
-                    "customer_name": lg_record.customer.name,
-                    "action_type": "LG Release",
-                    "instruction_serial": db_lg_instruction.serial_number,
-                    "internal_owner_email": lg_record.internal_owner_contact.email,
-                    "total_original_documents": total_original_documents,
-                    "pending_replies_count": pending_replies_count,
-                    "notes": notes, # NEW: Add notes to the email template data
-                }
-                email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
-                email_body_html = notification_template.content
-                for key, value in template_data.items():
-                    str_value = str(value) if value is not None else ""
-                    email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                    email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
 
-                email_sent_successfully = await send_email(
-                    db=db,
-                    to_emails=email_to_send_to,
-                    cc_emails=cc_emails,
-                    subject_template=email_subject,
-                    body_template=email_body_html,
-                    template_data=template_data,
-                    email_settings=email_settings_to_use,
-                    sender_name=lg_record.customer.name
-                )
-                if not email_sent_successfully:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                    )
-                    logger.error(f"LG released (ID: {lg_record.id}), but failed to send email notification.")
-                else:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                    )
+        email_sent_successfully = await send_email(
+            db=db,
+            to_emails=email_to_send_to,
+            cc_emails=cc_emails,
+            subject_template=email_subject,
+            body_template=email_body_html,
+            template_data={},
+            email_settings=email_settings_to_use,
+            sender_name=lg_record.customer.name
+        )
+        if not email_sent_successfully:
+            log_action(
+                db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
+                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
+                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+            )
+            logger.error(f"LG released (ID: {lg_record.id}), but failed to send email notification.")
+        else:
+            log_action(
+                db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
+                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+            )
+
             logger.debug("DEBUG: Email notification logic completed.")
 
         try:
@@ -1379,64 +1361,54 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            notification_template = db.query(models.Template).filter(models.Template.action_type == "LG_LIQUIDATE", models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+            email_subject = f"LG Liquidation Issued: LG #{lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+            
+            email_body_html = build_transaction_email_html(
+                customer_name=lg_record.customer.name if lg_record.customer else "Grow Treasury",
+                title=f"📋 LG Liquidation ({liquidation_type.capitalize()}) Instruction Issued",
+                transaction_ref=lg_record.lg_number,
+                transaction_type="LG Liquidation",
+                key_value_dict={
+                    "LG Number": lg_record.lg_number,
+                    "Instruction Serial": db_lg_instruction.serial_number,
+                    "Liquidation Type": liquidation_type.capitalize(),
+                    "Issuing Bank": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+                    "Beneficiary": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else "N/A",
+                    "Original Amount": f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}",
+                    "Remaining LG Amount": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
+                    "Notes": notes if notes else "None"
+                },
+                summary_text=f"An official LG Liquidation instruction ({liquidation_type.capitalize()}) has been issued for LG #{lg_record.lg_number}.",
+                cta_text="View LG in System",
+                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
+            )
 
-            if not notification_template:
-                log_action(
-                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                    details={"recipient": email_to_send_to, "subject": "N/A", "reason": "LG_LIQUIDATE notification template (is_notification_template=True) not found", "method": "none"},
-                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                )
-                logger.error(f"LG liquidated (ID: {lg_record.id}), but failed to send email notification.")
-            else:
-                template_data = {
-                    "lg_number": lg_record.lg_number,
-                    "liquidation_type": liquidation_type.capitalize(),
-                    "original_lg_amount": float(original_amount),
-                    "new_lg_amount": float(lg_record.lg_amount),
-                    "lg_currency": lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": lg_record.issuing_bank.name,
-                    "lg_issuer_name": lg_record.issuer_name,
-                    "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-                    "current_date": datetime.now().strftime("%Y-%m-%d"),
-                    "customer_name": lg_record.customer.name,
-                    "action_type": f"LG Liquidation ({liquidation_type.capitalize()})",
-                    "instruction_serial": db_lg_instruction.serial_number,
-                    "internal_owner_email": lg_record.internal_owner_contact.email,
-                    "total_original_documents": total_original_documents,
-                    "pending_replies_count": pending_replies_count,
-                    "notes": notes,
-                }
-                email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
-                email_body_html = notification_template.content
-                for key, value in template_data.items():
-                    str_value = str(value) if value is not None else ""
-                    email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                    email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
 
-                email_sent_successfully = await send_email(
-                    db=db,
-                    to_emails=email_to_send_to,
-                    cc_emails=cc_emails,
-                    subject_template=email_subject,
-                    body_template=email_body_html,
-                    template_data=template_data,
-                    email_settings=email_settings_to_use,
-                    sender_name=lg_record.customer.name
-                )
-                if not email_sent_successfully:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                    )
-                    logger.error(f"LG liquidated (ID: {lg_record.id}), but failed to send email notification.")
-                else:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                    )
+        email_sent_successfully = await send_email(
+            db=db,
+            to_emails=email_to_send_to,
+            cc_emails=cc_emails,
+            subject_template=email_subject,
+            body_template=email_body_html,
+            template_data={},
+            email_settings=email_settings_to_use,
+            sender_name=lg_record.customer.name
+        )
+        if not email_sent_successfully:
+            log_action(
+                db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
+                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
+                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+            )
+            logger.error(f"LG liquidated (ID: {lg_record.id}), but failed to send email notification.")
+        else:
+            log_action(
+                db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
+                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+            )
+
 
         db.refresh(lg_record)
         return lg_record, db_lg_instruction.id    
@@ -1631,65 +1603,54 @@ class CRUDLGRecord(CRUDBase):
                         logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
                 cc_emails = list(set(cc_emails))
 
-                notification_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_DECREASE_AMOUNT, models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+                email_subject = f"LG Amount Decrease Issued: LG #{lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+                
+                email_body_html = build_transaction_email_html(
+                    customer_name=lg_record.customer.name if lg_record.customer else "Grow Treasury",
+                    title="📋 LG Amount Decrease Instruction Issued",
+                    transaction_ref=lg_record.lg_number,
+                    transaction_type="LG Amount Decrease",
+                    key_value_dict={
+                        "LG Number": lg_record.lg_number,
+                        "Instruction Serial": db_lg_instruction.serial_number,
+                        "Issuing Bank": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+                        "Beneficiary": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else "N/A",
+                        "Original Amount": f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}" if lg_record.lg_currency else f"{float(original_amount):,.2f}",
+                        "Decrease Amount": f"<span style='color: #dc2626; font-weight: 700;'>- {lg_record.lg_currency.symbol} {float(decrease_amount):,.2f}</span>" if lg_record.lg_currency else f"- {float(decrease_amount):,.2f}",
+                        "New Amount": f"<span style='color: #16a34a; font-weight: 700;'>{lg_record.lg_currency.symbol} {float(new_amount):,.2f}</span>" if lg_record.lg_currency else f"{float(new_amount):,.2f}",
+                        "Notes": notes if notes else "None"
+                    },
+                    summary_text=f"An official instruction to decrease the amount of LG #{lg_record.lg_number} has been generated.",
+                    cta_text="View LG in System",
+                    cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                    recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
+                )
 
-                if not notification_template:
+
+                email_sent_successfully = await send_email(
+                    db=db,
+                    to_emails=email_to_send_to,
+                    cc_emails=cc_emails,
+                    subject_template=email_subject,
+                    body_template=email_body_html,
+                    template_data={},
+                    email_settings=email_settings_to_use,
+                    sender_name=lg_record.customer.name
+                )
+                if not email_sent_successfully:
                     log_action(
                         db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                        details={"recipient": email_to_send_to, "subject": "N/A", "reason": f"{ACTION_TYPE_LG_DECREASE_AMOUNT} notification template (is_notification_template=True) not found", "method": "none"},
+                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
                         customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
                     )
                     logger.error(f"LG amount decreased (ID: {lg_record.id}), but failed to send email notification.")
                 else:
-                    template_data = {
-                        "lg_number": lg_record.lg_number,
-                        "original_lg_amount": float(original_amount),
-                        "original_lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}" if lg_record.lg_currency else f"{float(original_amount):,.2f}",
-                        "decrease_amount": float(decrease_amount),
-                        "decrease_amount_formatted": f"{lg_record.lg_currency.symbol} {float(decrease_amount):,.2f}" if lg_record.lg_currency else f"{float(decrease_amount):,.2f}",
-                        "new_lg_amount": float(new_amount),
-                        "new_lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(new_amount):,.2f}" if lg_record.lg_currency else f"{float(new_amount):,.2f}",
-                        "lg_currency": lg_record.lg_currency.iso_code if lg_record.lg_currency else "N/A",
-                        "issuing_bank_name": lg_record.issuing_bank.name,
-                        "lg_issuer_name": lg_record.issuer_name,
-                        "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-                        "current_date": datetime.now().strftime("%Y-%m-%d"),
-                        "customer_name": lg_record.customer.name,
-                        "action_type": "LG Amount Decrease",
-                        "instruction_serial": db_lg_instruction.serial_number,
-                        "internal_owner_email": lg_record.internal_owner_contact.email,
-                        "notes": notes, # NEW: Add notes to the email template
-                    }
-                    email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
-                    email_body_html = notification_template.content
-                    for key, value in template_data.items():
-                        str_value = str(value) if value is not None else ""
-                        email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                        email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
-
-                    email_sent_successfully = await send_email(
-                        db=db,
-                        to_emails=email_to_send_to,
-                        cc_emails=cc_emails,
-                        subject_template=email_subject,
-                        body_template=email_body_html,
-                        template_data=template_data,
-                        email_settings=email_settings_to_use,
-                        sender_name=lg_record.customer.name
+                    log_action(
+                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
+                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                        customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
                     )
-                    if not email_sent_successfully:
-                        log_action(
-                            db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                            details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                            customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                        )
-                        logger.error(f"LG amount decreased (ID: {lg_record.id}), but failed to send email notification.")
-                    else:
-                        log_action(
-                            db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
-                            details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                            customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-                        )
+
 
             db.refresh(lg_record)
             return lg_record, db_lg_instruction.id
@@ -1904,69 +1865,54 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {db_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            notification_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+            email_subject = f"LG Activation Issued: LG #{db_lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+            
+            email_body_html = build_transaction_email_html(
+                customer_name=db_lg_record.customer.name if db_lg_record.customer else "Grow Treasury",
+                title="📋 LG Activation Instruction Issued",
+                transaction_ref=db_lg_record.lg_number,
+                transaction_type="LG Activation",
+                key_value_dict={
+                    "LG Number": db_lg_record.lg_number,
+                    "Instruction Serial": db_lg_instruction.serial_number,
+                    "Issuing Bank": db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "N/A",
+                    "Beneficiary": db_lg_record.beneficiary_corporate.entity_name if db_lg_record.beneficiary_corporate else "N/A",
+                    "LG Amount": f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}",
+                    "Payment Method": payment_details.payment_method,
+                    "Payment Amount": f"{payment_currency.iso_code} {float(payment_details.amount):,.2f}",
+                    "Payment Reference": payment_details.payment_reference
+                },
+                summary_text=f"An official instruction to activate non-operative LG #{db_lg_record.lg_number} has been generated.",
+                cta_text="View LG in System",
+                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
+            )
 
-            if not notification_template:
+            email_sent_successfully = await send_email(
+                db=db,
+                to_emails=email_to_send_to,
+                cc_emails=cc_emails,
+                subject_template=email_subject,
+                body_template=email_body_html,
+                template_data={},
+                email_settings=email_settings_to_use,
+                sender_name=db_lg_record.customer.name
+            )
+            if not email_sent_successfully:
                 log_action(
                     db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
-                    details={"recipient": email_to_send_to, "subject": "N/A", "reason": f"{ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE} notification template (is_notification_template=True) not found", "method": "none"},
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
                     customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
                 )
                 logger.error(f"LG activated (ID: {db_lg_record.id}), but failed to send email notification.")
             else:
-                template_data = {
-                    "lg_number": db_lg_record.lg_number,
-                    "lg_amount": float(db_lg_record.lg_amount),
-                    "lg_currency": db_lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": db_lg_record.issuing_bank.name,
-                    "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
-                    "lg_issuer_name": db_lg_record.issuer_name,
-                    "current_date": datetime.now().strftime("%Y-%m-%d"),
-                    "customer_name": db_lg_record.customer.name,
-                    "action_type": "LG Activation",
-                    "instruction_serial": db_lg_instruction.serial_number,
-                    "internal_owner_email": db_lg_record.internal_owner_contact.email,
-                    "payment_method": payment_details.payment_method,
-                    "payment_amount": float(payment_details.amount),
-                    "payment_currency_code": payment_currency.iso_code,
-                    "payment_reference": payment_details.payment_reference,
-                    "payment_issuing_bank_name": payment_bank.name if payment_bank else "N/A",
-                    "payment_date": payment_details.payment_date.isoformat(),
-                    "notes": notes, # NEW: Add notes to email template data
-                }
-                template_data["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
-                template_data["payment_amount_formatted"] = f"{template_data['payment_currency_code']} {float(payment_details.amount):,.2f}"
-
-                email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}} - Instruction #{{instruction_serial}}"
-                email_body_html = notification_template.content
-                for key, value in template_data.items():
-                    str_value = str(value) if value is not None else ""
-                    email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                    email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
-
-                email_sent_successfully = await send_email(
-                    db=db,
-                    to_emails=email_to_send_to,
-                    cc_emails=cc_emails,
-                    subject_template=email_subject,
-                    body_template=email_body_html,
-                    template_data=template_data,
-                    email_settings=email_settings_to_use,
-                    sender_name=db_lg_record.customer.name
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=db_lg_record.id,
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                    customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
                 )
-                if not email_sent_successfully:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                        customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
-                    )
-                    logger.error(f"LG activated (ID: {db_lg_record.id}), but failed to send email notification.")
-                else:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=db_lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                        customer_id=db_lg_record.customer_id, lg_record_id=db_lg_record.id,
-                    )
+
+
 
         db.refresh(db_lg_record)
         return db_lg_record, db_lg_instruction.id
@@ -2195,61 +2141,51 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {updated_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            notification_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_AMEND, models.Template.is_global == True, models.Template.is_notification_template == True, models.Template.is_deleted == False).first()
+            email_subject = f"LG Amendment Issued: LG #{updated_lg_record.lg_number}"
+            
+            email_body_html = build_transaction_email_html(
+                customer_name=updated_lg_record.customer.name if updated_lg_record.customer else "Grow Treasury",
+                title="📋 LG Amendment Instruction Issued",
+                transaction_ref=updated_lg_record.lg_number,
+                transaction_type="LG Amendment",
+                key_value_dict={
+                    "LG Number": updated_lg_record.lg_number,
+                    "Issuing Bank": updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else "N/A",
+                    "Beneficiary": updated_lg_record.beneficiary_corporate.entity_name if updated_lg_record.beneficiary_corporate else "N/A",
+                    "Amount": f"{updated_lg_record.lg_currency.symbol} {float(updated_lg_record.lg_amount):,.2f}",
+                    "Amended Fields": ", ".join(json_serializable_amended_fields.keys())
+                },
+                summary_text=f"An amendment instruction has been recorded and issued for LG #{updated_lg_record.lg_number}.",
+                cta_text="View LG in System",
+                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                recipient_name=updated_lg_record.internal_owner_contact.email if updated_lg_record.internal_owner_contact else "Internal Owner"
+            )
 
-            if not notification_template:
+            email_sent_successfully = await send_email(
+                db=db,
+                to_emails=email_to_send_to,
+                cc_emails=cc_emails,
+                subject_template=email_subject,
+                body_template=email_body_html,
+                template_data={},
+                email_settings=email_settings_to_use,
+                sender_name=updated_lg_record.customer.name
+            )
+            if not email_sent_successfully:
                 log_action(
                     db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=updated_lg_record.id,
-                    details={"recipient": email_to_send_to, "subject": "N/A", "reason": f"{ACTION_TYPE_LG_AMEND} notification template (is_notification_template=True) not found", "method": "none"},
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
                     customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
                 )
                 logger.error(f"LG amended (ID: {updated_lg_record.id}), but failed to send email notification.")
             else:
-                template_data = {
-                    "lg_number": updated_lg_record.lg_number,
-                    "amended_fields_summary": ", ".join(json_serializable_amended_fields.keys()),
-                    "lg_amount": float(updated_lg_record.lg_amount),
-                    "lg_currency": updated_lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": updated_lg_record.issuing_bank.name,
-                    "lg_beneficiary_name": updated_lg_record.beneficiary_corporate.entity_name,
-                    "current_date": datetime.now().strftime("%Y-%m-%d"),
-                    "customer_name": updated_lg_record.customer.name,
-                    "action_type": "LG Amendment",
-                    "internal_owner_email": updated_lg_record.internal_owner_contact.email,
-                    "amendment_document_id": document_id_for_log,
-                    "full_amendment_details": json.dumps(json_serializable_amended_fields, indent=2),
-                    "lg_amount_formatted": f"{updated_lg_record.lg_currency.symbol} {float(updated_lg_record.lg_amount):,.2f}",
-                }
-                email_subject = notification_template.subject if notification_template.subject else f"{{action_type}} LG #{{lg_number}}"
-                email_body_html = notification_template.content
-                for key, value in template_data.items():
-                    str_value = str(value) if value is not None else ""
-                    email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-                    email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
-
-                email_sent_successfully = await send_email(
-                    db=db,
-                    to_emails=email_to_send_to,
-                    cc_emails=cc_emails,
-                    subject_template=email_subject,
-                    body_template=email_body_html,
-                    template_data=template_data,
-                    email_settings=email_settings_to_use,
-                    sender_name=updated_lg_record.customer.name
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=updated_lg_record.id,
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                    customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
                 )
-                if not email_sent_successfully:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=updated_lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                        customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
-                    )
-                    logger.error(f"LG amended (ID: {updated_lg_record.id}), but failed to send email notification.")
-                else:
-                    log_action(
-                        db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=updated_lg_record.id,
-                        details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                        customer_id=updated_lg_record.customer_id, lg_record_id=updated_lg_record.id,
-                    )
+
+
         db.refresh(updated_lg_record)
         return updated_lg_record
 

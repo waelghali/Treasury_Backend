@@ -8,7 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
-from app.models import BaseModel # Inherit from your base model
+from app.models.models import BaseModel # Inherit from your base model
 
 # ==============================================================================
 # 0. CORPORATE PROJECTS (Shared entity for facility dedication)
@@ -386,6 +386,10 @@ class IssuedLGRecord(Base):
     # D3: Manual pricing for "other bank" (no facility) issuances
     manual_pricing = Column(JSONB, nullable=True,
                            comment="{commission_rate, flat_fee, margin_pct, margin_amount, agreed_sla, notes}")
+
+    # Liquidation fund receipt tracking
+    fund_receipt_details = Column(JSONB, nullable=True,
+                                 comment="Completed liquidation fund receipt details: bank_account_id, value_date, transaction_ref, liquidated_amount, bank_charges, notes")
 
     customer = relationship("Customer")
     currency = relationship("Currency", foreign_keys=[currency_id])

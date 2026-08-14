@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 import logging
 import decimal
 import json
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, UploadFile, File, Body, Form
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, UploadFile, File, Body, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse, HTMLResponse
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, and_
@@ -848,6 +848,7 @@ async def extend_lg_record(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user),
     end_user_context: TokenData = Depends(get_current_end_user_context),
+    background_tasks: BackgroundTasks = None,
     request: Request = None
 ):
     """
@@ -902,7 +903,8 @@ async def extend_lg_record(
             lg_record_id=lg_record_id,
             new_expiry_date=new_expiry_date_obj,
             user_id=end_user_context.user_id,
-            notes=notes # NEW: Pass notes to the crud function
+            notes=notes,
+            background_tasks=background_tasks
         )
         return {
             "lg_record": LGRecordOut.model_validate(updated_lg_record_db),
