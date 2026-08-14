@@ -155,6 +155,38 @@ def configure_app_instance(fastapi_app: FastAPI):
         if Base.metadata.tables:
             Base.metadata.create_all(bind=engine)
             logger.info("Database tables verified/created.")
+
+            # --- Safe Schema Auto-Migration for Cloud Databases (Render / Postgres) ---
+            try:
+                from sqlalchemy import text
+                startup_migrations = [
+                    # subscription_plans columns
+                    "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS has_custody_module BOOLEAN DEFAULT TRUE",
+                    "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS has_issuance_module BOOLEAN DEFAULT FALSE",
+                    "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS has_quotation_module BOOLEAN DEFAULT FALSE",
+                    "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS has_reconciliation_module BOOLEAN DEFAULT FALSE",
+                    "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS max_issuance_records INTEGER DEFAULT 0",
+                    "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS grace_period_days INTEGER DEFAULT 30",
+                    
+                    # users columns for MFA and legal version
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_code_hashed VARCHAR",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_code_expires_at TIMESTAMP WITH TIME ZONE",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_attempts INTEGER DEFAULT 0",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_accepted_legal_version DOUBLE PRECISION",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP WITH TIME ZONE",
+                ]
+                with engine.connect() as conn:
+                    for stmt in startup_migrations:
+                        try:
+                            conn.execute(text(stmt))
+                        except Exception as m_err:
+                            logger.debug(f"Migration statement skipped: {m_err}")
+                    conn.commit()
+                logger.info("Startup database schema migrations verified.")
+            except Exception as mig_err:
+                logger.warning(f"Startup schema migration check: {mig_err}")
+
             try:
                 from sqlalchemy.orm import Session as DBSession
                 from app.models.models import GlobalConfiguration
