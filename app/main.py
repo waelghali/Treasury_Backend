@@ -236,20 +236,13 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(ai_query_assistant.router, prefix="/api/v1/ai-query-assistant", tags=["AI Data Query Assistant (Experimental)"])
 
     
-    # Feature Toggle Dependency logic
-    from app.core.security import get_current_user
-    def require_customer_one(current_user = Depends(get_current_user)):
-        if getattr(current_user, "customer_id", None) != 1:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Module is currently disabled under feature flag."
-            )
+    from app.core.security import require_quotation_module, require_reconciliation_module
 
     fastapi_app.include_router(
         quotations_endpoints.router, 
         prefix="/api/v1/end-user/quotations", 
         tags=["Quotation Module"],
-        dependencies=[Depends(require_customer_one)]
+        dependencies=[Depends(require_quotation_module)]
     )
     fastapi_app.include_router(
         public_quotations.router, 
@@ -261,7 +254,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         reconciliation_endpoints.router, 
         prefix="/api/v1/reconciliation", 
         tags=["Reconciliation Engine"],
-        dependencies=[Depends(require_customer_one)]
+        dependencies=[Depends(require_reconciliation_module)]
     )
 
     # --- Static Files Mounting for Supporting Uploads ---
