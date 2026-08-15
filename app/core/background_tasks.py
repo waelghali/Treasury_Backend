@@ -2,7 +2,9 @@
 
 import logging
 import json
+import os
 from datetime import date, datetime, timedelta
+
 from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session, selectinload
@@ -101,28 +103,13 @@ def _get_int_config(db: Session, customer_id: int, key: GlobalConfigKey, default
 
 async def run_daily_undelivered_instructions_report(db: Session):
     """
-    Identifies undelivered LG instructions and emails Corporate Admins.
+    Identifies undelivered LG instructions and emails Corporate Admins using modern SaaS design.
     """
     logger.info("Starting task: Undelivered LG Instructions Report.")
     
     customers = crud_customer.get_all(db)
     if not customers:
         logger.info("No active customers found.")
-        return
-
-    # Check template existence once
-    template_name = "Undelivered LG Instructions Notification"
-    notification_template = crud_template.get_by_name_and_action_type(
-        db, name=template_name,
-        action_type=ACTION_TYPE_LG_UNDELIVERED_INSTRUCTIONS_REPORT,
-        customer_id=None, is_notification_template=True
-    )
-
-    if not notification_template:
-        logger.error(f"Missing global template: {template_name}")
-        log_action(db, None, "REPORT_GENERATION_FAILED", "System", None, 
-                   {"reason": "Missing email template"}, None, None)
-        db.commit()
         return
 
     for customer in customers:
@@ -157,59 +144,61 @@ async def run_daily_undelivered_instructions_report(db: Session):
 
             cc_emails = _get_common_cc_emails(db, customer.id)
 
-            # 4. Build HTML content
+            # 4. Build Modern HTML content
             rows = []
             for inst in undelivered:
                 lg = inst.lg_record
                 days_pending = (date.today() - inst.instruction_date.date()).days
                 rows.append(f"""
-                    <tr>
-                        <td>{lg.lg_number}</td>
-                        <td>{inst.instruction_type}</td>
-                        <td>{inst.serial_number}</td>
-                        <td>{inst.instruction_date.strftime('%Y-%m-%d')}</td>
-                        <td>{days_pending} days</td>
-                        <td>{lg.issuing_bank.name if lg.issuing_bank else 'N/A'}</td>
-                        <td>{lg.lg_currency.iso_code if lg.lg_currency else 'N/A'} {float(lg.lg_amount):,.2f}</td>
-                        <td>{lg.internal_owner_contact.email if lg.internal_owner_contact else 'N/A'}</td>
+                    <tr style="border-bottom: 1px solid #e2e8f0;">
+                        <td style="padding: 10px 12px; font-weight: 600; color: #0f172a;">{lg.lg_number}</td>
+                        <td style="padding: 10px 12px; color: #334155;">{inst.instruction_type}</td>
+                        <td style="padding: 10px 12px; color: #64748b;">{inst.serial_number}</td>
+                        <td style="padding: 10px 12px; color: #64748b;">{inst.instruction_date.strftime('%Y-%m-%d')}</td>
+                        <td style="padding: 10px 12px;"><span style="background: #fef2f2; color: #dc2626; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 9999px; display: inline-block;">{days_pending} days</span></td>
+                        <td style="padding: 10px 12px; color: #334155;">{lg.issuing_bank.name if lg.issuing_bank else 'N/A'}</td>
+                        <td style="padding: 10px 12px; font-weight: 600; color: #0f172a;">{lg.lg_currency.iso_code if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}</td>
+                        <td style="padding: 10px 12px; color: #64748b;">{lg.internal_owner_contact.email if lg.internal_owner_contact else 'N/A'}</td>
                     </tr>
                 """)
             
             table_html = f"""
-                <table border="1" cellpadding="5" cellspacing="0" style="width:100%; border-collapse: collapse;">
-                    <thead>
-                        <tr>
-                            <th>LG Number</th><th>Type</th><th>Serial</th><th>Date</th>
-                            <th>Days Pending</th><th>Bank</th><th>Amount</th><th>Owner</th>
-                        </tr>
-                    </thead>
-                    <tbody>{"".join(rows)}</tbody>
-                </table>
+                <div style="overflow-x: auto; margin-top: 16px;">
+                    <table style="width:100%; border-collapse: collapse; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+                        <thead>
+                            <tr style="background-color: #f8fafc; color: #475569; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; border-bottom: 2px solid #e2e8f0;">
+                                <th style="padding: 10px 12px;">LG Number</th>
+                                <th style="padding: 10px 12px;">Type</th>
+                                <th style="padding: 10px 12px;">Serial</th>
+                                <th style="padding: 10px 12px;">Date</th>
+                                <th style="padding: 10px 12px;">Days Pending</th>
+                                <th style="padding: 10px 12px;">Bank</th>
+                                <th style="padding: 10px 12px;">Amount</th>
+                                <th style="padding: 10px 12px;">Owner</th>
+                            </tr>
+                        </thead>
+                        <tbody>{"".join(rows)}</tbody>
+                    </table>
+                </div>
             """
 
-            # 5. Prepare and Send Email
+            subject = f"Urgent: {len(undelivered)} Undelivered LG Instruction(s) Found — {customer.name}"
+
+            body = build_alert_email_html(
+                customer_name=customer.name,
+                title=f"🚨 Undelivered LG Instructions Report ({len(undelivered)} Pending)",
+                alert_type="warning",
+                message=f"The following {len(undelivered)} LG instruction(s) were issued between {start_days} and {stop_days} days ago but have not yet been marked as delivered to the issuing bank. Please review and update custody status.",
+                details_table_html=table_html,
+                cta_text="View Action Center",
+                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/action-center",
+                recipient_name="Corporate Administrator"
+            )
+
             email_settings, email_method = get_customer_email_settings(db, customer.id)
-            
-            template_data = {
-                "customer_name": customer.name,
-                "report_start_days": start_days,
-                "report_stop_days": stop_days,
-                "undelivered_instructions_count": len(undelivered),
-                "undelivered_instructions_table": table_html,
-                "current_date": date.today().strftime('%Y-%m-%d'),
-                "platform_name": "Treasury Management Platform"
-            }
-
-            subject = notification_template.subject.replace("{{customer_name}}", customer.name) \
-                             .replace("{{undelivered_instructions_count}}", str(len(undelivered)))
-            
-            body = notification_template.content
-            for k, v in template_data.items():
-                body = body.replace(f"{{{{{k}}}}}", str(v) if v is not None else "")
-
             sent = await send_email(
                 db=db, to_emails=to_emails, cc_emails=cc_emails,
-                subject_template=subject, body_template=body, template_data=template_data,
+                subject_template=subject, body_template=body, template_data={},
                 email_settings=email_settings, sender_name=customer.name
             )
 
@@ -232,6 +221,7 @@ async def run_daily_undelivered_instructions_report(db: Session):
             db.commit()
 
     logger.info("Finished task: Undelivered LG Instructions Report.")
+
 
 
 async def proactively_correct_customer_configs(global_config_id: int):
@@ -289,21 +279,39 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
     if not to_emails: return
 
     rows = "".join([
-        f"<tr><td>{c['global_config_key']}</td><td>{c['old_value']}</td><td>{c['new_value']}</td></tr>"
+        f"""<tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 10px 12px; font-weight: 600; color: #0f172a;">{c['global_config_key']}</td>
+            <td style="padding: 10px 12px; color: #64748b;">{c['old_value']}</td>
+            <td style="padding: 10px 12px; font-weight: 700; color: #16a34a;">{c['new_value']}</td>
+        </tr>"""
         for c in corrections
     ])
 
-    html_body = f"""
-    <html><body>
-        <p>Dear Corporate Admin,</p>
-        <p>Some configuration settings for {customer.name} have been automatically adjusted to comply with global system limits.</p>
-        <table border="1" cellpadding="5" cellspacing="0" style="width:100%; border-collapse: collapse;">
-            <thead><tr><th>Config Key</th><th>Old Value</th><th>New Value</th></tr></thead>
-            <tbody>{rows}</tbody>
-        </table>
-        <p>No action is required.</p>
-    </body></html>
+    table_html = f"""
+        <div style="overflow-x: auto; margin-top: 16px;">
+            <table style="width:100%; border-collapse: collapse; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+                <thead>
+                    <tr style="background-color: #f8fafc; color: #475569; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; border-bottom: 2px solid #e2e8f0;">
+                        <th style="padding: 10px 12px;">Configuration Key</th>
+                        <th style="padding: 10px 12px;">Old Value</th>
+                        <th style="padding: 10px 12px;">Adjusted Value</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
     """
+
+    html_body = build_alert_email_html(
+        customer_name=customer.name,
+        title="⚙️ Configuration Automatically Adjusted",
+        alert_type="info",
+        message=f"Some configuration settings for {customer.name} have been automatically adjusted to comply with updated global system policies.",
+        details_table_html=table_html,
+        cta_text="View Settings",
+        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/settings",
+        recipient_name="Corporate Administrator"
+    )
 
     email_settings, _ = get_customer_email_settings(db, customer.id)
     await send_email(
@@ -312,6 +320,7 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
         body_template=html_body, template_data={}, 
         email_settings=email_settings, sender_name=customer.name
     )
+
 
 
 async def run_daily_print_reminders(db: Session):
@@ -400,45 +409,38 @@ async def run_daily_print_reminders(db: Session):
                 cc_emails.extend(_get_common_cc_emails(db, customer.id))
                 cc_emails = list(set(cc_emails))
 
-                # Template
-                template = crud_template.get_by_name_and_action_type(
-                    db, name=template_key.replace('_', ' ').title(),
-                    action_type=template_key, customer_id=None, is_notification_template=True
-                )
+                # Build Email with Modern SaaS Theme
+                title_text = "⚠️ Urgent: LG Physical Print Escalation" if is_escalation else "🖨️ Reminder: LG Physical Print Pending"
                 
-                if not template:
-                    logger.error(f"Missing template '{template_key}' for customer {customer.id}")
-                    continue
+                email_body_html = build_transaction_email_html(
+                    customer_name=customer.name,
+                    title=title_text,
+                    transaction_ref=inst.lg_record.lg_number if inst.lg_record else "N/A",
+                    transaction_type=f"Print Pending ({req.action_type.replace('_', ' ').title()})",
+                    key_value_dict={
+                        "LG Number": inst.lg_record.lg_number if inst.lg_record else "N/A",
+                        "Instruction Serial": inst.serial_number,
+                        "Action Type": req.action_type.replace('_', ' ').title(),
+                        "Days Overdue": f"<span style='color: {'#dc2626' if is_escalation else '#d97706'}; font-weight: 700;'>{days_old} days</span>",
+                        "Maker": req.maker_user.email,
+                        "Checker": req.checker_user.email if req.checker_user else "N/A"
+                    },
+                    summary_text=f"An approved {req.action_type.replace('_', ' ').title()} instruction for LG #{inst.lg_record.lg_number if inst.lg_record else 'N/A'} was approved {days_old} days ago but has not yet been marked as printed for physical bank delivery.",
+                    cta_text="View Issued LGs",
+                    cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                    recipient_name=req.maker_user.email.split('@')[0]
+                )
 
-                # Build Email
-                email_data = {
-                    "maker_email": req.maker_user.email,
-                    "maker_name": req.maker_user.email.split('@')[0],
-                    "checker_email": req.checker_user.email if req.checker_user else "N/A",
-                    "approval_request_id": req.id,
-                    "action_type": req.action_type.replace('_', ' ').title(),
-                    "lg_number": inst.lg_record.lg_number if inst.lg_record else "N/A",
-                    "instruction_serial_number": inst.serial_number,
-                    "days_overdue": days_old,
-                    "customer_name": customer.name,
-                    "platform_name": "Treasury Management Platform",
-                    "print_link": f"/api/v1/end-user/lg-records/instructions/{inst.id}/view-letter?print=true",
-                }
-
-                body = template.content
-                subject = template.subject or f"Print Reminder for LG #{{lg_number}}"
-                for k, v in email_data.items():
-                    val = str(v) if v is not None else ""
-                    body = body.replace(f"{{{{{k}}}}}", val)
-                    subject = subject.replace(f"{{{{{k}}}}}", val)
+                subject = f"{'ESCALATION' if is_escalation else 'REMINDER'}: Print LG Instruction #{inst.serial_number} (LG #{inst.lg_record.lg_number if inst.lg_record else 'N/A'})"
 
                 # Send
                 email_settings, email_method = get_customer_email_settings(db, customer.id)
                 sent = await send_email(
                     db=db, to_emails=to_emails, cc_emails=cc_emails,
-                    subject_template=subject, body_template=body, template_data=email_data,
+                    subject_template=subject, body_template=email_body_html, template_data={},
                     email_settings=email_settings, sender_name=customer.name
                 )
+
 
                 if sent:
                     req_details["print_notification_status"] = "ESCALATION_SENT" if is_escalation else "REMINDER_SENT"
@@ -553,37 +555,56 @@ async def run_daily_subscription_status_update(db: Session):
 
 
 async def _send_sub_notification(db: Session, customer: models.Customer, type_enum: SubscriptionNotificationType, subject: str, body_text: str):
-    """Internal helper to send subscription emails."""
+    """Internal helper to send subscription emails with modern SaaS design."""
     admins = crud_user.get_users_by_role_for_customer(db, customer.id, UserRole.CORPORATE_ADMIN)
     to_emails = [a.email for a in admins if a.email]
     
     if not to_emails:
         return
 
+    cc_emails = _get_common_cc_emails(db, customer.id)
     email_settings, method = get_customer_email_settings(db, customer.id)
-    alert_severity = "critical" if ("7_DAYS" in type_enum.value or "EXPIRED" in type_enum.value) else "warning"
-    
-    body_html = build_alert_email_html(
+
+    status_str = customer.status.value.upper() if hasattr(customer.status, 'value') else str(customer.status).upper()
+    if status_str == "ACTIVE":
+        status_html = "<span style='color: #16a34a; font-weight: 700;'>ACTIVE</span>"
+    elif status_str == "GRACE":
+        status_html = "<span style='color: #d97706; font-weight: 700;'>GRACE PERIOD</span>"
+    else:
+        status_html = "<span style='color: #dc2626; font-weight: 700;'>EXPIRED</span>"
+
+    plan_name = customer.subscription_plan.name if customer.subscription_plan else "Enterprise Subscription"
+    expiry_str = customer.end_date.strftime("%Y-%m-%d") if customer.end_date else "N/A"
+
+    body_html = build_transaction_email_html(
         customer_name=customer.name,
         title=subject,
-        alert_type=alert_severity,
-        message=body_text,
+        transaction_ref=plan_name,
+        transaction_type="Subscription Plan",
+        key_value_dict={
+            "Customer Name": customer.name,
+            "Subscription Plan": plan_name,
+            "Expiration Date": expiry_str,
+            "Current Status": status_html
+        },
+        summary_text=body_text,
         cta_text="Manage Subscription",
-        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/subscription"
+        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/subscription",
+        recipient_name="Corporate Administrator"
     )
 
     sent, error_reason = await send_email(
-        db=db, to_emails=to_emails, subject_template=subject,
+        db=db, to_emails=to_emails, cc_emails=cc_emails, subject_template=subject,
         body_template=body_html, template_data={},
         email_settings=email_settings, sender_name=customer.name
     )
 
-
     log_action(
         db, None, f"NOTIFICATION_{'SENT' if sent else 'FAILED'}_{type_enum.value}", 
         "Customer", customer.id,
-        {"recipients": to_emails, "subject": subject, "reason": error_reason if not sent else None}, customer.id
+        {"recipients": to_emails, "cc_recipients": cc_emails, "subject": subject, "reason": error_reason if not sent else None}, customer.id
     )
+
 
 
 async def run_daily_lg_status_update(db: Session):
@@ -1727,24 +1748,27 @@ async def _send_reservation_notification(
         try:
             email_settings, _ = get_customer_email_settings(db, customer.id)
             cc_emails = _get_common_cc_emails(db, customer.id)
+            email_body_html = build_alert_email_html(
+                customer_name=customer.name,
+                title=f"📌 Reservation Alert: {request.lg_ref_number or f'Request #{request.id}'}",
+                alert_type="warning",
+                message=message,
+                cta_text="View Request Details",
+                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/requests",
+                recipient_name="Treasury User"
+            )
+
             await send_email(
                 db=db,
                 to_emails=to_emails,
                 cc_emails=cc_emails,
                 subject_template=f"Reservation Alert: {request.lg_ref_number or f'Request #{request.id}'}",
-                body_template=f"""
-                <html><body>
-                    <p>Dear User,</p>
-                    <p>{message}</p>
-                    <p>Request Reference: {request.lg_ref_number or f'#{request.id}'}</p>
-                    <p>Please log in to take action.</p>
-                    <p>Best regards,<br>{customer.name} - Treasury Management Platform</p>
-                </body></html>
-                """,
+                body_template=email_body_html,
                 template_data={},
                 email_settings=email_settings,
                 sender_name=customer.name,
             )
+
         except Exception as e:
             logger.error(f"Failed to send reservation email: {e}")
 
@@ -1869,31 +1893,23 @@ async def run_daily_maintenance_delivery_reminders(db: Session):
                         subject = f"Reminder: Maintenance Letter Pending Delivery — {lg_ref} ({action_label})"
                         body_intro = f"A maintenance letter generated <strong>{days_old} days ago</strong> has not yet been marked as delivered to the bank."
 
-                    body = f"""
-                    <html>
-                    <body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f5f5f5; padding: 20px;">
-                        <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
-                            <h2 style="color: {'#dc2626' if is_escalation else '#f59e0b'}; margin-top: 0;">
-                                {'⚠️ Delivery Escalation' if is_escalation else '📋 Delivery Reminder'}
-                            </h2>
-                            <p>{body_intro}</p>
-                            <table style="width:100%; border-collapse:collapse; margin:15px 0;">
-                                <tr><td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">LG Reference</td>
-                                    <td style="padding:8px;border:1px solid #e5e7eb;">{lg_ref}</td></tr>
-                                <tr><td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">Action Type</td>
-                                    <td style="padding:8px;border:1px solid #e5e7eb;">{action_label}</td></tr>
-                                <tr><td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">Serial Number</td>
-                                    <td style="padding:8px;border:1px solid #e5e7eb;">{serial}</td></tr>
-                                <tr><td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">Days Pending</td>
-                                    <td style="padding:8px;border:1px solid #e5e7eb;color:#dc2626;font-weight:bold;">{days_old} days</td></tr>
-                            </table>
-                            <p>Please print and deliver the letter to the bank, then mark it as delivered in the system.</p>
-                            <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;" />
-                            <p style="font-size: 12px; color: #999;">Automated notification from Treasury LG Issuance system.</p>
-                        </div>
-                    </body>
-                    </html>
-                    """
+                    body = build_transaction_email_html(
+                        customer_name=customer.name,
+                        title="⚠️ Delivery Escalation: Maintenance Letter" if is_escalation else "📋 Delivery Reminder: Maintenance Letter",
+                        transaction_ref=lg_ref,
+                        transaction_type=f"Maintenance Letter ({action_label})",
+                        key_value_dict={
+                            "LG Reference": lg_ref,
+                            "Action Type": action_label,
+                            "Serial Number": serial,
+                            "Days Pending": f"<span style='color: {'#dc2626' if is_escalation else '#d97706'}; font-weight: 700;'>{days_old} days</span>"
+                        },
+                        summary_text=f"A maintenance letter generated {days_old} days ago has not yet been marked as delivered to the bank. Please print and deliver the letter to the bank, then mark it as delivered in the system.",
+                        cta_text="View Issued LGs",
+                        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                        recipient_name="Corporate Administrator"
+                    )
+
 
                     # 7. Send email
                     email_settings, _ = get_customer_email_settings(db, customer.id)

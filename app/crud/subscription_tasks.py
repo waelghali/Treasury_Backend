@@ -1,5 +1,4 @@
-# app/crud/subscription_tasks.py
-
+import os
 import logging
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, TYPE_CHECKING
@@ -14,7 +13,7 @@ from app.constants import (
     SubscriptionNotificationType,
 )
 from app.core.email_service import get_customer_email_settings, send_email, EmailSettings, get_global_email_settings
-# REMOVED the direct import from app.crud.crud. Instead, these will be passed as arguments.
+from app.services.unified_email_builder import build_alert_email_html, build_transaction_email_html
 
 import pytz
 
@@ -34,7 +33,7 @@ async def _send_subscription_notification(
     body: str,
     details: Dict[str, Any]
 ):
-    """Helper function to send a subscription-related notification email."""
+    """Helper function to send a subscription-related notification email using modern SaaS design."""
     try:
         # Fetch all Corporate Admins for the customer
         corporate_admins = db.query(models.User).filter(
@@ -42,7 +41,7 @@ async def _send_subscription_notification(
             models.User.role == UserRole.CORPORATE_ADMIN,
             models.User.is_deleted == False
         ).all()
-        to_emails = [admin.email for admin in corporate_admins]
+        to_emails = [admin.email for admin in corporate_admins if admin.email]
 
         if not to_emails:
             logger.warning(f"No Corporate Admins found for customer {customer.id}. Cannot send '{email_type.value}' notification.")
@@ -62,17 +61,41 @@ async def _send_subscription_notification(
 
         email_settings, email_method_for_log = get_customer_email_settings(db, customer.id)
         
-        # In a real-world scenario, you would have an email template for each type.
-        # For now, we use a simple text body.
-        # template = crud_template.get_by_name_and_action_type(db, name=email_type.value, action_type=email_type.value, is_notification_template=True)
-        # body = template.content if template else body_placeholder
+        # Determine status badge HTML
+        status_str = customer.status.value.upper() if hasattr(customer.status, 'value') else str(customer.status).upper()
+        if status_str == "ACTIVE":
+            status_html = "<span style='color: #16a34a; font-weight: 700;'>ACTIVE</span>"
+        elif status_str == "GRACE":
+            status_html = "<span style='color: #d97706; font-weight: 700;'>GRACE PERIOD</span>"
+        else:
+            status_html = "<span style='color: #dc2626; font-weight: 700;'>EXPIRED</span>"
+
+        plan_name = customer.subscription_plan.name if customer.subscription_plan else "Enterprise Subscription"
+        expiry_str = customer.end_date.strftime("%Y-%m-%d") if customer.end_date else "N/A"
+
+        body_html = build_transaction_email_html(
+            customer_name=customer.name,
+            title=subject,
+            transaction_ref=plan_name,
+            transaction_type="Subscription Plan",
+            key_value_dict={
+                "Customer Name": customer.name,
+                "Subscription Plan": plan_name,
+                "Expiration Date": expiry_str,
+                "Current Status": status_html
+            },
+            summary_text=body,
+            cta_text="Manage Subscription",
+            cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/subscription",
+            recipient_name="Corporate Administrator"
+        )
 
         email_sent = await send_email(
             db=db,
             to_emails=to_emails,
             subject_template=subject,
-            body_template=body,
-            template_data=details,
+            body_template=body_html,
+            template_data={},
             email_settings=email_settings,
             sender_name=customer.name
         )
@@ -119,6 +142,7 @@ async def _send_subscription_notification(
             details={"reason": str(e), "notification_type": email_type.value},
             customer_id=customer.id
         )
+
 
 
 async def run_daily_subscription_status_update(
