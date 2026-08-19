@@ -25,6 +25,7 @@ APPROVED_CARD_IDS: Dict[str, Dict[str, Any]] = {
     "expiring_60_days": {"intent": "find_expiring_lgs", "params": {"days": 60}},
     "portfolio_summary": {"intent": "get_lg_analytics_summary", "params": {}},
     "facility_summary": {"intent": "get_facility_analytics", "params": {}},
+    "facility_analytics": {"intent": "get_facility_analytics", "params": {}},
     "pending_approvals_check": {"intent": "get_pending_approvals", "params": {}},
     "system_capabilities_guide": {"intent": "system_help", "params": {"query": "system capabilities"}},
     "my_recent_activity": {"intent": "get_audit_history", "params": {"scope": "my_actions"}},
