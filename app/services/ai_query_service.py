@@ -119,13 +119,14 @@ class AIQueryAssistantService:
                 }
             }
 
-        # 2. Level 4 System Guides & Navigation
+        # 2. Level 4 System Guides & Navigation (using word boundaries to prevent 'show top' colliding with 'how to')
         is_greeting = q_lower in ["hi", "hello", "hey", "start", "help", "who are you", "what can you do", "restart", "reset"]
-        if is_greeting or any(kw in q_lower for kw in [
-            "how can i", "how do i", "how to", "where can i", "guide me", "steps to",
-            "where do i find", "how to extend", "how to record", "how to issue",
-            "how to approve", "how to create facility", "navigation"
-        ]):
+        guide_patterns = [
+            r"\bhow\s+can\s+i\b", r"\bhow\s+do\s+i\b", r"\bhow\s+to\b",
+            r"\bwhere\s+can\s+i\b", r"\bguide\s+me\b", r"\bsteps\s+to\b",
+            r"\bwhere\s+do\s+i\s+find\b", r"\bnavigation\b"
+        ]
+        if is_greeting or any(re.search(pat, q_lower) for pat in guide_patterns):
             return {
                 "suggested_level": 4,
                 "topic": "system_navigation",
@@ -167,9 +168,22 @@ class AIQueryAssistantService:
         ]):
             return {"suggested_level": 1, "topic": "treasury", "intent": "get_issuance_summary", "parameters": {}}
 
-        # 9. Top Beneficiaries
-        if any(kw in q_lower for kw in ["top beneficiaries", "beneficiary concentration", "highest beneficiary", "major beneficiaries", "top counterparty"]):
-            return {"suggested_level": 1, "topic": "treasury", "intent": "get_top_beneficiaries", "parameters": {"limit": 5}}
+        # 9a. Specific Inbound Issuers / Contractors / Applicants
+        if any(kw in q_lower for kw in ["top issuers", "top contractors", "top applicants", "custody issuers", "issuing counterparties", "who gave us lgs"]):
+            return {"suggested_level": 1, "topic": "treasury", "intent": "get_top_issuers", "parameters": {"limit": 5}}
+
+        # 9b. Subsidiary / Internal Entity Distribution
+        if any(kw in q_lower for kw in ["subsidiary", "subsidiaries", "entity distribution", "distributed among my companies", "distributed among our companies", "entity breakdown"]):
+            return {"suggested_level": 1, "topic": "treasury", "intent": "get_entity_distribution", "parameters": {}}
+
+        # 9c. Top Beneficiaries / Counterparties (Bi-Module Aware)
+        if any(kw in q_lower for kw in [
+            "top beneficiaries", "show top beneficiaries", "beneficiaries", "beneficiary concentration",
+            "highest beneficiary", "major beneficiaries", "top counterparty", "who are our beneficiaries",
+            "outbound beneficiaries", "issuance beneficiaries"
+        ]):
+            scope = "issuance" if any(w in q_lower for w in ["outbound", "issuance", "issued to"]) else "all"
+            return {"suggested_level": 1, "topic": "treasury", "intent": "get_top_beneficiaries", "parameters": {"limit": 5, "scope": scope}}
 
         # 10. Bank Exposure Distribution
         if any(kw in q_lower for kw in ["bank exposure", "bank concentration", "exposure by bank", "distribution by bank", "banks holding"]):
@@ -394,6 +408,54 @@ class AIQueryAssistantService:
             }
 
         if intent == "get_top_beneficiaries":
+            # Return both Inbound Custody entities + Outbound Issuance beneficiaries for unified intelligence
+            custody_records = custody_base.join(LGRecord.lg_status).filter(
+                func.upper(LgStatus.name) == "VALID"
+            ).options(
+                joinedload(LGRecord.beneficiary_corporate),
+                joinedload(LGRecord.lg_currency)
+            ).all()
+
+            outbound_records = db.query(
+                IssuanceRequest.beneficiary_name,
+                Currency.iso_code,
+                func.sum(IssuanceRequest.amount)
+            ).join(Currency, IssuanceRequest.currency_id == Currency.id).filter(
+                IssuanceRequest.customer_id == customer_id,
+                IssuanceRequest.is_deleted == False,
+                IssuanceRequest.beneficiary_name != None
+            ).group_by(IssuanceRequest.beneficiary_name, Currency.iso_code).all()
+
+            inbound_issuers = db.query(
+                LGRecord.issuer_name,
+                Currency.iso_code,
+                func.sum(LGRecord.lg_amount)
+            ).join(Currency, LGRecord.lg_currency_id == Currency.id).join(LGRecord.lg_status).filter(
+                LGRecord.customer_id == customer_id,
+                LGRecord.is_deleted == False,
+                func.upper(LgStatus.name) == "VALID",
+                LGRecord.issuer_name != None
+            ).group_by(LGRecord.issuer_name, Currency.iso_code).all()
+
+            return {
+                "custody_records": custody_records,
+                "outbound_records": outbound_records,
+                "inbound_issuers": inbound_issuers
+            }
+
+        if intent == "get_top_issuers":
+            return db.query(
+                LGRecord.issuer_name,
+                Currency.iso_code,
+                func.sum(LGRecord.lg_amount)
+            ).join(Currency, LGRecord.lg_currency_id == Currency.id).join(LGRecord.lg_status).filter(
+                LGRecord.customer_id == customer_id,
+                LGRecord.is_deleted == False,
+                func.upper(LgStatus.name) == "VALID",
+                LGRecord.issuer_name != None
+            ).group_by(LGRecord.issuer_name, Currency.iso_code).all()
+
+        if intent == "get_entity_distribution":
             return custody_base.join(LGRecord.lg_status).filter(
                 func.upper(LgStatus.name) == "VALID"
             ).options(
@@ -683,30 +745,128 @@ class AIQueryAssistantService:
             return "\n".join(lines), references, suggested_chips
 
         if intent == "get_top_beneficiaries":
+            data = query_result if isinstance(query_result, dict) else {"custody_records": query_result or [], "outbound_records": [], "inbound_issuers": []}
+            lines = ["🏢 **Beneficiary & Counterparty Intelligence (Bi-Module Analysis)**:\n"]
+
+            # 1. Outbound Issuance (External Beneficiaries)
+            outbound_raw = data.get("outbound_records") or []
+            outbound_map: Dict[str, Dict[str, float]] = {}
+            for row in outbound_raw:
+                name, curr, amt = row[0], row[1], row[2]
+                if not name:
+                    continue
+                if name not in outbound_map:
+                    outbound_map[name] = {}
+                outbound_map[name][curr] = outbound_map[name].get(curr, 0.0) + float(amt or 0.0)
+
+            if outbound_map:
+                sorted_out = sorted(outbound_map.items(), key=lambda x: sum(x[1].values()), reverse=True)[:5]
+                lines.append("📤 **Top External Beneficiaries (LG Issuance)**:")
+                for idx, (name, currs) in enumerate(sorted_out, 1):
+                    curr_strs = [f"{amt:,.2f} {c}" for c, amt in currs.items()]
+                    lines.append(f"{idx}. **{name}**: {', '.join(curr_strs)}")
+                lines.append("")
+
+            # 2. Inbound Custody (Internal Subsidiaries)
+            custody_recs = data.get("custody_records") or []
+            custody_map: Dict[str, Dict[str, float]] = {}
+            for r in custody_recs:
+                b_name = r.beneficiary_corporate.entity_name if (r.beneficiary_corporate and hasattr(r.beneficiary_corporate, "entity_name") and r.beneficiary_corporate.entity_name) else "Unassigned Entity"
+                curr = r.lg_currency.iso_code if (r.lg_currency and r.lg_currency.iso_code) else "EGP"
+                amt = float(r.lg_amount or 0.0)
+                if b_name not in custody_map:
+                    custody_map[b_name] = {}
+                custody_map[b_name][curr] = custody_map[b_name].get(curr, 0.0) + amt
+
+            if custody_map:
+                sorted_cust = sorted(custody_map.items(), key=lambda x: sum(x[1].values()), reverse=True)[:5]
+                lines.append("🛡️ **Internal Subsidiary Allocation (LG Custody)**:")
+                for idx, (name, currs) in enumerate(sorted_cust, 1):
+                    curr_strs = [f"{amt:,.2f} {c}" for c, amt in currs.items()]
+                    lines.append(f"{idx}. **{name}**: {', '.join(curr_strs)}")
+                lines.append("")
+
+            # 3. Inbound Issuers (Contractors / Applicants)
+            issuers_raw = data.get("inbound_issuers") or []
+            issuers_map: Dict[str, Dict[str, float]] = {}
+            for row in issuers_raw:
+                name, curr, amt = row[0], row[1], row[2]
+                if not name:
+                    continue
+                if name not in issuers_map:
+                    issuers_map[name] = {}
+                issuers_map[name][curr] = issuers_map[name].get(curr, 0.0) + float(amt or 0.0)
+
+            if issuers_map:
+                sorted_iss = sorted(issuers_map.items(), key=lambda x: sum(x[1].values()), reverse=True)[:3]
+                lines.append("🤝 **Top Issuing Contractors (Applicants in Custody)**:")
+                for idx, (name, currs) in enumerate(sorted_iss, 1):
+                    curr_strs = [f"{amt:,.2f} {c}" for c, amt in currs.items()]
+                    lines.append(f"{idx}. **{name}**: {', '.join(curr_strs)}")
+                lines.append("")
+
+            lines.append(f"👉 [View All Entities]({nav_base}/entities) | [View Issuance Pipeline]({nav_base}/issuance/requests)")
+
+            suggested_chips = [
+                {"label": "🏢 Outbound Beneficiaries", "query": "show outbound beneficiaries"},
+                {"label": "🤝 Top Inbound Issuers", "query": "show top contractors"},
+                {"label": "🏛️ Subsidiary Distribution", "query": "show subsidiary distribution"},
+                {"label": "🏦 Bank Exposure", "query": "bank exposure"}
+            ]
+            return "\n".join(lines).strip(), references, suggested_chips
+
+        if intent == "get_top_issuers":
+            raw_issuers = query_result or []
+            if not raw_issuers:
+                return "No counterparty applicant/issuer data found in custody guarantees.", [], []
+
+            issuers_map: Dict[str, Dict[str, float]] = {}
+            for row in raw_issuers:
+                name, curr, amt = row[0], row[1], row[2]
+                if not name:
+                    continue
+                if name not in issuers_map:
+                    issuers_map[name] = {}
+                issuers_map[name][curr] = issuers_map[name].get(curr, 0.0) + float(amt or 0.0)
+
+            sorted_iss = sorted(issuers_map.items(), key=lambda x: sum(x[1].values()), reverse=True)[:5]
+            lines = ["🤝 **Top Issuing Contractors / Applicants (LG Custody)**:\n"]
+            for idx, (name, currs) in enumerate(sorted_iss, 1):
+                curr_strs = [f"{amt:,.2f} {c}" for c, amt in currs.items()]
+                lines.append(f"{idx}. **{name}**: {', '.join(curr_strs)}")
+
+            lines.append(f"\n👉 [Open Custody Vault]({nav_base}/lg-records)")
+            suggested_chips = [
+                {"label": "🏢 Outbound Beneficiaries", "query": "show outbound beneficiaries"},
+                {"label": "🏛️ Subsidiary Distribution", "query": "show subsidiary distribution"},
+                {"label": "🏦 Bank Exposure", "query": "bank exposure"}
+            ]
+            return "\n".join(lines), references, suggested_chips
+
+        if intent == "get_entity_distribution":
             records = query_result or []
             if not records:
-                return "No active guarantee records found to compute counterparty concentration.", [], []
+                return "No active guarantee records found across subsidiaries.", [], []
 
-            beneficiary_map: Dict[str, Dict[str, float]] = {}
+            entity_map: Dict[str, Dict[str, float]] = {}
             for r in records:
-                b_name = r.beneficiary_corporate.entity_name if r.beneficiary_corporate else (r.beneficiary or "Unknown")
-                c_code = r.lg_currency.iso_code if r.lg_currency else "EGP"
-                if b_name not in beneficiary_map:
-                    beneficiary_map[b_name] = {}
-                beneficiary_map[b_name][c_code] = beneficiary_map[b_name].get(c_code, 0.0) + float(r.lg_amount or 0.0)
+                b_name = r.beneficiary_corporate.entity_name if (r.beneficiary_corporate and hasattr(r.beneficiary_corporate, "entity_name") and r.beneficiary_corporate.entity_name) else "Unassigned Entity"
+                curr = r.lg_currency.iso_code if (r.lg_currency and r.lg_currency.iso_code) else "EGP"
+                amt = float(r.lg_amount or 0.0)
+                if b_name not in entity_map:
+                    entity_map[b_name] = {}
+                entity_map[b_name][curr] = entity_map[b_name].get(curr, 0.0) + amt
 
-            sorted_beneficiaries = sorted(beneficiary_map.items(), key=lambda item: sum(item[1].values()), reverse=True)[:5]
+            lines = ["🏛️ **Guarantee Allocation by Internal Subsidiary / Entity**:\n"]
+            for idx, (name, currs) in enumerate(entity_map.items(), 1):
+                curr_strs = [f"{amt:,.2f} {c}" for c, amt in currs.items()]
+                lines.append(f"{idx}. **{name}**: {', '.join(curr_strs)}")
 
-            lines = ["🏢 **Top 5 Beneficiaries by Exposure (LG Custody)**:\n"]
-            for idx, (b_name, curr_dict) in enumerate(sorted_beneficiaries, 1):
-                amt_str = ", ".join([f"{amt:,.2f} {c}" for c, amt in curr_dict.items()])
-                lines.append(f"{idx}. **{b_name}**: {amt_str}")
-
-            lines.append(f"\n👉 [View All Beneficiary Entities]({nav_base}/entities)")
+            lines.append(f"\n👉 [Manage Corporate Entities]({nav_base}/entities)")
             suggested_chips = [
-                {"label": "🏦 Bank Exposure Distribution", "query": "show bank exposure"},
-                {"label": "📅 Expiring in 60 Days", "query": "lgs expiring within 60 days"},
-                {"label": "📊 Unified Portfolio Overview", "query": "show portfolio overview"}
+                {"label": "🤝 Top Inbound Issuers", "query": "show top contractors"},
+                {"label": "🏢 Outbound Beneficiaries", "query": "show outbound beneficiaries"},
+                {"label": "📊 Unified Portfolio Overview", "query": "show portfolio summary"}
             ]
             return "\n".join(lines), references, suggested_chips
 
@@ -879,10 +1039,16 @@ class AIQueryAssistantService:
             )
 
         knowledge = get_system_knowledge()
-        best_match = knowledge.get("lg_custody_system_overview", {})
+        if isinstance(knowledge, dict):
+            best_match = knowledge.get("lg_custody_system_overview", {})
+            title = best_match.get('title', 'Grow Treasury Guidance')
+            content = best_match.get('content', 'Please use the navigation menu on the left to access your treasury workflows.')
+        else:
+            title = 'Grow Treasury Guidance'
+            content = str(knowledge) if knowledge else 'Please use the navigation menu on the left to access your treasury workflows.'
         return (
-            f"**{best_match.get('title', 'Grow Treasury Guidance')}**:\n\n"
-            f"{best_match.get('content', 'Please use the navigation menu on the left to access your treasury workflows.')}\n\n"
+            f"**{title}**:\n\n"
+            f"{content}\n\n"
             f"👉 [Go to Dashboard]({nav_base}/dashboard)"
         )
 

@@ -49,7 +49,9 @@ APPROVED_OPERATIONS: Dict[str, Dict[str, Any]] = {
     "complex_analysis": {"params": {"query": str}},
     "get_issuance_summary": {"params": {"status": str, "currency": str}},
     "get_action_center_summary": {"params": {}},
-    "get_top_beneficiaries": {"params": {"limit": int}},
+    "get_top_beneficiaries": {"params": {"limit": int, "scope": str}},
+    "get_top_issuers": {"params": {"limit": int}},
+    "get_entity_distribution": {"params": {}},
     "get_bank_exposure": {"params": {"limit": int}}
 }
 
