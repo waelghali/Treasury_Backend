@@ -277,14 +277,14 @@ class AIQueryAssistantService:
                 }
 
         # ----------------------------------------------------------------------
-        # 8. FAST-PATH EXPIRY HORIZONS & SEARCHES
+        # 8. FAST-PATH EXPIRY HORIZONS & SEARCHES (Dynamic Day/Month Regex)
         # ----------------------------------------------------------------------
         months_map = {
             "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
             "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
         }
         for m_name, m_num in months_map.items():
-            if m_name in q_lower and any(w in q_lower for w in ["expir", "due", "matur"]):
+            if m_name in q_lower and any(w in q_lower for w in ["expir", "due", "matur", "in "]):
                 return {
                     "suggested_level": 1,
                     "topic": "treasury",
@@ -292,13 +292,29 @@ class AIQueryAssistantService:
                     "parameters": {"month": str(m_num)}
                 }
 
-        if any(kw in q_lower for kw in ["expire in 60 days", "expiring in 60 days", "next 60 days", "60 days"]):
-            return {"suggested_level": 1, "topic": "treasury", "intent": "find_expiring_lgs", "parameters": {"days": 60}}
-        if any(kw in q_lower for kw in ["expire in 30 days", "expiring in 30 days", "next 30 days", "expiring this month", "30 days"]):
-            return {"suggested_level": 1, "topic": "treasury", "intent": "find_expiring_lgs", "parameters": {"days": 30}}
-        if any(kw in q_lower for kw in ["expire in 90 days", "expiring in 90 days", "next 90 days", "90 days"]):
-            return {"suggested_level": 1, "topic": "treasury", "intent": "find_expiring_lgs", "parameters": {"days": 90}}
-        if any(kw in q_lower for kw in ["expir", "upcoming expiries", "due for renewal"]):
+        # Dynamic regex for any number of days: "within 60 days", "before 120 days", "next 1160 days", etc.
+        days_match = re.search(r'\b(?:within|in|next|before|under|less than)?\s*(\d+)\s*days?\b', q_lower)
+        if days_match and any(w in q_lower for w in ["expir", "due", "matur", "within", "before", "next", "in"]):
+            parsed_days = int(days_match.group(1))
+            return {
+                "suggested_level": 1,
+                "topic": "treasury",
+                "intent": "find_expiring_lgs",
+                "parameters": {"days": parsed_days}
+            }
+
+        # Dynamic regex for months: "within 3 months", "next 6 months"
+        months_window_match = re.search(r'\b(?:within|in|next|before)\s*(\d+)\s*months?\b', q_lower)
+        if months_window_match:
+            parsed_months = int(months_window_match.group(1))
+            return {
+                "suggested_level": 1,
+                "topic": "treasury",
+                "intent": "find_expiring_lgs",
+                "parameters": {"days": parsed_months * 30}
+            }
+
+        if any(kw in q_lower for kw in ["expir", "upcoming expiries", "due for renewal", "expiring soon"]):
             return {"suggested_level": 1, "topic": "treasury", "intent": "find_expiring_lgs", "parameters": {"days": 60}}
 
         # ----------------------------------------------------------------------
@@ -548,7 +564,7 @@ Here is how I can assist you:
             month = params.get("month")
             now = datetime.now(timezone.utc)
 
-            q = base_query.join(LgStatus).filter(LgStatus.name == "VALID")
+            q = base_query.join(LGRecord.lg_status).filter(func.upper(LgStatus.name) == "VALID")
             if month:
                 try:
                     m_int = int(month)
@@ -589,7 +605,7 @@ Here is how I can assist you:
             q = base_query
             if status_filter:
                 st_upper = status_filter.upper()
-                q = q.join(LgStatus).filter(LgStatus.name == st_upper)
+                q = q.join(LGRecord.lg_status).filter(func.upper(LgStatus.name) == st_upper)
             if currency_filter:
                 q = q.join(LGRecord.lg_currency).filter(func.upper(LGRecord.lg_currency.property.mapper.class_.iso_code) == currency_filter.upper())
             if bank_filter:
