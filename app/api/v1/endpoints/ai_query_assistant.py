@@ -29,10 +29,16 @@ class LGReferenceItem(BaseModel):
     currency: Optional[str] = None
 
 
+class SuggestedChip(BaseModel):
+    label: str
+    query: str
+
+
 class AIQueryResponse(BaseModel):
     success: bool
     answer: Optional[str] = None
     references: List[LGReferenceItem] = []
+    suggested_chips: List[SuggestedChip] = []
     visual_metadata: Optional[Dict[str, Any]] = None
     level: Optional[int] = Field(None, description="Architecture Level used (0, 1, 2, or 3)")
     source_awareness: Optional[str] = Field(None, description="Source tag: SYSTEM_DATA, GENERAL_AI_KNOWLEDGE, COMBINATION")
@@ -107,6 +113,7 @@ async def query_ai_assistant(
         success=True,
         answer=result.get("answer"),
         references=result.get("references", []),
+        suggested_chips=result.get("suggested_chips", []),
         visual_metadata=result.get("visual_metadata"),
         level=result.get("level"),
         source_awareness=result.get("source_awareness"),
