@@ -3,13 +3,14 @@
 AI Chat Logger Service
 Automatically logs user questions, AI responses, architectural levels, intents, and metadata.
 Saves logs to:
-1. Local lightweight text/jsonl files (for immediate review during user testing).
-2. Google Cloud Storage (GCS) (for persistent cloud-based production auditing & analysis).
+1. Local lightweight text/jsonl files (Immediate, 100% Offline, Non-Blocking).
+2. Google Cloud Storage (GCS) (Asynchronous background worker, never blocks HTTP thread, silent offline fallback).
 """
 
 import os
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -20,7 +21,7 @@ LOCAL_LOG_DIR = os.path.join(os.getcwd(), "uploads", "ai_chat_logs")
 
 class AIChatLogger:
     """
-    Manages dual-tier chat logging (Local Files + Google Cloud Storage).
+    Manages dual-tier chat logging (Local Files + Asynchronous Background GCS Sync).
     """
 
     def __init__(self):
@@ -47,7 +48,7 @@ class AIChatLogger:
         execution_time_ms: Optional[float] = None
     ) -> None:
         """
-        Logs a single chat interaction safely without blocking or throwing exceptions.
+        Logs a single chat interaction instantly locally, and schedules GCS sync asynchronously without blocking.
         """
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%Y-%m-%d")
@@ -68,17 +69,22 @@ class AIChatLogger:
             "execution_time_ms": execution_time_ms
         }
 
-        # 1. Write to Local JSONL and TXT files
+        # 1. Write to Local JSONL and TXT files (Instant <1ms local disk I/O)
         try:
             self._write_local_logs(date_str, timestamp_iso, customer_id, user_id, card_id, question, answer, level, intent, log_payload)
         except Exception as e:
             logger.error(f"Failed to write local chat log: {e}")
 
-        # 2. Upload/Sync to Google Cloud Storage (GCS)
+        # 2. Upload/Sync to Google Cloud Storage (GCS) in a background thread to NEVER block HTTP response
         try:
-            self._upload_to_gcs(customer_id, date_str, log_payload)
+            thread = threading.Thread(
+                target=self._upload_to_gcs_safe,
+                args=(customer_id, date_str, log_payload),
+                daemon=True
+            )
+            thread.start()
         except Exception as e:
-            logger.warning(f"Failed to sync chat log to GCS: {e}")
+            logger.debug(f"Could not spawn background GCS logger thread: {e}")
 
     def _write_local_logs(
         self,
@@ -102,7 +108,7 @@ class AIChatLogger:
 
         # B. TXT file (human-readable transcript for quick user review)
         txt_path = os.path.join(LOCAL_LOG_DIR, f"chat_transcript_{date_str}.txt")
-        level_label = {0: "L0 System Only", 1: "L1 Simple AI + System", 2: "L2 Complex AI (Tokenized)", 3: "L3 General Treasury AI"}.get(level, f"L{level}")
+        level_label = {0: "L0 System Only", 1: "L1 Simple AI + System", 2: "L2 Complex AI (Tokenized)", 3: "L3 General Treasury AI", 4: "L4 System Knowledge"}.get(level, f"L{level}")
         query_display = question if question else f"[Quick Action Card: {card_id}]"
 
         transcript_entry = (
@@ -117,11 +123,18 @@ class AIChatLogger:
         with open(txt_path, "a", encoding="utf-8") as f:
             f.write(transcript_entry)
 
-    def _upload_to_gcs(self, customer_id: int, date_str: str, log_payload: Dict[str, Any]):
+    def _upload_to_gcs_safe(self, customer_id: int, date_str: str, log_payload: Dict[str, Any]):
         """
-        Appends or uploads the daily chat log payload to Google Cloud Storage.
+        Background worker that syncs log payload to Google Cloud Storage.
+        Fails silently and immediately if offline without impacting API responsiveness.
         """
         try:
+            import socket
+            try:
+                socket.gethostbyname("oauth2.googleapis.com")
+            except Exception:
+                return
+
             from google.cloud import storage
             credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
             bucket_name = os.getenv("GCS_BUCKET_NAME", "lg_custody_bucket")
@@ -137,13 +150,12 @@ class AIChatLogger:
 
             new_line = json.dumps(log_payload, ensure_ascii=False) + "\n"
 
-            # Check if blob already exists to append, else create
-            if blob.exists():
-                existing_content = blob.download_as_text(encoding="utf-8")
+            if blob.exists(timeout=2):
+                existing_content = blob.download_as_text(encoding="utf-8", timeout=3)
                 updated_content = existing_content + new_line
-                blob.upload_from_string(updated_content, content_type="application/x-jsonlines")
+                blob.upload_from_string(updated_content, content_type="application/x-jsonlines", timeout=3)
             else:
-                blob.upload_from_string(new_line, content_type="application/x-jsonlines")
+                blob.upload_from_string(new_line, content_type="application/x-jsonlines", timeout=3)
 
             logger.info(f"Successfully synced chat log to GCS: gs://{bucket_name}/{blob_name}")
         except Exception as e:
