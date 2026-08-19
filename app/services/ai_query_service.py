@@ -318,16 +318,29 @@ class AIQueryAssistantService:
             return {"suggested_level": 1, "topic": "treasury", "intent": "find_expiring_lgs", "parameters": {"days": 60}}
 
         # ----------------------------------------------------------------------
-        # 9. FAST-PATH STATUS SEARCHES (Expired, Released, Liquidated, Active)
+        # 9. FAST-PATH SEARCHES & STATUS FILTERS (Beneficiary, Company, Status)
         # ----------------------------------------------------------------------
-        if "expired" in q_lower:
-            return {"suggested_level": 1, "topic": "treasury", "intent": "search_lgs", "parameters": {"status": "expired"}}
-        if "released" in q_lower:
-            return {"suggested_level": 1, "topic": "treasury", "intent": "search_lgs", "parameters": {"status": "released"}}
-        if "liquidated" in q_lower:
-            return {"suggested_level": 1, "topic": "treasury", "intent": "search_lgs", "parameters": {"status": "liquidated"}}
-        if any(kw in q_lower for kw in ["how many active", "active lgs", "which lgs are currently active"]):
-            return {"suggested_level": 1, "topic": "treasury", "intent": "search_lgs", "parameters": {"status": "valid"}}
+        # Extract company / beneficiary search term (e.g. "for NonExistentCompany12345", "for ACME")
+        comp_match = re.search(r'\b(?:for|company|beneficiary)\s+([A-Za-z0-9_-]+)\b', q_raw)
+        extracted_comp = comp_match.group(1).strip() if comp_match else None
+
+        status_match = re.search(r'\b(?:status|state)\s+([A-Za-z0-9_-]+)\b', q_lower)
+        extracted_status = status_match.group(1).strip() if status_match else None
+
+        if not extracted_status:
+            for st_word in ["suspended", "draft", "cancelled", "expired", "released", "liquidated"]:
+                if st_word in q_lower:
+                    extracted_status = st_word
+                    break
+
+        if not extracted_status and any(kw in q_lower for kw in ["active", "valid"]):
+            extracted_status = "valid"
+
+        if extracted_comp or extracted_status:
+            s_params = {}
+            if extracted_status: s_params["status"] = extracted_status
+            if extracted_comp: s_params["query"] = extracted_comp
+            return {"suggested_level": 1, "topic": "treasury", "intent": "search_lgs", "parameters": s_params}
 
         # ----------------------------------------------------------------------
         # 10. FAST-PATH GENERAL PORTFOLIO TOTALS & OVERVIEWS
@@ -601,6 +614,7 @@ Here is how I can assist you:
             status_filter = params.get("status")
             currency_filter = params.get("currency")
             bank_filter = params.get("bank")
+            search_term = params.get("query") or params.get("search_term")
 
             q = base_query
             if status_filter:
@@ -610,8 +624,16 @@ Here is how I can assist you:
                 q = q.join(LGRecord.lg_currency).filter(func.upper(LGRecord.lg_currency.property.mapper.class_.iso_code) == currency_filter.upper())
             if bank_filter:
                 q = q.join(LGRecord.issuing_bank).filter(func.upper(Bank.name).ilike(f"%{bank_filter.upper()}%"))
+            if search_term:
+                q = q.outerjoin(LGRecord.beneficiary_corporate).filter(
+                    or_(
+                        CustomerEntity.entity_name.ilike(f"%{search_term}%"),
+                        LGRecord.lg_number.ilike(f"%{search_term}%"),
+                        LGRecord.description_purpose.ilike(f"%{search_term}%")
+                    )
+                )
 
-            return q.options(joinedload(LGRecord.lg_currency), joinedload(LGRecord.issuing_bank), joinedload(LGRecord.lg_status)).all()
+            return q.options(joinedload(LGRecord.lg_currency), joinedload(LGRecord.issuing_bank), joinedload(LGRecord.lg_status), joinedload(LGRecord.beneficiary_corporate)).all()
 
         return base_query.all()
 
