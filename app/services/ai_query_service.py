@@ -19,7 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, and_, desc
 
-from app.models import LGRecord, LgStatus, Customer, User, Bank, CustomerEntity, InternalOwnerContact
+from app.models import LGRecord, LgStatus, Customer, User, Bank, CustomerEntity, InternalOwnerContact, Currency
 from app.models.models_issuance import IssuanceFacility
 from app.models.models import AuditLog
 from app.services.ai_policy_guardrail import policy_guardrail
@@ -258,7 +258,7 @@ class AIQueryAssistantService:
             return {"suggested_level": 1, "topic": "treasury", "intent": "get_facility_analytics", "parameters": {}}
 
         # ----------------------------------------------------------------------
-        # 7. FAST-PATH SINGLE-CURRENCY EXPOSURE (USD, EGP, EUR, SAR, AED, GBP)
+        # 7. FAST-PATH SINGLE-CURRENCY EXPOSURE & SEARCH (USD, EGP, EUR, SAR, AED, GBP)
         # ----------------------------------------------------------------------
         for curr_code, curr_keywords in [
             ("USD", ["usd", "dollar", "dollars"]),
@@ -268,13 +268,23 @@ class AIQueryAssistantService:
             ("AED", ["aed", "dirham", "dirhams"]),
             ("GBP", ["gbp", "sterling"])
         ]:
-            if any(k in q_lower for k in curr_keywords) and any(v in q_lower for v in ["how much", "exposure", "total", "value", "portfolio in", "how many"]):
-                return {
-                    "suggested_level": 1,
-                    "topic": "treasury",
-                    "intent": "get_lg_analytics_summary",
-                    "parameters": {"currency": curr_code}
-                }
+            if any(k in q_lower for k in curr_keywords):
+                # If asking for aggregate exposure / total
+                if any(v in q_lower for v in ["how much", "exposure", "total", "value", "portfolio in", "how many"]):
+                    return {
+                        "suggested_level": 1,
+                        "topic": "treasury",
+                        "intent": "get_lg_analytics_summary",
+                        "parameters": {"currency": curr_code}
+                    }
+                # If asking for a list / records in that currency ("list of LGs in USD", "LGs in USD", "show USD LGs")
+                if any(v in q_lower for v in ["list", "show", "find", "lgs in", "lg's in", "in usd", "in egp", "in eur", "in sar", "in aed", "in gbp", "guarantee"]):
+                    return {
+                        "suggested_level": 1,
+                        "topic": "treasury",
+                        "intent": "search_lgs",
+                        "parameters": {"currency": curr_code}
+                    }
 
         # ----------------------------------------------------------------------
         # 8. FAST-PATH EXPIRY HORIZONS & SEARCHES (Dynamic Day/Month Regex)
@@ -621,7 +631,7 @@ Here is how I can assist you:
                 st_upper = status_filter.upper()
                 q = q.join(LGRecord.lg_status).filter(func.upper(LgStatus.name) == st_upper)
             if currency_filter:
-                q = q.join(LGRecord.lg_currency).filter(func.upper(LGRecord.lg_currency.property.mapper.class_.iso_code) == currency_filter.upper())
+                q = q.join(LGRecord.lg_currency).filter(func.upper(Currency.iso_code) == currency_filter.upper())
             if bank_filter:
                 q = q.join(LGRecord.issuing_bank).filter(func.upper(Bank.name).ilike(f"%{bank_filter.upper()}%"))
             if search_term:
