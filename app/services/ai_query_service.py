@@ -178,6 +178,36 @@ class AIQueryAssistantService:
                 }
             }
 
+        # Feedback & Problem Listener Engine (Check BEFORE guide_patterns so feedback questions are not hijacked by 'how to')
+        feedback_triggers = [
+            "feedback", "feature request", "suggest a feature", "i wish there was",
+            "i wish we had", "report a bug", "report an issue", "found a bug", "found an issue",
+            "bug:", "bug report", "problem with the system", "it would be great if",
+            "can you add a feature", "why does it take so long", "there is an issue with", "problem with",
+            "system is slow", "something is wrong", "fails when", "crash when", "crashes when",
+            "how to share feedback", "how to give feedback", "share feedback", "giving feedback",
+            "sharing feedback"
+        ]
+        if any(trig in q_lower for trig in feedback_triggers):
+            if any(w in q_lower for w in ["bug", "error", "fail", "crash", "wrong", "broken", "issue"]):
+                fb_type = "BUG_REPORT"
+            elif any(w in q_lower for w in ["wish", "feature", "suggest", "add", "would be great"]):
+                fb_type = "FEATURE_REQUEST"
+            elif any(w in q_lower for w in ["slow", "difficult", "hard", "confusing", "pain", "strange", "annoying"]):
+                fb_type = "USABILITY_PAIN_POINT"
+            else:
+                fb_type = "GENERAL_FEEDBACK"
+
+            return {
+                "suggested_level": 1,
+                "topic": "system",
+                "intent": "report_feedback",
+                "parameters": {
+                    "message": q_raw,
+                    "feedback_type": fb_type
+                }
+            }
+
         # 2. Level 4 System Guides & Navigation (using word boundaries to prevent 'show top' colliding with 'how to')
         is_greeting = q_lower in ["hi", "hello", "hey", "start", "help", "who are you", "what can you do", "restart", "reset"]
         guide_patterns = [
@@ -493,28 +523,42 @@ class AIQueryAssistantService:
             u_email = user.email if user else None
             msg_text = params.get("message", "")
             f_type = params.get("feedback_type", "GENERAL_FEEDBACK")
-            sentiment = "NEGATIVE" if any(w in msg_text.lower() for w in ["slow", "bug", "error", "confusing", "hard", "problem", "fail", "bad", "crash"]) else (
+            sentiment = "NEGATIVE" if any(w in msg_text.lower() for w in ["slow", "bug", "error", "confusing", "hard", "problem", "fail", "bad", "crash", "broken", "strange"]) else (
                 "POSITIVE" if any(w in msg_text.lower() for w in ["love", "great", "awesome", "good", "helpful", "like"]) else "NEUTRAL"
             )
 
-            feedback_entry = UserFeedback(
-                customer_id=customer_id,
-                user_id=user_id,
-                user_email=u_email,
-                feedback_type=f_type,
-                sentiment=sentiment,
-                message=msg_text,
-                status="NEW"
+            # Only save if it's actual feedback, not just asking how to give feedback
+            is_intro = (
+                msg_text.lower().strip() in ["i want to give feedback", "share feedback", "give feedback", "feedback", "how to give feedback", "how to share feedback"]
+                or "don't know how to use" in msg_text.lower()
+                or "how to use it" in msg_text.lower()
+                or "how do i use it" in msg_text.lower()
+                or "how does feedback work" in msg_text.lower()
+                or "sharing feedback is very strange" in msg_text.lower()
             )
-            db.add(feedback_entry)
-            db.commit()
-            db.refresh(feedback_entry)
+
+            fb_id = None
+            if not is_intro and msg_text.strip():
+                feedback_entry = UserFeedback(
+                    customer_id=customer_id,
+                    user_id=user_id,
+                    user_email=u_email,
+                    feedback_type=f_type,
+                    sentiment=sentiment,
+                    message=msg_text,
+                    status="NEW"
+                )
+                db.add(feedback_entry)
+                db.commit()
+                db.refresh(feedback_entry)
+                fb_id = feedback_entry.id
 
             return {
-                "feedback_id": feedback_entry.id,
+                "feedback_id": fb_id or "N/A",
                 "feedback_type": f_type,
                 "sentiment": sentiment,
-                "message": msg_text
+                "message": msg_text,
+                "is_intro": is_intro
             }
 
         if intent == "get_action_center_summary":
@@ -910,29 +954,35 @@ class AIQueryAssistantService:
             data = query_result or {}
             fb_id = data.get("feedback_id", "N/A")
             fb_type_label = data.get("feedback_type", "FEEDBACK").replace("_", " ").title()
-            msg = data.get("message", "")
+            msg = (data.get("message") or "").strip()
+            is_intro = data.get("is_intro", False)
 
-            if msg.lower().strip() in ["i want to give feedback", "share feedback", "give feedback", "feedback"]:
-                return (
-                    "💬 **We Value Your Feedback & Feature Suggestions**!\n\n"
-                    "Please let me know what you'd like to share, request, or report.\n\n"
-                    "💡 *Transparency Notice: Feedback submitted here is securely shared with your **System Owner and the Grow Engineering Team** to prioritize platform enhancements.*\n\n"
-                    "What's on your mind?",
-                    references,
-                    [
-                        {"label": "💡 Suggest a Feature", "query": "Feature request: "},
-                        {"label": "🐞 Report an Issue", "query": "I found a problem with: "},
-                        {"label": "⚡ System Usability", "query": "I find it difficult to: "}
-                    ]
-                )
+            if is_intro or not msg:
+                intro_lines = [
+                    "💬 **How to Share Feedback & Request Features**:\n",
+                    "Sharing feedback is as simple as chatting with me! Everything you share is automatically logged for your **System Owner and the Grow Engineering Team**.\n",
+                    "**Examples of what you can type**:",
+                    "- 💡 *Feature request: Add Excel export for all credit facilities*",
+                    "- 🐞 *Found an issue: Bank form preview is misaligned on mobile*",
+                    "- ⚡ *I find it difficult to record delivery proof for multiple LGs*\n",
+                    "💡 *Transparency Notice: Feedback submitted here is securely shared with your System Owner and Grow Engineering to prioritize platform enhancements.*\n",
+                    "What would you like to share today?"
+                ]
+                return "\n".join(intro_lines), references, [
+                    {"label": "💡 Suggest a Feature", "query": "Feature request: "},
+                    {"label": "🐞 Report an Issue", "query": "Found an issue with: "},
+                    {"label": "⚡ System Usability", "query": "I find it difficult to: "}
+                ]
 
-            answer = (
-                f"✅ **Feedback Received & Logged [Ref: #FB-{fb_id}]**\n\n"
-                f"- **Type**: **{fb_type_label}**\n"
-                f"- **Status**: Logged in System Inbox for Review\n\n"
-                f"💡 *Transparency Notice: Your feedback has been recorded and forwarded directly to the **System Owner and the Grow Engineering Team** for review and prioritization.*\n\n"
-                f"Thank you for helping us make Grow Treasury better!"
-            )
+            answer_lines = [
+                f"✅ **Feedback Received & Logged [Ref: #FB-{fb_id}]**\n",
+                f"- **Category**: **{fb_type_label}**",
+                f"- **Logged Note**: *{msg}*",
+                f"- **Status**: Forwarded to System Inbox for Review\n",
+                "💡 *Transparency Notice: Your feedback has been recorded and forwarded directly to the **System Owner and the Grow Engineering Team** for review and prioritization.*\n",
+                "Thank you for helping us continuously improve Grow Treasury!"
+            ]
+            answer = "\n".join(answer_lines)
             suggested_chips = [
                 {"label": "☀️ Daily Treasury Pulse", "query": "daily pulse"},
                 {"label": "📊 Portfolio Summary", "query": "show portfolio summary"},
