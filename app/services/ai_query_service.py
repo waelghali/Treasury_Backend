@@ -127,6 +127,32 @@ class AIQueryAssistantService:
                 "parameters": {}
             }
 
+        # Highest / Largest / Maximum Amount Guarantees
+        if any(kw in q_lower for kw in [
+            "highest lg", "largest lg", "biggest lg", "highest amount", "largest amount",
+            "biggest amount", "highest value", "largest guarantee", "biggest guarantee",
+            "top lg by amount", "highest amount in my portfolio", "maximum lg", "max lg amount",
+            "highest exposure lg", "which is the highest lg"
+        ]):
+            return {
+                "suggested_level": 1,
+                "topic": "treasury",
+                "intent": "search_lgs",
+                "parameters": {"sort_by": "amount_desc", "limit": 5}
+            }
+
+        # Who Did / When Was (Audit Trail & Actor Attribution)
+        if any(kw in q_lower for kw in [
+            "who did", "who created", "who approved", "who deleted", "who updated", "who recorded",
+            "who modified", "who performed", "who logged in", "when was", "when did", "who issued"
+        ]):
+            return {
+                "suggested_level": 1,
+                "topic": "system",
+                "intent": "get_audit_history",
+                "parameters": {"scope": "all_organization", "limit": 10}
+            }
+
         # Check for multi-step compound analytical queries (Level 2)
         if any(conn in q_lower for conn in ["and also", "and which", "compare", "correlation", "cross-analyze", "breakdown and"]):
             return {
@@ -380,9 +406,17 @@ class AIQueryAssistantService:
         if intent == "get_audit_history":
             scope = params.get("scope", "my_actions")
             limit = params.get("limit", 15)
+            search_term = params.get("search_term")
             q = db.query(AuditLog).filter(AuditLog.customer_id == customer_id)
             if scope == "my_actions":
                 q = q.filter(AuditLog.user_id == user_id)
+            if search_term:
+                q = q.filter(
+                    or_(
+                        AuditLog.entity_type.ilike(f"%{search_term}%"),
+                        AuditLog.action_type.ilike(f"%{search_term}%")
+                    )
+                )
             return q.options(joinedload(AuditLog.user)).order_by(desc(AuditLog.timestamp)).limit(limit).all()
 
         if intent == "find_expiring_lgs":
@@ -566,6 +600,8 @@ class AIQueryAssistantService:
             bank_filter = params.get("bank")
             query_val = params.get("query") or params.get("search_term")
             min_amount = params.get("min_amount")
+            sort_by = params.get("sort_by")
+            limit = params.get("limit")
 
             q = custody_base
             if status_filter:
@@ -586,12 +622,18 @@ class AIQueryAssistantService:
                     )
                 )
 
-            return q.options(
+            if sort_by == "amount_desc":
+                q = q.filter(LGRecord.lg_amount != None).order_by(desc(LGRecord.lg_amount))
+
+            q = q.options(
                 joinedload(LGRecord.lg_currency),
                 joinedload(LGRecord.issuing_bank),
                 joinedload(LGRecord.lg_status),
                 joinedload(LGRecord.beneficiary_corporate)
-            ).all()
+            )
+            if limit:
+                return q.limit(limit).all()
+            return q.all()
 
         if intent == "get_lg_details":
             lg_id = params.get("lg_id")
@@ -1080,6 +1122,29 @@ class AIQueryAssistantService:
                     {"label": "📊 View All Active LGs", "query": "show active LGs"},
                     {"label": "📤 View Issuance Pipeline", "query": "show issuance pipeline"}
                 ]
+
+            if self._current_query_params.get("sort_by") == "amount_desc":
+                lines = [f"🏆 **Highest Value Guarantees in Portfolio (Ranked by Amount)**:\n"]
+                for idx, r in enumerate(records[:10], 1):
+                    curr_code = r.lg_currency.iso_code if r.lg_currency else "EGP"
+                    bank_name = r.issuing_bank.name if r.issuing_bank else "N/A"
+                    st_name = r.lg_status.name if (r.lg_status and hasattr(r.lg_status, 'name')) else "Valid"
+                    amt_str = f"{float(r.lg_amount):,.2f}" if r.lg_amount else "0.00"
+                    lines.append(f"{idx}. **{r.lg_number}**: **{amt_str} {curr_code}** (Bank: *{bank_name}*, Status: *{st_name}*)")
+                    references.append({
+                        "lg_id": r.id,
+                        "lg_number": r.lg_number,
+                        "expiry_date": r.expiry_date.strftime("%Y-%m-%d") if r.expiry_date else None,
+                        "amount": float(r.lg_amount) if r.lg_amount else 0.0,
+                        "currency": curr_code
+                    })
+                lines.append(f"\n👉 [Open Custody Vault]({nav_base}/lg-records)")
+                suggested_chips = [
+                    {"label": "📊 Portfolio Summary", "query": "show portfolio summary"},
+                    {"label": "🏢 Top Beneficiaries", "query": "show top beneficiaries"},
+                    {"label": "🏦 Bank Exposure", "query": "bank exposure"}
+                ]
+                return "\n".join(lines), references, suggested_chips
 
             lines = [f"Found **{len(records)} record(s)** matching your query:\n"]
             for r in records[:15]:
