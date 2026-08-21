@@ -157,6 +157,7 @@ def run_suite():
 
         # Re-enable feature flag for remaining tests
         os.environ["AI_DATA_ASSISTANT_ENABLED"] = "true"
+        db.rollback()
 
         # TEST 13: User Profile & Permissions Awareness
         print("\n--- TEST 13: User Profile & Permissions Awareness ---")

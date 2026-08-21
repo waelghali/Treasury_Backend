@@ -127,6 +127,15 @@ class AIQueryAssistantService:
                 "parameters": {}
             }
 
+        # Check for multi-step compound analytical queries (Level 2)
+        if any(conn in q_lower for conn in ["and also", "and which", "compare", "correlation", "cross-analyze", "breakdown and"]):
+            return {
+                "suggested_level": 2,
+                "topic": "treasury",
+                "intent": "search_lgs",
+                "parameters": {"query": q_raw}
+            }
+
         # Highest / Largest / Maximum Amount Guarantees
         if any(kw in q_lower for kw in [
             "highest lg", "largest lg", "biggest lg", "highest amount", "largest amount",
@@ -151,15 +160,6 @@ class AIQueryAssistantService:
                 "topic": "system",
                 "intent": "get_audit_history",
                 "parameters": {"scope": "all_organization", "limit": 10}
-            }
-
-        # Check for multi-step compound analytical queries (Level 2)
-        if any(conn in q_lower for conn in ["and also", "and which", "compare", "correlation", "cross-analyze", "breakdown and"]):
-            return {
-                "suggested_level": 2,
-                "topic": "treasury",
-                "intent": "search_lgs",
-                "parameters": {"query": q_raw}
             }
 
         # 1. Pronoun / Context continuation
@@ -377,6 +377,29 @@ class AIQueryAssistantService:
             if extracted_comp: s_params["query"] = extracted_comp
             if extracted_bank: s_params["bank"] = extracted_bank
             return {"suggested_level": 1, "topic": "treasury", "intent": "search_lgs", "parameters": s_params}
+
+        # 15.5 Position & Latest Guarantees Inquiries
+        if any(kw in q_lower for kw in [
+            "position", "my position", "our position", "latest position", "lg position", "guarantee position",
+            "current position", "latest lg position", "overall position", "consolidated position", "financial position"
+        ]):
+            return {
+                "suggested_level": 1,
+                "topic": "treasury",
+                "intent": "get_lg_analytics_summary",
+                "parameters": {"scope": "position_overview"}
+            }
+
+        if any(kw in q_lower for kw in [
+            "latest lg", "latest lgs", "recent lg", "recent lgs", "newest lg", "newest lgs",
+            "new lgs", "new guarantees", "latest guarantees", "recent guarantees", "newly added lgs"
+        ]) and "position" not in q_lower:
+            return {
+                "suggested_level": 1,
+                "topic": "treasury",
+                "intent": "search_lgs",
+                "parameters": {"sort_by": "date_desc", "limit": 10}
+            }
 
         # 16. Broad Portfolio Overview
         if any(kw in q_lower for kw in [
@@ -668,6 +691,8 @@ class AIQueryAssistantService:
 
             if sort_by == "amount_desc":
                 q = q.filter(LGRecord.lg_amount != None).order_by(desc(LGRecord.lg_amount))
+            elif sort_by == "date_desc":
+                q = q.order_by(desc(LGRecord.issuance_date), desc(LGRecord.id))
 
             q = q.options(
                 joinedload(LGRecord.lg_currency),
@@ -829,14 +854,17 @@ class AIQueryAssistantService:
             pending_issuance_cnt = sum(1 for req in issuance_requests if str(req.status).upper() in ["PENDING_APPROVAL", "SUBMITTED", "PENDING"])
             issued_cnt = sum(1 for req in issuance_requests if str(req.status).upper() in ["ISSUED", "COMPLETED"])
 
+            is_position_query = self._current_query_params.get("scope") == "position_overview" or "position" in getattr(self, "_current_user_question", "").lower()
+            header_title = "📊 **Consolidated Letter of Guarantee Position**:" if is_position_query else "📊 **Corporate Guarantee Portfolio Overview**:"
+
             answer = (
-                f"📊 **Corporate Guarantee Portfolio Overview**:\n\n"
+                f"{header_title}\n\n"
                 f"🛡️ **LG Custody (Inbound Guarantees Held)**:\n"
-                f"- **{len(custody_records)} Active Guarantees** in digital vault\n"
+                f"- **{len(custody_records)} Active Guarantees** in custody\n"
                 f"- **Total Exposure by Currency**:\n" + "\n".join(curr_lines) + "\n"
                 f"👉 [Open LG Custody Vault]({nav_base}/lg-records)\n\n"
                 f"📤 **LG Issuance (Outbound Guarantees Issued)**:\n"
-                f"- **{len(issuance_requests)} Total Issuance Requests** ({issued_cnt} Issued, {pending_issuance_cnt} Pending Approval)\n"
+                f"- **{len(issuance_requests)} Total Outbound Requests** ({issued_cnt} Issued, {pending_issuance_cnt} Pending Approval)\n"
                 f"- **{len(facilities)} Active Bank Facilities** connected\n"
                 f"👉 [Open LG Issuance Dashboard]({nav_base}/issuance/requests)"
             )
