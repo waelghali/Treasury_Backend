@@ -52,6 +52,8 @@ APPROVED_OPERATIONS: Dict[str, Dict[str, Any]] = {
     "get_top_beneficiaries": {"params": {"limit": int, "scope": str}},
     "get_top_issuers": {"params": {"limit": int}},
     "get_entity_distribution": {"params": {}},
+    "report_feedback": {"params": {"message": str, "feedback_type": str}},
+    "get_daily_pulse": {"params": {}},
     "get_bank_exposure": {"params": {"limit": int}}
 }
 

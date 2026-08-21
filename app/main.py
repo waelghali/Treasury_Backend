@@ -122,6 +122,9 @@ def configure_app_instance(fastapi_app: FastAPI):
         allow_headers=["*"],
     )
 
+    from app.core.security_headers import SecurityHeadersMiddleware
+    fastapi_app.add_middleware(SecurityHeadersMiddleware)
+
     # --- Module Imports ---
     # Imports are placed here to ensure app structure is ready or to avoid circular deps.
     # If these fail, the app will naturally crash with ImportError.
@@ -137,7 +140,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         system_owner, corporate_admin, end_user, migration, 
         public, public_issuance, reports, facility_endpoints,
         quotations_endpoints, public_quotations, reconciliation_endpoints,
-        notification_endpoints, ai_query_assistant
+        notification_endpoints, ai_query_assistant, user_feedback
     )
 
     from app.api.v1.endpoints import issuance as issuance_package
@@ -234,6 +237,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(public_issuance.router, prefix="/api/v1/public-issuance", tags=["Public Issuance Portal"])
     fastapi_app.include_router(notification_endpoints.router, prefix="/api/v1/notifications", tags=["Notifications"])
     fastapi_app.include_router(ai_query_assistant.router, prefix="/api/v1/ai-query-assistant", tags=["AI Data Query Assistant (Experimental)"])
+    fastapi_app.include_router(user_feedback.router, prefix="/api/v1/feedback", tags=["User Feedback"])
 
     
     from app.core.security import require_quotation_module, require_reconciliation_module

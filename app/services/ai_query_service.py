@@ -1,3 +1,4 @@
+from app.models.models_feedback import UserFeedback, FeedbackType, FeedbackSentiment, FeedbackStatus
 # app/services/ai_query_service.py
 """
 4-Level Enterprise Treasury AI Assistant Architecture
@@ -91,6 +92,38 @@ class AIQueryAssistantService:
                 "suggested_level": 3,
                 "topic": "capability_gap",
                 "intent": "capability_gap",
+                "parameters": {}
+            }
+
+        # Feedback & Problem Listener Engine
+        feedback_triggers = [
+            "i want to give feedback", "share feedback", "give feedback", "report a bug",
+            "report an issue", "feature request", "suggest a feature", "i wish there was",
+            "i wish we had", "i have a complaint", "problem with the system", "it would be great if",
+            "can you add a feature", "why does it take so long", "found a bug", "found an issue",
+            "bug:", "bug report", "there is an issue with", "problem with", "system is slow",
+            "something is wrong", "fails when", "crash when", "crashes when"
+        ]
+        if any(trig in q_lower for trig in feedback_triggers):
+            # Extract feedback type
+            f_type = "FEATURE_REQUEST" if any(w in q_lower for w in ["feature", "wish", "suggest", "add a", "great if"]) else (
+                "BUG_REPORT" if any(w in q_lower for w in ["bug", "error", "broken", "fails", "crash"]) else (
+                    "USABILITY_PAIN_POINT" if any(w in q_lower for w in ["slow", "confusing", "hard to", "difficult", "take so long"]) else "GENERAL_FEEDBACK"
+                )
+            )
+            return {
+                "suggested_level": 1,
+                "topic": "feedback",
+                "intent": "report_feedback",
+                "parameters": {"message": q_raw, "feedback_type": f_type}
+            }
+
+        # Daily Treasury Pulse / Morning Briefing
+        if any(kw in q_lower for kw in ["daily pulse", "morning pulse", "treasury pulse", "morning briefing", "daily briefing", "briefing", "pulse"]):
+            return {
+                "suggested_level": 0,
+                "topic": "treasury",
+                "intent": "get_daily_pulse",
                 "parameters": {}
             }
 
@@ -393,6 +426,62 @@ class AIQueryAssistantService:
                 joinedload(IssuanceFacility.bank),
                 joinedload(IssuanceFacility.currency)
             ).all()
+
+        if intent == "get_daily_pulse":
+            now_dt = datetime.utcnow()
+            d14 = (now_dt + timedelta(days=14)).date()
+            expiring_14 = custody_base.join(LGRecord.lg_status).filter(
+                func.upper(LgStatus.name) == "VALID",
+                LGRecord.expiry_date != None,
+                func.date(LGRecord.expiry_date) <= d14,
+                func.date(LGRecord.expiry_date) >= now_dt.date()
+            ).options(joinedload(LGRecord.lg_currency), joinedload(LGRecord.issuing_bank)).all()
+
+            instructions = db.query(LGInstruction).filter(LGInstruction.is_deleted == False).all()
+            pending_issuance = issuance_base.filter(
+                IssuanceRequest.status.in_(["PENDING_APPROVAL", "SUBMITTED", "PENDING"])
+            ).all()
+
+            facilities = facility_base.options(
+                joinedload(IssuanceFacility.bank),
+                joinedload(IssuanceFacility.currency)
+            ).all()
+
+            return {
+                "expiring_14": expiring_14,
+                "instructions": instructions,
+                "pending_issuance": pending_issuance,
+                "facilities": facilities
+            }
+
+        if intent == "report_feedback":
+            user = db.query(User).filter(User.id == user_id).first()
+            u_email = user.email if user else None
+            msg_text = params.get("message", "")
+            f_type = params.get("feedback_type", "GENERAL_FEEDBACK")
+            sentiment = "NEGATIVE" if any(w in msg_text.lower() for w in ["slow", "bug", "error", "confusing", "hard", "problem", "fail", "bad", "crash"]) else (
+                "POSITIVE" if any(w in msg_text.lower() for w in ["love", "great", "awesome", "good", "helpful", "like"]) else "NEUTRAL"
+            )
+
+            feedback_entry = UserFeedback(
+                customer_id=customer_id,
+                user_id=user_id,
+                user_email=u_email,
+                feedback_type=f_type,
+                sentiment=sentiment,
+                message=msg_text,
+                status="NEW"
+            )
+            db.add(feedback_entry)
+            db.commit()
+            db.refresh(feedback_entry)
+
+            return {
+                "feedback_id": feedback_entry.id,
+                "feedback_type": f_type,
+                "sentiment": sentiment,
+                "message": msg_text
+            }
 
         if intent == "get_action_center_summary":
             instructions = db.query(LGInstruction).join(LGRecord).filter(
@@ -722,6 +811,92 @@ class AIQueryAssistantService:
                 {"label": "📊 Unified Portfolio Overview", "query": "show portfolio overview"}
             ]
             return "\n".join(lines), references, suggested_chips
+
+        if intent == "get_daily_pulse":
+            data = query_result or {}
+            expiring_14 = data.get("expiring_14") or []
+            instructions = data.get("instructions") or []
+            pending_issuance = data.get("pending_issuance") or []
+            facilities = data.get("facilities") or []
+
+            undelivered = sum(1 for i in instructions if i.delivery_date is None and i.bank_reply_date is None)
+            awaiting_reply = sum(1 for i in instructions if i.delivery_date is not None and i.bank_reply_date is None)
+
+            has_urgent = (len(expiring_14) > 0 or awaiting_reply > 0 or undelivered > 0 or len(pending_issuance) > 0)
+
+            lines = ["☀️ **Daily Treasury Pulse & Morning Briefing**:\n"]
+            if has_urgent:
+                if expiring_14:
+                    lines.append(f"⚠️ **{len(expiring_14)} Guarantee(s) Expiring within 14 Days**")
+                    for lg in expiring_14[:3]:
+                        curr = lg.lg_currency.iso_code if lg.lg_currency else "EGP"
+                        exp_str = lg.expiry_date.strftime("%Y-%m-%d") if lg.expiry_date else "N/A"
+                        lines.append(f"  - `{lg.lg_number}`: **{lg.lg_amount:,.2f} {curr}** (Expires: *{exp_str}*)")
+                    lines.append("")
+
+                if awaiting_reply > 0 or undelivered > 0 or len(pending_issuance) > 0:
+                    lines.append("⚡ **Action Items Requiring Attention**:")
+                    if awaiting_reply > 0:
+                        lines.append(f"  - **{awaiting_reply}** instruction(s) awaiting bank reply")
+                    if undelivered > 0:
+                        lines.append(f"  - **{undelivered}** physical letter(s) pending bank delivery")
+                    if len(pending_issuance) > 0:
+                        lines.append(f"  - **{len(pending_issuance)}** issuance request(s) awaiting approval")
+                    lines.append("")
+
+                if facilities:
+                    lines.append(f"🏛️ **{len(facilities)} Active Bank Credit Facilities Available**")
+            else:
+                lines.append("🟢 **All Systems Operational & Healthy**:")
+                lines.append("- ✅ **0** Guarantees expiring in the next 14 days")
+                lines.append("- ✅ **All** bank instructions delivered and replies up to date")
+                lines.append("- ✅ **0** Pending approvals blocking the issuance pipeline")
+                if facilities:
+                    lines.append(f"- 🏛️ **{len(facilities)}** Active bank facilities ready with ample headroom")
+
+            lines.append(f"\n👉 [Open Action Center]({nav_base}/action-center) | [View Portfolio]({nav_base}/lg-records)")
+
+            suggested_chips = [
+                {"label": "📅 Expiring in 60 Days", "query": "lgs expiring within 60 days"},
+                {"label": "⚡ Action Center", "query": "show action center"},
+                {"label": "🏛️ Facility Headroom", "query": "show facility headroom"},
+                {"label": "💬 Share Feedback", "query": "i want to give feedback"}
+            ]
+            return "\n".join(lines).strip(), references, suggested_chips
+
+        if intent == "report_feedback":
+            data = query_result or {}
+            fb_id = data.get("feedback_id", "N/A")
+            fb_type_label = data.get("feedback_type", "FEEDBACK").replace("_", " ").title()
+            msg = data.get("message", "")
+
+            if msg.lower().strip() in ["i want to give feedback", "share feedback", "give feedback", "feedback"]:
+                return (
+                    "💬 **We Value Your Feedback & Feature Suggestions**!\n\n"
+                    "Please let me know what you'd like to share, request, or report.\n\n"
+                    "💡 *Transparency Notice: Feedback submitted here is securely shared with your **System Owner and the Grow Engineering Team** to prioritize platform enhancements.*\n\n"
+                    "What's on your mind?",
+                    references,
+                    [
+                        {"label": "💡 Suggest a Feature", "query": "Feature request: "},
+                        {"label": "🐞 Report an Issue", "query": "I found a problem with: "},
+                        {"label": "⚡ System Usability", "query": "I find it difficult to: "}
+                    ]
+                )
+
+            answer = (
+                f"✅ **Feedback Received & Logged [Ref: #FB-{fb_id}]**\n\n"
+                f"- **Type**: **{fb_type_label}**\n"
+                f"- **Status**: Logged in System Inbox for Review\n\n"
+                f"💡 *Transparency Notice: Your feedback has been recorded and forwarded directly to the **System Owner and the Grow Engineering Team** for review and prioritization.*\n\n"
+                f"Thank you for helping us make Grow Treasury better!"
+            )
+            suggested_chips = [
+                {"label": "☀️ Daily Treasury Pulse", "query": "daily pulse"},
+                {"label": "📊 Portfolio Summary", "query": "show portfolio summary"},
+                {"label": "💬 Share More Feedback", "query": "i want to give feedback"}
+            ]
+            return answer, references, suggested_chips
 
         if intent == "get_action_center_summary":
             instructions = query_result.get("instructions", [])
