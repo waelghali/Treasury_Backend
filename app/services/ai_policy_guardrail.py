@@ -9,6 +9,7 @@ from typing import Dict, Any, Tuple, Set
 # Whitelisted Level 0 Card IDs (Backend Authority)
 APPROVED_CARD_IDS: Dict[str, Dict[str, Any]] = {
     # Executive & Bi-Module
+    "daily_pulse": {"intent": "get_daily_pulse", "params": {}},
     "portfolio_summary": {"intent": "get_lg_analytics_summary", "params": {"scope": "unified"}},
     "my_profile_permissions": {"intent": "get_user_profile", "params": {}},
     "my_recent_activity": {"intent": "get_audit_history", "params": {"scope": "my_actions"}},
