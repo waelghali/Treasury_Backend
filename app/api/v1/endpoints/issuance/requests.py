@@ -152,7 +152,7 @@ def edit_issuance_request(
                         end_date=_now + timedelta(days=30),
                         target_user_ids=[admin.id],
                         target_customer_ids=[current_user.customer_id],
-                        link="/corporate-admin/approval-center",
+                        link="/corporate-admin/approval-inbox",
                     )
                     crud_notification.create_notification(db, obj_in=notif)
             except Exception:

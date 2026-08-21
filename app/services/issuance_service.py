@@ -2358,6 +2358,8 @@ class IssuanceService:
             from app.crud.crud import crud_notification
             _now = __import__('datetime').datetime.utcnow()
             status_word = "approved" if approved else "rejected"
+            req_user = db.query(models.User).filter(models.User.id == request.requestor_user_id).first() if request.requestor_user_id else None
+            role_prefix = "corporate-admin" if req_user and req_user.role == "corporate_admin" else "end-user"
             notif = SystemNotificationCreate(
                 content=f"Your cancellation request for {request.serial_number} has been {status_word}." + (f" Note: {note}" if note else ""),
                 notification_type="CANCELLATION_RESOLVED",
@@ -2365,7 +2367,7 @@ class IssuanceService:
                 target_customer_ids=[request.customer_id],
                 start_date=_now,
                 end_date=_now + __import__('datetime').timedelta(days=30),
-                link=f"/corporate-admin/issuance/requests"
+                link=f"/{role_prefix}/issuance/requests"
             )
             crud_notification.create_notification(db, obj_in=notif)
         except Exception as e:

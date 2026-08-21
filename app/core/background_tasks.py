@@ -957,7 +957,7 @@ async def _check_fx_breach_auto_suspend(db: Session):
                                 f"(+{breach_pct:.1f}%). Please review and reactivate if appropriate."
                             ),
                             notification_type="FX_BREACH_SUSPEND",
-                            link=f"/issuance/facilities/{facility.id}",
+                            link="/corporate-admin/issuance/facilities",
                             start_date=datetime.now() - timedelta(days=1),
                             end_date=datetime.now() + timedelta(days=30),
                             target_user_ids=[admin.id],
@@ -1064,10 +1064,11 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
                         models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
                     ).all()
                     for user in users:
+                        user_role_path = "corporate-admin" if user.role == models.UserRole.CORPORATE_ADMIN else "end-user"
                         notif = SystemNotificationCreate(
                             content=f"Issued LG {lg.lg_ref_number} ({lg.currency.iso_code if lg.currency else ''} {float(lg.current_amount):,.2f}) expires in {days_left} days.",
                             notification_type="ISSUANCE_LG_EXPIRY",
-                            link=f"/issuance/issued-lgs/{lg.id}",
+                            link=f"/{user_role_path}/issuance/issued-lgs",
                             start_date=start_dt,
                             end_date=end_dt,
                             target_user_ids=[user.id],
@@ -1177,10 +1178,11 @@ async def run_daily_reference_expiry_check(db: Session):
                                 models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
                             ).all()
                             for user in users:
+                                user_role_path = "corporate-admin" if user.role == models.UserRole.CORPORATE_ADMIN else "end-user"
                                 notif = SystemNotificationCreate(
                                     content=f"{request.reference_type or 'Reference'} '{request.reference_number}' expires in {days_to_ref_expiry} days. LG {lg.lg_ref_number} is linked to it.",
                                     notification_type="REFERENCE_EXPIRY",
-                                    link=f"/issuance/issued-lgs/{lg.id}",
+                                    link=f"/{user_role_path}/issuance/issued-lgs",
                                     start_date=start_dt,
                                     end_date=end_dt,
                                     target_user_ids=[user.id],
@@ -1374,7 +1376,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                             notif = SystemNotificationCreate(
                                 content=msg,
                                 notification_type="FACILITY_EXPIRY",
-                                link=f"/facilities/{facility.id}",
+                                link="/corporate-admin/issuance/facilities",
                                 start_date=start_dt,
                                 end_date=end_dt,
                                 target_user_ids=[user.id],
@@ -1521,13 +1523,15 @@ async def run_daily_sla_breach_alerts(db: Session):
 
                 # In-App Notifications
                 for user_id in recipient_ids:
+                    u_obj = db.query(models.User).filter(models.User.id == user_id).first()
+                    u_role_path = "corporate-admin" if u_obj and u_obj.role == UserRole.CORPORATE_ADMIN else "end-user"
                     for b in breaches:
                         start_dt = datetime.now()
                         end_dt = start_dt + timedelta(days=1)
                         notif = SystemNotificationCreate(
                             content=f"⚠️ SLA Breach: {b['ref']} — Bank has not responded for {b['elapsed_days']} days (SLA: {b['sla_days']} days). Please follow up.",
                             notification_type="SLA_BREACH",
-                            link=f"/issuance/issued-lgs/{b['lg'].id}",
+                            link=f"/{u_role_path}/issuance/issued-lgs",
                             start_date=start_dt,
                             end_date=end_dt,
                             target_user_ids=[user_id],
@@ -1732,7 +1736,7 @@ async def _send_reservation_notification(
             notif = SystemNotificationCreate(
                 content=message,
                 notification_type=notif_type,
-                link=f"/issuance/requests/{request.id}",
+                link="/corporate-admin/issuance/requests",
                 start_date=datetime.now() - timedelta(days=1),
                 end_date=datetime.now() + timedelta(days=7),
                 target_user_ids=[uid],

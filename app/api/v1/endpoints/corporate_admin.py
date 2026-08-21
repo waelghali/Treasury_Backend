@@ -2027,7 +2027,7 @@ def approve_quotation(
         bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
         if bank_row and bank_row.emails:
             bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-            link = f"{base_url}/public/quotation/{assignment.token}"
+            link = f"{base_url}/public-quotation/{assignment.token}"
             
             subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {rfq.type} - {rfq.ref_no}"
             body = f"""
@@ -2184,7 +2184,7 @@ def approve_quotation_request(
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if bank_row and bank_row.emails:
                 bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-                link = f"{base_url}/quotation-submission?token={assignment.token}"
+                link = f"{base_url}/public-quotation/{assignment.token}"
                 
                 subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
                 body = f"""
