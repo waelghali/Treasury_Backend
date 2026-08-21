@@ -13,7 +13,7 @@ from datetime import datetime
 from app.database import get_db
 from app.models.models import User
 from app.models.models_feedback import UserFeedback, FeedbackType, FeedbackSentiment, FeedbackStatus
-from app.services.auth_service import get_current_user
+from app.core.security import get_current_user, TokenData
 
 router = APIRouter()
 
@@ -44,7 +44,7 @@ def get_user_feedbacks(
     feedback_type: Optional[str] = Query(None, description="Filter by type (FEATURE_REQUEST, BUG_REPORT, USABILITY_PAIN_POINT, GENERAL_FEEDBACK)"),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: TokenData = Depends(get_current_user)
 ) -> Any:
     """
     Retrieve user feedback entries. System Owners can view all; Corporate Admins view their customer's.
@@ -69,7 +69,7 @@ def update_feedback_status(
     feedback_id: int,
     payload: FeedbackUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: TokenData = Depends(get_current_user)
 ) -> Any:
     """
     Update feedback status and resolution notes.
