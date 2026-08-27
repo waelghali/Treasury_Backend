@@ -215,7 +215,9 @@ class AIQueryAssistantService:
             r"\bwhere\s+can\s+i\b", r"\bguide\s+me\b", r"\bsteps\s+to\b",
             r"\bwhere\s+do\s+i\s+find\b", r"\bnavigation\b",
             r"\bcan\s+i\b", r"\bcan\s+we\b", r"\bhow\s+do\s+we\b",
-            r"\bhow\s+can\s+we\b", r"\bhow\s+to\s+change\b", r"\bhow\s+to\s+make\b"
+            r"\bhow\s+can\s+we\b", r"\bhow\s+to\s+change\b", r"\bhow\s+to\s+make\b",
+            r"\bwhat\s+does\b", r"\bwhat\s+is\s+going\s+to\s+happen\b",
+            r"\bwhat\s+will\s+happen\b", r"\bif\s+i\s+change\b", r"\bif\s+i\s+did\s+not\b"
         ]
         if is_greeting or any(re.search(pat, q_lower) for pat in guide_patterns):
             return {
@@ -1303,10 +1305,12 @@ class AIQueryAssistantService:
         return str(query_result), references, []
 
     def handle_system_help(self, user_question: str, user_role: str, user_email: str) -> str:
+
         q_lower = user_question.lower()
         role_label = user_role.replace("_", " ").title()
         nav_base = "/corporate-admin" if user_role == "CORPORATE_ADMIN" else ("/system-owner" if user_role == "SYSTEM_OWNER" else "/end-user")
 
+        # 0. Greeting / Fast Intro
         if any(w in q_lower for w in ["hi", "hello", "hey", "who are you", "start", "capabilities"]):
             return (
                 f"Hello! I am your **Grow Treasury & System AI Assistant**.\n\n"
@@ -1321,6 +1325,124 @@ class AIQueryAssistantService:
                 f"- **Treasury Concepts**: *\"What is cash pooling?\"*, *\"How do forward contracts work?\"*"
             )
 
+        # 1. Maker-Checker Removal / Liquidation Dual Control (Custody Truth)
+        if ("maker checker" in q_lower or "maker-checker" in q_lower or "dual control" in q_lower) and any(w in q_lower for w in [
+            "remove", "disable", "liquidation", "liquidate", "turn off", "bypass", "skip", "without", "can i", "stop"
+        ]):
+            return (
+                f"**Maker-Checker Policy for Liquidation & Custody Actions**:\n\n"
+                f"In Grow, **Liquidation** is an Inbound Custody maintenance action (claiming an LG held from a contractor/counterparty).\n\n"
+                f"Maker-Checker dual control is an **optional setting provisioned at the organization level** that applies across custody actions. **You cannot disable or bypass it for liquidation specifically by yourself**.\n\n"
+                f"If Maker-Checker is active for your organization, the only way to stop or adjust dual control is through an **official request from your organization's authorized signatory to Grow Business Development (BD) / System Owner**.\n\n"
+                f"👉 [View Organization Profile & Plan]({nav_base}/dashboard)"
+            )
+
+        # 2. What happens if I did not add the approval matrix for issued LGs?
+        if any(w in q_lower for w in [
+            "did not add the approval matrix", "no approval matrix", "without approval matrix",
+            "approval matrix for issued", "if i don't add approval matrix", "if no approval matrix",
+            "didn't add the approval matrix", "not add the approval matrix"
+        ]):
+            return (
+                f"**What Happens If No Approval Matrix Is Configured for Issued LGs**:\n\n"
+                f"If an organization submits an LG Issuance Request without an active **Approval Matrix** (`/corporate-admin/approval-requests`):\n\n"
+                f"1. **No System Crash / Block**: The request is created successfully and is not rejected.\n"
+                f"2. **Fallback to Single-Tier Review**: The system routes the request via the legacy single-tier path (assigned to the designated checker or defaulting to the Corporate Admin inbox).\n"
+                f"3. **Unassigned Approval Inbox**: Any authorized Checker or Corporate Admin can open the request in the Approval Center and approve/reject it directly.\n"
+                f"4. **Recommendation**: Configuring an Approval Matrix is recommended if your organization requires multi-level thresholds (e.g., Level 1 CFO approval above $100k).\n\n"
+                f"👉 [Configure Approval Matrix]({nav_base}/approval-requests)"
+            )
+
+        # 3. What does "Generate Invite" button do?
+        if any(w in q_lower for w in ["generate invite", "invite button", "invite link", "what does generate invite"]):
+            return (
+                f"**What the 'Generate Invite' Button Does**:\n\n"
+                f"In **LG Issuance Requests** (`{nav_base}/issuance/requests`), the **Generate Invite** button creates a secure, time-limited **Public Requestor Portal Link** for external project teams, procurement officers, or department staff who do not have full Grow user accounts.\n\n"
+                f"**How it works**:\n"
+                f"1. You enter the external requestor's work email.\n"
+                f"2. The system generates a tokenized single-use link.\n"
+                f"3. The external requestor accesses the streamlined form, verifies via email OTP, and submits their LG request directly into your organization's approval inbox without needing a paid license or system password.\n\n"
+                f"👉 [Open Issuance Requests Inbox]({nav_base}/issuance/requests)"
+            )
+
+        # 4. What happens if I change reminder days to 0?
+        if any(w in q_lower for w in ["reminder days to 0", "change reminder days to 0", "reminder days 0", "reminder to 0"]):
+            return (
+                f"**What Happens If You Set Reminder Days to 0**:\n\n"
+                f"In **Settings ➔ Group 1**, if you change **`REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE`** to `0`:\n\n"
+                f"1. **Zero Cooldown / Waiting Period**: The system immediately removes the mandatory waiting buffer between issuing an instruction and sending bank reminders.\n"
+                f"2. **Instant Reminder Availability**: On the exact same day that an instruction letter is generated (Day 0), users in the Action Center will immediately be allowed to trigger, generate, and print formal follow-up reminder letters to the bank.\n"
+                f"3. **Dashboard Reporting**: Unacknowledged instructions will immediately be flagged as eligible for follow-up without waiting the default 3 to 7 days.\n\n"
+                f"👉 [Review Reminder Timers in Settings]({nav_base}/module-configs)"
+            )
+
+        # 5. Sending Particular LG Data to Someone Specific
+        if any(w in q_lower for w in ["send", "share", "email", "export", "forward", "assign"]) and any(w in q_lower for w in [
+            "lg data", "particular lg", "specific lg", "to someone", "to a person", "to colleague", "to specific", "data to someone"
+        ]):
+            return (
+                f"**Sharing Particular Letter of Guarantee (LG) Data**:\n\n"
+                f"You have 3 direct methods to share specific LG data with authorized colleagues:\n\n"
+                f"1. **Direct Deep Link**:\n"
+                f"   - Open the LG record in **All LG Records** (`{nav_base}/lg-records`).\n"
+                f"   - Copy the secure URL (`{nav_base}/lg-records/:id`) and send it directly to authorized internal users (they will have instant authenticated access).\n\n"
+                f"2. **Assign Specific Internal Custodian / Contact**:\n"
+                f"   - Open the LG details page ➔ click **Actions Menu (3 dots) ➔ Change LG Owner**.\n"
+                f"   - Assign the designated colleague to route custody responsibility and automated email notifications directly to them.\n\n"
+                f"3. **Filtered CSV Export**:\n"
+                f"   - In the LG Vault table, filter for the specific LG(s) and click **Export CSV**.\n\n"
+                f"👉 [Open LG Custody Vault]({nav_base}/lg-records)"
+            )
+
+        # 6. Manager Always Copied (CC'd) in Emails
+        if any(w in q_lower for w in [
+            "manager always copied", "copy manager", "manager in the emails", "cc manager",
+            "cc email", "manager copied", "common communication list", "always copy my manager"
+        ]):
+            return (
+                f"**Configuring Automated Manager CC / Notification Distribution**:\n\n"
+                f"To have your manager automatically copied on system emails:\n\n"
+                f"1. Navigate to **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs`).\n"
+                f"2. Scroll to **Group 4: Operational Governance & Controls**.\n"
+                f"3. Locate **Common Communication List (`COMMON_COMMUNICATION_LIST`)**.\n"
+                f"4. Add your manager's email address (e.g. `manager@company.com`) to the list.\n"
+                f"5. Click **Save Changes**.\n\n"
+                f"⚠️ **Important Note**: Enabling this option means that **ALL system actions, bank reminder letters, escalation notices, SLA breach alerts, and maturity warnings generated across the organization** will be shared/copied to the entered email address.\n\n"
+                f"👉 [Configure Common Communication CC List]({nav_base}/module-configs)"
+            )
+
+        # 7. Changing Forced Renewal Number of Days
+        if any(w in q_lower for w in [
+            "forced renewal", "forced renew", "renewal number of days",
+            "days before it for renewal", "change renewal days"
+        ]):
+            return (
+                f"**Changing Forced Renewal Days Threshold**:\n\n"
+                f"To change the number of days before expiry for forced renewal:\n\n"
+                f"1. Navigate to **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs`).\n"
+                f"2. In **Group 1: Operational Timers, Expiries & Bank Reminder Windows**, locate **`FORCED_RENEW_DAYS_BEFORE_EXPIRY`**.\n"
+                f"3. Enter the desired number of days (e.g., `30`, `45`, or `60`).\n"
+                f"4. Click **Save Changes** at the bottom of the page.\n\n"
+                f"👉 [Open Expiry Settings]({nav_base}/module-configs)"
+            )
+
+        # 8. Making Delivery Receipt Mandatory
+        if any(w in q_lower for w in [
+            "delivery receipt mandatory", "make delivery receipt", "doc_mandatory_record_delivery",
+            "mandatory delivery receipt", "require delivery proof", "mandatory delivery proof", "mandatory receipt"
+        ]):
+            return (
+                f"**Enforcing Mandatory Delivery Receipts (`DOC_MANDATORY_RECORD_DELIVERY`)**:\n\n"
+                f"To require that End Users attach physical delivery proof before recording bank instruction dispatch:\n\n"
+                f"1. Navigate to **Sidebar -> Configuration -> Settings** (`{nav_base}/module-configs`).\n"
+                f"2. Open **Group 2: Document Compliance & Mandatory Evidence Policies**.\n"
+                f"3. Locate **`DOC_MANDATORY_RECORD_DELIVERY`** and toggle it to **`true` (Enabled)**.\n"
+                f"4. Click **Save Changes** at the bottom of the page.\n\n"
+                f"🛡️ *Compliance Rule*: Once enabled, any user recording bank delivery in the Action Center will be strictly blocked from submitting until a signed courier receipt or stamped bank receiving voucher is uploaded.\n\n"
+                f"👉 [Open Document Compliance Settings]({nav_base}/module-configs)"
+            )
+
+        # 9. Generic Action Guides (Extend, Record, Issue)
         if "extend" in q_lower:
             return (
                 f"To extend a Letter of Guarantee (LG) in Grow as **{role_label}**:\n\n"
@@ -1356,92 +1478,6 @@ class AIQueryAssistantService:
                 f"4. Attach supporting tender/contract documents.\n"
                 f"5. Click **Submit for Approval** to enter the corporate approval matrix.\n\n"
                 f"👉 [Click here to open New Issuance Request]({nav_base}/issuance/requests/new)"
-            )
-
-        # 1. Maker-Checker Removal / Liquidation Dual Control
-        if ("maker checker" in q_lower or "maker-checker" in q_lower or "dual control" in q_lower) and any(w in q_lower for w in [
-            "remove", "disable", "liquidation", "liquidate", "turn off", "bypass", "skip", "without", "can i"
-        ]):
-            return (
-                f"**Maker-Checker Dual Control for Liquidation & Maintenance Actions**:\n\n"
-                f"In Grow, Maker-Checker is governed by **Organization Approval Matrices** and **Subscription Tier Policies**:\n\n"
-                f"1. **Default Liquidation Safeguard**:\n"
-                f"   - **Liquidation** represents an irrevocable cash claim against company credit facilities. If Maker-Checker is active for your organization, liquidations strictly require **Checker approval** to protect against unauthorized debits.\n\n"
-                f"2. **How to Modify or Remove Dual-Control Requirements**:\n"
-                f"   - As **Corporate Admin**, navigate to **Sidebar -> Approval Center -> Approval Matrix Configuration**.\n"
-                f"   - You can set amount-based approval thresholds or remove specific checker levels for selected maintenance workflows.\n"
-                f"   - If your organization operates in single-user mode, Maker-Checker can be toggled off under **Sidebar -> Configuration -> Settings** (`/corporate-admin/module-configs`).\n\n"
-                f"👉 [Open Approval Matrix Configuration]({nav_base}/approval-requests)\n"
-                f"👉 [Open Module Settings]({nav_base}/module-configs)"
-            )
-
-        # 2. Sending Particular LG Data to Someone Specific
-        if any(w in q_lower for w in ["send", "share", "email", "export", "forward", "assign"]) and any(w in q_lower for w in [
-            "lg data", "particular lg", "specific lg", "to someone", "to a person", "to colleague", "to specific", "data to someone"
-        ]):
-            return (
-                f"**Sharing & Sending Specific Letter of Guarantee (LG) Data**:\n\n"
-                f"You have 3 streamlined options to share or route LG information in Grow:\n\n"
-                f"1. **Direct Deep Link & PDF Export** (Instant Share):\n"
-                f"   - Open **Sidebar -> LG Custody -> All LG Records** and select the specific guarantee.\n"
-                f"   - Click **Download PDF Summary** or copy the secure browser URL (`{nav_base}/lg-records/:id`) to send to authorized internal colleagues.\n\n"
-                f"2. **Assign Specific Internal Custodian / Owner**:\n"
-                f"   - From the LG Details page, click **Actions Menu (3 dots) -> Change LG Owner**.\n"
-                f"   - Select the designated internal team member or contact to assign ownership and route automated reminders directly to them.\n\n"
-                f"3. **Filtered CSV / Excel Export**:\n"
-                f"   - In the LG Vault table, filter by specific criteria (e.g. Beneficiary, Bank, or Status) and click **Export CSV**.\n\n"
-                f"👉 [Open LG Custody Vault]({nav_base}/lg-records)"
-            )
-
-        # 3. Manager Always Copied (CC'd) in Emails
-        if any(w in q_lower for w in [
-            "manager always copied", "copy manager", "manager in the emails", "cc manager",
-            "cc email", "manager copied", "common communication list", "always copy my manager"
-        ]):
-            return (
-                f"**Configuring Automated Manager CC / Notification Distribution**:\n\n"
-                f"To ensure your manager is automatically copied on all system communications, alerts, and escalation notices:\n\n"
-                f"1. Navigate to **Sidebar -> Configuration -> Settings** (`{nav_base}/module-configs`).\n"
-                f"2. Scroll to **Group 4: Operational Governance & Controls**.\n"
-                f"3. Locate the setting **Common Communication List (`COMMON_COMMUNICATION_LIST`)**.\n"
-                f"4. Add your manager's email address (e.g. `manager@company.com`) to the distribution array.\n"
-                f"5. Click **Save Changes**.\n\n"
-                f"📌 *Effect*: Once added, all automated bank reminders, instruction print escalations, SLA breach alerts, and maturity warnings will automatically **CC** your manager's inbox.\n\n"
-                f"👉 [Configure Common Communication CC List]({nav_base}/module-configs)"
-            )
-
-        # 4. Changing Forced Renewal Number of Days
-        if any(w in q_lower for w in [
-            "forced renewal", "forced renew", "renewal number of days",
-            "days before it for renewal", "change renewal days", "auto renewal days"
-        ]):
-            return (
-                f"**Configuring Forced Renewal & Expiry Timeframes**:\n\n"
-                f"To adjust the number of days before expiry when forced or automatic renewals are triggered:\n\n"
-                f"1. Navigate to **Sidebar -> Configuration -> Settings** (`{nav_base}/module-configs`).\n"
-                f"2. Open **Group 1: Operational Timers, Expiries & Bank Reminder Windows**.\n"
-                f"3. Update the relevant renewal parameter:\n"
-                f"   - **`FORCED_RENEW_DAYS_BEFORE_EXPIRY`**: Mandatory cutoff window for forced renewals.\n"
-                f"   - **`AUTO_RENEWAL_DAYS_BEFORE_EXPIRY`** (Default: `30` days): Days before maturity when auto-renew LGs are queued.\n"
-                f"   - **`AUTO_RENEW_REMINDER_START_DAYS_BEFORE_EXPIRY`** (Default: `60` days): Days before maturity when warnings start reporting on the dashboard.\n"
-                f"4. Click **Save Changes**.\n\n"
-                f"👉 [Open Expiry & Renewal Settings]({nav_base}/module-configs)"
-            )
-
-        # 5. Making Delivery Receipt Mandatory
-        if any(w in q_lower for w in [
-            "delivery receipt mandatory", "make delivery receipt", "doc_mandatory_record_delivery",
-            "mandatory delivery receipt", "require delivery proof", "mandatory delivery proof", "mandatory receipt"
-        ]):
-            return (
-                f"**Enforcing Mandatory Delivery Receipts (`DOC_MANDATORY_RECORD_DELIVERY`)**:\n\n"
-                f"To require that End Users attach physical delivery proof before recording bank instruction dispatch:\n\n"
-                f"1. Navigate to **Sidebar -> Configuration -> Settings** (`{nav_base}/module-configs`).\n"
-                f"2. Open **Group 2: Document Compliance & Mandatory Evidence Policies**.\n"
-                f"3. Locate **`DOC_MANDATORY_RECORD_DELIVERY`** and toggle it to **`true` (Enabled)**.\n"
-                f"4. Click **Save Changes** at the bottom of the page.\n\n"
-                f"🛡️ *Compliance Rule*: Once enabled, any user recording bank delivery in the Action Center will be strictly blocked from submitting until a signed courier receipt or stamped bank receiving voucher is uploaded.\n\n"
-                f"👉 [Open Document Compliance Settings]({nav_base}/module-configs)"
             )
 
         knowledge = get_system_knowledge()
