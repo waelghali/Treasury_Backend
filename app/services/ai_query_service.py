@@ -1308,6 +1308,12 @@ class AIQueryAssistantService:
 
         q_lower = user_question.lower()
         role_label = user_role.replace("_", " ").title()
+        is_admin = user_role.upper() in ["CORPORATE_ADMIN", "SYSTEM_OWNER"]
+        role_note = (
+            f"\n\n✅ **Role Access**: As **{role_label}**, you have full administrative permissions to modify organization settings."
+            if is_admin else
+            f"\n\n🔒 **Permission Note**: You are currently logged in as **{role_label}**. Only a **Corporate Admin** can modify organization settings (`/corporate-admin/module-configs`). Please refer this change to your Corporate Admin."
+        )
         nav_base = "/corporate-admin" if user_role == "CORPORATE_ADMIN" else ("/system-owner" if user_role == "SYSTEM_OWNER" else "/end-user")
 
         # 0. Greeting / Fast Intro
@@ -1365,32 +1371,35 @@ class AIQueryAssistantService:
                 f"👉 [Open Issuance Requests Inbox]({nav_base}/issuance/requests)"
             )
 
-        # 4. What happens if I change reminder days to 0?
+        # 4. What happens if I change reminder days to 0? (Disambiguated & Platform Rules)
         if any(w in q_lower for w in ["reminder days to 0", "change reminder days to 0", "reminder days 0", "reminder to 0"]):
             return (
-                f"**What Happens If You Set Reminder Days to 0**:\n\n"
-                f"In **Settings ➔ Group 1**, if you change **`REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE`** to `0`:\n\n"
-                f"1. **Zero Cooldown / Waiting Period**: The system immediately removes the mandatory waiting buffer between issuing an instruction and sending bank reminders.\n"
-                f"2. **Instant Reminder Availability**: On the exact same day that an instruction letter is generated (Day 0), users in the Action Center will immediately be allowed to trigger, generate, and print formal follow-up reminder letters to the bank.\n"
-                f"3. **Dashboard Reporting**: Unacknowledged instructions will immediately be flagged as eligible for follow-up without waiting the default 3 to 7 days.\n\n"
+                f"**Setting Reminder Timers to 0 & Rule Cancellation Impact**:\n\n"
+                f"Grow platform features several reminder and grace period timers under **Settings ➔ Group 1**. The effect of setting a value to `0` depends on the specific parameter:\n\n"
+                f"1. **Bank Follow-Up Reminders (`REMINDER_TO_BANKS_DAYS_SINCE_ISSUANCE`)**:\n"
+                f"   - **Minimum Allowed**: `0` days.\n"
+                f"   - **Impact**: Removes the cooldown buffer completely. On the exact same day that an instruction is issued (Day 0), users can immediately generate and print formal bank reminder letters.\n\n"
+                f"2. **Instruction Cancellation Window (`MAX_DAYS_FOR_LAST_INSTRUCTION_CANCELLATION`)**:\n"
+                f"   - **Impact**: Setting this to `0` **cancels the rule entirely** — meaning instruction cancellation is completely disabled, and users cannot withdraw unexecuted instructions.\n\n"
+                f"3. **Print Escalation Timers (`DAYS_FOR_FIRST_PRINT_REMINDER`, `DAYS_FOR_PRINT_ESCALATION`)**:\n"
+                f"   - **Impact**: Setting to `0` triggers immediate escalation on the day of approval.\n\n"
+                f"⚠️ *Platform Rule*: You cannot set any timer lower than the system-enforced minimum threshold.{role_note}\n\n"
                 f"👉 [Review Reminder Timers in Settings]({nav_base}/module-configs)"
             )
 
-        # 5. Sending Particular LG Data to Someone Specific
+        # 5. Sending Particular LG Data to Someone Specific (Accurate UI Grounding)
         if any(w in q_lower for w in ["send", "share", "email", "export", "forward", "assign"]) and any(w in q_lower for w in [
             "lg data", "particular lg", "specific lg", "to someone", "to a person", "to colleague", "to specific", "data to someone"
         ]):
             return (
                 f"**Sharing Particular Letter of Guarantee (LG) Data**:\n\n"
-                f"You have 3 direct methods to share specific LG data with authorized colleagues:\n\n"
-                f"1. **Direct Deep Link**:\n"
-                f"   - Open the LG record in **All LG Records** (`{nav_base}/lg-records`).\n"
-                f"   - Copy the secure URL (`{nav_base}/lg-records/:id`) and send it directly to authorized internal users (they will have instant authenticated access).\n\n"
-                f"2. **Assign Specific Internal Custodian / Contact**:\n"
-                f"   - Open the LG details page ➔ click **Actions Menu (3 dots) ➔ Change LG Owner**.\n"
-                f"   - Assign the designated colleague to route custody responsibility and automated email notifications directly to them.\n\n"
-                f"3. **Filtered CSV Export**:\n"
-                f"   - In the LG Vault table, filter for the specific LG(s) and click **Export CSV**.\n\n"
+                f"You have 2 direct methods in Grow to route or share specific LG data with colleagues:\n\n"
+                f"1. **Reassign Internal Custodian / Contact** (Automated Alerts):\n"
+                f"   - Open **Sidebar ➔ LG Custody ➔ All LG Records** (`{nav_base}/lg-records`).\n"
+                f"   - Click **Actions (3 dots)** next to the guarantee and select **Change LG Owner**.\n"
+                f"   - Assign the designated colleague so all operational reminders, maturity alerts, and task notifications are routed directly to them.\n\n"
+                f"2. **Filtered CSV Export** (Direct File Sharing):\n"
+                f"   - In the LG Vault table, filter for the specific LG(s) by Bank, Beneficiary, or Status, then click **Export CSV** to generate and share the spreadsheet.\n\n"
                 f"👉 [Open LG Custody Vault]({nav_base}/lg-records)"
             )
 
@@ -1407,7 +1416,7 @@ class AIQueryAssistantService:
                 f"3. Locate **Common Communication List (`COMMON_COMMUNICATION_LIST`)**.\n"
                 f"4. Add your manager's email address (e.g. `manager@company.com`) to the list.\n"
                 f"5. Click **Save Changes**.\n\n"
-                f"⚠️ **Important Note**: Enabling this option means that **ALL system actions, bank reminder letters, escalation notices, SLA breach alerts, and maturity warnings generated across the organization** will be shared/copied to the entered email address.\n\n"
+                f"⚠️ **Important Note**: Enabling this option means that **ALL system actions, bank reminder letters, escalation notices, SLA breach alerts, and maturity warnings generated across the entire organization** will be shared/copied to the entered email address.{role_note}\n\n"
                 f"👉 [Configure Common Communication CC List]({nav_base}/module-configs)"
             )
 
@@ -1422,7 +1431,7 @@ class AIQueryAssistantService:
                 f"1. Navigate to **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs`).\n"
                 f"2. In **Group 1: Operational Timers, Expiries & Bank Reminder Windows**, locate **`FORCED_RENEW_DAYS_BEFORE_EXPIRY`**.\n"
                 f"3. Enter the desired number of days (e.g., `30`, `45`, or `60`).\n"
-                f"4. Click **Save Changes** at the bottom of the page.\n\n"
+                f"4. Click **Save Changes** at the bottom of the page.{role_note}\n\n"
                 f"👉 [Open Expiry Settings]({nav_base}/module-configs)"
             )
 
@@ -1437,7 +1446,7 @@ class AIQueryAssistantService:
                 f"1. Navigate to **Sidebar -> Configuration -> Settings** (`{nav_base}/module-configs`).\n"
                 f"2. Open **Group 2: Document Compliance & Mandatory Evidence Policies**.\n"
                 f"3. Locate **`DOC_MANDATORY_RECORD_DELIVERY`** and toggle it to **`true` (Enabled)**.\n"
-                f"4. Click **Save Changes** at the bottom of the page.\n\n"
+                f"4. Click **Save Changes** at the bottom of the page.{role_note}\n\n"
                 f"🛡️ *Compliance Rule*: Once enabled, any user recording bank delivery in the Action Center will be strictly blocked from submitting until a signed courier receipt or stamped bank receiving voucher is uploaded.\n\n"
                 f"👉 [Open Document Compliance Settings]({nav_base}/module-configs)"
             )
@@ -1494,7 +1503,7 @@ class AIQueryAssistantService:
             f"👉 [Go to Dashboard]({nav_base}/dashboard)"
         )
 
-    def process_query(
+        def process_query(
         self,
         db: Session,
         user_question: str = "",
