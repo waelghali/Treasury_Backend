@@ -77,6 +77,23 @@ class AIQueryAssistantService:
         q_raw = user_question.strip()
         q_lower = q_raw.lower()
 
+        # 0. Security, Exploitation & Malicious Intent Guardrail
+        security_threat_keywords = [
+            "hack", "exploit", "bypass security", "bypass auth", "bypass guardrail", "bypass login",
+            "sql injection", "sqli", "xss", "cross-site scripting", "ddos", "dos attack",
+            "steal data", "leak password", "crack password", "unauthorized access",
+            "privilege escalation", "backdoor", "vulnerability scanner", "penetrate",
+            "jailbreak", "override guardrail", "ignore instructions", "how can i hack",
+            "how to hack", "hack this system", "hack the platform", "hack database"
+        ]
+        if any(kw in q_lower for kw in security_threat_keywords):
+            return {
+                "suggested_level": 3,
+                "topic": "security_policy",
+                "intent": "security_rejected",
+                "parameters": {"query": q_raw}
+            }
+
         # Non-treasury rejection
         if any(kw in q_lower for kw in ["capital of", "weather in", "recipe", "who won", "president of", "football", "tell me a joke"]):
             return {
@@ -1585,6 +1602,25 @@ class AIQueryAssistantService:
             params = classification.get("parameters", {})
 
             is_valid_op, valid_params = policy_guardrail.validate_intent(intent, params)
+            if intent == "security_rejected":
+                return {
+                    "success": True,
+                    "answer": (
+                        "🛡️ **Security Policy Enforcement**:\n\n"
+                        "I am an enterprise Treasury AI Assistant and cannot provide assistance, instructions, code, or guidance regarding hacking, exploiting vulnerabilities, bypassing security controls, or unauthorized access.\n\n"
+                        "All operations in Grow are strictly role-enforced, authenticated via JWT, and logged in the immutable **Audit Log** (`/corporate-admin/audit-logs` or `/system-owner/audit-logs`).\n\n"
+                        "If you have legitimate security inquiries or noticed potential suspicious behavior, please notify your organization's Corporate Administrator or Grow Security."
+                    ),
+                    "references": [],
+                    "suggested_chips": [
+                        {"label": "🛡️ View Audit Logs", "query": "show recent audit logs"},
+                        {"label": "📊 Portfolio Summary", "query": "show portfolio summary"}
+                    ],
+                    "level": 3,
+                    "source_awareness": "SYSTEM_KNOWLEDGE",
+                    "intent": "security_rejected"
+                }
+
             if intent == "capability_gap":
                 return {
                     "success": True,
