@@ -38,6 +38,45 @@ class FeedbackResponse(BaseModel):
     updated_at: Optional[str]
 
 
+
+class FeedbackCreateRequest(BaseModel):
+    message: str
+    feedback_type: Optional[str] = "GENERAL_FEEDBACK"
+    sentiment: Optional[str] = "NEUTRAL"
+    ai_summary: Optional[str] = None
+
+
+@router.post("/", response_model=FeedbackResponse)
+def create_user_feedback(
+    payload: FeedbackCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_user)
+) -> Any:
+    """
+    Submit a new user feedback, issue report, or AI response evaluation.
+    """
+    user = db.query(User).filter(User.id == current_user.user_id).first()
+    u_email = user.email if user else (current_user.email if hasattr(current_user, 'email') else None)
+    
+    f_type = payload.feedback_type.upper() if payload.feedback_type else "GENERAL_FEEDBACK"
+    sentiment_val = payload.sentiment.upper() if payload.sentiment else "NEUTRAL"
+    
+    entry = UserFeedback(
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+        user_email=u_email,
+        feedback_type=f_type,
+        sentiment=sentiment_val,
+        message=payload.message,
+        ai_summary=payload.ai_summary,
+        status="NEW"
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry.to_dict()
+
+
 @router.get("/", response_model=List[FeedbackResponse])
 def get_user_feedbacks(
     status: Optional[str] = Query(None, description="Filter by status (NEW, IN_REVIEW, RESOLVED, ARCHIVED)"),
