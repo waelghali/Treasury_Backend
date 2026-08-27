@@ -1489,18 +1489,25 @@ class AIQueryAssistantService:
                 f"👉 [Click here to open New Issuance Request]({nav_base}/issuance/requests/new)"
             )
 
-        knowledge = get_system_knowledge()
-        if isinstance(knowledge, dict):
-            best_match = knowledge.get("lg_custody_system_overview", {})
-            title = best_match.get('title', 'Grow Treasury Guidance')
-            content = best_match.get('content', 'Please use the navigation menu on the left to access your treasury workflows.')
-        else:
-            title = 'Grow Treasury Guidance'
-            content = str(knowledge) if knowledge else 'Please use the navigation menu on the left to access your treasury workflows.'
+        # Smart Section Matching fallback (prevents full-manual text dumps)
+        from app.services.system_knowledge_base import find_relevant_section
+        relevant_section = find_relevant_section(user_question)
+        
+        if relevant_section:
+            return (
+                f"**Grow Platform Guidance**:\n\n"
+                f"{relevant_section}\n\n"
+                f"👉 [Go to Dashboard]({nav_base}/dashboard)"
+            )
+
         return (
-            f"**{title}**:\n\n"
-            f"{content}\n\n"
-            f"👉 [Go to Dashboard]({nav_base}/dashboard)"
+            f"**Grow Treasury & Platform Guidance**:\n\n"
+            f"I can guide you through any workflow, setting, or operational rule in Grow as **{role_label}**.\n\n"
+            f"**Common Topics You Can Ask About**:\n"
+            f"- **LG Custody (Inbound)**: *\"How do I record a new LG?\"*, *\"How do I extend validity?\"*, *\"How do I share LG data?\"*\n"
+            f"- **LG Issuance (Outbound)**: *\"How do I create a new request?\"*, *\"What does Generate Invite do?\"*, *\"How do approval matrices work?\"*\n"
+            f"- **Organization Settings**: *\"How to change forced renewal days?\"*, *\"How to make delivery receipts mandatory?\"*, *\"How to CC manager in emails?\"*\n\n"
+            f"👉 [Open Platform Dashboard]({nav_base}/dashboard)"
         )
 
     def process_query(

@@ -146,3 +146,31 @@ Available from LG Details page -> Actions Menu:
 def get_system_knowledge() -> str:
     """Returns the full grounding system knowledge base text."""
     return SYSTEM_KNOWLEDGE_CONTEXT.strip()
+
+
+def find_relevant_section(query: str) -> str:
+    """
+    Finds and extracts the most relevant section/bullet point from the master knowledge base
+    based on keywords in the user query, preventing full-manual text dumps.
+    """
+    if not query:
+        return ""
+    q_words = set(w.lower() for w in query.split() if len(w) > 3)
+    if not q_words:
+        return ""
+
+    # Split by major sections and bullet points
+    blocks = SYSTEM_KNOWLEDGE_CONTEXT.split("\n\n")
+    best_score = 0
+    best_block = ""
+
+    for block in blocks:
+        b_lower = block.lower()
+        score = sum(2 if w in b_lower else 0 for w in q_words)
+        if score > best_score and len(block.strip()) > 40:
+            best_score = score
+            best_block = block
+
+    if best_score >= 2:
+        return best_block.strip()
+    return ""
