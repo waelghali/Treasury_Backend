@@ -740,6 +740,7 @@ Document Text:
                 "applicableRule": { "type": "STRING", "description": "The name of the applicable rule, e.g., 'URDG 758' or 'ISP98'."},
                 "beneficiaryAddress": { "type": "STRING", "description": "The full address of the beneficiary as stated on the LG document."},
                 "operationalStatus": { "type": "STRING", "description": "The operational status of the LG — 'Operative' or 'Non-Operative'. Primarily applicable to Advance Payment LGs. Look for terms like 'operative', 'non-operative', 'conditional', 'unconditional', 'مشروط', 'غير مشروط'."},
+                "mandatoryClaimStatement": { "type": "STRING", "description": "Any specific mandatory statement, declaration, or sentence that the LG stipulates MUST be written/included in a liquidation or claim demand letter (e.g. 'accompanied by your signed statement certifying that the Principal is in breach of contract...', 'شريطة أن يتضمن طلب المصادرة إقراراً يفيد إخلال العميل بالتزاماته'). Extract exact sentence as written. Return empty if not specified."},
                 # NEW FIELDS FOR FOREIGN BANKS
                 "foreign_bank_name": {"type": "STRING", "description": "Manually entered bank name for foreign banks. Prioritize this if the issuing bank is explicitly a foreign bank and not found in the list."},
                 "foreign_bank_country": {"type": "STRING", "description": "Manually entered country for foreign banks."},
@@ -809,17 +810,23 @@ Return your output as a JSON object with the following fields, based strictly on
 
 16. **operationalStatus**:
     Applicable primarily to Advance Payment LGs. Look for terms like "Operative", "Non-Operative", "Conditional", "Unconditional", "مشروط", "غير مشروط". Return either "Operative" or "Non-Operative". If not stated or not applicable, return empty.
+
+17. **mandatoryClaimStatement**:
+    Inspect the guarantee text for any claim conditions, demand clauses, or mandatory declarations that MUST be stated or included in a liquidation/claim demand letter.
+    Examples in English: "Any demand for payment must contain the statement that...", "accompanied by your signed declaration certifying that the Principal is in breach of contract...", "stating in what respect the applicant is in breach...".
+    Examples in Arabic: "يشترط لصرف قيمة هذا الضمان أن يتضمن طلبكم إقراراً يفيد إخلال العميل بالتزاماته التعاقدية", "بشرط تقديم إقرار كتابي من جهتكم يوضح أوجه الإخلال التعاقدي".
+    Extract the exact required sentence/statement as written in the document in its original language. If no specific required statement is mentioned or unconditional, return empty string.
     
-17. **foreign_bank_name**:
+18. **foreign_bank_name**:
     The name of the foreign bank if the issuing bank is a foreign bank.
     
-18. **foreign_bank_country**:
+19. **foreign_bank_country**:
     The country of the foreign bank.
 
-19. **foreign_bank_address**:
+20. **foreign_bank_address**:
     The address of the foreign bank.
 
-20. **foreign_bank_swift_code**:
+21. **foreign_bank_swift_code**:
     The SWIFT code of the foreign bank.
 
 
@@ -1447,6 +1454,10 @@ You must analyze the visual layout to identify every fillable area.
         "is_in_own_name": "Boolean: true if LG is issued in the customer's own name (NOT third party)",
         "third_party_name": "Name of the third party (if is_third_party is true)",
         "third_party_address": "Address of the third party",
+        "third_party_relationship": "Relationship to third party (e.g. Sister Company, Subcontractor)",
+        "third_party_cr": "Third party Commercial Registration Number (CR)",
+        "facility_holder_name": "Name of the facility holder / guarantor company (for third-party indemnity forms)",
+        "issuer_company_name": "Name of the issuing company requesting the guarantee under its credit line",
         # Additional conditions (auto-composed)
         "additional_conditions": "Auto-composed: combines special wording note + cross-border note if applicable",
         # Facility at bank

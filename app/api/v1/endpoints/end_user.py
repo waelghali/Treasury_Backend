@@ -40,6 +40,8 @@ from app.schemas.all_schemas import (
     LGDocumentCreate,
     LGRecordToggleAutoRenewalRequest,
     AutoRenewalRunSummaryOut,
+    AutoRenewalPreviewOut,
+    RunAutoRenewalRequestIn,
     CustomerConfigurationOut,
     # NEW: Import SystemNotificationOut schema
     SystemNotificationOut,
@@ -259,42 +261,74 @@ INSTRUCTION_TYPES_REQUIRING_PRINTING = [
     ACTION_TYPE_LG_DECREASE_AMOUNT,
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE,
 ]
+@router.get(
+    "/lg-records/auto-renewal-preview",
+    response_model=AutoRenewalPreviewOut,
+    dependencies=[Depends(HasPermission("lg_record:extend")), Depends(check_subscription_status)],
+    summary="Get candidates and suggested dates for auto and forced renewal preview"
+)
+async def get_auto_renewal_preview_endpoint(
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    """
+    Retrieves eligible LG candidates for auto and forced renewal preview,
+    including calculated suggested dates, risk tiers (Forced vs Proactive), and control flags.
+    """
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    preview = crud_lg_record.get_auto_renewal_candidates(
+        db,
+        customer_id=end_user_context.customer_id,
+        user_has_all_access=has_all,
+        user_allowed_entity_ids=allowed_ids
+    )
+    return preview
+
+
 @router.post(
     "/lg-records/run-auto-renewal",
-    response_model=AutoRenewalRunSummaryOut, # Or StreamingResponse if sending PDF directly, or Dict[str, Any] with base64
-    dependencies=[Depends(HasPermission("lg_record:extend")), Depends(check_for_read_only_mode)], # ADDED dependency
+    response_model=AutoRenewalRunSummaryOut,
+    dependencies=[Depends(HasPermission("lg_record:extend")), Depends(check_for_read_only_mode)],
     summary="Run automated and forced LG renewal for eligible records"
 )
 async def run_auto_renewal_endpoint(
+    request_payload: Optional[RunAutoRenewalRequestIn] = None,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
-    request: Request = None # For client host logging
+    request: Request = None
 ):
     """
     Triggers the bulk auto-renewal and force-renewal process for eligible LG records.
+    Optionally accepts a list of selected LG IDs and custom new expiry dates.
+    Enforces that mandatory forced renewal LGs cannot be bypassed.
     Returns a summary of renewed LGs and the combined instruction PDF.
     """
     client_host = get_client_ip(request) if request else None
 
     try:
+        has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+        selected_items = request_payload.renewals if request_payload and request_payload.renewals is not None else None
+
         renewed_count, combined_pdf_bytes = await crud_lg_record.run_auto_renewal_process(
             db,
             user_id=end_user_context.user_id,
-            customer_id=end_user_context.customer_id
+            customer_id=end_user_context.customer_id,
+            selected_items=selected_items,
+            user_has_all_access=has_all,
+            user_allowed_entity_ids=allowed_ids
         )
 
         if combined_pdf_bytes:
-            # Encode PDF to base64 for JSON response
             pdf_base64 = base64.b64encode(combined_pdf_bytes).decode('utf-8')
             return AutoRenewalRunSummaryOut(
                 renewed_count=renewed_count,
-                message=f"Successfully renewed {renewed_count} eligible LGs. Consolidated instruction letter generated.",
+                message=f"Successfully renewed {renewed_count} eligible LG(s). Consolidated instruction letter generated.",
                 combined_pdf_base64=pdf_base64
             )
         else:
             return AutoRenewalRunSummaryOut(
                 renewed_count=renewed_count,
-                message="No eligible LGs found or renewed.",
+                message="No eligible LGs were renewed.",
                 combined_pdf_base64=None
             )
     except HTTPException as e:
@@ -542,6 +576,7 @@ async def scan_lg_file(
             "lg_amount": extracted_ai_data.get("lgAmount"),
             "description_purpose": extracted_ai_data.get("purpose"),
             "other_conditions": extracted_ai_data.get("otherConditions"),
+            "mandatory_claim_statement": extracted_ai_data.get("mandatoryClaimStatement"),
             "issuance_date": extracted_ai_data.get("issuanceDate"),
             "expiry_date": extracted_ai_data.get("expiryDate"),
             "issuer_id": None,

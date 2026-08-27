@@ -114,6 +114,9 @@ class IssuanceFacility(Base):
     
     # SLA & Boundaries
     sla_agreement_days = Column(Integer, nullable=True, comment="Agreed Service Level Agreement in days")
+    actual_avg_sla_days = Column(Numeric(precision=6, scale=2), nullable=True, comment="Exponential Moving Average of actual turnaround in business days")
+    sla_commitment_pct = Column(Numeric(precision=5, scale=2), nullable=True, comment="Percentage of issuances completed on or before contractual SLA")
+    total_completed_issuances = Column(Integer, default=0, nullable=False, comment="Count of completed issuances on this facility")
     allow_cross_border = Column(Boolean, default=False, comment="Allows issuance to beneficiaries in other countries")
     allow_third_party_issuance = Column(Boolean, default=False, comment="Allows issuance on behalf of other entities")
     required_cash_margin_days = Column(Integer, default=0, comment="Days required to deposit cash margin before issuance")
@@ -503,6 +506,10 @@ class BankFormTemplate(Base):
     version = Column(Integer, default=1, nullable=False)     # Increments on re-upload
     form_type = Column(String, nullable=False, default="FILLABLE_PDF")  # FILLABLE_PDF | PHYSICAL_OVERLAY | SCANNED_FILL
 
+    # Form role: PRIMARY_ISSUER (default) or THIRD_PARTY_INDEMNITY
+    form_role = Column(String, default="PRIMARY_ISSUER", nullable=False, index=True,
+                       comment="PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY — Role of this form template")
+
     # Storage
     file_path = Column(String, nullable=True)                # File path to the original uploaded PDF
     original_filename = Column(String, nullable=True)        # Original upload filename
@@ -629,6 +636,7 @@ class IssuanceRequest(BaseModel):
     third_party_name = Column(String, nullable=True)
     third_party_address = Column(String, nullable=True)
     third_party_relationship = Column(String, nullable=True)
+    third_party_cr = Column(String, nullable=True, comment="Third-party commercial registration number")
     
     is_cross_border = Column(Boolean, default=False)
     issuance_country = Column(String, nullable=True)

@@ -354,11 +354,11 @@ class AuthService:
             "last_accepted_legal_version": user.last_accepted_legal_version,
             "subscription_status": user.customer.status.value if user.customer else None,
             "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None,
-            # Module access flags from subscription plan
             "has_custody_module": user.customer.subscription_plan.has_custody_module if user.customer and user.customer.subscription_plan else True,
             "has_issuance_module": user.customer.subscription_plan.has_issuance_module if user.customer and user.customer.subscription_plan else False,
             "has_quotation_module": user.customer.subscription_plan.has_quotation_module if user.customer and user.customer.subscription_plan else True,
             "has_reconciliation_module": user.customer.subscription_plan.has_reconciliation_module if user.customer and user.customer.subscription_plan else True,
+            "can_email_inbox": getattr(user.customer.subscription_plan, 'can_email_inbox', True) if user.customer and user.customer.subscription_plan else True,
         }
 
         access_token = create_access_token(data=token_data)

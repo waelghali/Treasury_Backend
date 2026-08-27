@@ -15,6 +15,7 @@ class QuotationBankCreate(QuotationBankBase):
 class BankSimpleOut(BaseModel):
     id: int
     name: str
+    email_domain: Optional[str] = None
 
     class Config:
         from_attributes = True

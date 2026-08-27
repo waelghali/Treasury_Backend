@@ -140,7 +140,8 @@ def configure_app_instance(fastapi_app: FastAPI):
         system_owner, corporate_admin, end_user, migration, 
         public, public_issuance, reports, facility_endpoints,
         quotations_endpoints, public_quotations, reconciliation_endpoints,
-        notification_endpoints, ai_query_assistant, user_feedback
+        notification_endpoints, ai_query_assistant, user_feedback,
+        inbox_endpoints, system_holidays_endpoints
     )
 
     from app.api.v1.endpoints import issuance as issuance_package
@@ -154,6 +155,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         import app.models.models_quotation
         import app.models.models_reconciliation_v2
         import app.models.models_notification
+        import app.models.models_inbox
         
         if Base.metadata.tables:
             Base.metadata.create_all(bind=engine)
@@ -178,14 +180,40 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_accepted_legal_version DOUBLE PRECISION",
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0",
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP WITH TIME ZONE",
+
+                    # lg_records columns for smart claim/liquidation intelligence
+                    "ALTER TABLE lg_records ADD COLUMN IF NOT EXISTS mandatory_claim_statement TEXT",
+
+                    # SLA Actualization & Turnaround Intelligence
+                    "ALTER TABLE facilities ADD COLUMN IF NOT EXISTS actual_avg_sla_days NUMERIC(6, 2)",
+                    "ALTER TABLE facilities ADD COLUMN IF NOT EXISTS sla_commitment_pct NUMERIC(5, 2)",
+                    "ALTER TABLE facilities ADD COLUMN IF NOT EXISTS total_completed_issuances INTEGER DEFAULT 0",
+                    "ALTER TABLE banks ADD COLUMN IF NOT EXISTS actual_avg_sla_days NUMERIC(6, 2)",
+                    "ALTER TABLE banks ADD COLUMN IF NOT EXISTS sla_commitment_pct NUMERIC(5, 2)",
+                    "ALTER TABLE banks ADD COLUMN IF NOT EXISTS total_completed_issuances INTEGER DEFAULT 0",
+
+                    # System Holidays table
+                    """
+                    CREATE TABLE IF NOT EXISTS system_holidays (
+                        id SERIAL PRIMARY KEY,
+                        holiday_date DATE NOT NULL UNIQUE,
+                        name VARCHAR(255) NOT NULL,
+                        is_recurring BOOLEAN NOT NULL DEFAULT FALSE,
+                        notes TEXT,
+                        is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE
+                    )
+                    """,
                 ]
                 with engine.connect() as conn:
                     for stmt in startup_migrations:
                         try:
                             conn.execute(text(stmt))
+                            conn.commit()
                         except Exception as m_err:
+                            conn.rollback()
                             logger.debug(f"Migration statement skipped: {m_err}")
-                    conn.commit()
                 logger.info("Startup database schema migrations verified.")
             except Exception as mig_err:
                 logger.warning(f"Startup schema migration check: {mig_err}")
@@ -211,6 +239,15 @@ def configure_app_instance(fastapi_app: FastAPI):
                         logger.info("Seeded QUOTATION_APPROVAL_REQUIRED into global_configurations.")
             except Exception as seed_err:
                 logger.warning(f"Global configuration seed check skipped: {seed_err}")
+
+            # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
+            try:
+                from sqlalchemy.orm import Session as DBSession
+                from app.core.telemetry_service import record_startup_watchdog
+                with DBSession(engine) as watchdog_db:
+                    record_startup_watchdog(watchdog_db)
+            except Exception as w_err:
+                logger.warning(f"Startup watchdog check skipped: {w_err}")
         else:
             logger.critical("FATAL: No SQLAlchemy models registered. Tables cannot be created.")
             sys.exit(1)
@@ -260,10 +297,20 @@ def configure_app_instance(fastapi_app: FastAPI):
         tags=["Reconciliation Engine"],
         dependencies=[Depends(require_reconciliation_module)]
     )
+    fastapi_app.include_router(
+        inbox_endpoints.router,
+        prefix="/api/v1/inbox",
+        tags=["Smart Inbox"]
+    )
+    fastapi_app.include_router(
+        system_holidays_endpoints.router,
+        prefix="/api/v1"
+    )
 
     # --- Static Files Mounting for Supporting Uploads ---
     from fastapi.staticfiles import StaticFiles
     os.makedirs("uploads/quotations", exist_ok=True)
+    os.makedirs("uploads/inbox", exist_ok=True)
     fastapi_app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
     # --- APScheduler Setup ---
@@ -412,16 +459,63 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "name": "Daily Core Approval Requests Auto-Rejection",
                 "minute": 58,
                 "args": []
+            },
+            {
+                "func": app_background_tasks.run_inbox_email_poll,
+                "id": "inbox_poll_working_hours_job",
+                "name": "Smart Inbox Email Polling (Working Hours)",
+                "cron_kwargs": {
+                    "day_of_week": "sun,mon,tue,wed,thu",
+                    "hour": "8-17",
+                    "minute": "*/5"
+                },
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_inbox_email_poll,
+                "id": "inbox_poll_off_hours_workdays_job",
+                "name": "Smart Inbox Email Polling (Off-Hours Workdays)",
+                "cron_kwargs": {
+                    "day_of_week": "sun,mon,tue,wed,thu",
+                    "hour": "0-7,18-23",
+                    "minute": "0,30"
+                },
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_inbox_email_poll,
+                "id": "inbox_poll_weekends_job",
+                "name": "Smart Inbox Email Polling (Weekends)",
+                "cron_kwargs": {
+                    "day_of_week": "fri,sat",
+                    "hour": "*",
+                    "minute": "0,30"
+                },
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_inbox_scheduled_outbound,
+                "id": "inbox_scheduled_outbound_daily_job",
+                "name": "Smart Inbox Scheduled Outbound Requests",
+                "hours": [8],
+                "minute": 0,
+                "args": []
             }
         ]
 
         for job in jobs:
-            if job.get("trigger_type") == "hourly":
+            if "cron_kwargs" in job:
+                trigger = CronTrigger(**job["cron_kwargs"], timezone=EGYPT_TIMEZONE)
+                schedule_desc = f"with cron parameters {job['cron_kwargs']}"
+            elif job.get("trigger_type") == "hourly":
                 trigger = CronTrigger(minute=job["minute"], timezone=EGYPT_TIMEZONE)
                 schedule_desc = f"every hour at minute {job['minute']}"
             elif job.get("trigger_type") == "minutely":
                 trigger = CronTrigger(minute='*', timezone=EGYPT_TIMEZONE)
                 schedule_desc = "every minute"
+            elif job.get("trigger_type") == "custom_cron":
+                trigger = CronTrigger(minute=job.get("cron_custom_minute", "0"), timezone=EGYPT_TIMEZONE)
+                schedule_desc = f"at minutes [{job.get('cron_custom_minute')}] every hour"
             else:
                 # NEW LOGIC: Support multiple hours
                 # If 'hours' is a list, join them (e.g., "15,23"), else use default 2
@@ -448,6 +542,13 @@ def configure_app_instance(fastapi_app: FastAPI):
 
     @fastapi_app.on_event("shutdown")
     async def shutdown_scheduler():
+        try:
+            from sqlalchemy.orm import Session as DBSession
+            from app.core.telemetry_service import record_shutdown_watchdog
+            with DBSession(engine) as shutdown_db:
+                record_shutdown_watchdog(shutdown_db)
+        except Exception as sd_err:
+            logger.warning(f"Shutdown watchdog logging skipped: {sd_err}")
         scheduler.shutdown()
         logger.info("APScheduler shut down.")
 

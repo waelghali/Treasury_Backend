@@ -2462,3 +2462,32 @@ async def run_daily_auto_reject_expired_requests(db: Session):
         crud_approval_request.auto_reject_expired_requests(db)
     except Exception as e:
         logger.error(f"Error during auto-rejection of expired requests: {e}", exc_info=True)
+
+
+async def run_inbox_email_poll(db: Session):
+    """
+    Periodic background job: polls IMAP mailboxes for all customers with active Smart Inbox settings.
+    Runs in a background thread via asyncio.to_thread so it never freezes the FastAPI async event loop.
+    """
+    logger.info("Running Smart Inbox periodic email polling...")
+    try:
+        import asyncio
+        from app.services.inbox_polling_service import inbox_polling_service
+        await asyncio.to_thread(inbox_polling_service.poll_all_active_customers, db)
+    except Exception as e:
+        logger.error(f"Error in Smart Inbox email polling job: {e}", exc_info=True)
+
+
+async def run_inbox_scheduled_outbound(db: Session):
+    """
+    Daily background job: sends scheduled position/statement requests to banks.
+    Runs in a background thread via asyncio.to_thread so it never freezes the FastAPI async event loop.
+    """
+    logger.info("Running Smart Inbox scheduled outbound requests...")
+    try:
+        import asyncio
+        from app.services.inbox_outbound_service import inbox_outbound_service
+        await asyncio.to_thread(inbox_outbound_service.send_scheduled_requests, db)
+    except Exception as e:
+        logger.error(f"Error in Smart Inbox scheduled outbound job: {e}", exc_info=True)
+

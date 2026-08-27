@@ -28,6 +28,7 @@ RE_APPROVAL_TRIGGER_FIELDS = {
     'beneficiary_name',
     'is_third_party',
     'third_party_name',
+    'third_party_cr',
     'is_cross_border',
 }
 

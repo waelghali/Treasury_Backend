@@ -523,7 +523,15 @@ class CRUDCustomerEmailSetting(CRUDBase):
             smtp_password_encrypted=encrypt_data(obj_in.smtp_password),
             sender_email=obj_in.sender_email,
             sender_display_name=obj_in.sender_display_name,
-            is_active=obj_in.is_active
+            is_active=obj_in.is_active,
+            imap_host=obj_in.imap_host,
+            imap_port=obj_in.imap_port,
+            imap_username=obj_in.imap_username,
+            imap_password_encrypted=encrypt_data(obj_in.imap_password) if obj_in.imap_password else None,
+            imap_use_ssl=obj_in.imap_use_ssl,
+            imap_inbox_folder=obj_in.imap_inbox_folder or "INBOX",
+            imap_processed_folder=obj_in.imap_processed_folder or "Processed",
+            imap_is_active=obj_in.imap_is_active
         )
         db.add(db_obj)
         log_action(db, user_id=user_id, action_type=AUDIT_ACTION_TYPE_CREATE, entity_type="CustomerEmailSetting", entity_id=db_obj.id, details={"customer_id": customer_id, "sender_email": obj_in.sender_email}, customer_id=customer_id)
@@ -537,6 +545,10 @@ class CRUDCustomerEmailSetting(CRUDBase):
         if "smtp_password" in update_data and update_data["smtp_password"] is not None:
             update_data["smtp_password_encrypted"] = encrypt_data(update_data["smtp_password"])
             del update_data["smtp_password"] # Remove plaintext password from update_data
+
+        if "imap_password" in update_data and update_data["imap_password"] is not None:
+            update_data["imap_password_encrypted"] = encrypt_data(update_data["imap_password"])
+            del update_data["imap_password"]
 
         # Manually update fields to track changes for logging
         changes = {}

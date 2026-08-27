@@ -68,6 +68,7 @@ class SubscriptionPlan(BaseModel):
     can_multi_entity = Column(Boolean, default=False, nullable=False, comment="Allows multiple entities under one customer")
     can_ai_integration = Column(Boolean, default=False, nullable=False, comment="Allows AI integration features")
     can_image_storage = Column(Boolean, default=False, nullable=False, comment="Allows image storage features")
+    can_email_inbox = Column(Boolean, default=False, nullable=False, comment="Allows Smart Inbox feature for automated email ingestion")
     
     # NEW: Modular Subscription Toggles
     has_custody_module = Column(Boolean, default=True, nullable=False, comment="Allows access to Phase 1: LG Custody module")
@@ -284,6 +285,10 @@ class Bank(BaseModel):
     former_names = Column(JSON, nullable=True, comment="Former names of the bank (JSON array of strings)")
     swift_code = Column(String, nullable=True, unique=True, index=True, comment="SWIFT/BIC code of the bank")
     short_name = Column(String, nullable=True, comment="Short name of the bank")
+    email_domain = Column(String, nullable=True, comment="Email domain of the bank (e.g. 'cibeg.com')")
+    actual_avg_sla_days = Column(Numeric(precision=6, scale=2), nullable=True, comment="Bank-wide moving average turnaround in business days")
+    sla_commitment_pct = Column(Numeric(precision=5, scale=2), nullable=True, comment="Bank-wide on-time SLA commitment rate")
+    total_completed_issuances = Column(Integer, default=0, nullable=False, comment="Total completed issuances across all facilities for this bank")
 
     def __repr__(self: Bank):
         return f"<Bank(id={self.id}, name='{self.name}')>"
@@ -478,6 +483,7 @@ class LGRecord(BaseModel):
     applicable_rule_id = Column(Integer, ForeignKey("rules.id"), nullable=False, comment="ID of the set of rules governing the LG")
     applicable_rules_text = Column(String, nullable=True, comment="Free text for rules (conditional)")
     other_conditions = Column(String(8000), nullable=True, comment="Any other specific conditions not covered elsewhere")
+    mandatory_claim_statement = Column(Text, nullable=True, comment="Mandatory wording or declaration required to be included in liquidation/claim letters")
     internal_owner_contact_id = Column(Integer, ForeignKey("internal_owner_contacts.id"), nullable=False, comment="ID of the internal owner contact person")
     lg_category_id = Column(Integer, ForeignKey("lg_categories.id"), nullable=False, comment="LG Category for internal classification")
     additional_field_values = Column(JSON, nullable=True, comment="Dynamic fields based on selected LGCategory's extra_field_name (JSONB)")
@@ -677,6 +683,16 @@ class CustomerEmailSetting(BaseModel):
     sender_email = Column(String, nullable=False, comment="Email address to use as the sender (e.g., no-reply@customer.com)")
     sender_display_name = Column(String, nullable=True, comment="Optional display name for the sender (e.g., 'Customer Name Treasury')")
     is_active = Column(Boolean, default=True, nullable=False, comment="Whether these custom settings are active (False means fallback to global)")
+
+    # --- IMAP (Inbound) Settings ---
+    imap_host = Column(String, nullable=True, comment="IMAP server host (e.g., imap.gmail.com)")
+    imap_port = Column(Integer, nullable=True, comment="IMAP server port (e.g., 993)")
+    imap_username = Column(String, nullable=True, comment="IMAP authentication username")
+    imap_password_encrypted = Column(String, nullable=True, comment="Encrypted IMAP password")
+    imap_use_ssl = Column(Boolean, default=True, comment="Whether to use SSL for IMAP")
+    imap_inbox_folder = Column(String, default="INBOX", comment="IMAP folder to poll for new emails")
+    imap_processed_folder = Column(String, default="Processed", comment="IMAP folder to move processed emails to")
+    imap_is_active = Column(Boolean, default=False, comment="Whether inbound email polling is enabled")
 
     customer = relationship("Customer", back_populates="customer_email_settings")
 
@@ -957,3 +973,15 @@ class AIUsageLog(BaseModel):
 
     def __repr__(self):
         return f"<AIUsageLog(id={self.id}, customer_id={self.customer_id}, tokens={self.total_tokens})>"
+
+
+class SystemHoliday(BaseModel):
+    __tablename__ = "system_holidays"
+
+    holiday_date = Column(Date, nullable=False, unique=True, index=True, comment="Calendar date of the holiday/shutdown")
+    name = Column(String(255), nullable=False, comment="Name or description of holiday (e.g., Eid Al-Fitr, Annual Maintenance)")
+    is_recurring = Column(Boolean, default=False, nullable=False, comment="True if holiday recurs annually on the same month and day")
+    notes = Column(Text, nullable=True)
+
+    def __repr__(self):
+        return f"<SystemHoliday(id={self.id}, date={self.holiday_date}, name='{self.name}')>"

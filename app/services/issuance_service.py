@@ -1251,8 +1251,16 @@ class IssuanceService:
                         tags.append("NO_MARGIN")
                     elif margin_pct <= 5:
                         tags.append("LOW_MARGIN")
-                    if fac.sla_agreement_days and fac.sla_agreement_days <= 2:
+
+                    # 4b. Smart SLA Actualization & Turnaround Intelligence
+                    from app.services.sla_actualization_service import sla_actualization_service
+                    sla_info = sla_actualization_service.compute_effective_sla(fac, fac.bank if hasattr(fac, 'bank') else None)
+                    effective_sla_days = sla_info["effective_sla_days"]
+
+                    if sla_info.get("is_fast_track"):
                         tags.append("FAST_TRACK")
+                    if sla_info.get("slippage_risk"):
+                        tags.append("SLA_SLIPPAGE_RISK")
 
                     # 5. Compute multi-factor score (0-100, higher is better)
                     # C3: Weights (w_cost, w_margin, w_sla, w_capacity, w_currency) pre-loaded from GlobalConfig
@@ -1264,9 +1272,15 @@ class IssuanceService:
                     # Margin score: lower margin = higher score
                     margin_score = max(0, 100 - margin_pct * 4)  # 25% margin = 0 score
                     
-                    # SLA score: faster = higher score
-                    sla_days = fac.sla_agreement_days or 7  # default 7 days
-                    sla_score = max(0, 100 - (sla_days * 10))  # 10 days = 0 score
+                    # SLA score: faster effective turnaround = higher score (10 days = 0 score)
+                    raw_sla_score = max(0, 100 - (effective_sla_days * 10))
+                    
+                    # Dynamic slippage penalty: If bank chronically misses SLA, apply penalty to SLA component
+                    if sla_info.get("slippage_risk"):
+                        penalty_pct = max(0.0, (70.0 - sla_info.get("sla_commitment_pct", 100.0)) / 100.0)
+                        sla_score = max(0, raw_sla_score * (1.0 - penalty_pct))
+                    else:
+                        sla_score = raw_sla_score
                     
                     # Capacity score: more available = higher score (encourages risk distribution)
                     capacity_ratio = available / limit_total if limit_total > 0 else 0
@@ -1323,7 +1337,15 @@ class IssuanceService:
                         required_cash_margin_amount=req_margin,
                         facility_score=facility_score,
                         
-                        recommendation_tags=tags
+                        recommendation_tags=tags,
+
+                        # Smart SLA & Turnaround Intelligence
+                        agreed_sla_days=sla_info.get("agreed_sla_days"),
+                        actual_avg_sla_days=sla_info.get("actual_avg_sla_days"),
+                        effective_sla_days=sla_info.get("effective_sla_days"),
+                        sla_commitment_pct=sla_info.get("sla_commitment_pct"),
+                        sla_source=sla_info.get("source"),
+                        sla_drift_days=sla_info.get("drift_days")
                     ))
                 except Exception as e:
                     import logging

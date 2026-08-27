@@ -315,6 +315,7 @@ async def refresh_token(
         "has_issuance_module": current_user.has_issuance_module,
         "has_quotation_module": current_user.has_quotation_module,
         "has_reconciliation_module": current_user.has_reconciliation_module,
+        "can_email_inbox": getattr(current_user, 'can_email_inbox', True),
     }
     
     # create_fresh_access_token is the alias for create_access_token

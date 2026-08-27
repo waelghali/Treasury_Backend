@@ -400,6 +400,7 @@ class BankBase(BaseModel):
     former_names: Optional[List[str]] = Field(None, description="Former names of the bank (list of strings)")
     swift_code: Optional[str] = Field(None, min_length=8, max_length=11, description="SWIFT/BIC code of the bank")
     short_name: Optional[str] = Field(None, max_length=50, description="Short name of the bank")
+    email_domain: Optional[str] = Field(None, max_length=100, description="Email domain of the bank (e.g., 'cibeg.com')")
 
 class BankCreate(BankBase):
     pass
@@ -412,6 +413,7 @@ class BankUpdate(BankBase):
     former_names: Optional[List[str]] = None
     swift_code: Optional[str] = Field(None, min_length=8, max_length=11)
     short_name: Optional[str] = None
+    email_domain: Optional[str] = None
 
 class BankOut(BankBase, BaseSchema):
     pass
@@ -877,6 +879,7 @@ class LGRecordBase(BaseModel):
     applicable_rule_id: int = Field(..., description="ID of the set of rules governing the LG")
     applicable_rules_text: Optional[str] = Field(None, max_length=64, description="Free text for rules (conditional)")
     other_conditions: Optional[str] = Field(None, max_length=8000, description="Any other specific conditions not covered elsewhere")
+    mandatory_claim_statement: Optional[str] = Field(None, description="Mandatory wording or declaration required to be included in liquidation/claim letters")
     internal_owner_contact_id: int = Field(..., description="ID of the internal owner contact person")
 
     lg_category_id: int = Field(..., description="ID of the LG Category for internal classification")
@@ -921,6 +924,7 @@ class LGRecordUpdate(BaseModel):
     issuance_date: Optional[date] = Field(None, description="New issuance date")
     issuing_bank_id: Optional[int] = Field(None, description="New issuing bank ID")
     issuing_bank_address: Optional[str] = Field(None, description="New issuing bank address")
+    mandatory_claim_statement: Optional[str] = Field(None, description="New mandatory claim statement")
     # End NEW fields
     pass
 
@@ -949,6 +953,7 @@ class LGRecordAmendRequest(BaseModel):
             "issuing_method_id", "applicable_rule_id", "applicable_rules_text",
             "auto_renewal", "payment_conditions", "lg_operational_status_id",
             "internal_contract_project_id", "issuer_name", "lg_number",
+            "mandatory_claim_statement",
             # FIX: Add the lg_currency_id field to the allowed_fields set.
             "lg_currency_id", 
         }
@@ -1163,6 +1168,16 @@ class CustomerEmailSettingBase(BaseModel):
     sender_display_name: Optional[str] = Field(None, description="Optional display name for the sender (e.g., 'Customer Name Treasury')")
     is_active: bool = Field(True, description="Whether these custom settings are active (False means fallback to global)")
 
+    # IMAP (Inbound) fields
+    imap_host: Optional[str] = Field(None, description="IMAP server host (e.g., imap.mail.yahoo.com)")
+    imap_port: Optional[int] = Field(993, gt=0, description="IMAP server port (e.g., 993)")
+    imap_username: Optional[str] = Field(None, description="IMAP authentication username")
+    imap_password: Optional[str] = Field(None, description="IMAP password (will be encrypted)")
+    imap_use_ssl: bool = Field(True, description="Whether to use SSL for IMAP")
+    imap_inbox_folder: Optional[str] = Field("INBOX", description="Folder to poll")
+    imap_processed_folder: Optional[str] = Field("Processed", description="Folder for processed emails")
+    imap_is_active: bool = Field(False, description="Whether inbound polling is active")
+
 class CustomerEmailSettingCreate(CustomerEmailSettingBase):
     pass
 
@@ -1175,6 +1190,16 @@ class CustomerEmailSettingUpdate(BaseModel):
     sender_display_name: Optional[str] = Field(None, description="Optional display name for the sender")
     is_active: Optional[bool] = Field(None, description="Whether these custom settings are active")
 
+    # IMAP (Inbound) updates
+    imap_host: Optional[str] = Field(None, description="IMAP server host")
+    imap_port: Optional[int] = Field(None, gt=0, description="IMAP server port")
+    imap_username: Optional[str] = Field(None, description="IMAP authentication username")
+    imap_password: Optional[str] = Field(None, description="New IMAP password (will be encrypted if provided)")
+    imap_use_ssl: Optional[bool] = Field(None, description="Whether to use SSL for IMAP")
+    imap_inbox_folder: Optional[str] = Field(None, description="Folder to poll")
+    imap_processed_folder: Optional[str] = Field(None, description="Folder for processed emails")
+    imap_is_active: Optional[bool] = Field(None, description="Whether inbound polling is active")
+
 class CustomerEmailSettingOut(BaseSchema):
     customer_id: int
     smtp_host: str
@@ -1183,6 +1208,13 @@ class CustomerEmailSettingOut(BaseSchema):
     sender_email: EmailStr
     sender_display_name: Optional[str] = None
     is_active: bool
+    imap_host: Optional[str] = None
+    imap_port: Optional[int] = None
+    imap_username: Optional[str] = None
+    imap_use_ssl: Optional[bool] = True
+    imap_inbox_folder: Optional[str] = "INBOX"
+    imap_processed_folder: Optional[str] = "Processed"
+    imap_is_active: Optional[bool] = False
 
 class InternalOwnerChangeScope(str, Enum):
     SINGLE_LG = "single_lg"
@@ -1250,6 +1282,38 @@ class AutoRenewalRunSummaryOut(BaseModel):
     renewed_count: int
     message: str
     combined_pdf_base64: Optional[str] = None
+
+class LGAutoRenewalItemIn(BaseModel):
+    lg_record_id: int = Field(..., description="The ID of the LG record to renew.")
+    new_expiry_date: date = Field(..., description="The new custom expiry date for the LG extension.")
+
+class RunAutoRenewalRequestIn(BaseModel):
+    renewals: Optional[List[LGAutoRenewalItemIn]] = Field(None, description="Optional list of specific LG renewals with custom dates. If omitted, runs default automatic renewal.")
+
+class AutoRenewalCandidateOut(BaseModel):
+    id: int
+    lg_number: str
+    beneficiary_name: Optional[str] = None
+    bank_name: Optional[str] = None
+    amount: Optional[Decimal] = None
+    currency_code: Optional[str] = None
+    current_expiry_date: date
+    lg_period_months: int
+    suggested_new_expiry_date: date
+    days_to_expiry: int
+    auto_renewal: bool
+    is_forced: bool
+    can_deselect: bool
+    tier_label: str
+    forced_reason: Optional[str] = None
+
+class AutoRenewalPreviewOut(BaseModel):
+    candidates: List[AutoRenewalCandidateOut]
+    total_candidates: int
+    forced_count: int
+    proactive_count: int
+    auto_renewal_days_threshold: int
+    forced_renew_days_threshold: int
 
 # New Schemas for Reporting Module
 class ReportFilterBase(BaseModel):

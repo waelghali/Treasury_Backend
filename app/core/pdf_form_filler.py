@@ -364,7 +364,7 @@ def get_pdf_form_fields(pdf_bytes: bytes) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Build comprehensive request data dictionary
 # ---------------------------------------------------------------------------
-def build_request_data_dict(request, db=None, bank_id=None) -> Dict[str, Any]:
+def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PRIMARY_ISSUER") -> Dict[str, Any]:
     """
     Builds a comprehensive data dictionary from an IssuanceRequest object.
     Used to populate both signed letters and fillable PDF forms.
@@ -374,6 +374,7 @@ def build_request_data_dict(request, db=None, bank_id=None) -> Dict[str, Any]:
         request: IssuanceRequest ORM object
         db: SQLAlchemy session (for bank account lookup)
         bank_id: Optional bank_id to resolve bank account details
+        form_role: PRIMARY_ISSUER (default) or THIRD_PARTY_INDEMNITY
     """
     data = {
         # Request basics
@@ -435,6 +436,10 @@ def build_request_data_dict(request, db=None, bank_id=None) -> Dict[str, Any]:
         "third_party_name": getattr(request, 'third_party_name', '') or "",
         "third_party_address": getattr(request, 'third_party_address', '') or "",
         "third_party_relationship": getattr(request, 'third_party_relationship', '') or "",
+        "third_party_cr": getattr(request, 'third_party_cr', '') or "",
+        
+        # Form role
+        "form_role": form_role,
         
         # LG Language booleans (for language selection checkboxes on bank forms)
         "lg_language_is_arabic": getattr(request, 'lg_language', 'AR') == 'AR',
@@ -596,6 +601,28 @@ def build_request_data_dict(request, db=None, bank_id=None) -> Dict[str, Any]:
             logger.warning(f"Failed to check facility: {e}")
             data["has_facility_at_bank"] = ""  # Unknown — will surface as missing field
     
+    # --- Third-Party Form Context Shifts ---
+    if form_role == "THIRD_PARTY_INDEMNITY" or data.get("form_role") == "THIRD_PARTY_INDEMNITY":
+        issuer_name = data.get("entity_name") or data.get("customer_name") or ""
+        issuer_addr = data.get("entity_address") or data.get("customer_address") or ""
+        data["issuer_company_name"] = issuer_name
+        data["issuer_address"] = issuer_addr
+        data["issuer_account_number"] = data.get("bank_account_number") or ""
+        data["facility_holder_name"] = issuer_name
+        data["guarantor_name"] = issuer_name
+        
+        if data.get("third_party_name"):
+            data["applicant_name"] = data["third_party_name"]
+            data["customer_name_for_bank"] = data["third_party_name"]
+            data["third_party_applicant_name"] = data["third_party_name"]
+        if data.get("third_party_address"):
+            data["applicant_address"] = data["third_party_address"]
+            data["third_party_applicant_address"] = data["third_party_address"]
+        if data.get("third_party_cr"):
+            data["commercial_register_number"] = data["third_party_cr"]
+            data["cr_number"] = data["third_party_cr"]
+            data["applicant_cr"] = data["third_party_cr"]
+    
     return data
 
 
@@ -686,8 +713,9 @@ def generate_overlay_pdf(
                 # Percentage-based: convert to absolute PDF points
                 # x_pct: 0=left, 100=right → multiply by page width
                 # y_pct: 0=TOP, 100=BOTTOM → invert for PDF (origin = bottom-left)
+                # Note: ReportLab drawString y is text baseline; subtract ~0.82*font_size to place text inside the visual box
                 x = float(x_pct) / 100.0 * pw
-                y = (1.0 - float(y_pct) / 100.0) * ph  # Invert Y axis (top→bottom to bottom→top)
+                y = (1.0 - float(y_pct) / 100.0) * ph - (float(font_size) * 0.82)
                 width_abs = float(entry.get("width_pct", 30)) / 100.0 * pw
             elif x_abs is not None and y_abs is not None:
                 # Legacy absolute PDF points
@@ -730,7 +758,11 @@ def generate_overlay_pdf(
             # Format value based on type
             if field_type == "checkbox":
                 is_checked = bool(value) and str(value).lower() not in ("", "0", "false", "no", "none")
-                value = "✓" if is_checked else ""
+                if is_checked:
+                    c.setFont("Helvetica-Bold", max(8, font_size))
+                    c.drawString(x, y, "X")
+                    filled_count += 1
+                continue
             elif field_type == "date" or isinstance(value, date):
                 if isinstance(value, str) and value:
                     try:
@@ -748,14 +780,22 @@ def generate_overlay_pdf(
             if not value:
                 continue
             
-            # Draw text at the specified position
-            c.setFont("Helvetica", font_size)
-            c.drawString(x, y, value)
+            # Draw text at the specified position with character spacing support
+            char_spacing = float(entry.get("char_spacing", 0))
+            if char_spacing > 0:
+                t = c.beginText(x, y)
+                t.setFont("Helvetica", font_size)
+                t.setCharSpace(char_spacing)
+                t.textOut(value)
+                c.drawText(t)
+            else:
+                c.setFont("Helvetica", font_size)
+                c.drawString(x, y, value)
             filled_count += 1
             logger.debug(
                 f"Overlay: p{page_num} '{mapped_to}' → '{value[:30]}' | "
                 f"pct=({x_pct or x_abs},{y_pct or y_abs}) → pts=({x:.1f},{y:.1f}) "
-                f"page=({pw:.0f}x{ph:.0f}) fs={font_size}"
+                f"page=({pw:.0f}x{ph:.0f}) fs={font_size} char_space={char_spacing}"
             )
         
         c.showPage()  # Move to next page

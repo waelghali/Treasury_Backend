@@ -104,6 +104,7 @@ class IssuanceRequestBase(BaseModel):
     third_party_name: Optional[str] = None
     third_party_address: Optional[str] = None
     third_party_relationship: Optional[str] = None
+    third_party_cr: Optional[str] = None
     is_cross_border: bool = False
     issuance_country: Optional[str] = None
     applicable_rules: Optional[str] = None
@@ -176,6 +177,7 @@ class IssuanceRequestDraftCreate(BaseModel):
     third_party_name: Optional[str] = None
     third_party_address: Optional[str] = None
     third_party_relationship: Optional[str] = None
+    third_party_cr: Optional[str] = None
     is_cross_border: bool = False
     issuance_country: Optional[str] = None
     applicable_rules: Optional[str] = None
@@ -381,6 +383,9 @@ class IssuanceFacilityBase(BaseModel):
     exposure_start_trigger: str = "ON_ISSUANCE"
     facility_default_margin_pct: Optional[Decimal] = None
     sla_agreement_days: Optional[int] = None
+    actual_avg_sla_days: Optional[Decimal] = None
+    sla_commitment_pct: Optional[Decimal] = None
+    total_completed_issuances: Optional[int] = 0
     allow_cross_border: bool = False
     allow_third_party_issuance: bool = False
     required_cash_margin_days: int = 0
@@ -457,6 +462,14 @@ class SuitableFacilityOut(BaseModel):
     required_cash_margin_amount: Decimal
     facility_score: float = 0.0
     recommendation_tags: List[str] = []
+
+    # Smart SLA & Turnaround Intelligence
+    agreed_sla_days: Optional[float] = None
+    actual_avg_sla_days: Optional[float] = None
+    effective_sla_days: Optional[float] = None
+    sla_commitment_pct: Optional[float] = None
+    sla_source: Optional[str] = None
+    sla_drift_days: Optional[float] = None
 
 # ==============================================================================
 # 4. RECONCILIATION & WORKFLOW (EXISTING)

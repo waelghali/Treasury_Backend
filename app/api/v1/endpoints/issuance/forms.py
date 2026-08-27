@@ -1,6 +1,6 @@
 from typing import List, Any, Optional, Dict
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, Body, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, Body, Request, UploadFile, File, Form, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from datetime import date
@@ -54,6 +54,7 @@ async def upload_bank_form(
     form_name: str = Query(...),
     form_type: str = Query("FILLABLE_PDF"),
     form_language: str = Query("BILINGUAL", description="AR / EN / BILINGUAL"),
+    form_role: str = Query("PRIMARY_ISSUER", description="PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY"),
     lg_type_ids: str = Query(None, description="Optional: comma-separated LG type IDs this form covers. NULL = universal."),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -118,6 +119,7 @@ async def upload_bank_form(
         version=new_version,
         form_type=form_type,
         form_language=form_language if form_language in ('AR', 'EN', 'BILINGUAL') else 'BILINGUAL',
+        form_role=form_role if form_role in ('PRIMARY_ISSUER', 'THIRD_PARTY_INDEMNITY') else 'PRIMARY_ISSUER',
         lg_type_ids=[int(x.strip()) for x in lg_type_ids.split(',') if x.strip()] if lg_type_ids else None,
         file_path=file_path,
         original_filename=file.filename,
@@ -139,6 +141,7 @@ async def upload_bank_form(
         "name": form_template.name,
         "version": form_template.version,
         "form_type": form_template.form_type,
+        "form_role": form_template.form_role,
         "bank_id": form_template.bank_id,
         "original_filename": form_template.original_filename,
         "ai_analysis_status": form_template.ai_analysis_status,
@@ -197,6 +200,66 @@ async def download_bank_form(
         raise HTTPException(500, "Failed to generate download URL.")
 
     raise HTTPException(404, "Uploaded PDF file not found.")
+
+
+@router.get("/bank-forms/{form_id}/page-image")
+def get_bank_form_page_image(
+    form_id: int,
+    page_num: int = Query(0, ge=0, description="0-indexed page number"),
+    dpi: int = Query(150, ge=72, le=300, description="Render resolution in DPI"),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(check_subscription_status),
+):
+    """
+    Renders a specific page of a bank form template as a high-resolution PNG image
+    for the interactive Visual Drag-and-Drop Designer.
+    """
+    import fitz  # PyMuPDF
+    from app.constants import UserRole
+    if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
+        raise HTTPException(403, "Not enough privileges.")
+
+    form_template = db.query(BankFormTemplate).filter(
+        BankFormTemplate.id == form_id,
+        BankFormTemplate.is_deleted == False
+    ).first()
+    if not form_template:
+        raise HTTPException(404, "Bank form template not found.")
+
+    pdf_bytes = _read_bank_form_pdf_bytes(form_template)
+    if not pdf_bytes:
+        raise HTTPException(404, "Form PDF content not found.")
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        if total_pages == 0:
+            raise HTTPException(400, "PDF has no pages.")
+        
+        target_page = min(page_num, total_pages - 1)
+        page = doc.load_page(target_page)
+        page_width = float(page.rect.width)
+        page_height = float(page.rect.height)
+        
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        png_bytes = pix.tobytes("png")
+        doc.close()
+
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={
+                "X-Total-Pages": str(total_pages),
+                "X-Current-Page": str(target_page),
+                "X-Page-Width": str(page_width),
+                "X-Page-Height": str(page_height),
+                "Access-Control-Expose-Headers": "X-Total-Pages, X-Current-Page, X-Page-Width, X-Page-Height",
+            }
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to render page image: {str(e)}")
 
 
 @router.post("/bank-forms/{form_id}/analyze")
@@ -590,6 +653,7 @@ def list_bank_forms(
             "name": f.name,
             "version": f.version,
             "form_type": f.form_type,
+            "form_role": getattr(f, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER',
             "form_language": getattr(f, 'form_language', 'BILINGUAL') or 'BILINGUAL',
             "original_filename": f.original_filename,
             "ai_analysis_status": f.ai_analysis_status,
@@ -626,6 +690,7 @@ def get_bank_form(
         "name": form_template.name,
         "version": form_template.version,
         "form_type": form_template.form_type,
+        "form_role": getattr(form_template, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER',
         "form_language": getattr(form_template, 'form_language', 'BILINGUAL') or 'BILINGUAL',
         "original_filename": form_template.original_filename,
         "file_path": form_template.file_path,
@@ -758,7 +823,31 @@ def set_bank_form_priority(
     
     form.priority = priority
     db.commit()
-    return {"message": f"Form '{form.name}' priority set to {priority}.", "id": form_id, "priority": priority}
+    return {"message": f"Priority set to {priority}", "id": form_id, "priority": priority}
+
+
+@router.patch("/bank-forms/{form_id}/role")
+def set_bank_form_role(
+    form_id: int,
+    form_role: str = Query("PRIMARY_ISSUER", description="PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY"),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(check_subscription_status),
+):
+    """Sets the role of a bank form (PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY)."""
+    from app.constants import UserRole
+    if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
+        raise HTTPException(403, "Not enough privileges.")
+    
+    form = db.query(BankFormTemplate).filter(
+        BankFormTemplate.id == form_id,
+        BankFormTemplate.is_deleted == False,
+    ).first()
+    if not form:
+        raise HTTPException(404, "Bank form template not found.")
+    
+    form.form_role = form_role if form_role in ("PRIMARY_ISSUER", "THIRD_PARTY_INDEMNITY") else "PRIMARY_ISSUER"
+    db.commit()
+    return {"message": f"Form role set to {form.form_role}", "id": form_id, "form_role": form.form_role}
 
 
 @router.get("/form-dictionary")
@@ -893,26 +982,86 @@ def update_form_configuration(
     )
 
 
-# ==============================================================================
-# DUPLICATE & SIMILARITY CHECKS
-# ==============================================================================
+def _find_best_matching_bank_form(
+    db: Session,
+    bank_id: int,
+    lg_type_id: Optional[int],
+    req_lang: str,
+    form_role: str = "PRIMARY_ISSUER"
+) -> Optional[BankFormTemplate]:
+    """
+    4-tier priority selection for bank form templates filtered by form_role:
+    1. Type-specific + matching language (AR/EN)
+    2. Type-specific + BILINGUAL
+    3. Universal + matching language
+    4. Universal + BILINGUAL
+    Fallback: Best effort within matching role.
+    """
+    candidates = db.query(BankFormTemplate).filter(
+        BankFormTemplate.bank_id == bank_id,
+        BankFormTemplate.is_active == True,
+        BankFormTemplate.is_deleted == False,
+        BankFormTemplate.ai_analysis_status == "COMPLETED",
+        BankFormTemplate.form_role == form_role,
+    ).order_by(BankFormTemplate.priority.desc(), BankFormTemplate.version.desc()).all()
+    
+    # If no templates found with explicit form_role and form_role is PRIMARY_ISSUER, fallback to records where form_role is null
+    if not candidates and form_role == "PRIMARY_ISSUER":
+        candidates = db.query(BankFormTemplate).filter(
+            BankFormTemplate.bank_id == bank_id,
+            BankFormTemplate.is_active == True,
+            BankFormTemplate.is_deleted == False,
+            BankFormTemplate.ai_analysis_status == "COMPLETED",
+            or_(BankFormTemplate.form_role == "PRIMARY_ISSUER", BankFormTemplate.form_role == None)
+        ).order_by(BankFormTemplate.priority.desc(), BankFormTemplate.version.desc()).all()
+    
+    if not candidates:
+        return None
+
+    # P1: type match + exact language
+    for f in candidates:
+        if f.lg_type_ids and lg_type_id in f.lg_type_ids:
+            if getattr(f, 'form_language', 'BILINGUAL') == req_lang:
+                return f
+
+    # P2: type match + bilingual
+    for f in candidates:
+        if f.lg_type_ids and lg_type_id in f.lg_type_ids:
+            if getattr(f, 'form_language', 'BILINGUAL') == 'BILINGUAL':
+                return f
+
+    # P3: universal + exact language
+    for f in candidates:
+        if not f.lg_type_ids:
+            if getattr(f, 'form_language', 'BILINGUAL') == req_lang:
+                return f
+
+    # P4: universal + bilingual
+    for f in candidates:
+        if not f.lg_type_ids:
+            if getattr(f, 'form_language', 'BILINGUAL') == 'BILINGUAL':
+                return f
+
+    return candidates[0]
+
 
 @router.post("/bank-forms/auto-fill/{request_id}")
 async def auto_fill_bank_form(
     request_id: int,
     bank_id: int = Query(..., description="The bank to find forms for"),
+    form_role: str = Query("PRIMARY_ISSUER", description="PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY"),
     user_values: Optional[Dict[str, str]] = Body(None, description="User-provided values for missing fields"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """
-    Two-phase bank form auto-fill:
+    Two-phase bank form auto-fill supporting multi-role forms (Issuer Request + Third-Party Indemnity):
     
-    Phase 1 (user_values=null): Build data, detect missing fields.
+    Phase 1 (user_values=null): Build data, detect missing fields for requested form_role and third-party form if applicable.
       - If ALL fields have values → return filled PDF immediately.
-      - If some fields are empty → return JSON with missing_fields + saved_values.
+      - If some fields are empty → return JSON with missing_fields + saved_values + third_party_form_info.
     
-    Phase 2 (user_values={...}): Merge user values into data, generate PDF, save values for reuse.
+    Phase 2 (user_values={...}): Merge user values into data, generate PDF for specified form_role, save values for reuse.
     """
     from sqlalchemy.orm import selectinload
     from app.models.models_issuance import FormFieldUserValue
@@ -957,7 +1106,6 @@ async def auto_fill_bank_form(
         )
 
     # Check bank lock: if request is locked to a DIFFERENT bank, reject
-
     meta = dict(request.metadata_json or {})
     locked_bank_id = meta.get("locked_bank_id")
     if locked_bank_id and int(locked_bank_id) != int(bank_id):
@@ -975,60 +1123,32 @@ async def auto_fill_bank_form(
         request.locked_for_issuance = True
         db.flush()  # Push lock immediately
     
-    # Find best matching form: type-specific first, then universal, language-aware
+    # Find best matching form for the requested role
     req_lang = getattr(request, 'lg_language', 'AR') or 'AR'  # AR or EN
+    target_role = form_role if form_role in ("PRIMARY_ISSUER", "THIRD_PARTY_INDEMNITY") else "PRIMARY_ISSUER"
     
-    all_candidates = db.query(BankFormTemplate).filter(
-        BankFormTemplate.bank_id == bank_id,
-        BankFormTemplate.is_active == True,
-        BankFormTemplate.is_deleted == False,
-        BankFormTemplate.ai_analysis_status == "COMPLETED",
-    ).order_by(BankFormTemplate.version.desc()).all()
+    form_template = _find_best_matching_bank_form(
+        db=db,
+        bank_id=bank_id,
+        lg_type_id=request.lg_type_id,
+        req_lang=req_lang,
+        form_role=target_role,
+    )
     
-    # 4-tier priority selection:
-    # 1. Type-specific + matching language (AR/EN)
-    # 2. Type-specific + BILINGUAL
-    # 3. Universal + matching language
-    # 4. Universal + BILINGUAL
-    form_template = None
-    
-    # P1: type match + exact language
-    for f in all_candidates:
-        if f.lg_type_ids and request.lg_type_id in f.lg_type_ids:
-            if getattr(f, 'form_language', 'BILINGUAL') == req_lang:
-                form_template = f
-                break
-    
-    # P2: type match + bilingual
-    if not form_template:
-        for f in all_candidates:
-            if f.lg_type_ids and request.lg_type_id in f.lg_type_ids:
-                if getattr(f, 'form_language', 'BILINGUAL') == 'BILINGUAL':
-                    form_template = f
-                    break
-    
-    # P3: universal + exact language
-    if not form_template:
-        for f in all_candidates:
-            if not f.lg_type_ids:
-                if getattr(f, 'form_language', 'BILINGUAL') == req_lang:
-                    form_template = f
-                    break
-    
-    # P4: universal + bilingual
-    if not form_template:
-        for f in all_candidates:
-            if not f.lg_type_ids:
-                if getattr(f, 'form_language', 'BILINGUAL') == 'BILINGUAL':
-                    form_template = f
-                    break
-    
-    if not form_template and all_candidates:
-        # Last resort: any active analyzed form for this bank
-        form_template = all_candidates[0]
+    # Check if a third-party indemnity form is also available for this bank
+    tp_template = None
+    if request.is_third_party:
+        tp_template = _find_best_matching_bank_form(
+            db=db,
+            bank_id=bank_id,
+            lg_type_id=request.lg_type_id,
+            req_lang=req_lang,
+            form_role="THIRD_PARTY_INDEMNITY",
+        )
     
     if not form_template:
-        raise HTTPException(404, f"No analyzed bank form template found for this bank. Please upload and analyze a form first.")
+        role_label = "Third-Party Indemnity" if target_role == "THIRD_PARTY_INDEMNITY" else "Primary Issuance"
+        raise HTTPException(404, f"No analyzed {role_label} bank form template found for this bank. Please upload and analyze a form first.")
     
     if not form_template.field_mapping:
         raise HTTPException(400, "Form has no field mapping. Run AI analysis first.")
@@ -1081,8 +1201,8 @@ async def auto_fill_bank_form(
     
     # Build data dict (auto-fills from system data + bank account)
     from app.core.pdf_form_filler import fill_pdf_form, build_request_data_dict
-    request_data = build_request_data_dict(request, db, bank_id=bank_id)
-    _logger.info(f"Auto-fill: form_type={form_template.form_type}, field_mapping has {len(field_mapping)} entries, request_data has {len(request_data)} keys")
+    request_data = build_request_data_dict(request, db, bank_id=bank_id, form_role=target_role)
+    _logger.info(f"Auto-fill: form_type={form_template.form_type}, form_role={target_role}, field_mapping has {len(field_mapping)} entries, request_data has {len(request_data)} keys")
     _logger.info(f"Auto-fill: non-empty request_data keys: {[k for k,v in request_data.items() if v]}")
     
     # Look up special wording attachment (for auto-open after form download)
@@ -1133,7 +1253,7 @@ async def auto_fill_bank_form(
         CURRENCY_ALWAYS_FILLED = {"currency_code", "currency_name", "amount_with_currency", "amount_in_words"}
         # Third-party fields to skip when request is NOT third-party
         is_third_party = request_data.get("is_third_party", False)
-        third_party_keys = {"third_party_name", "third_party_address", "third_party_relationship"}
+        third_party_keys = {"third_party_name", "third_party_address", "third_party_relationship", "third_party_cr"}
         # custom_field_1_value is used for "Other Commercial Registration" only in third-party context
         if not is_third_party:
             third_party_keys.add("custom_field_1_value")
@@ -1190,6 +1310,42 @@ async def auto_fill_bank_form(
                     "saved_value": saved_values.get(pdf_field, ""),
                 })
         
+        # Also analyze third-party indemnity form if available and in primary check
+        third_party_form_info = None
+        if request.is_third_party and tp_template:
+            tp_request_data = build_request_data_dict(request, db, bank_id=bank_id, form_role="THIRD_PARTY_INDEMNITY")
+            tp_saved_rows = db.query(FormFieldUserValue).filter(
+                FormFieldUserValue.customer_id == current_user.customer_id,
+                FormFieldUserValue.form_template_id == tp_template.id,
+            ).all()
+            tp_saved_values = {row.pdf_field_name: row.saved_value for row in tp_saved_rows}
+            tp_missing = []
+            seen_tp_mapped = set()
+            for me in (tp_template.field_mapping or []):
+                m_to = me.get("mapped_to", "")
+                p_f = me.get("pdf_field_name", "")
+                f_t = me.get("field_type", "text").lower()
+                if f_t == "checkbox" or m_to in CURRENCY_ALWAYS_FILLED or m_to in seen_tp_mapped:
+                    continue
+                seen_tp_mapped.add(m_to)
+                v = tp_request_data.get(m_to, "")
+                if not isinstance(v, (bool, int, float)) and (not v or str(v).strip() == ""):
+                    tp_missing.append({
+                        "pdf_field_name": p_f,
+                        "label": me.get("label", p_f),
+                        "mapped_to": m_to,
+                        "field_type": f_t,
+                        "saved_value": tp_saved_values.get(p_f, ""),
+                    })
+            third_party_form_info = {
+                "id": tp_template.id,
+                "name": tp_template.name,
+                "form_type": tp_template.form_type or "FILLABLE_PDF",
+                "form_role": "THIRD_PARTY_INDEMNITY",
+                "missing_fields": tp_missing,
+                "total_fields": len(tp_template.field_mapping or []),
+            }
+        
         # If nothing is missing, generate PDF directly
         if not missing_fields:
             # Merge any saved values that might map to unmapped fields
@@ -1244,8 +1400,11 @@ async def auto_fill_bank_form(
                     'X-Form-Template-Id': str(form_template.id),
                     'X-Form-Template-Name': form_template.name,
                     'X-Form-Type': form_template.form_type or 'FILLABLE_PDF',
+                    'X-Form-Role': str(getattr(form_template, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER'),
+                    'X-Has-Third-Party-Form': 'true' if tp_template else 'false',
+                    'X-Third-Party-Form-Id': str(tp_template.id) if tp_template else '',
                     'X-Special-Wording-Doc-Id': str(special_wording_doc_id) if special_wording_doc_id else '',
-                    'Access-Control-Expose-Headers': 'X-Form-Type, X-Special-Wording-Doc-Id',
+                    'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id',
                 }
             )
         
@@ -1255,9 +1414,12 @@ async def auto_fill_bank_form(
             "form_template_id": form_template.id,
             "form_template_name": form_template.name,
             "form_type": form_template.form_type or "FILLABLE_PDF",
+            "form_role": getattr(form_template, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER',
             "missing_fields": missing_fields,
             "total_fields": len(form_template.field_mapping),
             "auto_filled_fields": len(form_template.field_mapping) - len(missing_fields),
+            "has_third_party_form": bool(tp_template),
+            "third_party_form_info": third_party_form_info,
             "special_wording_doc_id": special_wording_doc_id,
         }
     
@@ -1349,6 +1511,12 @@ async def auto_fill_bank_form(
             'Content-Disposition': f'inline; filename="{filename}"',
             'X-Form-Template-Id': str(form_template.id),
             'X-Form-Template-Name': form_template.name,
+            'X-Form-Type': form_template.form_type or 'FILLABLE_PDF',
+            'X-Form-Role': str(getattr(form_template, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER'),
+            'X-Has-Third-Party-Form': 'true' if tp_template else 'false',
+            'X-Third-Party-Form-Id': str(tp_template.id) if tp_template else '',
+            'X-Special-Wording-Doc-Id': str(special_wording_doc_id) if special_wording_doc_id else '',
+            'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id',
         }
     )
 

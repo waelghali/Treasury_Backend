@@ -24,7 +24,8 @@ from app.schemas.all_schemas import (
     LGInstructionUpdate, LGInstructionRecordDelivery, LGInstructionRecordBankReply,
     InternalOwnerContactCreate, LGDocumentCreate, LGCategoryCreate, LGCategoryUpdate,
     LGInstructionCreate, LGRecordCreate, LGRecordUpdate, LGActivateNonOperativeRequest,
-    LGRecordAmendRequest # New schema for amendment
+    LGRecordAmendRequest, # New schema for amendment
+    LGAutoRenewalItemIn, AutoRenewalCandidateOut, AutoRenewalPreviewOut # Auto-renewal schemas
 )
 from app.constants import (
     GlobalConfigKey, ApprovalRequestStatusEnum, ACTION_TYPE_LG_DECREASE_AMOUNT, AUDIT_ACTION_TYPE_LG_DECREASED_AMOUNT,
@@ -1241,12 +1242,21 @@ class CRUDLGRecord(CRUDBase):
             "recipient_address": recipient_address,
         }
 
-        notes_html = ""
-        if notes:
-            notes_html = f"""
+        notes_html_parts = []
+        mandatory_stmt = (getattr(lg_record, "mandatory_claim_statement", None) or "").strip()
+        if mandatory_stmt:
+            notes_html_parts.append(f"""
+            <div style="background-color: #f8fafc; border-left: 3px solid #2563eb; padding: 6px 10px; margin: 8px 0;">
+                <h3 style="margin: 0 0 4px 0; font-size: 9.5pt; color: #1e3a8a;">Mandatory Claim Declaration / Conditions:</h3>
+                <p style="margin: 0; font-style: italic; font-size: 9pt;">{mandatory_stmt}</p>
+            </div>
+            """)
+        if notes and notes.strip() and notes.strip() != mandatory_stmt:
+            notes_html_parts.append(f"""
             <h3>Additional Notes</h3>
             <p>{notes}</p>
-            """
+            """)
+        notes_html = "".join(notes_html_parts)
         instruction_details["notes_section"] = notes_html
         
         # --- NEW LOGGING FOR DEBUGGING ---
@@ -2354,19 +2364,23 @@ class CRUDLGRecord(CRUDBase):
         logger.debug(f"[CRUDLGRecord.get_lg_records_for_renewal_reminder] Found {len(lg_records)} LGs approaching expiry for customer {customer_id}.")
         return lg_records
 
-    # NEW METHOD: Run Auto Renewal / Bulk Renewal
-    async def run_auto_renewal_process(self, db: Session, user_id: int, customer_id: int) -> Tuple[int, Optional[bytes]]:
+    def get_auto_renewal_candidates(
+        self,
+        db: Session,
+        customer_id: int,
+        user_has_all_access: bool = True,
+        user_allowed_entity_ids: List[int] = []
+    ) -> AutoRenewalPreviewOut:
         """
-        Identifies eligible LGs for auto-renewal and force-renewal,
-        executes the extension process for each, generates individual instruction letters,
-        sends individual email notifications, and finally produces a single consolidated PDF
-        of all generated instruction letters for physical printing by the user.
-        Bypasses Maker-Checker for individual extensions as it's a bulk operation.
+        Retrieves candidate LG records for auto-renewal and forced renewal preview.
+        Enforces tiered risk rules:
+        - Tier 1 (CRITICAL_FORCED): days_to_expiry <= FORCED_RENEW_DAYS_BEFORE_EXPIRY.
+          Regardless of auto_renewal flag, is_forced=True and can_deselect=False.
+        - Tier 2 (PROACTIVE_AUTO): days_to_expiry > FORCED_RENEW_DAYS_BEFORE_EXPIRY and
+          days_to_expiry <= AUTO_RENEWAL_DAYS_BEFORE_EXPIRY and auto_renewal == True.
+          is_forced=False and can_deselect=True.
         """
-        logger.info(f"[CRUDLGRecord.run_auto_renewal_process] Initiating auto/bulk renewal process for customer {customer_id} by user {user_id}.")
-
         try:
-            # Retrieve configurable thresholds for renewal eligibility 
             auto_renewal_days_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
                 db, customer_id, GlobalConfigKey.AUTO_RENEWAL_DAYS_BEFORE_EXPIRY
             )
@@ -2375,124 +2389,206 @@ class CRUDLGRecord(CRUDBase):
             )
 
             auto_renewal_days = int(auto_renewal_days_config.get('effective_value', 30)) if auto_renewal_days_config else 30
-            force_renewal_days = int(force_renewal_days_config.get('effective_value', 60)) if force_renewal_days_config else 60
+            force_renewal_days = int(force_renewal_days_config.get('effective_value', 15)) if force_renewal_days_config else 15
 
             if auto_renewal_days <= 0 or force_renewal_days <= 0:
                 logger.error(f"Invalid auto/force renewal days configuration for customer {customer_id}.")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Renewal configuration invalid. Please contact support.")
 
         except (ValueError, AttributeError, TypeError) as e:
-            logger.error(f"Error retrieving or parsing renewal configuration for customer {customer_id}: {e}", exc_info=True)
+            logger.error(f"Error retrieving renewal configuration for customer {customer_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve renewal configurations.")
 
-        current_date = date.today()
-        auto_renewal_cutoff_date = current_date + timedelta(days=auto_renewal_days)
-        force_renewal_cutoff_date = current_date + timedelta(days=force_renewal_days)
+        current_date = datetime.now(EEST_TIMEZONE).date()
+        max_lookahead_days = max(auto_renewal_days, force_renewal_days)
+        max_cutoff_date = current_date + timedelta(days=max_lookahead_days)
 
-        logger.info(f"DEBUG: Auto-renewal run for customer {customer_id}.")
-        logger.info(f"DEBUG: Current Server Date (today): {current_date}")
-        logger.info(f"DEBUG: Auto Renewal Days Before Expiry: {auto_renewal_days}")
-        logger.info(f"DEBUG: Auto Renewal Cutoff Date (inclusive): {auto_renewal_cutoff_date}")
-        logger.info(f"DEBUG: Force Renewal Days Before Expiry: {force_renewal_days}")
-        logger.info(f"DEBUG: Force Renewal Cutoff Date (inclusive): {force_renewal_cutoff_date}")
-
-
-        eligible_lgs: List[models.LGRecord] = []
-
-        # 1. Identify Auto-Renewal LGs
-        auto_renewal_lgs = db.query(self.model).filter(
+        query = db.query(self.model).filter(
             self.model.customer_id == customer_id,
             self.model.is_deleted == False,
-            self.model.lg_status.has(models.LgStatus.id == models.LgStatusEnum.VALID.value), # Corrected to models.LgStatusEnum
-            self.model.auto_renewal == True,
-            # LGs for auto-renewal that are nearing their expiry
-            models.LGRecord.expiry_date >= current_date,
-            models.LGRecord.expiry_date <= auto_renewal_cutoff_date
-        ).options(
+            self.model.lg_status_id == models.LgStatusEnum.VALID.value,
+            self.model.expiry_date >= current_date,
+            self.model.expiry_date <= max_cutoff_date
+        )
+
+        if not user_has_all_access:
+            if not user_allowed_entity_ids:
+                return AutoRenewalPreviewOut(
+                    candidates=[],
+                    total_candidates=0,
+                    forced_count=0,
+                    proactive_count=0,
+                    auto_renewal_days_threshold=auto_renewal_days,
+                    forced_renew_days_threshold=force_renewal_days
+                )
+            query = query.filter(self.model.beneficiary_corporate_id.in_(user_allowed_entity_ids))
+
+        lgs = query.options(
             selectinload(models.LGRecord.beneficiary_corporate),
             selectinload(models.LGRecord.lg_currency),
             selectinload(models.LGRecord.issuing_bank),
-            selectinload(models.LGRecord.internal_owner_contact),
-            selectinload(models.LGRecord.lg_category),
             selectinload(models.LGRecord.customer),
             selectinload(models.LGRecord.lg_status)
-        ).all()
-        
-        eligible_lgs.extend(auto_renewal_lgs)
-        logger.debug(f"Found {len(auto_renewal_lgs)} auto-renewal eligible LGs for customer {customer_id}.")
+        ).order_by(self.model.expiry_date.asc()).all()
 
-        # 2. Identify Force-Renewal LGs (not auto-renewal, but nearing expiry for forced action)
-        force_renewal_lgs = db.query(self.model).filter(
-            self.model.customer_id == customer_id,
-            self.model.is_deleted == False,
-            self.model.lg_status.has(models.LgStatus.id == models.LgStatusEnum.VALID.value), # Corrected to models.LgStatusEnum
-            self.model.auto_renewal == False, # Explicitly not auto-renewal
-            # LGs for force-renewal that are nearing their expiry
-            models.LGRecord.expiry_date >= current_date,
-            models.LGRecord.expiry_date <= force_renewal_cutoff_date
-        ).options(
-            selectinload(models.LGRecord.beneficiary_corporate),
-            selectinload(models.LGRecord.lg_currency),
-            selectinload(models.LGRecord.issuing_bank),
-            selectinload(models.LGRecord.internal_owner_contact),
-            selectinload(models.LGRecord.lg_category),
-            selectinload(models.LGRecord.customer),
-            selectinload(models.LGRecord.lg_status)
-        ).all()
+        candidates: List[AutoRenewalCandidateOut] = []
+        forced_count = 0
+        proactive_count = 0
 
-        # Filter out any duplicates if an LG somehow meets both (though criteria should prevent this)
-        # Or more likely, an LG could be in auto_renewal_lgs and also picked up here due to broad cutoff.
-        # Ensure distinct LGs. Using a set for IDs is efficient.
-        processed_lg_ids = {lg.id for lg in eligible_lgs}
-        for lg in force_renewal_lgs:
-            if lg.id not in processed_lg_ids:
-                eligible_lgs.append(lg)
-                processed_lg_ids.add(lg.id)
+        for lg in lgs:
+            lg_expiry_date = lg.expiry_date.date() if isinstance(lg.expiry_date, datetime) else lg.expiry_date
+            remaining_days = (lg_expiry_date - current_date).days
+            period_months = lg.lg_period_months or 12
+            suggested_new_date = (lg_expiry_date + relativedelta(months=period_months))
 
-        logger.debug(f"Found {len(force_renewal_lgs)} force-renewal eligible LGs. Total distinct eligible LGs: {len(eligible_lgs)}.")
+            # Tier 1: Forced / Critical window (<= force_renewal_days)
+            if remaining_days <= force_renewal_days:
+                forced_count += 1
+                candidates.append(AutoRenewalCandidateOut(
+                    id=lg.id,
+                    lg_number=lg.lg_number,
+                    beneficiary_name=lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else "N/A",
+                    bank_name=lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                    amount=lg.lg_amount,
+                    currency_code=lg.lg_currency.iso_code if lg.lg_currency else None,
+                    current_expiry_date=lg_expiry_date,
+                    lg_period_months=period_months,
+                    suggested_new_expiry_date=suggested_new_date,
+                    days_to_expiry=remaining_days,
+                    auto_renewal=bool(lg.auto_renewal),
+                    is_forced=True,
+                    can_deselect=False,
+                    tier_label="CRITICAL_FORCED",
+                    forced_reason=f"Expiring in {remaining_days} day(s), within mandatory cutoff of {force_renewal_days} days."
+                ))
+            # Tier 2: Proactive window (> force_renewal_days and <= auto_renewal_days and auto_renewal == True)
+            elif lg.auto_renewal and remaining_days <= auto_renewal_days:
+                proactive_count += 1
+                candidates.append(AutoRenewalCandidateOut(
+                    id=lg.id,
+                    lg_number=lg.lg_number,
+                    beneficiary_name=lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else "N/A",
+                    bank_name=lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                    amount=lg.lg_amount,
+                    currency_code=lg.lg_currency.iso_code if lg.lg_currency else None,
+                    current_expiry_date=lg_expiry_date,
+                    lg_period_months=period_months,
+                    suggested_new_expiry_date=suggested_new_date,
+                    days_to_expiry=remaining_days,
+                    auto_renewal=bool(lg.auto_renewal),
+                    is_forced=False,
+                    can_deselect=True,
+                    tier_label="PROACTIVE_AUTO",
+                    forced_reason=None
+                ))
 
+        # Sort candidates: Forced first, then by expiry date ascending
+        candidates.sort(key=lambda c: (0 if c.is_forced else 1, c.current_expiry_date))
 
-        if not eligible_lgs:
-            logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No eligible LGs found for auto/bulk renewal for customer {customer_id}.")
+        return AutoRenewalPreviewOut(
+            candidates=candidates,
+            total_candidates=len(candidates),
+            forced_count=forced_count,
+            proactive_count=proactive_count,
+            auto_renewal_days_threshold=auto_renewal_days,
+            forced_renew_days_threshold=force_renewal_days
+        )
+
+    # METHOD: Run Auto Renewal / Bulk Renewal with optional custom items & dates
+    async def run_auto_renewal_process(
+        self,
+        db: Session,
+        user_id: int,
+        customer_id: int,
+        selected_items: Optional[List[LGAutoRenewalItemIn]] = None,
+        user_has_all_access: bool = True,
+        user_allowed_entity_ids: List[int] = []
+    ) -> Tuple[int, Optional[bytes]]:
+        """
+        Executes the auto/forced renewal process for eligible LG records.
+        If selected_items is provided:
+          - Validates that NO mandatory forced renewal LGs are omitted.
+          - Uses the customized new_expiry_date for each selected LG.
+        If selected_items is None (legacy/sweep mode):
+          - Renews all eligible candidates using their default period-calculated date.
+        Generates individual instruction letters and a single consolidated PDF.
+        Bypasses Maker-Checker for individual extensions as it is an authorized bulk operation.
+        """
+        logger.info(f"[CRUDLGRecord.run_auto_renewal_process] Initiating renewal process for customer {customer_id} by user {user_id}.")
+
+        # Retrieve candidates based on current configuration rules
+        preview = self.get_auto_renewal_candidates(
+            db, customer_id, user_has_all_access=user_has_all_access, user_allowed_entity_ids=user_allowed_entity_ids
+        )
+
+        if not preview.candidates:
+            logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No eligible LG candidates found for customer {customer_id}.")
+            return 0, None
+
+        candidate_map = {c.id: c for c in preview.candidates}
+
+        # Determine target list to renew: (lg_id, new_expiry_date)
+        targets_to_renew: List[Tuple[int, date]] = []
+
+        if selected_items is not None:
+            selected_dict = {item.lg_record_id: item.new_expiry_date for item in selected_items}
+
+            # Critical validation: Check that no mandatory forced renewal LG is missing
+            missing_forced = [
+                c.lg_number for c in preview.candidates if c.is_forced and c.id not in selected_dict
+            ]
+            if missing_forced:
+                logger.warning(f"Customer {customer_id} attempted to exclude forced LGs: {missing_forced}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cannot exclude mandatory forced renewal LG(s): {', '.join(missing_forced)}. These must be renewed per company policy."
+                )
+
+            for lg_id, custom_date in selected_dict.items():
+                if lg_id not in candidate_map:
+                    logger.warning(f"LG ID {lg_id} is not an eligible candidate for customer {customer_id}. Skipping.")
+                    continue
+                cand = candidate_map[lg_id]
+                if custom_date <= cand.current_expiry_date:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"New expiry date ({custom_date}) for LG {cand.lg_number} must be strictly after the current expiry date ({cand.current_expiry_date})."
+                    )
+                targets_to_renew.append((lg_id, custom_date))
+        else:
+            # Default: renew all candidates with suggested dates
+            for c in preview.candidates:
+                targets_to_renew.append((c.id, c.suggested_new_expiry_date))
+
+        if not targets_to_renew:
+            logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs selected for renewal for customer {customer_id}.")
             return 0, None
 
         renewed_lg_count = 0
         all_generated_instruction_htmls = []
         renewed_lg_numbers = []
 
-        for lg_record_to_renew in eligible_lgs:
+        for lg_id, new_expiry_date_as_date in targets_to_renew:
+            cand = candidate_map.get(lg_id)
+            lg_num_label = cand.lg_number if cand else str(lg_id)
             try:
-                # Calculate new expiry date based on lg_period_months using relativedelta
-                current_expiry_dt = lg_record_to_renew.expiry_date # This is already a datetime object from DB
-
-                # Use relativedelta for accurate month addition, handling year rollovers and end-of-month correctly.
-                # Convert the resulting datetime object back to a date object, as required by extend_lg.
-                new_expiry_date_as_date = (current_expiry_dt + relativedelta(months=lg_record_to_renew.lg_period_months)).date()
-
-                # Call extend_lg, which handles LG update, instruction creation, and email
-                # CRITICAL: Pass None for approval_request_id to bypass Maker-Checker
-                updated_lg, instruction_id, generated_html = await self.extend_lg( # MODIFIED TO CAPTURE HTML
+                updated_lg, instruction_id, generated_html = await self.extend_lg(
                     db,
-                    lg_record_to_renew.id,
+                    lg_id,
                     new_expiry_date_as_date,
-                    user_id # The user initiating the bulk process is the 'maker' for this automated extension
+                    user_id
                 )
                 all_generated_instruction_htmls.append(generated_html)
                 renewed_lg_count += 1
                 renewed_lg_numbers.append(updated_lg.lg_number)
-                logger.info(f"Successfully renewed LG {updated_lg.lg_number} (ID: {updated_lg.id}) to new expiry date {updated_lg.expiry_date.date()}. Instruction ID: {instruction_id}.")
-
+                logger.info(f"Successfully renewed LG {updated_lg.lg_number} (ID: {updated_lg.id}) to {updated_lg.expiry_date.date()}. Instruction ID: {instruction_id}.")
             except HTTPException as e:
-                logger.error(f"Skipping LG {lg_record_to_renew.lg_number} (ID: {lg_record_to_renew.id}) due to specific error during extension: {e.detail}", exc_info=True)
-                # Do not re-raise, continue to process other LGs
+                logger.error(f"Skipping LG {lg_num_label} due to error during extension: {e.detail}", exc_info=True)
             except Exception as e:
-                # Ensure the traceback is properly logged for all unexpected errors
-                logger.error(f"Skipping LG {lg_record_to_renew.lg_number} (ID: {lg_record_to_renew.id}) due to unexpected error during extension: {e}", exc_info=True)
-                # Do not re-raise, continue to process other LGs
-
+                logger.error(f"Skipping LG {lg_num_label} due to unexpected error during extension: {e}", exc_info=True)
 
         if not all_generated_instruction_htmls:
-            logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs were successfully renewed to generate a combined PDF for customer {customer_id}.")
+            logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs were successfully renewed for customer {customer_id}.")
             return 0, None
 
         # Combine all generated instruction HTMLs into a single document with page breaks
@@ -2500,8 +2596,7 @@ class CRUDLGRecord(CRUDBase):
         for html_segment in all_generated_instruction_htmls:
             consolidated_html_content.append(html_segment)
             consolidated_html_content.append('<div style="page-break-after: always;"></div>')
-        
-        # Remove the last page break to avoid an empty page at the end
+
         if consolidated_html_content and consolidated_html_content[-1].startswith('<div style="page-break-after:'):
             consolidated_html_content.pop()
 
@@ -2519,21 +2614,20 @@ class CRUDLGRecord(CRUDBase):
             logger.info(f"Successfully generated combined PDF for {renewed_lg_count} renewed LGs.")
         except Exception as e:
             logger.error(f"Failed to generate consolidated PDF for bulk renewal for customer {customer_id}: {e}", exc_info=True)
-            # Do not re-raise, proceed with logging the overall action
 
-        # Log the overall bulk action 
+        # Log the overall bulk action
         log_action(
             db,
             user_id=user_id,
-            action_type=AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED, # Reusing for bulk renewal as a placeholder, ideally a new constant for auto renewal
+            action_type=AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED,
             entity_type="Customer",
             entity_id=customer_id,
             details={
                 "action": "Bulk LG Renewal (Auto & Forced)",
                 "renewed_lg_count": renewed_lg_count,
                 "renewed_lg_numbers": renewed_lg_numbers,
-                "auto_renewal_threshold_days": auto_renewal_days,
-                "force_renewal_threshold_days": force_renewal_days,
+                "auto_renewal_threshold_days": preview.auto_renewal_days_threshold,
+                "force_renewal_threshold_days": preview.forced_renew_days_threshold,
                 "combined_pdf_generated": combined_pdf_bytes is not None,
                 "triggered_by_user": user_id
             },

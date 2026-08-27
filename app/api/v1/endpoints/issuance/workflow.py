@@ -842,6 +842,13 @@ async def record_bank_reply(
                 request_obj.status = "COMPLETED"
                 request_obj.locked_for_issuance = False
 
+        # Smart SLA Actualization: compute net business turnaround and update EMA metrics
+        try:
+            from app.services.sla_actualization_service import sla_actualization_service
+            sla_actualization_service.record_issuance_turnaround(db, lg)
+        except Exception as sla_err:
+            logger.warning(f"SLA actualization calculation skipped on LG {lg.id}: {sla_err}")
+
     # ── REJECTED / NO_RESPONSE / CANCELLED_BY_USER: close this LG, reopen request ──
     elif reply_type in ("REJECTED", "NO_RESPONSE", "CANCELLED_BY_USER"):
         status_map = {"REJECTED": "BANK_REJECTED", "NO_RESPONSE": "SLA_EXCEEDED", "CANCELLED_BY_USER": "CANCELLED"}

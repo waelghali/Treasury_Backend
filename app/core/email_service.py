@@ -108,19 +108,20 @@ def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSet
 
 # --- Test Domain Filtering ---
 
-TEST_DOMAINS = ("@acmecorp.com", "@example.com", "@email.com", "@test.com")
+TEST_DOMAINS = ("@acmecorp.com", "@example.com", "@email.com", "@test.com", ".test", "test.com")
 
 def process_recipients(recipient_list: Optional[List[str]]) -> List[str]:
     """Filters out dummy/test domain email addresses."""
     if not recipient_list:
         return []
     clean_list = []
-    for email in recipient_list:
-        if not email or not isinstance(email, str):
+    for email_addr in recipient_list:
+        if not email_addr or not isinstance(email_addr, str):
             continue
-        if any(email.lower().strip().endswith(domain) for domain in TEST_DOMAINS):
+        lower_addr = email_addr.lower().strip()
+        if any(lower_addr.endswith(domain) or f"@{domain}" in lower_addr for domain in ("acmecorp.com", "example.com", "email.com", "test.com", "cibegtest.com")) or lower_addr.endswith(".test") or "test@" in lower_addr:
             continue
-        clean_list.append(email)
+        clean_list.append(email_addr)
     return clean_list
 
 

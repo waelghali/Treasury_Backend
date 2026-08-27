@@ -379,6 +379,7 @@ def get_system_health_telemetry(
     import time
     import platform
     from sqlalchemy import text as sql_text
+    from app.core.telemetry_service import get_process_memory_stats, get_system_uptime_stats
 
     # 1. Database Ping & Latency Check
     t0 = time.perf_counter()
@@ -401,11 +402,34 @@ def get_system_health_telemetry(
     except Exception:
         failed_logins_24h = 0
 
-    # 3. Microservice & Engine Matrix
+    # 3. Real-Time Memory & Resource Telemetry
+    mem_stats = get_process_memory_stats()
+    uptime_stats = get_system_uptime_stats(db)
+
+    # 4. Microservice & Engine Matrix
     total_customers = db.query(Customer).filter(Customer.is_deleted == False).count()
     total_users = db.query(User).filter(User.is_deleted == False).count()
 
+    is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+    env_label = "Render Cloud Container (512MB)" if is_render else f"{platform.system()} Host / Enterprise"
+
     services_status = [
+        {
+            "name": "RAM & Container Memory Guard",
+            "category": "Infrastructure",
+            "status": mem_stats["status"],
+            "latency": f"{mem_stats['current_mb']} / {mem_stats['limit_mb']:.0f} MB",
+            "details": mem_stats["status_message"],
+            "badge": mem_stats["badge"]
+        },
+        {
+            "name": "Host Process & Uptime Supervisor",
+            "category": "Runtime",
+            "status": "OPERATIONAL" if uptime_stats["restarts_24h"] == 0 else "RECOVERED",
+            "latency": f"Up {uptime_stats['uptime_human']}",
+            "details": f"Active PID {mem_stats['pid']} on {env_label} ({uptime_stats['restarts_24h']} restart{'s' if uptime_stats['restarts_24h'] != 1 else ''} in 24h)",
+            "badge": "bg-emerald-50 text-emerald-700 border-emerald-200" if uptime_stats["restarts_24h"] == 0 else "bg-amber-50 text-amber-700 border-amber-200"
+        },
         {
             "name": "PostgreSQL Database Engine",
             "category": "Data Layer",
@@ -443,20 +467,30 @@ def get_system_health_telemetry(
             "category": "Background Cron",
             "status": "RUNNING",
             "latency": "Periodic",
-            "details": "Automated LG maturity alerts & daily pulse processor",
+            "details": "Automated LG maturity alerts, email polling & daily pulse processor",
             "badge": "bg-emerald-50 text-emerald-700 border-emerald-200"
         }
     ]
 
+    overall_status = "ALL_SYSTEMS_OPERATIONAL"
+    if db_status != "HEALTHY" or mem_stats["status"] == "CRITICAL":
+        overall_status = "DEGRADED"
+    elif mem_stats["status"] == "WARNING" or uptime_stats["restarts_24h"] > 0:
+        overall_status = "OPERATIONAL_WITH_WARNINGS"
+
     return {
-        "status": "ALL_SYSTEMS_OPERATIONAL" if db_status == "HEALTHY" else "DEGRADED",
-        "uptime_sla": "99.98%",
+        "status": overall_status,
+        "uptime_sla": uptime_stats["uptime_sla"],
+        "uptime_human": uptime_stats["uptime_human"],
+        "restarts_24h": uptime_stats["restarts_24h"],
         "db_latency_ms": db_latency_ms,
         "failed_logins_24h": failed_logins_24h,
         "total_active_tenants": total_customers,
         "total_active_users": total_users,
-        "environment": "Production / Multi-Tenant Enterprise",
+        "environment": env_label,
         "server_time_utc": datetime.utcnow().isoformat(),
+        "memory": mem_stats,
+        "uptime_stats": uptime_stats,
         "services": services_status
     }
 
