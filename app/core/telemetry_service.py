@@ -254,7 +254,14 @@ def record_startup_watchdog(db: Session) -> None:
         is_unexpected_restart = False
         if last_log and last_log.action_type == "SYSTEM_SERVER_STARTUP":
             is_unexpected_restart = True
-            gap_seconds = (datetime.utcnow() - last_log.timestamp).total_seconds()
+            now_utc = datetime.now(timezone.utc)
+            last_ts = last_log.timestamp
+            if last_ts:
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                gap_seconds = (now_utc - last_ts).total_seconds()
+            else:
+                gap_seconds = 999999.0
             
             # Only flag as ungraceful reboot if the previous boot was recent (within 72 hours)
             if gap_seconds < 259200:
