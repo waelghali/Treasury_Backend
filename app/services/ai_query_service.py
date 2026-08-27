@@ -1503,7 +1503,7 @@ class AIQueryAssistantService:
             f"👉 [Go to Dashboard]({nav_base}/dashboard)"
         )
 
-        def process_query(
+    def process_query(
         self,
         db: Session,
         user_question: str = "",
