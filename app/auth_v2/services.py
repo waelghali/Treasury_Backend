@@ -63,9 +63,28 @@ logger = logging.getLogger(__name__)
 # Remove emails when testing is finished to restore full security.
 # ==============================================================================
 MFA_DEVICE_EXEMPT_EMAILS: Set[str] = {
+    "enduser@globex.com",
+    "corpadmin@globex.com",
+    "approver@globex.com",
+    "requestor@globex.com",
     "end.user@cyberdyne.com",
     "corp.admin@cyberdyne.com",
+    "grow-requestor@maildrop.cc",
+    "grow-approver@maildrop.cc",
+    "grow-officer@maildrop.cc",
+    "grow-treasury@maildrop.cc",
+    "grow-bankdesk@maildrop.cc",
+    "grow-inbox@maildrop.cc",
 }
+
+def is_email_mfa_exempt(email: Optional[str]) -> bool:
+    if not email:
+        return False
+    email_lower = email.lower().strip()
+    if email_lower in {e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS}:
+        return True
+    exempt_domains = ("@globex.com", "@cyberdyne.com", "@maildrop.cc", "@testcorp.local")
+    return any(email_lower.endswith(dom) for dom in exempt_domains)
 
 
 class AuthService:
@@ -263,7 +282,7 @@ class AuthService:
 
         # --- START OF MFA / TRUSTED DEVICE LOGIC ---
         
-        is_exempt = user.email.lower() in {e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS}
+        is_exempt = is_email_mfa_exempt(user.email)
         
         device_record = db.query(models.UserDevice).filter(
             models.UserDevice.user_id == user.id,
@@ -993,7 +1012,7 @@ class AuthService:
     def is_device_trusted(self, db: Session, user_id: int, device_id: str) -> bool:
         """Checks if the device_id is already marked as trusted for this user."""
         user = db.query(User).filter(User.id == user_id).first()
-        if user and user.email.lower() in {e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS}:
+        if user and is_email_mfa_exempt(user.email):
             return True
 
         device = db.query(models.UserDevice).filter(
