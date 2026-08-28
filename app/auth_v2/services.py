@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 # Remove emails when testing is finished to restore full security.
 # ==============================================================================
 MFA_DEVICE_EXEMPT_EMAILS: Set[str] = {
+    "system.owner@example.com",
     "enduser@globex.com",
     "corpadmin@globex.com",
     "approver@globex.com",
