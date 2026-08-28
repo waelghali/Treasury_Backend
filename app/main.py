@@ -102,11 +102,10 @@ app = FastAPI(
 def configure_app_instance(fastapi_app: FastAPI):
     # --- Middleware Configuration ---
     origins = [
-        "https://www.growbusinessdevelopment.com/",
         "https://www.growbusinessdevelopment.com",
-        "https://treasury-frontend-46hip9jex-waels-projects-e59ad1d5.vercel.app/",
-        "https://treasury-frontend-46hip9jex-waels-projects-e59ad1d5.vercel.app",
-        "https://treasury-frontend-nu.vercel.app/",
+        "https://growbusinessdevelopment.com",
+        "https://staging.growbusinessdevelopment.com",
+        "https://demo.growbusinessdevelopment.com",
         "https://treasury-frontend-nu.vercel.app",
         "http://localhost",
         "http://localhost:3000",
@@ -117,6 +116,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
+        allow_origin_regex=r"^https:\/\/([a-zA-Z0-9_-]+\.)*(onrender\.com|vercel\.app|growbusinessdevelopment\.com)$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
