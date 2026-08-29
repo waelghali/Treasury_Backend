@@ -497,78 +497,114 @@ async def record_handover(
 
 # --- Helper: Send requestor status notification ---
 def _send_requestor_status_notification(db, background_tasks, request, event_type, lg=None):
-    """Send email to requestor about status change. Covers both approval and post-issuance events."""
+    """Send email to requestor about status change using unified SaaS email template style."""
     from app.core.email_service import send_email, get_customer_email_settings
+    from app.services.unified_email_builder import build_transaction_email_html
+    from app.services.issuance_notifications import _get_customer_name, get_common_communication_emails
+    from app.core.routing import get_frontend_base_url
     import os
 
-    # Derive customer_id from the request or lg object
+    if not request or not getattr(request, 'requestor_email', None):
+        return
+
     customer_id = getattr(request, 'customer_id', None) or (getattr(lg, 'customer_id', None) if lg else None)
     if customer_id:
         email_settings, _ = get_customer_email_settings(db, customer_id)
+        customer_name = _get_customer_name(db, customer_id)
+        cc_emails = get_common_communication_emails(db, customer_id)
     else:
         from app.core.email_service import get_global_email_settings
         email_settings = get_global_email_settings()
-    from app.core.routing import get_frontend_base_url
+        customer_name = "Grow Treasury"
+        cc_emails = []
+
+    if getattr(request, 'manager_email', None) and request.manager_email not in cc_emails:
+        cc_emails.append(request.manager_email)
+
     frontend_url = get_frontend_base_url()
 
-    # Bank reply / post-issuance events (require lg)
-    bank_events = {}
-    if lg:
-        bank_events = {
-            "LG_ISSUED": {"emoji": "✅", "title": "Your LG Has Been Issued!", "color": "#10b981",
-                           "body": f"The bank has issued your Letter of Guarantee.<br><strong>LG Number:</strong> {lg.bank_lg_number or 'Pending'}"},
-            "INQUIRY": {"emoji": "❓", "title": "Bank Inquiry on Your LG Request", "color": "#f59e0b",
-                         "body": f"The bank has requested additional information.<br><strong>Details:</strong> {lg.bank_reply_notes or 'Please contact your treasury team.'}"},
-            "REJECTED": {"emoji": "❌", "title": "LG Issuance Request Declined", "color": "#ef4444",
-                          "body": f"Unfortunately, the bank has declined this issuance request.<br><strong>Reason:</strong> {lg.bank_reply_notes or 'No reason provided.'}"},
-            "NO_RESPONSE": {"emoji": "⏰", "title": "Bank SLA Exceeded", "color": "#6b7280",
-                             "body": "The bank has not responded within the expected timeframe. Your treasury team is following up."},
-            "VERIFIED": {"emoji": "🎉", "title": "LG Verified & Confirmed", "color": "#059669",
-                          "body": f"Your Letter of Guarantee has been verified and confirmed.<br><strong>LG Number:</strong> {lg.bank_lg_number or 'N/A'}"},
+    # Handover Ready / Verified event
+    if event_type in ("VERIFIED", "HANDOVER_READY", "LG_ISSUED") and lg:
+        subject = f"🎉 Ready for Handover: LG {lg.lg_ref_number or request.serial_number} is Ready"
+        key_vals = {
+            "Request Serial": request.serial_number,
+            "LG Reference": lg.lg_ref_number or "—",
+            "Bank LG Number": lg.bank_lg_number or "Issued by Bank",
+            "Issuing Bank": lg.bank_name or (lg.bank.name if getattr(lg, 'bank', None) else "—"),
+            "Beneficiary": request.beneficiary_name or "—",
+            "Amount": f"{lg.currency_code or ''} {float(lg.current_amount or 0):,.2f}",
+            "Expiry Date": str(lg.expiry_date) if lg.expiry_date else "—",
         }
-
-    # Approval lifecycle events (no lg needed)
-    approval_events = {
-        "APPROVED_STEP": {"emoji": "👍", "title": "Your LG Request Advanced", "color": "#3b82f6",
-                           "body": "Your issuance request has passed an approval step and is moving to the next reviewer."},
-        "APPROVED_INTERNAL": {"emoji": "✅", "title": "Your LG Request Has Been Fully Approved!", "color": "#10b981",
-                               "body": "Great news! Your issuance request has been fully approved and is now ready for issuance execution by the treasury team."},
-        "REQUEST_REJECTED": {"emoji": "❌", "title": "Your LG Request Has Been Rejected", "color": "#ef4444",
-                              "body": f"Your issuance request has been rejected by an approver.<br><strong>Notes:</strong> {getattr(request, 'revision_notes', '') or 'Please contact the treasury team for details.'}"},
-        "REVISION_REQUIRED": {"emoji": "🔄", "title": "Your LG Request Needs Revision", "color": "#f59e0b",
-                                   "body": f"An approver has returned your request for revision. Please review and re-submit.<br>"
-                                           f"<strong>Notes:</strong> {getattr(request, 'revision_notes', '') or 'No specific notes provided.'}<br><br>"
-                                           f'<a href="{frontend_url}/portal/issuance" style="padding: 10px 25px; background: #f59e0b; color: #fff; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Visit Portal to Edit &amp; Resubmit</a>'},
-    }
-
-    all_events = {**bank_events, **approval_events}
-    status_info = all_events.get(event_type)
-
-    if not status_info:
+        body = build_transaction_email_html(
+            customer_name=customer_name,
+            title="🎉 Letter of Guarantee Ready for Handover",
+            transaction_ref=lg.lg_ref_number or request.serial_number,
+            transaction_type="LG Issuance",
+            key_value_dict=key_vals,
+            summary_text="Great news! Your requested Letter of Guarantee has been issued by the bank and verified by the treasury team. The physical guarantee document is now ready for collection / handover.",
+            cta_text="View in Portal",
+            cta_url=f"{frontend_url}/portal/issuance",
+            recipient_name=request.requestor_name or "Requestor"
+        )
+    elif event_type == "APPROVED_INTERNAL":
+        subject = f"✅ Approved: LG Request {request.serial_number} Fully Approved"
+        key_vals = {
+            "Request Serial": request.serial_number,
+            "Beneficiary": request.beneficiary_name or "—",
+            "Amount": f"{request.currency.code if getattr(request, 'currency', None) else ''} {float(request.amount or 0):,.2f}",
+        }
+        body = build_transaction_email_html(
+            customer_name=customer_name,
+            title="✅ LG Request Fully Approved",
+            transaction_ref=request.serial_number,
+            transaction_type="LG Issuance Request",
+            key_value_dict=key_vals,
+            summary_text="Your LG issuance request has completed internal approvals and is now in the queue for issuance with the bank.",
+            cta_text="View Request Status",
+            cta_url=f"{frontend_url}/portal/issuance",
+            recipient_name=request.requestor_name or "Requestor"
+        )
+    elif event_type == "REVISION_REQUIRED":
+        subject = f"🔄 Action Required: Revision Requested for LG {request.serial_number}"
+        key_vals = {
+            "Request Serial": request.serial_number,
+            "Beneficiary": request.beneficiary_name or "—",
+            "Reviewer Notes": getattr(request, 'revision_notes', '') or "Please review details and update.",
+        }
+        body = build_transaction_email_html(
+            customer_name=customer_name,
+            title="🔄 Revision Requested",
+            transaction_ref=request.serial_number,
+            transaction_type="LG Issuance Request",
+            key_value_dict=key_vals,
+            summary_text="An approver has requested revisions on your LG request. Please update and re-submit.",
+            cta_text="Edit & Resubmit",
+            cta_url=f"{frontend_url}/portal/issuance",
+            recipient_name=request.requestor_name or "Requestor"
+        )
+    elif event_type == "REQUEST_REJECTED":
+        subject = f"❌ Declined: LG Request {request.serial_number}"
+        key_vals = {
+            "Request Serial": request.serial_number,
+            "Beneficiary": request.beneficiary_name or "—",
+            "Reason": getattr(request, 'revision_notes', '') or "Declined during review.",
+        }
+        body = build_transaction_email_html(
+            customer_name=customer_name,
+            title="❌ Request Declined",
+            transaction_ref=request.serial_number,
+            transaction_type="LG Issuance Request",
+            key_value_dict=key_vals,
+            summary_text="Your LG issuance request has been declined. Please contact your treasury team for further details.",
+            cta_text="View Portal",
+            cta_url=f"{frontend_url}/portal/issuance",
+            recipient_name=request.requestor_name or "Requestor"
+        )
+    else:
         return
 
-    subject = f"{status_info['emoji']} {status_info['title']} — {request.serial_number}"
-    body = f"""
-    <html>
-    <body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f5f5f5; padding: 20px;">
-        <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
-            <h2 style="color: {status_info['color']}; margin-top: 0;">{status_info['emoji']} {status_info['title']}</h2>
-            <div style="background: #f8fafc; border-left: 4px solid {status_info['color']}; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr><td style="padding: 4px 0; color: #666;">Request:</td><td style="padding: 4px 0; font-weight: bold;">{request.serial_number}</td></tr>
-                    <tr><td style="padding: 4px 0; color: #666;">Beneficiary:</td><td style="padding: 4px 0;">{request.beneficiary_name}</td></tr>
-                    <tr><td style="padding: 4px 0; color: #666;">Amount:</td><td style="padding: 4px 0; font-weight: bold;">{request.amount}</td></tr>
-                </table>
-            </div>
-            <p>{status_info['body']}</p>
-            <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;" />
-            <p style="font-size: 12px; color: #999;">This is an automated notification from your Treasury LG Issuance system.</p>
-        </div>
-    </body>
-    </html>
-    """
     background_tasks.add_task(
-        send_email, db, [request.requestor_email], subject, body, {}, email_settings
+        send_email, db, [request.requestor_email], subject, body, {}, email_settings, cc_emails=cc_emails
     )
 
 
@@ -645,6 +681,12 @@ async def extract_lg_copy(
                 file_path = os.path.join(upload_dir, bank_lg_copy_display_name)
                 with open(file_path, "wb") as f_out:
                     f_out.write(file_bytes)
+
+            # Deduplicate: Remove previous BANK_LG_COPY documents for this request so only the latest is kept
+            db.query(IssuanceRequestDocument).filter(
+                IssuanceRequestDocument.request_id == lg.request_id,
+                IssuanceRequestDocument.document_type == "BANK_LG_COPY"
+            ).delete()
 
             doc = IssuanceRequestDocument(
                 request_id=lg.request_id,
