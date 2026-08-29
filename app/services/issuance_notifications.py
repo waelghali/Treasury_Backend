@@ -65,7 +65,8 @@ def _get_user_email(db: Session, user_id: Optional[int]) -> Optional[str]:
 
 
 def _base_url() -> str:
-    return os.getenv("FRONTEND_URL", "http://localhost:3000")
+    from app.core.routing import get_frontend_base_url
+    return get_frontend_base_url()
 
 
 async def notify_approvers_of_submission(

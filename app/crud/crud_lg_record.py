@@ -13,6 +13,7 @@ import pytz # Ensure pytz is imported at the top of crud_lg_record.py if not alr
 EEST_TIMEZONE = pytz.timezone('Africa/Cairo') # Define or import EEST_TIMEZONE
 
 from app.crud.crud import CRUDBase, log_action
+from app.core.routing import get_frontend_base_url
 import app.models as models
 from app.models import (
     Customer, CustomerEmailSetting, CustomerEntity, InternalOwnerContact,
@@ -789,7 +790,7 @@ class CRUDLGRecord(CRUDBase):
             },
             summary_text=f"An official LG Extension instruction has been generated and issued to {updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else 'the bank'}.",
             cta_text="View LG in System",
-            cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+            cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
             recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
         )
 
@@ -1086,7 +1087,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An official LG Release instruction has been generated to release LG #{lg_record.lg_number} from further claims.",
                 cta_text="View LG in System",
-                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                 recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -1390,7 +1391,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An official LG Liquidation instruction ({liquidation_type.capitalize()}) has been issued for LG #{lg_record.lg_number}.",
                 cta_text="View LG in System",
-                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                 recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -1632,7 +1633,7 @@ class CRUDLGRecord(CRUDBase):
                     },
                     summary_text=f"An official instruction to decrease the amount of LG #{lg_record.lg_number} has been generated.",
                     cta_text="View LG in System",
-                    cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                     recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
                 )
 
@@ -1894,7 +1895,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An official instruction to activate non-operative LG #{db_lg_record.lg_number} has been generated.",
                 cta_text="View LG in System",
-                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                 recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -2167,7 +2168,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An amendment instruction has been recorded and issued for LG #{updated_lg_record.lg_number}.",
                 cta_text="View LG in System",
-                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                 recipient_name=updated_lg_record.internal_owner_contact.email if updated_lg_record.internal_owner_contact else "Internal Owner"
             )
 

@@ -7,9 +7,45 @@ import os
 from typing import Optional
 
 
-def get_frontend_base_url() -> str:
-    """Returns the configured frontend base URL from environment or default."""
-    return os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+def get_frontend_base_url(request: Optional[object] = None) -> str:
+    """
+    Returns the canonical frontend base URL for the active environment.
+    Priority:
+    1. Origin header from incoming request (e.g. https://staging.growbusinessdevelopment.com)
+    2. Referer header from incoming request
+    3. X-Forwarded-Host or Host header from incoming request
+    4. FRONTEND_URL environment variable
+    5. Automatic environment detection (Staging DB or staging environment variables)
+    6. Default: http://localhost:3000
+    """
+    if request and hasattr(request, "headers"):
+        origin = request.headers.get("origin")
+        if origin and origin.startswith("http"):
+            return origin.rstrip("/")
+        
+        referer = request.headers.get("referer")
+        if referer and referer.startswith("http"):
+            from urllib.parse import urlparse
+            parsed = urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if host:
+            is_ssl = "growbusinessdevelopment.com" in str(host) or "render.com" in str(host) or "vercel.app" in str(host)
+            proto = request.headers.get("x-forwarded-proto", "https" if is_ssl else "http")
+            return f"{proto}://{host}".rstrip("/")
+
+    env_val = os.getenv("FRONTEND_URL")
+    if env_val and env_val.strip():
+        return env_val.rstrip("/")
+
+    # Detect staging environment from DB URL or environment variables
+    db_url = os.getenv("DATABASE_URL", "").lower()
+    if "staging" in db_url or os.getenv("ENVIRONMENT") == "staging" or os.getenv("FLASK_ENV") == "staging":
+        return "https://staging.growbusinessdevelopment.com"
+
+    return "http://localhost:3000"
 
 
 def get_entity_link(entity_type: str, entity_id: Optional[int] = None, role: str = "end_user") -> str:

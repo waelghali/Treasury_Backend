@@ -3137,14 +3137,15 @@ async def approve_trial_registration(
         modules_text = " & ".join(module_names)
 
         # Step 3: Send approval email
-        email_settings = get_global_email_settings()
+        from app.core.routing import get_frontend_base_url
+        base_url = get_frontend_base_url()
         subject = f"Your {modules_text} Free Trial is Ready!"
         body = f"""
             <html><body>
                 <p>Hello {registration.contact_admin_name},</p>
                 <p>We're excited to confirm that your free trial account for <strong>{modules_text}</strong> is now active!</p>
                 <p>To get started, please use the following temporary password to log in: <strong>{generated_password}</strong>. We highly recommend that you change this password immediately after your first login.</p>
-                <p><strong>Login Link:</strong> <a href="{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login">{os.getenv('FRONTEND_URL', 'https://www.growbusinessdevelopment.com')}/login</a></p>
+                <p><strong>Login Link:</strong> <a href="{base_url}/login">{base_url}/login</a></p>
                 <p>Your free trial will be active for {subscription_plan.duration_months} months, expiring on {db_customer.end_date.strftime('%Y-%m-%d')}.</p>
                 <p><strong>Plan:</strong> {subscription_plan.name}</p>
                 <p><strong>Quick Start Guide:</strong> Please find a quick-start guide attached to help you get started with the platform's core features.</p>

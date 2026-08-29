@@ -202,6 +202,7 @@ def get_my_approval_history(
 async def submit_request_for_approval(
     request_id: int,
     background_tasks: BackgroundTasks,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_treasury_context)
 ):
@@ -215,6 +216,7 @@ async def submit_request_for_approval(
         from app.core.email_service import send_email, get_customer_email_settings
         from app.services.issuance_notifications import _get_user_emails
         from app.models import User
+        from app.core.routing import get_frontend_base_url
         import os
         
         email_settings, _ = get_customer_email_settings(db, result.customer_id)
@@ -222,7 +224,7 @@ async def submit_request_for_approval(
         currency = result.currency.iso_code if result.currency else "N/A"
         approver_ids = [int(uid) for uid in result.pending_approver_users]
         approver_emails = _get_user_emails(db, approver_ids)
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        frontend_url = get_frontend_base_url(request)
         
         print(f"[DEBUG EMAIL] internal_submit: approver_ids={approver_ids}, emails={approver_emails}, host={email_settings.smtp_host}")
         

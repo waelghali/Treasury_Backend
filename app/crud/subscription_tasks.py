@@ -14,6 +14,7 @@ from app.constants import (
 )
 from app.core.email_service import get_customer_email_settings, send_email, EmailSettings, get_global_email_settings
 from app.services.unified_email_builder import build_alert_email_html, build_transaction_email_html
+from app.core.routing import get_frontend_base_url
 
 import pytz
 
@@ -86,7 +87,7 @@ async def _send_subscription_notification(
             },
             summary_text=body,
             cta_text="Manage Subscription",
-            cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/subscription",
+            cta_url=f"{get_frontend_base_url()}/corporate-admin/subscription",
             recipient_name="Corporate Administrator"
         )
 

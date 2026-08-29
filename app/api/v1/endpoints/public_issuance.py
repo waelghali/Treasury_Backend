@@ -2,7 +2,7 @@
 
 from typing import Any, Optional
 from datetime import date
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, UploadFile, File, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, UploadFile, File, Body, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel
@@ -248,6 +248,7 @@ async def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
 def generate_invite_link(
     payload: InviteRequest,
     background_tasks: BackgroundTasks,
+    request: Request = None,
     db: Session = Depends(get_db)
 ):
     email = payload.email
@@ -278,7 +279,8 @@ def generate_invite_link(
     raw_token = f"{customer.id}|{department}|{email}|{expiry}"
     encrypted_token = encrypt_data(raw_token)
     
-    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    from app.core.routing import get_frontend_base_url
+    frontend_url = get_frontend_base_url(request)
     invite_link = f"{frontend_url}/public-issuance/form?token={encrypted_token}"
     
     # --- Send invite email (matching corporate_admin.py create_user pattern exactly) ---
@@ -322,6 +324,7 @@ def public_submit_request(
     request_in: IssuanceRequestCreate,
     token: str = Query(...),
     background_tasks: BackgroundTasks = None,
+    request: Request = None,
     db: Session = Depends(get_db)
 ):
     access_data = verify_portal_token(token)
@@ -331,14 +334,14 @@ def public_submit_request(
     if not request_in.department:
         request_in.department = access_data.get("department", "General")
 
-    request = crud_issuance_request.create_request(
+    request_record = crud_issuance_request.create_request(
         db, obj_in=request_in, customer_id=customer_id, user_id=None
     )
     
     # Use unified submit flow: creates V1 snapshot + runs approval matrix
     from app.services.issuance_service import issuance_service
     submitted_request = issuance_service.submit_for_approval(
-        db, request.id, user_id=None
+        db, request_record.id, user_id=None
     )
     
     print(f"[DEBUG EMAIL] public_submit: status={submitted_request.status}, approvers={submitted_request.pending_approver_users}, bg_tasks={background_tasks is not None}")
@@ -347,12 +350,13 @@ def public_submit_request(
     if background_tasks and submitted_request.status == "PENDING_APPROVAL" and submitted_request.pending_approver_users:
         from app.core.email_service import send_email, get_global_email_settings
         from app.services.issuance_notifications import _get_user_emails
+        from app.core.routing import get_frontend_base_url
         
         email_settings = get_global_email_settings()
         approver_ids = [int(uid) for uid in submitted_request.pending_approver_users]
         approver_emails = _get_user_emails(db, approver_ids)
         currency = submitted_request.currency.iso_code if submitted_request.currency else "N/A"
-        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+        frontend_url = get_frontend_base_url(request)
         
         print(f"[DEBUG EMAIL] public_submit: approver_ids={approver_ids}, emails={approver_emails}, host={email_settings.smtp_host}")
         
@@ -525,6 +529,7 @@ def public_submit_existing_draft(
     request_id: int,
     token: str = Query(...),
     background_tasks: BackgroundTasks = None,
+    request_obj: Request = None,
     db: Session = Depends(get_db)
 ):
     """Public: Submit an existing DRAFT request for approval (instead of creating a new one)."""
@@ -534,35 +539,36 @@ def public_submit_existing_draft(
     customer_id = access_data["customer_id"]
     email = access_data.get("email")
 
-    request = db.query(IssuanceRequest).filter(
+    request_rec = db.query(IssuanceRequest).filter(
         IssuanceRequest.id == request_id,
         IssuanceRequest.customer_id == customer_id,
         IssuanceRequest.is_deleted == False,
     ).first()
 
-    if not request:
+    if not request_rec:
         raise HTTPException(status_code=404, detail="Request not found")
-    if request.status not in ("DRAFT", "REVISION_REQUIRED"):
+    if request_rec.status not in ("DRAFT", "REVISION_REQUIRED"):
         raise HTTPException(status_code=400, detail="Only DRAFT or REVISION_REQUIRED requests can be submitted")
-    if email and request.requestor_email and request.requestor_email.lower() != email.lower():
+    if email and request_rec.requestor_email and request_rec.requestor_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Not authorized to submit this request")
 
     # Use unified submit flow: creates V1 snapshot + runs approval matrix
     from app.services.issuance_service import issuance_service
     submitted_request = issuance_service.submit_for_approval(
-        db, request.id, user_id=None
+        db, request_rec.id, user_id=None
     )
 
     # --- Send email to approvers ---
     if background_tasks and submitted_request.status == "PENDING_APPROVAL" and submitted_request.pending_approver_users:
         from app.core.email_service import send_email, get_global_email_settings
         from app.services.issuance_notifications import _get_user_emails
+        from app.core.routing import get_frontend_base_url
 
         email_settings = get_global_email_settings()
         approver_ids = [int(uid) for uid in submitted_request.pending_approver_users]
         approver_emails = _get_user_emails(db, approver_ids)
         currency = submitted_request.currency.iso_code if submitted_request.currency else "N/A"
-        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+        frontend_url = get_frontend_base_url(request_obj)
 
         if approver_emails:
             subject = f"ACTION REQUIRED: LG Request {submitted_request.serial_number} Awaiting Approval"

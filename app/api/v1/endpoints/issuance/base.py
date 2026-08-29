@@ -433,7 +433,8 @@ async def record_handover(
     # --- Send email notifications ---
     orig_request = db.query(IssuanceRequest).get(lg.request_id) if lg.request_id else None
     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
-    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    from app.core.routing import get_frontend_base_url
+    frontend_url = get_frontend_base_url()
 
     # Collect all email recipients
     email_recipients = set()
@@ -507,7 +508,8 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
     else:
         from app.core.email_service import get_global_email_settings
         email_settings = get_global_email_settings()
-    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    from app.core.routing import get_frontend_base_url
+    frontend_url = get_frontend_base_url()
 
     # Bank reply / post-issuance events (require lg)
     bank_events = {}

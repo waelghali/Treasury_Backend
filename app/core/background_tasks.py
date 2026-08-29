@@ -30,6 +30,7 @@ from app.services.unified_email_builder import (
     build_alert_email_html,
     build_transaction_email_html
 )
+from app.core.routing import get_frontend_base_url
 
 from app.crud.crud import (
     crud_customer,
@@ -191,7 +192,7 @@ async def run_daily_undelivered_instructions_report(db: Session):
                 message=f"The following {len(undelivered)} LG instruction(s) were issued between {start_days} and {stop_days} days ago but have not yet been marked as delivered to the issuing bank. Please review and update custody status.",
                 details_table_html=table_html,
                 cta_text="View Action Center",
-                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/action-center",
+                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/action-center",
                 recipient_name="Corporate Administrator"
             )
 
@@ -309,7 +310,7 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
         message=f"Some configuration settings for {customer.name} have been automatically adjusted to comply with updated global system policies.",
         details_table_html=table_html,
         cta_text="View Settings",
-        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/settings",
+        cta_url=f"{get_frontend_base_url()}/corporate-admin/settings",
         recipient_name="Corporate Administrator"
     )
 
@@ -427,7 +428,7 @@ async def run_daily_print_reminders(db: Session):
                     },
                     summary_text=f"An approved {req.action_type.replace('_', ' ').title()} instruction for LG #{inst.lg_record.lg_number if inst.lg_record else 'N/A'} was approved {days_old} days ago but has not yet been marked as printed for physical bank delivery.",
                     cta_text="View Issued LGs",
-                    cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                     recipient_name=req.maker_user.email.split('@')[0]
                 )
 
@@ -589,7 +590,7 @@ async def _send_sub_notification(db: Session, customer: models.Customer, type_en
         },
         summary_text=body_text,
         cta_text="Manage Subscription",
-        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/subscription",
+        cta_url=f"{get_frontend_base_url()}/corporate-admin/subscription",
         recipient_name="Corporate Administrator"
     )
 
@@ -1515,7 +1516,7 @@ async def run_daily_sla_breach_alerts(db: Session):
                     message=f"The following LG issuance request(s) have exceeded the agreed SLA with the bank and are still pending a response. Please follow up with the respective bank(s).",
                     details_table_html=table_html,
                     cta_text="Review Pending Requests",
-                    cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/issuance/requests"
+                    cta_url=f"{get_frontend_base_url()}/issuance/requests"
                 )
 
                 await send_email(db, recipient_emails, subject, body, {}, email_settings)
@@ -1758,7 +1759,7 @@ async def _send_reservation_notification(
                 alert_type="warning",
                 message=message,
                 cta_text="View Request Details",
-                cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/requests",
+                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/requests",
                 recipient_name="Treasury User"
             )
 
@@ -1910,7 +1911,7 @@ async def run_daily_maintenance_delivery_reminders(db: Session):
                         },
                         summary_text=f"A maintenance letter generated {days_old} days ago has not yet been marked as delivered to the bank. Please print and deliver the letter to the bank, then mark it as delivered in the system.",
                         cta_text="View Issued LGs",
-                        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs",
+                        cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
                         recipient_name="Corporate Administrator"
                     )
 
@@ -2101,7 +2102,7 @@ async def run_daily_reconciliation_reminders(db: Session):
                         alert_type="warning",
                         message=f"{message} Please log in to the Treasury Management Platform and upload the latest bank position reports to complete the reconciliation process.",
                         cta_text="Perform Position Reconciliation",
-                        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/issuance/reconciliation"
+                        cta_url=f"{get_frontend_base_url()}/issuance/reconciliation"
                     )
                     await send_email(
                         db=db,
@@ -2267,7 +2268,7 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
                         message=f"The <strong>{action.action_type.replace('_', ' ')}</strong> letter for LG <strong>{ref}</strong> was issued <strong>{days_old} days ago</strong> but has not been printed yet. {escalation_msg}",
                         details_table_html=table_details,
                         cta_text="View in Action Center",
-                        cta_url=f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/corporate-admin/issuance/issued-lgs"
+                        cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs"
                     )
 
                     sent = await send_email(

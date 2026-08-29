@@ -213,7 +213,8 @@ def create_rfq(
         # Trigger immediate email dispatch if not requiring approval
         if not requires_approval:
             email_settings = get_global_email_settings()
-            base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+            from app.core.routing import get_frontend_base_url
+            base_url = get_frontend_base_url()
             
             for assignment in assignments:
                 q_bank_id = assignment.get("quotation_bank_id")
@@ -804,7 +805,8 @@ async def resend_rfq_bank_invite(
         raise HTTPException(status_code=400, detail="No email address configured for this bank")
         
     email_settings = get_global_email_settings()
-    base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    from app.core.routing import get_frontend_base_url
+    base_url = get_frontend_base_url()
     bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]
     link = f"{base_url}/public-quotation/{assignment.token}"
     

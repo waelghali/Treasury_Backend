@@ -2016,9 +2016,10 @@ def approve_quotation(
     
     # Use Customer Specific Email Settings
     from app.core.email_service import get_customer_email_settings
+    from app.core.routing import get_frontend_base_url
     email_settings, source = get_customer_email_settings(db, rfq.customer_id)
     
-    base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    base_url = get_frontend_base_url()
     
     # Standard Bank Branding
     customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
@@ -2177,7 +2178,8 @@ def approve_quotation_request(
     # Dispatch Emails if Approved
     if approval_in.status == "PENDING":
         email_settings = get_global_email_settings()
-        base_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        from app.core.routing import get_frontend_base_url
+        base_url = get_frontend_base_url()
         
         assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.quotation_request_id == rfq.id).all()
         for assignment in assignments:
