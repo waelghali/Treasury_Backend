@@ -326,6 +326,69 @@ def create_issuance_request_docs():
                        onLaterPages=lambda c, d: add_page_decorations(c, d, "TENDER SPECIFICATIONS - NREA"))
     print(f"[CREATED] {f3}")
 
+    # Request 4: Issued Bank LG Scanned Copy (Post-Issuance Upload & Registration)
+    f4 = os.path.join(ISSUANCE_DIR, "Issued_Bank_LG_Scan_ENBD_Performance_Guarantee.pdf")
+    doc4 = SimpleDocTemplate(f4, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=40)
+    story4 = []
+    story4.append(Paragraph("EMIRATES NBD EGYPT S.A.E.", title_style))
+    story4.append(Paragraph("OFFICIAL LETTER OF GUARANTEE — FINAL PERFORMANCE BOND", subtitle_style))
+    story4.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#1e3a8a"), spaceAfter=8))
+
+    today_str = datetime.date.today().strftime("%d-%b-%Y")
+    exp_str = (datetime.date.today() + datetime.timedelta(days=365)).strftime("%d-%b-%Y")
+
+    meta_lg = [
+        [Paragraph("<b>Bank Guarantee Ref:</b>", cell_style), Paragraph("<b>ENBD-LG-2026-001</b>", cell_bold),
+         Paragraph("<b>Date of Issue:</b>", cell_style), Paragraph(today_str, cell_style)],
+        [Paragraph("<b>Beneficiary:</b>", cell_style), Paragraph("National Authority for Tunnels (NAT)", cell_style),
+         Paragraph("<b>Date of Expiry:</b>", cell_style), Paragraph(exp_str, cell_style)],
+        [Paragraph("<b>Applicant / Contractor:</b>", cell_style), Paragraph("Your Company (Delta / Apex / Horizon)", cell_style),
+         Paragraph("<b>Guarantee Amount:</b>", cell_style), Paragraph("<b>EGP 3,500,000.00</b>", cell_bold)],
+        [Paragraph("<b>Underlying Contract:</b>", cell_style), Paragraph("NAT-MONO-2026-PKG-B", cell_style),
+         Paragraph("<b>Project:</b>", cell_style), Paragraph("New Capital Monorail - Package B", cell_style)],
+    ]
+    t_lg = Table(meta_lg, colWidths=[120, 140, 115, 148])
+    t_lg.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#f8fafc")),
+        ('BOX', (0,0), (-1,-1), 1, colors.HexColor("#1e3a8a")),
+        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")),
+        ('TOPPADDING', (0,0), (-1,-1), 3.5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3.5),
+        ('LEFTPADDING', (0,0), (-1,-1), 6),
+        ('RIGHTPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story4.append(t_lg)
+    story4.append(Spacer(1, 10))
+
+    story4.append(Paragraph("TERMS OF GUARANTEE", h2_style))
+    story4.append(Paragraph(
+        "We hereby issue this irrevocable, unconditional Letter of Guarantee No. <b>ENBD-LG-2026-001</b> in your favor for an amount not exceeding <b>EGP 3,500,000.00 (Three Million Five Hundred Thousand Egyptian Pounds)</b> to secure the performance of the Applicant under Contract Ref: <b>NAT-MONO-2026-PKG-B</b>.",
+        body_style
+    ))
+    story4.append(Paragraph(
+        "We undertake to pay you immediately upon your first written demand, without cavil or argument and notwithstanding any contestation by the Applicant, any sum or sums within the limit of the guarantee amount, against your formal written declaration certifying default.",
+        body_style
+    ))
+    story4.append(Paragraph(
+        "This Letter of Guarantee is valid until <b>" + exp_str + "</b> and shall become null and void after said date whether the original document is returned to us or not.",
+        body_style
+    ))
+    story4.append(Spacer(1, 15))
+
+    sig_enbd = [
+        [Paragraph("<b>AUTHORIZED SIGNATURE (A)</b>", cell_bold), Paragraph("<b>AUTHORIZED SIGNATURE (B)</b>", cell_bold)],
+        [Spacer(1, 18), Spacer(1, 18)],
+        [Paragraph("____________________________<br/>Manager, Trade Operations<br/>Emirates NBD Egypt", cell_style),
+         Paragraph("____________________________<br/>Senior Director, Trade Finance<br/>Emirates NBD Egypt", cell_style)]
+    ]
+    st_sig = Table(sig_enbd, colWidths=[260, 263])
+    st_sig.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP')]))
+    story4.append(st_sig)
+
+    doc4.build(story4, onFirstPage=lambda c, d: add_page_decorations(c, d, "ISSUED LETTER OF GUARANTEE - ENBD"),
+                       onLaterPages=lambda c, d: add_page_decorations(c, d, "ISSUED LETTER OF GUARANTEE - ENBD"))
+    print(f"[CREATED] {f4}")
+
 # ==============================================================================
 # 3. CUSTODY MODULE: 4 Sample LG Scans
 # ==============================================================================
@@ -738,8 +801,18 @@ def main():
     create_custody_lg_scans()
     create_reconciliation_excel_statements()
     create_personalized_guides()
+
+    # Sync to external assets folder outside Git
+    ext_dest = r"C:\Grow_Project_External_Assets\test_documents_and_guides\test_assets"
+    import shutil
+    if os.path.exists(BASE_DIR):
+        if os.path.exists(ext_dest):
+            shutil.rmtree(ext_dest)
+        shutil.copytree(BASE_DIR, ext_dest)
+        print(f"[SYNCED] All assets mirrored to {ext_dest}")
+
     print("\n" + "=" * 60)
-    print("ALL TEST ASSETS & GUIDES SUCCESSFULLY UPDATED!")
+    print("ALL TEST ASSETS & GUIDES SUCCESSFULLY UPDATED & SYNCED OUTSIDE GIT!")
     print("=" * 60)
 
 if __name__ == "__main__":

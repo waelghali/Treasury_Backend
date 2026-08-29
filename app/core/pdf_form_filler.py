@@ -510,8 +510,20 @@ def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PR
     lg_type_name = ""
     if hasattr(request, 'lg_type') and request.lg_type:
         lg_type_name = (request.lg_type.name or "").strip()
-        data["lg_type"] = lg_type_name
-        data["guarantee_type"] = lg_type_name
+    elif db and getattr(request, 'lg_type_id', None):
+        try:
+            from app.models.models import LGType
+            lgt = db.query(LGType).filter(LGType.id == request.lg_type_id).first()
+            if lgt:
+                lg_type_name = (lgt.name or "").strip()
+        except Exception:
+            pass
+    if not lg_type_name and getattr(request, 'lg_type_id', None):
+        id_map = {1: "Performance Guarantee", 2: "Bid Bond", 3: "Advance Payment Guarantee", 4: "Financial Guarantee", 5: "Retention Guarantee"}
+        lg_type_name = id_map.get(request.lg_type_id, "")
+
+    data["lg_type"] = lg_type_name
+    data["guarantee_type"] = lg_type_name
     
     lt_lower = lg_type_name.lower()
     op_status = (data.get("operational_status") or "").lower()
