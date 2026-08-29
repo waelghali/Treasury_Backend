@@ -290,11 +290,12 @@ class FxService:
             return
 
         from app.models.models import AIUsageLog
+        from app.core.ai_integration import GEMINI_MODEL_NAME
         log = AIUsageLog(
             customer_id=customer_id,
             user_id=user_id,
             doc_name=f"FX_RATE_{from_code}_{to_code}",
-            model_name="gemini-2.0-flash",
+            model_name=GEMINI_MODEL_NAME,
             prompt_tokens=0,
             completion_tokens=0,
             total_tokens=tokens_used,

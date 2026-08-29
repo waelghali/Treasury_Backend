@@ -70,8 +70,8 @@ except ImportError:
     genai = None
     genai_types = None
 
-# Model name constant — single source of truth
-GEMINI_MODEL_NAME = 'gemini-2.5-flash'
+# Model name constant — configurable via GEMINI_MODEL_NAME environment variable with default fallback
+GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-3.0-flash')
 
 # Try to import Google Document AI
 try:
