@@ -976,6 +976,16 @@ async def upload_request_document(
     
     # Save metadata — use systematic filename for discoverability
     doc_display_name = _make_doc_filename(document_type, f"REQ-{request_id}", file.filename)
+    
+    # Soft-delete older superseded copies of the same document for this request
+    existing_old_docs = db.query(IssuanceRequestDocument).filter(
+        IssuanceRequestDocument.request_id == request_id,
+        IssuanceRequestDocument.document_type == document_type,
+        IssuanceRequestDocument.is_deleted == False
+    ).all()
+    for old_doc in existing_old_docs:
+        old_doc.is_deleted = True
+
     doc = IssuanceRequestDocument(
         request_id=request_id,
         document_type=document_type,

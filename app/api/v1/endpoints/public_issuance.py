@@ -1054,6 +1054,16 @@ async def public_upload_document(
     if not stored_uri:
         raise HTTPException(status_code=500, detail="Failed to upload document")
 
+    # Soft-delete older superseded copies of the same document for this request
+    existing_old_docs = db.query(IssuanceRequestDocument).filter(
+        IssuanceRequestDocument.request_id == request_id,
+        IssuanceRequestDocument.document_type == document_type,
+        IssuanceRequestDocument.file_name == file.filename,
+        IssuanceRequestDocument.is_deleted == False
+    ).all()
+    for old_doc in existing_old_docs:
+        old_doc.is_deleted = True
+
     # Save metadata
     doc = IssuanceRequestDocument(
         request_id=request_id,
