@@ -71,7 +71,52 @@ except ImportError:
     genai_types = None
 
 # Model name constant — configurable via GEMINI_MODEL_NAME environment variable with default fallback
-GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-3.0-flash')
+GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
+
+async def _safe_generate_content_async(client, model: str, contents, config=None):
+    """
+    Safely executes an async generate_content call against Google GenAI client.
+    If the requested model produces a 404 NOT_FOUND (e.g. model name mismatch or regional rollout),
+    it automatically falls back to 'gemini-2.5-flash'.
+    """
+    try:
+        return await client.aio.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config
+        )
+    except Exception as e:
+        err_str = str(e)
+        if ("404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower()) and model != "gemini-2.5-flash":
+            logger.warning(f"Gemini model '{model}' not available on Vertex AI ({e}). Falling back to 'gemini-2.5-flash'.")
+            return await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=config
+            )
+        raise
+
+def _safe_generate_content_sync(client, model: str, contents, config=None):
+    """
+    Safely executes a sync generate_content call against Google GenAI client.
+    Falls back to 'gemini-2.5-flash' on 404 NOT_FOUND.
+    """
+    try:
+        return client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config
+        )
+    except Exception as e:
+        err_str = str(e)
+        if ("404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower()) and model != "gemini-2.5-flash":
+            logger.warning(f"Gemini model '{model}' not available on Vertex AI ({e}). Falling back to 'gemini-2.5-flash'.")
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=config
+            )
+        raise
 
 # Try to import Google Document AI
 try:
@@ -861,8 +906,8 @@ Document Text:
             response_schema=response_schema
         )
 
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL_NAME, contents=prompt, config=config
+        response = await _safe_generate_content_async(
+            client=client, model=GEMINI_MODEL_NAME, contents=prompt, config=config
         )
         extracted_data_str = response.text
         logger.debug(f"--- FULL GEMINI JSON RESPONSE START ---")
@@ -1217,8 +1262,8 @@ Return a JSON object with exactly these fields:
             response_mime_type="application/json",
         )
 
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL_NAME, contents=prompt, config=config
+        response = await _safe_generate_content_async(
+            client=client, model=GEMINI_MODEL_NAME, contents=prompt, config=config
         )
         result_str = response.text
         logger.info(f"AI document verification complete ({len(result_str)} chars)")
@@ -1763,7 +1808,8 @@ Many bank forms in this region are **bilingual** — English on one side and Ara
         # Upload PDF to Gemini for analysis (it can read PDFs directly)
         # Use Gemini's ability to analyze PDF content
         pdf_part = genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-        response = await client.aio.models.generate_content(
+        response = await _safe_generate_content_async(
+            client=client,
             model=GEMINI_MODEL_NAME,
             contents=[
                 prompt,
@@ -2147,7 +2193,8 @@ If ALL fields are correctly placed: {{"corrections": [], "summary": "All fields 
     
     logger.info(f"Enhance: sending {num_pages} page pairs to Gemini for visual correction...")
     
-    response = client.models.generate_content(
+    response = _safe_generate_content_sync(
+        client=client,
         model=GEMINI_MODEL_NAME,
         contents=content_parts,
         config=genai_types.GenerateContentConfig(
@@ -2262,7 +2309,8 @@ Rules:
 """
 
     try:
-        response = await client.aio.models.generate_content(
+        response = await _safe_generate_content_async(
+            client=client,
             model=GEMINI_MODEL_NAME,
             contents=[prompt, genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")],
             config=genai_types.GenerateContentConfig(

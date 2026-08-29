@@ -476,7 +476,8 @@ def configure_app_instance(fastapi_app: FastAPI):
                 trigger=trigger,
                 id=job["id"],
                 name=job["name"],
-                args=[job["func"]] + job["args"]
+                args=[job["func"]] + job["args"],
+                misfire_grace_time=3600
             )
             logger.info(f"Scheduled '{job['name']}' {schedule_desc} EEST.")
 
