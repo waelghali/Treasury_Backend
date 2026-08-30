@@ -167,7 +167,7 @@ def resolve_issuance_edit(
     request_id: int,
     payload: dict,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_treasury_context)
+    current_user: TokenData = Depends(get_current_approver_context)
 ):
     """
     Admin approves or rejects a pending edit request.
