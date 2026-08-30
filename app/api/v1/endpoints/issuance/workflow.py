@@ -794,18 +794,18 @@ async def record_bank_reply(
         try:
             gcs_url = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, file_bytes, bank_reply_file.content_type)
             if gcs_url:
-                doc = IssuanceRequestDocument(
-                    request_id=lg.request_id,
-                    document_type=doc_type,
-                    file_name=new_filename,
-                    file_path=gcs_url,
-                    uploaded_by=current_user.user_id,
-                )
-                db.add(doc)
-                db.flush()
+                with db.begin_nested():
+                    doc = IssuanceRequestDocument(
+                        request_id=lg.request_id,
+                        document_type=doc_type,
+                        file_name=new_filename,
+                        file_path=gcs_url,
+                        uploaded_by=current_user.user_id,
+                    )
+                    db.add(doc)
+                    db.flush()
         except Exception as e:
-            # Non-fatal if GCS upload fails, could log it
-            pass
+            logger.warning(f"Could not persist uploaded bank reply document: {e}")
 
     # ── INQUIRY: append note only, keep step open ──
     if reply_type == "INQUIRY":
