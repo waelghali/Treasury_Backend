@@ -246,6 +246,7 @@ class IssuanceRequestOut(IssuanceRequestBase):
     applicable_rules: Optional[str] = None
     cross_border_details: Optional[Dict[str, Any]] = None
     treasury_enrichment: Optional[Dict[str, Any]] = None
+    metadata_json: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True)
 
 class IssuanceRequestVersionOut(BaseModel):
