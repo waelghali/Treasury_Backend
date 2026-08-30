@@ -150,7 +150,19 @@ def get_my_pending_approvals(
         IssuanceRequest.pending_approver_users.cast(JSONB).contains([current_user.user_id])
     ).order_by(IssuanceRequest.created_at.desc()).all()
     
-    print(f"[DEBUG APPROVAL] my-pending-approvals: user_id={current_user.user_id}, found {len(requests)} requests: {[(r.id, r.pending_approver_users) for r in requests]}")
+    # For Corporate Admins and Checkers: include requests pending edit approval or cancellation approval
+    if current_user.role in ("corporate_admin", "checker"):
+        admin_pending = db.query(IssuanceRequest).filter(
+            IssuanceRequest.customer_id == current_user.customer_id,
+            IssuanceRequest.status.in_(["EDIT_REQUESTED", "CANCELLATION_REQUESTED"]),
+            IssuanceRequest.is_deleted == False,
+        ).order_by(IssuanceRequest.created_at.desc()).all()
+        existing_ids = {r.id for r in requests}
+        for ap in admin_pending:
+            if ap.id not in existing_ids:
+                requests.append(ap)
+
+    print(f"[DEBUG APPROVAL] my-pending-approvals: user_id={current_user.user_id}, found {len(requests)} requests: {[(r.id, r.status, r.pending_approver_users) for r in requests]}")
     
     return requests
 
@@ -163,7 +175,8 @@ def get_my_approval_history(
     """
     Returns issuance requests relevant to this approver:
     - PENDING_APPROVAL: only if user is in pending_approver_users
-    - All other statuses: only if user has acted on them (in approval_chain_audit)
+    - EDIT_REQUESTED / CANCELLATION_REQUESTED: always visible to corporate_admin / checker
+    - All other statuses: only if user has acted on them (in approval_chain_audit) or if user is corporate_admin
     """
     from app.models.models_issuance import IssuanceRequest
     from sqlalchemy.dialects.postgresql import JSONB
@@ -175,25 +188,31 @@ def get_my_approval_history(
     ).order_by(IssuanceRequest.created_at.desc()).all()
 
     uid = current_user.user_id
+    is_admin = current_user.role in ("corporate_admin", "checker")
     filtered = []
     for req in requests:
         if req.status == "PENDING_APPROVAL":
-            # Only show if this user is a designated approver for the current step
+            # Show if designated approver OR if corporate_admin
             approvers = [int(x) for x in (req.pending_approver_users or [])]
-            if uid not in approvers:
+            if uid not in approvers and not is_admin:
+                continue
+        elif req.status in ("EDIT_REQUESTED", "CANCELLATION_REQUESTED"):
+            # Corporate Admins and Checkers always see requests requiring edit/cancel resolution
+            if not is_admin:
                 continue
         else:
-            # For completed/rejected: only show if user participated in the audit trail
-            audit = req.approval_chain_audit or []
-            participated = any(
-                entry.get("user_id") == uid
-                for entry in audit
-                if isinstance(entry, dict) and entry.get("action") in (
-                    "APPROVED_STEP", "REJECTED", "REVISION_REQUIRED"
+            # For completed/rejected: show if user participated in the audit trail or is admin
+            if not is_admin:
+                audit = req.approval_chain_audit or []
+                participated = any(
+                    entry.get("user_id") == uid
+                    for entry in audit
+                    if isinstance(entry, dict) and entry.get("action") in (
+                        "APPROVED_STEP", "REJECTED", "REVISION_REQUIRED", "EDIT_RESOLVED"
+                    )
                 )
-            )
-            if not participated:
-                continue
+                if not participated:
+                    continue
         filtered.append(req)
 
     return filtered

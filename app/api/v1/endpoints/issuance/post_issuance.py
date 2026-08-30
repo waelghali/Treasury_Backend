@@ -2059,17 +2059,19 @@ def mark_maintenance_printed(
 @router.post("/requests/{request_id}/analyze-document")
 async def analyze_supporting_document_endpoint(
     request_id: int,
-    doc_type: str = Form(...),
-    file: UploadFile = File(...),
+    doc_type: Optional[str] = Form(None),
+    document_id: Optional[int] = Form(None),
+    file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """
-    H2: Upload a supporting document (Contract, PO, Formal Request) for AI analysis.
+    H2: Upload or select a supporting document (Contract, PO, Formal Request) for AI analysis.
     Cross-references extracted fields against the issuance request.
     ADVISORY only — highlights potential gaps, never blocks the user.
     """
     from app.core.ai_integration import analyze_supporting_document, AI_DOC_MAX_SIZE_BYTES
+    import os
 
     # Validate request
     request_obj = db.query(IssuanceRequest).filter(
@@ -2079,7 +2081,47 @@ async def analyze_supporting_document_endpoint(
     if not request_obj:
         raise HTTPException(404, "Issuance request not found")
 
-    pdf_bytes = await file.read()
+    pdf_bytes = None
+    filename = "document.pdf"
+    target_doc_type = (doc_type or "CONTRACT").upper()
+
+    if document_id:
+        from app.models.models_issuance import IssuanceRequestDocument
+        doc_record = db.query(IssuanceRequestDocument).filter(
+            IssuanceRequestDocument.id == document_id,
+            IssuanceRequestDocument.request_id == request_id,
+        ).first()
+        if not doc_record:
+            raise HTTPException(404, "Document not found")
+        filename = doc_record.file_name or "document.pdf"
+        target_doc_type = doc_record.document_type or target_doc_type
+
+        # Read bytes from GCS or local disk
+        if doc_record.file_path and doc_record.file_path.startswith("gs://"):
+            try:
+                from app.core.ai_integration import _get_gcs_client
+                path_parts = doc_record.file_path[5:].split('/', 1)
+                bucket_name, blob_name = path_parts[0], path_parts[1]
+                client = _get_gcs_client()
+                if not client:
+                    raise HTTPException(500, "GCS client not available")
+                bucket = client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+                pdf_bytes = blob.download_as_bytes()
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(500, f"Failed to download document from storage: {e}")
+        elif doc_record.file_path and os.path.exists(doc_record.file_path):
+            with open(doc_record.file_path, "rb") as f:
+                pdf_bytes = f.read()
+        else:
+            raise HTTPException(404, f"Document file path not found: {doc_record.file_path}")
+    elif file:
+        filename = file.filename or "document.pdf"
+        pdf_bytes = await file.read()
+    else:
+        raise HTTPException(400, "Either document_id or file must be provided")
 
     # File size guard (friendly message, not an error)
     if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
@@ -2089,7 +2131,7 @@ async def analyze_supporting_document_endpoint(
             "comparison": None,
         }
 
-    # Build request_data dict with the 9 fields for AI-driven comparison
+    # Build request_data dict with the fields for AI-driven comparison
     request_data = {
         "contract_value": float(request_obj.reference_amount) if request_obj.reference_amount else None,
         "currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
@@ -2102,9 +2144,9 @@ async def analyze_supporting_document_endpoint(
         "lg_purpose": request_obj.lg_purpose,
     }
 
-    # Run AI-driven verification (comparison is done by AI, not rule-based)
+    # Run AI-driven verification
     result = await analyze_supporting_document(
-        pdf_bytes, doc_type.upper(), file.filename,
+        pdf_bytes, target_doc_type, filename,
         request_data=request_data,
         db=db, customer_id=current_user.customer_id, user_id=current_user.user_id,
     )
@@ -2112,11 +2154,16 @@ async def analyze_supporting_document_endpoint(
     # Persist the verification result on the matching document
     if result.get("status") == "OK":
         from app.models.models_issuance import IssuanceRequestDocument
-        doc_record = db.query(IssuanceRequestDocument).filter(
-            IssuanceRequestDocument.request_id == request_id,
-            IssuanceRequestDocument.document_type == doc_type.upper(),
-            IssuanceRequestDocument.is_deleted == False
-        ).order_by(IssuanceRequestDocument.created_at.desc()).first()
+        if document_id:
+            doc_record = db.query(IssuanceRequestDocument).filter(
+                IssuanceRequestDocument.id == document_id
+            ).first()
+        else:
+            doc_record = db.query(IssuanceRequestDocument).filter(
+                IssuanceRequestDocument.request_id == request_id,
+                IssuanceRequestDocument.document_type == target_doc_type,
+            ).order_by(IssuanceRequestDocument.created_at.desc()).first()
+
         if doc_record and hasattr(doc_record, 'ai_verification_result'):
             doc_record.ai_verification_result = result
             db.commit()
