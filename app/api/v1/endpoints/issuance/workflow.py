@@ -1012,6 +1012,8 @@ async def record_bank_reply(
                 db, background_tasks, request, reply_type, lg
             )
 
+    db.commit()
+
     return {
         "message": f"Bank reply recorded: {reply_type}",
         "id": lg.id,

@@ -151,15 +151,10 @@ class SLAActualizationService:
             updated_metrics["bank_new_avg_sla"] = new_bank_sla
             updated_metrics["bank_commitment_pct"] = new_bank_comm
 
-        try:
-            db.commit()
-            logger.info(
-                f"SLA Actualized for LG {issued_lg.lg_ref_number}: "
-                f"Turnaround={turnaround_days}d (Agreed={agreed_sla}d, OnTime={is_on_time})"
-            )
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Error persisting SLA actualization metrics: {e}")
+        logger.info(
+            f"SLA Actualized for LG {issued_lg.lg_ref_number}: "
+            f"Turnaround={turnaround_days}d (Agreed={agreed_sla}d, OnTime={is_on_time})"
+        )
 
         return updated_metrics
 
