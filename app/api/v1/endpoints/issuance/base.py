@@ -535,11 +535,19 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
     # Handover Ready / Verified event
     if event_type in ("VERIFIED", "HANDOVER_READY", "LG_ISSUED") and lg:
         subject = f"🎉 Ready for Handover: LG {lg.lg_ref_number or request.serial_number} is Ready"
+        bank_name = "—"
+        if getattr(lg, 'bank', None) and getattr(lg.bank, 'name', None):
+            bank_name = lg.bank.name
+        elif getattr(lg, 'sub_limit', None) and getattr(lg.sub_limit, 'facility', None) and getattr(lg.sub_limit.facility, 'bank', None):
+            bank_name = getattr(lg.sub_limit.facility.bank, 'name', None) or "—"
+        elif getattr(lg, 'bank_name', None):
+            bank_name = lg.bank_name
+
         key_vals = {
             "Request Serial": request.serial_number,
             "LG Reference": lg.lg_ref_number or "—",
             "Bank LG Number": lg.bank_lg_number or "Issued by Bank",
-            "Issuing Bank": lg.bank_name or (lg.bank.name if getattr(lg, 'bank', None) else "—"),
+            "Issuing Bank": bank_name,
             "Beneficiary": request.beneficiary_name or "—",
             "Amount": f"{currency_str} {float(lg.current_amount or 0):,.2f}".strip(),
             "Expiry Date": str(lg.expiry_date) if lg.expiry_date else "—",

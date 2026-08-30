@@ -106,6 +106,14 @@ class BusinessCalendarService:
         country_code: Optional[str] = None
     ) -> bool:
         """Returns True if the given date is a working business day."""
+        if isinstance(target_date, str):
+            try:
+                target_date = datetime.strptime(str(target_date)[:10], "%Y-%m-%d").date()
+            except Exception:
+                return True
+        elif isinstance(target_date, datetime):
+            target_date = target_date.date()
+
         weekend_days = self.get_weekend_days(db)
         if target_date.weekday() in weekend_days:
             return False
@@ -132,9 +140,20 @@ class BusinessCalendarService:
         if not start_date or not end_date:
             return 1.0
 
-        if isinstance(start_date, datetime):
+        if isinstance(start_date, str):
+            try:
+                start_date = datetime.strptime(str(start_date)[:10], "%Y-%m-%d").date()
+            except Exception:
+                return 1.0
+        elif isinstance(start_date, datetime):
             start_date = start_date.date()
-        if isinstance(end_date, datetime):
+
+        if isinstance(end_date, str):
+            try:
+                end_date = datetime.strptime(str(end_date)[:10], "%Y-%m-%d").date()
+            except Exception:
+                return 1.0
+        elif isinstance(end_date, datetime):
             end_date = end_date.date()
 
         if end_date < start_date:
