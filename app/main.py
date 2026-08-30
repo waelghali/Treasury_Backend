@@ -191,6 +191,83 @@ def configure_app_instance(fastapi_app: FastAPI):
                     record_startup_watchdog(watchdog_db)
             except Exception as w_err:
                 logger.warning(f"Startup watchdog check skipped: {w_err}")
+
+            # --- Auto-Sync Letter Templates from Disk → DB ---
+            try:
+                from sqlalchemy.orm import Session as DBSession
+                from app.models import Template
+                import re as _re
+
+                templates_folder = os.path.join(os.path.dirname(__file__), "templates")
+                if os.path.isdir(templates_folder):
+                    with DBSession(engine) as tpl_db:
+                        updated_count = 0
+                        created_count = 0
+                        for entry in os.scandir(templates_folder):
+                            if not (entry.is_file() and entry.name.endswith("_template.html")):
+                                continue
+
+                            filename = entry.name
+                            customer_match = _re.match(r"CustomerID_(\d+)_(.*)_template\.html", filename)
+
+                            if customer_match:
+                                customer_id = int(customer_match.group(1))
+                                action_type = customer_match.group(2)
+                                is_global = False
+                            else:
+                                action_type = filename.replace("_template.html", "")
+                                customer_id = None
+                                is_global = True
+
+                            with open(entry.path, "r", encoding="utf-8") as f:
+                                new_html = f.read()
+
+                            query = tpl_db.query(Template).filter(
+                                Template.action_type == action_type,
+                                Template.is_notification_template == False,
+                                Template.is_global == is_global,
+                                Template.is_deleted == False
+                            )
+                            if not is_global:
+                                query = query.filter(Template.customer_id == customer_id)
+
+                            tpl = query.first()
+                            if tpl:
+                                # Update existing template if content differs
+                                if tpl.content != new_html:
+                                    tpl.content = new_html
+                                    updated_count += 1
+                            else:
+                                # Create new template record from disk file
+                                human_name = action_type.replace("_", " ").title() + " Instruction"
+                                owner_label = f" (Customer {customer_id})" if not is_global else ""
+                                new_tpl = Template(
+                                    name=human_name + owner_label,
+                                    template_type="LETTER",
+                                    action_type=action_type,
+                                    content=new_html,
+                                    language="EN",
+                                    is_global=is_global,
+                                    customer_id=customer_id,
+                                    is_notification_template=False,
+                                    is_default=True,
+                                )
+                                tpl_db.add(new_tpl)
+                                created_count += 1
+                                logger.info(f"Template auto-sync: created '{action_type}'{owner_label} from disk.")
+
+                        tpl_db.commit()
+                        parts = []
+                        if updated_count:
+                            parts.append(f"updated {updated_count}")
+                        if created_count:
+                            parts.append(f"created {created_count}")
+                        if parts:
+                            logger.info(f"Template auto-sync: {', '.join(parts)} template(s).")
+                        else:
+                            logger.info("Template auto-sync: all templates up-to-date.")
+            except Exception as tpl_err:
+                logger.warning(f"Template auto-sync skipped: {tpl_err}")
         else:
             logger.critical("FATAL: No SQLAlchemy models registered. Tables cannot be created.")
             sys.exit(1)
