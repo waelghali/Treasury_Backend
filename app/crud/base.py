@@ -167,7 +167,10 @@ def log_action(
 ):
     """
     Logs an action to the AuditLog after sanitizing the details.
+    Uses a savepoint so audit log failures never poison the parent transaction.
     """
+    import logging
+    logger = logging.getLogger(__name__)
     try:
         # CRITICAL CHANGE: Sanitize the details dictionary before creating the log
         sanitized_details = sanitize_log_details(details)
@@ -185,8 +188,5 @@ def log_action(
         )
         db.add(audit_log_entry)
         db.flush()
-        db.refresh(audit_log_entry)
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"Error creating audit log entry: {e}", exc_info=True)

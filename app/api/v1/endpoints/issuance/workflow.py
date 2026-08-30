@@ -834,6 +834,9 @@ async def record_bank_reply(
             "inquiry_count": len(current_log),
         }
 
+    # ── Cache request_id before any flush can expire the ORM state ──
+    _cached_request_id = lg.request_id
+
     # ── LG_ISSUED: normal flow → pending verification ──
     lg.bank_reply_type = reply_type
     lg.bank_reply_date = bank_reply_date or date.today().isoformat()
@@ -857,16 +860,31 @@ async def record_bank_reply(
         lg.status = "LG_ISSUED"
         lg.verification_status = "PENDING"
         # Also set the request to COMPLETED since bank confirmed issuance
-        if lg.request_id:
-            request_obj = db.query(IssuanceRequest).get(lg.request_id)
+        if _cached_request_id:
+            request_obj = db.query(IssuanceRequest).get(_cached_request_id)
             if request_obj and request_obj.status == "INTERNAL_PROCESSING":
                 request_obj.status = "COMPLETED"
                 request_obj.locked_for_issuance = False
 
-        # Smart SLA Actualization: compute net business turnaround and update EMA metrics
+        # Flush core LG + request changes before optional SLA metrics
         try:
-            from app.services.sla_actualization_service import sla_actualization_service
-            sla_actualization_service.record_issuance_turnaround(db, lg)
+            db.flush()
+        except Exception as flush_err:
+            logger.error(f"Failed to flush core LG changes for LG {lg.id}: {flush_err}")
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Database error recording bank reply: {flush_err}")
+
+        # Smart SLA Actualization: compute net business turnaround and update EMA metrics
+        # Wrapped in savepoint so failures don't poison the main transaction
+        try:
+            nested = db.begin_nested()
+            try:
+                from app.services.sla_actualization_service import sla_actualization_service
+                sla_actualization_service.record_issuance_turnaround(db, lg)
+                nested.commit()
+            except Exception:
+                nested.rollback()
+                raise
         except Exception as sla_err:
             logger.warning(f"SLA actualization calculation skipped on LG {lg.id}: {sla_err}")
 
@@ -876,8 +894,8 @@ async def record_bank_reply(
         lg.status = status_map[reply_type]
 
         # Reopen the original IssuanceRequest for reprocessing
-        if lg.request_id:
-            request_obj = db.query(IssuanceRequest).get(lg.request_id)
+        if _cached_request_id:
+            request_obj = db.query(IssuanceRequest).get(_cached_request_id)
             if request_obj:
                 previous_status = request_obj.status
                 request_obj.status = "APPROVED_INTERNAL"  # Back to "Ready for Bank"
@@ -886,7 +904,7 @@ async def record_bank_reply(
                 # Release facility exposure — free the held capacity
                 from app.models.models_issuance import IssuanceExposureEntry
                 db.query(IssuanceExposureEntry).filter(
-                    IssuanceExposureEntry.request_id == lg.request_id,
+                    IssuanceExposureEntry.request_id == _cached_request_id,
                     IssuanceExposureEntry.is_active == True
                 ).update({"is_active": False})
                 request_obj.selected_sub_limit_id = None
@@ -1000,29 +1018,41 @@ async def record_bank_reply(
             logger.error(f"Failed to generate cancellation notice for LG {lg.id}: {e}", exc_info=True)
             # Don't fail the whole request — the NO_RESPONSE recording still succeeds
 
-    log_action(db, current_user.user_id, "ISSUANCE_BANK_REPLY_RECORDED", "IssuedLGRecord", lg.id,
-               {"reply_type": reply_type, "bank_lg_number": lg.bank_lg_number},
-               current_user.customer_id)
+    # Audit log — isolated in savepoint so failure doesn't poison the transaction
+    _cached_lg_id = lg.id
+    _cached_lg_ref = lg.lg_ref_number
+    _cached_bank_lg_number = lg.bank_lg_number
+    _cached_status = lg.status
+    try:
+        with db.begin_nested():
+            log_action(db, current_user.user_id, "ISSUANCE_BANK_REPLY_RECORDED", "IssuedLGRecord", _cached_lg_id,
+                       {"reply_type": reply_type, "bank_lg_number": _cached_bank_lg_number},
+                       current_user.customer_id)
+    except Exception as audit_err:
+        logger.warning(f"Audit log for bank reply on LG {_cached_lg_id} skipped: {audit_err}")
 
     # Notify requestor (all reply types except INQUIRY get email)
-    if lg.request_id:
-        request = db.query(IssuanceRequest).get(lg.request_id)
-        if request and request.requestor_email:
-            _send_requestor_status_notification(
-                db, background_tasks, request, reply_type, lg
-            )
+    if _cached_request_id:
+        try:
+            request = db.query(IssuanceRequest).get(_cached_request_id)
+            if request and request.requestor_email:
+                _send_requestor_status_notification(
+                    db, background_tasks, request, reply_type, lg
+                )
+        except Exception as notify_err:
+            logger.warning(f"Requestor notification skipped for LG {_cached_lg_id}: {notify_err}")
 
     db.commit()
 
     return {
         "message": f"Bank reply recorded: {reply_type}",
-        "id": lg.id,
-        "status": lg.status,
+        "id": _cached_lg_id,
+        "status": _cached_status,
         "bank_reply_type": reply_type,
-        "bank_lg_number": lg.bank_lg_number,
+        "bank_lg_number": _cached_bank_lg_number,
         "request_reopened": reply_type in ("REJECTED", "NO_RESPONSE"),
         "cancellation_letter_generated": cancellation_letter_generated,
-        "cancellation_notice_download_url": f"/api/v1/issuance/lg-records/{lg.id}/cancellation-notice-pdf" if cancellation_letter_generated else None,
+        "cancellation_notice_download_url": f"/api/v1/issuance/lg-records/{_cached_lg_id}/cancellation-notice-pdf" if cancellation_letter_generated else None,
     }
 
 # ── Cancellation Notice Endpoints ─────────────────────────────────────
