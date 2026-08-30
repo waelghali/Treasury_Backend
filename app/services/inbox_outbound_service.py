@@ -6,6 +6,7 @@ Attaches custom Message-ID headers for robust thread matching upon bank reply.
 """
 
 import os
+import hashlib
 import smtplib
 import email
 import email.utils
