@@ -523,6 +523,15 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
 
     frontend_url = get_frontend_base_url()
 
+    # Safely extract currency code from request or lg
+    currency_str = ""
+    if lg and getattr(lg, 'currency_code', None):
+        currency_str = lg.currency_code
+    elif hasattr(request, 'currency') and request.currency:
+        currency_str = getattr(request.currency, 'iso_code', None) or getattr(request.currency, 'symbol', '') or ""
+    elif hasattr(request, 'currency_code'):
+        currency_str = getattr(request, 'currency_code', '') or ""
+
     # Handover Ready / Verified event
     if event_type in ("VERIFIED", "HANDOVER_READY", "LG_ISSUED") and lg:
         subject = f"🎉 Ready for Handover: LG {lg.lg_ref_number or request.serial_number} is Ready"
@@ -532,7 +541,7 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
             "Bank LG Number": lg.bank_lg_number or "Issued by Bank",
             "Issuing Bank": lg.bank_name or (lg.bank.name if getattr(lg, 'bank', None) else "—"),
             "Beneficiary": request.beneficiary_name or "—",
-            "Amount": f"{lg.currency_code or ''} {float(lg.current_amount or 0):,.2f}",
+            "Amount": f"{currency_str} {float(lg.current_amount or 0):,.2f}".strip(),
             "Expiry Date": str(lg.expiry_date) if lg.expiry_date else "—",
         }
         body = build_transaction_email_html(
@@ -551,7 +560,7 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
         key_vals = {
             "Request Serial": request.serial_number,
             "Beneficiary": request.beneficiary_name or "—",
-            "Amount": f"{request.currency.code if getattr(request, 'currency', None) else ''} {float(request.amount or 0):,.2f}",
+            "Amount": f"{currency_str} {float(request.amount or 0):,.2f}".strip(),
         }
         body = build_transaction_email_html(
             customer_name=customer_name,

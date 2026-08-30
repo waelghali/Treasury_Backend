@@ -1771,8 +1771,8 @@ class IssuanceService:
             "reserved_equivalent": round(reserved_equivalent, 2),
             "current_equivalent": round(current_equivalent, 2),
             "cost_impact": round(cost_impact, 2),
-            "facility_currency": facility.currency.code if facility.currency else "N/A",
-            "request_currency": request.currency.code if request.currency else "N/A",
+            "facility_currency": (getattr(facility.currency, 'iso_code', None) or getattr(facility.currency, 'code', 'N/A')) if facility and facility.currency else "N/A",
+            "request_currency": (getattr(request.currency, 'iso_code', None) or getattr(request.currency, 'code', 'N/A')) if request and request.currency else "N/A",
         }
 
         result["fx_drift"] = fx_drift_info
