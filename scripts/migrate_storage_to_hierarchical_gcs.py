@@ -105,7 +105,12 @@ def run_migration(dry_run: bool = True, target_env: str = "production", db_url: 
     if db_url:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
-        engine = create_engine(db_url, pool_pre_ping=True)
+        engine = create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_recycle=300,
+            connect_args={"connect_timeout": 30, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 5}
+        )
         Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         db = Session()
     else:
@@ -118,8 +123,10 @@ def run_migration(dry_run: bool = True, target_env: str = "production", db_url: 
     total_already_migrated = 0
     total_errors = 0
 
+    from sqlalchemy.orm import joinedload
+
     tables = [
-        ("LGDocument", db.query(LGDocument).filter(LGDocument.is_deleted == False), "file_path"),
+        ("LGDocument", db.query(LGDocument).options(joinedload(LGDocument.lg_record)).filter(LGDocument.is_deleted == False), "file_path"),
         ("IssuanceRequestDocument", db.query(IssuanceRequestDocument).filter(IssuanceRequestDocument.is_deleted == False), "file_path"),
         ("IssuanceFacility", db.query(IssuanceFacility).filter(IssuanceFacility.is_deleted == False), "contract_document_path"),
         ("BankFormTemplate", db.query(BankFormTemplate).filter(BankFormTemplate.is_deleted == False), "file_path"),
@@ -152,19 +159,20 @@ def run_migration(dry_run: bool = True, target_env: str = "production", db_url: 
                     tgt_bucket_name, tgt_blob_name = parse_gcs_uri(target_uri)
 
                     src_bucket = client.bucket(src_bucket_name)
-                    src_blob = src_bucket.blob(src_blob_name)
+                    tgt_bucket = client.bucket(tgt_bucket_name)
 
-                    blob_exists = False
-                    try:
-                        blob_exists = src_blob.exists()
-                    except Exception as blob_check_err:
-                        logger.warning(f"Could not check existence of source blob {current_uri}: {blob_check_err}")
+                    tgt_blob = tgt_bucket.blob(tgt_blob_name)
+                    if not tgt_blob.exists():
+                        src_blob = src_bucket.blob(src_blob_name)
+                        blob_exists = False
+                        try:
+                            blob_exists = src_blob.exists()
+                        except Exception as blob_check_err:
+                            logger.warning(f"Could not check source blob {current_uri}: {blob_check_err}")
 
-                    if blob_exists:
-                        # Server-side copy in GCS
-                        tgt_bucket = client.bucket(tgt_bucket_name)
-                        src_bucket.copy_blob(src_blob, tgt_bucket, tgt_blob_name)
-                        logger.info(f"Copied GCS blob to {target_uri}")
+                        if blob_exists:
+                            src_bucket.copy_blob(src_blob, tgt_bucket, tgt_blob_name)
+                            logger.info(f"Copied GCS blob to {target_uri}")
 
                     # Update DB record pointer
                     setattr(rec, url_field, target_uri)
