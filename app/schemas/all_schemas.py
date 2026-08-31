@@ -732,17 +732,18 @@ class AuditLogCreate(AuditLogBase):
 
 class AuditLogOut(BaseModel):
     id: int
-    user_id: Optional[int]
+    user_id: Optional[int] = None
     user_name: Optional[str] = None
     action_type: str
     entity_type: str
-    entity_id: Optional[int]
+    entity_id: Optional[int] = None
     lg_number: Optional[str] = None
     entity_name: Optional[str] = None
-    details: Optional[Dict[str, Any]]
-    timestamp: datetime
-    ip_address: Optional[str]
+    details: Optional[Dict[str, Any]] = None
+    timestamp: Optional[datetime] = None
+    ip_address: Optional[str] = None
     customer_id: Optional[int] = None
+    customer_name: Optional[str] = None
     lg_record_id: Optional[int] = None
 
     class Config:

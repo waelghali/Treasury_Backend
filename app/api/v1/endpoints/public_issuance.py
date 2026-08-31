@@ -1037,8 +1037,9 @@ async def public_upload_document(
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     unique_filename = f"REQ-{request_id}_{document_type}_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
 
+    from app.core.storage_service import build_customer_blob_path
     doc_type_slug = _slugify_doc_type(document_type)
-    blob_path = f"customer_{customer_id}/issuance_req_{request_id}/{doc_type_slug}/{unique_filename}"
+    blob_path = build_customer_blob_path(customer_id, "issuance/requests", f"req_{request_id}/{doc_type_slug}/{unique_filename}")
 
     # Get customer-specific bucket or fallback
     from app.crud import crud_customer_configuration
@@ -1264,7 +1265,8 @@ async def public_upload_maintenance_document(
 
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     unique_name = f"MAINT_DOC_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
-    blob_path = f"customer_{customer_id}/maintenance_docs/{unique_name}"
+    from app.core.storage_service import build_customer_blob_path
+    blob_path = build_customer_blob_path(customer_id, "issuance/maintenance", f"maint_docs/{unique_name}")
 
     bucket_name = GCS_BUCKET_NAME
     bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(

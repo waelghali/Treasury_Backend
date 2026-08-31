@@ -209,6 +209,23 @@ def _get_vision_client():
             _vision_client = None
     return _vision_client
 
+def get_service_account_email() -> str:
+    """Returns the active Google Cloud Service Account email, or a clean fallback."""
+    creds = _get_google_credentials()
+    if creds and getattr(creds, "service_account_email", None):
+        return creds.service_account_email
+    if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+        try:
+            path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"].strip('\'"')
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if data.get("client_email"):
+                        return data["client_email"]
+        except Exception:
+            pass
+    return "service-account@grow-platform.iam.gserviceaccount.com"
+
 # Vertex AI project & location (reuses DOCUMENT_AI_PROJECT_ID as fallback)
 VERTEX_AI_PROJECT_ID = os.environ.get('GCP_PROJECT_ID') or os.environ.get('DOCUMENT_AI_PROJECT_ID', '')
 VERTEX_AI_LOCATION = os.environ.get('VERTEX_AI_LOCATION', 'us-central1')
@@ -484,76 +501,17 @@ async def _cleanup_gcs_files(bucket_name: str, prefix: str):
 
 def delete_file_from_gcs(gcs_uri: str) -> bool:
     """Deletes a file directly from GCS using its gs:// URI."""
-    if not gcs_uri or not gcs_uri.startswith("gs://"):
-        return False
-    
-    try:
-        # uri format: gs://bucket_name/path/to/blob
-        parts = gcs_uri[len("gs://"):].split('/', 1)
-        bucket_name = parts[0]
-        blob_name = parts[1]
-
-        client = _get_gcs_client()
-        if not client:
-            logger.error("GCS client not initialized. Cannot delete file.")
-            return False
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        
-        blob.delete()
-        return True
-    except Exception as e:
-        logger.error(f"Error deleting file {gcs_uri}: {e}")
-        return False
+    from app.core.storage_service import delete_gcs_blob
+    return delete_gcs_blob(gcs_uri)
 
 # --- UPDATED: Generate Signed URL ---
 async def generate_signed_gcs_url(gcs_uri: str, expiration: int = 3600) -> Optional[str]:
     """
     Generates a temporary signed URL for viewing a file using the full GCS URI.
-    Args:
-        gcs_uri: The full GCS URI (e.g., gs://bucket_name/path/to/blob).
-        expiration: Time in seconds until the link expires.
+    Uses dual-read path resolution to seamlessly handle both new hierarchical and legacy paths.
     """
-    if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
-        return None
-
-    # --- CRITICAL FIX: Robust GCS URI Parsing ---
-    # We must extract bucket_name and blob_name from the full URI
-    if not gcs_uri.startswith("gs://"):
-        logger.error(f"Invalid GCS URI format: {gcs_uri}. Must start with 'gs://'.")
-        return None
-        
-    path_parts = gcs_uri[5:].split('/', 1)
-    if len(path_parts) != 2:
-        logger.error(f"Failed to parse bucket and blob name from URI: {gcs_uri}")
-        return None
-        
-    bucket_name, blob_name = path_parts
-    # ---------------------------------------------
-
-    try:
-        # We run this in a thread because GCS client operations are synchronous
-        def _generate():
-            client = _get_gcs_client()
-            if not client:
-                return None
-            
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
-            
-            # Generate the signed URL
-            url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(seconds=expiration),
-                method="GET"
-            )
-            return url
-
-        return await asyncio.to_thread(_generate)
-        
-    except Exception as e:
-        logger.error(f"Error generating signed URL for {gcs_uri}: {e}")
-        return None
+    from app.core.storage_service import generate_signed_url
+    return await generate_signed_url(gcs_uri, expiration_seconds=expiration)
 
 # --- Google Vision OCR Function ---
 async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> Optional[str]:

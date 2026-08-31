@@ -662,11 +662,9 @@ async def record_delivery(
             bucket_name = os.environ.get("GCS_BUCKET_NAME") or GCS_BUCKET_NAME or "lg_custody_bucket"
             file_ext = delivery_proof_file.filename.rsplit(".", 1)[-1] if "." in delivery_proof_file.filename else "pdf"
             
-            # Organized path: customer / requests / req_id / lg / doc_type_slug / file
-            from app.crud.crud_lg_document import _slugify_doc_type
-            doc_type_slug = _slugify_doc_type("DELIVERY_PROOF")
-            req_folder = lg.request_id if lg.request_id else "unlinked"
-            gcs_path = f"customer_{current_user.customer_id}/requests/{req_folder}/lg_{lg_id}/{doc_type_slug}/{delivery_proof_display_name}"
+            # Organized path: {env}/customer_{customer_id}/issuance/issued_lgs/issued_{lg_id}/delivery_proofs/{file}
+            from app.core.storage_service import build_customer_blob_path
+            gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg_id}/delivery_proofs/{delivery_proof_display_name}")
             file_content = await delivery_proof_file.read()
             stored_uri = await _upload_to_gcs(bucket_name, gcs_path, file_content, delivery_proof_file.content_type)
 
@@ -787,9 +785,8 @@ async def record_bank_reply(
         # Format: DOC_TYPE_LG-REF-123_20260325_filename.pdf
         new_filename = f"{doc_type}_{safe_ref}_{date_str}_{sanitized_orig}.{file_ext}"
         
-        from app.crud.crud_lg_document import _slugify_doc_type
-        doc_type_slug = _slugify_doc_type(doc_type)
-        gcs_path = f"customer_{current_user.customer_id}/requests/{lg.request_id}/lg_{lg.id}/{doc_type_slug}/{new_filename}"
+        from app.core.storage_service import build_customer_blob_path
+        gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg.id}/bank_replies/{new_filename}")
         
         try:
             gcs_url = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, file_bytes, bank_reply_file.content_type)
@@ -973,9 +970,10 @@ async def record_bank_reply(
                 pdf_filename = f"cancellation_notice_{lg.lg_ref_number}_{date.today().isoformat()}"
                 generated_pdf_bytes = await generate_pdf_from_html(generated_html, pdf_filename)
 
-                # Upload to GCS; fall back to local tempdir if GCS is unavailable
+                # Upload to GCS
                 from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
-                gcs_path = f"issuance/{lg.customer_id}/cancellation_notices/{pdf_filename}.pdf"
+                from app.core.storage_service import build_customer_blob_path
+                gcs_path = build_customer_blob_path(lg.customer_id, "issuance/issued_lgs", f"issued_{lg.id}/cancellations/{pdf_filename}.pdf")
                 pdf_path = None
                 try:
                     gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, generated_pdf_bytes, "application/pdf")

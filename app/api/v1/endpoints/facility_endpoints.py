@@ -126,9 +126,9 @@ async def upload_facility_attachment(
     # 1. Read the file content
     file_content = await file.read()
     
-    # 2. Define the path using your system's existing pattern:
-    # customer_{id}/Facilities/{filename}
-    blob_path = f"customer_{current_user.customer_id}/Facilities/{file.filename}"
+    # 2. Define the path: {env}/customer_{customer_id}/facilities/fac_docs/{filename}
+    from app.core.storage_service import build_customer_blob_path
+    blob_path = build_customer_blob_path(current_user.customer_id, "facilities", f"fac_docs/{file.filename}")
     
     # 3. Use your existing _upload_to_gcs function from ai_integration.py
     # This function already handles the technical upload logic

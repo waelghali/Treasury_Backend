@@ -769,28 +769,66 @@ def create_personalized_guides():
         story.append(Paragraph(m2, body_style))
         story.append(Spacer(1, 5))
 
+        # Mission 3: Reconciliation & Smart Inbox Polling (Now Phase 3)
         m3 = (
-            "<b>PHASE 3: CUSTODY, SPECIAL LIQUIDATION &amp; FORCED RENEWAL</b><br/>"
-            "1. Go to <b>Custody Module &gt; Record New LG Received</b>.<br/>"
-            "2. Upload <code>LG_01_Special_Liquidation_Wording_Scan.pdf</code>. Observe the AI banner detecting: <i>'Special Liquidation Wording: Requires Original Physical Presentation + FIDIC Engineer Certificate'</i>.<br/>"
-            "3. Upload <code>LG_02_Near_Maturity_Forced_Renewal_Scan.pdf</code> (Expiring in 7 days) &gt; Test <b>Forced Renewal Demand</b> in the action center.<br/>"
-            "4. Test <b>Record Delivery &amp; Bank Handover</b> using <code>LG_04_Bank_Handover_Receipt_Reply_Scan.pdf</code>.<br/>"
-            "5. Test <b>Transaction Cancellation / Rollback</b> on any active amendment."
+            "<b>PHASE 3: RECONCILIATION &amp; SMART INBOX POLLING</b><br/>"
+            "1. <b>Send Test Bank Position:</b> Send an email from your personal inbox or <code>bankdesk.simulation@gmail.com</code> to <code>" + c["smart_inbox"] + "</code> attaching <code>ENBD_Monthly_Bank_Position_Statement_Perfect_Match.xlsx</code>.<br/>"
+            "2. <b>Smart Ingestion:</b> In the platform as Officer, go to <b>Smart Inbox &gt; Click 'Fetch Now'</b>. View automated AI classification.<br/>"
+            "3. <b>Discrepancy Resolution:</b> Go to <b>Bank Reconciliation</b> &gt; Upload <code>CIB_Monthly_Bank_Position_Statement_Discrepancies.xlsx</code> and review how the system flags amount mismatches and expired unreleased LGs."
         )
         story.append(Paragraph(m3, body_style))
         story.append(Spacer(1, 5))
 
+        # Mission 4: Custody & Maintenance Actions (Now Phase 4)
         m4 = (
-            "<b>PHASE 4: RECONCILIATION &amp; SMART INBOX POLLING</b><br/>"
-            "1. <b>Send Test Bank Position:</b> Send an email from your personal inbox or <code>bankdesk.simulation@gmail.com</code> to <code>" + c["smart_inbox"] + "</code> attaching <code>ENBD_Monthly_Bank_Position_Statement_Perfect_Match.xlsx</code>.<br/>"
-            "2. <b>Smart Ingestion:</b> In the platform as Officer, go to <b>Smart Inbox &gt; Click 'Fetch Now'</b>. View automated AI classification.<br/>"
-            "3. <b>Discrepancy Resolution:</b> Go to <b>Bank Reconciliation</b> &gt; Upload <code>CIB_Monthly_Bank_Position_Statement_Discrepancies.xlsx</code> and review how the system flags amount mismatches and expired unreleased LGs."
+            "<b>PHASE 4: CUSTODY LIFECYCLE &amp; ACTION CENTER (Managing Received Guarantees)</b><br/>"
+            "<i>The Custody module acts as your digital vault for guarantees received from contractors/suppliers:</i><br/>"
+            "1. <b>AI Intake &amp; OCR Extraction:</b> Go to <b>LG Custody &gt; Record New LG Received</b>. Upload <code>LG_01_Special_Liquidation_Wording_Scan.pdf</code>. Observe AI extracting key fields in &lt;60s and flagging: <i>'Special Liquidation Wording: Requires Original Physical Presentation + FIDIC Engineer Certificate'</i>.<br/>"
+            "2. <b>Near Maturity &amp; Forced Renewal:</b> Upload <code>LG_02_Near_Maturity_Forced_Renewal_Scan.pdf</code> (Expiring in 7 days). Open the action drawer &gt; Click <b>Demand Forced Renewal</b> to auto-generate the official bank instruction letter.<br/>"
+            "3. <b>Evergreen &amp; Auto-Renewal Tracking:</b> Upload <code>LG_03_Auto_Renewal_Notice_Scan.pdf</code>. Review how the system tracks 30-day notice windows without manual reminders.<br/>"
+            "4. <b>6 Supported Lifecycle Actions:</b> Test executing actions on any active custody LG: <i>Extend</i>, <i>Decrease</i>, <i>Liquidate</i>, <i>Amend</i>, <i>Activate</i>, or <i>Release</i> (all protected by Maker-Checker dual authorization).<br/>"
+            "5. <b>Bank Handover &amp; Audit Trail:</b> Test <b>Record Delivery &amp; Bank Reply</b> using <code>LG_04_Bank_Handover_Receipt_Reply_Scan.pdf</code> to record courier tracking and bank confirmation stamps."
         )
         story.append(Paragraph(m4, body_style))
 
         doc.build(story, onFirstPage=lambda c, d: add_page_decorations(c, d, "GROW TREASURY - TESTER PLAYBOOK"),
                            onLaterPages=lambda c, d: add_page_decorations(c, d, "GROW TREASURY - TESTER PLAYBOOK"))
         print(f"[CREATED GUIDE] {filepath}")
+
+def build_evaluator_packages():
+    import shutil
+    packages_root = r"C:\Grow_Project_External_Assets\evaluator_packages"
+    os.makedirs(packages_root, exist_ok=True)
+
+    packages = [
+        ("Package_1_Apex_Global", "Apex_Global_Tester_Guide.pdf"),
+        ("Package_2_Horizon_Infrastructure", "Horizon_Infrastructure_Tester_Guide.pdf"),
+        ("Package_3_Delta_Modern_Owner", "Delta_Modern_Owner_Guide.pdf"),
+    ]
+
+    for pkg_folder, guide_pdf in packages:
+        pkg_dir = os.path.join(packages_root, pkg_folder)
+        if os.path.exists(pkg_dir):
+            shutil.rmtree(pkg_dir)
+        os.makedirs(pkg_dir, exist_ok=True)
+
+        # Copy personalized guide to root of the package
+        src_guide = os.path.join(GUIDES_DIR, guide_pdf)
+        if os.path.exists(src_guide):
+            shutil.copy2(src_guide, os.path.join(pkg_dir, guide_pdf))
+
+        # Copy test document categories
+        setup_dst = os.path.join(pkg_dir, "01_Setup_Documents")
+        issuance_dst = os.path.join(pkg_dir, "02_Issuance_Documents")
+        custody_dst = os.path.join(pkg_dir, "03_Custody_Scans")
+        recon_dst = os.path.join(pkg_dir, "04_Reconciliation_Statements")
+
+        shutil.copytree(SETUP_DIR, setup_dst)
+        shutil.copytree(ISSUANCE_DIR, issuance_dst)
+        shutil.copytree(CUSTODY_DIR, custody_dst)
+        shutil.copytree(RECON_DIR, recon_dst)
+
+        print(f"[PACKAGED] {pkg_folder} ready at {pkg_dir}")
 
 def main():
     print("=" * 60)
@@ -801,18 +839,20 @@ def main():
     create_custody_lg_scans()
     create_reconciliation_excel_statements()
     create_personalized_guides()
+    build_evaluator_packages()
 
     # Sync to external assets folder outside Git
     ext_dest = r"C:\Grow_Project_External_Assets\test_documents_and_guides\test_assets"
     import shutil
     if os.path.exists(BASE_DIR):
-        if os.path.exists(ext_dest):
-            shutil.rmtree(ext_dest)
-        shutil.copytree(BASE_DIR, ext_dest)
-        print(f"[SYNCED] All assets mirrored to {ext_dest}")
+        try:
+            shutil.copytree(BASE_DIR, ext_dest, dirs_exist_ok=True)
+            print(f"[SYNCED] All assets mirrored to {ext_dest}")
+        except Exception as e:
+            print(f"[SYNC WARNING] Partial mirror (some files might be open in Excel/viewer): {e}")
 
     print("\n" + "=" * 60)
-    print("ALL TEST ASSETS & GUIDES SUCCESSFULLY UPDATED & SYNCED OUTSIDE GIT!")
+    print("ALL TEST ASSETS, GUIDES & 3 EVALUATOR PACKAGES READY!")
     print("=" * 60)
 
 if __name__ == "__main__":

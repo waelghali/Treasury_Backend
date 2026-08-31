@@ -14,6 +14,7 @@ import app.models as models
 from app.models import LGDocument, Customer, SubscriptionPlan
 from app.schemas.all_schemas import LGDocumentCreate
 from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME 
+from app.core.storage_service import build_customer_blob_path 
 
 import logging
 logger = logging.getLogger(__name__)
@@ -127,9 +128,9 @@ class CRUDLGDocument(CRUDBase):
             unique_filename = f"{unique_filename}.{file_extension}"
 
         # 3. Construct Hierarchical Path (The Folder Structure)
-        # Structure: customer_{id}/lg_{id}/{type_slug}/{filename}
+        # Structure: {env}/customer_{id}/lg_custody/lg_{id}/{type_slug}/{filename}
         doc_type_slug = _slugify_doc_type(obj_in.document_type)
-        blob_path = f"customer_{customer_id}/lg_{lg_record_id}/{doc_type_slug}/{unique_filename}"
+        blob_path = build_customer_blob_path(customer_id, "lg_custody", f"lg_{lg_record_id}/{doc_type_slug}/{unique_filename}")
 
         # --- CENTRALIZED BUCKET LOOKUP ---
         # If no bucket_name was passed, try to find the customer-specific one

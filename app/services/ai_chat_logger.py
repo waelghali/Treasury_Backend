@@ -144,8 +144,8 @@ class AIChatLogger:
             else:
                 client = storage.Client()
 
-            bucket = client.bucket(bucket_name)
-            blob_name = f"ai_chat_logs/customer_{customer_id}/chat_logs_{date_str}.jsonl"
+            from app.core.storage_service import build_customer_blob_path
+            blob_name = build_customer_blob_path(customer_id, "ai_chat_logs", f"chat_logs_{date_str}.jsonl")
             blob = bucket.blob(blob_name)
 
             new_line = json.dumps(log_payload, ensure_ascii=False) + "\n"

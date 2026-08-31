@@ -39,24 +39,15 @@ async def upload_quotation_documents(
     for file in files:
         file_bytes = await file.read()
         safe_filename = f"{uuid.uuid4().hex[:8]}_{file.filename.replace(' ', '_')}"
-        blob_path = f"quotations/{safe_filename}"
+        from app.core.storage_service import build_customer_blob_path
+        blob_path = build_customer_blob_path(current_user.customer_id, "quotations", f"rfq_docs/{safe_filename}")
         
-        doc_url = None
-        if GCS_BUCKET_NAME:
-            try:
-                gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, file_bytes, file.content_type or "application/octet-stream")
-                if gcs_uri:
-                    signed = await generate_signed_gcs_url(gcs_uri, expiration=604800)
-                    doc_url = signed or gcs_uri
-            except Exception as e:
-                logger.warning(f"GCS upload failed for {file.filename}, falling back to local: {e}")
-
-        if not doc_url:
-            os.makedirs("uploads/quotations", exist_ok=True)
-            local_path = os.path.join("uploads", "quotations", safe_filename)
-            with open(local_path, "wb") as buffer:
-                buffer.write(file_bytes)
-            doc_url = f"/uploads/quotations/{safe_filename}"
+        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, file_bytes, file.content_type or "application/octet-stream")
+        if not gcs_uri:
+            raise HTTPException(status_code=500, detail=f"Failed to upload document {file.filename} to cloud storage")
+        
+        signed = await generate_signed_gcs_url(gcs_uri, expiration=604800)
+        doc_url = signed or gcs_uri
 
         uploaded_files.append({
             "name": file.filename,

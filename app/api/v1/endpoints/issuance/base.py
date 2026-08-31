@@ -405,10 +405,9 @@ async def record_handover(
                 signed_copy_file.filename or "signed_copy"
             )
             
-            # Organized path: customer / requests / req_id / lg / doc_type_slug / file
-            req_id_folder = f"{lg.request_id}" if lg.request_id else "unlinked"
-            doc_type_slug = "handover_signed_copy"
-            gcs_path = f"customer_{current_user.customer_id}/requests/{req_id_folder}/lg_{lg_id}/{doc_type_slug}/{handover_display_name}"
+            # Organized path: {env}/customer_{customer_id}/issuance/issued_lgs/issued_{lg_id}/delivery_proofs/{file}
+            from app.core.storage_service import build_customer_blob_path
+            gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg_id}/delivery_proofs/{handover_display_name}")
             file_content = await signed_copy_file.read()
             stored_uri = await _upload_to_gcs(bucket_name, gcs_path, file_content, signed_copy_file.content_type)
             if stored_uri:
@@ -682,22 +681,12 @@ async def extract_lg_copy(
 
             # Upload to GCS
             from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
-            gcs_path = f"issuance/{current_user.customer_id}/{lg.request_id}/lg_{lg_id}/bank_lg_copy/{bank_lg_copy_display_name}"
-            file_path = None
-            try:
-                gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, file_bytes, file.content_type or "application/octet-stream")
-                if gcs_uri:
-                    file_path = gcs_uri
-                else:
-                    raise Exception("GCS upload returned None")
-            except Exception as gcs_err:
-                import os
-                logger.warning(f"GCS upload failed for BANK_LG_COPY, saving locally: {gcs_err}")
-                upload_dir = os.path.join("uploads", "issuance", str(current_user.customer_id), str(lg.request_id), f"lg_{lg_id}", "bank_lg_copy")
-                os.makedirs(upload_dir, exist_ok=True)
-                file_path = os.path.join(upload_dir, bank_lg_copy_display_name)
-                with open(file_path, "wb") as f_out:
-                    f_out.write(file_bytes)
+            from app.core.storage_service import build_customer_blob_path
+            gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg_id}/bank_lg_copies/{bank_lg_copy_display_name}")
+            gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, file_bytes, file.content_type or "application/octet-stream")
+            if not gcs_uri:
+                raise HTTPException(status_code=500, detail="Failed to upload Bank LG Copy to cloud storage")
+            file_path = gcs_uri
 
             # Deduplicate: Remove previous BANK_LG_COPY documents for this request so only the latest is kept
             db.query(IssuanceRequestDocument).filter(

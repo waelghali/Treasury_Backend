@@ -862,12 +862,13 @@ async def upload_scan_for_ai_extraction(
                 results["errors"].append({"file": fname, "error": "Empty file"})
                 continue
 
-            # Save the original scan to uploads directory
-            upload_dir = os.path.join("uploads", "issuance", "migration", str(current_user.customer_id))
-            os.makedirs(upload_dir, exist_ok=True)
-            scan_path = os.path.join(upload_dir, fname)
-            with open(scan_path, "wb") as f:
-                f.write(content)
+            # Upload the original scan directly to GCS
+            from app.core.storage_service import build_customer_blob_path, upload_bytes_to_gcs
+            blob_path = build_customer_blob_path(current_user.customer_id, "migration", f"scans/{fname}")
+            try:
+                await upload_bytes_to_gcs(blob_path, content, uploaded_file.content_type or "application/pdf")
+            except Exception as upload_err:
+                logger.warning(f"Could not archive migration scan to GCS: {upload_err}")
 
             # Call AI extraction
             extracted_data = await _extract_data_from_scan(content, fname)

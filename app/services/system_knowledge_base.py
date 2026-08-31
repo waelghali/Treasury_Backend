@@ -124,7 +124,10 @@ Calculates a 0-100 score for each available bank facility when recommending opti
 - `PASSWORD_REQUIRE_DIGIT` (Default: `true`)
 - `PASSWORD_RESET_TOKEN_EXPIRY_MINUTES` (Default: `15` min)
 - `GRACE_PERIOD_DAYS` (Default: `14` days)
-- `STORAGE_BUCKET_NAME` (Tenant-specific GCS bucket)
+- `STORAGE_BUCKET_NAME` (Tenant-specific Cloud Storage Bucket):
+  * Allows an enterprise organization to store all uploaded LG scans, amendment copies, and supporting documents in their own dedicated private Google Cloud Storage (GCS) bucket for full data residency and compliance.
+  * Configured via **Sidebar ➔ Configuration ➔ Settings (`/corporate-admin/module-configs`)** or by System Owner during customer onboarding.
+  * In the cloud provider console (Bucket Permissions / IAM), grant the designated **Grow Platform Service Account Email** (obtainable from Grow Support / Onboarding Lead) the **`Storage Object Admin`** role.
 - `TC_VERSION` & `PP_VERSION` (Terms & Conditions, Privacy Policy versions)
 
 4. LG CUSTODY LIFECYCLE ACTIONS & WORKFLOWS
@@ -151,26 +154,36 @@ def get_system_knowledge() -> str:
 def find_relevant_section(query: str) -> str:
     """
     Finds and extracts the most relevant section/bullet point from the master knowledge base
-    based on keywords in the user query, preventing full-manual text dumps.
+    based on keywords in the user query, ignoring header banners.
     """
+    import re
     if not query:
         return ""
-    q_words = set(w.lower() for w in query.split() if len(w) > 3)
+    
+    # Strip punctuation and extract meaningful lowercase words
+    cleaned_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9_-]+\b', query) if len(w) > 2]
+    # Filter out common stop words
+    stop_words = {"how", "can", "the", "what", "with", "from", "your", "that", "this", "have", "setup", "help", "does", "where"}
+    q_words = set(w for w in cleaned_words if w not in stop_words)
+    if not q_words:
+        q_words = set(cleaned_words)
     if not q_words:
         return ""
 
-    # Split by major sections and bullet points
     blocks = SYSTEM_KNOWLEDGE_CONTEXT.split("\n\n")
     best_score = 0
     best_block = ""
 
     for block in blocks:
+        # Skip top-level title banners
+        if "====" in block or "GROW PLATFORM AUTHORITATIVE CAPABILITIES" in block:
+            continue
         b_lower = block.lower()
-        score = sum(2 if w in b_lower else 0 for w in q_words)
-        if score > best_score and len(block.strip()) > 40:
+        score = sum(3 if w in b_lower else 0 for w in q_words)
+        if score > best_score and len(block.strip()) > 30:
             best_score = score
             best_block = block
 
-    if best_score >= 2:
+    if best_score >= 3:
         return best_block.strip()
     return ""

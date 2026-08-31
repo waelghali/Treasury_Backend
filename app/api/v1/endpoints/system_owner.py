@@ -2725,29 +2725,36 @@ def read_audit_logs(
     skip: int = 0, 
     limit: int = 1000,
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    customer_id: Optional[int] = Query(None, description="Filter by customer ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
-    entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., Customer, SubscriptionPlan)"),
+    entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., Customer, User, LGRecord)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
+    start_date: Optional[str] = Query(None, description="Filter logs on or after this date (ISO format or YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter logs on or before this date (ISO format or YYYY-MM-DD)"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("audit_log:view"))
 ):
     """
-    Retrieve a list of audit log entries.
-    System Owners can filter logs but sensitive data should be redacted in the 'details' if present.
+    Retrieve a list of audit log entries for System Owner with enriched human-readable names.
     """
-    logs = crud_audit_log.get_all_logs(
+    from app.crud.crud_audit import enrich_audit_logs
+
+    raw_logs = crud_audit_log.get_all_logs(
         db, 
         skip=skip, 
         limit=limit, 
         user_id=user_id,
         action_type=action_type,
         entity_type=entity_type,
-        entity_id=entity_id
+        entity_id=entity_id,
+        customer_id=customer_id,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
     )
-    for log in logs:
-        setattr(log, 'user_name', log.user.email if log.user else "System")
+    return enrich_audit_logs(db, raw_logs)
 
-    return logs
 
 @router.get(
     "/audit-logs/export-csv",
@@ -2757,67 +2764,63 @@ def read_audit_logs(
 def export_system_owner_audit_logs_to_csv(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("audit_log:view")),
-    # --- Filters copied from read_audit_logs ---
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    customer_id: Optional[int] = Query(None, description="Filter by Customer ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., Customer, SubscriptionPlan)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
-    customer_id: Optional[int] = Query(None, description="Filter by Customer ID") # Add customer_id filter
+    start_date: Optional[str] = Query(None, description="Filter logs on or after this date"),
+    end_date: Optional[str] = Query(None, description="Filter logs on or before this date"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
 ):
     """
     Exports a CSV file of all audit log entries, applying the same filters
-    as the main system owner view.
+    as the main system owner view with enriched names.
     """
-    
-    # --- Re-use the query logic from crud_audit.get_all_logs ---
-    query = db.query(AuditLog).options(
-        selectinload(AuditLog.user),
-        selectinload(AuditLog.lg_record)
+    from app.crud.crud_audit import enrich_audit_logs
+
+    raw_logs = crud_audit_log.get_all_logs(
+        db,
+        skip=0,
+        limit=10000,
+        user_id=user_id,
+        action_type=action_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
     )
-    if user_id:
-        query = query.filter(AuditLog.user_id == user_id)
-    if action_type:
-        query = query.filter(AuditLog.action_type == action_type)
-    if entity_type:
-        query = query.filter(AuditLog.entity_type == entity_type)
-    if entity_id:
-        query = query.filter(AuditLog.entity_id == entity_id)
-    if customer_id:
-        query = query.filter(AuditLog.customer_id == customer_id)
-    
-    # Get all logs, not just a page
-    logs = query.order_by(AuditLog.timestamp.desc()).all()
-    
-    # --- Create CSV in memory ---
+    enriched_logs = enrich_audit_logs(db, raw_logs)
+
     output = io.StringIO()
     writer = csv.writer(output)
-    
-    # Write the header row
+
     headers = [
-        "Timestamp", "User ID", "User Email", "Customer ID", "Action Type", 
-        "Entity Type", "Entity ID", "LG Record ID", "LG Number", "Details", "IP Address"
+        "Timestamp", "User Email", "User ID", "Customer Name", "Customer ID", 
+        "Action Type", "Entity Type", "Entity Name", "Entity ID", "LG Number", "Details", "IP Address"
     ]
     writer.writerow(headers)
-    
-    # Write the data rows
-    for log in logs:
+
+    for log in enriched_logs:
         writer.writerow([
-            log.timestamp.isoformat(),
-            log.user_id,
-            log.user.email if log.user else "System/Unknown",
-            log.customer_id,
-            log.action_type,
-            log.entity_type,
-            log.entity_id,
-            log.lg_record_id,
-            log.lg_record.lg_number if log.lg_record else "N/A",
-            str(log.details), # Flatten details to a string
+            log.timestamp.isoformat() if log.timestamp else "",
+            log.user_name or "System",
+            log.user_id or "",
+            log.customer_name or "N/A",
+            log.customer_id or "",
+            log.action_type or "",
+            log.entity_type or "",
+            log.entity_name or "",
+            log.entity_id or "",
+            log.lg_number or "N/A",
+            str(log.details) if log.details else "",
             log.ip_address or "N/A"
         ])
-    
+
     output.seek(0)
-    
-    # Return the CSV as a file download
+
     return StreamingResponse(
         output,
         media_type="text/csv",
@@ -2826,6 +2829,7 @@ def export_system_owner_audit_logs_to_csv(
         }
     )
 
+
 @router.get("/audit-logs/{log_id}", response_model=AuditLogOut)
 def read_audit_log(
     log_id: int, 
@@ -2833,12 +2837,13 @@ def read_audit_log(
     current_user: TokenData = Depends(HasPermission("audit_log:view"))
 ):
     """
-    Retrieves a single audit log entry by ID.
+    Retrieves a single audit log entry by ID with enriched names.
     """
+    from app.crud.crud_audit import enrich_audit_log
     log = crud_audit_log.get(db, id=log_id)
     if log is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audit log entry not found")
-    return log
+    return enrich_audit_log(db, log)
 
 @router.get("/scheduler/jobs")
 async def get_scheduled_jobs(current_user: Any = Depends(HasPermission("system_owner:view_scheduler"))):

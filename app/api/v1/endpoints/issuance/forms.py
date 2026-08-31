@@ -87,23 +87,12 @@ async def upload_bank_form(
     
     # Upload to Google Cloud Storage
     from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
-    blob_path = f"bank_forms/{bank_id}/{safe_filename}"
-    file_path = None
-    try:
-        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, pdf_bytes, "application/pdf")
-        if gcs_uri:
-            file_path = gcs_uri  # Store the gs:// URI
-        else:
-            raise Exception("GCS upload returned None")
-    except Exception as gcs_err:
-        import logging
-        logging.getLogger(__name__).warning(f"GCS upload failed, saving locally: {gcs_err}")
-        # Fallback: store locally
-        upload_dir = os.path.join("uploads", "bank_forms", str(bank_id))
-        os.makedirs(upload_dir, exist_ok=True)
-        file_path = os.path.join(upload_dir, safe_filename)
-        with open(file_path, "wb") as f:
-            f.write(pdf_bytes)
+    from app.core.storage_service import build_system_blob_path
+    blob_path = build_system_blob_path("bank_forms", f"bank_{bank_id}/{safe_filename}")
+    gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, pdf_bytes, "application/pdf")
+    if not gcs_uri:
+        raise HTTPException(status_code=500, detail="Failed to upload Bank Form to cloud storage")
+    file_path = gcs_uri
     
     # Try to extract interactive form fields
     try:

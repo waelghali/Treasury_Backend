@@ -1506,6 +1506,58 @@ class AIQueryAssistantService:
                 f"👉 [Click here to open New Issuance Request]({nav_base}/issuance/requests/new)"
             )
 
+        # 10. Custom Data Storage Bucket Setup (STORAGE_BUCKET_NAME)
+        if any(w in q_lower for w in [
+            "data bucket", "storage bucket", "custom bucket", "own bucket", "bucket name",
+            "storage_bucket_name", "gcs bucket", "cloud storage", "setup my own bucket", "set up my own data bucket"
+        ]):
+            from app.core.ai_integration import get_service_account_email
+            sa_email = get_service_account_email()
+            return (
+                f"**Setting Up a Custom Dedicated Data Storage Bucket (`STORAGE_BUCKET_NAME`)**:\n\n"
+                f"Grow allows enterprise organizations to store all scanned LG copies, amendment files, and internal supporting documents in their own dedicated Google Cloud Storage (GCS) bucket for full data residency, compliance, and enterprise data ownership:\n\n"
+                f"1. **Create Your Cloud Storage Bucket**:\n"
+                f"   - In your company's Google Cloud Console, create a private storage bucket (e.g. `acme-treasury-guarantee-docs`).\n\n"
+                f"2. **Authorize Grow Access (IAM Permissions)**:\n"
+                f"   - In your Cloud Console, go to your bucket's **Permissions (IAM)** tab.\n"
+                f"   - Click **Grant Access (Add Principal)** and paste the Grow Service Account email for your environment:\n"
+                f"     ```text\n"
+                f"     {sa_email}\n"
+                f"     ```\n"
+                f"   - Assign the role **`Storage Object Admin`** (allows uploading, OCR scanning, and secure viewing of LG documents).\n\n"
+                f"3. **Link the Bucket in Grow**:\n"
+                f"   - Navigate to **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs`).\n"
+                f"   - Locate **Group 5: Security, Authentication & Platform Policies**.\n"
+                f"   - Enter your bucket name in **`STORAGE_BUCKET_NAME`**.\n"
+                f"   - Click **Save Changes** at the bottom of the page.{role_note}\n\n"
+                f"👉 [Open Platform Settings]({nav_base}/module-configs)"
+            )
+
+        # Dynamic AI synthesis using Grounding Knowledge Base
+        try:
+            from app.core.ai_integration import _get_genai_client, GEMINI_MODEL_NAME
+            from app.services.system_knowledge_base import get_system_knowledge
+            client = _get_genai_client()
+            if client:
+                kb_context = get_system_knowledge()
+                prompt = (
+                    f"You are the Grow Platform & Treasury Assistant. A user ({user_email}, role: {role_label}) asked:\n"
+                    f"\"{user_question}\"\n\n"
+                    f"Using the authoritative platform knowledge base below, give a clear, accurate, step-by-step guidance response formatted in Markdown.\n"
+                    f"Always maintain enterprise treasury professional tone and reference the appropriate navigation paths if applicable.\n\n"
+                    f"--- PLATFORM KNOWLEDGE BASE ---\n"
+                    f"{kb_context}\n"
+                    f"--- END KNOWLEDGE BASE ---"
+                )
+                res = client.models.generate_content(
+                    model=GEMINI_MODEL_NAME,
+                    contents=prompt
+                )
+                if res and res.text and len(res.text.strip()) > 30:
+                    return res.text.strip() + f"\n\n👉 [Open Platform Dashboard]({nav_base}/dashboard)"
+        except Exception as e:
+            logger.warning(f"Dynamic system help GenAI call failed: {e}")
+
         # Smart Section Matching fallback (prevents full-manual text dumps)
         from app.services.system_knowledge_base import find_relevant_section
         relevant_section = find_relevant_section(user_question)
@@ -1523,7 +1575,7 @@ class AIQueryAssistantService:
             f"**Common Topics You Can Ask About**:\n"
             f"- **LG Custody (Inbound)**: *\"How do I record a new LG?\"*, *\"How do I extend validity?\"*, *\"How do I share LG data?\"*\n"
             f"- **LG Issuance (Outbound)**: *\"How do I create a new request?\"*, *\"What does Generate Invite do?\"*, *\"How do approval matrices work?\"*\n"
-            f"- **Organization Settings**: *\"How to change forced renewal days?\"*, *\"How to make delivery receipts mandatory?\"*, *\"How to CC manager in emails?\"*\n\n"
+            f"- **Organization Settings**: *\"How to change forced renewal days?\"*, *\"How to configure custom storage bucket?\"*, *\"How to CC manager in emails?\"*\n\n"
             f"👉 [Open Platform Dashboard]({nav_base}/dashboard)"
         )
 

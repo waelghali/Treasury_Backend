@@ -136,6 +136,15 @@ class ReconciliationService:
 
             session.parsing_method = method
 
+            # Archive raw uploaded file to GCS
+            from app.core.storage_service import build_customer_blob_path, upload_bytes_to_gcs
+            blob_path = build_customer_blob_path(customer_id, "reconciliation/lg_positions", f"session_{session.id}/{file_name}")
+            try:
+                gcs_uri = await upload_bytes_to_gcs(blob_path, file_bytes)
+                session.uploaded_file_path = gcs_uri
+            except Exception as upload_err:
+                logger.warning(f"Could not archive reconciliation file to GCS: {upload_err}")
+
             # Create bank rows
             for row_data in rows:
                 bank_row = ReconciliationBankRow(

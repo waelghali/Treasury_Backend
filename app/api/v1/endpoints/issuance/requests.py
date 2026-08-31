@@ -955,10 +955,10 @@ async def upload_request_document(
     # Generate unique filename
     unique_filename = f"{document_type}_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
     
-    # Construct GCS path: customer / request / lg (if known) / doc_type / file
+    # Construct GCS path: {env}/customer_{customer_id}/issuance/requests/req_{request_id}/{doc_type_slug}/{unique_filename}
+    from app.core.storage_service import build_customer_blob_path
     doc_type_slug = _slugify_doc_type(document_type)
-    lg_folder = f"lg_{request.issued_lg_id}" if hasattr(request, 'issued_lg_id') and request.issued_lg_id else "request_docs"
-    blob_path = f"customer_{current_user.customer_id}/requests/{request_id}/{lg_folder}/{doc_type_slug}/{unique_filename}"
+    blob_path = build_customer_blob_path(current_user.customer_id, "issuance/requests", f"req_{request_id}/{doc_type_slug}/{unique_filename}")
     
     # Get customer-specific bucket or fallback
     from app.crud import crud_customer_configuration

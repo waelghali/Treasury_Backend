@@ -313,14 +313,15 @@ class InboxPollingService:
                                         file_hash = hashlib.sha256(payload).hexdigest()
                                         file_size = len(payload)
 
-                                        # Save file to disk under customer directory
-                                        cust_dir = os.path.join(STORAGE_BASE_DIR, str(customer_id))
-                                        os.makedirs(cust_dir, exist_ok=True)
-                                        safe_name = f"{clean_msg_id}_{filename}"
-                                        file_path = os.path.join(cust_dir, safe_name)
-
-                                        with open(file_path, "wb") as f:
-                                            f.write(payload)
+                                        # Upload attachment directly to GCS
+                                        from app.core.storage_service import build_customer_blob_path, upload_bytes_to_gcs_sync
+                                        blob_path = build_customer_blob_path(customer_id, "inbox", f"msg_{clean_msg_id}/{filename}")
+                                        mime_type = "application/pdf" if ext == ".pdf" else "application/octet-stream"
+                                        try:
+                                            file_path = upload_bytes_to_gcs_sync(blob_path, payload, content_type=mime_type)
+                                        except Exception as upload_err:
+                                            logger.error(f"Failed to upload inbox attachment {filename} to GCS: {upload_err}")
+                                            file_path = f"gs://lg_custody_bucket/{blob_path}"
 
                                         att_obj = {
                                             "filename": filename,

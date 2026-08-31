@@ -1544,86 +1544,36 @@ def read_corporate_admin_audit_logs(
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., User, CustomerEntity)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
-    lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)")
+    lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)"),
+    start_date: Optional[str] = Query(None, description="Filter logs on or after this date"),
+    end_date: Optional[str] = Query(None, description="Filter logs on or before this date"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
 ):
     """
     Retrieves a list of audit log entries for the authenticated Corporate Admin's customer.
     Filters are applied on top of the customer scope. Includes user and entity names.
     """
-    customer_id = corporate_admin_context.customer_id
-    
-    logs_query = db.query(models.AuditLog).options(
-        selectinload(models.AuditLog.user),
-        selectinload(models.AuditLog.lg_record)
-    ).filter(models.AuditLog.customer_id == customer_id)
-    
-    if user_id is not None:
-        logs_query = logs_query.filter(models.AuditLog.user_id == user_id)
-    if action_type:
-        logs_query = logs_query.filter(func.lower(models.AuditLog.action_type) == func.lower(action_type))
-    if entity_type:
-        logs_query = logs_query.filter(func.lower(models.AuditLog.entity_type) == func.lower(entity_type))
-    if entity_id is not None:
-        logs_query = logs_query.filter(models.AuditLog.entity_id == entity_id)
-    if lg_record_id is not None:
-        logs_query = logs_query.filter(models.AuditLog.lg_record_id == lg_record_id)
-        
-    logs = logs_query.order_by(models.AuditLog.timestamp.desc()).offset(skip).limit(limit).all()
-    
-    output_logs = []
-    for log in logs:
-        user_name = log.user.email if log.user else "System"
-        
-        entity_name = None
-        lg_number = None
+    from app.crud.crud_audit import enrich_audit_logs
 
-        if log.lg_record:
-            lg_number = log.lg_record.lg_number
-            entity_name = lg_number
-        elif log.entity_type == "User" and log.entity_id:
-            entity = db.query(models.User).filter(models.User.id == log.entity_id).first()
-            entity_name = entity.email if entity else "Unknown User"
-        elif log.entity_type == "CustomerEntity" and log.entity_id:
-            entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == log.entity_id).first()
-            entity_name = entity.entity_name if entity else "Unknown Entity"
-        elif log.entity_type == "Customer" and log.entity_id:
-            customer = db.query(models.Customer).filter(models.Customer.id == log.entity_id).first()
-            entity_name = customer.name if customer else "Unknown Customer"
-        elif log.entity_type == "LGCategory" and log.entity_id:
-            category = db.query(models.LGCategory).filter(models.LGCategory.id == log.entity_id).first()
-            entity_name = category.name if category else "Unknown Category"
-        elif log.entity_type == "ApprovalRequest" and log.entity_id:
-            # For approval requests, the entity name should be the action type on the LG
-            entity_name = f"{log.action_type.replace('_', ' ').title()}"
-            if log.lg_record:
-                lg_number = log.lg_record.lg_number
-        elif log.entity_type == "LGInstruction" and log.entity_id:
-            # For instructions, the entity name should be the serial number, and LG number should be separate
-            instruction = db.query(models.LGInstruction).filter(models.LGInstruction.id == log.entity_id).first()
-            entity_name = instruction.serial_number if instruction else f"Instruction ID: {log.entity_id}"
-            if log.lg_record:
-                lg_number = log.lg_record.lg_number
-        else:
-            entity_name = log.entity_type
-            
-        # Construct the output object
-        output_logs.append(AuditLogOut(
-            id=log.id,
-            timestamp=log.timestamp,
-            user_id=log.user_id,
-            user_name=user_name,
-            action_type=log.action_type,
-            entity_type=log.entity_type,
-            entity_id=log.entity_id,
-            entity_name=entity_name,
-            lg_number=lg_number,
-            details=log.details,
-            customer_id=log.customer_id,
-            lg_record_id=log.lg_record_id,
-            ip_address=log.ip_address
-        ))
-    
-    return output_logs
+    customer_id = corporate_admin_context.customer_id
+
+    raw_logs = crud_audit_log.get_all_logs(
+        db,
+        skip=skip,
+        limit=limit,
+        user_id=user_id,
+        action_type=action_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        lg_record_id=lg_record_id,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
+    )
+
+    return enrich_audit_logs(db, raw_logs)
+
 
 @router.get(
     "/audit-logs/export-csv",
@@ -1634,109 +1584,62 @@ def read_corporate_admin_audit_logs(
 def export_corporate_admin_audit_logs_to_csv(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(HasPermission("audit_log:view")),
-    # --- Filters copied from read_corporate_admin_audit_logs ---
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., User, CustomerEntity)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
-    lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)")
+    lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)"),
+    start_date: Optional[str] = Query(None, description="Filter logs on or after this date"),
+    end_date: Optional[str] = Query(None, description="Filter logs on or before this date"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
 ):
     """
     Exports a CSV file of audit log entries for the authenticated Corporate Admin's customer,
     applying the same filters as the main view.
     """
+    from app.crud.crud_audit import enrich_audit_logs
+
     customer_id = corporate_admin_context.customer_id
-    
-    # --- Re-use the query logic from read_corporate_admin_audit_logs ---
-    logs_query = db.query(models.AuditLog).options(
-        selectinload(models.AuditLog.user),
-        selectinload(models.AuditLog.lg_record)
-    ).filter(models.AuditLog.customer_id == customer_id)
-    
-    if user_id is not None:
-        logs_query = logs_query.filter(models.AuditLog.user_id == user_id)
-    if action_type:
-        logs_query = logs_query.filter(func.lower(models.AuditLog.action_type) == func.lower(action_type))
-    if entity_type:
-        logs_query = logs_query.filter(func.lower(models.AuditLog.entity_type) == func.lower(entity_type))
-    if entity_id is not None:
-        logs_query = logs_query.filter(models.AuditLog.entity_id == entity_id)
-    if lg_record_id is not None:
-        logs_query = logs_query.filter(models.AuditLog.lg_record_id == lg_record_id)
-        
-    # Get all logs, not just a page
-    logs = logs_query.order_by(models.AuditLog.timestamp.desc()).all()
-    
-    processed_logs = []
-    # --- Re-use the processing logic from read_corporate_admin_audit_logs ---
-    for log in logs:
-        user_name = log.user.email if log.user else "System"
-        
-        entity_name = None
-        lg_number = None
 
-        if log.lg_record:
-            lg_number = log.lg_record.lg_number
-            # Default entity_name to lg_number if it exists
-            entity_name = lg_number
-        
-        if log.entity_type == "User" and log.entity_id:
-            entity = db.query(models.User).filter(models.User.id == log.entity_id).first()
-            entity_name = entity.email if entity else "Unknown User"
-        elif log.entity_type == "CustomerEntity" and log.entity_id:
-            entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == log.entity_id).first()
-            entity_name = entity.entity_name if entity else "Unknown Entity"
-        elif log.entity_type == "Customer" and log.entity_id:
-            customer = db.query(models.Customer).filter(models.Customer.id == log.entity_id).first()
-            entity_name = customer.name if customer else "Unknown Customer"
-        elif log.entity_type == "LGCategory" and log.entity_id:
-            category = db.query(models.LGCategory).filter(models.LGCategory.id == log.entity_id).first()
-            entity_name = category.name if category else "Unknown Category"
-        elif log.entity_type == "ApprovalRequest" and log.entity_id:
-            entity_name = f"{log.action_type.replace('_', ' ').title()}"
-            # lg_number is already set if log.lg_record exists
-        elif log.entity_type == "LGInstruction" and log.entity_id:
-            instruction = db.query(models.LGInstruction).filter(models.LGInstruction.id == log.entity_id).first()
-            entity_name = instruction.serial_number if instruction else f"Instruction ID: {log.entity_id}"
-            # lg_number is already set if log.lg_record exists
-        elif not entity_name: # Fallback if not set by lg_record or other types
-            entity_name = log.entity_type
+    raw_logs = crud_audit_log.get_all_logs(
+        db,
+        skip=0,
+        limit=10000,
+        user_id=user_id,
+        action_type=action_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        customer_id=customer_id,
+        lg_record_id=lg_record_id,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
+    )
 
-        processed_logs.append({
-            "timestamp": log.timestamp.isoformat(),
-            "user_name": user_name,
-            "action_type": log.action_type,
-            "entity_type": log.entity_type,
-            "entity_name": entity_name,
-            "lg_number": lg_number or "N/A",
-            "details": str(log.details), # Flatten details to a string for CSV
-            "ip_address": log.ip_address or "N/A"
-        })
+    enriched_logs = enrich_audit_logs(db, raw_logs)
 
-    # --- Create CSV in memory ---
     output = io.StringIO()
     writer = csv.writer(output)
-    
-    # Write the header row
-    headers = ["Timestamp", "User Name", "Action Type", "Entity Type", "Entity Name", "LG Number", "Details", "IP Address"]
+
+    headers = ["Timestamp", "User Email", "User ID", "Action Type", "Entity Type", "Entity Name", "Entity ID", "LG Number", "Details", "IP Address"]
     writer.writerow(headers)
-    
-    # Write the data rows
-    for log in processed_logs:
+
+    for log in enriched_logs:
         writer.writerow([
-            log["timestamp"],
-            log["user_name"],
-            log["action_type"],
-            log["entity_type"],
-            log["entity_name"],
-            log["lg_number"],
-            log["details"],
-            log["ip_address"]
+            log.timestamp.isoformat() if log.timestamp else "",
+            log.user_name or "System",
+            log.user_id or "",
+            log.action_type or "",
+            log.entity_type or "",
+            log.entity_name or "",
+            log.entity_id or "",
+            log.lg_number or "N/A",
+            str(log.details) if log.details else "",
+            log.ip_address or "N/A"
         ])
-    
+
     output.seek(0)
-    
-    # Return the CSV as a file download
+
     return StreamingResponse(
         output,
         media_type="text/csv",
