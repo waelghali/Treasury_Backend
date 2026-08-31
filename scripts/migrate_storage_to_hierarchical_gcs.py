@@ -111,10 +111,13 @@ def run_migration(dry_run: bool = True, target_env: str = "production", db_url: 
             pool_recycle=300,
             connect_args={"connect_timeout": 30, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 5}
         )
-        Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Session = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
         db = Session()
     else:
-        db = SessionLocal()
+        from sqlalchemy.orm import sessionmaker
+        from app.database import engine
+        Session = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
+        db = Session()
 
     client = _get_gcs_client() if not dry_run else None
 
@@ -137,7 +140,7 @@ def run_migration(dry_run: bool = True, target_env: str = "production", db_url: 
         records = query.all()
         print(f"\n--- Scanning {model_name} ({len(records)} active records) ---")
 
-        for rec in records:
+        for idx, rec in enumerate(records, 1):
             total_scanned += 1
             current_uri = getattr(rec, url_field, None)
             if not current_uri or not current_uri.startswith("gs://"):
@@ -176,12 +179,19 @@ def run_migration(dry_run: bool = True, target_env: str = "production", db_url: 
 
                     # Update DB record pointer
                     setattr(rec, url_field, target_uri)
-                    db.commit()
+                    if idx % 10 == 0:
+                        db.commit()
                     print(f"  ✅ [MIGRATED] ID {rec.id} -> {target_uri}")
                 except Exception as err:
                     db.rollback()
                     logger.error(f"Failed to migrate record {rec.id} ({current_uri}): {err}")
                     total_errors += 1
+
+        if not dry_run:
+            try:
+                db.commit()
+            except Exception:
+                pass
 
     db.close()
 
