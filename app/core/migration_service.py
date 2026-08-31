@@ -528,6 +528,7 @@ class MigrationService:
                 user_id=user_id,
                 ai_scan_file_content=None,
                 internal_supporting_document_file_content=None,
+                allow_past_expiry=True,
             )
             
             new_lg_record.migration_source = 'LEGACY'

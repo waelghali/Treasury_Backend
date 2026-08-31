@@ -395,6 +395,13 @@ async def create_lg_record(
             detail=f"Error validating LG record data: {e}"
         )
     
+    # Reject expired LGs during operational recording
+    if lg_record_in.expiry_date and lg_record_in.expiry_date < date.today():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot record an expired LG. The Expiry Date must be today or in the future. For historical data or LGs that have been extended, please record them through the Migration Hub."
+        )
+
     # NEW LOGIC: Conditional validation for Foreign Bank details and Advising Status
     foreign_bank = db.query(models.Bank).filter(models.Bank.name == "Foreign Bank", models.Bank.is_deleted == False).first()
     if foreign_bank and lg_record_in.issuing_bank_id == foreign_bank.id:

@@ -130,7 +130,13 @@ class CRUDLGRecord(CRUDBase):
 
     async def create(self, db: Session, obj_in: LGRecordCreate, customer_id: int, user_id: int,
                  ai_scan_file_content: Optional[bytes] = None,
-                 internal_supporting_document_file_content: Optional[bytes] = None) -> models.LGRecord:
+                 internal_supporting_document_file_content: Optional[bytes] = None,
+                 allow_past_expiry: bool = False) -> models.LGRecord:
+        if not allow_past_expiry and obj_in.expiry_date and obj_in.expiry_date < date.today():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot record an expired LG. The Expiry Date must be today or in the future. For historical data or LGs that have been extended, please record them through the Migration Hub."
+            )
         existing_lg = self.get_by_lg_number(db, obj_in.lg_number)
         if existing_lg:
             raise HTTPException(
