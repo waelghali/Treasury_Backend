@@ -571,15 +571,22 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
         
         for page_num in range(num_pages):
             page = pdf_document.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
-            img_bytes = pix.pil_tobytes(format="PNG")
+            pix = page.get_pixmap(matrix=fitz.Matrix(260/72, 260/72))
+            img_bytes = pix.pil_tobytes(format="JPEG", quality=95)
             
-            blob_name = f"lg_scans_temp/{lg_number}/page_{page_num + 1}_{uuid.uuid4().hex}.png"
-            gcs_uri = await _upload_to_gcs(bucket_name, blob_name, img_bytes, "image/png")
+            blob_name = f"lg_scans_temp/{lg_number}/page_{page_num + 1}_{uuid.uuid4().hex}.jpg"
+            gcs_uri = await _upload_to_gcs(bucket_name, blob_name, img_bytes, "image/jpeg")
             if gcs_uri:
                 image_uris.append(gcs_uri)
             else:
                 logger.warning(f"Failed to upload image for page {page_num + 1} of PDF.")
+            
+            # Immediately reclaim per-page raw pixel and compression buffers
+            del pix
+            del img_bytes
+            import gc
+            gc.collect()
+
         logger.info(f"Successfully converted PDF to {len(image_uris)} images and uploaded to GCS.")
     except Exception as e:
         logger.error(f"Error converting PDF to images or uploading to GCS: {e}", exc_info=True)
@@ -615,9 +622,13 @@ async def _log_ai_usage_to_db(db: Session, current_user: "User", file_name: str,
             total_pages=metadata.get("total_pages_processed", 0)
         )
         db.add(usage_log)
-        await db.commit()
+        db.commit()
         logger.info(f"AI Usage Log saved for customer {current_user.customer_id}")
     except Exception as log_err:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.error(f"Failed to save AI usage log: {log_err}")
 
 

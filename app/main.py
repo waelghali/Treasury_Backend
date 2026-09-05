@@ -397,7 +397,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "func": app_background_tasks.run_hourly_cbe_news_sync,
                 "id": "cbe_news_hourly_job",
                 "name": "Hourly CBE News Sync",
-                "minute": 0,         # Run at the start of the hour
+                "minute": 12,        # Offset slightly from :00 to prevent concurrent memory collision with email polling
                 "trigger_type": "hourly",
                 "args": []
             },
@@ -519,6 +519,14 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "name": "Smart Inbox Scheduled Outbound Requests",
                 "hours": [8],
                 "minute": 0,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_memory_maintenance,
+                "id": "memory_maintenance_daily_job",
+                "name": "Daily Off-Peak Memory Maintenance",
+                "hours": [3],
+                "minute": 15,
                 "args": []
             }
         ]

@@ -782,6 +782,15 @@ async def run_hourly_cbe_news_sync(db: Session):
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to sync CBE news: {e}")
+    finally:
+        try:
+            del news_items
+            del soup
+            del response
+        except Exception:
+            pass
+        import gc
+        gc.collect()
 
 
 async def run_daily_exchange_rate_sync(db: Session):
@@ -2491,4 +2500,30 @@ async def run_inbox_scheduled_outbound(db: Session):
         await asyncio.to_thread(inbox_outbound_service.send_scheduled_requests, db)
     except Exception as e:
         logger.error(f"Error in Smart Inbox scheduled outbound job: {e}", exc_info=True)
+
+
+async def run_daily_memory_maintenance(db: Session):
+    """
+    Daily off-peak system memory defragmentation (scheduled at 3:15 AM Cairo time).
+    1. Triggers Python generational garbage collection.
+    2. On Linux containers (Render), invokes glibc malloc_trim(0) to release freed heap pages back to the OS.
+    """
+    logger.info("Running daily off-peak system memory maintenance & defragmentation...")
+    try:
+        import gc
+        collected = gc.collect()
+        logger.info(f"Garbage collector freed {collected} cyclical objects.")
+        
+        # Release unmapped C/glibc heap pages back to the operating system
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            res = libc.malloc_trim(0)
+            logger.info(f"Linux glibc malloc_trim(0) executed with result: {res}")
+        except Exception as trim_err:
+            logger.debug(f"malloc_trim skipped (non-Linux or glibc unavailable): {trim_err}")
+            
+    except Exception as e:
+        logger.warning(f"Error during memory maintenance job: {e}")
+
 
