@@ -57,10 +57,10 @@ from app.constants import (
     UserRole # ADDED in the previous turn
 )
 from app.services.email_digest_service import build_lg_renewal_digest_html
-from app.services.unified_email_builder import build_transaction_email_html, build_standard_email_html
+from app.services.unified_email_builder import build_transaction_email_html, build_standard_email_html, build_alert_email_html
 
 
-from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
+from app.core.email_service import EmailSettings, EmailAttachment, get_global_email_settings, send_email, get_customer_email_settings
 from app.core.document_generator import generate_pdf_from_html
 from app.core.ai_integration import process_lg_document_with_ai, GCS_BUCKET_NAME
 
@@ -478,33 +478,50 @@ class CRUDLGRecord(CRUDBase):
                     models.LGDocument.is_deleted == False
                 ).first()
 
-                if lg_document:
-                    # In a real-world scenario, you would need to download the file from GCS
-                    # using the `lg_document.file_path` and store it in memory.
-                    # For this example, we'll simulate the file content.
+                if lg_document and lg_document.file_path:
                     try:
-                        # Placeholder for GCS download function
-                        # from app.core.ai_integration import _download_from_gcs
-                        # file_content = await _download_from_gcs(lg_document.file_path)
-                        file_content = b"This is a placeholder for the LG document content."
+                        from app.core.storage_service import download_bytes_from_gcs
+                        file_content, content_type = await download_bytes_from_gcs(lg_document.file_path)
                         attachments.append(EmailAttachment(
-                            filename=lg_document.file_name,
+                            filename=lg_document.file_name or "LG_Document.pdf",
                             content=file_content,
-                            mime_type=lg_document.mime_type
+                            mime_type=lg_document.mime_type or content_type
                         ))
                     except Exception as e:
                         logger.error(f"Failed to retrieve LG document from GCS for email attachment: {e}")
 
-                # 5. Get email settings and send the email
+                # 5. Get email settings and send structured corporate transaction email
                 email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer_id)
                 
-                # Replace placeholders in subject/body templates
-                subject = notification_template.subject
-                body_html = notification_template.content
-                for key, value in template_data.items():
-                    str_value = str(value) if value is not None else ""
-                    subject = subject.replace(f"{{{{{key}}}}}", str_value)
-                    body_html = body_html.replace(f"{{{{{key}}}}}", str_value)
+                subject = f"New LG Recorded: LG #{db_lg_record.lg_number} ({db_lg_record.customer.name})"
+                if notification_template and notification_template.subject:
+                    custom_subj = notification_template.subject
+                    for k, v in template_data.items():
+                        custom_subj = custom_subj.replace(f"{{{{{k}}}}}", str(v) if v is not None else "")
+                    if custom_subj.strip():
+                        subject = custom_subj
+
+                body_html = build_transaction_email_html(
+                    customer_name=db_lg_record.customer.name if db_lg_record.customer else "Grow Treasury",
+                    title="📝 New Letter of Guarantee Recorded",
+                    transaction_ref=db_lg_record.lg_number,
+                    transaction_type="New LG Registration",
+                    key_value_dict={
+                        "LG Number": db_lg_record.lg_number,
+                        "Issuing Bank": db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "N/A",
+                        "Beneficiary": db_lg_record.beneficiary_corporate.entity_name if db_lg_record.beneficiary_corporate else "N/A",
+                        "LG Type": db_lg_record.lg_type.name if db_lg_record.lg_type else "N/A",
+                        "Category": db_lg_record.lg_category.name if db_lg_record.lg_category else "N/A",
+                        "Amount": f"{db_lg_record.lg_currency.symbol if db_lg_record.lg_currency else ''} {float(db_lg_record.lg_amount):,.2f} ({db_lg_record.lg_currency.iso_code if db_lg_record.lg_currency else ''})",
+                        "Issue Date": str(db_lg_record.issue_date) if db_lg_record.issue_date else "N/A",
+                        "Expiry Date": f"<span style='color: #16a34a; font-weight: 700;'>{str(db_lg_record.expiry_date)}</span>" if db_lg_record.expiry_date else "N/A",
+                        "Internal Owner": db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "N/A",
+                    },
+                    summary_text=f"A new Letter of Guarantee (#{db_lg_record.lg_number}) has been recorded into the Grow BD Treasury Platform and registered under your custody.",
+                    cta_text="View LG Details",
+                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                    recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
+                )
 
                 email_sent_successfully = await send_email(
                     db=db,
@@ -2775,6 +2792,27 @@ class CRUDLGRecord(CRUDBase):
             email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
             email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
 
+        alert_type = "critical" if is_urgent else "warning"
+        details_table = f"""
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+            <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 9px 12px; font-weight: 600; color: #475569; width: 35%;">LG Number</td><td style="padding: 9px 12px; font-weight: 700; color: #0f172a;">{lg_record.lg_number}</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0; background-color: #f8fafc;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Issuing Bank</td><td style="padding: 9px 12px; color: #0f172a;">{lg_record.issuing_bank.name if lg_record.issuing_bank else 'N/A'}</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Amount</td><td style="padding: 9px 12px; font-weight: 700; color: #0f172a;">{template_data['lg_amount_formatted']}</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0; background-color: #f8fafc;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Expiry Date</td><td style="padding: 9px 12px; font-weight: 700; color: {'#dc2626' if is_urgent else '#d97706'};">{lg_record.expiry_date.strftime('%Y-%m-%d')} ({days_until_expiry} days remaining)</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Auto Renewal</td><td style="padding: 9px 12px; color: #0f172a;">{template_data['auto_renewal_status']}</td></tr>
+        </table>
+        """
+        email_body_html = build_alert_email_html(
+            customer_name=lg_record.customer.name,
+            title=f"LG #{lg_record.lg_number} Renewal Reminder",
+            alert_type=alert_type,
+            message=f"Letter of Guarantee #{lg_record.lg_number} will expire on {lg_record.expiry_date.strftime('%Y-%m-%d')} ({days_until_expiry} days remaining). Please initiate renewal or release actions.",
+            details_table_html=details_table,
+            cta_text="View LG in System",
+            cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+            recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
+        )
+
         email_sent_successfully = await send_email(
             db=db,
             to_emails=to_emails,
@@ -3502,6 +3540,25 @@ class CRUDLGRecord(CRUDBase):
             str_value = str(value) if value is not None else ""
             email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
             email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
+
+        details_table = f"""
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+            <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 9px 12px; font-weight: 600; color: #475569; width: 35%;">LG Number</td><td style="padding: 9px 12px; font-weight: 700; color: #0f172a;">{lg_record.lg_number}</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0; background-color: #f8fafc;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Issuing Bank</td><td style="padding: 9px 12px; color: #0f172a;">{lg_record.issuing_bank.name if lg_record.issuing_bank else 'N/A'}</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Amount</td><td style="padding: 9px 12px; font-weight: 700; color: #0f172a;">{template_data['lg_amount_formatted']}</td></tr>
+            <tr style="border-bottom: 1px solid #e2e8f0; background-color: #f8fafc;"><td style="padding: 9px 12px; font-weight: 600; color: #475569;">Expiry Date</td><td style="padding: 9px 12px; font-weight: 700; color: #d97706;">{lg_record.expiry_date.strftime('%Y-%m-%d')} ({days_until_expiry} days remaining)</td></tr>
+        </table>
+        """
+        email_body_html = build_alert_email_html(
+            customer_name=lg_record.customer.name,
+            title=f"Action Required: LG #{lg_record.lg_number} Renewal",
+            alert_type="warning",
+            message=f"Letter of Guarantee #{lg_record.lg_number} registered under your custody will expire on {lg_record.expiry_date.strftime('%Y-%m-%d')} ({days_until_expiry} days remaining). Please coordinate renewal or release actions.",
+            details_table_html=details_table,
+            cta_text="View LG in System",
+            cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+            recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
+        )
 
         email_sent_successfully = await send_email(
             db=db,

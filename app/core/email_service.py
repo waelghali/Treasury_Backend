@@ -169,16 +169,45 @@ async def send_email(
         if cc_emails:
             msg['Cc'] = ", ".join(cc_emails)
 
-        msg.attach(MIMEText(body_template, 'html'))
+        # Ensure all outgoing emails have high-aesthetic corporate SaaS styling
+        body_to_send = body_template or ""
+        body_lower = body_to_send.strip().lower()
+        if "<!doctype html" not in body_lower and "<html" not in body_lower:
+            from app.services.unified_email_builder import build_standard_email_html
+            cust_name = sender_name or getattr(email_settings, 'sender_display_name', None) or "Grow Treasury"
+            
+            # Format plain-text / newlines if not already using HTML block elements
+            if "<p" not in body_lower and "<div" not in body_lower and "<table" not in body_lower:
+                paragraphs = [f"<p style='margin: 0 0 14px 0; line-height: 1.6; color: #334155;'>{p.strip().replace(chr(10), '<br/>')}</p>" for p in body_to_send.split("\n\n") if p.strip()]
+                formatted_body = "".join(paragraphs) if paragraphs else f"<p style='margin: 0; line-height: 1.6; color: #334155;'>{body_to_send.replace(chr(10), '<br/>')}</p>"
+            else:
+                formatted_body = body_to_send
+
+            body_to_send = build_standard_email_html(
+                customer_name=cust_name,
+                title=subject_template,
+                content_html=formatted_body,
+                platform_name="Grow BD Treasury Platform"
+            )
+
+        msg.attach(MIMEText(body_to_send, 'html'))
 
         # 2. Handle Attachments
         if attachments:
             for att in attachments:
-                main_type, sub_type = att.mime_type.split('/', 1)
+                mime_type = att.mime_type or "application/octet-stream"
+                if '/' in mime_type:
+                    main_type, sub_type = mime_type.split('/', 1)
+                else:
+                    main_type, sub_type = "application", "octet-stream"
                 part = MIMEBase(main_type, sub_type)
                 part.set_payload(att.content)
                 encoders.encode_base64(part)
-                part.add_header('Content-Disposition', f'attachment; filename="{att.filename}"')
+                try:
+                    att.filename.encode('ascii')
+                    part.add_header('Content-Disposition', 'attachment', filename=att.filename)
+                except (UnicodeEncodeError, AttributeError):
+                    part.add_header('Content-Disposition', 'attachment', filename=('utf-8', '', att.filename or "attachment.pdf"))
                 msg.attach(part)
 
         # 3. Consolidate Recipients
