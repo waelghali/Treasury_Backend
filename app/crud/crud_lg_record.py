@@ -501,6 +501,12 @@ class CRUDLGRecord(CRUDBase):
                     if custom_subj.strip():
                         subject = custom_subj
 
+                issue_date_val = getattr(db_lg_record, 'issuance_date', None)
+                issue_date_str = issue_date_val.strftime('%Y-%m-%d') if (issue_date_val and hasattr(issue_date_val, 'strftime')) else (str(issue_date_val) if issue_date_val else "N/A")
+
+                expiry_date_val = getattr(db_lg_record, 'expiry_date', None)
+                expiry_date_str = expiry_date_val.strftime('%Y-%m-%d') if (expiry_date_val and hasattr(expiry_date_val, 'strftime')) else (str(expiry_date_val) if expiry_date_val else "N/A")
+
                 body_html = build_transaction_email_html(
                     customer_name=db_lg_record.customer.name if db_lg_record.customer else "Grow Treasury",
                     title="📝 New Letter of Guarantee Recorded",
@@ -513,8 +519,8 @@ class CRUDLGRecord(CRUDBase):
                         "LG Type": db_lg_record.lg_type.name if db_lg_record.lg_type else "N/A",
                         "Category": db_lg_record.lg_category.name if db_lg_record.lg_category else "N/A",
                         "Amount": f"{db_lg_record.lg_currency.symbol if db_lg_record.lg_currency else ''} {float(db_lg_record.lg_amount):,.2f} ({db_lg_record.lg_currency.iso_code if db_lg_record.lg_currency else ''})",
-                        "Issue Date": str(db_lg_record.issue_date) if db_lg_record.issue_date else "N/A",
-                        "Expiry Date": f"<span style='color: #16a34a; font-weight: 700;'>{str(db_lg_record.expiry_date)}</span>" if db_lg_record.expiry_date else "N/A",
+                        "Issue Date": issue_date_str,
+                        "Expiry Date": f"<span style='color: #16a34a; font-weight: 700;'>{expiry_date_str}</span>",
                         "Internal Owner": db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "N/A",
                     },
                     summary_text=f"A new Letter of Guarantee (#{db_lg_record.lg_number}) has been recorded into the Grow BD Treasury Platform and registered under your custody.",
@@ -579,13 +585,17 @@ class CRUDLGRecord(CRUDBase):
                 )
 
         except Exception as e:
-            logger.error(f"An error occurred while sending LG Recorded confirmation email for LG {db_lg_record.lg_number}: {e}", exc_info=True)
-            db.rollback() # Rollback the email part of the transaction if it fails
-            log_action(
-                db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
-                details={"reason": f"Unhandled exception during email send: {e}"},
-                customer_id=customer_id, lg_record_id=db_lg_record.id
-            )
+            logger.error(f"An error occurred while sending LG Recorded confirmation email for LG {getattr(db_lg_record, 'lg_number', 'N/A')}: {e}", exc_info=True)
+            # NEVER rollback session here! The LG record was already successfully saved.
+            # Email delivery failure should never delete or roll back the newly created LG record.
+            try:
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=db_lg_record.id,
+                    details={"reason": f"Unhandled exception during email send: {e}"},
+                    customer_id=customer_id, lg_record_id=db_lg_record.id
+                )
+            except Exception as log_err:
+                logger.warning(f"Could not log NOTIFICATION_FAILED audit action: {log_err}")
         # --- END NEW CODE BLOCK: Send LG Recorded Confirmation Email ---
 
         log_action(
