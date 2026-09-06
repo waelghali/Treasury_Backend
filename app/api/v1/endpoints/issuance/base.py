@@ -42,6 +42,8 @@ from app.crud.crud_issuance import crud_issuance_request
 from app.crud.crud_facility import crud_facility
 from app.crud.crud_bank_methods import crud_bank_methods
 from fastapi.responses import StreamingResponse
+from app.constants import GlobalConfigKey
+from app.crud.crud_config import crud_customer_configuration
 
 router = APIRouter()
 def _read_bank_form_pdf_bytes(form_template) -> bytes:
@@ -702,6 +704,8 @@ async def extract_lg_copy(
                 uploaded_by=current_user.user_id,
             )
             db.add(doc)
+            lg.soft_copy_path = file_path
+            lg.verification_source = "SCAN_VERIFIED"
             db.commit()
         except Exception as doc_err:
             logger.warning(f"Could not save LG copy document: {doc_err}")
@@ -827,10 +831,78 @@ async def extract_lg_copy(
             "severity": severity,
         }
 
+    # Load customer verification policy (customer override -> global fallback)
+    form_config = db.query(CustomerFormConfiguration).filter(
+        CustomerFormConfiguration.customer_id == current_user.customer_id
+    ).first()
+    policy = None
+    if form_config and form_config.verification_policy:
+        policy = form_config.verification_policy
+    else:
+        cfg_policy = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, current_user.customer_id, GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY
+        )
+        if cfg_policy and cfg_policy.get("effective_value"):
+            try:
+                policy = json.loads(cfg_policy["effective_value"]) if isinstance(cfg_policy["effective_value"], str) else cfg_policy["effective_value"]
+            except Exception:
+                policy = None
+    if not policy:
+        policy = {}
+    expiry_tolerance_days = int(policy.get("expiry_date_tolerance_days", 3))
+    beneficiary_threshold = float(policy.get("beneficiary_match_pct", 90)) / 100.0
+    issuer_threshold = float(policy.get("issuer_match_pct", 90)) / 100.0
+    verify_issuing_bank = bool(policy.get("verify_issuing_bank", True))
+    verify_issuer_name = bool(policy.get("verify_issuer_name", True))
+
+    def _date_compare(label, requested, extracted_val, tolerance_days=3, severity="HIGH"):
+        if not requested or not extracted_val:
+            return {"field": label, "requested": str(requested) if requested else None, "extracted": str(extracted_val) if extracted_val else None, "match": True, "severity": "OK"}
+        r_s = _normalize_date(requested)
+        e_s = _normalize_date(extracted_val)
+        if r_s == e_s:
+            return {"field": label, "requested": r_s, "extracted": e_s, "match": True, "severity": "OK"}
+        try:
+            from datetime import datetime as _dt
+            rd = _dt.strptime(r_s, "%Y-%m-%d").date()
+            ed = _dt.strptime(e_s, "%Y-%m-%d").date()
+            diff = abs((ed - rd).days)
+            if diff <= tolerance_days:
+                return {"field": label, "requested": r_s, "extracted": e_s, "match": True, "tolerance_applied": True, "diff_days": diff, "severity": "OK", "note": f"Within ±{tolerance_days}d tolerance ({diff}d diff)"}
+            else:
+                return {"field": label, "requested": r_s, "extracted": e_s, "match": False, "diff_days": diff, "severity": severity, "note": f"Exceeds ±{tolerance_days}d tolerance ({diff}d diff)"}
+        except Exception:
+            return {"field": label, "requested": r_s, "extracted": e_s, "match": False, "severity": severity}
+
     # Core comparisons
     comparison["fields"].append(_compare("Amount", request_amount, extracted_amount, "HIGH"))
-    comparison["fields"].append(_compare("Expiry Date", request_expiry, extracted_expiry, "HIGH"))
-    comparison["fields"].append(_name_compare("Beneficiary Name", request_beneficiary, extracted_beneficiary, 0.80, "HIGH"))
+    comparison["fields"].append(_date_compare("Expiry Date", request_expiry, extracted_expiry, expiry_tolerance_days, "HIGH"))
+    comparison["fields"].append(_name_compare("Beneficiary Name", request_beneficiary, extracted_beneficiary, beneficiary_threshold, "HIGH"))
+
+    # Issuing Bank comparison
+    if verify_issuing_bank:
+        request_bank = None
+        if lg.bank_id and lg.bank:
+            request_bank = lg.bank.name
+        elif lg.sub_limit and lg.sub_limit.facility and lg.sub_limit.facility.bank:
+            request_bank = lg.sub_limit.facility.bank.name
+        extracted_bank = extracted_data.get("issuingBankName", "")
+        comparison["fields"].append(_name_compare("Issuing Bank", request_bank, extracted_bank, 0.80, "HIGH"))
+
+    # Issuer / Applicant comparison
+    if verify_issuer_name:
+        request_issuer = None
+        if request_obj:
+            if request_obj.issuing_entity_id:
+                from app.models.models import CustomerEntity
+                ent = db.query(CustomerEntity).get(request_obj.issuing_entity_id)
+                if ent: request_issuer = ent.entity_name
+            if not request_issuer:
+                from app.models.models import Customer
+                cust = db.query(Customer).get(request_obj.customer_id)
+                if cust: request_issuer = cust.name
+        extracted_issuer = extracted_data.get("issuerName", "")
+        comparison["fields"].append(_name_compare("Issuer / Applicant", request_issuer, extracted_issuer, issuer_threshold, "HIGH"))
 
     # Additional comparisons
     comparison["fields"].append(_compare("Currency", request_currency, extracted_currency, "HIGH"))
@@ -853,6 +925,7 @@ async def extract_lg_copy(
             "bank_lg_expiry_date": extracted_expiry,
             "bank_beneficiary_name": extracted_beneficiary,
             "issuing_bank_name": extracted_data.get("issuingBankName", ""),
+            "issuer_name": extracted_data.get("issuerName", ""),
             "currency": extracted_currency,
             "lg_type": extracted_lg_type,
             "purpose": extracted_purpose,
@@ -1263,6 +1336,21 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
             config.reference_types = new_val["reference_types"]
         if "document_config" in new_val:
             config.document_config = new_val["document_config"]
+        if "issued_lg_scan_mandatory" in new_val:
+            config.issued_lg_scan_mandatory = bool(new_val["issued_lg_scan_mandatory"])
+        if "verification_policy" in new_val:
+            config.verification_policy = new_val["verification_policy"]
+            try:
+                import json
+                crud_customer_configuration.set_customer_config(
+                    db,
+                    customer_id=change_req.customer_id,
+                    config_key=GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY,
+                    configured_value=json.dumps(new_val["verification_policy"]),
+                    user_id=change_req.requested_by_user_id
+                )
+            except Exception:
+                pass
 
     elif ct == "APPROVAL_MATRIX_UPDATE":
         # Bulk-replace workflow policies

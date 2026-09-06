@@ -295,6 +295,7 @@ class IssuedLGRecord(Base):
     # Step 5.6: LG Copy Verification
     verification_status = Column(String, nullable=True, comment="PENDING, MATCHED, DISCREPANCY, ACCEPTED")
     verification_notes = Column(Text, nullable=True, comment="Discrepancy details or acceptance notes")
+    verification_source = Column(String(50), nullable=True, comment="SCAN_VERIFIED, MANUAL_ENTRY, AUTO_RECONCILIATION, or MANUAL_AUDIT")
     verified_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     verified_at = Column(DateTime, nullable=True)
 
@@ -777,6 +778,10 @@ class CustomerFormConfiguration(BaseModel):
 
     # C6: Reservation TTL configuration
     reservation_ttl_days = Column(Integer, nullable=True, default=14, comment="Days before unused reservations are auto-released. Default: 14")
+
+    # Bank Scan & Verification Governance Settings
+    issued_lg_scan_mandatory = Column(Boolean, default=False, nullable=False, server_default='false', comment="If true, users cannot complete bank reply without attaching an issued LG scan")
+    verification_policy = Column(JSONB, nullable=True, default=dict, comment="Tolerance rules: expiry date +/- days, beneficiary % match, issuer % match, issuing bank verify, enforcement mode")
 
 
 # ==============================================================================

@@ -800,6 +800,9 @@ async def record_bank_reply(
                         uploaded_by=current_user.user_id,
                     )
                     db.add(doc)
+                    if doc_type == "BANK_LG_COPY":
+                        lg.soft_copy_path = gcs_url
+                        lg.verification_source = "SCAN_VERIFIED"
                     db.flush()
         except Exception as e:
             logger.warning(f"Could not persist uploaded bank reply document: {e}")
@@ -870,6 +873,13 @@ async def record_bank_reply(
             logger.error(f"Failed to flush core LG changes for LG {lg.id}: {flush_err}")
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Database error recording bank reply: {flush_err}")
+
+        # Promotional Campaign & Cashback Claim Hook
+        try:
+            from app.crud.crud_campaign import crud_campaign
+            crud_campaign.record_claim_for_issued_lg(db, lg)
+        except Exception as camp_err:
+            logger.warning(f"Could not evaluate promotional claim for issued LG #{lg.id}: {camp_err}")
 
         # Smart SLA Actualization: compute net business turnaround and update EMA metrics
         # Wrapped in savepoint so failures don't poison the main transaction

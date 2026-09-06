@@ -2464,6 +2464,7 @@ def create_bank(
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="Bank", entity_id=db_bank.id, details={"name": db_bank.name, "swift_code": db_bank.swift_code, "ip_address": client_host})
     return db_bank
 
+@router.get("/banks", response_model=List[BankOut])
 @router.get("/banks/", response_model=List[BankOut])
 def read_banks(
     skip: int = 0, limit: int = 100, db: Session = Depends(get_db),

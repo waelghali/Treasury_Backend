@@ -896,12 +896,30 @@ def get_form_configuration(
         return CustomerFormConfigurationCreateUpdate()
         
     return CustomerFormConfigurationCreateUpdate(
-        field_configurations=config.field_configurations,
+        field_configurations=config.field_configurations or {},
         custom_field_1_config=config.custom_field_1_config,
         custom_field_2_config=config.custom_field_2_config,
-        mandatory_document_types=config.mandatory_document_types,
+        mandatory_document_types=config.mandatory_document_types or ["FORMAL_REQUEST"],
         reference_types=config.reference_types,
-        document_config=config.document_config
+        document_config=config.document_config,
+        issued_lg_scan_mandatory=bool(getattr(config, "issued_lg_scan_mandatory", False)),
+        verification_policy=(lambda: (
+            (lambda cfg: (
+                json.loads(cfg["effective_value"]) if isinstance(cfg["effective_value"], str) else cfg["effective_value"]
+            ) if cfg and cfg.get("effective_value") else getattr(config, "verification_policy", None))(
+                crud_customer_configuration.get_customer_config_or_global_fallback(
+                    db, current_user.customer_id, GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY
+                )
+            ) or getattr(config, "verification_policy", None) or {
+                "enforcement_mode": "TOLERANCE",
+                "expiry_date_tolerance_days": 3,
+                "beneficiary_match_pct": 90,
+                "issuer_match_pct": 90,
+                "verify_issuing_bank": True,
+                "verify_issuer_name": True,
+                "block_issuance_without_scan": False
+            }
+        ))()
     )
 
 @router.put("/form-config", response_model=CustomerFormConfigurationCreateUpdate)
@@ -933,6 +951,16 @@ def update_form_configuration(
         "mandatory_document_types": config_in.mandatory_document_types,
         "reference_types": config_in.reference_types,
         "document_config": config_in.document_config,
+        "issued_lg_scan_mandatory": config_in.issued_lg_scan_mandatory,
+        "verification_policy": config_in.verification_policy.model_dump() if config_in.verification_policy else {
+            "enforcement_mode": "TOLERANCE",
+            "expiry_date_tolerance_days": 3,
+            "beneficiary_match_pct": 90,
+            "issuer_match_pct": 90,
+            "verify_issuing_bank": True,
+            "verify_issuer_name": True,
+            "block_issuance_without_scan": False
+        },
     }
     if config_in.custom_field_1_config:
         new_val["custom_field_1_config"] = config_in.custom_field_1_config.model_dump()

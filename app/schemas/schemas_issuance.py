@@ -39,6 +39,15 @@ class CustomFieldConfig(BaseModel):
                 raise ValueError('LIST type requires at least one option')
         return v
 
+class VerificationPolicyConfig(BaseModel):
+    enforcement_mode: str = "TOLERANCE"  # "TOLERANCE", "STRICT", "ADVISORY"
+    expiry_date_tolerance_days: int = Field(default=3, ge=0, le=30)
+    beneficiary_match_pct: int = Field(default=90, ge=50, le=100)
+    issuer_match_pct: int = Field(default=90, ge=50, le=100)
+    verify_issuing_bank: bool = True
+    verify_issuer_name: bool = True
+    block_issuance_without_scan: bool = False
+
 class CustomerFormConfigurationCreateUpdate(BaseModel):
     field_configurations: Dict[str, StandardFieldConfig] = Field(default_factory=dict)
     custom_field_1_config: Optional[CustomFieldConfig] = None
@@ -46,6 +55,8 @@ class CustomerFormConfigurationCreateUpdate(BaseModel):
     mandatory_document_types: List[str] = Field(default=["FORMAL_REQUEST"])
     reference_types: Optional[List[Dict[str, str]]] = None  # [{id, name}] — defaults applied in frontend
     document_config: Optional[Dict[str, Dict[str, bool]]] = None  # {DOC_TYPE: {is_visible, is_mandatory}}
+    issued_lg_scan_mandatory: bool = False
+    verification_policy: Optional[VerificationPolicyConfig] = None
 
     @field_validator('field_configurations')
     @classmethod

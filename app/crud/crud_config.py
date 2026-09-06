@@ -33,6 +33,67 @@ class CRUDGlobalConfiguration(CRUDBase):
             .first()
         )
 
+    def _validate_bounds(self, value_min, value_max, value_default, key=None):
+        """Strictly enforce: value_min <= value_default <= value_max for numeric settings and policy bounds."""
+        key_name = key.value if hasattr(key, 'value') else str(key or 'Configuration')
+
+        # 1. Scalar Numeric Check
+        try:
+            num_min = float(value_min) if value_min is not None and str(value_min).strip() != '' else None
+            num_max = float(value_max) if value_max is not None and str(value_max).strip() != '' else None
+            num_def = float(value_default) if value_default is not None and str(value_default).strip() != '' else None
+
+            if num_min is not None and num_max is not None:
+                if num_min > num_max:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"[{key_name}] Minimum value ({num_min}) cannot exceed Maximum value ({num_max})."
+                    )
+            if num_def is not None:
+                if num_min is not None and num_def < num_min:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"[{key_name}] Default value ({num_def}) cannot be less than Minimum value ({num_min})."
+                    )
+                if num_max is not None and num_def > num_max:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"[{key_name}] Default value ({num_def}) cannot be greater than Maximum value ({num_max})."
+                    )
+        except (ValueError, TypeError):
+            pass
+
+        # 2. JSON Bounds Check (e.g. ISSUED_LG_VERIFICATION_POLICY)
+        if isinstance(value_default, str) and value_default.strip().startswith('{'):
+            try:
+                import json
+                p_def = json.loads(value_default)
+                p_min = json.loads(value_min) if isinstance(value_min, str) and value_min.strip().startswith('{') else {}
+                p_max = json.loads(value_max) if isinstance(value_max, str) and value_max.strip().startswith('{') else {}
+                if isinstance(p_def, dict) and isinstance(p_min, dict) and isinstance(p_max, dict):
+                    for k in ['expiry_date_tolerance_days', 'beneficiary_match_pct', 'issuer_match_pct']:
+                        d_val = p_def.get(k)
+                        mi_val = p_min.get(k)
+                        ma_val = p_max.get(k)
+                        if mi_val is not None and ma_val is not None and mi_val > ma_val:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"[{key_name}] Bounds for {k}: Minimum ({mi_val}) cannot exceed Maximum ({ma_val})."
+                            )
+                        if d_val is not None:
+                            if mi_val is not None and d_val < mi_val:
+                                raise HTTPException(
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"[{key_name}] Default for {k} ({d_val}) cannot be less than Minimum ({mi_val})."
+                                )
+                            if ma_val is not None and d_val > ma_val:
+                                raise HTTPException(
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"[{key_name}] Default for {k} ({d_val}) cannot be greater than Maximum ({ma_val})."
+                                )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     def _validate_config_value(global_config, configured_value):
         if global_config.unit and global_config.unit.lower() == 'boolean':
             if configured_value.lower() not in ['true', 'false']:
@@ -42,6 +103,13 @@ class CRUDGlobalConfiguration(CRUDBase):
                 )
 
     def create(self, db: Session, obj_in: BaseModel, **kwargs: Any) -> BaseModel:
+        data = obj_in.model_dump() if hasattr(obj_in, 'model_dump') else (obj_in.dict() if hasattr(obj_in, 'dict') else dict(obj_in))
+        self._validate_bounds(
+            value_min=data.get('value_min'),
+            value_max=data.get('value_max'),
+            value_default=data.get('value_default'),
+            key=data.get('key')
+        )
         db_obj = super().create(db, obj_in, **kwargs)
         log_action(
             db,
@@ -56,6 +124,13 @@ class CRUDGlobalConfiguration(CRUDBase):
     def update(
         self, db: Session, db_obj: BaseModel, obj_in: BaseModel, **kwargs: Any
     ) -> BaseModel:
+        data = obj_in.model_dump(exclude_unset=True) if hasattr(obj_in, 'model_dump') else (obj_in.dict(exclude_unset=True) if hasattr(obj_in, 'dict') else dict(obj_in))
+        eff_min = data.get('value_min', db_obj.value_min)
+        eff_max = data.get('value_max', db_obj.value_max)
+        eff_def = data.get('value_default', db_obj.value_default)
+        eff_key = data.get('key', db_obj.key)
+        self._validate_bounds(value_min=eff_min, value_max=eff_max, value_default=eff_def, key=eff_key)
+
         # Save old values to check for narrowing ranges
         old_value_min = db_obj.value_min
         old_value_max = db_obj.value_max
@@ -255,6 +330,56 @@ class CRUDCustomerConfiguration(CRUDBase):
                         raise ValueError("Value must be a JSON array of valid email strings.")
                 except json.JSONDecodeError:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Value must be a valid JSON array for communication list.")
+            elif getattr(global_config.key, 'value', str(global_config.key)) == "ISSUED_LG_VERIFICATION_POLICY":
+                try:
+                    policy_dict = json.loads(configured_value) if isinstance(configured_value, str) else configured_value
+                    if not isinstance(policy_dict, dict):
+                        raise ValueError("Policy must be a valid JSON object.")
+                    
+                    min_bounds = {}
+                    max_bounds = {}
+                    if global_config.value_min:
+                        try:
+                            min_bounds = json.loads(global_config.value_min) if isinstance(global_config.value_min, str) else global_config.value_min
+                        except Exception:
+                            pass
+                    if global_config.value_max:
+                        try:
+                            max_bounds = json.loads(global_config.value_max) if isinstance(global_config.value_max, str) else global_config.value_max
+                        except Exception:
+                            pass
+
+                    exp_days = policy_dict.get("expiry_date_tolerance_days")
+                    if exp_days is not None:
+                        min_d = min_bounds.get("expiry_date_tolerance_days", 0) if isinstance(min_bounds, dict) else 0
+                        max_d = max_bounds.get("expiry_date_tolerance_days", 30) if isinstance(max_bounds, dict) else 30
+                        if exp_days < min_d or exp_days > max_d:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Expiry date tolerance ({exp_days} days) must be between {min_d} and {max_d} days.",
+                            )
+
+                    ben_pct = policy_dict.get("beneficiary_match_pct")
+                    if ben_pct is not None:
+                        min_b = min_bounds.get("beneficiary_match_pct", 50) if isinstance(min_bounds, dict) else 50
+                        max_b = max_bounds.get("beneficiary_match_pct", 100) if isinstance(max_bounds, dict) else 100
+                        if ben_pct < min_b or ben_pct > max_b:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Beneficiary match percentage ({ben_pct}%) must be between {min_b}% and {max_b}%.",
+                            )
+
+                    iss_pct = policy_dict.get("issuer_match_pct")
+                    if iss_pct is not None:
+                        min_i = min_bounds.get("issuer_match_pct", 50) if isinstance(min_bounds, dict) else 50
+                        max_i = max_bounds.get("issuer_match_pct", 100) if isinstance(max_bounds, dict) else 100
+                        if iss_pct < min_i or iss_pct > max_i:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Issuer match percentage ({iss_pct}%) must be between {min_i}% and {max_i}%.",
+                            )
+                except json.JSONDecodeError:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Value must be valid JSON for verification policy.")
 
         except (ValueError, TypeError) as e:
             raise HTTPException(
@@ -324,28 +449,25 @@ class CRUDCustomerConfiguration(CRUDBase):
                 },
                 customer_id=customer_id,
             )
-            return updated_config
-        else:
-            new_config = super().create(
-                db,
-                obj_in=CustomerConfigurationCreate(
-                    global_config_id=global_config_id, configured_value=configured_value
-                ),
-                customer_id=customer_id,
-            )
-            log_action(
-                db,
-                user_id=user_id,
-                action_type="CREATE",
-                entity_type="CustomerConfiguration",
-                entity_id=new_config.id,
-                details={
-                    "global_config_key": global_config.key.value,
-                    "configured_value": configured_value,
-                },
-                customer_id=customer_id,
-            )
-            return new_config
+        target_config = updated_config if customer_config else new_config
+
+        # Two-way sync with CustomerFormConfiguration.verification_policy
+        if getattr(global_config.key, 'value', str(global_config.key)) == "ISSUED_LG_VERIFICATION_POLICY":
+            try:
+                from app.models.models_issuance import CustomerFormConfiguration
+                form_cfg = db.query(CustomerFormConfiguration).filter(
+                    CustomerFormConfiguration.customer_id == customer_id
+                ).first()
+                if not form_cfg:
+                    form_cfg = CustomerFormConfiguration(customer_id=customer_id)
+                    db.add(form_cfg)
+                policy_dict = json.loads(configured_value) if isinstance(configured_value, str) else configured_value
+                form_cfg.verification_policy = policy_dict
+                db.commit()
+            except Exception:
+                pass
+
+        return target_config
 
     def revalidate_customer_configs_for_global_change(
         self, db: Session, global_config_id: int

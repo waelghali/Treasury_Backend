@@ -141,7 +141,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         public, public_issuance, reports, facility_endpoints,
         quotations_endpoints, public_quotations, reconciliation_endpoints,
         notification_endpoints, ai_query_assistant, user_feedback,
-        inbox_endpoints, system_holidays_endpoints
+        inbox_endpoints, system_holidays_endpoints, campaign_endpoints
     )
 
     from app.api.v1.endpoints import issuance as issuance_package
@@ -156,6 +156,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         import app.models.models_reconciliation_v2
         import app.models.models_notification
         import app.models.models_inbox
+        import app.models.models_campaign
         
         if Base.metadata.tables:
             Base.metadata.create_all(bind=engine)
@@ -182,6 +183,20 @@ def configure_app_instance(fastapi_app: FastAPI):
                         logger.info("Seeded QUOTATION_APPROVAL_REQUIRED into global_configurations.")
             except Exception as seed_err:
                 logger.warning(f"Global configuration seed check skipped: {seed_err}")
+
+            # --- Cashback Claims Schema Migration Check ---
+            try:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS issued_lg_record_id INTEGER REFERENCES issued_lg_records(id);
+                        ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS verified_by_user_id INTEGER REFERENCES users(id);
+                        ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS verification_source VARCHAR(30);
+                        ALTER TABLE cashback_claims ALTER COLUMN lg_record_id DROP NOT NULL;
+                    """))
+                    conn.commit()
+            except Exception as ddl_err:
+                logger.warning(f"Cashback claims schema migration check skipped: {ddl_err}")
 
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:
@@ -325,6 +340,11 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(
         system_holidays_endpoints.router,
         prefix="/api/v1"
+    )
+    fastapi_app.include_router(
+        campaign_endpoints.router,
+        prefix="/api/v1",
+        tags=["Campaigns & Cashback"]
     )
 
     # --- Static Files Mounting for Supporting Uploads ---

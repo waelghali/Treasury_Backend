@@ -576,6 +576,70 @@ def verify_lg_copy(
 
     request = db.query(IssuanceRequest).get(lg.request_id) if lg.request_id else None
 
+    # Customer Form Configuration & Verification Policy (customer override -> global fallback)
+    form_config = db.query(CustomerFormConfiguration).filter(
+        CustomerFormConfiguration.customer_id == current_user.customer_id
+    ).first()
+    
+    # Check scan mandatory
+    if form_config and form_config.issued_lg_scan_mandatory is not None:
+        scan_mandatory = bool(form_config.issued_lg_scan_mandatory)
+    else:
+        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, current_user.customer_id, GlobalConfigKey.DOC_MANDATORY_ISSUED_LG_SCAN
+        )
+        scan_mandatory = (cfg or {}).get("effective_value", "false").lower() == "true"
+
+    # Check verification policy
+    policy = None
+    if form_config and form_config.verification_policy:
+        policy = form_config.verification_policy
+    else:
+        cfg_policy = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, current_user.customer_id, GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY
+        )
+        if cfg_policy and cfg_policy.get("effective_value"):
+            try:
+                policy = json.loads(cfg_policy["effective_value"]) if isinstance(cfg_policy["effective_value"], str) else cfg_policy["effective_value"]
+            except Exception:
+                policy = None
+    if not policy:
+        policy = {
+            "enforcement_mode": "TOLERANCE",
+            "expiry_date_tolerance_days": 3,
+            "beneficiary_match_pct": 90,
+            "issuer_match_pct": 90,
+            "verify_issuing_bank": True,
+            "verify_issuer_name": True,
+            "block_issuance_without_scan": False,
+        }
+    enforcement_mode = policy.get("enforcement_mode", "TOLERANCE")
+    expiry_tolerance_days = int(policy.get("expiry_date_tolerance_days", 3))
+    beneficiary_threshold = float(policy.get("beneficiary_match_pct", 90)) / 100.0
+    issuer_threshold = float(policy.get("issuer_match_pct", 90)) / 100.0
+    verify_issuing_bank = bool(policy.get("verify_issuing_bank", True))
+    verify_issuer_name = bool(policy.get("verify_issuer_name", True))
+
+    # Determine if scanned bank LG copy exists
+    from app.models.models_issuance import IssuanceRequestDocument
+    has_scan = bool(lg.soft_copy_path)
+    if not has_scan and lg.request_id:
+        doc_count = db.query(IssuanceRequestDocument).filter(
+            IssuanceRequestDocument.request_id == lg.request_id,
+            IssuanceRequestDocument.document_type == "BANK_LG_COPY"
+        ).count()
+        has_scan = (doc_count > 0)
+
+    # Check if scan mandatory
+    if scan_mandatory and not has_scan:
+        raise HTTPException(
+            status_code=400,
+            detail="A scanned copy of the issued bank LG is mandatory before verification. Please upload the bank LG scan document."
+        )
+
+    # Set verification source
+    lg.verification_source = "SCAN_VERIFIED" if has_scan else "MANUAL_ENTRY"
+
     # Allow user to update bank values if provided
     if payload.get("bank_lg_number"):
         lg.bank_lg_number = payload["bank_lg_number"]
@@ -586,175 +650,205 @@ def verify_lg_copy(
     if payload.get("bank_lg_expiry_date"):
         lg.bank_lg_expiry_date = payload["bank_lg_expiry_date"]
 
-    # Compliance auto-check
+    import re as _re
+    from decimal import Decimal
+    from difflib import SequenceMatcher as _SM
+
+    def _to_date_str(v):
+        if not v: return None
+        m = _re.match(r'(\d{4}-\d{2}-\d{2})', str(v).strip())
+        return m.group(1) if m else str(v)
+
+    def _name_match(a, b, threshold=0.80):
+        if not a or not b: return True, 1.0
+        al, bl = str(a).strip().lower(), str(b).strip().lower()
+        if al in bl or bl in al: return True, 1.0
+        ratio = _SM(None, al, bl).ratio()
+        return ratio >= threshold, ratio
+
     discrepancies = []
+    all_comparisons = []
+
     if request:
         # Amount check
         if lg.bank_lg_amount is not None and request.amount is not None:
-            from decimal import Decimal
             bank_amt = Decimal(str(lg.bank_lg_amount))
             req_amt = Decimal(str(request.amount))
-            if bank_amt != req_amt:
+            amt_match = abs(bank_amt - req_amt) < Decimal("0.01")
+            all_comparisons.append({
+                "field": "Amount", "requested": str(req_amt), "bank_confirmed": str(bank_amt),
+                "severity": "HIGH" if not amt_match else "OK", "match": amt_match
+            })
+            if not amt_match:
                 discrepancies.append({
-                    "field": "amount",
-                    "requested": str(req_amt),
-                    "bank_confirmed": str(bank_amt),
+                    "field": "amount", "requested": str(req_amt), "bank_confirmed": str(bank_amt),
                     "severity": "HIGH"
                 })
 
-        # Expiry date check — normalize both to YYYY-MM-DD to avoid format mismatches
-        if lg.bank_lg_expiry_date and request.requested_expiry_date:
-            import re as _re
-            def _to_date_str(v):
-                m = _re.match(r'(\d{4}-\d{2}-\d{2})', str(v).strip())
-                return m.group(1) if m else str(v)
-            if _to_date_str(lg.bank_lg_expiry_date) != _to_date_str(request.requested_expiry_date):
+        # Expiry date check with tolerance
+        if request.requested_expiry_date:
+            b_exp = _to_date_str(lg.bank_lg_expiry_date) if lg.bank_lg_expiry_date else None
+            r_exp = _to_date_str(request.requested_expiry_date)
+            date_match = True
+            diff_days = 0
+            tolerance_applied = False
+
+            if b_exp and b_exp != r_exp:
+                try:
+                    from datetime import datetime as _dt
+                    b_dt = _dt.strptime(b_exp, "%Y-%m-%d").date()
+                    r_dt = _dt.strptime(r_exp, "%Y-%m-%d").date()
+                    diff_days = abs((b_dt - r_dt).days)
+                    if enforcement_mode == "TOLERANCE" and diff_days <= expiry_tolerance_days:
+                        date_match = True
+                        tolerance_applied = True
+                    else:
+                        date_match = False
+                except Exception:
+                    date_match = False
+
+            all_comparisons.append({
+                "field": "Expiry Date", "requested": r_exp, "bank_confirmed": b_exp or "—",
+                "severity": "OK" if date_match else "MEDIUM", "match": date_match,
+                "tolerance_applied": tolerance_applied, "diff_days": diff_days,
+                "note": f"Within ±{expiry_tolerance_days}d tolerance ({diff_days}d diff)" if tolerance_applied else None
+            })
+            if not date_match and b_exp:
                 discrepancies.append({
-                    "field": "expiry_date",
-                    "requested": str(request.requested_expiry_date),
-                    "bank_confirmed": str(lg.bank_lg_expiry_date),
+                    "field": "expiry_date", "requested": r_exp, "bank_confirmed": b_exp,
+                    "diff_days": diff_days, "severity": "MEDIUM"
+                })
+
+        # Beneficiary check
+        bank_beneficiary = payload.get("bank_beneficiary_name", "")
+        if request.beneficiary_name:
+            eff_ben_thresh = beneficiary_threshold if enforcement_mode != "STRICT" else 1.0
+            ben_match, ben_ratio = _name_match(request.beneficiary_name, bank_beneficiary, eff_ben_thresh)
+            all_comparisons.append({
+                "field": "Beneficiary", "requested": request.beneficiary_name,
+                "bank_confirmed": bank_beneficiary or "—",
+                "severity": "OK" if ben_match else "MEDIUM", "match": ben_match,
+                "match_pct": round(ben_ratio * 100, 1)
+            })
+            if not ben_match and bank_beneficiary:
+                discrepancies.append({
+                    "field": "beneficiary_name", "requested": request.beneficiary_name,
+                    "bank_confirmed": bank_beneficiary, "match_pct": round(ben_ratio * 100, 1),
                     "severity": "MEDIUM"
                 })
 
-        # Beneficiary name — allow substring containment (bank may use full legal name)
-        bank_beneficiary = payload.get("bank_beneficiary_name", "")
-        if bank_beneficiary and request.beneficiary_name:
-            r = request.beneficiary_name.strip().lower()
-            e = bank_beneficiary.strip().lower()
-            if r not in e and e not in r:
-                from difflib import SequenceMatcher as _SM
-                ratio = _SM(None, r, e).ratio()
-                if ratio < 0.80:
+        # Issuing Bank check
+        if verify_issuing_bank:
+            expected_bank = None
+            if lg.bank_id and lg.bank:
+                expected_bank = lg.bank.name
+            elif lg.sub_limit and lg.sub_limit.facility and lg.sub_limit.facility.bank:
+                expected_bank = lg.sub_limit.facility.bank.name
+
+            confirmed_bank = payload.get("issuing_bank_name") or payload.get("bank_name")
+            if expected_bank:
+                bank_match, b_ratio = _name_match(expected_bank, confirmed_bank, 0.80) if confirmed_bank else (True, 1.0)
+                all_comparisons.append({
+                    "field": "Issuing Bank", "requested": expected_bank,
+                    "bank_confirmed": confirmed_bank or "—",
+                    "severity": "OK" if bank_match else "HIGH", "match": bank_match
+                })
+                if not bank_match and confirmed_bank:
                     discrepancies.append({
-                        "field": "beneficiary_name",
-                        "requested": request.beneficiary_name,
-                        "bank_confirmed": bank_beneficiary,
+                        "field": "issuing_bank", "requested": expected_bank,
+                        "bank_confirmed": confirmed_bank, "severity": "HIGH"
+                    })
+
+        # Issuer / Applicant Name check
+        if verify_issuer_name:
+            expected_issuer = None
+            if request.issuing_entity_id:
+                from app.models.models import CustomerEntity
+                ent = db.query(CustomerEntity).get(request.issuing_entity_id)
+                if ent: expected_issuer = ent.entity_name
+            if not expected_issuer:
+                from app.models.models import Customer
+                cust = db.query(Customer).get(request.customer_id)
+                if cust: expected_issuer = cust.name
+
+            confirmed_issuer = payload.get("issuer_name") or payload.get("bank_issuer_name")
+            if expected_issuer:
+                eff_iss_thresh = issuer_threshold if enforcement_mode != "STRICT" else 1.0
+                iss_match, iss_ratio = _name_match(expected_issuer, confirmed_issuer, eff_iss_thresh) if confirmed_issuer else (True, 1.0)
+                all_comparisons.append({
+                    "field": "Issuer / Applicant", "requested": expected_issuer,
+                    "bank_confirmed": confirmed_issuer or "—",
+                    "severity": "OK" if iss_match else "MEDIUM", "match": iss_match,
+                    "match_pct": round(iss_ratio * 100, 1)
+                })
+                if not iss_match and confirmed_issuer:
+                    discrepancies.append({
+                        "field": "issuer_name", "requested": expected_issuer,
+                        "bank_confirmed": confirmed_issuer, "match_pct": round(iss_ratio * 100, 1),
                         "severity": "MEDIUM"
                     })
 
         # Currency check
         bank_currency = payload.get("bank_currency_id") or payload.get("bank_currency")
-        if bank_currency and request.currency_id is not None:
-            # Support both currency_id (int) and currency code (string)
-            if isinstance(bank_currency, int) or (isinstance(bank_currency, str) and bank_currency.isdigit()):
-                currency_match = int(bank_currency) == request.currency_id
+        if request.currency_id is not None:
+            from app.models.models import Currency as CurrencyModel
+            req_currency = db.query(CurrencyModel).filter(CurrencyModel.id == request.currency_id).first()
+            req_curr_name = req_currency.iso_code if req_currency else str(request.currency_id)
+            if bank_currency:
+                if isinstance(bank_currency, int) or (isinstance(bank_currency, str) and bank_currency.isdigit()):
+                    curr_match = int(bank_currency) == request.currency_id
+                else:
+                    curr_match = req_currency and req_currency.iso_code.upper() == str(bank_currency).upper()
             else:
-                # Lookup by currency code
-                from app.models.models import Currency as CurrencyModel
-                req_currency = db.query(CurrencyModel).filter(CurrencyModel.id == request.currency_id).first()
-                currency_match = req_currency and req_currency.iso_code.upper() == str(bank_currency).upper()
-            if not currency_match:
-                req_currency_obj = db.query(CurrencyModel).filter(CurrencyModel.id == request.currency_id).first() if 'req_currency' not in dir() else req_currency
+                curr_match = True
+            all_comparisons.append({
+                "field": "Currency", "requested": req_curr_name,
+                "bank_confirmed": str(bank_currency) if bank_currency else "—",
+                "severity": "HIGH" if not curr_match else "OK", "match": curr_match
+            })
+            if not curr_match and bank_currency:
                 discrepancies.append({
-                    "field": "currency",
-                    "requested": req_currency_obj.iso_code if req_currency_obj else str(request.currency_id),
-                    "bank_confirmed": str(bank_currency),
-                    "severity": "HIGH"
+                    "field": "currency", "requested": req_curr_name,
+                    "bank_confirmed": str(bank_currency), "severity": "HIGH"
                 })
 
         # LG Type check
         bank_lg_type = payload.get("bank_lg_type_id") or payload.get("bank_lg_type")
-        if bank_lg_type and request.lg_type_id is not None:
-            if isinstance(bank_lg_type, int) or (isinstance(bank_lg_type, str) and bank_lg_type.isdigit()):
-                lg_type_match = int(bank_lg_type) == request.lg_type_id
-            else:
-                from app.models.models import LgType
-                req_lg_type = db.query(LgType).filter(LgType.id == request.lg_type_id).first()
-                lg_type_match = req_lg_type and req_lg_type.name.strip().lower() == str(bank_lg_type).strip().lower()
-            if not lg_type_match:
-                discrepancies.append({
-                    "field": "lg_type",
-                    "requested": str(request.lg_type_id),
-                    "bank_confirmed": str(bank_lg_type),
-                    "severity": "MEDIUM"
-                })
-
-        # Purpose — allow substring containment (bank often expands purpose text)
-        bank_purpose = payload.get("bank_lg_purpose", "")
-        if bank_purpose and request.lg_purpose:
-            r = request.lg_purpose.strip().lower()
-            e = bank_purpose.strip().lower()
-            if r not in e and e not in r:
-                from difflib import SequenceMatcher as _SM
-                ratio = _SM(None, r, e).ratio()
-                if ratio < 0.50:
-                    discrepancies.append({
-                        "field": "purpose",
-                        "requested": request.lg_purpose,
-                        "bank_confirmed": bank_purpose,
-                        "severity": "MEDIUM"
-                    })
-
-        # Operational Status check (particularly for Advance Payment LGs)
-        bank_operational_status = payload.get("bank_operational_status", "")
-        if bank_operational_status and request.operational_status:
-            if bank_operational_status.strip().lower() != request.operational_status.strip().lower():
-                discrepancies.append({
-                    "field": "operational_status",
-                    "requested": request.operational_status,
-                    "bank_confirmed": bank_operational_status,
-                    "severity": "MEDIUM"
-                })
-
-    # Build full comparison (ALL fields, matched + mismatched) for the admin review
-    all_comparisons = []
-    if request:
-        from decimal import Decimal
-        import re as _re2
-        def _norm_date(v):
-            m = _re2.match(r'(\d{4}-\d{2}-\d{2})', str(v).strip())
-            return m.group(1) if m else str(v)
-        def _name_match(a, b):
-            if not a or not b: return True
-            al, bl = a.strip().lower(), b.strip().lower()
-            if al in bl or bl in al: return True
-            from difflib import SequenceMatcher as _SM2
-            return _SM2(None, al, bl).ratio() >= 0.80
-        # Amount
-        if lg.bank_lg_amount is not None and request.amount is not None:
-            bank_amt = Decimal(str(lg.bank_lg_amount))
-            req_amt = Decimal(str(request.amount))
-            all_comparisons.append({"field": "Amount", "requested": str(req_amt), "bank_confirmed": str(bank_amt), "severity": "HIGH" if bank_amt != req_amt else "OK", "match": bank_amt == req_amt})
-        # Expiry Date — normalize to YYYY-MM-DD
-        if request.requested_expiry_date:
-            bank_exp = _norm_date(lg.bank_lg_expiry_date) if lg.bank_lg_expiry_date else "—"
-            req_exp = _norm_date(request.requested_expiry_date)
-            match_d = bank_exp == "—" or bank_exp == req_exp
-            all_comparisons.append({"field": "Expiry Date", "requested": req_exp, "bank_confirmed": bank_exp, "severity": "MEDIUM" if not match_d else "OK", "match": match_d})
-        # Beneficiary — substring containment
-        bank_beneficiary = payload.get("bank_beneficiary_name", "")
-        if request.beneficiary_name:
-            match_b = not bank_beneficiary or _name_match(bank_beneficiary, request.beneficiary_name)
-            all_comparisons.append({"field": "Beneficiary", "requested": request.beneficiary_name, "bank_confirmed": bank_beneficiary or "—", "severity": "MEDIUM" if not match_b else "OK", "match": match_b})
-        # Currency
-        bank_currency_val = payload.get("bank_currency_id") or payload.get("bank_currency")
-        if request.currency_id:
-            from app.models.models import Currency as CurrencyModel
-            req_curr_obj = db.query(CurrencyModel).filter(CurrencyModel.id == request.currency_id).first()
-            req_curr_name = req_curr_obj.iso_code if req_curr_obj else str(request.currency_id)
-            match_c = not bank_currency_val or req_curr_name.upper() == str(bank_currency_val).upper()
-            all_comparisons.append({"field": "Currency", "requested": req_curr_name, "bank_confirmed": str(bank_currency_val) if bank_currency_val else "—", "severity": "HIGH" if not match_c else "OK", "match": match_c})
-
-        # LG Type — substring containment
-        bank_lg_type_val = payload.get("bank_lg_type_id") or payload.get("bank_lg_type")
-        if request.lg_type_id:
+        if request.lg_type_id is not None:
             from sqlalchemy import text as sa_text
             lg_type_row = db.execute(sa_text("SELECT name FROM lg_types WHERE id = :id"), {"id": request.lg_type_id}).first()
             req_lg_type_name = lg_type_row[0] if lg_type_row else str(request.lg_type_id)
-            match_t = not bank_lg_type_val or _name_match(req_lg_type_name, str(bank_lg_type_val))
-            all_comparisons.append({"field": "LG Type", "requested": req_lg_type_name, "bank_confirmed": str(bank_lg_type_val) if bank_lg_type_val else "—", "severity": "MEDIUM" if not match_t else "OK", "match": match_t})
-        # Purpose — substring containment + 50% fuzzy
-        bank_purpose_val = payload.get("bank_lg_purpose", "")
+            type_match, _ = _name_match(req_lg_type_name, str(bank_lg_type)) if bank_lg_type else (True, 1.0)
+            all_comparisons.append({
+                "field": "LG Type", "requested": req_lg_type_name,
+                "bank_confirmed": str(bank_lg_type) if bank_lg_type else "—",
+                "severity": "MEDIUM" if not type_match else "OK", "match": type_match
+            })
+            if not type_match and bank_lg_type:
+                discrepancies.append({
+                    "field": "lg_type", "requested": req_lg_type_name,
+                    "bank_confirmed": str(bank_lg_type), "severity": "MEDIUM"
+                })
+
+        # Purpose check
+        bank_purpose = payload.get("bank_lg_purpose", "")
         if request.lg_purpose:
-            r_p, e_p = request.lg_purpose.strip().lower(), bank_purpose_val.strip().lower()
-            if not bank_purpose_val:
-                match_p = True
-            elif r_p in e_p or e_p in r_p:
-                match_p = True
-            else:
-                from difflib import SequenceMatcher as _SM3
-                match_p = _SM3(None, r_p, e_p).ratio() >= 0.50
-            all_comparisons.append({"field": "Purpose", "requested": request.lg_purpose, "bank_confirmed": bank_purpose_val or "—", "severity": "MEDIUM" if not match_p else "OK", "match": match_p})
+            p_match = True
+            if bank_purpose:
+                rp, bp = request.lg_purpose.strip().lower(), bank_purpose.strip().lower()
+                if rp not in bp and bp not in rp:
+                    p_ratio = _SM(None, rp, bp).ratio()
+                    p_match = p_ratio >= 0.50
+            all_comparisons.append({
+                "field": "Purpose", "requested": request.lg_purpose,
+                "bank_confirmed": bank_purpose or "—",
+                "severity": "MEDIUM" if not p_match else "OK", "match": p_match
+            })
+            if not p_match and bank_purpose:
+                discrepancies.append({
+                    "field": "purpose", "requested": request.lg_purpose,
+                    "bank_confirmed": bank_purpose, "severity": "MEDIUM"
+                })
 
     # Determine result
     force_accept = payload.get("force_accept", False)
@@ -787,6 +881,15 @@ def verify_lg_copy(
         lg.verification_status = "ACCEPTED"
         lg.verification_notes = payload.get("verification_notes", "Discrepancies manually accepted")
         lg.status = "LG_ISSUED"
+    elif enforcement_mode == "ADVISORY":
+        # Advisory mode logs discrepancies in notes but marks MATCHED without blocking
+        disc_text = "Verification Advisory Notes (Advisory Mode):\n"
+        actual_discrepancies = [c for c in all_comparisons if not c['match']]
+        for c in actual_discrepancies:
+            disc_text += f"- {c['field'].title()}: Requested '{c['requested']}', Bank Confirmed '{c['bank_confirmed']}'\n"
+        lg.verification_status = "MATCHED"
+        lg.verification_notes = disc_text
+        lg.status = "LG_ISSUED"
     else:
         lg.verification_status = "DISCREPANCY"
         
@@ -807,8 +910,15 @@ def verify_lg_copy(
     lg.verified_at = datetime.utcnow()
 
     log_action(db, current_user.user_id, "ISSUANCE_LG_VERIFIED", "IssuedLGRecord", lg.id,
-               {"verification_status": lg.verification_status, "discrepancies": discrepancies},
+               {"verification_status": lg.verification_status, "verification_source": lg.verification_source, "discrepancies": discrepancies},
                current_user.customer_id)
+
+    # Promotional Campaign & Cashback Claim Verification Hook
+    try:
+        from app.crud.crud_campaign import crud_campaign
+        crud_campaign.record_claim_for_issued_lg(db, lg)
+    except Exception as camp_err:
+        logger.warning(f"Could not update promotional claim for verified LG #{lg.id}: {camp_err}")
 
     # Notify requestor on confirmation
     if lg.status == "LG_ISSUED" and request and request.requestor_email:
@@ -821,7 +931,9 @@ def verify_lg_copy(
         "id": lg.id,
         "status": lg.status,
         "verification_status": lg.verification_status,
-        "discrepancies": discrepancies
+        "verification_source": lg.verification_source,
+        "discrepancies": discrepancies,
+        "comparisons": all_comparisons
     }
 
 
@@ -1167,11 +1279,69 @@ def get_post_issuance_status(
     if request:
         from app.models.models import Currency as CurrencyModel
         req_currency_obj = db.query(CurrencyModel).filter(CurrencyModel.id == request.currency_id).first() if request.currency_id else None
+
+        # Resolve issuing bank
+        bank_name = None
+        if lg.bank_id and lg.bank:
+            bank_name = lg.bank.name
+        elif lg.sub_limit and lg.sub_limit.facility and lg.sub_limit.facility.bank:
+            bank_name = lg.sub_limit.facility.bank.name
+
+        # Resolve issuer name
+        issuer_name = None
+        if request.issuing_entity_id:
+            from app.models.models import CustomerEntity
+            ent = db.query(CustomerEntity).get(request.issuing_entity_id)
+            if ent:
+                issuer_name = ent.entity_name
+        if not issuer_name:
+            from app.models.models import Customer
+            cust = db.query(Customer).get(request.customer_id)
+            if cust:
+                issuer_name = cust.name
+
         expected_values = {
             "amount": str(request.amount) if request.amount else None,
             "expiry_date": str(request.requested_expiry_date) if request.requested_expiry_date else None,
             "beneficiary_name": request.beneficiary_name,
             "currency": req_currency_obj.iso_code if req_currency_obj else None,
+            "issuing_bank_name": bank_name,
+            "issuer_name": issuer_name,
+        }
+
+    has_scan = bool(lg.soft_copy_path or any(d.get("type") == "BANK_LG_COPY" for d in docs))
+
+    # Check scan mandatory (customer override -> global fallback)
+    if form_config and form_config.issued_lg_scan_mandatory is not None:
+        scan_mandatory = bool(form_config.issued_lg_scan_mandatory)
+    else:
+        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, current_user.customer_id, GlobalConfigKey.DOC_MANDATORY_ISSUED_LG_SCAN
+        )
+        scan_mandatory = (cfg or {}).get("effective_value", "false").lower() == "true"
+
+    # Check verification policy (customer override -> global fallback)
+    policy = None
+    if form_config and form_config.verification_policy:
+        policy = form_config.verification_policy
+    else:
+        cfg_policy = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, current_user.customer_id, GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY
+        )
+        if cfg_policy and cfg_policy.get("effective_value"):
+            try:
+                policy = json.loads(cfg_policy["effective_value"]) if isinstance(cfg_policy["effective_value"], str) else cfg_policy["effective_value"]
+            except Exception:
+                policy = None
+    if not policy:
+        policy = {
+            "enforcement_mode": "TOLERANCE",
+            "expiry_date_tolerance_days": 3,
+            "beneficiary_match_pct": 90,
+            "issuer_match_pct": 90,
+            "verify_issuing_bank": True,
+            "verify_issuer_name": True,
+            "block_issuance_without_scan": False,
         }
 
     return {
@@ -1182,6 +1352,10 @@ def get_post_issuance_status(
         "documents": docs,
         "recipient_field_config": recipient_field_config,
         "handover_signed_copy_required": handover_signed_copy_required,
+        "issued_lg_scan_mandatory": scan_mandatory,
+        "verification_policy": policy,
+        "verification_source": lg.verification_source,
+        "has_scan": has_scan,
         "expected_values": expected_values,
     }
 

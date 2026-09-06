@@ -316,6 +316,16 @@ class ReconciliationService:
             session.completeness_status = "NOT_CHECKED"
             session.completeness_note = None
 
+        # --- Promotional Campaign / Cashback Verification Hook ---
+        if matched_system_ids:
+            try:
+                from app.crud.crud_campaign import crud_campaign
+                reconciled_count = crud_campaign.reconcile_claims_for_lgs(db, list(matched_system_ids))
+                if reconciled_count > 0:
+                    logger.info(f"Reconciliation session #{session.id} automatically verified {reconciled_count} cashback claim(s).")
+            except Exception as camp_recon_err:
+                logger.warning(f"Could not update cashback claims during reconciliation: {camp_recon_err}")
+
         db.commit()
         db.refresh(session)
 
