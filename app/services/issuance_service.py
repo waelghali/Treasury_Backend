@@ -1531,6 +1531,33 @@ class IssuanceService:
                            "The request's project does not match."
                 )
 
+        # 4. Tenor & Open-Ended governance
+        is_open_ended = bool(getattr(request, 'is_open_ended', False)) or (getattr(request, 'expiry_type', None) == 'OPEN_ENDED')
+        if is_open_ended:
+            if not getattr(sub_limit, 'allows_open_ended', False):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This sub-limit '{sub_limit.limit_name}' does not permit open-ended guarantees."
+                )
+        else:
+            from datetime import date as _dt_cls
+            req_issue_d = getattr(request, 'requested_issue_date', None) or _dt_cls.today()
+            tenor_days = None
+            if getattr(request, 'expiry_type', None) == 'PERIOD_FROM_ISSUANCE' and getattr(request, 'validity_period_value', None):
+                from app.core.date_utils import calculate_projected_expiry
+                proj_exp = calculate_projected_expiry(req_issue_d, request.validity_period_value, request.validity_period_unit)
+                if proj_exp:
+                    tenor_days = (proj_exp - req_issue_d).days
+            elif getattr(request, 'requested_expiry_date', None):
+                tenor_days = (request.requested_expiry_date - req_issue_d).days
+
+            if tenor_days is not None and getattr(sub_limit, 'max_tenor_days', None) and sub_limit.max_tenor_days > 0:
+                if tenor_days > sub_limit.max_tenor_days:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Requested validity ({tenor_days} days) exceeds maximum tenor of {sub_limit.max_tenor_days} days allowed for sub-limit '{sub_limit.limit_name}'."
+                    )
+
         # C1: Convert request amount to facility currency for capacity comparison
         from app.services.fx_service import fx_service
         facility_equivalent_amount, fx_rate = fx_service.convert(
@@ -2014,6 +2041,10 @@ class IssuanceService:
                 issue_date=None,  # D2: Set to NULL — populated from bank reply
                 requested_issue_date=issue_date or request.requested_issue_date,
                 expiry_date=expiry_date or request.requested_expiry_date,
+                expiry_type=getattr(request, 'expiry_type', 'FIXED_DATE') or 'FIXED_DATE',
+                validity_period_value=getattr(request, 'validity_period_value', None),
+                validity_period_unit=getattr(request, 'validity_period_unit', None),
+                is_open_ended=getattr(request, 'is_open_ended', False) or False,
                 status="INTERNAL_PROCESSING",
                 # Accountability
                 issued_by_user_id=user_id,

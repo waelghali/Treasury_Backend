@@ -168,6 +168,7 @@ class IssuanceFacilitySubLimit(Base):
         comment="Structure: {'type': 'ALLOW'|'EXCLUDE', 'countries': ['US', 'AE']}"
     )
     allows_confirmation = Column(Boolean, default=False)
+    allows_open_ended = Column(Boolean, default=False, comment="Whether this sub-limit permits open-ended / indefinite LGs")
     
     # Initial utilization for onboarding existing facilities (not new ones)
     initial_utilization = Column(Numeric(precision=20, scale=2), default=0, nullable=False,
@@ -271,6 +272,10 @@ class IssuedLGRecord(Base):
     
     issue_date = Column(Date, nullable=True, comment="Set from bank reply, NOT at execution")
     expiry_date = Column(Date, nullable=True)
+    expiry_type = Column(String(30), default="FIXED_DATE", comment="FIXED_DATE, PERIOD_FROM_ISSUANCE, OPEN_ENDED")
+    validity_period_value = Column(Integer, nullable=True)
+    validity_period_unit = Column(String(20), nullable=True, comment="DAYS, MONTHS, YEARS")
+    is_open_ended = Column(Boolean, default=False)
     status = Column(String, default="INTERNAL_PROCESSING", comment="INTERNAL_PROCESSING, DELIVERED_TO_BANK, LG_ISSUED, ACTIVE, BANK_REJECTED, SLA_EXCEEDED, EXPIRED, RETURNED, LIQUIDATED, CANCELLED")
     
     # Accountability & Issuance Method
@@ -529,8 +534,9 @@ class BankFormTemplate(Base):
     ai_analysis = Column(JSONB, nullable=True)
     ai_analysis_status = Column(String, default="PENDING")   # PENDING | ANALYZING | COMPLETED | FAILED
 
-    # Language
+    # Language & Expiry Rules
     form_language = Column(String, default="BILINGUAL", nullable=False, comment="AR / EN / BILINGUAL — language of this form template")
+    allows_period_expiry = Column(Boolean, default=False, comment="Whether this form accepts validity period sentences (e.g. 3 months from issuance) or strictly requires calendar date")
 
     # Status
     is_active = Column(Boolean, default=True)
@@ -616,7 +622,11 @@ class IssuanceRequest(BaseModel):
     amount = Column(Numeric(precision=20, scale=2), nullable=True) # Maps to LG Amount
     currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=True) # Maps to LG Currency
     requested_issue_date = Column(Date, nullable=True, default=func.current_date()) # Suggested Start
-    requested_expiry_date = Column(Date, nullable=True) # Maturity Date
+    requested_expiry_date = Column(Date, nullable=True) # Maturity Date (tentative if period-based)
+    expiry_type = Column(String(30), default="FIXED_DATE", comment="FIXED_DATE, PERIOD_FROM_ISSUANCE, OPEN_ENDED")
+    validity_period_value = Column(Integer, nullable=True)
+    validity_period_unit = Column(String(20), nullable=True, comment="DAYS, MONTHS, YEARS")
+    is_open_ended = Column(Boolean, default=False)
     payable_currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=True) # New field
     operational_status = Column(String, nullable=True) # Operative / Non-Operative (Rule bound)
     lg_language = Column(String, nullable=False, default="AR", comment="AR / EN — language for LG issuance")

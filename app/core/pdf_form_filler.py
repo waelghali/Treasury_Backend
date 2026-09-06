@@ -14,6 +14,7 @@ import logging
 from typing import Dict, Any, Optional, List
 from datetime import date
 from decimal import Decimal
+from app.core.date_utils import calculate_projected_expiry, format_period_sentence
 
 logger = logging.getLogger(__name__)
 
@@ -364,7 +365,7 @@ def get_pdf_form_fields(pdf_bytes: bytes) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Build comprehensive request data dictionary
 # ---------------------------------------------------------------------------
-def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PRIMARY_ISSUER") -> Dict[str, Any]:
+def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PRIMARY_ISSUER", form_template=None) -> Dict[str, Any]:
     """
     Builds a comprehensive data dictionary from an IssuanceRequest object.
     Used to populate both signed letters and fillable PDF forms.
@@ -375,7 +376,34 @@ def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PR
         db: SQLAlchemy session (for bank account lookup)
         bank_id: Optional bank_id to resolve bank account details
         form_role: PRIMARY_ISSUER (default) or THIRD_PARTY_INDEMNITY
+        form_template: Optional BankFormTemplate ORM object to inspect capabilities (e.g. allows_period_expiry)
     """
+    expiry_type = getattr(request, 'expiry_type', 'FIXED_DATE') or 'FIXED_DATE'
+    period_val = getattr(request, 'validity_period_value', None)
+    period_unit = getattr(request, 'validity_period_unit', None)
+    is_open_ended = bool(getattr(request, 'is_open_ended', False)) or (expiry_type == 'OPEN_ENDED')
+    
+    req_lang = getattr(request, 'lg_language', 'AR') or 'AR'
+    period_text_ar = format_period_sentence(period_val, period_unit, "AR")
+    period_text_en = format_period_sentence(period_val, period_unit, "EN")
+
+    start_d = request.requested_issue_date or date.today()
+    projected_expiry_date = None
+    if expiry_type == 'PERIOD_FROM_ISSUANCE' and period_val:
+        projected_expiry_date = calculate_projected_expiry(start_d, period_val, period_unit)
+
+    template_allows_period = bool(getattr(form_template, 'allows_period_expiry', False)) if form_template else False
+    
+    if is_open_ended:
+        final_expiry_val = "غير محدد المدة / ساري حتى الإلغاء" if req_lang == 'AR' else "Open-ended / Until cancellation"
+    elif expiry_type == 'PERIOD_FROM_ISSUANCE':
+        if template_allows_period:
+            final_expiry_val = period_text_ar if req_lang == 'AR' else period_text_en
+        else:
+            final_expiry_val = projected_expiry_date
+    else:
+        final_expiry_val = request.requested_expiry_date
+
     data = {
         # Request basics
         "request_id": request.serial_number or f"REQ-{request.id}",
@@ -400,8 +428,16 @@ def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PR
         
         # Dates  
         "requested_issue_date": request.requested_issue_date,
-        "requested_expiry_date": request.requested_expiry_date,
-        "expiry_date": request.requested_expiry_date,
+        "requested_expiry_date": final_expiry_val,
+        "expiry_date": final_expiry_val,
+        "expiry_type": expiry_type,
+        "validity_period_value": period_val,
+        "validity_period_unit": period_unit,
+        "period_text_ar": period_text_ar,
+        "period_text_en": period_text_en,
+        "projected_expiry_date": projected_expiry_date,
+        "is_open_ended": is_open_ended,
+        "calculated_expiry_applied": (expiry_type == 'PERIOD_FROM_ISSUANCE' and not template_allows_period),
         
         # Reference
         "reference_type": request.reference_type or "",

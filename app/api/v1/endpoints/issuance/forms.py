@@ -55,6 +55,7 @@ async def upload_bank_form(
     form_type: str = Query("FILLABLE_PDF"),
     form_language: str = Query("BILINGUAL", description="AR / EN / BILINGUAL"),
     form_role: str = Query("PRIMARY_ISSUER", description="PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY"),
+    allows_period_expiry: bool = Query(False, description="Whether this form accepts validity period text (e.g. 3 months from issuance)"),
     lg_type_ids: str = Query(None, description="Optional: comma-separated LG type IDs this form covers. NULL = universal."),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -109,6 +110,7 @@ async def upload_bank_form(
         form_type=form_type,
         form_language=form_language if form_language in ('AR', 'EN', 'BILINGUAL') else 'BILINGUAL',
         form_role=form_role if form_role in ('PRIMARY_ISSUER', 'THIRD_PARTY_INDEMNITY') else 'PRIMARY_ISSUER',
+        allows_period_expiry=allows_period_expiry,
         lg_type_ids=[int(x.strip()) for x in lg_type_ids.split(',') if x.strip()] if lg_type_ids else None,
         file_path=file_path,
         original_filename=file.filename,
@@ -651,6 +653,7 @@ def list_bank_forms(
             "is_active": f.is_active,
             "is_deleted": f.is_deleted,
             "priority": f.priority or 0,
+            "allows_period_expiry": bool(getattr(f, 'allows_period_expiry', False)),
             "created_at": f.created_at.isoformat() if f.created_at else None,
         }
         for f in forms
@@ -690,6 +693,7 @@ def get_bank_form(
         "ai_analysis": form_template.ai_analysis,
         "is_active": form_template.is_active,
         "priority": form_template.priority or 0,
+        "allows_period_expiry": bool(getattr(form_template, 'allows_period_expiry', False)),
         "created_at": form_template.created_at.isoformat() if form_template.created_at else None,
         "updated_at": form_template.updated_at.isoformat() if form_template.updated_at else None,
     }
@@ -837,6 +841,33 @@ def set_bank_form_role(
     form.form_role = form_role if form_role in ("PRIMARY_ISSUER", "THIRD_PARTY_INDEMNITY") else "PRIMARY_ISSUER"
     db.commit()
     return {"message": f"Form role set to {form.form_role}", "id": form_id, "form_role": form.form_role}
+
+
+@router.patch("/bank-forms/{form_id}/toggle-period-expiry")
+def toggle_bank_form_period_expiry(
+    form_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(check_subscription_status),
+):
+    """Toggles whether this bank form accepts period text (e.g. '3 months from issuance') or requires fixed calendar dates."""
+    from app.constants import UserRole
+    if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
+        raise HTTPException(403, "Not enough privileges.")
+    
+    form = db.query(BankFormTemplate).filter(
+        BankFormTemplate.id == form_id,
+        BankFormTemplate.is_deleted == False,
+    ).first()
+    if not form:
+        raise HTTPException(404, "Bank form template not found.")
+    
+    form.allows_period_expiry = not getattr(form, 'allows_period_expiry', False)
+    db.commit()
+    return {
+        "message": f"Form period expiry acceptance updated to {form.allows_period_expiry}.",
+        "id": form_id,
+        "allows_period_expiry": form.allows_period_expiry,
+    }
 
 
 @router.get("/form-dictionary")
@@ -1218,7 +1249,7 @@ async def auto_fill_bank_form(
     
     # Build data dict (auto-fills from system data + bank account)
     from app.core.pdf_form_filler import fill_pdf_form, build_request_data_dict
-    request_data = build_request_data_dict(request, db, bank_id=bank_id, form_role=target_role)
+    request_data = build_request_data_dict(request, db, bank_id=bank_id, form_role=target_role, form_template=form_template)
     _logger.info(f"Auto-fill: form_type={form_template.form_type}, form_role={target_role}, field_mapping has {len(field_mapping)} entries, request_data has {len(request_data)} keys")
     _logger.info(f"Auto-fill: non-empty request_data keys: {[k for k,v in request_data.items() if v]}")
     
@@ -1421,7 +1452,9 @@ async def auto_fill_bank_form(
                     'X-Has-Third-Party-Form': 'true' if tp_template else 'false',
                     'X-Third-Party-Form-Id': str(tp_template.id) if tp_template else '',
                     'X-Special-Wording-Doc-Id': str(special_wording_doc_id) if special_wording_doc_id else '',
-                    'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id',
+                    'X-Calculated-Expiry-Applied': 'true' if request_data.get("calculated_expiry_applied") else 'false',
+                    'X-Projected-Expiry-Date': str(request_data.get("projected_expiry_date") or ''),
+                    'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id, X-Calculated-Expiry-Applied, X-Projected-Expiry-Date',
                 }
             )
         
@@ -1438,6 +1471,9 @@ async def auto_fill_bank_form(
             "has_third_party_form": bool(tp_template),
             "third_party_form_info": third_party_form_info,
             "special_wording_doc_id": special_wording_doc_id,
+            "calculated_expiry_applied": bool(request_data.get("calculated_expiry_applied")),
+            "projected_expiry_date": str(request_data.get("projected_expiry_date") or ""),
+            "allows_period_expiry": bool(getattr(form_template, 'allows_period_expiry', False)),
         }
     
     # ── PHASE 2: Merge user values and generate PDF ──
@@ -1533,7 +1569,9 @@ async def auto_fill_bank_form(
             'X-Has-Third-Party-Form': 'true' if tp_template else 'false',
             'X-Third-Party-Form-Id': str(tp_template.id) if tp_template else '',
             'X-Special-Wording-Doc-Id': str(special_wording_doc_id) if special_wording_doc_id else '',
-            'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id',
+            'X-Calculated-Expiry-Applied': 'true' if request_data.get("calculated_expiry_applied") else 'false',
+            'X-Projected-Expiry-Date': str(request_data.get("projected_expiry_date") or ''),
+            'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id, X-Calculated-Expiry-Applied, X-Projected-Expiry-Date',
         }
     )
 

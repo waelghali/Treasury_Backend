@@ -1303,6 +1303,10 @@ def get_post_issuance_status(
         expected_values = {
             "amount": str(request.amount) if request.amount else None,
             "expiry_date": str(request.requested_expiry_date) if request.requested_expiry_date else None,
+            "expiry_type": getattr(request, 'expiry_type', 'FIXED_DATE') or 'FIXED_DATE',
+            "validity_period_value": getattr(request, 'validity_period_value', None),
+            "validity_period_unit": getattr(request, 'validity_period_unit', None),
+            "is_open_ended": bool(getattr(request, 'is_open_ended', False)),
             "beneficiary_name": request.beneficiary_name,
             "currency": req_currency_obj.iso_code if req_currency_obj else None,
             "issuing_bank_name": bank_name,

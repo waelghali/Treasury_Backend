@@ -1,6 +1,6 @@
 # app/schemas/schemas_issuance.py
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from typing import Optional, Dict, List, Any
 from datetime import date, datetime
 from enum import Enum
@@ -98,7 +98,11 @@ class IssuanceRequestBase(BaseModel):
     currency_id: int
     payable_currency_id: Optional[int] = None
     requested_issue_date: Optional[date] = None
-    requested_expiry_date: date
+    requested_expiry_date: Optional[date] = None
+    expiry_type: Optional[str] = "FIXED_DATE"  # FIXED_DATE, PERIOD_FROM_ISSUANCE, OPEN_ENDED
+    validity_period_value: Optional[int] = None
+    validity_period_unit: Optional[str] = None  # DAYS, MONTHS, YEARS
+    is_open_ended: Optional[bool] = False
     operational_status: Optional[str] = None
     lg_language: Optional[str] = "AR"
     is_auto_reducing: bool = False
@@ -144,6 +148,26 @@ class IssuanceRequestBase(BaseModel):
             raise ValueError("Amount must be greater than 0")
         return v
 
+    @model_validator(mode='after')
+    def validate_expiry(self):
+        # Skip validation for update subclass if partial
+        if getattr(self, '__class__', None) and self.__class__.__name__ == 'IssuanceRequestUpdate':
+            return self
+
+        exp_type = (self.expiry_type or "FIXED_DATE").upper()
+        if exp_type == "PERIOD_FROM_ISSUANCE":
+            if not self.validity_period_value or self.validity_period_value <= 0:
+                raise ValueError("validity_period_value must be greater than 0 for period-based validity.")
+            if not self.validity_period_unit or self.validity_period_unit.upper() not in ("DAYS", "MONTHS", "YEARS"):
+                raise ValueError("validity_period_unit must be DAYS, MONTHS, or YEARS.")
+        elif exp_type == "OPEN_ENDED" or self.is_open_ended:
+            self.is_open_ended = True
+            self.expiry_type = "OPEN_ENDED"
+        elif exp_type == "FIXED_DATE":
+            if not self.requested_expiry_date:
+                raise ValueError("requested_expiry_date is required when expiry_type is FIXED_DATE.")
+        return self
+
 class IssuanceRequestCreate(IssuanceRequestBase):
     pass 
 
@@ -172,6 +196,10 @@ class IssuanceRequestDraftCreate(BaseModel):
     payable_currency_id: Optional[int] = None
     requested_issue_date: Optional[date] = None
     requested_expiry_date: Optional[date] = None
+    expiry_type: Optional[str] = "FIXED_DATE"
+    validity_period_value: Optional[int] = None
+    validity_period_unit: Optional[str] = None
+    is_open_ended: Optional[bool] = False
     operational_status: Optional[str] = None
     lg_language: Optional[str] = "AR"
     is_auto_reducing: bool = False
@@ -306,6 +334,10 @@ class IssuedLGRecordDetailOut(BaseModel):
     currency_id: int
     issue_date: Optional[date] = None
     expiry_date: Optional[date] = None
+    expiry_type: Optional[str] = "FIXED_DATE"
+    validity_period_value: Optional[int] = None
+    validity_period_unit: Optional[str] = None
+    is_open_ended: Optional[bool] = False
     status: str
     issued_by_user_id: Optional[int] = None
     issuance_method: Optional[str] = None
@@ -334,6 +366,7 @@ class IssuanceFacilitySubLimitBase(BaseModel):
     lg_type_ids: List[int] = []
     max_amount_per_lg: Optional[Decimal] = None
     max_tenor_days: Optional[int] = None
+    allows_open_ended: bool = False
     allowed_countries: Optional[CountryRule] = None
     allows_confirmation: bool = False
     default_commission_rate: Optional[Decimal] = Decimal("0.0")

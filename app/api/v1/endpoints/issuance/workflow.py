@@ -857,6 +857,8 @@ async def record_bank_reply(
         lg.bank_lg_amount = bank_lg_amount or None
         # D2: Populate issue_date from bank's confirmed issue date
         lg.issue_date = lg.bank_lg_issue_date or date.today()
+        if lg.bank_lg_expiry_date:
+            lg.expiry_date = lg.bank_lg_expiry_date
         lg.status = "LG_ISSUED"
         lg.verification_status = "PENDING"
         # Also set the request to COMPLETED since bank confirmed issuance

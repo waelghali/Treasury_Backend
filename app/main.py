@@ -198,6 +198,29 @@ def configure_app_instance(fastapi_app: FastAPI):
             except Exception as ddl_err:
                 logger.warning(f"Cashback claims schema migration check skipped: {ddl_err}")
 
+            # --- Period & Open-Ended LG Schema Migration Check ---
+            try:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        ALTER TABLE issuance_requests ADD COLUMN IF NOT EXISTS expiry_type VARCHAR(30) DEFAULT 'FIXED_DATE';
+                        ALTER TABLE issuance_requests ADD COLUMN IF NOT EXISTS validity_period_value INTEGER;
+                        ALTER TABLE issuance_requests ADD COLUMN IF NOT EXISTS validity_period_unit VARCHAR(20);
+                        ALTER TABLE issuance_requests ADD COLUMN IF NOT EXISTS is_open_ended BOOLEAN DEFAULT FALSE;
+
+                        ALTER TABLE issued_lg_records ADD COLUMN IF NOT EXISTS expiry_type VARCHAR(30) DEFAULT 'FIXED_DATE';
+                        ALTER TABLE issued_lg_records ADD COLUMN IF NOT EXISTS validity_period_value INTEGER;
+                        ALTER TABLE issued_lg_records ADD COLUMN IF NOT EXISTS validity_period_unit VARCHAR(20);
+                        ALTER TABLE issued_lg_records ADD COLUMN IF NOT EXISTS is_open_ended BOOLEAN DEFAULT FALSE;
+
+                        ALTER TABLE issuance_facility_sub_limits ADD COLUMN IF NOT EXISTS allows_open_ended BOOLEAN DEFAULT FALSE;
+
+                        ALTER TABLE bank_form_templates ADD COLUMN IF NOT EXISTS allows_period_expiry BOOLEAN DEFAULT FALSE;
+                    """))
+                    conn.commit()
+            except Exception as ddl_err:
+                logger.warning(f"Period & Open-Ended schema migration check skipped: {ddl_err}")
+
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:
                 from sqlalchemy.orm import Session as DBSession
