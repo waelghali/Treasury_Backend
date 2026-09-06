@@ -265,23 +265,63 @@ def get_system_notification_analytics(
         
     return crud_system_notification.get_analytics(db, notification_id=notification_id)
 
+@router.get("/system-notifications-types", response_model=List[str])
+async def read_system_notification_types(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_notification:view"))
+):
+    return crud_system_notification.get_distinct_notification_types(db)
+
+
 @router.get("/system-notifications/", response_model=List[SystemNotificationOut])
 async def read_system_notifications(
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 200,
+    search: Optional[str] = None,
+    notification_type: Optional[str] = None,
+    is_automated: Optional[bool] = None,
+    created_by_user_id: Optional[int] = None,
+    customer_id: Optional[int] = None,
+    target_user_id: Optional[int] = None,
+    target_role: Optional[str] = None,
+    status: Optional[str] = None,
+    created_from: Optional[datetime] = None,
+    created_to: Optional[datetime] = None,
+    include_broadcast: bool = True,
     is_active: Optional[bool] = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_notification:view"))
 ):
-    if is_active is True:
-        notifications = crud_system_notification.get_all_active(db, skip=skip, limit=limit)
-    else:
-        notifications = crud_system_notification.get_all(db, skip=skip, limit=limit)
-    
+    # Backward compatibility with is_active
+    effective_status = status
+    if is_active is True and not effective_status:
+        effective_status = "ACTIVE"
+    elif is_active is False and not effective_status:
+        effective_status = "INACTIVE"
+
+    notifications = crud_system_notification.filter_system_notifications(
+        db=db,
+        search=search,
+        notification_type=notification_type,
+        is_automated=is_automated,
+        created_by_user_id=created_by_user_id,
+        customer_id=customer_id,
+        target_user_id=target_user_id,
+        target_role=target_role,
+        status=effective_status,
+        created_from=created_from,
+        created_to=created_to,
+        include_broadcast=include_broadcast,
+        skip=skip,
+        limit=limit,
+    )
+
+    # Enrich with human-readable creator and target details
+    crud_system_notification.enrich_notification_metadata(db, notifications)
+
     # DYNAMIC SIGNING: Generate FRESH links for every view
     results = []
     for n in notifications:
-        # FIX: Explicitly detach each object before mutation
         db.expunge(n)
         
         if n.image_url and n.image_url.startswith("gs://"):
@@ -303,7 +343,7 @@ async def read_system_notification(
     if not db_notification:
         raise HTTPException(status_code=404, detail="Not found.")
     
-    # FIX: Explicitly detach the object
+    crud_system_notification.enrich_notification_metadata(db, [db_notification])
     db.expunge(db_notification) 
 
     # Use the now detached object for the response model (no need for .from_orm here, can reuse ORM object)

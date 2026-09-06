@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError 
 
 from app.crud.crud import CRUDBase, log_action
-from app.models import SystemNotification, User, SystemNotificationViewLog
+from app.models import SystemNotification, User, SystemNotificationViewLog, Customer
 from app.schemas.all_schemas import SystemNotificationCreate, SystemNotificationUpdate
 from app.constants import UserRole
 
@@ -49,6 +49,207 @@ class CRUDSystemNotification(CRUDBase):
         This enables the 'Restore' functionality in the admin panel.
         """
         return db.query(self.model).order_by(self.model.created_at.desc()).offset(skip).limit(limit).all()
+
+    def filter_system_notifications(
+        self,
+        db: Session,
+        search: Optional[str] = None,
+        notification_type: Optional[str] = None,
+        is_automated: Optional[bool] = None,
+        created_by_user_id: Optional[int] = None,
+        customer_id: Optional[int] = None,
+        target_user_id: Optional[int] = None,
+        target_role: Optional[str] = None,
+        status: Optional[str] = None,
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+        include_broadcast: bool = True,
+        skip: int = 0,
+        limit: int = 200,
+    ) -> List[SystemNotification]:
+        """
+        Multi-criteria query for system notifications.
+        """
+        query = db.query(self.model)
+        now = datetime.now()
+
+        # Status filter
+        if status:
+            s = status.upper().strip()
+            if s == "ACTIVE":
+                query = query.filter(
+                    self.model.is_deleted == False,
+                    self.model.is_active == True,
+                    self.model.start_date <= now,
+                    self.model.end_date >= now,
+                )
+            elif s == "INACTIVE":
+                query = query.filter(
+                    self.model.is_deleted == False,
+                    self.model.is_active == False,
+                )
+            elif s == "SCHEDULED":
+                query = query.filter(
+                    self.model.is_deleted == False,
+                    self.model.is_active == True,
+                    self.model.start_date > now,
+                )
+            elif s == "EXPIRED":
+                query = query.filter(
+                    self.model.is_deleted == False,
+                    self.model.is_active == True,
+                    self.model.end_date < now,
+                )
+            elif s == "DELETED":
+                query = query.filter(self.model.is_deleted == True)
+            # if s == "ALL", include everything including soft-deleted
+
+        # Search term across content and link
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            query = query.filter(
+                or_(
+                    self.model.content.ilike(term),
+                    self.model.link.ilike(term),
+                    self.model.notification_type.ilike(term),
+                )
+            )
+
+        # Exact Notification Type
+        if notification_type and notification_type.strip() and notification_type.upper() != "ALL":
+            query = query.filter(self.model.notification_type == notification_type.strip())
+
+        # Origin: Automated vs Manual
+        if is_automated is not None:
+            automated_types = [
+                'LG_EXPIRED', 'LG_EXPIRING_SOON', 'SYSTEM_ALERT', 'MARGIN_CALL', 
+                'AUTO_RENEWAL', 'FACILITY_LIMIT_BREACH', 'AUTOMATED_NOTICE'
+            ]
+            if is_automated:
+                query = query.filter(
+                    or_(
+                        self.model.notification_type.in_(automated_types),
+                        self.model.notification_type.ilike('%EXPIRED%'),
+                        self.model.notification_type.ilike('%ALERT%'),
+                    )
+                )
+            else:
+                query = query.filter(
+                    and_(
+                        ~self.model.notification_type.in_(automated_types),
+                        ~self.model.notification_type.ilike('%EXPIRED%'),
+                        ~self.model.notification_type.ilike('%ALERT%'),
+                    )
+                )
+
+        # Created By User ID
+        if created_by_user_id:
+            query = query.filter(self.model.created_by_user_id == created_by_user_id)
+
+        # Target Customer ID (JSONB)
+        if customer_id:
+            if include_broadcast:
+                query = query.filter(
+                    or_(
+                        self.model.target_customer_ids.is_(None),
+                        self.model.target_customer_ids == [],
+                        self.model.target_customer_ids.contains([customer_id])
+                    )
+                )
+            else:
+                query = query.filter(self.model.target_customer_ids.contains([customer_id]))
+
+        # Target User ID (JSONB)
+        if target_user_id:
+            if include_broadcast:
+                query = query.filter(
+                    or_(
+                        self.model.target_user_ids.is_(None),
+                        self.model.target_user_ids == [],
+                        self.model.target_user_ids.contains([target_user_id])
+                    )
+                )
+            else:
+                query = query.filter(self.model.target_user_ids.contains([target_user_id]))
+
+        # Target Role (JSONB)
+        if target_role and target_role.strip() and target_role.upper() != "ALL":
+            query = query.filter(self.model.target_roles.contains([target_role.strip().upper()]))
+
+        # Created At Date Range
+        if created_from:
+            query = query.filter(self.model.created_at >= created_from)
+        if created_to:
+            query = query.filter(self.model.created_at <= created_to)
+
+        return query.order_by(self.model.created_at.desc()).offset(skip).limit(limit).all()
+
+    def enrich_notification_metadata(self, db: Session, notifications: List[SystemNotification]) -> List[SystemNotification]:
+        """
+        Batch enriches notification models with creator user name/email,
+        target customer names, and target user emails.
+        """
+        if not notifications:
+            return []
+
+        customer_ids = set()
+        user_ids = set()
+        creator_ids = set()
+
+        for n in notifications:
+            if n.created_by_user_id:
+                creator_ids.add(n.created_by_user_id)
+            if n.target_customer_ids and isinstance(n.target_customer_ids, list):
+                for cid in n.target_customer_ids:
+                    if isinstance(cid, int):
+                        customer_ids.add(cid)
+            if n.target_user_ids and isinstance(n.target_user_ids, list):
+                for uid in n.target_user_ids:
+                    if isinstance(uid, int):
+                        user_ids.add(uid)
+
+        customer_map = {}
+        if customer_ids:
+            customers = db.query(Customer.id, Customer.name).filter(Customer.id.in_(customer_ids)).all()
+            customer_map = {c.id: c.name for c in customers}
+
+        all_user_ids = user_ids.union(creator_ids)
+        user_map = {}
+        if all_user_ids:
+            users = db.query(User.id, User.email).filter(User.id.in_(all_user_ids)).all()
+            user_map = {u.id: u.email for u in users}
+
+        for n in notifications:
+            # Creator metadata
+            if n.created_by_user_id == 1:
+                n.created_by_user_name = "System Automation"
+                n.created_by_user_email = user_map.get(1, "system@grow.com")
+            elif n.created_by_user_id in user_map:
+                n.created_by_user_name = user_map[n.created_by_user_id].split('@')[0].capitalize()
+                n.created_by_user_email = user_map[n.created_by_user_id]
+            else:
+                n.created_by_user_name = f"User #{n.created_by_user_id}" if n.created_by_user_id else "System"
+
+            # Target Customer Names
+            if n.target_customer_ids and isinstance(n.target_customer_ids, list):
+                n.target_customer_names = [customer_map.get(cid, f"Customer #{cid}") for cid in n.target_customer_ids if isinstance(cid, int)]
+            else:
+                n.target_customer_names = []
+
+            # Target User Emails
+            if n.target_user_ids and isinstance(n.target_user_ids, list):
+                n.target_user_emails = [user_map.get(uid, f"User #{uid}") for uid in n.target_user_ids if isinstance(uid, int)]
+            else:
+                n.target_user_emails = []
+
+        return notifications
+
+    def get_distinct_notification_types(self, db: Session) -> List[str]:
+        """
+        Returns list of distinct notification types present in the database.
+        """
+        types = db.query(self.model.notification_type).distinct().all()
+        return sorted([t[0] for t in types if t[0]])
 
     def get_active_notifications_for_user(self, db: Session, user_id: int, customer_id: Optional[int]) -> List[SystemNotification]:
         """

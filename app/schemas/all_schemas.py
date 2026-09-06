@@ -1392,6 +1392,10 @@ class SystemNotificationOut(SystemNotificationBase):
     updated_at: Optional[datetime] = None
     created_by_user_id: Optional[int] = None
     is_deleted: bool = False
+    created_by_user_name: Optional[str] = None
+    created_by_user_email: Optional[str] = None
+    target_customer_names: Optional[List[str]] = None
+    target_user_emails: Optional[List[str]] = None
 
     class Config:
         from_attributes = True
