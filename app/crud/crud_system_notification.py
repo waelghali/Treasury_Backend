@@ -121,26 +121,11 @@ class CRUDSystemNotification(CRUDBase):
 
         # Origin: Automated vs Manual
         if is_automated is not None:
-            automated_types = [
-                'LG_EXPIRED', 'LG_EXPIRING_SOON', 'SYSTEM_ALERT', 'MARGIN_CALL', 
-                'AUTO_RENEWAL', 'FACILITY_LIMIT_BREACH', 'AUTOMATED_NOTICE'
-            ]
+            manual_types = ['system_info', 'system_critical', 'cbe', 'news', 'ad']
             if is_automated:
-                query = query.filter(
-                    or_(
-                        self.model.notification_type.in_(automated_types),
-                        self.model.notification_type.ilike('%EXPIRED%'),
-                        self.model.notification_type.ilike('%ALERT%'),
-                    )
-                )
+                query = query.filter(~self.model.notification_type.in_(manual_types))
             else:
-                query = query.filter(
-                    and_(
-                        ~self.model.notification_type.in_(automated_types),
-                        ~self.model.notification_type.ilike('%EXPIRED%'),
-                        ~self.model.notification_type.ilike('%ALERT%'),
-                    )
-                )
+                query = query.filter(self.model.notification_type.in_(manual_types))
 
         # Created By User ID
         if created_by_user_id:
@@ -210,25 +195,30 @@ class CRUDSystemNotification(CRUDBase):
 
         customer_map = {}
         if customer_ids:
-            customers = db.query(Customer.id, Customer.name).filter(Customer.id.in_(customer_ids)).all()
-            customer_map = {c.id: c.name for c in customers}
+            customers = db.query(Customer.id, Customer.name, Customer.is_deleted).filter(Customer.id.in_(customer_ids)).all()
+            customer_map = {c.id: (f"{c.name} (Deleted)" if c.is_deleted else c.name) for c in customers}
 
         all_user_ids = user_ids.union(creator_ids)
         user_map = {}
         if all_user_ids:
-            users = db.query(User.id, User.email).filter(User.id.in_(all_user_ids)).all()
-            user_map = {u.id: u.email for u in users}
+            users = db.query(User.id, User.email, User.is_deleted).filter(User.id.in_(all_user_ids)).all()
+            user_map = {u.id: (f"{u.email} (Deleted)" if u.is_deleted else u.email) for u in users}
 
+        manual_types = {'system_info', 'system_critical', 'cbe', 'news', 'ad'}
         for n in notifications:
             # Creator metadata
-            if n.created_by_user_id == 1:
+            is_automated_notif = (n.notification_type or '').lower() not in manual_types
+            if is_automated_notif:
                 n.created_by_user_name = "System Automation"
-                n.created_by_user_email = user_map.get(1, "system@grow.com")
+                n.created_by_user_email = "scheduler@system"
+            elif n.created_by_user_id == 1:
+                n.created_by_user_name = "System Owner"
+                n.created_by_user_email = user_map.get(1, "system.owner@example.com")
             elif n.created_by_user_id in user_map:
                 n.created_by_user_name = user_map[n.created_by_user_id].split('@')[0].capitalize()
                 n.created_by_user_email = user_map[n.created_by_user_id]
             else:
-                n.created_by_user_name = f"User #{n.created_by_user_id}" if n.created_by_user_id else "System"
+                n.created_by_user_name = f"User #{n.created_by_user_id}" if n.created_by_user_id else "System Owner"
 
             # Target Customer Names
             if n.target_customer_ids and isinstance(n.target_customer_ids, list):
