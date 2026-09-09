@@ -104,15 +104,19 @@ class AuthService:
             (GlobalConfigKey.PASSWORD_REQUIRE_DIGIT, "true"),
             (GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES, "15")
         ]:
-            config_value = crud_global_configuration.get_by_key(db, key_enum)
-            value = config_value.value_default if config_value else default_value
+            try:
+                config_value = crud_global_configuration.get_by_key(db, key_enum)
+                value = config_value.value_default if config_value and config_value.value_default is not None else default_value
+            except Exception as e:
+                logger.warning(f"Error fetching password policy config {key_enum}: {e}")
+                value = default_value
             
             if key_enum == GlobalConfigKey.PASSWORD_MIN_LENGTH:
                 policy_config[key_enum.value] = int(value)
             elif key_enum == GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES:
                 policy_config[key_enum.value] = int(value)
             else:
-                policy_config[key_enum.value] = value.lower() == 'true'
+                policy_config[key_enum.value] = str(value).lower() == 'true'
         return policy_config
 
     async def _get_login_policy_config(self, db: Session) -> Dict[str, Any]:
@@ -124,10 +128,13 @@ class AuthService:
             (GlobalConfigKey.LOGIN_MAX_FAILED_ATTEMPTS, "5"),
             (GlobalConfigKey.LOGIN_LOCKOUT_DURATION_MINUTES, "15")
         ]:
-            config_value = crud_global_configuration.get_by_key(db, key_enum)
-            value = config_value.value_default if config_value else default_value
-            
-            policy_config[key_enum.value] = int(value)
+            try:
+                config_value = crud_global_configuration.get_by_key(db, key_enum)
+                value = config_value.value_default if config_value and config_value.value_default is not None else default_value
+                policy_config[key_enum.value] = int(value)
+            except Exception as e:
+                logger.warning(f"Error fetching login policy config {key_enum}: {e}")
+                policy_config[key_enum.value] = int(default_value)
         return policy_config
 
     async def _get_legal_artifact_versions(self, db: Session) -> Dict[str, float]:
@@ -137,11 +144,16 @@ class AuthService:
         """
         from app.crud.crud import crud_global_configuration
         
-        tc_config = crud_global_configuration.get_by_key(db, GlobalConfigKey.TC_VERSION)
-        pp_config = crud_global_configuration.get_by_key(db, GlobalConfigKey.PP_VERSION)
-        
-        tc_version = float(tc_config.value_default) if tc_config and tc_config.value_default else 0.0
-        pp_version = float(pp_config.value_default) if pp_config and pp_config.value_default else 0.0
+        try:
+            tc_config = crud_global_configuration.get_by_key(db, GlobalConfigKey.TC_VERSION)
+            pp_config = crud_global_configuration.get_by_key(db, GlobalConfigKey.PP_VERSION)
+            
+            tc_version = float(tc_config.value_default) if tc_config and tc_config.value_default else 0.0
+            pp_version = float(pp_config.value_default) if pp_config and pp_config.value_default else 0.0
+        except Exception as e:
+            logger.warning(f"Error fetching legal artifact versions: {e}")
+            tc_version = 0.0
+            pp_version = 0.0
 
         return {
             "tc_version": tc_version,
@@ -498,7 +510,7 @@ class AuthService:
             "must_accept_policies": must_accept_policies_status
         }
 
-    async def initiate_password_reset(self, db: Session, email: str, request_ip: Optional[str]) -> None:
+    async def initiate_password_reset(self, db: Session, email: str, request_ip: Optional[str] = None, request: Optional[Request] = None) -> None:
         """
         Generates a password reset token and sends it to the user's email.
         """
@@ -548,7 +560,7 @@ class AuthService:
 
         # Send email with the plaintext token
         from app.core.routing import get_frontend_base_url
-        frontend_url = get_frontend_base_url()
+        frontend_url = get_frontend_base_url(request=request)
         reset_link = f"{frontend_url}/reset-password?token={plain_token}" # Updated path based on App.js routing
 
         # Get email settings (customer-specific or global fallback)

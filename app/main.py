@@ -221,6 +221,28 @@ def configure_app_instance(fastapi_app: FastAPI):
             except Exception as ddl_err:
                 logger.warning(f"Period & Open-Ended schema migration check skipped: {ddl_err}")
 
+            # --- Bank Reconciliation Smart Classification Schema Migration Check ---
+            try:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS classification_source VARCHAR(50);
+                        ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS classification_confidence INTEGER;
+                        ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS suggested_category VARCHAR(100);
+                        ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS variance_amount NUMERIC(18, 2);
+                        ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS rule_type VARCHAR(20) DEFAULT 'LITERAL';
+                        ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS created_by INTEGER;
+                        ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS updated_by INTEGER;
+                        ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS bank_id INTEGER;
+                        ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS bank_name VARCHAR(100);
+                        ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS bank_account_number VARCHAR(50);
+                        ALTER TABLE reconciliation_matches ADD COLUMN IF NOT EXISTS variance_amount NUMERIC(18, 2) DEFAULT 0.00;
+                        ALTER TABLE reconciliation_matches ADD COLUMN IF NOT EXISTS variance_disposition VARCHAR(50) DEFAULT 'NONE';
+                    """))
+                    conn.commit()
+            except Exception as ddl_err:
+                logger.warning(f"Bank reconciliation smart classification schema migration check skipped: {ddl_err}")
+
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:
                 from sqlalchemy.orm import Session as DBSession

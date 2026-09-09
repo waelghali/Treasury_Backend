@@ -112,6 +112,13 @@ class BankTransaction(BaseModel):
     applied_rule_id = Column(Integer, ForeignKey("classification_rules.id"), nullable=True)
     linked_txn_id = Column(Integer, ForeignKey("bank_transactions.id"), nullable=True)
     
+    # Smart Classification Metadata
+    classification_source = Column(String, nullable=True)  # BUILTIN, RULE, MANUAL, LEARNED
+    classification_confidence = Column(Integer, nullable=True)  # 0-100
+    suggested_category = Column(String, nullable=True)  # Pending suggestion, not yet confirmed
+    variance_amount = Column(Numeric(precision=18, scale=2), nullable=True)  # Bank fee or FX variance on paired sweeps/reversals
+
+    
     # Relationships
     statement = relationship("BankStatement", back_populates="transactions")
     multi_references = relationship("MultiReference", back_populates="transaction", cascade="all, delete-orphan")
@@ -147,6 +154,8 @@ class ReconciliationMatch(BaseModel):
     
     match_type = Column(String, nullable=False) # 1:1, 1:M, M:1, PARTIAL
     match_logic = Column(String, nullable=False) # REFERENCE, EXACT, TOLERANCE, MANUAL
+    variance_amount = Column(Numeric(precision=18, scale=2), default=0.00, nullable=True) # Intermediary fee / correspondent variance
+    variance_disposition = Column(String(50), default="NONE", nullable=True) # 'NONE', 'BANK_FEE_WRITEOFF', 'FX_DIFFERENCE', 'ROUNDING'
     
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     # created_at is in BaseModel
@@ -161,10 +170,11 @@ class ClassificationRule(BaseModel):
 
     company_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
     rule_name = Column(String, nullable=True) # Optional user-friendly name
+    rule_type = Column(String, default="LITERAL") # LITERAL or CONCEPT
     priority = Column(Integer, default=100)
     stop_after_match = Column(Boolean, default=True)
     
-    conditions_json = Column(JSON, nullable=False) # { "field": "cleaned_description", "op": "contains", "val": "TAX" }
+    conditions_json = Column(JSON, nullable=False) # { "field": "cleaned_description", "op": "contains", "val": "TAX" } or concept dict
     assigned_gl_account = Column(String, nullable=False)
     
     usage_count = Column(Integer, default=0)
@@ -177,3 +187,129 @@ class ClassificationRule(BaseModel):
     __table_args__ = (
         Index('idx_classification_rules_priority', 'company_id', 'priority'),
     )
+
+class Counterparty(BaseModel):
+    """
+    Registry of known counterparties (customers, suppliers, banks, government bodies).
+    Supports both tenant-specific entries (company_id) and system-wide global entries (company_id is None).
+    Enables concept-based rules:
+      - Credit + Customer entity in description -> Collection from Customer (AR)
+      - Debit + Supplier entity in description -> Payment to Supplier (AP)
+      - Transfer + Bank entity in description -> Inter-bank sweep / Internal transfer
+    Can be manually defined or automatically learned and reinforced from customer transactions.
+    """
+    __tablename__ = 'reconciliation_counterparties'
+
+    company_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True) # None = Global for all companies
+    name = Column(String, nullable=False, index=True)
+    aliases = Column(JSON, nullable=True) # List of alias strings / search keywords e.g. ["ACME", "ACME LLC"]
+    entity_type = Column(String, nullable=False, default="CUSTOMER") # CUSTOMER, SUPPLIER, BANK, GOVERNMENT, OTHER
+    default_gl_account = Column(String, nullable=True) # e.g. "ACCOUNTS_RECEIVABLE", "ACCOUNTS_PAYABLE"
+    default_category = Column(String, nullable=True) # e.g. "COLLECTION_FROM_CUSTOMER", "PAYMENT_TO_SUPPLIER"
+    
+    learned_count = Column(Integer, default=0) # Times confirmed/learned
+    is_verified = Column(Boolean, default=False) # Manually verified vs auto-learned
+    is_active = Column(Boolean, default=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    
+    company = relationship("Customer")
+
+
+class CollaborativePattern(BaseModel):
+    """
+    Dynamic, self-evolving collaborative learning pattern.
+    Stores anonymized consensus signatures across tenants.
+    Zero customer PII, zero amounts, zero account numbers.
+    """
+    __tablename__ = 'collaborative_patterns'
+
+    bank_id = Column(Integer, ForeignKey("banks.id"), nullable=True, index=True) # Null = Universal cross-bank, Set = Bank-specific
+    signature_token = Column(String, nullable=False, index=True) # Anonymized normalized n-gram e.g. "INSTAPAY COMMISSION"
+    direction = Column(String, nullable=False, default="DEBIT") # CREDIT, DEBIT, EITHER
+    
+    suggested_category = Column(String, nullable=False) # e.g. "BANK_CHARGES", "TAX_DEDUCTION", "COLLECTION"
+    suggested_gl_account = Column(String, nullable=True) # e.g. "BANK_CHARGES", "ACCOUNTS_RECEIVABLE"
+    
+    distinct_tenants_count = Column(Integer, default=1) # Count of distinct companies that validated this pattern
+    total_confirmations = Column(Integer, default=1)    # Total times confirmed platform-wide
+    agreement_score = Column(Numeric(precision=5, scale=2), default=100.00) # % agreement across tenants
+    confidence_score = Column(Integer, default=50)      # Computed 0-100 confidence
+    
+    is_promoted = Column(Boolean, default=False, index=True) # Promoted to live active prediction when distinct_tenants >= K
+    last_confirmed_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    bank = relationship("Bank")
+    votes = relationship("CollaborativeTenantVote", back_populates="pattern", cascade="all, delete-orphan")
+
+
+class CollaborativeTenantVote(BaseModel):
+    """
+    Internal ledger of distinct tenant votes for K-anonymity validation.
+    Used exclusively to ensure 1 company = 1 vote and prevent gaming or leakage.
+    Never exposed through any client API.
+    """
+    __tablename__ = 'collaborative_tenant_votes'
+
+    pattern_id = Column(Integer, ForeignKey("collaborative_patterns.id", ondelete="CASCADE"), nullable=False, index=True)
+    company_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    category_voted = Column(String, nullable=False)
+    last_voted_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    pattern = relationship("CollaborativePattern", back_populates="votes")
+    company = relationship("Customer")
+
+
+class InternalLedgerRecord(BaseModel):
+    """
+    Simulated or integrated ERP records (AP Bills, AR Invoices, Payroll Batches, LG Commissions).
+    Used for automated dual-pane matching against bank statement lines.
+    """
+    __tablename__ = 'internal_ledger_records'
+
+    company_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    record_type = Column(String(50), nullable=False) # 'AR_INVOICE', 'AP_BILL', 'PAYROLL_BATCH', 'LG_COMMISSION'
+    reference_number = Column(String(100), nullable=False, index=True) # e.g. "INV-2026-001", "BILL-2026-042"
+    entity_name = Column(String(255), nullable=False, index=True) # Customer or Supplier name
+    record_date = Column(DateTime(timezone=True), nullable=False)
+    amount = Column(Numeric(precision=18, scale=2), nullable=False) # Positive for AR/Inflow, Negative for AP/Outflow
+    currency = Column(String(3), default="EGP")
+    gl_account = Column(String(100), nullable=True) # e.g. "4010010 - Revenue", "2010010 - Payables"
+    bank_id = Column(Integer, ForeignKey("banks.id"), nullable=True) # Associated bank for payment/receipt
+    bank_name = Column(String(100), nullable=True) # Cached bank name e.g. "CIB", "HSBC"
+    bank_account_number = Column(String(50), nullable=True) # Target bank account number
+    status = Column(String(20), default="OPEN", index=True) # 'OPEN', 'RECONCILED'
+    matched_bank_txn_id = Column(Integer, ForeignKey("bank_transactions.id"), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    
+    company = relationship("Customer")
+    bank = relationship("Bank")
+    matched_txn = relationship("BankTransaction")
+
+
+class ClassificationTaxonomy(BaseModel):
+    """
+    Hierarchical Classification Taxonomy (Classes & Subclasses).
+    Allows corporate admins to define and manage endless categories tailored to their business,
+    with default GL account mappings and cash flow directions.
+    Supports both global system templates (company_id is None) and company-specific overrides.
+    """
+    __tablename__ = 'classification_taxonomy'
+
+    company_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True) # None = Global Template
+    parent_id = Column(Integer, ForeignKey("classification_taxonomy.id", ondelete="CASCADE"), nullable=True, index=True) # None = Class (Level 1), Set = Subclass (Level 2)
+    
+    code = Column(String(100), nullable=False, index=True) # e.g. "OPEX_SOFTWARE", "TREASURY_SWEEP"
+    name = Column(String(255), nullable=False) # e.g. "Software Subscriptions"
+    name_ar = Column(String(255), nullable=True) # e.g. "اشتراكات برمجيات"
+    
+    direction = Column(String(20), default="EITHER") # 'DEBIT', 'CREDIT', 'EITHER'
+    default_gl_account = Column(String(100), nullable=True) # e.g. "5020100 - Software Licenses"
+    description = Column(String(500), nullable=True)
+    is_active = Column(Boolean, default=True)
+    order_index = Column(Integer, default=0)
+
+    company = relationship("Customer")
+    parent = relationship("ClassificationTaxonomy", remote_side="ClassificationTaxonomy.id", backref="subclasses")
+
+

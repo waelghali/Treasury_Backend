@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
-from app.models.models_reconciliation_v2 import BankStatement, BankTransaction, ReconciliationMatch
+from app.models.models_reconciliation_v2 import BankStatement, BankTransaction, ReconciliationMatch, InternalLedgerRecord
 from app.models import LGRecord
 from app.crud.crud_reconciliation_v2 import crud_bank_statement, crud_bank_transaction
 
@@ -19,7 +19,142 @@ class BankReconciliationService:
     """
     Core engine for bank statement ingestion, validation, and matching.
     Includes smart heuristic detection for various bank formats.
+    Built-in classifiers automatically detect interest, charges, sweeps, salary, etc.
     """
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  BUILT-IN CLASSIFIERS — Universal patterns that work for ALL customers
+    # ═══════════════════════════════════════════════════════════════════
+    BUILTIN_CLASSIFIERS = [
+        {
+            "name": "BANK_INTEREST_EARNED",
+            "category": "BANK_INTEREST",
+            "sub_category": "INTEREST_EARNED",
+            "keywords": [
+                "interest credit", "interest earned", "int credit", "int earned",
+                "deposit interest", "savings interest", "accrued interest",
+                "فائدة دائنة", "عائد", "فوائد الودائع", "فائدة على الحساب"
+            ],
+            "direction": "CREDIT",  # Only match credits
+            "confidence": 90
+        },
+        {
+            "name": "BANK_INTEREST_CHARGED",
+            "category": "BANK_INTEREST",
+            "sub_category": "INTEREST_CHARGED",
+            "keywords": [
+                "interest debit", "interest charge", "int debit", "int charge",
+                "overdraft interest", "loan interest", "debit interest",
+                "فائدة مدينة", "فائدة على المكشوف", "فائدة القرض"
+            ],
+            "direction": "DEBIT",
+            "confidence": 90
+        },
+        {
+            "name": "BANK_CHARGES",
+            "category": "BANK_CHARGES",
+            "sub_category": None,
+            "keywords": [
+                "bank charge", "service charge", "account fee", "maintenance fee",
+                "ledger fee", "statement fee", "commission", "bank fee",
+                "swift charge", "transfer fee", "processing fee", "handling fee",
+                "custody fee", "account charge",
+                "عمولة", "رسوم", "مصاريف بنكية", "رسوم الحساب", "رسوم الخدمة",
+                "مصاريف", "رسوم تحويل", "عمولة تحصيل"
+            ],
+            "direction": "DEBIT",
+            "confidence": 85
+        },
+        {
+            "name": "TAX_DEDUCTION",
+            "category": "TAX_DEDUCTION",
+            "sub_category": None,
+            "keywords": [
+                "withholding tax", "wht", "tax deduction", "vat", "stamp duty",
+                "tax on interest", "tax deducted",
+                "ضريبة", "ضريبة خصم", "ضريبة استقطاع", "ضريبة القيمة المضافة",
+                "دمغة", "ضرائب"
+            ],
+            "direction": "DEBIT",
+            "confidence": 85
+        },
+        {
+            "name": "SALARY_PAYROLL",
+            "category": "SALARY_PAYROLL",
+            "sub_category": None,
+            "keywords": [
+                "salary", "payroll", "wages", "salaries", "staff pay",
+                "employee pay", "net salary", "gross salary",
+                "رواتب", "أجور", "مرتبات", "راتب"
+            ],
+            "direction": "DEBIT",
+            "confidence": 85
+        },
+        {
+            "name": "GOVERNMENT_PAYMENT",
+            "category": "GOVERNMENT_PAYMENT",
+            "sub_category": None,
+            "keywords": [
+                "social insurance", "pension", "customs", "excise",
+                "government", "ministry", "authority",
+                "تأمينات اجتماعية", "جمارك", "حكومة", "هيئة", "مصلحة"
+            ],
+            "direction": None,
+            "confidence": 70
+        },
+        {
+            "name": "LOAN_REPAYMENT",
+            "category": "LOAN_REPAYMENT",
+            "sub_category": None,
+            "keywords": [
+                "loan repayment", "installment", "instalment", "emi",
+                "loan payment", "principal repayment", "facility repayment",
+                "قسط", "سداد قرض", "أقساط", "تسهيلات"
+            ],
+            "direction": "DEBIT",
+            "confidence": 80
+        },
+        {
+            "name": "INTER_BANK_SWEEP",
+            "category": "INTER_BANK_SWEEP",
+            "sub_category": "LIQUIDITY_SWEEP",
+            "keywords": [
+                "sweep from", "sweep to", "sweep", "internal transfer", "own account",
+                "inter-account", "intercompany transfer", "cash pool", "pooling",
+                "تحويل بين الحسابات", "سويب", "تحويل ذاتي"
+            ],
+            "direction": None,
+            "confidence": 90
+        },
+        {
+            "name": "CHEQUE_TRANSACTION",
+            "category": "CHEQUE",
+            "sub_category": None,
+            "keywords": [
+                "cheque", "check", "chq", "chq no",
+                "شيك", "صك"
+            ],
+            "direction": None,
+            "confidence": 70
+        },
+        {
+            "name": "BANK_INTEREST_GENERIC",
+            "category": "BANK_INTEREST",
+            "sub_category": None,
+            "keywords": [
+                "interest", "فائدة", "فوائد"
+            ],
+            "direction": None,  # Either direction fallback
+            "confidence": 75
+        },
+    ]
+
+    # Sweep/transfer keywords used in cross-bank detection
+    SWEEP_KEYWORDS = [
+        "sweep", "transfer", "own account", "internal transfer",
+        "a/c transfer", "fund transfer", "between accounts",
+        "تحويل", "تحويل داخلي", "بين الحسابات", "تحويل ذاتي"
+    ]
 
     def _clean_decimal(self, val: Any) -> Decimal:
         if pd.isna(val) or val == "":
@@ -30,6 +165,65 @@ class BankReconciliationService:
             return Decimal(clean_val).quantize(Decimal("1.00"))
         except (InvalidOperation, ValueError):
             return Decimal("0.00")
+
+    MONTH_MAP = {
+        'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+        'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+        'يناير': 1, 'فبراير': 2, 'مارس': 3, 'ابريل': 4, 'مايو': 5, 'يونيو': 6,
+        'يوليو': 7, 'اغسطس': 8, 'سبتمبر': 9, 'اكتوبر': 10, 'نوفمبر': 11, 'ديسمبر': 12
+    }
+
+    def _resolve_transaction_date(self, date_val: Any, narrative: str = "", metadata: Dict[str, Any] = None) -> Optional[datetime]:
+        """
+        Contextual Multi-Signal Date Resolution Engine:
+        Prevents date format inversion (e.g. 02/05/2026 vs 05/02/2026) using:
+        1. Narrative month tokens (e.g., '05FEB2026', '05-FEB-26', 'FEB', 'فبراير')
+        2. Statement period metadata (e.g. start_date/end_date month boundaries)
+        3. Standard dayfirst=True for Egyptian & Middle Eastern banking formats
+        """
+        if pd.isna(date_val) or date_val is None:
+            return None
+
+        narrative_upper = (narrative or "").upper()
+
+        # Signal 1: Month tokens in narrative (e.g. 05FEB2026, 05-FEB-26, 05FEB)
+        month_token_match = re.search(r'\b(\d{1,2})[-/]?([A-Z]{3})[-/]?(\d{2,4})?\b', narrative_upper)
+        if month_token_match:
+            day_str = month_token_match.group(1)
+            month_str = month_token_match.group(2)
+            year_str = month_token_match.group(3)
+            if month_str in self.MONTH_MAP:
+                m = self.MONTH_MAP[month_str]
+                d = int(day_str)
+                y = int(year_str) if year_str else 2026
+                if len(str(y)) == 2: y += 2000
+                try:
+                    return datetime(y, m, d)
+                except Exception:
+                    pass
+
+        # Signal 2: Pandas dayfirst parse
+        dt_cand = pd.to_datetime(date_val, dayfirst=True, errors='coerce')
+        if pd.isna(dt_cand):
+            return None
+        
+        dt = dt_cand.to_pydatetime() if hasattr(dt_cand, 'to_pydatetime') else dt_cand
+
+        # Signal 3: Statement period header cross-check (detect and correct inverted MM/DD vs DD/MM)
+        if metadata:
+            meta_start = metadata.get("start_date")
+            if meta_start and isinstance(meta_start, (datetime, pd.Timestamp)):
+                target_month = meta_start.month
+                target_year = meta_start.year
+                # If parsed month != target_month, but parsed day == target_month and parsed month <= 31:
+                # Then day and month were swapped by the Excel reader!
+                if dt.month != target_month and dt.day == target_month and dt.month <= 31:
+                    try:
+                        return datetime(target_year, target_month, dt.month)
+                    except Exception:
+                        pass
+
+        return dt
 
     def _detect_column_mapping(self, df: pd.DataFrame) -> Dict[str, str]:
         """
@@ -197,6 +391,9 @@ class BankReconciliationService:
             logger.info(f"Final Detection Mapping: {mapping}")
             return mapping
 
+        # Keyword-based detection was sufficient; return what was found
+        return mapping
+
     def _detect_metadata(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Scans top and bottom rows for balance keywords (English & Arabic).
@@ -307,7 +504,9 @@ class BankReconciliationService:
         logger.info(f"Detected Mapping: {mapping}")
         logger.info(f"Detected Metadata: {metadata}")
         
-        # Fallback if detection still failed
+        # Fallback if detection still failed (mapping may be None when no column heuristic matched)
+        if mapping is None:
+            mapping = {}
         if not mapping.get('date') or (not mapping.get('amount') and not mapping.get('creditamount')):
              logger.warning("Heuristic detection failed or incomplete. Using smart fallback...")
              # Find non-empty columns
@@ -367,8 +566,8 @@ class BankReconciliationService:
                 if any(kw in desc_low for kw in balance_keywords):
                     continue
                     
-                booking_date = pd.to_datetime(date_val, dayfirst=True, errors='coerce')
-                if pd.isna(booking_date): 
+                booking_date = self._resolve_transaction_date(date_val, narrative=desc, metadata=metadata)
+                if not booking_date or pd.isna(booking_date): 
                     # If date fails but it was expected, maybe it's just a spacer or random text
                     continue
                 
@@ -445,7 +644,7 @@ class BankReconciliationService:
 
                 txn = {
                     "booking_date": booking_date,
-                    "value_date": pd.to_datetime(row.get(mapping.get("value_date"), date_val), dayfirst=True, errors='coerce') or booking_date,
+                    "value_date": self._resolve_transaction_date(row.get(mapping.get("value_date"), date_val), narrative=desc, metadata=metadata) or booking_date,
                     "debit_amount": debit,
                     "credit_amount": credit,
                     "raw_description": desc,
@@ -470,6 +669,17 @@ class BankReconciliationService:
                     "amount_in_egp": txn_amount_egp,
                     "transfer_type": str(row.get(mapping.get("transfer_type"), "")) if mapping.get("transfer_type") else None,
                 }
+                
+                # ── Run built-in classifiers on each transaction ──
+                builtin_result = self._run_builtin_classifiers(txn)
+                if builtin_result:
+                    txn["internal_category"] = builtin_result["category"]
+                    txn["classification_category"] = builtin_result["category"]
+                    txn["sub_category"] = builtin_result.get("sub_category") or txn.get("sub_category")
+                    txn["classification_source"] = "BUILTIN"
+                    txn["classification_confidence"] = builtin_result["confidence"]
+                    txn["is_classified"] = True
+                
                 transactions.append(txn)
             except HTTPException:
                 raise
@@ -566,21 +776,51 @@ class BankReconciliationService:
         db.commit()
         db.refresh(db_stmt)
         
-        # 5. Automatically run classification rules
+        # 5. Automatically run classification rules (for transactions NOT already classified by builtins)
         try:
-            self.apply_classification_rules(db, db_stmt.id, company_id)
+            result = self.apply_classification_rules(db, customer_id=company_id, statement_id=db_stmt.id)
+            logger.info(f"Auto-classification result: {result}")
         except Exception as e:
-            # Classification failure should not block ingestion completion
             logger.warning(f"Auto-classification failed: {e}")
+        
+        # 5b. Run counterparty concept matching (Credit + Customer -> Collection, Debit + Supplier -> Payment)
+        try:
+            concept_result = self._match_counterparty_and_concept(db, customer_id=company_id, statement_id=db_stmt.id)
+            logger.info(f"Concept classification result: {concept_result}")
+        except Exception as e:
+            logger.warning(f"Concept classification failed: {e}")
+        
+        # 5c. Run collaborative consensus pattern matching
+        try:
+            collab_result = self._match_collaborative_patterns(db, customer_id=company_id, statement_id=db_stmt.id)
+            logger.info(f"Collaborative consensus classification result: {collab_result}")
+        except Exception as e:
+            logger.warning(f"Collaborative consensus classification failed: {e}")
+        
+        # 6. Automatically detect reversals and inter-account/inter-bank transfers
+        try:
+            rel_result = self._detect_logical_relationships_sync(db, company_id)
+            logger.info(f"Auto relationship detection: {rel_result}")
+        except Exception as e:
+            logger.warning(f"Auto relationship detection failed: {e}")
             
         return db_stmt
 
     def run_matching_engine(self, db: Session, customer_id: int, user_id: int, statement_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Runs deterministic rules to match unmatched transactions with Internal Records (LG).
-        If statement_id is provided, only processes that statement. Otherwise processes all for customer.
+        Runs comprehensive multi-criteria rules to match unmatched transactions with:
+        1. Internal ERP Ledger Records (AR Invoices, AP Bills, Payroll Batches, LG Fees)
+        2. LG Records (Treasury)
+        3. Automated sweeps / transfers and reversals
         """
-        # 1. Fetch unmatched transactions
+        # 1. First run logical relationship detection (Sweeps and reversals)
+        rel_result = {}
+        try:
+            rel_result = self._detect_logical_relationships_sync(db, customer_id)
+        except Exception as e:
+            logger.warning(f"Relationship detection during auto-match failed: {e}")
+
+        # 2. Fetch unmatched transactions
         query = db.query(BankTransaction).join(BankStatement).filter(
             BankStatement.company_id == customer_id,
             BankTransaction.is_reconciled == False
@@ -589,37 +829,104 @@ class BankReconciliationService:
             query = query.filter(BankTransaction.statement_id == statement_id)
             
         transactions = query.all()
-        
-        if not transactions:
-            return {"matched_count": 0, "status": "No unmatched transactions found"}
 
-        # 2. Fetch active LG records for this customer
-        # We'll match against lg_number
+        # 3. Fetch open ERP records
+        open_erp_records = db.query(InternalLedgerRecord).filter(
+            InternalLedgerRecord.company_id == customer_id,
+            InternalLedgerRecord.status == "OPEN",
+            InternalLedgerRecord.is_deleted == False
+        ).all()
+
+        # 4. Fetch active LG records
         lg_records = db.query(LGRecord).filter(LGRecord.customer_id == customer_id).all()
         lg_map = {lg.lg_number.strip().upper(): lg for lg in lg_records if lg.lg_number}
-        
+
         matched_count = 0
-        
-        # Rule 1: Reference Match (LG Number)
+        used_erp_ids = set()
+
         for txn in transactions:
-            desc_upper = txn.raw_description.upper()
+            if txn.is_reconciled:
+                continue
+
+            desc_upper = (txn.raw_description or "").upper()
             e2e_upper = (txn.e2e_id or "").upper()
-            
-            match_found = None
-            
-            # Efficient check: if any known LG number is a substring of the description
+            back_office_upper = (txn.back_office_ref or "").upper()
+            combined_text = f"{desc_upper} {e2e_upper} {back_office_upper}"
+
+            txn_credit = Decimal(str(txn.credit_amount or 0))
+            txn_debit = Decimal(str(txn.debit_amount or 0))
+            txn_is_credit = txn_credit > Decimal("0.00")
+            txn_amount = txn_credit if txn_is_credit else -txn_debit
+
+            match_erp = None
+            match_logic = "REFERENCE"
+
+            # Pass 1: Exact Reference Match on ERP records (e.g. INV-2026-..., BILL-2026-...)
+            for erp_rec in open_erp_records:
+                if erp_rec.id in used_erp_ids:
+                    continue
+
+                ref_clean = erp_rec.reference_number.strip().upper()
+                if len(ref_clean) >= 4 and ref_clean in combined_text:
+                    # Verify direction and amount
+                    erp_amt = Decimal(str(erp_rec.amount))
+                    direction_ok = (txn_is_credit and erp_amt > 0) or (not txn_is_credit and erp_amt < 0)
+                    amt_diff = abs(abs(txn_amount) - abs(erp_amt))
+                    
+                    if direction_ok and amt_diff < Decimal("0.05"):
+                        match_erp = erp_rec
+                        match_logic = "REFERENCE"
+                        break
+
+            # Pass 2: Counterparty Entity Name & Exact Amount Match
+            if not match_erp:
+                for erp_rec in open_erp_records:
+                    if erp_rec.id in used_erp_ids:
+                        continue
+
+                    entity_upper = erp_rec.entity_name.strip().upper()
+                    cp_name = (txn.counterparty_name or "").strip().upper()
+                    entity_matches = (len(entity_upper) >= 3 and entity_upper in desc_upper) or (cp_name and entity_upper in cp_name)
+                    
+                    if entity_matches:
+                        erp_amt = Decimal(str(erp_rec.amount))
+                        direction_ok = (txn_is_credit and erp_amt > 0) or (not txn_is_credit and erp_amt < 0)
+                        amt_diff = abs(abs(txn_amount) - abs(erp_amt))
+
+                        if direction_ok and amt_diff < Decimal("0.05"):
+                            match_erp = erp_rec
+                            match_logic = "EXACT"
+                            break
+
+            if match_erp:
+                new_match = ReconciliationMatch(
+                    bank_txn_id=txn.id,
+                    source_type=match_erp.record_type,
+                    source_record_id=match_erp.id,
+                    match_type="1:1",
+                    match_logic=match_logic,
+                    created_by=user_id
+                )
+                db.add(new_match)
+                txn.is_reconciled = True
+                match_erp.status = "RECONCILED"
+                match_erp.matched_bank_txn_id = txn.id
+                used_erp_ids.add(match_erp.id)
+                matched_count += 1
+                continue
+
+            # Pass 3: Treasury LG Number Match
+            match_lg = None
             for lg_num, lg_obj in lg_map.items():
-                if len(lg_num) > 4 and (lg_num in desc_upper or lg_num in e2e_upper): 
-                    # Only match if LG number is reasonably long to avoid false positives with small codes
-                    match_found = lg_obj
+                if len(lg_num) > 4 and (lg_num in desc_upper or lg_num in e2e_upper):
+                    match_lg = lg_obj
                     break
             
-            if match_found:
-                # Create match record
+            if match_lg:
                 new_match = ReconciliationMatch(
                     bank_txn_id=txn.id,
                     source_type="Treasury (LG)",
-                    source_record_id=match_found.id,
+                    source_record_id=match_lg.id,
                     match_type="1:1",
                     match_logic="REFERENCE",
                     created_by=user_id
@@ -627,15 +934,43 @@ class BankReconciliationService:
                 db.add(new_match)
                 txn.is_reconciled = True
                 matched_count += 1
-                
+
         db.commit()
-        return {"matched_count": matched_count, "status": f"Successfully matched {matched_count} transactions."}
+        return {
+            "matched_count": matched_count,
+            "relationships": rel_result,
+            "status": f"Successfully auto-matched {matched_count} transactions against ERP ledger."
+        }
+
 
     def _evaluate_condition(self, txn: BankTransaction, condition: Dict[str, Any]) -> bool:
         field = condition.get("field")
         op = condition.get("operator")
         val = condition.get("value")
         
+        # Concept shortcut condition
+        if field == "concept":
+            concept_name = str(val).upper()
+            debit = float(txn.debit_amount or 0)
+            credit = float(txn.credit_amount or 0)
+            if concept_name in ["COLLECTION", "COLLECTION_FROM_CUSTOMER"]:
+                return credit > 0 and bool(txn.counterparty_name)
+            elif concept_name in ["PAYMENT", "PAYMENT_TO_SUPPLIER", "SUPPLIER_PAYMENT"]:
+                return debit > 0 and bool(txn.counterparty_name)
+            elif concept_name in ["SWEEP", "TRANSFER", "INTER_BANK_SWEEP"]:
+                return (txn.internal_category in ["INTER_BANK_SWEEP", "INTERNAL_TRANSFER"]) or bool(txn.linked_txn_id)
+            return False
+
+        if field in ["counterparty_name", "counterparty"]:
+            txn_cp = (txn.counterparty_name or "").upper()
+            if op in ["is_not_empty", "exists"]:
+                return bool(txn.counterparty_name)
+            elif op == "contains":
+                return str(val).upper() in txn_cp
+            elif op == "equals":
+                return txn_cp == str(val).upper()
+            return False
+
         # Get actual value from transaction
         txn_val = getattr(txn, field, None)
         if txn_val is None: return False
@@ -665,9 +1000,16 @@ class BankReconciliationService:
     def _evaluate_group(self, txn: BankTransaction, group: Dict[str, Any]) -> bool:
         """
         Evaluates a group of conditions against a transaction.
-        Supports sequential AND/OR logic at the line level.
+        Supports sequential AND/OR logic at the line level, as well as concept shortcuts.
         Group structure: { "conditions": [ {field, op, val, joiner}, ... ] }
+        Or concept format: { "concept": "COLLECTION_FROM_CUSTOMER" }
         """
+        if not group or not isinstance(group, dict):
+            return False
+
+        if "concept" in group:
+            return self._evaluate_condition(txn, {"field": "concept", "operator": "equals", "value": group["concept"]})
+
         conditions = group.get("conditions", [])
         if not conditions:
             return False
@@ -679,10 +1021,7 @@ class BankReconciliationService:
         # Iterate through remaining conditions applying joiners sequentially
         for i in range(1, len(conditions)):
             cond = conditions[i]
-            # Joiner tells us how to combine THIS condition with the previous RESULT
             joiner = str(cond.get("joiner", "AND")).upper()
-            
-            # Evaluate current condition/group
             current_val = self._evaluate_group(txn, cond) if "conditions" in cond else self._evaluate_condition(txn, cond)
             
             if joiner == "OR":
@@ -699,18 +1038,7 @@ class BankReconciliationService:
         """
         from app.models.models_reconciliation_v2 import ClassificationRule
         
-        # 1. Fetch active rules for customer, sorted by priority ascending
-        # Smallest number = Highest Priority (runs first)
-        rules = db.query(ClassificationRule).filter(
-            ClassificationRule.company_id == customer_id,
-            ClassificationRule.is_active == True,
-            ClassificationRule.is_deleted == False
-        ).order_by(ClassificationRule.priority.asc()).all()
-        
-        if not rules:
-            return {"classified_count": 0, "status": "No active rules found"}
-
-        # 2. Fetch unclassified transactions
+        # 1. Fetch unclassified transactions
         query = db.query(BankTransaction).join(BankStatement).filter(
             BankStatement.company_id == customer_id,
             BankTransaction.is_classified == False
@@ -720,33 +1048,395 @@ class BankReconciliationService:
             
         transactions = query.all()
         
-        classified_count = 0
+        builtin_count = 0
+        rule_count = 0
+
+        # Layer 1: Run Built-in Classifiers on unclassified transactions
         for txn in transactions:
-            for rule in rules:
-                res = self._evaluate_group(txn, rule.conditions_json)
-                if res:
-                    txn.internal_category = rule.assigned_gl_account
-                    txn.classification_category = rule.assigned_gl_account # Ensure UI visibility
-                    txn.applied_rule_id = rule.id # Track which rule was used
+            if not txn.is_classified:
+                builtin_res = self._run_builtin_classifiers({
+                    "raw_description": txn.raw_description,
+                    "description_line2": txn.description_line2,
+                    "debit_amount": txn.debit_amount,
+                    "credit_amount": txn.credit_amount
+                })
+                if builtin_res:
+                    txn.internal_category = builtin_res["category"]
+                    txn.classification_category = builtin_res["category"]
+                    txn.sub_category = builtin_res.get("sub_category") or txn.sub_category
+                    txn.classification_source = "BUILTIN"
+                    txn.classification_confidence = builtin_res["confidence"]
                     txn.is_classified = True
-                    rule.usage_count = (rule.usage_count or 0) + 1
-                    rule.last_triggered_date = datetime.now()
-                    classified_count += 1
-                    if rule.stop_after_match:
-                        break
+                    builtin_count += 1
+
+        if builtin_count > 0:
+            db.commit()
+
+        # Layer 2: Fetch active custom rules for customer, sorted by priority ascending
+        rules = db.query(ClassificationRule).filter(
+            ClassificationRule.company_id == customer_id,
+            ClassificationRule.is_active == True,
+            ClassificationRule.is_deleted == False
+        ).order_by(ClassificationRule.priority.asc()).all()
         
+        if rules:
+            for txn in transactions:
+                if not txn.is_classified:
+                    for rule in rules:
+                        res = self._evaluate_group(txn, rule.conditions_json)
+                        if res:
+                            txn.internal_category = rule.assigned_gl_account
+                            txn.classification_category = rule.assigned_gl_account
+                            txn.applied_rule_id = rule.id
+                            txn.classification_source = "RULE"
+                            txn.classification_confidence = 100
+                            txn.is_classified = True
+                            rule.usage_count = (rule.usage_count or 0) + 1
+                            rule.last_triggered_date = datetime.now()
+                            rule_count += 1
+                            if rule.stop_after_match:
+                                break
+            if rule_count > 0:
+                db.commit()
+        
+        # Layer 3: Concept-based counterparty matching for remaining unclassified transactions
+        concept_res = self._match_counterparty_and_concept(db, customer_id=customer_id, statement_id=statement_id)
+        
+        # Layer 4: Dynamic collaborative consensus intelligence for remaining unclassified transactions
+        collab_count = self._match_collaborative_patterns(db, customer_id=customer_id, statement_id=statement_id)
+        
+        # Layer 5: Detect sweeps, internal transfers, and reversals
+        try:
+            rel_res = self._detect_logical_relationships_sync(db, customer_id=customer_id)
+        except Exception as e:
+            logger.warning(f"Relationship detection skipped during classification: {e}")
+            rel_res = {}
+
+        total_classified = builtin_count + rule_count + concept_res.get("matched_count", 0) + collab_count
+        
+        return {
+            "classified_count": total_classified,
+            "builtin_matched": builtin_count,
+            "rules_matched": rule_count,
+            "concept_matched": concept_res.get("matched_count", 0),
+            "collaborative_matched": collab_count,
+            "relationships_detected": rel_res.get("affected_count", 0),
+            "status": f"Successfully classified {total_classified} transactions ({builtin_count} built-in, {rule_count} custom rules, {concept_res.get('matched_count', 0)} concepts, {collab_count} collaborative)."
+        }
+
+    def _match_counterparty_and_concept(self, db: Session, customer_id: int, statement_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Concept-based Intelligent Matching:
+        1. Loads all known counterparties visible to this customer (customer-specific + global system counterparties).
+        2. Matches counterparties against transaction descriptions (name and aliases, case-insensitive).
+        3. Applies concept rules:
+           - CREDIT + Known Customer -> "COLLECTION_FROM_CUSTOMER" (GL: AR or default_gl)
+           - DEBIT + Known Supplier -> "PAYMENT_TO_SUPPLIER" (GL: AP or default_gl)
+           - Transfer keywords / Bank counterparty -> "INTER_BANK_SWEEP" or "BANK_TRANSFER"
+        4. Sets counterparty_name, classification_source="CONCEPT", classification_confidence=85, is_classified=True.
+        """
+        from app.crud.crud_reconciliation_v2 import crud_counterparty
+        counterparties = crud_counterparty.find_all_active(db, customer_id)
+        if not counterparties:
+            return {"matched_count": 0, "status": "No counterparties found in registry"}
+
+        query = db.query(BankTransaction).join(BankStatement).filter(
+            BankStatement.company_id == customer_id,
+            BankTransaction.is_classified == False
+        )
+        if statement_id:
+            query = query.filter(BankTransaction.statement_id == statement_id)
+        
+        unclassified_txns = query.all()
+        matched_count = 0
+
+        # Sort counterparties by name length descending so longer/more specific names match first
+        sorted_cps = sorted(counterparties, key=lambda c: len(c.name), reverse=True)
+
+        for txn in unclassified_txns:
+            desc_upper = f"{txn.raw_description or ''} {txn.description_line2 or ''}".upper()
+            matched_cp = None
+
+            for cp in sorted_cps:
+                # Check main name
+                cp_name_upper = cp.name.upper()
+                if len(cp_name_upper) >= 3 and cp_name_upper in desc_upper:
+                    matched_cp = cp
+                    break
+                
+                # Check aliases
+                if cp.aliases and isinstance(cp.aliases, list):
+                    for alias in cp.aliases:
+                        alias_upper = str(alias).upper()
+                        if len(alias_upper) >= 3 and alias_upper in desc_upper:
+                            matched_cp = cp
+                            break
+                    if matched_cp:
+                        break
+
+            if matched_cp:
+                # Set counterparty
+                txn.counterparty_name = matched_cp.name
+                debit = txn.debit_amount or Decimal("0.00")
+                credit = txn.credit_amount or Decimal("0.00")
+
+                # Concept Rule 1: Collection from customer (Credit + Customer)
+                if credit > 0 and matched_cp.entity_type in ["CUSTOMER", "OTHER"]:
+                    category = matched_cp.default_category or "COLLECTION_FROM_CUSTOMER"
+                    gl = matched_cp.default_gl_account or "ACCOUNTS_RECEIVABLE"
+                    txn.internal_category = gl
+                    txn.classification_category = category
+                    txn.suggested_category = category
+                    txn.classification_source = "CONCEPT"
+                    txn.classification_confidence = 85
+                    txn.is_classified = True
+                    matched_count += 1
+                
+                # Concept Rule 2: Payment to supplier (Debit + Supplier)
+                elif debit > 0 and matched_cp.entity_type in ["SUPPLIER", "OTHER"]:
+                    category = matched_cp.default_category or "PAYMENT_TO_SUPPLIER"
+                    gl = matched_cp.default_gl_account or "ACCOUNTS_PAYABLE"
+                    txn.internal_category = gl
+                    txn.classification_category = category
+                    txn.suggested_category = category
+                    txn.classification_source = "CONCEPT"
+                    txn.classification_confidence = 85
+                    txn.is_classified = True
+                    matched_count += 1
+                
+                # Concept Rule 3: Bank / Treasury entity
+                elif matched_cp.entity_type == "BANK":
+                    category = matched_cp.default_category or "BANK_TRANSFER"
+                    txn.internal_category = matched_cp.default_gl_account or "INTERNAL_TRANSFER"
+                    txn.classification_category = category
+                    txn.suggested_category = category
+                    txn.classification_source = "CONCEPT"
+                    txn.classification_confidence = 80
+                    txn.is_classified = True
+                    matched_count += 1
+                
+                # Concept Rule 4: Government entity (Taxes/Customs/Social insurance)
+                elif matched_cp.entity_type == "GOVERNMENT":
+                    category = matched_cp.default_category or "GOVERNMENT_PAYMENT"
+                    txn.internal_category = matched_cp.default_gl_account or "TAX_EXPENSE"
+                    txn.classification_category = category
+                    txn.suggested_category = category
+                    txn.classification_source = "CONCEPT"
+                    txn.classification_confidence = 85
+                    txn.is_classified = True
+                    matched_count += 1
+
         db.commit()
-        return {"classified_count": classified_count, "status": f"Successfully classified {classified_count} transactions."}
+        return {"matched_count": matched_count, "status": f"Concept engine classified {matched_count} transactions."}
 
-    def detect_reversals(self, db: Session, statement_id: int):
-        pass
+    def _match_collaborative_patterns(self, db: Session, customer_id: int, statement_id: Optional[int] = None) -> int:
+        """
+        Dynamically matches unclassified transactions against platform-wide promoted
+        collaborative consensus patterns (both bank-specific and universal cross-bank).
+        Zero customer PII, 100% anonymized signatures.
+        """
+        from app.services.collaborative_learning_service import collaborative_service
+        query = db.query(BankTransaction).join(BankStatement).filter(
+            BankStatement.company_id == customer_id,
+            BankTransaction.is_classified == False
+        )
+        if statement_id:
+            query = query.filter(BankTransaction.statement_id == statement_id)
 
-    async def detect_logical_relationships(self, db: Session, customer_id: int) -> Dict[str, Any]:
+        unclassified = query.all()
+        matched = 0
+        for txn in unclassified:
+            direction = "CREDIT" if (txn.credit_amount or 0) > 0 else "DEBIT"
+            bank_id = txn.statement.bank_id if txn.statement else None
+            prediction = collaborative_service.match_collaborative(
+                db=db,
+                bank_id=bank_id,
+                raw_description=txn.raw_description,
+                direction=direction,
+                description_line2=txn.description_line2
+            )
+            if prediction:
+                txn.classification_category = prediction["category"]
+                txn.suggested_category = prediction["category"]
+                txn.internal_category = prediction.get("gl_account") or prediction["category"]
+                txn.classification_source = "COLLABORATIVE"
+                txn.classification_confidence = prediction["confidence"]
+                txn.is_classified = True
+                matched += 1
+
+        if matched > 0:
+            db.commit()
+        return matched
+
+    def confirm_and_learn(
+        self, db: Session, transaction_id: int, customer_id: int, user_id: int,
+        counterparty_name: Optional[str] = None,
+        entity_type: Optional[str] = "CUSTOMER",
+        category: Optional[str] = None,
+        gl_account: Optional[str] = None
+    ) -> BankTransaction:
         """
-        Detects reversals and inter-account transfers.
+        Feedback & Learning Loop:
+        1. Updates the individual transaction.
+        2. Learns/reinforces the private counterparty in the tenant registry.
+        3. Submits an anonymized structural signature to the platform-wide Collaborative Consensus Engine.
         """
-        # 1. Fetch all unreconciled, unlinked transactions for this customer
-        # We need to look across all statements
+        from app.crud.crud_reconciliation_v2 import crud_counterparty
+        
+        txn = db.query(BankTransaction).join(BankStatement).filter(
+            BankTransaction.id == transaction_id,
+            BankStatement.company_id == customer_id
+        ).first()
+        if not txn:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        chosen_category = category or txn.classification_category or "CLASSIFIED"
+        chosen_gl = gl_account or txn.internal_category
+
+        if category:
+            txn.classification_category = category
+            txn.suggested_category = category
+        if gl_account:
+            txn.internal_category = gl_account
+        if counterparty_name:
+            txn.counterparty_name = counterparty_name.strip()
+            # Learn or increment in tenant registry
+            crud_counterparty.learn_or_increment(
+                db=db,
+                name=counterparty_name,
+                customer_id=customer_id,
+                entity_type=entity_type or "CUSTOMER",
+                default_category=chosen_category,
+                default_gl=chosen_gl,
+                user_id=user_id
+            )
+
+        txn.is_classified = True
+        txn.classification_source = "MANUAL"
+        txn.classification_confidence = 100
+
+        # Submit to federated collaborative consensus learning via Privacy Sanitizer
+        try:
+            from app.services.collaborative_learning_service import collaborative_service
+            direction = "CREDIT" if (txn.credit_amount or 0) > 0 else "DEBIT"
+            bank_id = txn.statement.bank_id if txn.statement else None
+            collaborative_service.submit_confirmation(
+                db=db,
+                company_id=customer_id,
+                bank_id=bank_id,
+                raw_description=txn.raw_description,
+                direction=direction,
+                category=chosen_category,
+                gl_account=chosen_gl
+            )
+        except Exception as col_err:
+            logger.warning(f"Collaborative learning submission skipped: {col_err}")
+
+        db.commit()
+        db.refresh(txn)
+        return txn
+
+    def auto_discover_counterparties_from_history(self, db: Session, customer_id: int, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Analyzes historical transactions for recurring counterparty candidates.
+        Returns suggestions with frequency, observed direction (CREDIT -> CUSTOMER, DEBIT -> SUPPLIER),
+        and example descriptions.
+        """
+        txns = db.query(BankTransaction).join(BankStatement).filter(
+            BankStatement.company_id == customer_id
+        ).order_by(BankTransaction.id.desc()).limit(limit).all()
+
+        STOP_WORDS = {
+            "TRANSFER", "PAYMENT", "BANK", "COMMISSION", "BRANCH", "SWIFT", "DEBIT", 
+            "CREDIT", "CHARGE", "FEES", "ONLINE", "ATM", "POS", "REF", "TRF", "CHQ", 
+            "CHECK", "TO", "FROM", "FOR", "AND", "THE", "INVOICE", "INV", "SALARY", 
+            "TAX", "WITHHOLDING", "EGP", "USD", "EUR", "GBP", "SAR", "AED",
+            "تحويل", "سداد", "بنك", "عمولة", "فرع", "شيك", "حساب", "فاتورة", "دفع", "مبلغ", "مصاريف"
+        }
+
+        token_directions = {}  # token -> {"credits": int, "debits": int, "samples": list}
+        
+        for t in txns:
+            raw = (t.raw_description or "").upper()
+            words = [w for w in re.split(r'[^a-zA-Z\u0600-\u06FF]+', raw) if len(w) >= 3 and not w.isdigit()]
+            is_credit = (t.credit_amount or 0) > 0
+
+            for word in words:
+                if word in STOP_WORDS:
+                    continue
+                if word not in token_directions:
+                    token_directions[word] = {"credits": 0, "debits": 0, "samples": []}
+                if is_credit:
+                    token_directions[word]["credits"] += 1
+                else:
+                    token_directions[word]["debits"] += 1
+                if len(token_directions[word]["samples"]) < 2 and raw not in token_directions[word]["samples"]:
+                    token_directions[word]["samples"].append(raw)
+
+        suggestions = []
+        for word, stats in token_directions.items():
+            total = stats["credits"] + stats["debits"]
+            if total >= 2:
+                predominant_type = "CUSTOMER" if stats["credits"] >= stats["debits"] else "SUPPLIER"
+                suggestions.append({
+                    "suggested_name": word,
+                    "entity_type": predominant_type,
+                    "frequency": total,
+                    "credit_count": stats["credits"],
+                    "debit_count": stats["debits"],
+                    "default_category": "COLLECTION_FROM_CUSTOMER" if predominant_type == "CUSTOMER" else "PAYMENT_TO_SUPPLIER",
+                    "default_gl_account": "ACCOUNTS_RECEIVABLE" if predominant_type == "CUSTOMER" else "ACCOUNTS_PAYABLE",
+                    "sample_descriptions": stats["samples"]
+                })
+
+        return sorted(suggestions, key=lambda s: s["frequency"], reverse=True)[:50]
+
+    def _run_builtin_classifiers(self, txn_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Runs universal built-in classifiers against a parsed transaction dict.
+        These are banking-universal patterns (interest, charges, tax, salary, etc.)
+        that work for ALL customers without any configuration.
+        
+        Returns {"category", "sub_category", "confidence", "classifier_name"} or None.
+        First match wins (classifiers are ordered from most specific to most generic).
+        """
+        desc = (txn_data.get("raw_description") or "").lower()
+        desc2 = (txn_data.get("description_line2") or "").lower()
+        combined_desc = f"{desc} {desc2}"
+        
+        debit = txn_data.get("debit_amount", Decimal("0.00"))
+        credit = txn_data.get("credit_amount", Decimal("0.00"))
+        
+        for classifier in self.BUILTIN_CLASSIFIERS:
+            # Check direction constraint
+            if classifier["direction"] == "CREDIT" and credit <= 0:
+                continue
+            if classifier["direction"] == "DEBIT" and debit <= 0:
+                continue
+            
+            # Check keyword match
+            matched = False
+            for kw in classifier["keywords"]:
+                if kw in combined_desc:
+                    matched = True
+                    break
+            
+            if matched:
+                return {
+                    "category": classifier["category"],
+                    "sub_category": classifier.get("sub_category"),
+                    "confidence": classifier["confidence"],
+                    "classifier_name": classifier["name"]
+                }
+        
+        return None
+
+    def _detect_logical_relationships_sync(self, db: Session, customer_id: int) -> Dict[str, Any]:
+        """
+        Synchronous version of detect_logical_relationships for use during ingestion.
+        Detects reversals, intra-bank transfers, and CROSS-BANK sweeps.
+        Works across ALL statements for the customer to catch inter-bank movements.
+        """
         txns = db.query(BankTransaction).join(BankStatement).filter(
             BankStatement.company_id == customer_id,
             BankTransaction.is_reconciled == False,
@@ -756,74 +1446,393 @@ class BankReconciliationService:
         if not txns:
             return {"affected_count": 0, "status": "No candidate transactions found"}
 
-        counts = {"reversals": 0, "transfers": 0}
+        counts = {"reversals": 0, "transfers": 0, "sweeps": 0}
         processed_ids = set()
 
-        # Reversal keywords for fuzzy matching
         rev_keywords = ["REVERSE", "REVERSAL", "ADJ", "ADJUSTMENT", "ERR", "ERROR", "OFFSET", "CORR", "CORRECTION"]
+        sweep_keywords_upper = [kw.upper() for kw in self.SWEEP_KEYWORDS] + ["SWEEP", "سويب", "تحويل ذاتي", "CASH POOL"]
 
+        def extract_sweep_tokens(desc: Optional[str]) -> set:
+            if not desc:
+                return set()
+            tokens = set(re.findall(r'\b[A-Z0-9_]{8,}\b', desc.upper()))
+            # Keep tokens containing at least one digit and not pure numbers
+            return {t for t in tokens if any(c.isdigit() for c in t) and not t.isdigit()}
+
+        # ── Pass 1: Direct Sweep Reference / Token Matching (Exact Ref Match Across Legs) ──
         for i, t1 in enumerate(txns):
-            if t1.id in processed_ids: continue
-            
-            t1_amt = (t1.credit_amount or 0) - (t1.debit_amount or 0)
-            if t1_amt == 0: continue
+            if t1.id in processed_ids:
+                continue
+
+            t1_desc_upper = (t1.raw_description or "").upper()
+            has_sweep_kw_1 = any(kw in t1_desc_upper for kw in sweep_keywords_upper)
+            if not has_sweep_kw_1:
+                continue
+
+            t1_is_credit = (t1.credit_amount or 0) > 0
+            t1_tokens = extract_sweep_tokens(t1.raw_description)
+            if t1.e2e_id:
+                t1_tokens.add(str(t1.e2e_id).upper())
+            if t1.back_office_ref:
+                t1_tokens.add(str(t1.back_office_ref).upper())
+
+            if not t1_tokens:
+                continue
 
             for j in range(i + 1, len(txns)):
                 t2 = txns[j]
-                if t2.id in processed_ids: continue
-                
-                t2_amt = (t2.credit_amount or 0) - (t2.debit_amount or 0)
-                
-                # Condition A: Opposite Sign & Same Magnitude
-                if t1_amt != -t2_amt: continue
+                if t2.id in processed_ids:
+                    continue
 
-                # Logic 1: Reversal Detection (Same Account, Fuzzy Desc, Close Dates)
+                t2_is_credit = (t2.credit_amount or 0) > 0
+                # Must be opposite direction: one Credit, one Debit
+                if t1_is_credit == t2_is_credit:
+                    continue
+
+                t2_desc_upper = (t2.raw_description or "").upper()
+                has_sweep_kw_2 = any(kw in t2_desc_upper for kw in sweep_keywords_upper)
+                if not has_sweep_kw_2:
+                    continue
+
+                t2_tokens = extract_sweep_tokens(t2.raw_description)
+                if t2.e2e_id:
+                    t2_tokens.add(str(t2.e2e_id).upper())
+                if t2.back_office_ref:
+                    t2_tokens.add(str(t2.back_office_ref).upper())
+
+                common_tokens = t1_tokens.intersection(t2_tokens)
+                if common_tokens:
+                    # Match found! Link both transactions as paired sweeps
+                    t1.linked_txn_id = t2.id
+                    t2.linked_txn_id = t1.id
+
+                    # Record variance due to bank charges, commission, or FX conversion
+                    t1_val = (t1.credit_amount or 0) if t1_is_credit else (t1.debit_amount or 0)
+                    t2_val = (t2.credit_amount or 0) if t2_is_credit else (t2.debit_amount or 0)
+                    fee_variance = abs(t1_val - t2_val)
+                    if fee_variance > 0:
+                        t1.variance_amount = fee_variance
+                        t2.variance_amount = fee_variance
+
+                    t1.internal_category = "INTER_BANK_SWEEP"
+                    t2.internal_category = "INTER_BANK_SWEEP"
+                    t1.classification_category = "INTER_BANK_SWEEP"
+                    t2.classification_category = "INTER_BANK_SWEEP"
+                    t1.classification_source = "BUILTIN"
+                    t2.classification_source = "BUILTIN"
+                    t1.classification_confidence = 95
+                    t2.classification_confidence = 95
+                    t1.is_classified = True
+                    t2.is_classified = True
+
+                    processed_ids.add(t1.id)
+                    processed_ids.add(t2.id)
+                    counts["sweeps"] += 2
+                    break
+
+        # ── Pass 2: Opposite Sign Clearing (Exact Amount or Minor Bank Charge Variance) ──
+        for i, t1 in enumerate(txns):
+            if t1.id in processed_ids:
+                continue
+
+            t1_is_credit = (t1.credit_amount or 0) > 0
+            t1_val = (t1.credit_amount or 0) if t1_is_credit else (t1.debit_amount or 0)
+            if t1_val == 0:
+                continue
+
+            for j in range(i + 1, len(txns)):
+                t2 = txns[j]
+                if t2.id in processed_ids:
+                    continue
+
+                t2_is_credit = (t2.credit_amount or 0) > 0
+                # Must be opposite sign: one Credit, one Debit
+                if t1_is_credit == t2_is_credit:
+                    continue
+
+                t2_val = (t2.credit_amount or 0) if t2_is_credit else (t2.debit_amount or 0)
+                if t2_val == 0:
+                    continue
+
+                amt_diff = abs(t1_val - t2_val)
                 is_same_account = t1.account_number == t2.account_number
                 date_diff = abs((t1.booking_date - t2.booking_date).days)
-                
-                if is_same_account and date_diff <= 7:
-                    desc1 = t1.raw_description.upper()
-                    desc2 = t2.raw_description.upper()
-                    
+
+                # Reversals: Same Account, Close Dates (<= 7 days), strict equal amount
+                if is_same_account and date_diff <= 7 and amt_diff == 0:
+                    desc1 = (t1.raw_description or "").upper()
+                    desc2 = (t2.raw_description or "").upper()
+
                     has_rev_keyword = any(kw in desc1 or kw in desc2 for kw in rev_keywords)
-                    names_match = desc1.split()[:3] == desc2.split()[:3] # Fuzzy name start match
-                    
-                    if has_rev_keyword or names_match or t1.e2e_id == t2.e2e_id:
-                        # Link them
+                    names_match = desc1.split()[:3] == desc2.split()[:3]
+                    refs_match = t1.e2e_id and t2.e2e_id and t1.e2e_id == t2.e2e_id
+
+                    if has_rev_keyword or names_match or refs_match:
                         t1.linked_txn_id = t2.id
                         t2.linked_txn_id = t1.id
                         t1.is_reversal = True
                         t2.is_reversal = True
                         t1.is_reconciled = True
                         t2.is_reconciled = True
-                        
+                        t1.classification_source = "BUILTIN"
+                        t2.classification_source = "BUILTIN"
+                        t1.classification_confidence = 90
+                        t2.classification_confidence = 90
+
                         processed_ids.add(t1.id)
                         processed_ids.add(t2.id)
                         counts["reversals"] += 2
                         break
 
-                # Logic 2: Internal Transfer Detection (Different Account, Same Date, Same Magnitude)
-                if not is_same_account and date_diff <= 2:
-                    # Often transfers have very similar descriptions or refs
-                    if t1.e2e_id == t2.e2e_id or t1.raw_description.split()[:3] == t2.raw_description.split()[:3]:
+                # Sweeps / Transfers: Different Accounts, Close Dates (<= 2 days)
+                # Supports bank charge fixed fee variance (e.g. diff <= 150 or <= 5% fee tolerance)
+                is_within_fee_tolerance = (amt_diff == 0) or (amt_diff <= 150) or (max(t1_val, t2_val) > 0 and (amt_diff / max(t1_val, t2_val)) <= 0.05)
+
+                if not is_same_account and date_diff <= 2 and is_within_fee_tolerance:
+                    desc1_upper = (t1.raw_description or "").upper()
+                    desc2_upper = (t2.raw_description or "").upper()
+
+                    refs_match = t1.e2e_id and t2.e2e_id and t1.e2e_id == t2.e2e_id
+                    names_match = desc1_upper.split()[:3] == desc2_upper.split()[:3]
+                    has_sweep_keyword = any(
+                        kw in desc1_upper or kw in desc2_upper
+                        for kw in sweep_keywords_upper
+                    )
+
+                    is_cross_bank = False
+                    try:
+                        is_cross_bank = t1.statement.bank_id != t2.statement.bank_id
+                    except Exception:
+                        pass
+
+                    if refs_match or names_match or has_sweep_keyword:
                         t1.linked_txn_id = t2.id
                         t2.linked_txn_id = t1.id
-                        t1.internal_category = "INTERNAL_TRANSFER"
-                        t2.internal_category = "INTERNAL_TRANSFER"
-                        # We don't mark as reconciled automatically for transfers yet, 
-                        # just link them for visibility, OR we can if user prefers.
-                        # Let's link them and categorize for now.
-                        
+
+                        if amt_diff > 0:
+                            t1.variance_amount = amt_diff
+                            t2.variance_amount = amt_diff
+
+                        category = "INTER_BANK_SWEEP" if (is_cross_bank or has_sweep_keyword) else "INTERNAL_TRANSFER"
+                        if category == "INTER_BANK_SWEEP":
+                            counts["sweeps"] += 2
+                        else:
+                            counts["transfers"] += 2
+
+                        t1.internal_category = category
+                        t2.internal_category = category
+                        t1.classification_category = category
+                        t2.classification_category = category
+                        t1.classification_source = "BUILTIN"
+                        t2.classification_source = "BUILTIN"
+                        t1.classification_confidence = 85 if (refs_match or names_match) else 75
+                        t2.classification_confidence = 85 if (refs_match or names_match) else 75
+                        t1.is_classified = True
+                        t2.is_classified = True
+
                         processed_ids.add(t1.id)
                         processed_ids.add(t2.id)
-                        counts["transfers"] += 2
                         break
 
         db.commit()
+        total_affected = counts["sweeps"] + counts["reversals"] + counts["transfers"]
         return {
+            "affected_count": total_affected,
             "reversals_count": counts["reversals"],
             "transfers_count": counts["transfers"],
-            "status": f"Found {counts['reversals'] // 2} reversals and {counts['transfers'] // 2} transfers."
+            "sweeps_count": counts["sweeps"],
+            "status": f"Found {counts['sweeps'] // 2} sweep pairs ({counts['sweeps']} transactions), {counts['reversals'] // 2} reversal pairs."
+        }
+
+    async def detect_logical_relationships(self, db: Session, customer_id: int) -> Dict[str, Any]:
+        """
+        Async wrapper for the relationship detection engine (used by the API endpoint).
+        """
+        return self._detect_logical_relationships_sync(db, customer_id)
+
+    def process_erp_file_ingestion(self, db: Session, file_content: bytes, file_type: str, company_id: int, user_id: int) -> Dict[str, Any]:
+        """
+        Inward ERP Processing Engine:
+        Reads ERP ledger exports (.xlsx, .xls, .csv), detects columns, validates,
+        and saves into internal_ledger_records for dual-pane matching.
+        """
+        try:
+            if file_type.lower() in ['csv', 'txt']:
+                df = pd.read_csv(io.BytesIO(file_content))
+            else:
+                df = pd.read_excel(io.BytesIO(file_content))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read ERP file: {str(e)}")
+
+        if df.empty:
+            return {"imported_count": 0, "total_rows_processed": 0, "errors": ["File is empty"], "status": "Empty file"}
+
+        # Heuristic Column Detection
+        col_map = {}
+        for c in df.columns:
+            c_clean = str(c).strip().lower()
+            if not col_map.get("date") and any(k in c_clean for k in ['date', 'posting date', 'invoice date', 'bill date', 'تاريخ']):
+                col_map["date"] = c
+            elif not col_map.get("ref") and any(k in c_clean for k in ['reference', 'ref', 'invoice', 'bill', 'doc #', 'document', 'مرجع', 'فاتورة']):
+                col_map["ref"] = c
+            elif not col_map.get("entity") and any(k in c_clean for k in ['customer', 'vendor', 'supplier', 'party', 'entity', 'name', 'عميل', 'مورد', 'الاسم']):
+                col_map["entity"] = c
+            elif not col_map.get("amount") and any(k in c_clean for k in ['amount', 'total', 'net', 'value', 'مبلغ', 'قيمة', 'إجمالي']):
+                col_map["amount"] = c
+            elif not col_map.get("debit") and any(k in c_clean for k in ['debit', 'مدين']):
+                col_map["debit"] = c
+            elif not col_map.get("credit") and any(k in c_clean for k in ['credit', 'دائن']):
+                col_map["credit"] = c
+            elif not col_map.get("type") and any(k in c_clean for k in ['type', 'record type', 'doc type', 'category', 'نوع']):
+                col_map["type"] = c
+            elif not col_map.get("gl") and any(k in c_clean for k in ['gl', 'account', 'حساب']):
+                col_map["gl"] = c
+
+        if not col_map.get("ref") or (not col_map.get("amount") and not (col_map.get("debit") and col_map.get("credit"))):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not reliably detect Reference and Amount columns. Detected: {list(col_map.keys())}"
+            )
+
+        imported_count = 0
+        errors = []
+
+        for idx, row in df.iterrows():
+            ref_val = row.get(col_map.get("ref"))
+            if pd.isna(ref_val) or not str(ref_val).strip():
+                continue
+
+            ref_str = str(ref_val).strip()
+
+            # Amount
+            if col_map.get("amount"):
+                amt = self._clean_decimal(row.get(col_map.get("amount")))
+            else:
+                deb = self._clean_decimal(row.get(col_map.get("debit")))
+                cred = self._clean_decimal(row.get(col_map.get("credit")))
+                amt = cred - deb
+
+            if amt == Decimal("0.00"):
+                continue
+
+            # Date
+            date_val = row.get(col_map.get("date")) if col_map.get("date") else None
+            rec_date = self._resolve_transaction_date(date_val) if date_val is not None else datetime.utcnow()
+            if not rec_date:
+                rec_date = datetime.utcnow()
+
+            # Entity
+            entity_val = row.get(col_map.get("entity")) if col_map.get("entity") else "General Entity"
+            entity_name = str(entity_val).strip() if pd.notna(entity_val) else "General Entity"
+
+            # Type
+            raw_type = str(row.get(col_map.get("type"), "")).upper() if col_map.get("type") else ""
+            if "AR" in raw_type or "INVOICE" in raw_type or "RECEIVABLE" in raw_type:
+                record_type = "AR_INVOICE"
+            elif "AP" in raw_type or "BILL" in raw_type or "PAYABLE" in raw_type:
+                record_type = "AP_BILL"
+            elif "PAYROLL" in raw_type or "SALARY" in raw_type:
+                record_type = "PAYROLL_BATCH"
+            elif "LG" in raw_type or "GUARANTEE" in raw_type:
+                record_type = "LG_COMMISSION"
+            else:
+                record_type = "AR_INVOICE" if amt > 0 else "AP_BILL"
+
+            gl_acct = str(row.get(col_map.get("gl"), "")) if col_map.get("gl") and pd.notna(row.get(col_map.get("gl"))) else None
+
+            # Upsert
+            existing = db.query(InternalLedgerRecord).filter(
+                InternalLedgerRecord.company_id == company_id,
+                InternalLedgerRecord.reference_number == ref_str,
+                InternalLedgerRecord.is_deleted == False
+            ).first()
+
+            if existing:
+                existing.amount = amt
+                existing.record_date = rec_date
+                existing.entity_name = entity_name
+                existing.record_type = record_type
+                if gl_acct:
+                    existing.gl_account = gl_acct
+                existing.updated_by = user_id
+            else:
+                new_rec = InternalLedgerRecord(
+                    company_id=company_id,
+                    record_type=record_type,
+                    reference_number=ref_str,
+                    entity_name=entity_name,
+                    record_date=rec_date,
+                    amount=amt,
+                    currency="EGP",
+                    gl_account=gl_acct,
+                    status="OPEN",
+                    created_by=user_id
+                )
+                db.add(new_rec)
+
+            imported_count += 1
+
+        db.commit()
+        return {
+            "imported_count": imported_count,
+            "total_rows_processed": len(df),
+            "errors": errors,
+            "status": f"Successfully ingested {imported_count} ERP records into ledger."
+        }
+
+    def ingest_erp_records_bulk(self, db: Session, records_data: List[Dict[str, Any]], company_id: int, user_id: int) -> Dict[str, Any]:
+        """
+        Accepts structured bulk JSON records from REST API / webhooks.
+        """
+        imported_count = 0
+        for item in records_data:
+            ref_str = str(item.get("reference_number", "")).strip()
+            if not ref_str:
+                continue
+
+            amt = Decimal(str(item.get("amount", 0)))
+            rec_type = item.get("record_type", "AR_INVOICE" if amt > 0 else "AP_BILL")
+            entity_name = item.get("entity_name", "General Entity")
+            raw_date = item.get("record_date")
+            rec_date = pd.to_datetime(raw_date).to_pydatetime() if raw_date else datetime.utcnow()
+
+            existing = db.query(InternalLedgerRecord).filter(
+                InternalLedgerRecord.company_id == company_id,
+                InternalLedgerRecord.reference_number == ref_str,
+                InternalLedgerRecord.is_deleted == False
+            ).first()
+
+            if existing:
+                existing.amount = amt
+                existing.record_date = rec_date
+                existing.entity_name = entity_name
+                existing.record_type = rec_type
+                if item.get("gl_account"):
+                    existing.gl_account = item.get("gl_account")
+                existing.updated_by = user_id
+            else:
+                new_rec = InternalLedgerRecord(
+                    company_id=company_id,
+                    record_type=rec_type,
+                    reference_number=ref_str,
+                    entity_name=entity_name,
+                    record_date=rec_date,
+                    amount=amt,
+                    currency=item.get("currency", "EGP"),
+                    gl_account=item.get("gl_account"),
+                    status="OPEN",
+                    created_by=user_id
+                )
+                db.add(new_rec)
+            imported_count += 1
+
+        db.commit()
+        return {
+            "imported_count": imported_count,
+            "total_rows_processed": len(records_data),
+            "errors": [],
+            "status": f"Successfully ingested {imported_count} ERP records."
         }
 
 bank_reconcile_service = BankReconciliationService()
+

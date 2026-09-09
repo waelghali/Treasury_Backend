@@ -25,13 +25,15 @@ class CRUDGlobalConfiguration(CRUDBase):
     def get_by_key(
         self, db: Session, key: GlobalConfigKey
     ) -> Optional[GlobalConfiguration]:
-        # REVERT TO ORIGINAL: We rely on the developer to ensure the database value 
-        # exactly matches the GlobalConfigKey enum value string.
-        return (
-            db.query(self.model)
-            .filter(self.model.key == key, self.model.is_deleted == False)
-            .first()
-        )
+        key_val = key.value if hasattr(key, 'value') else str(key)
+        try:
+            return (
+                db.query(self.model)
+                .filter(cast(self.model.key, String) == key_val, self.model.is_deleted == False)
+                .first()
+            )
+        except Exception:
+            return None
 
     def _validate_bounds(self, value_min, value_max, value_default, key=None):
         """Strictly enforce: value_min <= value_default <= value_max for numeric settings and policy bounds."""

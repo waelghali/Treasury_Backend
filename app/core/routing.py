@@ -40,10 +40,12 @@ def get_frontend_base_url(request: Optional[object] = None) -> str:
     if env_val and env_val.strip():
         return env_val.rstrip("/")
 
-    # Detect staging environment from DB URL or environment variables
+    # Detect staging / production environment from DB URL or environment variables
     db_url = os.getenv("DATABASE_URL", "").lower()
     if "staging" in db_url or os.getenv("ENVIRONMENT") == "staging" or os.getenv("FLASK_ENV") == "staging":
         return "https://staging.growbusinessdevelopment.com"
+    if "grow_xl8z" in db_url or os.getenv("ENVIRONMENT") == "production" or os.getenv("RENDER"):
+        return "https://www.growbusinessdevelopment.com"
 
     return "http://localhost:3000"
 

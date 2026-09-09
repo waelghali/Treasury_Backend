@@ -117,7 +117,7 @@ async def forgot_password(
     """
     try:
         await auth_service.initiate_password_reset(
-            db, request_body.email, get_client_ip(request)
+            db, request_body.email, get_client_ip(request), request=request
         )
         return {"message": "If an account with that email exists, a password reset link has been sent."}
     except HTTPException as e:
