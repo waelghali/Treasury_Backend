@@ -12,10 +12,14 @@ def build_lg_renewal_digest_html(
     recipient_name: Optional[str] = None,
     digest_title: str = "DAILY EXPIRY & RENEWAL DIGEST",
     items: List[Dict[str, Any]] = None,
-    portal_url: str = "https://app.growtreasury.com/lg/history"
+    portal_url: Optional[str] = None
 ) -> str:
     """
     Generates a responsive HTML digest email for LG Renewal & Expiry Reminders.
+    """
+    if not portal_url:
+        from app.core.routing import get_frontend_base_url
+        portal_url = f"{get_frontend_base_url()}/corporate-admin/lg-records"
     
     Each item in `items` is expected to have:
     - lg_number: str

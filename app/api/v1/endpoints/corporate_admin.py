@@ -523,9 +523,9 @@ def create_user(
         from app.core.email_service import get_customer_email_settings as _get_cust_email
         email_settings, _email_source = _get_cust_email(db, customer_id)
         
-        welcome_subject = f"Welcome to the Platform, {db_user.email}!"
-        user_name = db_user.email 
-        login_url = os.getenv('FRONTEND_LOGIN_URL', 'https://www.growbusinessdevelopment.com/login')
+        from app.core.routing import get_frontend_base_url
+        base_url = get_frontend_base_url(request=request)
+        login_url = f"{base_url}/login"
 
         welcome_body = f"""
             <html><body>
@@ -1897,7 +1897,8 @@ def approve_quotation(
     rfq_id: str,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    request: Request = None
 ):
     """Approves a quotation and broadcasts it to assigned banks."""
     rfq = db.query(QuotationRequest).filter(
@@ -1922,7 +1923,7 @@ def approve_quotation(
     from app.core.routing import get_frontend_base_url
     email_settings, source = get_customer_email_settings(db, rfq.customer_id)
     
-    base_url = get_frontend_base_url()
+    base_url = get_frontend_base_url(request=request)
     
     # Standard Bank Branding
     customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
@@ -2032,7 +2033,8 @@ def approve_quotation_request(
     approval_in: QuotationApprovalRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    request: Request = None
 ):
     """
     Allows a Corporate Admin to approve or reject an RFQ that is currently PENDING_APPROVAL.
@@ -2082,7 +2084,7 @@ def approve_quotation_request(
     if approval_in.status == "PENDING":
         email_settings = get_global_email_settings()
         from app.core.routing import get_frontend_base_url
-        base_url = get_frontend_base_url()
+        base_url = get_frontend_base_url(request=request)
         
         assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.quotation_request_id == rfq.id).all()
         for assignment in assignments:

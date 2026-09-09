@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request
 from sqlalchemy.orm import Session
 from typing import List, Any
 from datetime import datetime, timezone
@@ -149,7 +149,8 @@ def create_rfq(
     rfq_in: QuotationRequestCreate,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_active_user)
+    current_user: TokenData = Depends(get_current_active_user),
+    request: Request = None
 ):
     """Creates a new RFQ and generates secure tokens for external Banks."""
     # Add file path parsing here if files are uploaded.
@@ -205,7 +206,7 @@ def create_rfq(
         if not requires_approval:
             email_settings = get_global_email_settings()
             from app.core.routing import get_frontend_base_url
-            base_url = get_frontend_base_url()
+            base_url = get_frontend_base_url(request=request)
             
             for assignment in assignments:
                 q_bank_id = assignment.get("quotation_bank_id")
@@ -774,7 +775,8 @@ async def resend_rfq_bank_invite(
     quotation_bank_id: int,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_active_user)
+    current_user: TokenData = Depends(get_current_active_user),
+    request: Request = None
 ):
     """Resends the secure invite email to a specific bank for an RFQ."""
     rfq = db.query(QuotationRequest).filter(
@@ -797,7 +799,7 @@ async def resend_rfq_bank_invite(
         
     email_settings = get_global_email_settings()
     from app.core.routing import get_frontend_base_url
-    base_url = get_frontend_base_url()
+    base_url = get_frontend_base_url(request=request)
     bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]
     link = f"{base_url}/public-quotation/{assignment.token}"
     

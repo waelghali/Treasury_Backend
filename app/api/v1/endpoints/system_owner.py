@@ -3184,7 +3184,7 @@ async def approve_trial_registration(
 
         # Step 3: Send approval email
         from app.core.routing import get_frontend_base_url
-        base_url = get_frontend_base_url()
+        base_url = get_frontend_base_url(request=request)
         subject = f"Your {modules_text} Free Trial is Ready!"
         body = f"""
             <html><body>
