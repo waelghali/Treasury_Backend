@@ -550,6 +550,20 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
         logger.error(f"An unexpected error occurred during Google Vision OCR for {file_uri}: {e}", exc_info=True)
         return None
 
+def _reclaim_system_memory():
+    """Runs Python generational garbage collection and glibc malloc_trim on Linux."""
+    try:
+        import gc
+        gc.collect()
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 # --- PyMuPDF PDF to Image Conversion and GCS Upload ---
 async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name: str, lg_number: str = "unknown_lg") -> List[str]:
     gcs_client = _get_gcs_client()
@@ -571,8 +585,26 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
         
         for page_num in range(num_pages):
             page = pdf_document.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(260/72, 260/72))
-            img_bytes = pix.pil_tobytes(format="JPEG", quality=95)
+            
+            # Dynamic resolution clamping:
+            # For standard A4 (595x842 pt), scale to ~1800 px on longest side (zoom ≈ 2.14, ~150 DPI).
+            # For scanner-created PDFs (e.g. 2480x3508 pt), scale down to ~1800 px on longest side (zoom ≈ 0.51).
+            # This guarantees that raw pixel buffers NEVER exceed 6-8 MB in RAM regardless of input resolution.
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+            max_dim = max(page_w, page_h)
+            
+            target_max_pixels = 1800.0
+            if max_dim > 0:
+                zoom = min(target_max_pixels / max_dim, 2.0)
+            else:
+                zoom = 1.0
+            
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            
+            # Use native C-level PyMuPDF JPEG export to avoid duplicating memory via PIL
+            img_bytes = pix.tobytes("jpeg", jpg_quality=85)
             
             blob_name = f"lg_scans_temp/{lg_number}/page_{page_num + 1}_{uuid.uuid4().hex}.jpg"
             gcs_uri = await _upload_to_gcs(bucket_name, blob_name, img_bytes, "image/jpeg")
@@ -581,11 +613,11 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
             else:
                 logger.warning(f"Failed to upload image for page {page_num + 1} of PDF.")
             
-            # Immediately reclaim per-page raw pixel and compression buffers
+            # Immediately free per-page C-buffers and trim glibc memory
             del pix
             del img_bytes
-            import gc
-            gc.collect()
+            del page
+            _reclaim_system_memory()
 
         logger.info(f"Successfully converted PDF to {len(image_uris)} images and uploaded to GCS.")
     except Exception as e:
@@ -593,6 +625,7 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
     finally:
         if pdf_document:
             pdf_document.close()
+        _reclaim_system_memory()
     return image_uris
 
 # --- Text Sanitization Utility ---
@@ -1011,6 +1044,7 @@ async def process_lg_document_with_ai(
         if temp_files and unique_file_id:
             await _cleanup_gcs_files(target_bucket_name, f"lg_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS files: {unique_file_id}")
+        _reclaim_system_memory()
 # NEW FUNCTION: For amendment-specific AI processing
 
 async def process_amendment_with_ai(
@@ -1095,6 +1129,7 @@ async def process_amendment_with_ai(
         if temp_files:
             await _cleanup_gcs_files(target_bucket_name, f"lg_amendment_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
+        _reclaim_system_memory()
 
 # ==============================================================================
 # Supporting Document AI Analysis (for Issuance Request Verification)
@@ -2060,14 +2095,17 @@ async def enhance_bank_form_mapping(
         orig_pix = page.get_pixmap(dpi=150)
         orig_bytes = orig_pix.tobytes("png")
         image_parts.append(genai_types.Part.from_bytes(data=orig_bytes, mime_type="image/png"))
+        del orig_pix
         
         if pg_idx < filled_doc.page_count:
             fill_pix = filled_doc[pg_idx].get_pixmap(dpi=150)
             fill_bytes = fill_pix.tobytes("png")
             image_parts.append(genai_types.Part.from_bytes(data=fill_bytes, mime_type="image/png"))
+            del fill_pix
     
     original_doc.close()
     filled_doc.close()
+    _reclaim_system_memory()
     
     # ── Step 3: Build mapping summary ──
     mapping_summary = json.dumps([
