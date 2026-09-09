@@ -2950,13 +2950,18 @@ class CRUDLGRecord(CRUDBase):
                     ).order_by(models.AuditLog.timestamp.desc()).first()
 
                     # 4. Priority Sending (urgent > normal) with configurable interval
+                    # CRITICAL OVERRIDE: If days_left <= 3, ignore the cooldown interval and send daily reminders
+                    is_critical_daily = days_left <= 3
+
                     if is_urgent_due:
                         should_send = False
                         if not last_second:
                             should_send = True
                         else:
                             last_rem_date = last_second.timestamp.date() if hasattr(last_second.timestamp, 'date') else last_second.timestamp
-                            if (current_date_only - last_rem_date).days >= interval_days:
+                            if is_critical_daily and last_rem_date < current_date_only:
+                                should_send = True
+                            elif (current_date_only - last_rem_date).days >= interval_days:
                                 should_send = True
 
                         if should_send:
@@ -2974,7 +2979,9 @@ class CRUDLGRecord(CRUDBase):
                             should_send = True
                         else:
                             last_rem_date = last_first.timestamp.date() if hasattr(last_first.timestamp, 'date') else last_first.timestamp
-                            if (current_date_only - last_rem_date).days >= interval_days:
+                            if is_critical_daily and last_rem_date < current_date_only:
+                                should_send = True
+                            elif (current_date_only - last_rem_date).days >= interval_days:
                                 should_send = True
 
                         if should_send:
@@ -3236,6 +3243,9 @@ class CRUDLGRecord(CRUDBase):
                             models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
                         ).order_by(models.AuditLog.timestamp.desc()).first()
 
+                        # CRITICAL OVERRIDE: If days_until_expiry <= 3, ignore the cooldown interval and send daily reminders
+                        is_critical_daily = days_until_expiry <= 3
+
                         should_send = False
                         if not last_reminder:
                             logger.info(f" -> LG {lg.lg_number}: Initial reminder due ({days_until_expiry} days left).")
@@ -3244,7 +3254,10 @@ class CRUDLGRecord(CRUDBase):
                             last_rem_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
                             days_since_last = (current_date_only - last_rem_date).days
                             
-                            if days_since_last >= interval_days:
+                            if is_critical_daily and last_rem_date < current_date_only:
+                                logger.info(f" -> LG {lg.lg_number}: Critical daily reminder due ({days_until_expiry} days left <= 3d).")
+                                should_send = True
+                            elif days_since_last >= interval_days:
                                 logger.info(f" -> LG {lg.lg_number}: Follow-up due. Last sent {days_since_last} days ago.")
                                 should_send = True
                             else:

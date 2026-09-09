@@ -1058,12 +1058,16 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
                     models.AuditLog.action_type == audit_type
                 ).order_by(models.AuditLog.timestamp.desc()).first()
 
+                is_critical_daily = days_left <= 3
+
                 should_send = False
                 if not last_reminder:
                     should_send = True
                 else:
                     last_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
-                    if (current_date_only - last_date).days >= interval_cfg:
+                    if is_critical_daily and last_date < current_date_only:
+                        should_send = True
+                    elif (current_date_only - last_date).days >= interval_cfg:
                         should_send = True
 
                 if should_send:

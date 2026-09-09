@@ -16,10 +16,6 @@ def build_lg_renewal_digest_html(
 ) -> str:
     """
     Generates a responsive HTML digest email for LG Renewal & Expiry Reminders.
-    """
-    if not portal_url:
-        from app.core.routing import get_frontend_base_url
-        portal_url = f"{get_frontend_base_url()}/corporate-admin/lg-records"
     
     Each item in `items` is expected to have:
     - lg_number: str
@@ -33,6 +29,9 @@ def build_lg_renewal_digest_html(
     - urgency_level: str ("urgent" or "normal")
     - auto_renewal: bool
     """
+    if not portal_url:
+        from app.core.routing import get_frontend_base_url
+        portal_url = f"{get_frontend_base_url()}/corporate-admin/lg-records"
     items = items or []
     total_count = len(items)
 
@@ -67,9 +66,9 @@ def build_lg_renewal_digest_html(
 
 
         if is_urgent:
-            badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #fef2f2; color: #dc2626; font-size: 11px; font-weight: 700; border: 1px solid #fecaca;">🔴 Urgent ({days_left}d)</span>"""
+            badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #fef2f2; color: #dc2626; font-size: 11px; font-weight: 700; border: 1px solid #fecaca;">URGENT ({days_left}d)</span>"""
         else:
-            badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #fffbeb; color: #d97706; font-size: 11px; font-weight: 700; border: 1px solid #fef3c7;">🟡 Notice ({days_left}d)</span>"""
+            badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #fffbeb; color: #d97706; font-size: 11px; font-weight: 700; border: 1px solid #fef3c7;">NOTICE ({days_left}d)</span>"""
 
         auto_renew_badge = "Auto-Renew" if item.get("auto_renewal") else "Manual"
 
