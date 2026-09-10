@@ -143,8 +143,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "customer_name": customer_name,
         "serverTime": now.isoformat(),
         "isWindowOpen": is_open,
-        "offers": offers,
-        "contacts": contacts
+        "offers": offers
     }
 
 @router.post("/request-otp")
