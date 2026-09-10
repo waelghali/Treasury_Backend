@@ -104,6 +104,7 @@ class OTPVerifyCreate(BaseModel):
 class FXSpotOfferCreate(BaseModel):
     token: str
     price: float
+    notes: Optional[str] = None
     session_token: Optional[str] = None
     email: Optional[str] = None
 
@@ -112,10 +113,12 @@ class TBillLineItem(BaseModel):
     maturityDate: str
     discountRate: float
     maxAmount: float
+    notes: Optional[str] = None
 
 class TBillOfferCreate(BaseModel):
     token: str
     lines: List[TBillLineItem]
+    notes: Optional[str] = None
     session_token: Optional[str] = None
     email: Optional[str] = None
 
@@ -126,6 +129,7 @@ class QuotationResultItem(BaseModel):
     bank_emails: str
     price: Optional[float] = None
     finalPrice: Optional[float] = None
+    notes: Optional[str] = None
     submitted_at: Optional[datetime] = None
     submitted_by_email: Optional[str] = None
     token: Optional[str] = None

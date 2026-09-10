@@ -75,6 +75,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
             "maturity_date": o.maturity_date,
             "discount_rate": o.discount_rate,
             "max_amount": o.max_amount,
+            "notes": o.notes,
             "submitted_by_email": o.submitted_by_email,
             "submitted_at": o.submitted_at
         } for o in tbill_records]
@@ -84,6 +85,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         if offer:
             offers = [{
                 "price": offer.price, 
+                "notes": offer.notes,
                 "submitted_by_email": offer.submitted_by_email,
                 "submitted_at": offer.submitted_at
             }]
@@ -352,6 +354,7 @@ def submit_fx_offer(
     offer = QuotationOffer(
         assignment_id=assignment.id,
         price=offer_in.price,
+        notes=offer_in.notes,
         submitted_by_email=submitted_by
     )
     db.add(offer)
@@ -417,6 +420,7 @@ def submit_tbill_offer(
             maturity_date=line.maturityDate,
             discount_rate=line.discountRate,
             max_amount=line.maxAmount,
+            notes=line.notes or offer_in.notes,
             submitted_by_email=submitted_by
         )
         db.add(o)
@@ -448,17 +452,21 @@ def get_bank_quotation_history(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
-    q_bank_id = assignment.quotation_bank_id
-    q_bank = db.query(QuotationBank).filter(QuotationBank.id == q_bank_id).first()
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if not q_bank:
-        return {"history": []}
+        raise HTTPException(status_code=404, detail="Bank counterparty configuration not found")
 
-    # Fetch all assignments for this specific quotation bank
+    q_bank_id = q_bank.id
+    customer_id = q_bank.customer_id
+
+    # Find all assignments for this specific bank under this customer
     all_assignments = db.query(QuotationBankAssignment).join(
-        QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
+        QuotationRequest, QuotationRequest.id == QuotationBankAssignment.rfq_id
     ).filter(
-        QuotationBankAssignment.quotation_bank_id == q_bank_id
-    ).order_by(QuotationRequest.created_at.desc()).limit(50).all()
+        QuotationBankAssignment.quotation_bank_id == q_bank_id,
+        QuotationRequest.customer_id == customer_id,
+        QuotationRequest.status.in_(["OPEN", "PENDING", "COMPLETED", "CANCELLED", "EVALUATING"])
+    ).order_by(QuotationRequest.created_at.desc()).limit(100).all()
 
     history_items = []
     for a in all_assignments:
@@ -466,23 +474,25 @@ def get_bank_quotation_history(
         if not rfq:
             continue
 
-        # Get submitted offers for this assignment
-        offers_info = []
         best_price = None
         submitted_by = None
         submitted_at = None
+        notes = None
+        offers_info = []
 
         if rfq.type == "TBILL":
             tb_offers = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
             if tb_offers:
-                best_price = min((o.discount_rate for o in tb_offers), default=None)
+                best_price = min(o.discount_rate for o in tb_offers)
                 submitted_by = tb_offers[0].submitted_by_email
                 submitted_at = tb_offers[0].submitted_at
+                notes = tb_offers[0].notes
                 offers_info = [{
                     "settlement_date": o.settlement_date,
                     "maturity_date": o.maturity_date,
                     "discount_rate": o.discount_rate,
-                    "max_amount": o.max_amount
+                    "max_amount": o.max_amount,
+                    "notes": o.notes
                 } for o in tb_offers]
         else:
             fx_offer = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
@@ -490,6 +500,7 @@ def get_bank_quotation_history(
                 best_price = fx_offer.price
                 submitted_by = fx_offer.submitted_by_email
                 submitted_at = fx_offer.submitted_at
+                notes = fx_offer.notes
 
         # Determine trade outcome
         outcome = "NO_QUOTE"
@@ -518,6 +529,7 @@ def get_bank_quotation_history(
             "status": rfq.status,
             "quotation_base": a.quotation_base or rfq.quotation_base,
             "best_quote": best_price,
+            "notes": notes,
             "submitted_by": submitted_by,
             "submitted_at": submitted_at,
             "outcome": outcome,

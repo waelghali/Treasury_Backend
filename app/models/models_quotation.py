@@ -77,6 +77,7 @@ class QuotationOffer(BaseModel):
     __tablename__ = "quotation_offers"
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False)
     price = Column(Float, nullable=False)
+    notes = Column(Text, nullable=True, comment="Optional notes or comments from the submitting trader")
     submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -90,6 +91,7 @@ class QuotationTBillOffer(BaseModel):
     maturity_date = Column(String, nullable=False)
     discount_rate = Column(Float, nullable=False)
     max_amount = Column(Float, nullable=False)
+    notes = Column(Text, nullable=True, comment="Optional notes or comments from the submitting trader")
     submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
