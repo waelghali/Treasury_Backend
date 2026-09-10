@@ -35,6 +35,7 @@ class CRUDAuditLog(CRUDBase):
         skip: int = 0,
         limit: int = 100,
         user_id: Optional[int] = None,
+        user_email: Optional[str] = None,
         action_type: Optional[str] = None,
         entity_type: Optional[str] = None,
         entity_id: Optional[int] = None,
@@ -54,6 +55,9 @@ class CRUDAuditLog(CRUDBase):
         )
         if user_id:
             query = query.filter(self.model.user_id == user_id)
+        if user_email and user_email.strip():
+            email_term = f"%{user_email.strip().lower()}%"
+            query = query.join(self.model.user).filter(func.lower(User.email).like(email_term))
         if action_type and action_type.strip() and action_type.upper() != "ALL":
             query = query.filter(func.lower(self.model.action_type) == func.lower(action_type.strip()))
         if entity_type and entity_type.strip() and entity_type.upper() != "ALL":
@@ -88,15 +92,17 @@ class CRUDAuditLog(CRUDBase):
                 except Exception:
                     pass
 
-        # Text search across action, entity, details JSON, and IP address
+        # Text search across action, entity, details JSON, IP address, and User email
         if search and search.strip():
             s = f"%{search.strip().lower()}%"
-            query = query.filter(
+            # Use outerjoin so logs with no user (e.g. system background jobs) are still returned
+            query = query.outerjoin(self.model.user).filter(
                 or_(
                     func.lower(self.model.action_type).like(s),
                     func.lower(self.model.entity_type).like(s),
                     func.lower(self.model.ip_address).like(s),
-                    func.lower(cast(self.model.details, String)).like(s)
+                    func.lower(cast(self.model.details, String)).like(s),
+                    func.lower(User.email).like(s)
                 )
             )
 

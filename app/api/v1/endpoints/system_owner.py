@@ -2766,13 +2766,14 @@ def read_audit_logs(
     skip: int = 0, 
     limit: int = 1000,
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    user_email: Optional[str] = Query(None, description="Filter by user email"),
     customer_id: Optional[int] = Query(None, description="Filter by customer ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., Customer, User, LGRecord)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
     start_date: Optional[str] = Query(None, description="Filter logs on or after this date (ISO format or YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="Filter logs on or before this date (ISO format or YYYY-MM-DD)"),
-    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, user email, or IP"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("audit_log:view"))
 ):
@@ -2786,6 +2787,7 @@ def read_audit_logs(
         skip=skip, 
         limit=limit, 
         user_id=user_id,
+        user_email=user_email,
         action_type=action_type,
         entity_type=entity_type,
         entity_id=entity_id,
@@ -2806,13 +2808,14 @@ def export_system_owner_audit_logs_to_csv(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("audit_log:view")),
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    user_email: Optional[str] = Query(None, description="Filter by user email"),
     customer_id: Optional[int] = Query(None, description="Filter by Customer ID"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., Customer, SubscriptionPlan)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
     start_date: Optional[str] = Query(None, description="Filter logs on or after this date"),
     end_date: Optional[str] = Query(None, description="Filter logs on or before this date"),
-    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, user email, or IP"),
 ):
     """
     Exports a CSV file of all audit log entries, applying the same filters
@@ -2825,6 +2828,7 @@ def export_system_owner_audit_logs_to_csv(
         skip=0,
         limit=10000,
         user_id=user_id,
+        user_email=user_email,
         action_type=action_type,
         entity_type=entity_type,
         entity_id=entity_id,

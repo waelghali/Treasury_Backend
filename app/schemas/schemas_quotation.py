@@ -4,10 +4,16 @@ from typing import Optional, List, Any
 from datetime import datetime
 
 # --- Quotation Bank Schemas ---
+class QuotationContactItem(BaseModel):
+    email: str
+    name: Optional[str] = None
+    role: str = "EXECUTION" # "EXECUTION" or "VIEW_ONLY"
+
 class QuotationBankBase(BaseModel):
     bank_id: int
     trade_type: str = "BOTH"
-    emails: str
+    emails: Optional[str] = None
+    contacts: Optional[List[QuotationContactItem]] = None
 
 class QuotationBankCreate(QuotationBankBase):
     pass
@@ -25,6 +31,7 @@ class QuotationBankOut(QuotationBankBase):
     customer_id: int
     created_at: datetime
     bank: Optional[BankSimpleOut] = None
+    contacts: Optional[List[dict]] = None
     
     class Config:
         from_attributes = True
@@ -83,10 +90,22 @@ class QuotationRequestOut(BaseModel):
     class Config:
         from_attributes = True
 
-# --- Bank Offers Schemas (Public) ---
+# --- Bank Offers & OTP Schemas (Public) ---
+class OTPRequestCreate(BaseModel):
+    token: str
+    email: str
+
+class OTPVerifyCreate(BaseModel):
+    token: str
+    email: Optional[str] = None
+    otp_code: Optional[str] = None
+    magic_token: Optional[str] = None
+
 class FXSpotOfferCreate(BaseModel):
     token: str
     price: float
+    session_token: Optional[str] = None
+    email: Optional[str] = None
 
 class TBillLineItem(BaseModel):
     settlementDate: str
@@ -97,6 +116,8 @@ class TBillLineItem(BaseModel):
 class TBillOfferCreate(BaseModel):
     token: str
     lines: List[TBillLineItem]
+    session_token: Optional[str] = None
+    email: Optional[str] = None
 
 # --- Results Schemas ---
 class QuotationResultItem(BaseModel):
@@ -106,10 +127,12 @@ class QuotationResultItem(BaseModel):
     price: Optional[float] = None
     finalPrice: Optional[float] = None
     submitted_at: Optional[datetime] = None
+    submitted_by_email: Optional[str] = None
     token: Optional[str] = None
     offers: Optional[List[dict]] = None # For T-Bills
     quotation_base: Optional[str] = None
     is_document_visible: Optional[bool] = True
+    contacts: Optional[List[dict]] = None
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

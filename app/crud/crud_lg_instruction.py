@@ -555,17 +555,6 @@ class CRUDLGInstruction(CRUDBase):
         generated_html = reminder_template.content
         for key, value in template_data.items():
             str_value = str(value) if value is not None else ""
-            generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
-        try:
-            filename_for_pdf = f"lg_reminder_{lg_record.lg_number}_original_{original_instruction.serial_number}_{reminder_serial_number}"
-            generated_pdf_bytes = await generate_pdf_from_html(
-                generated_html,
-                filename_for_pdf
-            )
-        except Exception as e:
-            logger.error(f"[CRUDLGInstruction.send_bank_reminder] Failed to generate PDF for reminder for LG {lg_record.id}, original instruction {original_instruction_id}: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate reminder PDF: {e}")
-        
         generated_content_path = None
         new_reminder_instruction = await self.create(
             db,

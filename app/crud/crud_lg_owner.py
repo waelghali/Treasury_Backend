@@ -284,7 +284,6 @@ class CRUDLGOwner(CRUDBase):
                     generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
                 try:
-                    generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, f"lg_owner_change_{lg_record.lg_number}_instruction")
                     generated_content_path = None
                     
                     db_lg_instruction = crud_instances.crud_lg_instruction.create(
@@ -306,7 +305,7 @@ class CRUDLGOwner(CRUDBase):
                     instruction_ids.append(db_lg_instruction.id)
                     logger.debug(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Instruction {db_lg_instruction.serial_number} created and flushed.")
                 except Exception as e:
-                    logger.error(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Error generating PDF or creating instruction for LG {lg_record.lg_number} owner change: {e}", exc_info=True)
+                    logger.error(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Error creating instruction for LG {lg_record.lg_number} owner change: {e}", exc_info=True)
 
         return instruction_ids
 

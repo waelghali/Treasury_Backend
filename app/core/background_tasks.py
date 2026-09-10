@@ -334,6 +334,8 @@ async def run_daily_print_reminders(db: Session):
     customers = db.query(models.Customer).filter(models.Customer.is_deleted == False).all()
     if not customers: return
 
+    current_time = datetime.now(EEST_TIMEZONE)
+
     for customer in customers:
         try:
             # 1. Check Configs
@@ -357,105 +359,158 @@ async def run_daily_print_reminders(db: Session):
                 selectinload(models.ApprovalRequest.checker_user),
             ).all()
 
-            # 1. This is "Aware" (has Egypt Timezone)
-            current_time = datetime.now(EEST_TIMEZONE)
+            # Group eligible items by maker user
+            maker_batches = {}
 
             for req in requests:
                 inst = req.related_instruction
-                if not inst or inst.is_printed or not req.maker_user:
+                if not inst or inst.is_printed or not req.maker_user or not req.maker_user.email:
                     continue
 
-                # 2. Get the date from the database
+                # Get the date from the database
                 created_at = inst.instruction_date
-                
-                # 3. If it's a simple 'date', turn it into a 'datetime' first
                 if isinstance(created_at, date) and not isinstance(created_at, datetime):
                     created_at = datetime.combine(created_at, datetime.min.time())
 
-                # 4. If it has no timezone (Naive), give it the Egypt Timezone (Aware)
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=EEST_TIMEZONE)
-                # If it already has a timezone, move it to Egypt Timezone to be sure
                 else:
                     created_at = created_at.astimezone(EEST_TIMEZONE)
 
-                # 5. NOW they match perfectly. Both are Datetimes, both are Egypt Time.
                 days_old = (current_time - created_at).days
-                
                 req_details = req.request_details or {}
                 status = req_details.get("print_notification_status", "NONE")
 
-                # 3. Determine Action
-                action_mode = None # "REMIND" or "ESCALATE"
-                
+                # Determine Action Mode
+                action_mode = None
                 if days_old >= d_escalate and status in ["REMINDER_SENT", "NONE"]:
                     action_mode = "ESCALATE"
                 elif days_old >= d_remind and status == "NONE":
                     action_mode = "REMIND"
-                
+
                 if not action_mode:
                     continue
 
-                # 4. Prepare Notification
                 is_escalation = (action_mode == "ESCALATE")
-                template_key = "PRINT_ESCALATION" if is_escalation else "PRINT_REMINDER"
-                audit_type = AUDIT_ACTION_TYPE_PRINT_ESCALATION_SENT if is_escalation else AUDIT_ACTION_TYPE_PRINT_REMINDER_SENT
-                
-                # Recipients
-                to_emails = [req.maker_user.email]
-                cc_emails = []
-                if is_escalation and req.checker_user:
-                    cc_emails.append(req.checker_user.email)
-                
-                cc_emails.extend(_get_common_cc_emails(db, customer.id))
-                cc_emails = list(set(cc_emails))
+                maker_key = req.maker_user.email.strip().lower()
 
-                # Build Email with Modern SaaS Theme
-                title_text = "⚠️ Urgent: LG Physical Print Escalation" if is_escalation else "🖨️ Reminder: LG Physical Print Pending"
+                if maker_key not in maker_batches:
+                    maker_batches[maker_key] = []
+
+                maker_batches[maker_key].append({
+                    "req": req,
+                    "inst": inst,
+                    "days_old": days_old,
+                    "action_mode": action_mode,
+                    "is_escalation": is_escalation,
+                    "maker_user": req.maker_user,
+                    "checker_user": req.checker_user,
+                })
+
+            if not maker_batches:
+                continue
+
+            email_settings, email_method = get_customer_email_settings(db, customer.id)
+            common_cc_emails = _get_common_cc_emails(db, customer.id)
+
+            # Send 1 consolidated digest email per Maker
+            for maker_email, items in maker_batches.items():
+                has_escalation = any(item["is_escalation"] for item in items)
                 
-                email_body_html = build_transaction_email_html(
+                to_emails = [items[0]["maker_user"].email]
+                cc_emails = list(common_cc_emails)
+                
+                if has_escalation:
+                    for item in items:
+                        if item["is_escalation"] and item["checker_user"] and item["checker_user"].email:
+                            cc_emails.append(item["checker_user"].email)
+                
+                cc_emails = [e for e in set(cc_emails) if e not in to_emails]
+
+                # Build Consolidated Table Rows
+                rows = []
+                for item in items:
+                    inst = item["inst"]
+                    req = item["req"]
+                    days_old = item["days_old"]
+                    is_esc = item["is_escalation"]
+                    lg_num = inst.lg_record.lg_number if inst.lg_record else "N/A"
+                    act_label = req.action_type.replace('_', ' ').title()
+                    badge_color = "#dc2626" if is_esc else "#d97706"
+                    badge_bg = "#fef2f2" if is_esc else "#fffbeb"
+                    status_text = "⚠️ Escalated" if is_esc else "📋 Reminder"
+
+                    rows.append(f"""
+                        <tr style="border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 10px 12px; font-weight: 600; color: #0f172a;">{lg_num}</td>
+                            <td style="padding: 10px 12px; color: #334155;">{act_label}</td>
+                            <td style="padding: 10px 12px; color: #64748b; font-family: monospace;">#{inst.serial_number}</td>
+                            <td style="padding: 10px 12px; color: #64748b;">{inst.instruction_date.strftime('%Y-%m-%d')}</td>
+                            <td style="padding: 10px 12px; text-align: center;">
+                                <span style="background: {badge_bg}; color: {badge_color}; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 9999px; display: inline-block;">
+                                    {days_old} days ({status_text})
+                                </span>
+                            </td>
+                            <td style="padding: 10px 12px; color: #64748b; font-size: 12px;">{item['checker_user'].email if item['checker_user'] else 'N/A'}</td>
+                        </tr>
+                    """)
+
+                table_html = f"""
+                    <table style="width:100%; border-collapse: collapse; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+                        <thead>
+                            <tr style="background-color: #f8fafc; color: #475569; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; border-bottom: 2px solid #e2e8f0;">
+                                <th style="padding: 10px 12px;">LG Number</th>
+                                <th style="padding: 10px 12px;">Action Type</th>
+                                <th style="padding: 10px 12px;">Instruction Serial</th>
+                                <th style="padding: 10px 12px;">Approved Date</th>
+                                <th style="padding: 10px 12px; text-align: center;">Days Pending</th>
+                                <th style="padding: 10px 12px;">Checker</th>
+                            </tr>
+                        </thead>
+                        <tbody>{"".join(rows)}</tbody>
+                    </table>
+                """
+
+                alert_type = "critical" if has_escalation else "warning"
+                title_text = f"⚠️ Action Required: {len(items)} Approved LG Physical Print(s) Pending"
+                subject = f"{'ESCALATION' if has_escalation else 'REMINDER'}: {len(items)} Approved LG Instruction(s) Pending Physical Print — {customer.name}"
+                recipient_display = items[0]["maker_user"].email.split('@')[0]
+
+                email_body_html = build_alert_email_html(
                     customer_name=customer.name,
                     title=title_text,
-                    transaction_ref=inst.lg_record.lg_number if inst.lg_record else "N/A",
-                    transaction_type=f"Print Pending ({req.action_type.replace('_', ' ').title()})",
-                    key_value_dict={
-                        "LG Number": inst.lg_record.lg_number if inst.lg_record else "N/A",
-                        "Instruction Serial": inst.serial_number,
-                        "Action Type": req.action_type.replace('_', ' ').title(),
-                        "Days Overdue": f"<span style='color: {'#dc2626' if is_escalation else '#d97706'}; font-weight: 700;'>{days_old} days</span>",
-                        "Maker": req.maker_user.email,
-                        "Checker": req.checker_user.email if req.checker_user else "N/A"
-                    },
-                    summary_text=f"An approved {req.action_type.replace('_', ' ').title()} instruction for LG #{inst.lg_record.lg_number if inst.lg_record else 'N/A'} was approved {days_old} days ago but has not yet been marked as printed for physical bank delivery.",
-                    cta_text="View Issued LGs",
-                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
-                    recipient_name=req.maker_user.email.split('@')[0]
+                    alert_type=alert_type,
+                    message=f"The following {len(items)} approved LG instruction(s) have not yet been marked as printed for physical bank delivery. Please review, print, and mark them in the Action Center.",
+                    details_table_html=table_html,
+                    cta_text="View Action Center",
+                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/action-center",
+                    recipient_name=recipient_display
                 )
 
-                subject = f"{'ESCALATION' if is_escalation else 'REMINDER'}: Print LG Instruction #{inst.serial_number} (LG #{inst.lg_record.lg_number if inst.lg_record else 'N/A'})"
-
-                # Send
-                email_settings, email_method = get_customer_email_settings(db, customer.id)
                 sent = await send_email(
                     db=db, to_emails=to_emails, cc_emails=cc_emails,
                     subject_template=subject, body_template=email_body_html, template_data={},
                     email_settings=email_settings, sender_name=customer.name
                 )
 
-
                 if sent:
-                    req_details["print_notification_status"] = "ESCALATION_SENT" if is_escalation else "REMINDER_SENT"
-                    req.request_details = req_details
-                    db.add(req)
-                    
-                    log_action(db, None, audit_type, "ApprovalRequest", req.id, {
-                        "recipient": to_emails,
-                        "notification_type": template_key,
-                        "days_overdue": days_old
-                    }, customer.id, req.entity_id)
-                    db.flush() # Flush to save status update immediately
+                    for item in items:
+                        req = item["req"]
+                        req_details = req.request_details or {}
+                        req_details["print_notification_status"] = "ESCALATION_SENT" if item["is_escalation"] else "REMINDER_SENT"
+                        req.request_details = req_details
+                        db.add(req)
+
+                        audit_type = AUDIT_ACTION_TYPE_PRINT_ESCALATION_SENT if item["is_escalation"] else AUDIT_ACTION_TYPE_PRINT_REMINDER_SENT
+                        log_action(db, None, audit_type, "ApprovalRequest", req.id, {
+                            "recipient": to_emails,
+                            "notification_type": "PRINT_ESCALATION" if item["is_escalation"] else "PRINT_REMINDER",
+                            "days_overdue": item["days_old"],
+                            "batch_total": len(items)
+                        }, customer.id, req.entity_id)
+                    db.flush()
                 else:
-                    logger.error(f"Failed to send {template_key} for Request {req.id}")
+                    logger.error(f"Failed to send consolidated print reminders to {to_emails} for customer {customer.id}")
 
         except Exception as e:
             db.rollback()
@@ -1804,7 +1859,7 @@ async def run_daily_maintenance_delivery_reminders(db: Session):
       - DAYS_FOR_FIRST_PRINT_REMINDER (default 2): send first reminder
       - DAYS_FOR_PRINT_ESCALATION (default 5): escalate to Corp Admin
     
-    Mirrors the pattern from run_daily_print_reminders() for consistency.
+    Consolidates pending delivery letters per initiator/admin into a single daily digest email.
     """
     logger.info("Running daily maintenance delivery reminders...")
 
@@ -1836,147 +1891,200 @@ async def run_daily_maintenance_delivery_reminders(db: Session):
                 IssuedLGRecord.id == IssuanceMaintenanceAction.issued_lg_id
             ).filter(
                 IssuedLGRecord.customer_id == customer.id,
+            ).options(
+                selectinload(IssuanceMaintenanceAction.issued_lg),
             ).all()
 
+            # Group eligible actions by initiator user ID
+            initiator_batches = {}
+
             for action in pending_actions:
-                try:
-                    # Calculate days since execution
-                    created_at = action.updated_at or action.created_at
-                    if not created_at:
-                        continue
-                    
-                    if isinstance(created_at, date) and not isinstance(created_at, datetime):
-                        created_at = datetime.combine(created_at, datetime.min.time())
-                    if created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=EEST)
-                    else:
-                        created_at = created_at.astimezone(EEST)
+                created_at = action.updated_at or action.created_at
+                if not created_at:
+                    continue
+                
+                if isinstance(created_at, date) and not isinstance(created_at, datetime):
+                    created_at = datetime.combine(created_at, datetime.min.time())
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=EEST)
+                else:
+                    created_at = created_at.astimezone(EEST)
 
-                    days_old = (current_time - created_at).days
+                days_old = (current_time - created_at).days
 
-                    # Check notification status (tracked in action_data JSONB)
-                    action_data = action.action_data or {}
-                    notif_status = action_data.get("delivery_notification_status", "NONE")
+                # Check notification status (tracked in action_data JSONB)
+                action_data = action.action_data or {}
+                notif_status = action_data.get("delivery_notification_status", "NONE")
 
-                    # 3. Determine action mode
-                    action_mode = None
-                    if days_old >= d_escalate and notif_status in ["REMINDER_SENT", "NONE"]:
-                        action_mode = "ESCALATE"
-                    elif days_old >= d_remind and notif_status == "NONE":
-                        action_mode = "REMIND"
+                # Determine action mode
+                action_mode = None
+                if days_old >= d_escalate and notif_status in ["REMINDER_SENT", "NONE"]:
+                    action_mode = "ESCALATE"
+                elif days_old >= d_remind and notif_status == "NONE":
+                    action_mode = "REMIND"
 
-                    if not action_mode:
-                        continue
+                if not action_mode:
+                    continue
 
-                    is_escalation = (action_mode == "ESCALATE")
+                is_escalation = (action_mode == "ESCALATE")
 
-                    # 4. Get LG info for the notification
-                    lg = db.query(IssuedLGRecord).filter(
-                        IssuedLGRecord.id == action.issued_lg_id
-                    ).first()
-                    if not lg:
-                        continue
+                lg = action.issued_lg or db.query(IssuedLGRecord).filter(IssuedLGRecord.id == action.issued_lg_id).first()
+                if not lg:
+                    continue
 
-                    # 5. Build recipients
-                    initiator = db.query(models.User).filter(
-                        models.User.id == action.initiated_by_user_id
-                    ).first()
-                    to_emails = [initiator.email] if initiator and initiator.email else []
+                initiator_id = action.initiated_by_user_id or 0
+                if initiator_id not in initiator_batches:
+                    initiator_batches[initiator_id] = []
 
-                    cc_emails = []
-                    if is_escalation:
-                        # Escalate: add corp admins
-                        admins = db.query(models.User).filter(
-                            models.User.customer_id == customer.id,
-                            models.User.role == UserRole.CORPORATE_ADMIN,
-                            models.User.is_deleted == False,
-                        ).all()
-                        cc_emails = [a.email for a in admins if a.email]
+                initiator_batches[initiator_id].append({
+                    "action": action,
+                    "lg": lg,
+                    "days_old": days_old,
+                    "action_mode": action_mode,
+                    "is_escalation": is_escalation,
+                })
 
-                    cc_emails.extend(_get_common_cc_emails(db, customer.id))
-                    cc_emails = list(set(cc_emails))
+            if not initiator_batches:
+                continue
 
-                    if not to_emails and not cc_emails:
-                        continue
+            email_settings, _ = get_customer_email_settings(db, customer.id)
+            common_cc_emails = _get_common_cc_emails(db, customer.id)
 
-                    # 6. Build email
-                    action_label = action.action_type.replace("_", " ").title()
+            # Get Corporate Admins for escalation CC
+            admins = db.query(models.User).filter(
+                models.User.customer_id == customer.id,
+                models.User.role == UserRole.CORPORATE_ADMIN,
+                models.User.is_deleted == False,
+            ).all()
+            admin_emails = [a.email for a in admins if a.email]
+
+            for initiator_id, items in initiator_batches.items():
+                initiator = db.query(models.User).filter(models.User.id == initiator_id).first() if initiator_id else None
+                to_emails = [initiator.email] if initiator and initiator.email else []
+                
+                # If no initiator email found, fallback to corporate admins
+                if not to_emails:
+                    to_emails = list(admin_emails)
+
+                if not to_emails:
+                    continue
+
+                has_escalation = any(item["is_escalation"] for item in items)
+                cc_emails = list(common_cc_emails)
+                if has_escalation:
+                    cc_emails.extend(admin_emails)
+                cc_emails = [e for e in set(cc_emails) if e not in to_emails]
+
+                # Build Consolidated Table Rows
+                rows = []
+                for item in items:
+                    act = item["action"]
+                    lg = item["lg"]
+                    days_old = item["days_old"]
+                    is_esc = item["is_escalation"]
                     lg_ref = lg.lg_ref_number or lg.bank_lg_number or f"LG #{lg.id}"
-                    serial = action.letter_serial_number or f"Action #{action.id}"
+                    action_label = act.action_type.replace("_", " ").title()
+                    serial = act.letter_serial_number or f"Action #{act.id}"
+                    badge_color = "#dc2626" if is_esc else "#d97706"
+                    badge_bg = "#fef2f2" if is_esc else "#fffbeb"
+                    status_text = "⚠️ Escalated" if is_esc else "📋 Reminder"
 
-                    if is_escalation:
-                        subject = f"⚠️ Escalation: Maintenance Letter Not Delivered — {lg_ref} ({action_label})"
-                        body_intro = f"The following maintenance letter has not been delivered for <strong>{days_old} days</strong>. This requires immediate attention."
-                    else:
-                        subject = f"Reminder: Maintenance Letter Pending Delivery — {lg_ref} ({action_label})"
-                        body_intro = f"A maintenance letter generated <strong>{days_old} days ago</strong> has not yet been marked as delivered to the bank."
+                    rows.append(f"""
+                        <tr style="border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 10px 12px; font-weight: 600; color: #0f172a;">{lg_ref}</td>
+                            <td style="padding: 10px 12px; color: #334155;">{action_label}</td>
+                            <td style="padding: 10px 12px; color: #64748b; font-family: monospace;">{serial}</td>
+                            <td style="padding: 10px 12px; text-align: center;">
+                                <span style="background: {badge_bg}; color: {badge_color}; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 9999px; display: inline-block;">
+                                    {days_old} days ({status_text})
+                                </span>
+                            </td>
+                        </tr>
+                    """)
 
-                    body = build_transaction_email_html(
-                        customer_name=customer.name,
-                        title="⚠️ Delivery Escalation: Maintenance Letter" if is_escalation else "📋 Delivery Reminder: Maintenance Letter",
-                        transaction_ref=lg_ref,
-                        transaction_type=f"Maintenance Letter ({action_label})",
-                        key_value_dict={
-                            "LG Reference": lg_ref,
-                            "Action Type": action_label,
-                            "Serial Number": serial,
-                            "Days Pending": f"<span style='color: {'#dc2626' if is_escalation else '#d97706'}; font-weight: 700;'>{days_old} days</span>"
-                        },
-                        summary_text=f"A maintenance letter generated {days_old} days ago has not yet been marked as delivered to the bank. Please print and deliver the letter to the bank, then mark it as delivered in the system.",
-                        cta_text="View Issued LGs",
-                        cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
-                        recipient_name="Corporate Administrator"
-                    )
+                table_html = f"""
+                    <table style="width:100%; border-collapse: collapse; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+                        <thead>
+                            <tr style="background-color: #f8fafc; color: #475569; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; border-bottom: 2px solid #e2e8f0;">
+                                <th style="padding: 10px 12px;">LG Reference</th>
+                                <th style="padding: 10px 12px;">Action Type</th>
+                                <th style="padding: 10px 12px;">Serial Number</th>
+                                <th style="padding: 10px 12px; text-align: center;">Days Pending Delivery</th>
+                            </tr>
+                        </thead>
+                        <tbody>{"".join(rows)}</tbody>
+                    </table>
+                """
 
+                alert_type = "critical" if has_escalation else "warning"
+                title_text = f"⚠️ Action Required: {len(items)} Maintenance Letter(s) Pending Delivery"
+                subject = f"{'ESCALATION' if has_escalation else 'REMINDER'}: {len(items)} Maintenance Letter(s) Pending Bank Delivery — {customer.name}"
+                recipient_name = initiator.email.split('@')[0] if initiator and initiator.email else "Corporate Administrator"
 
-                    # 7. Send email
-                    email_settings, _ = get_customer_email_settings(db, customer.id)
-                    sent = await send_email(
-                        db=db, to_emails=to_emails, cc_emails=cc_emails,
-                        subject_template=subject, body_template=body, template_data={},
-                        email_settings=email_settings, sender_name=customer.name
-                    )
+                body = build_alert_email_html(
+                    customer_name=customer.name,
+                    title=title_text,
+                    alert_type=alert_type,
+                    message=f"The following {len(items)} maintenance letter(s) were generated but have not yet been marked as delivered to the bank. Please print and deliver the letter(s) to the bank, then update the delivery status in the system.",
+                    details_table_html=table_html,
+                    cta_text="View Issued LGs",
+                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                    recipient_name=recipient_name
+                )
 
-                    # 8. In-app notification
-                    user_ids = [action.initiated_by_user_id]
-                    if is_escalation:
-                        user_ids.extend([a.id for a in admins])
-                    user_ids = list(set(uid for uid in user_ids if uid))
+                sent = await send_email(
+                    db=db, to_emails=to_emails, cc_emails=cc_emails,
+                    subject_template=subject, body_template=body, template_data={},
+                    email_settings=email_settings, sender_name=customer.name
+                )
 
-                    for uid in user_ids:
-                        try:
-                            notif = SystemNotificationCreate(
-                                content=f"{'⚠️ Escalation' if is_escalation else '📋 Reminder'}: "
-                                        f"{action_label} letter for {lg_ref} not delivered ({days_old} days).",
-                                notification_type="MAINTENANCE_DELIVERY_REMINDER",
-                                start_date=datetime.now(),
-                                end_date=datetime.now() + timedelta(days=1),
-                                target_user_ids=[uid],
-                                target_customer_ids=[customer.id],
-                                display_frequency="once",
-                            )
-                            crud_system_notification.create(db, obj_in=notif, user_id=1)
-                        except Exception as e:
-                            logger.error(f"Failed to create maintenance reminder notification: {e}")
+                if sent:
+                    for item in items:
+                        act = item["action"]
+                        lg = item["lg"]
+                        days_old = item["days_old"]
+                        is_esc = item["is_escalation"]
+                        action_label = act.action_type.replace("_", " ").title()
+                        lg_ref = lg.lg_ref_number or lg.bank_lg_number or f"LG #{lg.id}"
 
-                    # 9. Update notification status
-                    if sent:
+                        action_data = act.action_data or {}
                         action_data["delivery_notification_status"] = (
-                            "ESCALATION_SENT" if is_escalation else "REMINDER_SENT"
+                            "ESCALATION_SENT" if is_esc else "REMINDER_SENT"
                         )
-                        action.action_data = dict(action_data)
-                        db.add(action)
+                        act.action_data = dict(action_data)
+                        db.add(act)
+
+                        # In-app notification
+                        target_uids = [initiator_id] if initiator_id else []
+                        if is_esc:
+                            target_uids.extend([a.id for a in admins])
+                        target_uids = list(set(uid for uid in target_uids if uid))
+
+                        for uid in target_uids:
+                            try:
+                                notif = SystemNotificationCreate(
+                                    content=f"{'⚠️ Escalation' if is_esc else '📋 Reminder'}: "
+                                            f"{action_label} letter for {lg_ref} not delivered ({days_old} days).",
+                                    notification_type="MAINTENANCE_DELIVERY_REMINDER",
+                                    start_date=datetime.now(),
+                                    end_date=datetime.now() + timedelta(days=3),
+                                    target_user_ids=[uid],
+                                    target_customer_ids=[customer.id],
+                                    display_frequency="once",
+                                )
+                                crud_system_notification.create(db, obj_in=notif, user_id=1)
+                            except Exception as notif_err:
+                                logger.debug(f"In-app notification skipped: {notif_err}")
 
                         log_action(db, None,
-                            f"MAINTENANCE_DELIVERY_{'ESCALATION' if is_escalation else 'REMINDER'}_SENT",
-                            "IssuanceMaintenanceAction", action.id,
-                            {"days_overdue": days_old, "recipients": to_emails + cc_emails},
+                            f"MAINTENANCE_DELIVERY_{'ESCALATION' if is_esc else 'REMINDER'}_SENT",
+                            "IssuanceMaintenanceAction", act.id,
+                            {"days_overdue": days_old, "recipients": to_emails + cc_emails, "batch_total": len(items)},
                             customer.id
                         )
-                        db.flush()
-
-                except Exception as action_err:
-                    logger.error(f"Error processing maintenance reminder for action {action.id}: {action_err}")
+                    db.flush()
+                else:
+                    logger.error(f"Failed to send consolidated maintenance delivery reminders to {to_emails} for customer {customer.id}")
 
         except Exception as e:
             db.rollback()

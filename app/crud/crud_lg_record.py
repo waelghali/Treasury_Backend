@@ -752,16 +752,7 @@ class CRUDLGRecord(CRUDBase):
             if not db_lg_instruction:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
 
-            filename_for_pdf = f"lg_extension_{db_lg_record.lg_number}_instruction_{db_lg_instruction.serial_number}"
-            generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, filename_for_pdf)
-            
-            generated_content_path = f"gs://your-gcs-bucket/generated_instructions/{filename_for_pdf}.pdf"
-            
             db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
-            db_lg_instruction_in_current_session.generated_content_path = generated_content_path
-            db.add(db_lg_instruction_in_current_session)
-            db.flush()
-
             db.refresh(updated_lg_record)
             db.refresh(db_lg_instruction_in_current_session)
 
@@ -1046,15 +1037,7 @@ class CRUDLGRecord(CRUDBase):
             if not db_lg_instruction:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
 
-            filename_for_pdf = f"lg_release_{lg_record.lg_number}_instruction_{db_lg_instruction.serial_number}"
-            generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, filename_for_pdf)
-            
-            generated_content_path = f"gs://your-gcs-bucket/generated_instructions/{filename_for_pdf}.pdf"
-            
             db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
-            db_lg_instruction_in_current_session.generated_content_path = generated_content_path
-            db.add(db_lg_instruction_in_current_session)
-            db.flush()
 
             if supporting_document_id:
                 db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
@@ -1344,15 +1327,7 @@ class CRUDLGRecord(CRUDBase):
             if not db_lg_instruction:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
 
-            filename_for_pdf = f"lg_liquidation_{lg_record.lg_number}_instruction_{db_lg_instruction.serial_number}"
-            generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, filename_for_pdf)
-            
-            generated_content_path = f"gs://your-gcs-bucket/generated_instructions/{filename_for_pdf}.pdf"
-            
             db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
-            db_lg_instruction_in_current_session.generated_content_path = generated_content_path
-            db.add(db_lg_instruction_in_current_session)
-            db.flush()
 
             if supporting_document_id:
                 db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()
@@ -1578,15 +1553,8 @@ class CRUDLGRecord(CRUDBase):
                 db_lg_instruction = db.query(models.LGInstruction).filter(models.LGInstruction.id == instruction_id).first()
                 if not db_lg_instruction:
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
-
-                filename_for_pdf = f"{db_lg_instruction.serial_number}"
-                generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, filename_for_pdf)
-                
-                generated_content_path = f"gs://{GCS_BUCKET_NAME}/generated_instructions/{filename_for_pdf}"
                 
                 db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
-                db_lg_instruction_in_current_session.generated_content_path = generated_content_path
-                db.add(db_lg_instruction_in_current_session)
                 db.flush()
                 
                 if supporting_document_id:
@@ -1844,15 +1812,7 @@ class CRUDLGRecord(CRUDBase):
             if not db_lg_instruction:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
 
-            filename_for_pdf = f"lg_activation_{db_lg_record.lg_number}_instruction_{db_lg_instruction.serial_number}"
-            generated_pdf_bytes = await generate_pdf_from_html(generated_instruction_html, filename_for_pdf)
-            
-            generated_content_path = f"gs://your-gcs-bucket/generated_instructions/{filename_for_pdf}.pdf"
-            
             db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
-            db_lg_instruction_in_current_session.generated_content_path = generated_content_path
-            db.add(db_lg_instruction_in_current_session)
-            db.flush()
 
             if supporting_document_id:
                 db_document = db.query(models.LGDocument).filter(models.LGDocument.id == supporting_document_id, models.LGDocument.is_deleted == False).first()

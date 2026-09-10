@@ -14,6 +14,17 @@ class CRUDQuotation:
     
     # --- Quotation Banks ---
     def create_quotation_bank(self, db: Session, customer_id: int, obj_in: QuotationBankCreate):
+        contacts_data = []
+        if obj_in.contacts:
+            contacts_data = [c.dict() if hasattr(c, 'dict') else c for c in obj_in.contacts]
+            emails_str = ", ".join([c["email"].strip() for c in contacts_data if c.get("email")])
+        elif obj_in.emails:
+            emails_list = [e.strip() for e in obj_in.emails.split(",") if e.strip()]
+            contacts_data = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+            emails_str = ", ".join(emails_list)
+        else:
+            emails_str = ""
+
         # Check if already exists for this customer and trade_type
         existing = db.query(QuotationBank).filter(
             QuotationBank.customer_id == customer_id,
@@ -22,8 +33,9 @@ class CRUDQuotation:
         ).first()
         
         if existing:
-            # Update emails if changed
-            existing.emails = obj_in.emails
+            # Update emails and contacts if changed
+            existing.emails = emails_str
+            existing.contacts = contacts_data
             db.commit()
             db.refresh(existing)
             return existing
@@ -31,7 +43,8 @@ class CRUDQuotation:
         db_obj = QuotationBank(
             customer_id=customer_id,
             bank_id=obj_in.bank_id,
-            emails=obj_in.emails,
+            emails=emails_str,
+            contacts=contacts_data,
             trade_type=obj_in.trade_type or "BOTH"
         )
         db.add(db_obj)
@@ -55,7 +68,12 @@ class CRUDQuotation:
         if trade_type:
             # If trade_type is specified, return banks matching the specific type OR "BOTH"
             query = query.filter(QuotationBank.trade_type.in_([trade_type, "BOTH"]))
-        return query.all()
+        banks = query.all()
+        for b in banks:
+            if not b.contacts:
+                emails_list = [e.strip() for e in (b.emails or "").split(",") if e.strip()]
+                b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+        return banks
 
     # --- Requests ---
     def create_request(self, db: Session, customer_id: int, user_id: int, requires_approval: bool, obj_in: QuotationRequestCreate, document_path: str = None):

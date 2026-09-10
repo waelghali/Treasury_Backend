@@ -1541,13 +1541,14 @@ def read_corporate_admin_audit_logs(
     skip: int = 0,
     limit: int = 1000,
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    user_email: Optional[str] = Query(None, description="Filter by user email"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., User, CustomerEntity)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
     lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)"),
     start_date: Optional[str] = Query(None, description="Filter logs on or after this date"),
     end_date: Optional[str] = Query(None, description="Filter logs on or before this date"),
-    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, user email, or IP"),
 ):
     """
     Retrieves a list of audit log entries for the authenticated Corporate Admin's customer.
@@ -1562,6 +1563,7 @@ def read_corporate_admin_audit_logs(
         skip=skip,
         limit=limit,
         user_id=user_id,
+        user_email=user_email,
         action_type=action_type,
         entity_type=entity_type,
         entity_id=entity_id,
@@ -1585,13 +1587,14 @@ def export_corporate_admin_audit_logs_to_csv(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(HasPermission("audit_log:view")),
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    user_email: Optional[str] = Query(None, description="Filter by user email"),
     action_type: Optional[str] = Query(None, description="Filter by type of action (e.g., CREATE, UPDATE)"),
     entity_type: Optional[str] = Query(None, description="Filter by type of entity (e.g., User, CustomerEntity)"),
     entity_id: Optional[int] = Query(None, description="Filter by ID of the entity"),
     lg_record_id: Optional[int] = Query(None, description="Filter by ID of the LG Record (if applicable)"),
     start_date: Optional[str] = Query(None, description="Filter logs on or after this date"),
     end_date: Optional[str] = Query(None, description="Filter logs on or before this date"),
-    search: Optional[str] = Query(None, description="Search term for action, entity, details, or IP"),
+    search: Optional[str] = Query(None, description="Search term for action, entity, details, user email, or IP"),
 ):
     """
     Exports a CSV file of audit log entries for the authenticated Corporate Admin's customer,
@@ -1606,6 +1609,7 @@ def export_corporate_admin_audit_logs_to_csv(
         skip=0,
         limit=10000,
         user_id=user_id,
+        user_email=user_email,
         action_type=action_type,
         entity_type=entity_type,
         entity_id=entity_id,
@@ -1930,11 +1934,16 @@ def approve_quotation(
 
     for assignment in assignments:
         bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
-        if bank_row and bank_row.emails:
-            bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-            link = f"{base_url}/public-quotation/{assignment.token}"
-            
-            subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {rfq.type} - {rfq.ref_no}"
+        if bank_row:
+            bank_emails = []
+            if bank_row.contacts and isinstance(bank_row.contacts, list):
+                bank_emails = [c.get("email", "").strip() for c in bank_row.contacts if c.get("email")]
+            if not bank_emails and bank_row.emails:
+                bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
+
+            if bank_emails:
+                link = f"{base_url}/public-quotation/{assignment.token}"
+                subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {rfq.type} - {rfq.ref_no}"
             body = f"""
             <html>
             <body style="font-family: sans-serif; color: #333;">

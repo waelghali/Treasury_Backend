@@ -12,6 +12,7 @@ class QuotationBank(BaseModel):
     bank_id = Column(Integer, ForeignKey("banks.id", ondelete="CASCADE"), nullable=False)
     trade_type = Column(String, default="BOTH", comment="'FX_SPOT', 'TBILL', or 'BOTH'")
     emails = Column(Text, nullable=False, comment="Comma-separated emails for this specific customer's counterparty list")
+    contacts = Column(JSONB, default=list, nullable=True, comment="Structured contacts list: [{'email': '...', 'name': '...', 'role': 'EXECUTION'|'VIEW_ONLY'}]")
 
     customer = relationship("Customer")
     bank = relationship("Bank")
@@ -69,12 +70,14 @@ class QuotationBankAssignment(BaseModel):
     quotation_bank = relationship("QuotationBank")
     offers = relationship("QuotationOffer", back_populates="assignment", cascade="all, delete-orphan")
     tbill_offers = relationship("QuotationTBillOffer", back_populates="assignment", cascade="all, delete-orphan")
+    otps = relationship("QuotationAccessOTP", back_populates="assignment", cascade="all, delete-orphan")
 
 class QuotationOffer(BaseModel):
     """FX Spot Offers from banks."""
     __tablename__ = "quotation_offers"
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False)
     price = Column(Float, nullable=False)
+    submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assignment = relationship("QuotationBankAssignment", back_populates="offers")
@@ -87,9 +90,25 @@ class QuotationTBillOffer(BaseModel):
     maturity_date = Column(String, nullable=False)
     discount_rate = Column(Float, nullable=False)
     max_amount = Column(Float, nullable=False)
+    submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assignment = relationship("QuotationBankAssignment", back_populates="tbill_offers")
+
+class QuotationAccessOTP(BaseModel):
+    """Stores OTPs and magic access tokens for bank desk authentication."""
+    __tablename__ = "quotation_access_otps"
+    id = Column(Integer, primary_key=True, index=True)
+    assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String, nullable=False, index=True)
+    role = Column(String, default="EXECUTION", comment="'EXECUTION' or 'VIEW_ONLY'")
+    otp_code = Column(String, nullable=False)
+    magic_token = Column(String, unique=True, index=True, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    is_used = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    assignment = relationship("QuotationBankAssignment", back_populates="otps")
 
 class QuotationAnalytics(BaseModel):
     """Stores definite factual computation facts for closed RFQs."""

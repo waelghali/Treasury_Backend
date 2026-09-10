@@ -211,38 +211,43 @@ def create_rfq(
             for assignment in assignments:
                 q_bank_id = assignment.get("quotation_bank_id")
                 bank_row = db.query(QuotationBank).filter(QuotationBank.id == q_bank_id).first() if q_bank_id else None
-                if bank_row and bank_row.emails:
-                    bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-                    link = f"{base_url}/public-quotation/{assignment['token']}"
-                    
-                    subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
-                    body = f"""
-                    <html>
-                    <body>
-                        <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
-                        <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
-                        <br/>
-                        <ul>
-                            <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                            <li><strong>Product:</strong> {rfq.type}</li>
-                        </ul>
-                        <p>To submit your quote, please click the secure link below. This link is unique to your institution and will expire automatically.</p>
-                        <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Submit Quote Now</a>
-                        <br/><br/>
-                        <p>Best Regards,</p>
-                        <p>Treasury Team</p>
-                    </body>
-                    </html>
-                    """
-                    background_tasks.add_task(
-                        send_email,
-                        db,
-                        bank_emails,
-                        subject,
-                        body,
-                        {}, 
-                        email_settings,
-                    )
+                if bank_row:
+                    bank_emails = []
+                    if bank_row.contacts and isinstance(bank_row.contacts, list):
+                        bank_emails = [c.get("email", "").strip() for c in bank_row.contacts if c.get("email")]
+                    if not bank_emails and bank_row.emails:
+                        bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
+
+                    if bank_emails:
+                        link = f"{base_url}/public-quotation/{assignment['token']}"
+                        subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
+                        body = f"""
+                        <html>
+                        <body>
+                            <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
+                            <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
+                            <br/>
+                            <ul>
+                                <li><strong>Reference:</strong> {rfq.ref_no}</li>
+                                <li><strong>Product:</strong> {rfq.type}</li>
+                            </ul>
+                            <p>To view full terms and submit your quote (or observe in View-Only mode), please click the secure link below. This link is unique to your institution and will expire automatically.</p>
+                            <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Access Quotation Portal</a>
+                            <br/><br/>
+                            <p>Best Regards,</p>
+                            <p>Treasury Team</p>
+                        </body>
+                        </html>
+                        """
+                        background_tasks.add_task(
+                            send_email,
+                            db,
+                            bank_emails,
+                            subject,
+                            body,
+                            {}, 
+                            email_settings,
+                        )
         else:
             # Notify Corporate Admins
             from app.models import User, UserRole
@@ -548,9 +553,11 @@ def get_rfq_results(
                 "bank_emails": q_bank.emails if q_bank else "",
                 "offers": bank_offers,
                 "best_score": best_offer['score'] if best_offer else None,
+                "submitted_by_email": best_offer.get('submitted_by_email') if best_offer else (bank_offers[0].get('submitted_by_email') if bank_offers else None),
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
-                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True
+                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else []
             })
 
         # Sort results: Lowest score wins (Lowest price for buy, Lowest DR for sell)
@@ -573,9 +580,11 @@ def get_rfq_results(
                     "price": None,
                     "finalPrice": None,
                     "submitted_at": None,
+                    "submitted_by_email": None,
                     "token": a.token,
                     "quotation_base": a.quotation_base or rfq.quotation_base,
-                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True
+                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else []
                 })
                 continue
             
@@ -603,9 +612,11 @@ def get_rfq_results(
                 "bank_fee_total": clamped_fee,
                 "fee_per_unit": fee_per_unit,
                 "submitted_at": offer_db.submitted_at,
+                "submitted_by_email": offer_db.submitted_by_email,
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
-                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True
+                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else []
             })
             
         # Filter nulls and sort by direction
@@ -714,10 +725,15 @@ async def send_rfq_results(
         if q_base == 'indicative':
             continue
 
-        if not bank_res.get('bank_emails'):
+        bank_emails = []
+        if bank_res.get('contacts') and isinstance(bank_res['contacts'], list):
+            bank_emails = [c.get('email', '').strip() for c in bank_res['contacts'] if c.get('email')]
+        if not bank_emails and bank_res.get('bank_emails'):
+            bank_emails = [e.strip() for e in bank_res['bank_emails'].split(',') if e.strip()]
+
+        if not bank_emails:
             continue
         
-        bank_emails = [e.strip() for e in bank_res['bank_emails'].split(',') if e.strip()]
         is_winner = (bank_res['bank_id'] == winner_bank_id)
         
         ref_no = rfq.ref_no
