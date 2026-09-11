@@ -7,7 +7,12 @@ from datetime import datetime
 class QuotationContactItem(BaseModel):
     email: str
     name: Optional[str] = None
-    role: str = "EXECUTION" # "EXECUTION" or "VIEW_ONLY"
+    role: str = "EXECUTION" # "EXECUTION", "VIEW_ONLY", or "APPROVER"
+
+class BankApprovalActionCreate(BaseModel):
+    action: str  # "APPROVE" or "DECLINE"
+    session_token: str
+    notes: Optional[str] = None
 
 class QuotationBankBase(BaseModel):
     bank_id: int
@@ -137,6 +142,10 @@ class QuotationResultItem(BaseModel):
     quotation_base: Optional[str] = None
     is_document_visible: Optional[bool] = True
     contacts: Optional[List[dict]] = None
+    approval_status: Optional[str] = None
+    approved_by_email: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    approval_notes: Optional[str] = None
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

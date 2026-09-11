@@ -202,7 +202,7 @@ def create_rfq(
             customer_id=current_user.customer_id
         )
         
-        # Trigger immediate email dispatch if not requiring approval
+        # Trigger immediate email dispatch if not requiring corporate-level approval
         if not requires_approval:
             email_settings = get_global_email_settings()
             from app.core.routing import get_frontend_base_url
@@ -211,20 +211,78 @@ def create_rfq(
             for assignment in assignments:
                 q_bank_id = assignment.get("quotation_bank_id")
                 bank_row = db.query(QuotationBank).filter(QuotationBank.id == q_bank_id).first() if q_bank_id else None
-                if bank_row:
-                    bank_emails = []
-                    if bank_row.contacts and isinstance(bank_row.contacts, list):
-                        bank_emails = [c.get("email", "").strip() for c in bank_row.contacts if c.get("email")]
-                    if not bank_emails and bank_row.emails:
-                        bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-
+                if not bank_row:
+                    continue
+                    
+                contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
+                if not contacts and bank_row.emails:
+                    contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
+                if not contacts:
+                    continue
+                
+                bank_name = bank_row.bank.name if bank_row.bank else 'Bank Partner'
+                link = f"{base_url}/public-quotation/{assignment['token']}"
+                
+                if assignment.get("approval_status") == "PENDING":
+                    # --- BANK APPROVAL FLOW (Execution RFQ + bank has APPROVER contacts) ---
+                    
+                    # Phase 1a: Email APPROVER contacts with action link
+                    approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
+                    if approver_emails:
+                        approver_subject = f"APPROVAL REQUIRED: RFQ {rfq.ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
+                        approver_body = f"""
+                        <html>
+                        <body>
+                            <p>Dear {bank_name} Authorized Approver,</p>
+                            <p>Your bank has been invited to participate in a new <strong>Execution</strong> Request for Quotation (RFQ).</p>
+                            <br/>
+                            <ul>
+                                <li><strong>Reference:</strong> {rfq.ref_no}</li>
+                                <li><strong>Product:</strong> {rfq.type}</li>
+                                <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
+                            </ul>
+                            <p>Please review the RFQ details and approve your bank's participation. Once approved, your execution desk will receive the secure link to submit their binding quote.</p>
+                            <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Review & Approve</a>
+                            <br/><br/>
+                            <p>Best Regards,</p>
+                            <p>Treasury Team</p>
+                        </body>
+                        </html>
+                        """
+                        background_tasks.add_task(send_email, db, approver_emails, approver_subject, approver_body, {}, email_settings)
+                    
+                    # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link)
+                    non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
+                    if non_approver_emails:
+                        headsup_subject = f"HEADS UP: New RFQ Pending Bank Approval - {rfq.ref_no}"
+                        headsup_body = f"""
+                        <html>
+                        <body>
+                            <p>Dear {bank_name} FX Desk,</p>
+                            <p>A new Request for Quotation (RFQ) has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
+                            <br/>
+                            <ul>
+                                <li><strong>Reference:</strong> {rfq.ref_no}</li>
+                                <li><strong>Product:</strong> {rfq.type}</li>
+                                <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
+                            </ul>
+                            <p>You will receive a follow-up notification with a secure access link once your bank's approver has authorized participation.</p>
+                            <br/>
+                            <p>Best Regards,</p>
+                            <p>Treasury Team</p>
+                        </body>
+                        </html>
+                        """
+                        background_tasks.add_task(send_email, db, non_approver_emails, headsup_subject, headsup_body, {}, email_settings)
+                else:
+                    # --- STANDARD FLOW (no approval needed) ---
+                    bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
                     if bank_emails:
-                        link = f"{base_url}/public-quotation/{assignment['token']}"
                         subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
                         body = f"""
                         <html>
                         <body>
-                            <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
+                            <p>Dear {bank_name} FX Desk,</p>
                             <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
                             <br/>
                             <ul>
@@ -239,15 +297,7 @@ def create_rfq(
                         </body>
                         </html>
                         """
-                        background_tasks.add_task(
-                            send_email,
-                            db,
-                            bank_emails,
-                            subject,
-                            body,
-                            {}, 
-                            email_settings,
-                        )
+                        background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
         else:
             # Notify Corporate Admins
             from app.models import User, UserRole
@@ -293,6 +343,15 @@ def get_rfq_history(
                 changed = True
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED' # Or 'STOPPED/EXPIRED' - User said "rejected or stopped"
+                changed = True
+            
+            # Auto-expire any bank-level approvals that were still PENDING when window closed
+            pending_assignments = db.query(QuotationBankAssignment).filter(
+                QuotationBankAssignment.rfq_id == r.id,
+                QuotationBankAssignment.approval_status == 'PENDING'
+            ).all()
+            for pa in pending_assignments:
+                pa.approval_status = 'EXPIRED'
                 changed = True
             
     if changed:
@@ -482,7 +541,11 @@ def get_rfq_results(
                     "bank_emails": q_bank.emails if q_bank else "",
                     "offers": [],
                     "best_score": None,
-                    "token": a.token
+                    "token": a.token,
+                    "approval_status": a.approval_status,
+                    "approved_by_email": a.approved_by_email,
+                    "approved_at": a.approved_at,
+                    "approval_notes": a.approval_notes
                 })
             return {"rfq": rfq, "results": results}
 
@@ -558,7 +621,11 @@ def get_rfq_results(
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
                 "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else []
+                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                "approval_status": a.approval_status,
+                "approved_by_email": a.approved_by_email,
+                "approved_at": a.approved_at,
+                "approval_notes": a.approval_notes
             })
 
         # Sort results: Lowest score wins (Lowest price for buy, Lowest DR for sell)
@@ -586,7 +653,11 @@ def get_rfq_results(
                     "token": a.token,
                     "quotation_base": a.quotation_base or rfq.quotation_base,
                     "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else []
+                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                    "approval_status": a.approval_status,
+                    "approved_by_email": a.approved_by_email,
+                    "approved_at": a.approved_at,
+                    "approval_notes": a.approval_notes
                 })
                 continue
             
@@ -619,7 +690,11 @@ def get_rfq_results(
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
                 "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else []
+                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                "approval_status": a.approval_status,
+                "approved_by_email": a.approved_by_email,
+                "approved_at": a.approved_at,
+                "approval_notes": a.approval_notes
             })
             
         # Filter nulls and sort by direction

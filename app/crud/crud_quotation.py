@@ -132,6 +132,13 @@ class CRUDQuotation:
                     if is_doc_vis is None:
                         is_doc_vis = True
                     
+                    # Determine if bank-level approval is required
+                    # Approval activates only for Execution RFQs when the bank has APPROVER contacts
+                    effective_base = (q_base_override or 'Execution').lower()
+                    contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
+                    has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
+                    bank_approval_status = 'PENDING' if (has_approver and effective_base == 'execution') else None
+                    
                     db_assignment = QuotationBankAssignment(
                         id=assignment_id,
                         rfq_id=rfq_id,
@@ -142,13 +149,15 @@ class CRUDQuotation:
                         cost_max=b_data.get('costMax', 0.0),
                         cost_flat=b_data.get('costFlat', 0.0),
                         quotation_base=q_base_override,
-                        is_document_visible=is_doc_vis
+                        is_document_visible=is_doc_vis,
+                        approval_status=bank_approval_status
                     )
                     db.add(db_assignment)
                     assignments.append({
                         "bankId": b_data.get('id'),
                         "quotation_bank_id": q_bank.id,
-                        "token": token
+                        "token": token,
+                        "approval_status": bank_approval_status
                     })
         except Exception as e:
             # Re-raise or handle JSON parsing failure

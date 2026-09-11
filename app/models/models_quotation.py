@@ -65,6 +65,12 @@ class QuotationBankAssignment(BaseModel):
     cost_flat = Column(Float, default=0.0)
     quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative' override per bank")
     is_document_visible = Column(Boolean, default=True, comment="Controls document attachment visibility for this bank")
+    
+    # Bank Approval Layer (optional, per-assignment)
+    approval_status = Column(String, default=None, nullable=True, comment="NULL=no approval needed, 'PENDING', 'APPROVED', 'DECLINED', 'EXPIRED'")
+    approved_by_email = Column(String, nullable=True, comment="Email of the approver who approved/declined")
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    approval_notes = Column(Text, nullable=True, comment="Optional notes from the approver")
 
     rfq = relationship("QuotationRequest", back_populates="assignments")
     quotation_bank = relationship("QuotationBank")
@@ -103,7 +109,7 @@ class QuotationAccessOTP(BaseModel):
     id = Column(Integer, primary_key=True, index=True)
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False, index=True)
     email = Column(String, nullable=False, index=True)
-    role = Column(String, default="EXECUTION", comment="'EXECUTION' or 'VIEW_ONLY'")
+    role = Column(String, default="EXECUTION", comment="'EXECUTION', 'VIEW_ONLY', or 'APPROVER'")
     otp_code = Column(String, nullable=False)
     magic_token = Column(String, unique=True, index=True, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)

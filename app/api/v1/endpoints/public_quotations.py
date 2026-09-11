@@ -9,10 +9,12 @@ import uuid
 from app.database import get_db
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
-    QuotationTBillOffer, QuotationBank, QuotationAccessOTP, QuotationAnalytics
+    QuotationTBillOffer, QuotationBank, QuotationAccessOTP, QuotationAnalytics,
+    QuotationNotification
 )
 from app.schemas.schemas_quotation import (
-    FXSpotOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate
+    FXSpotOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate,
+    BankApprovalActionCreate
 )
 from app.core.email_service import send_email, get_customer_email_settings, get_global_email_settings
 from app.core.routing import get_frontend_base_url
@@ -90,8 +92,11 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
                 "submitted_at": offer.submitted_at
             }]
 
+    effective_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
+
     parsed_docs = []
-    if (assignment.is_document_visible is not False) and rfq.document_path:
+    # Indicative RFQs never share documents, and document visibility flag is respected
+    if effective_base != 'indicative' and (assignment.is_document_visible is not False) and rfq.document_path:
         raw_docs = []
         try:
             import json
@@ -135,7 +140,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "window_start": rfq.window_start,
         "window_end": rfq.window_end,
         "quotation_base": assignment.quotation_base or rfq.quotation_base,
-        "document_path": rfq.document_path if (assignment.is_document_visible is not False) else None,
+        "document_path": rfq.document_path if (effective_base != 'indicative' and assignment.is_document_visible is not False) else None,
         "documents": parsed_docs,
         "status": rfq.status,
         "assignment_id": assignment.id,
@@ -143,7 +148,11 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "customer_name": customer_name,
         "serverTime": now.isoformat(),
         "isWindowOpen": is_open,
-        "offers": offers
+        "offers": offers,
+        "approval_status": assignment.approval_status,
+        "approved_by_email": assignment.approved_by_email,
+        "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else None,
+        "approval_notes": assignment.approval_notes
     }
 
 @router.post("/request-otp")
@@ -177,6 +186,24 @@ async def request_quotation_otp(
     role = matched_contact.get("role", "EXECUTION")
     contact_name = matched_contact.get("name") or target_email.split("@")[0]
 
+    # Non-approvers are blocked if bank-level approval has not been granted
+    if role in ("EXECUTION", "VIEW_ONLY"):
+        if assignment.approval_status == 'PENDING':
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="This quotation is awaiting internal bank approval from your authorized approver."
+            )
+        elif assignment.approval_status == 'EXPIRED':
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Quotation window closed before your bank approved participation."
+            )
+        elif assignment.approval_status == 'DECLINED':
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Your bank's approver declined participation in this quotation."
+            )
+
     # Generate 6-digit OTP & Magic Token
     otp_code = f"{secrets.randbelow(900000) + 100000}"
     magic_token = uuid.uuid4().hex
@@ -198,7 +225,13 @@ async def request_quotation_otp(
     base_url = get_frontend_base_url(request=request)
     magic_link = f"{base_url}/public-quotation/{req.token}?magic_token={magic_token}"
     customer_name = rfq.customer.name if rfq.customer else "Treasury Client"
-    role_badge = "⚡ Execution Trader" if role == "EXECUTION" else "👁️ View-Only Observer"
+    
+    if role == "APPROVER":
+        role_badge = "🛡️ Authorized Bank Approver"
+    elif role == "VIEW_ONLY":
+        role_badge = "👁️ View-Only Observer"
+    else:
+        role_badge = "⚡ Execution Trader"
     
     subject = f"🔐 Access Code {otp_code} for RFQ {rfq.ref_no} - {q_bank.bank.name if q_bank.bank else 'Treasury Portal'}"
     body = f"""
@@ -299,6 +332,15 @@ def verify_quotation_otp(
     if not otp_record:
         raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
 
+    # Non-approvers cannot authenticate while approval is still pending, expired, or declined
+    if otp_record.role in ("EXECUTION", "VIEW_ONLY"):
+        if assignment.approval_status == 'PENDING':
+            raise HTTPException(status_code=403, detail="This quotation is awaiting internal bank approval from your authorized approver.")
+        elif assignment.approval_status == 'EXPIRED':
+            raise HTTPException(status_code=403, detail="Quotation window closed before your bank approved participation.")
+        elif assignment.approval_status == 'DECLINED':
+            raise HTTPException(status_code=403, detail="Your bank's approver declined participation in this quotation.")
+
     otp_record.is_used = True
     db.commit()
 
@@ -328,6 +370,12 @@ def submit_fx_offer(
     if rfq.status == 'PENDING_APPROVAL':
         raise HTTPException(status_code=403, detail="Quotation is not yet approved.")
     
+    # Verify quotation approval status
+    if assignment.approval_status == 'PENDING':
+        raise HTTPException(status_code=403, detail="Quotation is pending approval from your bank's authorized approver.")
+    if assignment.approval_status in ('DECLINED', 'EXPIRED'):
+        raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
+
     # 5 seconds buffer check
     now = datetime.now(timezone.utc)
     try:
@@ -346,8 +394,8 @@ def submit_fx_offer(
             QuotationAccessOTP.magic_token == offer_in.session_token
         ).first()
         if otp_rec:
-            if otp_rec.role == "VIEW_ONLY":
-                raise HTTPException(status_code=403, detail="View-Only contacts are not authorized to submit bids.")
+            if otp_rec.role in ("VIEW_ONLY", "APPROVER"):
+                raise HTTPException(status_code=403, detail="Only Execution contacts are authorized to submit bids.")
             submitted_by = otp_rec.email
 
     offer = QuotationOffer(
@@ -387,6 +435,12 @@ def submit_tbill_offer(
     if rfq.status == 'PENDING_APPROVAL':
         raise HTTPException(status_code=403, detail="Quotation is not yet approved.")
     
+    # Verify quotation approval status
+    if assignment.approval_status == 'PENDING':
+        raise HTTPException(status_code=403, detail="Quotation is pending approval from your bank's authorized approver.")
+    if assignment.approval_status in ('DECLINED', 'EXPIRED'):
+        raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
+
     # Window check logic
     now = datetime.now(timezone.utc)
     try:
@@ -405,8 +459,8 @@ def submit_tbill_offer(
             QuotationAccessOTP.magic_token == offer_in.session_token
         ).first()
         if otp_rec:
-            if otp_rec.role == "VIEW_ONLY":
-                raise HTTPException(status_code=403, detail="View-Only contacts are not authorized to submit bids.")
+            if otp_rec.role in ("VIEW_ONLY", "APPROVER"):
+                raise HTTPException(status_code=403, detail="Only Execution contacts are authorized to submit bids.")
             submitted_by = otp_rec.email
 
     # Delete existing lines for this exact assignment entirely before repopulating
@@ -440,6 +494,162 @@ def submit_tbill_offer(
     db.commit()
 
     return {"success": True, "submitted_by": submitted_by}
+
+@router.post("/{token}/approve")
+async def approve_rfq_for_bank(
+    token: str,
+    action_in: BankApprovalActionCreate,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Approver authorizes or declines bank participation for this RFQ."""
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+
+    # Authenticate session & verify role
+    otp_rec = db.query(QuotationAccessOTP).filter(
+        QuotationAccessOTP.assignment_id == assignment.id,
+        QuotationAccessOTP.magic_token == action_in.session_token
+    ).first()
+    if not otp_rec:
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please log in again.")
+    if otp_rec.role != "APPROVER":
+        raise HTTPException(status_code=403, detail="Only authorized Bank Approvers can approve or decline participation.")
+
+    now = datetime.now(timezone.utc)
+    window_end = rfq.window_end
+    if window_end and window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
+
+    # Check if window already ended
+    if window_end and now > window_end:
+        if assignment.approval_status == 'PENDING':
+            assignment.approval_status = 'EXPIRED'
+            db.commit()
+        raise HTTPException(
+            status_code=403, 
+            detail="The quotation window has closed. Your bank has been excluded due to late response."
+        )
+
+    if assignment.approval_status == 'EXPIRED':
+        raise HTTPException(
+            status_code=403, 
+            detail="The quotation window has closed. Your bank has been excluded due to late response."
+        )
+
+    if assignment.approval_status in ('APPROVED', 'DECLINED'):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Quotation participation has already been {assignment.approval_status.lower()} by {assignment.approved_by_email or 'another approver'}."
+        )
+
+    action = action_in.action.strip().upper()
+    if action not in ("APPROVE", "DECLINE"):
+        raise HTTPException(status_code=400, detail="Action must be either APPROVE or DECLINE.")
+
+    approver_email = otp_rec.email
+    assignment.approved_by_email = approver_email
+    assignment.approved_at = now
+    assignment.approval_notes = action_in.notes
+
+    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Bank Partner"
+    customer_name = rfq.customer.name if rfq and rfq.customer else "Treasury Client"
+    base_url = get_frontend_base_url(request=request)
+    email_settings, source = get_customer_email_settings(db, rfq.customer_id)
+
+    contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+    non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
+
+    if action == "APPROVE":
+        assignment.approval_status = "APPROVED"
+        
+        # Phase 2: Email EXECUTION + VIEW_ONLY contacts WITH active link
+        if non_approver_emails:
+            link = f"{base_url}/public-quotation/{assignment.token}"
+            subject = f"ACTION REQUIRED: RFQ {rfq.ref_no} Approved - Submit Your Quote"
+            amount_str = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
+            body = f"""
+            <html>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
+                <p>Dear {bank_name} FX Desk,</p>
+                <p>Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>approved participation</strong> in Request for Quotation (RFQ) <strong>{rfq.ref_no}</strong> for <strong>{customer_name}</strong>.</p>
+                <br/>
+                <ul>
+                    <li><strong>Reference:</strong> {rfq.ref_no}</li>
+                    <li><strong>Product:</strong> {rfq.type}</li>
+                    <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
+                    <li><strong>Amount:</strong> {amount_str}</li>
+                </ul>
+                <p>You can now access the live RFQ portal and submit your quote:</p>
+                <p><a href="{link}" style="display: inline-block; background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: 600;">⚡ Access RFQ & Submit Quote</a></p>
+                <br/>
+                <p>Best Regards,</p>
+                <p>Treasury Team</p>
+            </body>
+            </html>
+            """
+            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+
+        # Notify Corporate Admin / Creator
+        db.add(QuotationNotification(
+            user_id=rfq.created_by_user_id,
+            type="BANK_APPROVED",
+            title=f"Bank Approved: {bank_name}",
+            message=f"{bank_name} approver ({approver_email}) approved participation for {rfq.ref_no}.",
+            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+            is_read=False
+        ))
+
+    else:
+        # DECLINE
+        assignment.approval_status = "DECLINED"
+        
+        # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
+        if non_approver_emails:
+            subject = f"RFQ {rfq.ref_no} - Bank Participation Declined"
+            notes_html = f"<p><strong>Reason / Notes:</strong> {action_in.notes}</p>" if action_in.notes else ""
+            body = f"""
+            <html>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
+                <p>Dear {bank_name} FX Desk,</p>
+                <p>Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>declined participation</strong> for RFQ <strong>{rfq.ref_no}</strong>.</p>
+                {notes_html}
+                <p>No further action is required from your desk.</p>
+                <br/>
+                <p>Best Regards,</p>
+                <p>Treasury Team</p>
+            </body>
+            </html>
+            """
+            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+
+        # Notify Corporate Admin / Creator
+        db.add(QuotationNotification(
+            user_id=rfq.created_by_user_id,
+            type="BANK_DECLINED",
+            title=f"Bank Declined: {bank_name}",
+            message=f"{bank_name} approver ({approver_email}) declined participation for {rfq.ref_no}." + (f" Notes: {action_in.notes}" if action_in.notes else ""),
+            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+            is_read=False
+        ))
+
+    db.commit()
+
+    return {
+        "success": True,
+        "approval_status": assignment.approval_status,
+        "approved_by_email": approver_email,
+        "approved_at": assignment.approved_at.isoformat(),
+        "notes": action_in.notes
+    }
 
 @router.get("/{token}/history")
 def get_bank_quotation_history(
