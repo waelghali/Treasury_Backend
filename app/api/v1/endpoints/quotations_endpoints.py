@@ -19,10 +19,11 @@ from app.services.unified_email_builder import build_transaction_email_html, bui
 from app.schemas.schemas_quotation import (
     QuotationBankCreate, QuotationBankOut,
     QuotationRequestCreate, QuotationRequestOut,
-    QuotationResultsOut, QuotationResultItem
+    QuotationResultsOut, QuotationResultItem,
+    ReTenderRequest, QuotationResubmitRequest
 )
 from app.crud.crud_quotation import crud_quotation
-from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationOffer, QuotationTBillOffer, QuotationBank
+from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationOffer, QuotationTBillOffer, QuotationBank, QuotationAnalytics
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -452,7 +453,7 @@ def get_rfq_history(
                 r.status = 'COMPLETED'
                 changed = True
             elif r.status == 'PENDING_APPROVAL':
-                r.status = 'REJECTED' # Or 'STOPPED/EXPIRED' - User said "rejected or stopped"
+                r.status = 'REJECTED'
                 changed = True
             
             # Auto-expire any bank-level approvals that were still PENDING when window closed
@@ -463,11 +464,242 @@ def get_rfq_history(
             for pa in pending_assignments:
                 pa.approval_status = 'EXPIRED'
                 changed = True
+        
+        # Attach winner and analytics data if available
+        analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == r.id).first()
+        if analytics:
+            if analytics.winner_bank and analytics.winner_bank.bank:
+                r.winner_bank_name = analytics.winner_bank.bank.name
+            r.winner_rate = analytics.winner_price
+            r.saved_vs_avg = analytics.avg_price_spread
+            
+        if r.parent_rfq_id:
+            parent = db.query(QuotationRequest).filter(QuotationRequest.id == r.parent_rfq_id).first()
+            if parent:
+                r.parent_rfq_ref = parent.ref_no
+                
+        r.re_tender_count = db.query(QuotationRequest).filter(QuotationRequest.parent_rfq_id == r.id).count()
             
     if changed:
         db.commit()
         
     return reqs
+
+@router.post("/{rfq_id}/re-tender")
+def retender_quotation(
+    rfq_id: str,
+    payload: ReTenderRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user),
+    request: Request = None
+):
+    """Clones an existing quotation (e.g. Inconclusive, Expired, or Completed) into a clean, audited re-tender."""
+    parent = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    # Calculate re-tender suffix
+    existing_count = db.query(QuotationRequest).filter(QuotationRequest.parent_rfq_id == parent.id).count()
+    base_ref = parent.ref_no.split("-R")[0]
+    new_ref_no = f"{base_ref}-R{existing_count + 1}"
+
+    # Determine window times
+    now = datetime.now(timezone.utc)
+    w_start = payload.window_start if payload.window_start else now
+    w_end = payload.window_end
+
+    if w_end <= w_start:
+        raise HTTPException(status_code=400, detail="Window close time must be after the opening time.")
+
+    # Check customer approval policy
+    from app.crud.crud_config import crud_customer_configuration
+    from app.constants import GlobalConfigKey
+    config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, customer_id=current_user.customer_id, config_key=GlobalConfigKey.QUOTATION_APPROVAL_REQUIRED
+    )
+    requires_approval = False
+    if config and config.get("effective_value"):
+        requires_approval = str(config.get("effective_value")).lower() == 'true'
+
+    initial_status = "PENDING_APPROVAL" if requires_approval else "PENDING"
+
+    new_id = str(uuid.uuid4())
+    new_rfq = QuotationRequest(
+        id=new_id,
+        ref_no=new_ref_no,
+        customer_id=parent.customer_id,
+        created_by_user_id=current_user.user_id,
+        type=parent.type,
+        direction=parent.direction,
+        value_date=parent.value_date,
+        amount=payload.amount if payload.amount is not None else parent.amount,
+        min_ticket_amount=parent.min_ticket_amount,
+        buy_currency=parent.buy_currency,
+        sell_currency=parent.sell_currency,
+        settlement_date_start=parent.settlement_date_start,
+        settlement_date_end=parent.settlement_date_end,
+        maturity_date_start=parent.maturity_date_start,
+        maturity_date_end=parent.maturity_date_end,
+        eval_rate=parent.eval_rate,
+        window_start=w_start,
+        window_end=w_end,
+        quotation_base=parent.quotation_base,
+        max_tolerance_percent=parent.max_tolerance_percent,
+        document_path=parent.document_path,
+        status=initial_status,
+        token_validity_hours=payload.token_validity_hours or parent.token_validity_hours or 24,
+        parent_rfq_id=parent.id
+    )
+    db.add(new_rfq)
+    db.flush()
+
+    # Replicate Bank Assignments
+    parent_assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == parent.id).all()
+    assigned_records = []
+    
+    for pa in parent_assignments:
+        if payload.selected_bank_ids is not None and pa.quotation_bank.bank_id not in payload.selected_bank_ids:
+            continue
+        
+        token = str(uuid.uuid4())
+        bank_row = pa.quotation_bank
+        bank_contacts = bank_row.contacts if (bank_row and isinstance(bank_row.contacts, list)) else []
+        has_approvers = any(c.get("role") == "APPROVER" for c in bank_contacts)
+        assignment_approval_status = "PENDING" if (has_approvers and parent.quotation_base == "Execution") else None
+
+        new_assignment = QuotationBankAssignment(
+            id=str(uuid.uuid4()),
+            rfq_id=new_rfq.id,
+            quotation_bank_id=pa.quotation_bank_id,
+            token=token,
+            cost_min=pa.cost_min,
+            cost_percent=pa.cost_percent,
+            cost_max=pa.cost_max,
+            cost_flat=pa.cost_flat,
+            quotation_base=pa.quotation_base,
+            is_document_visible=pa.is_document_visible,
+            approval_status=assignment_approval_status
+        )
+        db.add(new_assignment)
+        assigned_records.append({"assignment": new_assignment, "bank_row": bank_row, "token": token})
+
+    db.commit()
+
+    # If no internal approval required, dispatch bank notification emails
+    if not requires_approval:
+        email_settings = get_global_email_settings()
+        from app.core.routing import get_frontend_base_url
+        base_url = get_frontend_base_url(request=request)
+        customer_branding = new_rfq.customer.name if new_rfq.customer else "Treasury Customer"
+
+        for item in assigned_records:
+            bank_row = item["bank_row"]
+            if not bank_row: continue
+            contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
+            if not contacts and bank_row.emails:
+                contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
+            
+            bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
+            if bank_emails:
+                link = f"{base_url}/public-quotation/{item['token']}"
+                subject = f"ACTION REQUIRED: Re-Tender RFQ Request from {customer_branding} - {new_rfq.type} - {new_rfq.ref_no}"
+                body = f"""
+                <html>
+                <body>
+                    <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
+                    <p>You have received a new re-tendered Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>.</p>
+                    <ul>
+                        <li><strong>Reference:</strong> {new_rfq.ref_no} (Re-tender of {parent.ref_no})</li>
+                        <li><strong>Product:</strong> {new_rfq.type}</li>
+                        <li><strong>Amount:</strong> {new_rfq.amount} {new_rfq.buy_currency or ''}</li>
+                    </ul>
+                    <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block;">Access Quotation Portal</a>
+                </body>
+                </html>
+                """
+                background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
+    else:
+        # Notify Corporate Admins
+        from app.models import User, UserRole
+        from app.models.models_quotation import QuotationNotification
+        admins = db.query(User).filter(
+            User.customer_id == current_user.customer_id,
+            User.role == UserRole.CORPORATE_ADMIN
+        ).all()
+        for admin in admins:
+            db.add(QuotationNotification(
+                user_id=admin.id,
+                type="RFQ_PENDING_APPROVAL",
+                title=f"Action Required: Re-Tender RFQ {new_rfq.ref_no} Pending Approval",
+                message=f"Re-tender {new_rfq.ref_no} (of {parent.ref_no}) has been created and requires your approval.",
+                link=f"/corporate-admin/quotations/history?rfq_id={new_rfq.id}",
+                is_read=False
+            ))
+        db.commit()
+
+    return {
+        "message": "Quotation re-tendered successfully.",
+        "rfq_id": new_rfq.id,
+        "ref_no": new_rfq.ref_no,
+        "parent_ref_no": parent.ref_no,
+        "status": new_rfq.status
+    }
+
+@router.post("/{rfq_id}/resubmit")
+def resubmit_quotation(
+    rfq_id: str,
+    payload: QuotationResubmitRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Allows the maker to update an RFQ that was returned with status NEEDS_REVISION and resubmit for approval."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'NEEDS_REVISION':
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be resubmitted.")
+
+    if payload.amount is not None:
+        rfq.amount = payload.amount
+    if payload.window_start is not None:
+        rfq.window_start = payload.window_start
+    if payload.window_end is not None:
+        rfq.window_end = payload.window_end
+    if payload.quotation_base is not None:
+        rfq.quotation_base = payload.quotation_base
+    if payload.max_tolerance_percent is not None:
+        rfq.max_tolerance_percent = payload.max_tolerance_percent
+
+    rfq.status = 'PENDING_APPROVAL'
+    db.commit()
+
+    # Notify Corporate Admins
+    from app.models import User, UserRole
+    from app.models.models_quotation import QuotationNotification
+    admins = db.query(User).filter(
+        User.customer_id == current_user.customer_id,
+        User.role == UserRole.CORPORATE_ADMIN
+    ).all()
+    for admin in admins:
+        db.add(QuotationNotification(
+            user_id=admin.id,
+            type="RFQ_RESUBMITTED",
+            title=f"Revised RFQ {rfq.ref_no} Resubmitted for Approval",
+            message=f"Maker has addressed your notes and resubmitted RFQ {rfq.ref_no}.",
+            link=f"/corporate-admin/quotations/history?rfq_id={rfq.id}",
+            is_read=False
+        ))
+    db.commit()
+
+    return {"message": "Quotation revised and resubmitted for approval.", "rfq_id": rfq.id, "status": rfq.status}
 
 @router.get("/stats")
 def get_quotation_stats(

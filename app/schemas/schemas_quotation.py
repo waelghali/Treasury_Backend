@@ -91,9 +91,32 @@ class QuotationRequestOut(BaseModel):
     quotation_base: Optional[str] = None
     max_tolerance_percent: Optional[float] = None
     document_path: Optional[str] = None
+    parent_rfq_id: Optional[str] = None
+    parent_rfq_ref: Optional[str] = None
+    admin_revision_notes: Optional[str] = None
+    admin_reviewed_at: Optional[datetime] = None
+    winner_bank_name: Optional[str] = None
+    winner_rate: Optional[float] = None
+    saved_vs_avg: Optional[float] = None
+    re_tender_count: Optional[int] = 0
 
     class Config:
         from_attributes = True
+
+class ReTenderRequest(BaseModel):
+    window_start: Optional[datetime] = None
+    window_end: datetime
+    amount: Optional[float] = None
+    selected_bank_ids: Optional[List[int]] = None
+    token_validity_hours: Optional[int] = 24
+
+class QuotationResubmitRequest(BaseModel):
+    amount: Optional[float] = None
+    window_start: Optional[datetime] = None
+    window_end: Optional[datetime] = None
+    selected_bank_ids: Optional[List[int]] = None
+    quotation_base: Optional[str] = None
+    max_tolerance_percent: Optional[float] = None
 
 # --- Bank Offers & OTP Schemas (Public) ---
 class OTPRequestCreate(BaseModel):

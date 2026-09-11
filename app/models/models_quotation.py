@@ -44,12 +44,16 @@ class QuotationRequest(BaseModel):
     quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative'")
     max_tolerance_percent = Column(Float, nullable=True, comment="Max allowed % deviation for Execution rates vs Indicative benchmark")
     document_path = Column(Text, nullable=True)
-    status = Column(String, default="PENDING", comment="'PENDING_APPROVAL', 'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'REJECTED'")
+    status = Column(String, default="PENDING", comment="'PENDING_APPROVAL', 'NEEDS_REVISION', 'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'REJECTED'")
     token_validity_hours = Column(Integer, default=24, comment="Hours the bank link remains valid after window_end")
+    parent_rfq_id = Column(String, ForeignKey("quotation_rfqs.id", ondelete="SET NULL"), nullable=True, index=True, comment="Original RFQ if this is a re-tender")
+    admin_revision_notes = Column(Text, nullable=True, comment="Notes from Corporate Admin when returned for revision")
+    admin_reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
     customer = relationship("Customer")
     creator = relationship("User")
     assignments = relationship("QuotationBankAssignment", back_populates="rfq", cascade="all, delete-orphan")
+    parent_rfq = relationship("QuotationRequest", remote_side=[id], backref="re_tenders")
 
 class QuotationBankAssignment(BaseModel):
     """Junction table connecting an RFQ strictly to a QuotationBank."""

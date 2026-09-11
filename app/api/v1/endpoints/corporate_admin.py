@@ -2033,6 +2033,51 @@ def reject_quotation(
     
     return {"message": "Quotation rejected.", "rfq_id": rfq.id}
 
+class QuotationRevisionRequest(BaseModel):
+    revision_notes: str
+
+@router.post("/quotations/{rfq_id}/request-revision")
+def request_quotation_revision(
+    rfq_id: str,
+    payload: QuotationRevisionRequest,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Returns a quotation to the maker for revision with administrator notes."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'PENDING_APPROVAL':
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be returned for revision.")
+
+    notes = payload.revision_notes.strip() if payload.revision_notes else ""
+    if not notes:
+        raise HTTPException(status_code=400, detail="Please provide revision instructions for the maker.")
+
+    rfq.status = 'NEEDS_REVISION'
+    rfq.admin_revision_notes = notes
+    rfq.admin_reviewed_at = func.now()
+    db.commit()
+
+    # Notify End User Maker
+    from app.models.models_quotation import QuotationNotification
+    db.add(QuotationNotification(
+        user_id=rfq.created_by_user_id,
+        type="RFQ_NEEDS_REVISION",
+        title=f"Action Required: RFQ {rfq.ref_no} Returned for Revision",
+        message=f"Administrator feedback: {notes}",
+        link=f"/end-user/quotations/dashboard?edit_rfq_id={rfq.id}",
+        is_read=False
+    ))
+    db.commit()
+
+    return {"message": "Quotation returned to maker for revision.", "rfq_id": rfq.id, "status": "NEEDS_REVISION"}
+
 class QuotationApprovalRequest(BaseModel):
     status: str
 
