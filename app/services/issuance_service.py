@@ -1105,6 +1105,15 @@ class IssuanceService:
             f"total facilities to evaluate={len(facilities)}"
         )
 
+        # Phase 3: Facility Limit "What-If" Pipeline Advisor
+        # Load in-flight pipeline requests for this customer to determine net committed capacity
+        from app.models.models_issuance import IssuanceRequest
+        pipeline_requests = db.query(IssuanceRequest).filter(
+            IssuanceRequest.customer_id == request.customer_id,
+            IssuanceRequest.id != request.id,
+            IssuanceRequest.status.in_(['SUBMITTED', 'PENDING_APPROVAL', 'APPROVED_INTERNAL', 'FACILITY_RESERVED'])
+        ).all()
+
         for fac in facilities:
             fac_label = f"Fac[{fac.id}] '{fac.facility_name}'"
 
@@ -1262,6 +1271,29 @@ class IssuanceService:
                     if sla_info.get("slippage_risk"):
                         tags.append("SLA_SLIPPAGE_RISK")
 
+                    # Phase 3: Facility Limit "What-If" Pipeline Advisor
+                    sub_pipeline_amount = Decimal(0)
+                    sub_pipeline_count = 0
+                    for pr in pipeline_requests:
+                        if getattr(pr, 'selected_sub_limit_id', None) == sub.id:
+                            sub_pipeline_amount += Decimal(str(pr.amount or 0))
+                            sub_pipeline_count += 1
+                        elif not getattr(pr, 'selected_sub_limit_id', None) and getattr(pr, 'selected_bank_id', None) == fac.bank_id:
+                            sub_pipeline_amount += Decimal(str(pr.amount or 0))
+                            sub_pipeline_count += 1
+
+                    avail_dec = Decimal(str(round(max(0.0, available), 2)))
+                    req_amt_dec = Decimal(str(request.amount or 0))
+                    real_net_headroom = max(Decimal(0), avail_dec - sub_pipeline_amount)
+                    post_issuance_headroom = real_net_headroom - req_amt_dec
+
+                    if post_issuance_headroom < Decimal(0):
+                        headroom_status = "OVERCOMMIT_WARNING"
+                    elif post_issuance_headroom < (req_amt_dec * Decimal("0.25")):
+                        headroom_status = "TIGHT"
+                    else:
+                        headroom_status = "SAFE"
+
                     # 5. Compute multi-factor score (0-100, higher is better)
                     # C3: Weights (w_cost, w_margin, w_sla, w_capacity, w_currency) pre-loaded from GlobalConfig
                     
@@ -1345,7 +1377,14 @@ class IssuanceService:
                         effective_sla_days=sla_info.get("effective_sla_days"),
                         sla_commitment_pct=sla_info.get("sla_commitment_pct"),
                         sla_source=sla_info.get("source"),
-                        sla_drift_days=sla_info.get("drift_days")
+                        sla_drift_days=sla_info.get("drift_days"),
+
+                        # Phase 3: Facility Limit "What-If" Pipeline Advisor
+                        pipeline_in_flight_amount=sub_pipeline_amount,
+                        pipeline_in_flight_count=sub_pipeline_count,
+                        real_net_headroom=real_net_headroom,
+                        post_issuance_headroom=post_issuance_headroom,
+                        headroom_status=headroom_status
                     ))
                 except Exception as e:
                     import logging

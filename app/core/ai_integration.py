@@ -1228,10 +1228,15 @@ async def analyze_supporting_document(
 1. A {doc_type.replace('_', ' ').title()} document (OCR-extracted text)
 2. Data entered by a user for a Letter of Guarantee (LG) issuance request
 
-Your task: Compare each user-entered field against the document. For each field, return one of three verdicts:
+Your task:
+A. Compare each user-entered field against the document. For each field, return one of three verdicts:
 - **MATCH**: The document clearly confirms this value (exact or semantically equivalent)
 - **MISMATCH**: The document contains a DIFFERENT value for this field
 - **COULD_NOT_VALIDATE**: The field is not mentioned in the document, or the document is too ambiguous to verify
+
+B. AI Contract Clause & Expiry Harvester:
+Search the document for any tender validity period, completion timeline, or guarantee duration clauses (e.g., "Clause 4.2", "Validity of the tender shall be 90 days from the submission deadline", "Guarantee shall remain valid until 30 days after contract completion").
+Extract the exact citation and compute/propose the expiry date in YYYY-MM-DD format if determinable.
 
 **CRITICAL RULES:**
 - `contract_value` is the CONTRACT/PO total value. The `lg_value` is the LG amount, which is often a PERCENTAGE of the contract value (e.g., 5-20%). These are DIFFERENT fields. Do NOT flag a mismatch just because lg_value != contract_value.
@@ -1259,6 +1264,11 @@ Return a JSON object with exactly these fields:
   - "document_value": what you found in the document (as string), or null if not found
   - "verdict": one of "MATCH", "MISMATCH", "COULD_NOT_VALIDATE"
   - "note": brief explanation (e.g., "Contract mentions EGP 3,000,000 which matches", or "Beneficiary not found in document")
+- "clause_harvest": object or null:
+  - "clause_citation": exact excerpt or clause reference mentioning validity/expiry (e.g. "Clause 4.2: Tender validity shall be 90 days after tender submission date")
+  - "recommended_expiry_date": suggested expiry in YYYY-MM-DD format if calculable, else null
+  - "clause_title": short title (e.g. "Tender Validity Clause" or "Contract Expiry Milestone")
+  - "calculation_basis": brief explanation (e.g. "90 days from deadline of Oct 31, 2026")
 - "summary": 1-2 sentence summary of the document
 """
 
@@ -1306,6 +1316,7 @@ Return a JSON object with exactly these fields:
             "message": None,
             "doc_type": doc_type.upper(),
             "summary": result.get("summary"),
+            "clause_harvest": result.get("clause_harvest"),
             "comparison": comparison,
             "mismatches": mismatches,
             "total_fields_compared": len(comparison),

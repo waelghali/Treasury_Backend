@@ -516,6 +516,13 @@ class SuitableFacilityOut(BaseModel):
     sla_source: Optional[str] = None
     sla_drift_days: Optional[float] = None
 
+    # Phase 3: Facility Limit "What-If" Pipeline Advisor
+    pipeline_in_flight_amount: Optional[Decimal] = Decimal(0)
+    pipeline_in_flight_count: Optional[int] = 0
+    real_net_headroom: Optional[Decimal] = None
+    post_issuance_headroom: Optional[Decimal] = None
+    headroom_status: Optional[str] = "SAFE"
+
 # ==============================================================================
 # 4. RECONCILIATION & WORKFLOW (EXISTING)
 # ==============================================================================

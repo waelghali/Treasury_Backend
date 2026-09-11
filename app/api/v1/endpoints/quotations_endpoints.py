@@ -887,6 +887,88 @@ def get_rfq_results(
                     # Scenario A: All Execution or no Indicative quotes submitted
                     winner_bank_id = best_exec_item['bank_id']
 
+    # --- 1. Live Trading Floor Presence Telemetry ---
+    from app.models.models_quotation import QuotationAccessOTP
+    total_invited = len(assignments)
+    desks_active = 0
+    quotes_locked = 0
+    approvals_pending = 0
+    approvals_cleared = 0
+
+    for a in assignments:
+        if a.approval_status == 'PENDING':
+            approvals_pending += 1
+        elif a.approval_status == 'APPROVED':
+            approvals_cleared += 1
+
+        otp_exists = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == a.id).first()
+        if otp_exists:
+            desks_active += 1
+
+        if rfq.type == 'TBILL':
+            has_q = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).first()
+        else:
+            has_q = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).first()
+        if has_q:
+            quotes_locked += 1
+
+    live_telemetry = {
+        "total_invited": total_invited,
+        "desks_active": desks_active,
+        "quotes_locked": quotes_locked,
+        "approvals_pending": approvals_pending,
+        "approvals_cleared": approvals_cleared,
+        "summary_text": f"{desks_active} of {total_invited} Desks Active • {quotes_locked} Quote{'s' if quotes_locked != 1 else ''} Locked In"
+    }
+
+    # --- 2. Best Execution & Monetary Savings Summary ---
+    savings_summary = None
+    if winner_bank_id and not is_inconclusive:
+        winner_res = next((r for r in results if r['bank_id'] == winner_bank_id), None)
+        if winner_res:
+            if rfq.type == 'FX_SPOT' and valid_results:
+                rates = [r['finalPrice'] for r in valid_results if r.get('finalPrice') is not None]
+                if len(rates) >= 1:
+                    win_rate = winner_res.get('finalPrice') or rates[0]
+                    avg_rate = sum(rates) / len(rates)
+                    worst_rate = max(rates) if not is_sell else min(rates)
+                    amount = float(rfq.amount or 1.0)
+                    
+                    if not is_sell:
+                        # Buy: lower price is better
+                        saved_vs_avg = max(0.0, (avg_rate - win_rate) * amount)
+                        saved_vs_worst = max(0.0, (worst_rate - win_rate) * amount)
+                    else:
+                        # Sell: higher price is better
+                        saved_vs_avg = max(0.0, (win_rate - avg_rate) * amount)
+                        saved_vs_worst = max(0.0, (win_rate - worst_rate) * amount)
+
+                    savings_summary = {
+                        "winner_bank_name": winner_res.get('bank_name'),
+                        "winner_rate": round(win_rate, 4),
+                        "avg_rate": round(avg_rate, 4),
+                        "worst_rate": round(worst_rate, 4),
+                        "currency": rfq.sell_currency,
+                        "saved_vs_avg": round(saved_vs_avg, 2),
+                        "saved_vs_worst": round(saved_vs_worst, 2),
+                        "total_quotes": len(rates)
+                    }
+            elif rfq.type == 'TBILL' and valid_results:
+                scores = [r['best_score'] for r in valid_results if r.get('best_score') is not None]
+                if len(scores) >= 1:
+                    win_score = winner_res.get('best_score') or scores[0]
+                    avg_score = sum(scores) / len(scores)
+                    savings_summary = {
+                        "winner_bank_name": winner_res.get('bank_name'),
+                        "winner_rate": round(win_score, 4),
+                        "avg_rate": round(avg_score, 4),
+                        "worst_rate": round(max(scores) if is_buy else min(scores), 4),
+                        "currency": "EGP",
+                        "saved_vs_avg": round(abs(avg_score - win_score) * 1000, 2),
+                        "saved_vs_worst": round(abs(max(scores) - min(scores)) * 1000, 2),
+                        "total_quotes": len(scores)
+                    }
+
     return {
         "rfq": rfq,
         "results": results,
@@ -896,7 +978,9 @@ def get_rfq_results(
         "best_indicative_rate": best_indicative_rate,
         "best_execution_rate": best_execution_rate,
         "deviation_percent": deviation_percent,
-        "has_execution_banks": has_execution_banks
+        "has_execution_banks": has_execution_banks,
+        "live_telemetry": live_telemetry,
+        "savings_summary": savings_summary
     }
 
 @router.post("/{rfq_id}/send-results")
