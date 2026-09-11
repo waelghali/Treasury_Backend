@@ -524,6 +524,27 @@ def get_rfq_history(
         
     return reqs
 
+@router.get("/market-benchmarks")
+def get_rfq_market_benchmarks(
+    currency_pair: str = "USD/EGP",
+    trade_type: str = "FX_SPOT",
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Returns K-anonymity privacy-protected market spread benchmarks (0% confidentiality risk)."""
+    from app.services.quotation_benchmark_service import get_market_benchmarks
+    return get_market_benchmarks(db, currency_pair=currency_pair, trade_type=trade_type, k_threshold=3)
+
+@router.get("/timing-recommendations")
+def get_rfq_timing_recommendations(
+    trade_type: str = "FX_SPOT",
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Returns optimal liquidity timing windows across historical tenders."""
+    from app.services.quotation_benchmark_service import get_timing_recommendations
+    return get_timing_recommendations(db, trade_type=trade_type)
+
 @router.post("/{rfq_id}/re-tender")
 def retender_quotation(
     rfq_id: str,

@@ -3376,5 +3376,19 @@ def resolve_bank_form_issue(
     }
 
 
+@router.get("/quotations-telemetry")
+def get_quotations_macro_telemetry(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """
+    System Owner: Quotation Platform Macro Telemetry & Bank Response SLA Matrix.
+    Provides ecosystem velocity, bank participation rankings, and governance bottlenecks
+    without exposing any individual customer identities, trade amounts, or commercial secrets.
+    """
+    from app.services.quotation_benchmark_service import get_system_owner_telemetry
+    return get_system_owner_telemetry(db)
+
+
 # Make sure the router inclusion remains at the bottom
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])

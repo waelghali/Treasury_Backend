@@ -152,3 +152,25 @@ class QuotationNotification(BaseModel):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
+
+class QuotationAnonymousBenchmark(BaseModel):
+    """
+    Zero-Knowledge Anonymous Aggregation Mart.
+    Stores stripped, normalized macro metrics across all tenders with 0% confidentiality risk.
+    Contains NO customer IDs, NO user IDs, NO RFQ refs, and NO raw trade amounts.
+    """
+    __tablename__ = "quotation_anonymous_benchmarks"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_cohort_hash = Column(String, nullable=False, index=True, comment="One-way anonymous tenant hash for k-anonymity cardinality verification")
+    currency_pair = Column(String(10), nullable=False, index=True, comment="e.g. 'USD/EGP', 'EUR/EGP'")
+    trade_type = Column(String(20), nullable=False, default="FX_SPOT", comment="'FX_SPOT' or 'TBILL'")
+    deal_tier = Column(String(10), nullable=False, comment="'TIER_1' (<250k), 'TIER_2' (250k-1M), 'TIER_3' (>1M)")
+    cbe_benchmark_rate = Column(Float, nullable=True, comment="Reference rate from CBE at window start")
+    winning_spread_bps = Column(Float, nullable=True, comment="Winning execution rate spread in basis points over CBE benchmark")
+    avg_spread_bps = Column(Float, nullable=True, comment="Market average spread in basis points over CBE benchmark")
+    num_participating_banks = Column(Integer, default=0)
+    num_quotes_submitted = Column(Integer, default=0)
+    response_duration_seconds = Column(Integer, nullable=True, comment="Seconds from tender opening to first winning quote")
+    window_time_slot = Column(String(20), nullable=True, comment="e.g. 'TUE_10_12', 'WED_14_16' for liquidity timing analysis")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
