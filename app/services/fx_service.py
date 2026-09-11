@@ -83,6 +83,28 @@ class FxService:
         logger.warning(f"FX: No rate found for {from_code}/{to_code} — returning None")
         return None
 
+    def get_rate_by_code(
+        self,
+        db: Session,
+        from_code: str,
+        to_code: str,
+        allow_ai: bool = False
+    ) -> Optional[Decimal]:
+        """Convenience: lookup exchange rate by ISO currency codes (e.g. 'USD', 'EGP', 'EUR')."""
+        if not from_code or not to_code:
+            return None
+        from_code = from_code.strip().upper()
+        to_code = to_code.strip().upper()
+        if from_code == to_code:
+            return Decimal("1.0")
+
+        from app.models.models import Currency
+        from_curr = db.query(Currency).filter(Currency.iso_code == from_code).first()
+        to_curr = db.query(Currency).filter(Currency.iso_code == to_code).first()
+        if not from_curr or not to_curr:
+            return None
+        return self.get_rate(db, from_curr.id, to_curr.id, allow_ai=allow_ai)
+
     def convert(
         self,
         db: Session,

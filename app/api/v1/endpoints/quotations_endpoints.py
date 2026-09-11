@@ -144,6 +144,116 @@ def get_latest_bank_costs(
         
     return {"cost_min": 0.0, "cost_percent": 0.0, "cost_max": 0.0, "cost_flat": 0.0}
 
+@router.get("/recommendations")
+def get_bank_recommendations(
+    trade_type: str = "FX_SPOT",
+    buy_currency: str = None,
+    sell_currency: str = None,
+    amount: float = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Analyzes historical quotation outcomes for this customer to recommend the top 3 best-performing counterparties.
+    Calculates win rates, response times, and spread performance.
+    """
+    from app.models.models_quotation import QuotationBank, QuotationRequest, QuotationBankAssignment, QuotationAnalytics, QuotationOffer
+
+    q = db.query(QuotationBank).filter(
+        QuotationBank.customer_id == current_user.customer_id
+    )
+    if trade_type and trade_type != 'BOTH':
+        q = q.filter(QuotationBank.trade_type.in_([trade_type, 'BOTH']))
+    customer_banks = q.all()
+
+    if not customer_banks:
+        return {"recommended_bank_ids": [], "recommendations": []}
+
+    bank_stats = []
+    for qb in customer_banks:
+        assignments = db.query(QuotationBankAssignment).join(
+            QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
+        ).filter(
+            QuotationBankAssignment.quotation_bank_id == qb.id,
+            QuotationRequest.status.in_(['COMPLETED', 'EXPIRED'])
+        )
+
+        # Pair-specific filter if provided and enough history exists
+        if buy_currency and sell_currency:
+            pair_filtered = assignments.filter(
+                QuotationRequest.buy_currency == buy_currency,
+                QuotationRequest.sell_currency == sell_currency
+            ).all()
+            if len(pair_filtered) >= 1:
+                assignments = pair_filtered
+            else:
+                assignments = assignments.all()
+        else:
+            assignments = assignments.all()
+
+        total_invited = len(assignments)
+        total_responded = 0
+        total_won = 0
+        response_times_sec = []
+
+        for a in assignments:
+            offers = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).all()
+            if offers:
+                total_responded += 1
+                first_offer = sorted(offers, key=lambda o: o.submitted_at)[0]
+                rfq = a.rfq
+                ref_time = rfq.window_start or rfq.created_at
+                if first_offer.submitted_at and ref_time:
+                    try:
+                        delta = (first_offer.submitted_at - ref_time).total_seconds()
+                        if 0 < delta < 86400:
+                            response_times_sec.append(delta)
+                    except Exception:
+                        pass
+
+            analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == a.rfq_id).first()
+            if analytics and analytics.winner_quotation_bank_id == qb.id:
+                total_won += 1
+
+        win_rate = (total_won / total_responded * 100) if total_responded > 0 else 0.0
+        response_rate = (total_responded / total_invited * 100) if total_invited > 0 else 100.0
+        avg_resp_min = (sum(response_times_sec) / len(response_times_sec) / 60) if response_times_sec else None
+
+        score = (win_rate * 0.6) + (response_rate * 0.3) + (10 if total_won > 0 else 0)
+
+        # Smart contextual highlight
+        pair_label = f" in {buy_currency}/{sell_currency}" if (buy_currency and sell_currency) else ""
+        if total_won > 0 and avg_resp_min:
+            highlight = f"{win_rate:.0f}% Win Rate{pair_label} • Avg {avg_resp_min:.1f}m"
+        elif total_won > 0:
+            highlight = f"{win_rate:.0f}% Win Rate ({total_won} deals won)"
+        elif total_responded > 0:
+            highlight = f"Active Counterparty ({total_responded} quotes)"
+        else:
+            highlight = "Roster Bank • Ready to Quote"
+
+        bank_name = qb.bank.name if qb.bank else f"Bank {qb.bank_id}"
+        bank_stats.append({
+            "bank_id": qb.bank_id,
+            "quotation_bank_id": qb.id,
+            "bank_name": bank_name,
+            "win_rate": round(win_rate, 1),
+            "total_won": total_won,
+            "total_participated": total_responded,
+            "avg_response_minutes": round(avg_resp_min, 1) if avg_resp_min else None,
+            "highlight": highlight,
+            "score": score
+        })
+
+    bank_stats.sort(key=lambda x: x["score"], reverse=True)
+    top_recommendations = bank_stats[:3]
+    rec_bank_ids = [r["bank_id"] for r in top_recommendations]
+
+    return {
+        "recommended_bank_ids": rec_bank_ids,
+        "recommendations": top_recommendations
+    }
+
 @router.post("/", response_model=Any)
 def create_rfq(
     rfq_in: QuotationRequestCreate,

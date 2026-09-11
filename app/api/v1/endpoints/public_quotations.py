@@ -122,6 +122,16 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
 
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
 
+    cbe_benchmark_rate = None
+    if rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
+        try:
+            from app.services.fx_service import fx_service
+            bm = fx_service.get_rate_by_code(db, from_code=rfq.buy_currency, to_code=rfq.sell_currency, allow_ai=False)
+            if bm is not None:
+                cbe_benchmark_rate = float(bm)
+        except Exception:
+            pass
+
     return {
         "id": rfq.id,
         "ref_no": rfq.ref_no,
@@ -152,7 +162,8 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "approval_status": assignment.approval_status,
         "approved_by_email": assignment.approved_by_email,
         "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else None,
-        "approval_notes": assignment.approval_notes
+        "approval_notes": assignment.approval_notes,
+        "cbe_benchmark_rate": cbe_benchmark_rate
     }
 
 @router.post("/request-otp")
