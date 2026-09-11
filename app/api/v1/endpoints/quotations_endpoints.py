@@ -537,17 +537,31 @@ def get_rfq_results(
                 q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
                 results.append({
                     "bank_id": q_bank.bank_id if q_bank else 0,
+                    "quotation_bank_id": a.quotation_bank_id,
                     "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
                     "bank_emails": q_bank.emails if q_bank else "",
                     "offers": [],
                     "best_score": None,
                     "token": a.token,
+                    "quotation_base": a.quotation_base or rfq.quotation_base,
+                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                     "approval_status": a.approval_status,
                     "approved_by_email": a.approved_by_email,
                     "approved_at": a.approved_at,
                     "approval_notes": a.approval_notes
                 })
-            return {"rfq": rfq, "results": results}
+            return {
+                "rfq": rfq,
+                "results": results,
+                "winner_bank_id": None,
+                "is_inconclusive": is_closed,
+                "inconclusive_reason": "Quotation window closed without receiving any offers from counterparties." if is_closed else None,
+                "best_indicative_rate": None,
+                "best_execution_rate": None,
+                "deviation_percent": None,
+                "has_execution_banks": True
+            }
 
         # --- T-Bill Normalization Logic ---
         is_buy = (rfq.direction and rfq.direction.lower() == 'buy')
@@ -713,7 +727,11 @@ def get_rfq_results(
         best_execution_rate = None
         deviation_percent = None
 
-        if not has_execution_banks:
+        if not valid_results:
+            if is_closed:
+                is_inconclusive = True
+                inconclusive_reason = "Quotation window closed without receiving any quotes from assigned counterparties."
+        elif not has_execution_banks:
             # Scenario B: All banks are Indicative -> pure market sounding
             is_inconclusive = True
             inconclusive_reason = "All counterparties were requested on an Indicative basis. No binding winner is selected."
@@ -721,6 +739,10 @@ def get_rfq_results(
             # Separate valid bids into Indicative and Execution pools
             indicative_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'indicative']
             execution_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution']
+            
+            if not execution_bids and is_closed:
+                is_inconclusive = True
+                inconclusive_reason = "No Execution quotes were submitted before the window closed. Only Indicative quotes were received."
             
             if indicative_bids:
                 best_indicative_rate = indicative_bids[0]['finalPrice'] # Already sorted by direction

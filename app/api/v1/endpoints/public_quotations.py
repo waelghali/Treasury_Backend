@@ -767,11 +767,11 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     except TypeError:
         is_closed = datetime.now() > rfq.window_end
         
-    if is_closed and rfq.status == 'PENDING':
+    if is_closed and rfq.status in ('PENDING', 'OPEN'):
         rfq.status = 'COMPLETED'
         db.commit()
 
-    if rfq.status != 'COMPLETED':
+    if not is_closed and rfq.status not in ('COMPLETED', 'CANCELLED', 'REJECTED'):
         return {"status": "PENDING"}
 
     # Indicative banks are for market sounding only and are never declared winners or sent regret statuses
