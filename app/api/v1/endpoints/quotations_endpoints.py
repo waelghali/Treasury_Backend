@@ -465,13 +465,52 @@ def get_rfq_history(
                 pa.approval_status = 'EXPIRED'
                 changed = True
         
-        # Attach winner and analytics data if available
+        # Attach winner and rate data
+        winner_name = None
+        winner_rate = None
+        saved_vs_avg = None
+
         analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == r.id).first()
-        if analytics:
+        if analytics and analytics.winner_price:
             if analytics.winner_bank and analytics.winner_bank.bank:
-                r.winner_bank_name = analytics.winner_bank.bank.name
-            r.winner_rate = analytics.winner_price
-            r.saved_vs_avg = analytics.avg_price_spread
+                winner_name = analytics.winner_bank.bank.name
+            winner_rate = analytics.winner_price
+            saved_vs_avg = analytics.avg_price_spread
+        else:
+            assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == r.id).all()
+            if r.type == 'FX_SPOT':
+                offers = []
+                for a in assignments:
+                    off = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
+                    if off and off.price:
+                        b_name = a.quotation_bank.bank.name if (a.quotation_bank and a.quotation_bank.bank) else "Unknown Bank"
+                        offers.append({'bank_name': b_name, 'price': off.price, 'base': a.quotation_base or r.quotation_base})
+                if offers:
+                    is_sell = (r.direction and r.direction.lower() == 'sell')
+                    exec_offers = [o for o in offers if (o['base'] or 'Execution').lower() == 'execution']
+                    target_offers = exec_offers if exec_offers else offers
+                    target_offers.sort(key=lambda x: x['price'], reverse=is_sell)
+                    winner_name = target_offers[0]['bank_name']
+                    winner_rate = target_offers[0]['price']
+                    if len(target_offers) > 1:
+                        avg_price = sum(o['price'] for o in target_offers) / len(target_offers)
+                        saved_vs_avg = abs(avg_price - winner_rate)
+            else:
+                tb_offers = []
+                for a in assignments:
+                    off = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).order_by(QuotationTBillOffer.discount_rate.asc()).first()
+                    if off and off.discount_rate:
+                        b_name = a.quotation_bank.bank.name if (a.quotation_bank and a.quotation_bank.bank) else "Unknown Bank"
+                        tb_offers.append({'bank_name': b_name, 'rate': off.discount_rate})
+                if tb_offers:
+                    is_buy = (r.direction and r.direction.lower() == 'buy')
+                    tb_offers.sort(key=lambda x: x['rate'], reverse=is_buy)
+                    winner_name = tb_offers[0]['bank_name']
+                    winner_rate = tb_offers[0]['rate']
+
+        r.winner_bank_name = winner_name
+        r.winner_rate = winner_rate
+        r.saved_vs_avg = saved_vs_avg
             
         if r.parent_rfq_id:
             parent = db.query(QuotationRequest).filter(QuotationRequest.id == r.parent_rfq_id).first()
