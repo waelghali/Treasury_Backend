@@ -71,6 +71,7 @@ class QuotationRequestCreate(BaseModel):
     documentPath: Optional[str] = None
     selectedBanks: str # JSON string matching Node module format, or we can parse it in FastAPI
     token_validity_hours: Optional[int] = 24
+    entity_id: Optional[int] = None
 
 class QuotationRequestOut(BaseModel):
     id: str
@@ -86,6 +87,8 @@ class QuotationRequestOut(BaseModel):
     window_end: datetime
     status: str
     token_validity_hours: Optional[int]
+    entity_id: Optional[int] = None
+    entity_name: Optional[str] = None
     created_at: datetime
     creator_name: Optional[str] = None
     quotation_base: Optional[str] = None
@@ -180,3 +183,39 @@ class QuotationResultsOut(BaseModel):
     best_execution_rate: Optional[float] = None
     deviation_percent: Optional[float] = None
     has_execution_banks: bool = True
+
+# --- Bank Live Ranking Schemas ---
+class BankLiveRankingConfigCreate(BaseModel):
+    bank_id: int
+    trade_type: str = "BOTH"
+    scope_type: str = "ALL_CUSTOMERS"
+    customer_id: Optional[int] = None
+    entity_scope_type: str = "ALL_ENTITIES"
+    entity_id: Optional[int] = None
+    is_enabled: bool = True
+
+class BankLiveRankingConfigUpdate(BaseModel):
+    trade_type: Optional[str] = None
+    scope_type: Optional[str] = None
+    customer_id: Optional[int] = None
+    entity_scope_type: Optional[str] = None
+    entity_id: Optional[int] = None
+    is_enabled: Optional[bool] = None
+
+class BankLiveRankingConfigOut(BaseModel):
+    id: int
+    bank_id: int
+    bank_name: Optional[str] = None
+    trade_type: str
+    scope_type: str
+    customer_id: Optional[int] = None
+    customer_name: Optional[str] = None
+    entity_scope_type: str
+    entity_id: Optional[int] = None
+    entity_name: Optional[str] = None
+    is_enabled: bool
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

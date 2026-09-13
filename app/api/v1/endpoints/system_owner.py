@@ -3390,5 +3390,211 @@ def get_quotations_macro_telemetry(
     return get_system_owner_telemetry(db)
 
 
+# =====================================================================
+# Bank Live Ranking Configuration Endpoints (System Owner)
+# =====================================================================
+from app.models.models_quotation import BankLiveRankingConfig
+from app.models.models import CustomerEntity
+from app.schemas.schemas_quotation import (
+    BankLiveRankingConfigCreate, BankLiveRankingConfigUpdate, BankLiveRankingConfigOut
+)
+
+@router.get("/live-ranking-configs", response_model=List[BankLiveRankingConfigOut])
+def list_live_ranking_configs(
+    bank_id: Optional[int] = None,
+    customer_id: Optional[int] = None,
+    trade_type: Optional[str] = None,
+    is_enabled: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """List all Bank Live Ranking configuration policies."""
+    query = db.query(BankLiveRankingConfig)
+    if bank_id:
+        query = query.filter(BankLiveRankingConfig.bank_id == bank_id)
+    if customer_id:
+        query = query.filter(BankLiveRankingConfig.customer_id == customer_id)
+    if trade_type:
+        query = query.filter(BankLiveRankingConfig.trade_type == trade_type)
+    if is_enabled is not None:
+        query = query.filter(BankLiveRankingConfig.is_enabled == is_enabled)
+
+    records = query.order_by(BankLiveRankingConfig.created_at.desc()).all()
+    results = []
+    for r in records:
+        results.append(BankLiveRankingConfigOut(
+            id=r.id,
+            bank_id=r.bank_id,
+            bank_name=r.bank.name if r.bank else None,
+            trade_type=r.trade_type,
+            scope_type=r.scope_type,
+            customer_id=r.customer_id,
+            customer_name=r.customer.name if r.customer else None,
+            entity_scope_type=r.entity_scope_type,
+            entity_id=r.entity_id,
+            entity_name=r.entity.name if r.entity else None,
+            is_enabled=r.is_enabled,
+            created_at=r.created_at,
+            updated_at=r.updated_at
+        ))
+    return results
+
+
+@router.post("/live-ranking-configs", response_model=BankLiveRankingConfigOut)
+def create_live_ranking_config(
+    config_in: BankLiveRankingConfigCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Create or update a Bank Live Ranking configuration rule."""
+    bank = db.query(models.Bank).filter(models.Bank.id == config_in.bank_id).first()
+    if not bank:
+        raise HTTPException(status_code=404, detail="Bank not found")
+
+    if config_in.scope_type == "SPECIFIC_CUSTOMER":
+        if not config_in.customer_id:
+            raise HTTPException(status_code=400, detail="Customer ID is required when scope is SPECIFIC_CUSTOMER")
+        customer = db.query(models.Customer).filter(models.Customer.id == config_in.customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        if config_in.entity_scope_type == "SPECIFIC_ENTITY":
+            if not config_in.entity_id:
+                raise HTTPException(status_code=400, detail="Entity ID is required when entity scope is SPECIFIC_ENTITY")
+            entity = db.query(CustomerEntity).filter(
+                CustomerEntity.id == config_in.entity_id,
+                CustomerEntity.customer_id == config_in.customer_id
+            ).first()
+            if not entity:
+                raise HTTPException(status_code=404, detail="Customer Entity not found for this customer")
+    else:
+        config_in.customer_id = None
+        config_in.entity_id = None
+        config_in.entity_scope_type = "ALL_ENTITIES"
+
+    existing = db.query(BankLiveRankingConfig).filter(
+        BankLiveRankingConfig.bank_id == config_in.bank_id,
+        BankLiveRankingConfig.trade_type == config_in.trade_type,
+        BankLiveRankingConfig.scope_type == config_in.scope_type,
+        BankLiveRankingConfig.customer_id == config_in.customer_id,
+        BankLiveRankingConfig.entity_scope_type == config_in.entity_scope_type,
+        BankLiveRankingConfig.entity_id == config_in.entity_id
+    ).first()
+
+    if existing:
+        existing.is_enabled = config_in.is_enabled
+        db.commit()
+        db.refresh(existing)
+        db_obj = existing
+    else:
+        db_obj = BankLiveRankingConfig(
+            bank_id=config_in.bank_id,
+            trade_type=config_in.trade_type,
+            scope_type=config_in.scope_type,
+            customer_id=config_in.customer_id,
+            entity_scope_type=config_in.entity_scope_type,
+            entity_id=config_in.entity_id,
+            is_enabled=config_in.is_enabled,
+            created_by_user_id=current_user.id
+        )
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+
+    return BankLiveRankingConfigOut(
+        id=db_obj.id,
+        bank_id=db_obj.bank_id,
+        bank_name=db_obj.bank.name if db_obj.bank else None,
+        trade_type=db_obj.trade_type,
+        scope_type=db_obj.scope_type,
+        customer_id=db_obj.customer_id,
+        customer_name=db_obj.customer.name if db_obj.customer else None,
+        entity_scope_type=db_obj.entity_scope_type,
+        entity_id=db_obj.entity_id,
+        entity_name=db_obj.entity.name if db_obj.entity else None,
+        is_enabled=db_obj.is_enabled,
+        created_at=db_obj.created_at,
+        updated_at=db_obj.updated_at
+    )
+
+
+@router.put("/live-ranking-configs/{config_id}", response_model=BankLiveRankingConfigOut)
+def update_live_ranking_config(
+    config_id: int,
+    config_update: BankLiveRankingConfigUpdate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Update an existing Live Ranking rule."""
+    rule = db.query(BankLiveRankingConfig).filter(BankLiveRankingConfig.id == config_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Live ranking config not found")
+
+    if config_update.is_enabled is not None:
+        rule.is_enabled = config_update.is_enabled
+    if config_update.trade_type is not None:
+        rule.trade_type = config_update.trade_type
+    if config_update.scope_type is not None:
+        rule.scope_type = config_update.scope_type
+        if rule.scope_type == "ALL_CUSTOMERS":
+            rule.customer_id = None
+            rule.entity_id = None
+            rule.entity_scope_type = "ALL_ENTITIES"
+    if config_update.customer_id is not None:
+        rule.customer_id = config_update.customer_id
+    if config_update.entity_scope_type is not None:
+        rule.entity_scope_type = config_update.entity_scope_type
+    if config_update.entity_id is not None:
+        rule.entity_id = config_update.entity_id
+
+    db.commit()
+    db.refresh(rule)
+
+    return BankLiveRankingConfigOut(
+        id=rule.id,
+        bank_id=rule.bank_id,
+        bank_name=rule.bank.name if rule.bank else None,
+        trade_type=rule.trade_type,
+        scope_type=rule.scope_type,
+        customer_id=rule.customer_id,
+        customer_name=rule.customer.name if rule.customer else None,
+        entity_scope_type=rule.entity_scope_type,
+        entity_id=rule.entity_id,
+        entity_name=rule.entity.name if rule.entity else None,
+        is_enabled=rule.is_enabled,
+        created_at=rule.created_at,
+        updated_at=rule.updated_at
+    )
+
+
+@router.delete("/live-ranking-configs/{config_id}")
+def delete_live_ranking_config(
+    config_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Delete a Live Ranking rule."""
+    rule = db.query(BankLiveRankingConfig).filter(BankLiveRankingConfig.id == config_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Live ranking config not found")
+
+    db.delete(rule)
+    db.commit()
+    return {"success": True, "message": "Live ranking config deleted successfully"}
+
+
+@router.get("/customers/{customer_id}/entities")
+def get_customer_entities_for_system_owner(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Get active entities for a specific customer to populate entity dropdown in System Owner."""
+    entities = db.query(CustomerEntity).filter(
+        CustomerEntity.customer_id == customer_id,
+        CustomerEntity.is_active == True
+    ).order_by(CustomerEntity.name.asc()).all()
+    return [{"id": e.id, "name": e.name, "country": getattr(e, "country", None)} for e in entities]
+
+
 # Make sure the router inclusion remains at the bottom
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])

@@ -132,6 +132,42 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         except Exception:
             pass
 
+    # Live Ranking Evaluation
+    is_live_ranking_enabled = False
+    live_rank = None
+    total_quotes = 0
+    try:
+        from app.services.live_ranking_service import live_ranking_service
+        actual_bank_id = q_bank.bank_id if q_bank else None
+        rfq_entity_id = getattr(rfq, 'entity_id', None)
+        is_live_ranking_enabled = live_ranking_service.evaluate_live_ranking_eligibility(
+            db, bank_id=actual_bank_id, customer_id=rfq.customer_id,
+            entity_id=rfq_entity_id, trade_type=rfq.type or 'FX_SPOT'
+        )
+        if is_live_ranking_enabled and offers:
+            rank_result = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id)
+            if rank_result is not None:
+                live_rank = rank_result
+                # Count total banks that have submitted
+                all_assignments = db.query(QuotationBankAssignment).filter(
+                    QuotationBankAssignment.rfq_id == rfq.id
+                ).all()
+                if rfq.type == 'TBILL':
+                    submitted_ids = set(
+                        o.assignment_id for o in db.query(QuotationTBillOffer).filter(
+                            QuotationTBillOffer.assignment_id.in_([a.id for a in all_assignments])
+                        ).all()
+                    )
+                else:
+                    submitted_ids = set(
+                        o.assignment_id for o in db.query(QuotationOffer).filter(
+                            QuotationOffer.assignment_id.in_([a.id for a in all_assignments])
+                        ).all()
+                    )
+                total_quotes = len(submitted_ids)
+    except Exception:
+        pass
+
     return {
         "id": rfq.id,
         "ref_no": rfq.ref_no,
@@ -163,7 +199,10 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "approved_by_email": assignment.approved_by_email,
         "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else None,
         "approval_notes": assignment.approval_notes,
-        "cbe_benchmark_rate": cbe_benchmark_rate
+        "cbe_benchmark_rate": cbe_benchmark_rate,
+        "is_live_ranking_enabled": is_live_ranking_enabled,
+        "live_rank": live_rank,
+        "total_quotes": total_quotes
     }
 
 @router.post("/request-otp")
@@ -431,7 +470,36 @@ def submit_fx_offer(
     ))
     db.commit()
 
-    return {"success": True, "submitted_by": submitted_by}
+    # Calculate live rank if enabled
+    live_rank_data = None
+    try:
+        from app.services.live_ranking_service import live_ranking_service
+        q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+        actual_bank_id = q_bank.bank_id if q_bank else None
+        rfq_entity_id = getattr(rfq, 'entity_id', None)
+        is_enabled = live_ranking_service.evaluate_live_ranking_eligibility(
+            db, bank_id=actual_bank_id, customer_id=rfq.customer_id,
+            entity_id=rfq_entity_id, trade_type=rfq.type or 'FX_SPOT'
+        )
+        if is_enabled:
+            rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id)
+            all_assignments = db.query(QuotationBankAssignment).filter(
+                QuotationBankAssignment.rfq_id == rfq.id
+            ).all()
+            submitted_ids = set(
+                o.assignment_id for o in db.query(QuotationOffer).filter(
+                    QuotationOffer.assignment_id.in_([a.id for a in all_assignments])
+                ).all()
+            )
+            live_rank_data = {
+                "rank": rank,
+                "total_quotes": len(submitted_ids),
+                "is_leading": rank == 1
+            }
+    except Exception:
+        pass
+
+    return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
 
 @router.post("/tbill-offer")
 def submit_tbill_offer(
@@ -504,7 +572,100 @@ def submit_tbill_offer(
     ))
     db.commit()
 
-    return {"success": True, "submitted_by": submitted_by}
+    # Calculate live rank if enabled
+    live_rank_data = None
+    try:
+        from app.services.live_ranking_service import live_ranking_service
+        q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+        actual_bank_id = q_bank.bank_id if q_bank else None
+        rfq_entity_id = getattr(rfq, 'entity_id', None)
+        is_enabled = live_ranking_service.evaluate_live_ranking_eligibility(
+            db, bank_id=actual_bank_id, customer_id=rfq.customer_id,
+            entity_id=rfq_entity_id, trade_type=rfq.type or 'TBILL'
+        )
+        if is_enabled:
+            rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id)
+            all_assignments = db.query(QuotationBankAssignment).filter(
+                QuotationBankAssignment.rfq_id == rfq.id
+            ).all()
+            submitted_ids = set(
+                o.assignment_id for o in db.query(QuotationTBillOffer).filter(
+                    QuotationTBillOffer.assignment_id.in_([a.id for a in all_assignments])
+                ).all()
+            )
+            live_rank_data = {
+                "rank": rank,
+                "total_quotes": len(submitted_ids),
+                "is_leading": rank == 1
+            }
+    except Exception:
+        pass
+
+    return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
+
+@router.get("/{token}/live-rank")
+def get_live_rank(token: str, db: Session = Depends(get_db)):
+    """Lightweight polling endpoint: returns the bank's current rank among submitted quotes."""
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+
+    # Evaluate eligibility
+    from app.services.live_ranking_service import live_ranking_service
+    actual_bank_id = q_bank.bank_id if q_bank else None
+    rfq_entity_id = getattr(rfq, 'entity_id', None)
+    is_enabled = live_ranking_service.evaluate_live_ranking_eligibility(
+        db, bank_id=actual_bank_id, customer_id=rfq.customer_id,
+        entity_id=rfq_entity_id, trade_type=rfq.type or 'FX_SPOT'
+    )
+
+    if not is_enabled:
+        return {"is_live_ranking_enabled": False, "rank": None, "total_quotes": 0}
+
+    rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id)
+
+    # Count total submitted banks
+    all_assignments = db.query(QuotationBankAssignment).filter(
+        QuotationBankAssignment.rfq_id == rfq.id
+    ).all()
+    if rfq.type == 'TBILL':
+        submitted_ids = set(
+            o.assignment_id for o in db.query(QuotationTBillOffer).filter(
+                QuotationTBillOffer.assignment_id.in_([a.id for a in all_assignments])
+            ).all()
+        )
+    else:
+        submitted_ids = set(
+            o.assignment_id for o in db.query(QuotationOffer).filter(
+                QuotationOffer.assignment_id.in_([a.id for a in all_assignments])
+            ).all()
+        )
+
+    # Check if window is still open
+    now = datetime.now(timezone.utc)
+    window_end = rfq.window_end
+    if window_end and window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
+    is_open = False
+    if rfq.window_start and window_end:
+        ws = rfq.window_start
+        if ws.tzinfo is None:
+            ws = ws.replace(tzinfo=timezone.utc)
+        is_open = (ws <= now <= window_end)
+
+    return {
+        "is_live_ranking_enabled": True,
+        "rank": rank,
+        "total_quotes": len(submitted_ids),
+        "is_leading": rank == 1 if rank else False,
+        "isWindowOpen": is_open
+    }
 
 @router.post("/{token}/approve")
 async def approve_rfq_for_bank(

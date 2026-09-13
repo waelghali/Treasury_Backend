@@ -47,10 +47,12 @@ class QuotationRequest(BaseModel):
     status = Column(String, default="PENDING", comment="'PENDING_APPROVAL', 'NEEDS_REVISION', 'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'REJECTED'")
     token_validity_hours = Column(Integer, default=24, comment="Hours the bank link remains valid after window_end")
     parent_rfq_id = Column(String, ForeignKey("quotation_rfqs.id", ondelete="SET NULL"), nullable=True, index=True, comment="Original RFQ if this is a re-tender")
+    entity_id = Column(Integer, ForeignKey("customer_entities.id", ondelete="SET NULL"), nullable=True, index=True, comment="Customer entity/subsidiary requesting the RFQ")
     admin_revision_notes = Column(Text, nullable=True, comment="Notes from Corporate Admin when returned for revision")
     admin_reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
     customer = relationship("Customer")
+    entity = relationship("CustomerEntity")
     creator = relationship("User")
     assignments = relationship("QuotationBankAssignment", back_populates="rfq", cascade="all, delete-orphan")
     parent_rfq = relationship("QuotationRequest", remote_side=[id], backref="re_tenders")
@@ -174,3 +176,32 @@ class QuotationAnonymousBenchmark(BaseModel):
     response_duration_seconds = Column(Integer, nullable=True, comment="Seconds from tender opening to first winning quote")
     window_time_slot = Column(String(20), nullable=True, comment="e.g. 'TUE_10_12', 'WED_14_16' for liquidity timing analysis")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+class BankLiveRankingConfig(BaseModel):
+    """
+    Configuration table allowing System Owner to enable or disable live ranking per Bank,
+    filtered by Service (FX_SPOT, TBILL, or BOTH), Customer Scope (ALL or SPECIFIC),
+    and Entity Scope (ALL or SPECIFIC).
+    """
+    __tablename__ = "bank_live_ranking_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bank_id = Column(Integer, ForeignKey("banks.id", ondelete="CASCADE"), nullable=False, index=True)
+    trade_type = Column(String(20), default="BOTH", nullable=False, comment="'FX_SPOT', 'TBILL', or 'BOTH'")
+    
+    # Customer scope
+    scope_type = Column(String(30), default="ALL_CUSTOMERS", nullable=False, comment="'ALL_CUSTOMERS' or 'SPECIFIC_CUSTOMER'")
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=True, index=True)
+    
+    # Entity scope (applicable when scope_type == 'SPECIFIC_CUSTOMER')
+    entity_scope_type = Column(String(30), default="ALL_ENTITIES", nullable=False, comment="'ALL_ENTITIES' or 'SPECIFIC_ENTITY'")
+    entity_id = Column(Integer, ForeignKey("customer_entities.id", ondelete="CASCADE"), nullable=True, index=True)
+    
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    bank = relationship("Bank")
+    customer = relationship("Customer")
+    entity = relationship("CustomerEntity")
