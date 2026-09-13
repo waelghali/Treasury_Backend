@@ -3432,7 +3432,7 @@ def list_live_ranking_configs(
             customer_name=r.customer.name if r.customer else None,
             entity_scope_type=r.entity_scope_type,
             entity_id=r.entity_id,
-            entity_name=r.entity.name if r.entity else None,
+            entity_name=r.entity.entity_name if r.entity else None,
             is_enabled=r.is_enabled,
             created_at=r.created_at,
             updated_at=r.updated_at
@@ -3447,14 +3447,14 @@ def create_live_ranking_config(
     current_user: TokenData = Depends(get_current_system_owner),
 ):
     """Create or update a Bank Live Ranking configuration rule."""
-    bank = db.query(models.Bank).filter(models.Bank.id == config_in.bank_id).first()
+    bank = db.query(Bank).filter(Bank.id == config_in.bank_id).first()
     if not bank:
         raise HTTPException(status_code=404, detail="Bank not found")
 
     if config_in.scope_type == "SPECIFIC_CUSTOMER":
         if not config_in.customer_id:
             raise HTTPException(status_code=400, detail="Customer ID is required when scope is SPECIFIC_CUSTOMER")
-        customer = db.query(models.Customer).filter(models.Customer.id == config_in.customer_id).first()
+        customer = db.query(Customer).filter(Customer.id == config_in.customer_id).first()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         if config_in.entity_scope_type == "SPECIFIC_ENTITY":
@@ -3510,7 +3510,7 @@ def create_live_ranking_config(
         customer_name=db_obj.customer.name if db_obj.customer else None,
         entity_scope_type=db_obj.entity_scope_type,
         entity_id=db_obj.entity_id,
-        entity_name=db_obj.entity.name if db_obj.entity else None,
+        entity_name=db_obj.entity.entity_name if db_obj.entity else None,
         is_enabled=db_obj.is_enabled,
         created_at=db_obj.created_at,
         updated_at=db_obj.updated_at
@@ -3559,7 +3559,7 @@ def update_live_ranking_config(
         customer_name=rule.customer.name if rule.customer else None,
         entity_scope_type=rule.entity_scope_type,
         entity_id=rule.entity_id,
-        entity_name=rule.entity.name if rule.entity else None,
+        entity_name=rule.entity.entity_name if rule.entity else None,
         is_enabled=rule.is_enabled,
         created_at=rule.created_at,
         updated_at=rule.updated_at
@@ -3592,8 +3592,9 @@ def get_customer_entities_for_system_owner(
     entities = db.query(CustomerEntity).filter(
         CustomerEntity.customer_id == customer_id,
         CustomerEntity.is_active == True
-    ).order_by(CustomerEntity.name.asc()).all()
-    return [{"id": e.id, "name": e.name, "country": getattr(e, "country", None)} for e in entities]
+    ).order_by(CustomerEntity.entity_name.asc()).all()
+    return [{"id": e.id, "name": e.entity_name, "entity_name": e.entity_name, "country": getattr(e, "country", None)} for e in entities]
+
 
 
 # Make sure the router inclusion remains at the bottom
