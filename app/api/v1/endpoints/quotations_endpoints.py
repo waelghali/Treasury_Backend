@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request
 from sqlalchemy.orm import Session
 from typing import List, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import secrets
 import logging
 import csv
 import io
@@ -23,7 +24,10 @@ from app.schemas.schemas_quotation import (
     ReTenderRequest, QuotationResubmitRequest
 )
 from app.crud.crud_quotation import crud_quotation
-from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationOffer, QuotationTBillOffer, QuotationBank, QuotationAnalytics
+from app.models.models_quotation import (
+    QuotationRequest, QuotationBankAssignment, QuotationOffer, 
+    QuotationTBillOffer, QuotationBank, QuotationAnalytics, QuotationAccessOTP
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -337,9 +341,25 @@ def create_rfq(
                 if assignment.get("approval_status") == "PENDING":
                     # --- BANK APPROVAL FLOW (Execution RFQ + bank has APPROVER contacts) ---
                     
-                    # Phase 1a: Email APPROVER contacts with action link
+                    # Phase 1a: Email APPROVER contacts with 1-click magic action link
                     approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
-                    if approver_emails:
+                    for app_email in approver_emails:
+                        magic_token = uuid.uuid4().hex
+                        otp_code = f"{secrets.randbelow(900000) + 100000}"
+                        expires_at = datetime.now(timezone.utc) + timedelta(hours=rfq.token_validity_hours or 24)
+                        otp_record = QuotationAccessOTP(
+                            assignment_id=assignment["id"],
+                            email=app_email.lower(),
+                            role="APPROVER",
+                            otp_code=otp_code,
+                            magic_token=magic_token,
+                            expires_at=expires_at,
+                            is_used=False
+                        )
+                        db.add(otp_record)
+                        db.commit()
+
+                        approver_link = f"{base_url}/public-quotation/{assignment['token']}?magic_token={magic_token}"
                         approver_subject = f"APPROVAL REQUIRED: RFQ {rfq.ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
                         approver_body = f"""
                         <html>
@@ -353,14 +373,14 @@ def create_rfq(
                                 <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
                             </ul>
                             <p>Please review the RFQ details and approve your bank's participation. Once approved, your execution desk will receive the secure link to submit their binding quote.</p>
-                            <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Review & Approve</a>
+                            <a href="{approver_link}" style="padding: 12px 24px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 6px; display: inline-block; margin-top: 10px; font-weight: bold;">Review & Approve RFQ</a>
                             <br/><br/>
                             <p>Best Regards,</p>
                             <p>Treasury Team</p>
                         </body>
                         </html>
                         """
-                        background_tasks.add_task(send_email, db, approver_emails, approver_subject, approver_body, {}, email_settings)
+                        background_tasks.add_task(send_email, db, [app_email], approver_subject, approver_body, {}, email_settings)
                     
                     # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link)
                     non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]

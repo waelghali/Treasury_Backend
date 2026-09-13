@@ -133,11 +133,12 @@ class CRUDQuotation:
                         is_doc_vis = True
                     
                     # Determine if bank-level approval is required
-                    # Approval activates only for Execution RFQs when the bank has APPROVER contacts
-                    effective_base = (q_base_override or 'Execution').lower()
+                    # Approval activates for Execution RFQs when the bank has APPROVER contacts
+                    effective_base = (q_base_override or obj_in.quotationBase or 'Execution').lower()
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
-                    bank_approval_status = 'PENDING' if (has_approver and effective_base == 'execution') else None
+                    is_exec = (obj_in.quotationBase or '').lower() == 'execution' or effective_base == 'execution'
+                    bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
                     
                     db_assignment = QuotationBankAssignment(
                         id=assignment_id,
