@@ -3494,7 +3494,7 @@ def create_live_ranking_config(
             entity_scope_type=config_in.entity_scope_type,
             entity_id=config_in.entity_id,
             is_enabled=config_in.is_enabled,
-            created_by_user_id=current_user.id
+            created_by_user_id=getattr(current_user, 'user_id', None)
         )
         db.add(db_obj)
         db.commit()
