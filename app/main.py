@@ -120,6 +120,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        max_age=600,
     )
 
     from app.core.security_headers import SecurityHeadersMiddleware
