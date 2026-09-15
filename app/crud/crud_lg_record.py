@@ -2241,13 +2241,15 @@ class CRUDLGRecord(CRUDBase):
         customer_id: int,
         internal_owner_contact_id: Optional[int] = None,
         skip: int = 0,
-        limit: int = 100,
+        limit: Optional[int] = None,
         user_has_all_access: bool = True, 
-        user_allowed_entity_ids: List[int] = [] 
+        user_allowed_entity_ids: List[int] = [],
+        lg_record_ids: Optional[List[int]] = None
     ) -> List[models.LGRecord]:
         """
         Retrieves all LG records for a given customer, with optional filtering
         by internal owner contact ID AND mandatory filtering by User Entity Access.
+        If limit is None, all records are returned without pagination cap.
         """
         # Debug print to confirm execution
         print(f"DEBUG: Filtering LGs. Has All Access: {user_has_all_access}, Allowed Entities: {user_allowed_entity_ids}")
@@ -2272,6 +2274,10 @@ class CRUDLGRecord(CRUDBase):
         if internal_owner_contact_id is not None:
             query = query.filter(self.model.internal_owner_contact_id == internal_owner_contact_id)
 
+        # 3. Optional Specific LG IDs Filter
+        if lg_record_ids:
+            query = query.filter(self.model.id.in_(lg_record_ids))
+
         query = query.options(
             selectinload(self.model.beneficiary_corporate),
             selectinload(self.model.lg_currency),
@@ -2288,7 +2294,12 @@ class CRUDLGRecord(CRUDBase):
             selectinload(self.model.instructions).selectinload(models.LGInstruction.documents),
         )
 
-        return query.offset(skip).limit(limit).all()
+        if skip:
+            query = query.offset(skip)
+        if limit is not None:
+            query = query.limit(limit)
+
+        return query.all()
 
     def create_document_model(self, obj_in: LGDocumentCreate, lg_record_id: int, uploaded_by_user_id: int) -> LGDocument:
         document_data = obj_in.model_dump()

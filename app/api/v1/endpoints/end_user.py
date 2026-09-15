@@ -817,8 +817,9 @@ async def view_lg_document_securely(
 @router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
 async def list_lg_records(
     skip: int = 0,
-    limit: int = 200,
+    limit: Optional[int] = Query(None, description="Filter limit. Defaults to None (fetches all records)."),
     internal_owner_contact_id: Optional[int] = Query(None, description="Filter LG records by the ID of the internal owner contact"),
+    lg_record_ids: Optional[str] = Query(None, description="Optional comma-separated list of LG record IDs"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:view_own")),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -826,9 +827,17 @@ async def list_lg_records(
     """
     Retrieves a list of LG records belonging to the authenticated End User's customer.
     Includes an optional filter for internal owner contact ID.
+    If limit is omitted, all records are returned without pagination cap.
     """
     # FIX: Get fresh permissions from DB instead of stale Token
     fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+
+    parsed_lg_ids = None
+    if lg_record_ids:
+        try:
+            parsed_lg_ids = [int(x.strip()) for x in lg_record_ids.split(",") if x.strip()]
+        except ValueError:
+            parsed_lg_ids = None
 
     lg_records = crud_lg_record.get_all_lg_records_for_customer(
         db,
@@ -838,7 +847,8 @@ async def list_lg_records(
         limit=limit,
         # NEW: Pass the FRESH security parameters
         user_has_all_access=fresh_has_all_access,
-        user_allowed_entity_ids=fresh_entity_ids
+        user_allowed_entity_ids=fresh_entity_ids,
+        lg_record_ids=parsed_lg_ids
     )
     return lg_records
 
