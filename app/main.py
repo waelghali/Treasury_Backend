@@ -106,7 +106,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         "https://growbusinessdevelopment.com",
         "https://staging.growbusinessdevelopment.com",
         "https://demo.growbusinessdevelopment.com",
-        "https://treasury-frontend-nu.vercel.app",
+
         "http://localhost",
         "http://localhost:3000",
         "http://127.0.0.1",
@@ -116,7 +116,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_origin_regex=r"^https:\/\/([a-zA-Z0-9_-]+\.)*(onrender\.com|vercel\.app|growbusinessdevelopment\.com)$",
+        allow_origin_regex=r"^https:\/\/([a-zA-Z0-9_-]+\.)*(vercel\.app|growbusinessdevelopment\.com)$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
