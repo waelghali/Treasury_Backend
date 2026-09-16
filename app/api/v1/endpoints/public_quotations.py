@@ -67,7 +67,10 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     # Process Token Validity Expiry
     validity_hours = rfq.token_validity_hours or 24
     if window_end and now > (window_end + timedelta(hours=validity_hours)):
-        raise HTTPException(status_code=403, detail="The validity of this link has expired.")
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE, 
+            detail="The validity of this quotation link has expired."
+        )
 
     offers = []
     if rfq.type == 'TBILL':

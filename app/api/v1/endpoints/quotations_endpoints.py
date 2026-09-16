@@ -747,8 +747,30 @@ def resubmit_quotation(
     if rfq.status != 'NEEDS_REVISION':
         raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be resubmitted.")
 
+    if payload.type is not None:
+        rfq.type = payload.type
+    if payload.direction is not None:
+        rfq.direction = payload.direction
+    if payload.value_date is not None:
+        rfq.value_date = payload.value_date
     if payload.amount is not None:
         rfq.amount = payload.amount
+    if payload.min_ticket_amount is not None:
+        rfq.min_ticket_amount = payload.min_ticket_amount
+    if payload.buy_currency is not None:
+        rfq.buy_currency = payload.buy_currency
+    if payload.sell_currency is not None:
+        rfq.sell_currency = payload.sell_currency
+    if payload.settlement_date_start is not None:
+        rfq.settlement_date_start = payload.settlement_date_start
+    if payload.settlement_date_end is not None:
+        rfq.settlement_date_end = payload.settlement_date_end
+    if payload.maturity_date_start is not None:
+        rfq.maturity_date_start = payload.maturity_date_start
+    if payload.maturity_date_end is not None:
+        rfq.maturity_date_end = payload.maturity_date_end
+    if payload.eval_rate is not None:
+        rfq.eval_rate = payload.eval_rate
     if payload.window_start is not None:
         rfq.window_start = payload.window_start
     if payload.window_end is not None:
@@ -757,6 +779,52 @@ def resubmit_quotation(
         rfq.quotation_base = payload.quotation_base
     if payload.max_tolerance_percent is not None:
         rfq.max_tolerance_percent = payload.max_tolerance_percent
+    if payload.document_path is not None:
+        rfq.document_path = payload.document_path
+    if payload.token_validity_hours is not None:
+        rfq.token_validity_hours = payload.token_validity_hours
+
+    # If new selected banks provided from the builder, re-sync bank assignments
+    if payload.selected_banks:
+        try:
+            banks_data = json.loads(payload.selected_banks) if isinstance(payload.selected_banks, str) else payload.selected_banks
+            # Remove previous unsubmitted assignments
+            db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).delete()
+            for b_data in banks_data:
+                assignment_id = str(uuid.uuid4())
+                token = str(uuid.uuid4())
+                q_bank = db.query(QuotationBank).filter(
+                    QuotationBank.customer_id == current_user.customer_id,
+                    QuotationBank.bank_id == b_data.get('id'),
+                    QuotationBank.trade_type.in_([rfq.type, "BOTH"])
+                ).first()
+                if q_bank:
+                    q_base_override = b_data.get('quotationBase') or rfq.quotation_base
+                    is_doc_vis = b_data.get('isDocumentVisible', True)
+                    if is_doc_vis is None:
+                        is_doc_vis = True
+                    effective_base = (q_base_override or rfq.quotation_base or 'Execution').lower()
+                    contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
+                    has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
+                    is_exec = (rfq.quotation_base or '').lower() == 'execution' or effective_base == 'execution'
+                    bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
+
+                    db_assignment = QuotationBankAssignment(
+                        id=assignment_id,
+                        rfq_id=rfq.id,
+                        quotation_bank_id=q_bank.id,
+                        token=token,
+                        cost_min=b_data.get('costMin', 0.0),
+                        cost_percent=b_data.get('costPercent', 0.0),
+                        cost_max=b_data.get('costMax', 0.0),
+                        cost_flat=b_data.get('costFlat', 0.0),
+                        quotation_base=q_base_override or rfq.quotation_base,
+                        is_document_visible=is_doc_vis,
+                        approval_status=bank_approval_status
+                    )
+                    db.add(db_assignment)
+        except Exception as e:
+            logger.error(f"Failed to update bank assignments on resubmit: {e}")
 
     rfq.status = 'PENDING_APPROVAL'
     db.commit()
@@ -768,12 +836,13 @@ def resubmit_quotation(
         User.customer_id == current_user.customer_id,
         User.role == UserRole.CORPORATE_ADMIN
     ).all()
+    user_note_text = f" Note: {payload.user_notes.strip()}" if payload.user_notes and payload.user_notes.strip() else ""
     for admin in admins:
         db.add(QuotationNotification(
             user_id=admin.id,
             type="RFQ_RESUBMITTED",
             title=f"Revised RFQ {rfq.ref_no} Resubmitted for Approval",
-            message=f"Maker has addressed your notes and resubmitted RFQ {rfq.ref_no}.",
+            message=f"Maker has addressed your notes and resubmitted RFQ {rfq.ref_no}.{user_note_text}",
             link=f"/corporate-admin/quotations/history?rfq_id={rfq.id}",
             is_read=False
         ))
@@ -971,7 +1040,11 @@ def get_rfq_results(
                     "approval_status": a.approval_status,
                     "approved_by_email": a.approved_by_email,
                     "approved_at": a.approved_at,
-                    "approval_notes": a.approval_notes
+                    "approval_notes": a.approval_notes,
+                    "cost_min": a.cost_min or 0.0,
+                    "cost_percent": a.cost_percent or 0.0,
+                    "cost_max": a.cost_max or 0.0,
+                    "cost_flat": a.cost_flat or 0.0
                 })
             return {
                 "rfq": rfq,
@@ -1061,7 +1134,11 @@ def get_rfq_results(
                 "approval_status": a.approval_status,
                 "approved_by_email": a.approved_by_email,
                 "approved_at": a.approved_at,
-                "approval_notes": a.approval_notes
+                "approval_notes": a.approval_notes,
+                "cost_min": a.cost_min or 0.0,
+                "cost_percent": a.cost_percent or 0.0,
+                "cost_max": a.cost_max or 0.0,
+                "cost_flat": a.cost_flat or 0.0
             })
 
         # Sort results: Lowest score wins (Lowest price for buy, Lowest DR for sell)
@@ -1093,7 +1170,11 @@ def get_rfq_results(
                     "approval_status": a.approval_status,
                     "approved_by_email": a.approved_by_email,
                     "approved_at": a.approved_at,
-                    "approval_notes": a.approval_notes
+                    "approval_notes": a.approval_notes,
+                    "cost_min": a.cost_min or 0.0,
+                    "cost_percent": a.cost_percent or 0.0,
+                    "cost_max": a.cost_max or 0.0,
+                    "cost_flat": a.cost_flat or 0.0
                 })
                 continue
             
@@ -1130,7 +1211,11 @@ def get_rfq_results(
                 "approval_status": a.approval_status,
                 "approved_by_email": a.approved_by_email,
                 "approved_at": a.approved_at,
-                "approval_notes": a.approval_notes
+                "approval_notes": a.approval_notes,
+                "cost_min": a.cost_min or 0.0,
+                "cost_percent": a.cost_percent or 0.0,
+                "cost_max": a.cost_max or 0.0,
+                "cost_flat": a.cost_flat or 0.0
             })
             
         # Filter nulls and sort by direction

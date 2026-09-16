@@ -150,8 +150,9 @@ class IssuanceRequestBase(BaseModel):
 
     @model_validator(mode='after')
     def validate_expiry(self):
-        # Skip validation for update subclass if partial
-        if getattr(self, '__class__', None) and self.__class__.__name__ == 'IssuanceRequestUpdate':
+        # Skip validation for update subclasses or output/response models (drafts allow null dates)
+        cls_name = getattr(self, '__class__', None).__name__ if getattr(self, '__class__', None) else ''
+        if cls_name in ('IssuanceRequestUpdate', 'IssuanceRequestOut') or getattr(self, 'status', None) == 'DRAFT':
             return self
 
         exp_type = (self.expiry_type or "FIXED_DATE").upper()

@@ -80,8 +80,22 @@ class CRUDQuotation:
         rfq_id = str(uuid.uuid4())
         date_str = datetime.now().strftime("%Y%m%d")
         
-        prefix = "TB" if obj_in.type == "TBILL" else "RFQ"
-        ref_no = f"{prefix}-{date_str}-{uuid.uuid4().hex[:4].upper()}"
+        parent_rfq = None
+        if getattr(obj_in, 'parent_rfq_id', None):
+            parent_rfq = db.query(QuotationRequest).filter(
+                QuotationRequest.id == obj_in.parent_rfq_id,
+                QuotationRequest.customer_id == customer_id
+            ).first()
+
+        if parent_rfq:
+            existing_count = db.query(QuotationRequest).filter(QuotationRequest.parent_rfq_id == parent_rfq.id).count()
+            base_ref = parent_rfq.ref_no.split("-R")[0]
+            ref_no = f"{base_ref}-R{existing_count + 1}"
+            parent_id = parent_rfq.id
+        else:
+            prefix = "TB" if obj_in.type == "TBILL" else "RFQ"
+            ref_no = f"{prefix}-{date_str}-{uuid.uuid4().hex[:4].upper()}"
+            parent_id = None
 
         initial_status = "PENDING_APPROVAL" if requires_approval else "PENDING"
 
@@ -107,7 +121,9 @@ class CRUDQuotation:
             quotation_base=obj_in.quotationBase,
             max_tolerance_percent=obj_in.maxTolerancePercent,
             document_path=document_path or obj_in.documentPath,
-            status=initial_status
+            status=initial_status,
+            token_validity_hours=getattr(obj_in, 'token_validity_hours', 24) or 24,
+            parent_rfq_id=parent_id
         )
         db.add(db_rfq)
         

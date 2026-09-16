@@ -42,11 +42,19 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Dependency to get a database session
 def get_db():
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    from fastapi import HTTPException as FastAPIHTTPException
+
     db = SessionLocal()
     try:
         yield db
         logger.debug("Committing DB Session")
         db.commit()
+    except (StarletteHTTPException, FastAPIHTTPException) as http_exc:
+        # Expected client-side errors (400, 401, 403, 404, etc.) - rollback cleanly without false error alarm
+        logger.debug(f"Rolling back DB Session due to client HTTP {http_exc.status_code}: {http_exc.detail}")
+        db.rollback()
+        raise
     except Exception as e:
         logger.error(f"Rolling back DB Session due to error: {e}")
         db.rollback()

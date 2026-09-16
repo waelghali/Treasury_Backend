@@ -72,21 +72,27 @@ class QuotationRequestCreate(BaseModel):
     selectedBanks: str # JSON string matching Node module format, or we can parse it in FastAPI
     token_validity_hours: Optional[int] = 24
     entity_id: Optional[int] = None
+    parent_rfq_id: Optional[str] = None
 
 class QuotationRequestOut(BaseModel):
     id: str
     ref_no: str
     type: str
-    direction: Optional[str]
-    value_date: Optional[str]
-    amount: Optional[float]
-    min_ticket_amount: Optional[float]
-    buy_currency: Optional[str]
-    sell_currency: Optional[str]
+    direction: Optional[str] = None
+    value_date: Optional[str] = None
+    amount: Optional[float] = None
+    min_ticket_amount: Optional[float] = None
+    buy_currency: Optional[str] = None
+    sell_currency: Optional[str] = None
+    settlement_date_start: Optional[str] = None
+    settlement_date_end: Optional[str] = None
+    maturity_date_start: Optional[str] = None
+    maturity_date_end: Optional[str] = None
+    eval_rate: Optional[float] = None
     window_start: datetime
     window_end: datetime
     status: str
-    token_validity_hours: Optional[int]
+    token_validity_hours: Optional[int] = 24
     entity_id: Optional[int] = None
     entity_name: Optional[str] = None
     created_at: datetime
@@ -114,12 +120,27 @@ class ReTenderRequest(BaseModel):
     token_validity_hours: Optional[int] = 24
 
 class QuotationResubmitRequest(BaseModel):
+    type: Optional[str] = None
+    direction: Optional[str] = None
+    value_date: Optional[str] = None
     amount: Optional[float] = None
+    min_ticket_amount: Optional[float] = None
+    buy_currency: Optional[str] = None
+    sell_currency: Optional[str] = None
+    settlement_date_start: Optional[str] = None
+    settlement_date_end: Optional[str] = None
+    maturity_date_start: Optional[str] = None
+    maturity_date_end: Optional[str] = None
+    eval_rate: Optional[float] = None
     window_start: Optional[datetime] = None
     window_end: Optional[datetime] = None
-    selected_bank_ids: Optional[List[int]] = None
     quotation_base: Optional[str] = None
     max_tolerance_percent: Optional[float] = None
+    document_path: Optional[str] = None
+    selected_banks: Optional[str] = None
+    selected_bank_ids: Optional[List[int]] = None
+    token_validity_hours: Optional[int] = 24
+    user_notes: Optional[str] = None
 
 # --- Bank Offers & OTP Schemas (Public) ---
 class OTPRequestCreate(BaseModel):
@@ -172,6 +193,10 @@ class QuotationResultItem(BaseModel):
     approved_by_email: Optional[str] = None
     approved_at: Optional[datetime] = None
     approval_notes: Optional[str] = None
+    cost_min: Optional[float] = 0.0
+    cost_percent: Optional[float] = 0.0
+    cost_max: Optional[float] = 0.0
+    cost_flat: Optional[float] = 0.0
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

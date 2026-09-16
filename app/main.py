@@ -243,6 +243,35 @@ def configure_app_instance(fastapi_app: FastAPI):
             except Exception as ddl_err:
                 logger.warning(f"Bank reconciliation smart classification schema migration check skipped: {ddl_err}")
 
+            # --- Quotation Anonymous Benchmark & Ranking Schema Migration Check ---
+            try:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        ALTER TABLE quotation_anonymous_benchmarks ADD COLUMN IF NOT EXISTS tenant_cohort_hash VARCHAR;
+                        CREATE INDEX IF NOT EXISTS ix_quotation_anonymous_benchmarks_tenant_cohort_hash ON quotation_anonymous_benchmarks(tenant_cohort_hash);
+
+                        CREATE TABLE IF NOT EXISTS bank_live_ranking_configs (
+                            id SERIAL PRIMARY KEY,
+                            bank_id INTEGER NOT NULL REFERENCES banks(id) ON DELETE CASCADE,
+                            trade_type VARCHAR(20) NOT NULL DEFAULT 'BOTH',
+                            scope_type VARCHAR(30) NOT NULL DEFAULT 'ALL_CUSTOMERS',
+                            customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+                            entity_scope_type VARCHAR(30) NOT NULL DEFAULT 'ALL_ENTITIES',
+                            entity_id INTEGER REFERENCES customer_entities(id) ON DELETE CASCADE,
+                            is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS ix_bank_live_ranking_configs_bank_id ON bank_live_ranking_configs(bank_id);
+                        CREATE INDEX IF NOT EXISTS ix_bank_live_ranking_configs_customer_id ON bank_live_ranking_configs(customer_id);
+                    """))
+                    conn.commit()
+                    logger.info("Quotation benchmark and live ranking schemas verified.")
+            except Exception as ddl_err:
+                logger.warning(f"Quotation benchmark schema migration check skipped: {ddl_err}")
+
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:
                 from sqlalchemy.orm import Session as DBSession

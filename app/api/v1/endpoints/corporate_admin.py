@@ -2071,7 +2071,7 @@ def request_quotation_revision(
         type="RFQ_NEEDS_REVISION",
         title=f"Action Required: RFQ {rfq.ref_no} Returned for Revision",
         message=f"Administrator feedback: {notes}",
-        link=f"/end-user/quotations/dashboard?edit_rfq_id={rfq.id}",
+        link=f"/end-user/quotations/active?revision_rfq_id={rfq.id}",
         is_read=False
     ))
     db.commit()
