@@ -336,6 +336,20 @@ class CurrencyExchangeRate(Base):
     # Optional relationship to your existing Currency model
     currency = relationship("Currency")
 
+class CBEInterestRateHistory(Base):
+    __tablename__ = "cbe_interest_rate_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rate_date = Column(Date, nullable=False, index=True)
+    lending_rate = Column(Float, nullable=False, comment="CBE Overnight Lending Rate (%)")
+    deposit_rate = Column(Float, nullable=False, comment="CBE Overnight Deposit Rate (%)")
+    mid_corridor_rate = Column(Float, nullable=False, comment="Arithmetic Average: (Lending + Deposit) / 2 (%)")
+    source = Column(String, default="CBE_PORTAL_SYNC", nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self: CBEInterestRateHistory):
+        return f"<CBEInterestRateHistory(id={self.id}, date='{self.rate_date}', mid={self.mid_corridor_rate}%)>"
+
 class LgType(BaseModel):
     __tablename__ = "lg_types"
     name = Column(String, unique=True, nullable=False, comment="Name of the LG Type (e.g., 'Performance LG', 'Advance Payment LG')")

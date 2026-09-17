@@ -931,6 +931,205 @@ async def run_daily_exchange_rate_sync(db: Session):
         logger.error(f"Error syncing CBE exchange rates: {e}", exc_info=True)
 
 
+async def run_daily_cbe_lending_rate_sync(db: Session):
+    """
+    Daily sync of Central Bank of Egypt (CBE) Policy Interest Rates:
+    - Overnight Lending Rate
+    - Overnight Deposit Rate
+    - Mid-Corridor Rate (Arithmetic Average: (Lending + Deposit) / 2)
+    Fetches the policy rates from CBE or updates CBE_OVERNIGHT_LENDING_RATE,
+    CBE_OVERNIGHT_DEPOSIT_RATE, and CBE_MID_CORRIDOR_RATE in global_configurations.
+    Gracefully defaults to:
+      - Lending: 20.00%
+      - Deposit: 19.00%
+      - Arithmetic Mid Corridor: 19.50%
+    """
+    logger.info("Starting Daily CBE Policy Rates (Lending, Deposit, Mid-Corridor) Sync...")
+    from sqlalchemy import cast, String
+    from app.models import GlobalConfiguration
+    from app.constants import GlobalConfigKey
+
+    url = "https://www.cbe.org.eg/en/monetary-policy/key-cbe-interest-rates"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    scraped_lending = None
+    scraped_deposit = None
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, "html.parser")
+            tables = soup.find_all("table")
+            for table in tables:
+                text_content = table.get_text()
+                if any(w in text_content for w in ["Lending", "Deposit", "Overnight"]):
+                    for row in table.find_all("tr"):
+                        cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+                        row_text = " ".join(cols).lower()
+                        if "lending" in row_text and scraped_lending is None:
+                            for candidate in cols:
+                                cand_clean = candidate.replace("%", "").strip()
+                                try:
+                                    val = float(cand_clean)
+                                    if 5.0 <= val <= 45.0:
+                                        scraped_lending = val
+                                        break
+                                except ValueError:
+                                    continue
+                        if "deposit" in row_text and scraped_deposit is None:
+                            for candidate in cols:
+                                cand_clean = candidate.replace("%", "").strip()
+                                try:
+                                    val = float(cand_clean)
+                                    if 5.0 <= val <= 45.0:
+                                        scraped_deposit = val
+                                        break
+                                except ValueError:
+                                    continue
+                    if scraped_lending is not None and scraped_deposit is not None:
+                        break
+    except Exception as scrape_err:
+        logger.warning(f"CBE interest rate fetch attempt had warning: {scrape_err}")
+
+    effective_lending = scraped_lending if scraped_lending is not None else 20.0
+    effective_deposit = scraped_deposit if scraped_deposit is not None else 19.0
+    effective_mid = round((effective_lending + effective_deposit) / 2.0, 4)
+
+    # Persist all 3 rate benchmarks to global configurations
+    rates_to_persist = [
+        (GlobalConfigKey.CBE_OVERNIGHT_LENDING_RATE, effective_lending, "CBE Overnight Lending Rate (%)"),
+        (GlobalConfigKey.CBE_OVERNIGHT_DEPOSIT_RATE, effective_deposit, "CBE Overnight Deposit Rate (%)"),
+        (GlobalConfigKey.CBE_MID_CORRIDOR_RATE, effective_mid, "CBE Mid-Corridor Rate: (Lending + Deposit) / 2 (%)"),
+    ]
+
+    for key_enum, val_num, desc in rates_to_persist:
+        try:
+            cfg = db.query(GlobalConfiguration).filter(
+                cast(GlobalConfiguration.key, String) == key_enum.value,
+                GlobalConfiguration.is_deleted == False
+            ).first()
+            if cfg:
+                cfg.value_default = str(val_num)
+                db.commit()
+                logger.info(f"{desc} updated to {val_num}%.")
+            else:
+                logger.info(f"{desc} resolved as {val_num}% (config row not present yet).")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error persisting {key_enum.value}: {e}", exc_info=True)
+
+    # 4. Record snapshot into immutable historical timeseries table
+    try:
+        from app.models.models import CBEInterestRateHistory
+        from datetime import date
+        today = date.today()
+        existing_history = db.query(CBEInterestRateHistory).filter(
+            CBEInterestRateHistory.rate_date == today
+        ).first()
+
+        source_label = "CBE_OFFICIAL_WEBSITE" if scraped_lending is not None else "CBE_BASELINE_CORRIDOR"
+        if existing_history:
+            existing_history.lending_rate = effective_lending
+            existing_history.deposit_rate = effective_deposit
+            existing_history.mid_corridor_rate = effective_mid
+            existing_history.source = source_label
+        else:
+            new_history = CBEInterestRateHistory(
+                rate_date=today,
+                lending_rate=effective_lending,
+                deposit_rate=effective_deposit,
+                mid_corridor_rate=effective_mid,
+                source=source_label
+            )
+            db.add(new_history)
+        db.commit()
+        logger.info(f"Recorded CBE interest rate history for {today}: Lending={effective_lending}%, Deposit={effective_deposit}%, Mid={effective_mid}%.")
+    except Exception as hist_err:
+        db.rollback()
+        logger.error(f"Error recording CBE interest rate history: {hist_err}", exc_info=True)
+
+
+run_daily_cbe_interest_rates_sync = run_daily_cbe_lending_rate_sync
+
+
+def get_effective_quotation_eval_rate(db: Session, customer_id: Optional[int] = None) -> float:
+    """
+    Computes the effective evaluation rate for quotation alternative value dates:
+    R_eval = CBE_MID_CORRIDOR_RATE + QUOTATION_VALUE_DATE_INTEREST_MARGIN
+    Where CBE_MID_CORRIDOR_RATE is the arithmetic average of Lending and Deposit rates:
+      CBE_MID_CORRIDOR_RATE = (CBE_LENDING + CBE_DEPOSIT) / 2.0
+    Default CBE rates: Lending 20.00%, Deposit 19.00% -> Mid 19.50%
+    Default customer margin: 0.25%
+    Total default: 19.75%
+    """
+    from sqlalchemy import cast, String
+    from app.models import GlobalConfiguration
+    from app.constants import GlobalConfigKey
+    from app.crud.crud_config import crud_customer_configuration
+
+    cbe_mid = None
+    # 1. Try reading the arithmetic mid corridor rate directly
+    try:
+        mid_cfg = db.query(GlobalConfiguration).filter(
+            cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_MID_CORRIDOR_RATE.value,
+            GlobalConfiguration.is_deleted == False
+        ).first()
+        if mid_cfg and mid_cfg.value_default:
+            cbe_mid = float(mid_cfg.value_default)
+    except Exception:
+        cbe_mid = None
+
+    # 2. If mid not set, calculate from lending and deposit configs
+    if cbe_mid is None:
+        lending = 20.0
+        deposit = 19.0
+        try:
+            lending_cfg = db.query(GlobalConfiguration).filter(
+                cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_LENDING_RATE.value,
+                GlobalConfiguration.is_deleted == False
+            ).first()
+            if lending_cfg and lending_cfg.value_default:
+                lending = float(lending_cfg.value_default)
+        except Exception:
+            pass
+
+        try:
+            deposit_cfg = db.query(GlobalConfiguration).filter(
+                cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_DEPOSIT_RATE.value,
+                GlobalConfiguration.is_deleted == False
+            ).first()
+            if deposit_cfg and deposit_cfg.value_default:
+                deposit = float(deposit_cfg.value_default)
+        except Exception:
+            pass
+
+        cbe_mid = round((lending + deposit) / 2.0, 4)
+
+    margin = 0.25
+    if customer_id:
+        try:
+            cfg_dict = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id, GlobalConfigKey.QUOTATION_VALUE_DATE_INTEREST_MARGIN
+            )
+            if cfg_dict and cfg_dict.get("effective_value") is not None:
+                margin = float(cfg_dict["effective_value"])
+        except Exception:
+            margin = 0.25
+    else:
+        try:
+            margin_cfg = db.query(GlobalConfiguration).filter(
+                cast(GlobalConfiguration.key, String) == GlobalConfigKey.QUOTATION_VALUE_DATE_INTEREST_MARGIN.value,
+                GlobalConfiguration.is_deleted == False
+            ).first()
+            if margin_cfg and margin_cfg.value_default:
+                margin = float(margin_cfg.value_default)
+        except Exception:
+            margin = 0.25
+
+    return round(cbe_mid + margin, 4)
+
+
 async def _check_fx_breach_auto_suspend(db: Session):
     """
     C4: FX Breach Auto-Suspend.

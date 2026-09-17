@@ -9,6 +9,8 @@ import io
 import os
 import uuid
 import shutil
+import threading
+import asyncio
 
 from app.database import get_db
 from app.core.security import get_current_active_user, TokenData
@@ -361,22 +363,25 @@ def create_rfq(
 
                         approver_link = f"{base_url}/public-quotation/{assignment['token']}?magic_token={magic_token}"
                         approver_subject = f"APPROVAL REQUIRED: RFQ {rfq.ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
+                        amount_formatted = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
                         approver_body = f"""
                         <html>
-                        <body>
+                        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
                             <p>Dear {bank_name} Authorized Approver,</p>
-                            <p>Your bank has been invited to participate in a new <strong>Execution</strong> Request for Quotation (RFQ).</p>
+                            <p>Your bank has been invited to participate in a new <strong>Execution</strong> Request for Quotation (RFQ) on behalf of <strong>{rfq.customer.name if rfq.customer else 'Treasury Customer'}</strong>.</p>
                             <br/>
-                            <ul>
-                                <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                                <li><strong>Product:</strong> {rfq.type}</li>
-                                <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
-                            </ul>
-                            <p>Please review the RFQ details and approve your bank's participation. Once approved, your execution desk will receive the secure link to submit their binding quote.</p>
-                            <a href="{approver_link}" style="padding: 12px 24px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 6px; display: inline-block; margin-top: 10px; font-weight: bold;">Review & Approve RFQ</a>
+                            <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
+                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
+                                <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{rfq.type}</td></tr>
+                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair & Direction:</td><td style="padding: 10px;">{rfq.buy_currency}/{rfq.sell_currency} ({rfq.direction or 'Buy'})</td></tr>
+                                <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {rfq.buy_currency or ''}</td></tr>
+                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{rfq.value_date or 'N/A'}</td></tr>
+                            </table>
+                            <br/>
+                            <p>Please review the RFQ details and authorize your bank's participation. Once authorized, your execution desk will receive the live link to submit their binding quote.</p>
+                            <a href="{approver_link}" style="padding: 14px 28px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 8px; display: inline-block; margin-top: 10px; font-weight: bold;">⚡ Review & Authorize RFQ</a>
                             <br/><br/>
-                            <p>Best Regards,</p>
-                            <p>Treasury Team</p>
+                            <p>Best Regards,<br/>Treasury Operations</p>
                         </body>
                         </html>
                         """
@@ -386,21 +391,24 @@ def create_rfq(
                     non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
                     if non_approver_emails:
                         headsup_subject = f"HEADS UP: New RFQ Pending Bank Approval - {rfq.ref_no}"
+                        amount_formatted = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
                         headsup_body = f"""
                         <html>
-                        <body>
+                        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
                             <p>Dear {bank_name} FX Desk,</p>
                             <p>A new Request for Quotation (RFQ) has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
                             <br/>
-                            <ul>
-                                <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                                <li><strong>Product:</strong> {rfq.type}</li>
-                                <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
-                            </ul>
+                            <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
+                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
+                                <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{rfq.type}</td></tr>
+                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair & Direction:</td><td style="padding: 10px;">{rfq.buy_currency}/{rfq.sell_currency} ({rfq.direction or 'Buy'})</td></tr>
+                                <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {rfq.buy_currency or ''}</td></tr>
+                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{rfq.value_date or 'N/A'}</td></tr>
+                            </table>
+                            <br/>
                             <p>You will receive a follow-up notification with a secure access link once your bank's approver has authorized participation.</p>
                             <br/>
-                            <p>Best Regards,</p>
-                            <p>Treasury Team</p>
+                            <p>Best Regards,<br/>Treasury Operations</p>
                         </body>
                         </html>
                         """
@@ -409,25 +417,17 @@ def create_rfq(
                     # --- STANDARD FLOW (no approval needed) ---
                     bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
                     if bank_emails:
-                        subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
-                        body = f"""
-                        <html>
-                        <body>
-                            <p>Dear {bank_name} FX Desk,</p>
-                            <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
-                            <br/>
-                            <ul>
-                                <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                                <li><strong>Product:</strong> {rfq.type}</li>
-                            </ul>
-                            <p>To view full terms and submit your quote (or observe in View-Only mode), please click the secure link below. This link is unique to your institution and will expire automatically.</p>
-                            <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Access Quotation Portal</a>
-                            <br/><br/>
-                            <p>Best Regards,</p>
-                            <p>Treasury Team</p>
-                        </body>
-                        </html>
-                        """
+                        from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                        customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+                        db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.id == assignment["id"]).first()
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=db_assignment,
+                            bank_name=bank_name,
+                            customer_branding=customer_branding,
+                            link=link,
+                            email_purpose="INVITATION"
+                        )
                         background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
         else:
             # Notify Corporate Admins
@@ -582,10 +582,8 @@ def retender_quotation(
     if not parent:
         raise HTTPException(status_code=404, detail="Quotation not found.")
 
-    # Calculate re-tender suffix
-    existing_count = db.query(QuotationRequest).filter(QuotationRequest.parent_rfq_id == parent.id).count()
-    base_ref = parent.ref_no.split("-R")[0]
-    new_ref_no = f"{base_ref}-R{existing_count + 1}"
+    # Calculate unique sequential re-tender suffix
+    new_ref_no, root_parent_id = crud_quotation.get_unique_retender_ref_no(db, parent)
 
     # Determine window times
     now = datetime.now(timezone.utc)
@@ -629,10 +627,11 @@ def retender_quotation(
         window_end=w_end,
         quotation_base=parent.quotation_base,
         max_tolerance_percent=parent.max_tolerance_percent,
+        allow_alternative_value_date=parent.allow_alternative_value_date or False,
         document_path=parent.document_path,
         status=initial_status,
         token_validity_hours=payload.token_validity_hours or parent.token_validity_hours or 24,
-        parent_rfq_id=parent.id
+        parent_rfq_id=root_parent_id
     )
     db.add(new_rfq)
     db.flush()
@@ -662,6 +661,8 @@ def retender_quotation(
             cost_flat=pa.cost_flat,
             quotation_base=pa.quotation_base,
             is_document_visible=pa.is_document_visible,
+            value_date=pa.value_date,
+            allow_alternative_value_date=pa.allow_alternative_value_date,
             approval_status=assignment_approval_status
         )
         db.add(new_assignment)
@@ -686,21 +687,16 @@ def retender_quotation(
             bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
             if bank_emails:
                 link = f"{base_url}/public-quotation/{item['token']}"
-                subject = f"ACTION REQUIRED: Re-Tender RFQ Request from {customer_branding} - {new_rfq.type} - {new_rfq.ref_no}"
-                body = f"""
-                <html>
-                <body>
-                    <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
-                    <p>You have received a new re-tendered Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>.</p>
-                    <ul>
-                        <li><strong>Reference:</strong> {new_rfq.ref_no} (Re-tender of {parent.ref_no})</li>
-                        <li><strong>Product:</strong> {new_rfq.type}</li>
-                        <li><strong>Amount:</strong> {new_rfq.amount} {new_rfq.buy_currency or ''}</li>
-                    </ul>
-                    <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block;">Access Quotation Portal</a>
-                </body>
-                </html>
-                """
+                from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                subject, body = build_quotation_rfq_bank_email(
+                    rfq=new_rfq,
+                    assignment=item.get("assignment"),
+                    bank_name=bank_display_name,
+                    customer_branding=customer_branding,
+                    link=link,
+                    email_purpose="RE_TENDER"
+                )
                 background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
     else:
         # Notify Corporate Admins
@@ -783,6 +779,8 @@ def resubmit_quotation(
         rfq.document_path = payload.document_path
     if payload.token_validity_hours is not None:
         rfq.token_validity_hours = payload.token_validity_hours
+    if payload.allow_alternative_value_date is not None:
+        rfq.allow_alternative_value_date = payload.allow_alternative_value_date
 
     # If new selected banks provided from the builder, re-sync bank assignments
     if payload.selected_banks:
@@ -809,6 +807,9 @@ def resubmit_quotation(
                     is_exec = (rfq.quotation_base or '').lower() == 'execution' or effective_base == 'execution'
                     bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
 
+                    bank_value_date = b_data.get('valueDate') or rfq.value_date
+                    bank_allow_alt = b_data.get('allowAlternativeValueDate')
+
                     db_assignment = QuotationBankAssignment(
                         id=assignment_id,
                         rfq_id=rfq.id,
@@ -820,6 +821,8 @@ def resubmit_quotation(
                         cost_flat=b_data.get('costFlat', 0.0),
                         quotation_base=q_base_override or rfq.quotation_base,
                         is_document_visible=is_doc_vis,
+                        value_date=bank_value_date,
+                        allow_alternative_value_date=bank_allow_alt,
                         approval_status=bank_approval_status
                     )
                     db.add(db_assignment)
@@ -976,7 +979,7 @@ def get_rfq_results(
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """Calculates active Quotation standings/results for a given RFQ."""
-    if current_user:
+    if current_user and hasattr(current_user, 'customer_id'):
         rfq = crud_quotation.get_request(db, rfq_id=rfq_id, customer_id=current_user.customer_id)
     else:
         rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
@@ -1152,6 +1155,9 @@ def get_rfq_results(
             offer_db = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
             q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
             
+            assigned_val_date = a.value_date or rfq.value_date
+            allow_alt_val = a.allow_alternative_value_date if a.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
+
             if not offer_db:
                 results.append({
                     "bank_id": q_bank.bank_id if q_bank else 0,
@@ -1160,6 +1166,12 @@ def get_rfq_results(
                     "bank_emails": q_bank.emails if q_bank else "",
                     "price": None,
                     "finalPrice": None,
+                    "normalized_price": None,
+                    "assigned_value_date": str(assigned_val_date) if assigned_val_date is not None else None,
+                    "offered_value_date": None,
+                    "allow_alternative_value_date": allow_alt_val,
+                    "is_alternative_value_date": False,
+                    "time_value_adjustment": 0.0,
                     "notes": None,
                     "submitted_at": None,
                     "submitted_by_email": None,
@@ -1190,8 +1202,34 @@ def get_rfq_results(
                 
             fee_per_unit = clamped_fee / deal_amount if deal_amount > 0 else 0.0
             is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
-            final_all_in_price = (price - fee_per_unit) if is_sell_dir else (price + fee_per_unit)
+            final_all_in_price = round((price - fee_per_unit) if is_sell_dir else (price + fee_per_unit), 5)
+
+            # TVM Normalization for Alternative / Custom Value Date
+            # The benchmark for TVM normalization across ALL counterparties is the RFQ's master target value date (rfq.value_date).
+            # Any counterparty settling on a date different from rfq.value_date (whether via per-bank assigned value date or an offered alternative date)
+            # must have TVM adjustment applied against rfq.value_date.
+            rfq_target_val_date = rfq.value_date
+            effective_val_date = offer_db.offered_value_date or assigned_val_date or rfq_target_val_date
+            normalized_price = final_all_in_price
+            tvm_adjustment = 0.0
+            is_alt_date = False
+
+            if rfq_target_val_date and effective_val_date:
+                try:
+                    target_dt = datetime.strptime(str(rfq_target_val_date).split('T')[0], "%Y-%m-%d").date()
+                    offered_dt = datetime.strptime(str(effective_val_date).split('T')[0], "%Y-%m-%d").date()
+                    delta_days = (offered_dt - target_dt).days
+                    if delta_days != 0:
+                        is_alt_date = True
+                        r_eval = (rfq.eval_rate or 20.25) / 100.0
+                        normalized_price = round(final_all_in_price * (1.0 - (r_eval * (delta_days / 365.0))), 5)
+                        tvm_adjustment = round(normalized_price - final_all_in_price, 5)
+                except Exception as tvm_err:
+                    logger.warning(f"Error computing TVM adjustment: {tvm_err}")
                 
+            assigned_val_str = str(assigned_val_date) if assigned_val_date is not None else (str(rfq.value_date) if rfq.value_date is not None else None)
+            offered_val_str = str(effective_val_date) if effective_val_date is not None else None
+
             results.append({
                 "bank_id": q_bank.bank_id if q_bank else 0,
                 "quotation_bank_id": a.quotation_bank_id,
@@ -1199,6 +1237,12 @@ def get_rfq_results(
                 "bank_emails": q_bank.emails if q_bank else "",
                 "price": price,
                 "finalPrice": final_all_in_price,
+                "normalized_price": normalized_price,
+                "assigned_value_date": assigned_val_str,
+                "offered_value_date": offered_val_str,
+                "allow_alternative_value_date": allow_alt_val,
+                "is_alternative_value_date": is_alt_date,
+                "time_value_adjustment": tvm_adjustment,
                 "bank_fee_total": clamped_fee,
                 "fee_per_unit": fee_per_unit,
                 "notes": offer_db.notes,
@@ -1218,10 +1262,26 @@ def get_rfq_results(
                 "cost_flat": a.cost_flat or 0.0
             })
             
-        # Filter nulls and sort by direction
+        # Filter nulls and sort by direction using normalized_price for economic ranking, with earlier submission timestamp as tie-breaker
         is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
         valid_results = [r for r in results if r.get('finalPrice') is not None]
-        valid_results.sort(key=lambda x: x['finalPrice'], reverse=is_sell)
+
+        def _sort_ts(r):
+            ts = r.get('submitted_at')
+            if ts and hasattr(ts, 'timestamp'):
+                return ts.timestamp()
+            return float('inf')
+
+        if is_sell:
+            valid_results.sort(key=lambda x: (
+                -(x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
+                _sort_ts(x)
+            ))
+        else:
+            valid_results.sort(key=lambda x: (
+                (x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
+                _sort_ts(x)
+            ))
         results = valid_results + [r for r in results if r.get('finalPrice') is None]
         
         # --- Evaluation Logic: Execution vs Indicative & Max Tolerance Check ---
@@ -1252,9 +1312,9 @@ def get_rfq_results(
                 inconclusive_reason = "No Execution quotes were submitted before the window closed. Only Indicative quotes were received."
             
             if indicative_bids:
-                best_indicative_rate = indicative_bids[0]['finalPrice'] # Already sorted by direction
+                best_indicative_rate = indicative_bids[0].get('normalized_price') or indicative_bids[0]['finalPrice']
             if execution_bids:
-                best_execution_rate = execution_bids[0]['finalPrice'] # Already sorted by direction
+                best_execution_rate = execution_bids[0].get('normalized_price') or execution_bids[0]['finalPrice']
                 
             if execution_bids:
                 best_exec_item = execution_bids[0]
@@ -1366,6 +1426,10 @@ def get_rfq_results(
                         "total_quotes": len(scores)
                     }
 
+    # Auto-dispatch result emails for concluded Execution quotations if not already sent
+    if is_closed and winner_bank_id and not is_inconclusive and has_execution_banks:
+        trigger_auto_dispatch_results(rfq.id)
+
     return {
         "rfq": rfq,
         "results": results,
@@ -1380,38 +1444,51 @@ def get_rfq_results(
         "savings_summary": savings_summary
     }
 
-@router.post("/{rfq_id}/send-results")
-async def send_rfq_results(
-    rfq_id: str,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_active_user)
-):
-    """Sends winner/regret emails to assigned Execution banks for a completed RFQ."""
+_DISPATCHING_RFQS = set()
+
+async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = False) -> dict:
+    """Sends winner & regret emails to assigned Execution banks for a completed RFQ."""
+    from app.models.models import AuditLog
+    from app.crud.crud import log_action
+
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
     if not rfq:
-        raise HTTPException(status_code=404, detail="RFQ not found")
-    
-    # Process results retrieval
-    res_data = get_rfq_results(rfq_id, db, current_user)
-    results = res_data["results"]
+        return {"status": "error", "detail": "RFQ not found"}
+
+    # Idempotency check: only send once automatically unless manually forced by admin
+    if not force:
+        already_sent = db.query(AuditLog).filter(
+            AuditLog.action_type == "QUOTATION_RESULTS_SENT",
+            AuditLog.entity_type == "QuotationRequest"
+        ).filter(
+            AuditLog.details["rfq_id"].astext == str(rfq.id)
+        ).first()
+        if already_sent:
+            return {"status": "skipped", "detail": "Result emails already dispatched for this RFQ"}
+
+    # Evaluate results using central evaluation engine
+    res_data = get_rfq_results(rfq_id, db, current_user=None)
+    results = res_data.get("results", [])
     is_inconclusive = res_data.get("is_inconclusive", False)
     inconclusive_reason = res_data.get("inconclusive_reason")
     winner_bank_id = res_data.get("winner_bank_id")
 
     if is_inconclusive:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot send deal result emails: {inconclusive_reason or 'RFQ ended without a conclusive winner.'}"
-        )
-        
+        return {"status": "skipped", "detail": f"RFQ ended without a conclusive winner: {inconclusive_reason}"}
+
     if not winner_bank_id:
-        raise HTTPException(status_code=400, detail="Cannot send result emails: No winning Execution quote found.")
+        return {"status": "skipped", "detail": "No winning Execution quote found."}
 
     from app.core.email_service import get_customer_email_settings, send_email
+    from app.services.unified_email_builder import build_transaction_email_html
     email_settings, source = get_customer_email_settings(db, rfq.customer_id)
 
+    customer_name = rfq.customer.name if rfq.customer else "Treasury Client"
+    ref_no = rfq.ref_no
+    emails_dispatched = 0
+
     for bank_res in results:
-        # Indicative banks do not receive execution win/regret emails
+        # Strictly for Execution banks only - Indicative quotes are for sounding only
         q_base = (bank_res.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
         if q_base == 'indicative':
             continue
@@ -1424,11 +1501,20 @@ async def send_rfq_results(
 
         if not bank_emails:
             continue
-        
+
         is_winner = (bank_res['bank_id'] == winner_bank_id)
-        
-        ref_no = rfq.ref_no
-        customer_name = rfq.customer.name if rfq.customer else "Treasury Client"
+
+        # Identify dealer who confirmed / submitted the deal
+        dealer_identity = bank_res.get('submitted_by_email') or "Authorized Execution Dealer"
+        sub_time_str = "N/A"
+        if bank_res.get('submitted_at'):
+            try:
+                sub_time_str = bank_res['submitted_at'].strftime("%d %b %Y, %H:%M:%S UTC")
+            except Exception:
+                sub_time_str = str(bank_res['submitted_at'])
+
+        executed_val_date = bank_res.get('offered_value_date') or bank_res.get('assigned_value_date') or str(rfq.value_date) or 'Standard Spot'
+
         if is_winner:
             subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
             body = build_transaction_email_html(
@@ -1437,33 +1523,42 @@ async def send_rfq_results(
                 transaction_ref=ref_no,
                 transaction_type="RFQ Execution",
                 key_value_dict={
+                    "RFQ Reference": ref_no,
                     "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
                     "Direction": rfq.direction,
                     "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
                     "Executed Rate": f"<span style='color: #16a34a; font-weight: 700;'>{bank_res['price']:.5f}</span>",
                     "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
-                    "Value Date": rfq.value_date or 'Standard Spot'
+                    "Settlement Value Date": executed_val_date,
+                    "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
+                    "Execution Timestamp": sub_time_str
                 },
                 summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
                 recipient_name=f"{bank_res['bank_name']} Treasury Desk"
             )
         else:
             subject = f"RFQ Result Notification: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
-            body = build_standard_email_html(
+            quote_display = f"{bank_res['price']:.5f}" if bank_res.get('price') is not None else "No Quote Submitted"
+            body = build_transaction_email_html(
                 customer_name=customer_name,
-                title="RFQ Result Notification",
-                content_html=f"""
-                <p>Thank you for participating in the Request for Quotation (RFQ) for <strong>{rfq.buy_currency}/{rfq.sell_currency}</strong> with <strong>{customer_name}</strong>.</p>
-                <p>We are writing to inform you that your quote was not selected for this specific deal as we executed with another counterparty at a more competitive all-in rate.</p>
-                <p>We appreciate your prompt participation and look forward to receiving your quotes on future requests.</p>
-                """,
+                title="RFQ Concluded - Trade Outcome Notification",
+                transaction_ref=ref_no,
+                transaction_type="RFQ Outcome",
+                key_value_dict={
+                    "RFQ Reference": ref_no,
+                    "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                    "Direction": rfq.direction,
+                    "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
+                    "Target Value Date": executed_val_date,
+                    "Your Submitted Quote": quote_display,
+                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Another Counterparty</span>"
+                },
+                summary_text=f"Thank you for submitting your quote for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this transaction has concluded and was executed with another counterparty who offered a more competitive all-in rate.",
                 recipient_name=f"{bank_res['bank_name']} Treasury Desk"
             )
 
-        
-        # Override sender name to "Treasury Quotations" if using system default
         sender_name = "Treasury Quotations" if source != "customer_specific" else email_settings.sender_display_name
-        
+
         await send_email(
             db=db,
             to_emails=bank_emails,
@@ -1473,8 +1568,78 @@ async def send_rfq_results(
             email_settings=email_settings,
             sender_name=sender_name
         )
+        emails_dispatched += 1
 
-    return {"message": "Result emails sent to all participating banks."}
+    # Record audit log for idempotency
+    log_action(
+        db,
+        user_id=rfq.created_by_user_id,
+        action_type="QUOTATION_RESULTS_SENT",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": str(rfq.id),
+            "ref_no": rfq.ref_no,
+            "winner_bank_id": winner_bank_id,
+            "emails_count": emails_dispatched,
+            "dispatched_at": datetime.now(timezone.utc).isoformat()
+        },
+        customer_id=rfq.customer_id
+    )
+    db.commit()
+
+    return {"status": "sent", "dispatched_count": emails_dispatched, "winner_bank_id": winner_bank_id}
+
+def _run_auto_dispatch(rfq_id: str):
+    from app.database import SessionLocal
+    db_local = SessionLocal()
+    try:
+        from app.models.models import AuditLog
+        already_sent = db_local.query(AuditLog).filter(
+            AuditLog.action_type == "QUOTATION_RESULTS_SENT",
+            AuditLog.entity_type == "QuotationRequest"
+        ).filter(
+            AuditLog.details["rfq_id"].astext == str(rfq_id)
+        ).first()
+        if already_sent:
+            return
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(dispatch_rfq_result_emails(rfq_id, db_local, force=False))
+        loop.close()
+    except Exception as err:
+        logger.warning(f"Auto-dispatching result emails failed for RFQ {rfq_id}: {err}")
+    finally:
+        _DISPATCHING_RFQS.discard(rfq_id)
+        db_local.close()
+
+def trigger_auto_dispatch_results(rfq_id: str):
+    if rfq_id in _DISPATCHING_RFQS:
+        return
+    _DISPATCHING_RFQS.add(rfq_id)
+    thread = threading.Thread(target=_run_auto_dispatch, args=(rfq_id,))
+    thread.daemon = True
+    thread.start()
+
+@router.post("/{rfq_id}/send-results")
+async def send_rfq_results(
+    rfq_id: str,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Sends or resends winner/regret emails to assigned Execution banks for a completed RFQ."""
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+
+    res = await dispatch_rfq_result_emails(rfq_id, db, force=True)
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("detail", "Error sending results"))
+    if res.get("status") == "skipped":
+        raise HTTPException(status_code=400, detail=res.get("detail", "Cannot send deal result emails: No conclusive winner found."))
+
+    return {"message": f"Result emails sent to participating banks ({res.get('dispatched_count', 0)} emails sent)."}
 
 @router.post("/{rfq_id}/resend-invite/{quotation_bank_id}")
 async def resend_rfq_bank_invite(
@@ -1510,25 +1675,18 @@ async def resend_rfq_bank_invite(
     bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]
     link = f"{base_url}/public-quotation/{assignment.token}"
     
-    subject = f"REMINDER: RFQ Request - {rfq.type} - {rfq.ref_no}"
-    body = f"""
-    <html>
-    <body>
-        <p>Dear {q_bank.bank.name if q_bank.bank else 'Bank Partner'} FX Desk,</p>
-        <p>This is a reminder regarding the Request for Quotation (RFQ) on our Treasury Platform.</p>
-        <br/>
-        <ul>
-            <li><strong>Reference:</strong> {rfq.ref_no}</li>
-            <li><strong>Product:</strong> {rfq.type}</li>
-        </ul>
-        <p>To submit your quote, please click the secure link below. This link is unique to your institution and will expire automatically.</p>
-        <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Submit Quote Now</a>
-        <br/><br/>
-        <p>Best Regards,</p>
-        <p>Treasury Team</p>
-    </body>
-    </html>
-    """
+    from app.services.unified_email_builder import build_quotation_rfq_bank_email
+    customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+    bank_display_name = q_bank.bank.name if q_bank.bank else "Bank Partner"
+    
+    subject, body = build_quotation_rfq_bank_email(
+        rfq=rfq,
+        assignment=assignment,
+        bank_name=bank_display_name,
+        customer_branding=customer_branding,
+        link=link,
+        email_purpose="REMINDER"
+    )
     background_tasks.add_task(
         send_email,
         db,
@@ -1538,7 +1696,7 @@ async def resend_rfq_bank_invite(
         {},
         email_settings,
     )
-    return {"message": f"Invitation email resent to {q_bank.bank.name if q_bank.bank else 'Bank'}"}
+    return {"message": f"Invitation email resent to {bank_display_name}"}
 
 @router.get("/notifications")
 def get_my_notifications(

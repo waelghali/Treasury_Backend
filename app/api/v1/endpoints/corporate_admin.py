@@ -979,6 +979,13 @@ def update_customer_configuration(
     customer_id = corporate_admin_context.customer_id
     key_for_db = global_config_key.upper()
 
+    # 0. Prevent editing official CBE policy rates
+    if key_for_db in ["CBE_OVERNIGHT_LENDING_RATE", "CBE_OVERNIGHT_DEPOSIT_RATE", "CBE_MID_CORRIDOR_RATE"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Central Bank of Egypt (CBE) benchmark interest rates are automatically synchronized from official sources and cannot be manually modified."
+        )
+
     try:
         # 1. Validation: Convert the string key to the Enum instance (This is necessary for the next check)
         config_key_enum = GlobalConfigKey(key_for_db)
@@ -1932,6 +1939,8 @@ def approve_quotation(
     # Standard Bank Branding
     customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
 
+    from app.services.unified_email_builder import build_quotation_rfq_bank_email
+
     for assignment in assignments:
         bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
         if bank_row:
@@ -1943,42 +1952,24 @@ def approve_quotation(
 
             if bank_emails:
                 link = f"{base_url}/public-quotation/{assignment.token}"
-                subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {rfq.type} - {rfq.ref_no}"
-            body = f"""
-            <html>
-            <body style="font-family: sans-serif; color: #333;">
-                <div style="max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
-                    <h2 style="color: #000;">New Quotation Request</h2>
-                    <p>Dear {bank_row.bank.name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
-                    <p>You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>.</p>
-                    <div style="background-color: #f9f9f9; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                        <ul style="list-style: none; padding: 0;">
-                            <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                            <li><strong>Product:</strong> {rfq.type}</li>
-                            <li><strong>Direction:</strong> {rfq.direction or 'N/A'}</li>
-                            <li><strong>Amount:</strong> {rfq.amount} {rfq.buy_currency or ''}</li>
-                        </ul>
-                    </div>
-                    <p>Please click the secure link below to view full details and submit your quote:</p>
-                    <div style="text-align: center; margin: 30px 0;">
-                        <a href="{link}" style="padding: 12px 30px; background-color: #000; color: #fff; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">View & Submit Quote</a>
-                    </div>
-                    <p style="font-size: 12px; color: #888;">This link is secure and unique to your institution. It will expire automatically once the quotation window closes.</p>
-                    <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
-                    <p style="font-size: 12px; color: #888;">Best Regards,<br/>Operations Team</p>
-                </div>
-            </body>
-            </html>
-            """
-            background_tasks.add_task(
-                send_email,
-                db,
-                bank_emails,
-                subject,
-                body,
-                {}, 
-                email_settings,
-            )
+                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                subject, body = build_quotation_rfq_bank_email(
+                    rfq=rfq,
+                    assignment=assignment,
+                    bank_name=bank_display_name,
+                    customer_branding=customer_branding,
+                    link=link,
+                    email_purpose="INVITATION"
+                )
+                background_tasks.add_task(
+                    send_email,
+                    db,
+                    bank_emails,
+                    subject,
+                    body,
+                    {}, 
+                    email_settings,
+                )
             
     db.commit()
     
@@ -2140,41 +2131,37 @@ def approve_quotation_request(
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         
-        assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.quotation_request_id == rfq.id).all()
+        customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+        assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
         for assignment in assignments:
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
-            if bank_row and bank_row.emails:
-                bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
-                link = f"{base_url}/public-quotation/{assignment.token}"
-                
-                subject = f"ACTION REQUIRED: New RFQ Request - {rfq.type} - {rfq.ref_no}"
-                body = f"""
-                <html>
-                <body>
-                    <p>Dear {bank_row.bank.bank_name if bank_row.bank else 'Bank Partner'} FX Desk,</p>
-                    <p>You have received a new Request for Quotation (RFQ) on our Treasury Platform.</p>
-                    <br/>
-                    <ul>
-                        <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                        <li><strong>Product:</strong> {rfq.type}</li>
-                    </ul>
-                    <p>To submit your quote, please click the secure link below. This link is unique to your institution and will expire automatically.</p>
-                    <a href="{link}" style="padding: 10px 20px; background-color: #000; color: #fff; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;">Submit Quote Now</a>
-                    <br/><br/>
-                    <p>Best Regards,</p>
-                    <p>Treasury Team</p>
-                </body>
-                </html>
-                """
-                background_tasks.add_task(
-                    send_email,
-                    db,
-                    bank_emails,
-                    subject,
-                    body,
-                    {}, 
-                    email_settings,
-                )
+            if bank_row:
+                bank_emails = []
+                if bank_row.contacts and isinstance(bank_row.contacts, list):
+                    bank_emails = [c.get("email", "").strip() for c in bank_row.contacts if c.get("email")]
+                if not bank_emails and bank_row.emails:
+                    bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
+
+                if bank_emails:
+                    link = f"{base_url}/public-quotation/{assignment.token}"
+                    bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                    subject, body = build_quotation_rfq_bank_email(
+                        rfq=rfq,
+                        assignment=assignment,
+                        bank_name=bank_display_name,
+                        customer_branding=customer_branding,
+                        link=link,
+                        email_purpose="INVITATION"
+                    )
+                    background_tasks.add_task(
+                        send_email,
+                        db,
+                        bank_emails,
+                        subject,
+                        body,
+                        {}, 
+                        email_settings,
+                    )
 
     return {"message": "Quotation status updated successfully.", "status": rfq.status}
 
@@ -2470,3 +2457,55 @@ def delete_project(
     db.delete(project)
     db.commit()
     return {"ok": True}
+
+@router.get("/cbe-rates-history")
+def get_cbe_rates_history(
+    limit: int = 30,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Returns the historical audit trail of Central Bank of Egypt (CBE) policy benchmark rates."""
+    from app.models.models import CBEInterestRateHistory
+    records = db.query(CBEInterestRateHistory).order_by(
+        CBEInterestRateHistory.rate_date.desc()
+    ).limit(limit).all()
+
+    return [
+        {
+            "id": r.id,
+            "rate_date": r.rate_date.isoformat() if r.rate_date else None,
+            "lending_rate": r.lending_rate,
+            "deposit_rate": r.deposit_rate,
+            "mid_corridor_rate": r.mid_corridor_rate,
+            "source": r.source,
+            "recorded_at": r.created_at.isoformat() if r.created_at else None
+        }
+        for r in records
+    ]
+
+@router.post("/cbe-rates-sync")
+async def trigger_cbe_rates_sync(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Manually triggers an immediate synchronization of official Central Bank of Egypt policy rates."""
+    from app.core.background_tasks import run_daily_cbe_lending_rate_sync
+    from app.models.models import CBEInterestRateHistory
+    
+    await run_daily_cbe_lending_rate_sync(db)
+    
+    latest = db.query(CBEInterestRateHistory).order_by(
+        CBEInterestRateHistory.rate_date.desc()
+    ).first()
+    
+    return {
+        "success": True,
+        "message": "CBE policy interest rates synchronized successfully.",
+        "latest_rate": {
+            "rate_date": latest.rate_date.isoformat() if latest and latest.rate_date else None,
+            "lending_rate": latest.lending_rate if latest else 20.0,
+            "deposit_rate": latest.deposit_rate if latest else 19.0,
+            "mid_corridor_rate": latest.mid_corridor_rate if latest else 19.5,
+            "source": latest.source if latest else "CBE_PORTAL_SYNC"
+        }
+    }

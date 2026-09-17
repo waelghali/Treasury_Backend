@@ -1,7 +1,7 @@
 # app/schemas_quotation.py
 from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, List, Any
-from datetime import datetime
+from typing import Optional, List, Any, Union
+from datetime import datetime, date
 
 # --- Quotation Bank Schemas ---
 class QuotationContactItem(BaseModel):
@@ -50,6 +50,8 @@ class BankSelection(BaseModel):
     costFlat: Optional[float] = 0.0
     quotationBase: Optional[str] = None
     isDocumentVisible: Optional[bool] = True
+    valueDate: Optional[str] = None
+    allowAlternativeValueDate: Optional[bool] = None
 
 class QuotationRequestCreate(BaseModel):
     type: str = "FX_SPOT"
@@ -68,6 +70,7 @@ class QuotationRequestCreate(BaseModel):
     windowEnd: datetime
     quotationBase: Optional[str] = None
     maxTolerancePercent: Optional[float] = None
+    allowAlternativeValueDate: Optional[bool] = False
     documentPath: Optional[str] = None
     selectedBanks: str # JSON string matching Node module format, or we can parse it in FastAPI
     token_validity_hours: Optional[int] = 24
@@ -79,7 +82,7 @@ class QuotationRequestOut(BaseModel):
     ref_no: str
     type: str
     direction: Optional[str] = None
-    value_date: Optional[str] = None
+    value_date: Optional[Union[str, date]] = None
     amount: Optional[float] = None
     min_ticket_amount: Optional[float] = None
     buy_currency: Optional[str] = None
@@ -107,6 +110,7 @@ class QuotationRequestOut(BaseModel):
     winner_bank_name: Optional[str] = None
     winner_rate: Optional[float] = None
     saved_vs_avg: Optional[float] = None
+    allow_alternative_value_date: Optional[bool] = False
     re_tender_count: Optional[int] = 0
 
     class Config:
@@ -136,6 +140,7 @@ class QuotationResubmitRequest(BaseModel):
     window_end: Optional[datetime] = None
     quotation_base: Optional[str] = None
     max_tolerance_percent: Optional[float] = None
+    allow_alternative_value_date: Optional[bool] = None
     document_path: Optional[str] = None
     selected_banks: Optional[str] = None
     selected_bank_ids: Optional[List[int]] = None
@@ -153,9 +158,16 @@ class OTPVerifyCreate(BaseModel):
     otp_code: Optional[str] = None
     magic_token: Optional[str] = None
 
+class DeskSessionActionRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+    role: Optional[str] = "EXECUTION"
+    session_token: Optional[str] = None
+
 class FXSpotOfferCreate(BaseModel):
     token: str
     price: float
+    offered_value_date: Optional[str] = None
     notes: Optional[str] = None
     session_token: Optional[str] = None
     email: Optional[str] = None
@@ -197,6 +209,12 @@ class QuotationResultItem(BaseModel):
     cost_percent: Optional[float] = 0.0
     cost_max: Optional[float] = 0.0
     cost_flat: Optional[float] = 0.0
+    assigned_value_date: Optional[Union[str, date]] = None
+    offered_value_date: Optional[Union[str, date]] = None
+    allow_alternative_value_date: Optional[bool] = False
+    is_alternative_value_date: Optional[bool] = False
+    time_value_adjustment: Optional[float] = 0.0
+    normalized_price: Optional[float] = None
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

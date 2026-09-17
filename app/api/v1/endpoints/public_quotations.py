@@ -14,8 +14,9 @@ from app.models.models_quotation import (
 )
 from app.schemas.schemas_quotation import (
     FXSpotOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate,
-    BankApprovalActionCreate
+    BankApprovalActionCreate, DeskSessionActionRequest
 )
+from app.services.desk_session_service import desk_session_service
 from app.core.email_service import send_email, get_customer_email_settings, get_global_email_settings
 from app.core.routing import get_frontend_base_url
 
@@ -90,6 +91,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         if offer:
             offers = [{
                 "price": offer.price, 
+                "offered_value_date": offer.offered_value_date,
                 "notes": offer.notes,
                 "submitted_by_email": offer.submitted_by_email,
                 "submitted_at": offer.submitted_at
@@ -171,12 +173,16 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     except Exception:
         pass
 
+    effective_value_date = assignment.value_date or rfq.value_date
+    effective_allow_alt = assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
+
     return {
         "id": rfq.id,
         "ref_no": rfq.ref_no,
         "type": rfq.type,
         "direction": rfq.direction,
-        "value_date": rfq.value_date,
+        "value_date": effective_value_date,
+        "allow_alternative_value_date": effective_allow_alt,
         "amount": rfq.amount,
         "min_ticket_amount": rfq.min_ticket_amount,
         "buy_currency": rfq.buy_currency,
@@ -410,6 +416,114 @@ def verify_quotation_otp(
         "session_token": otp_record.magic_token
     }
 
+# --- Multi-Dealer Concurrency & Active Trader Desk Session Endpoints ---
+@router.get("/{token}/desk-session")
+def get_desk_session(
+    token: str,
+    email: str = None,
+    name: str = None,
+    db: Session = Depends(get_db)
+):
+    """Retrieves current desk lock state, active controller, and online colleagues."""
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    if not email:
+        desk = desk_session_service._get_or_create(assignment.id)
+        return desk_session_service._build_status(desk, caller_email="", is_active=False)
+
+    return desk_session_service.get_or_claim_desk(
+        assignment_id=assignment.id,
+        email=email,
+        name=name
+    )
+
+@router.post("/{token}/desk-heartbeat")
+def desk_heartbeat(
+    token: str,
+    payload: DeskSessionActionRequest,
+    db: Session = Depends(get_db)
+):
+    """Refreshes active dealer presence and returns latest desk state."""
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    # Authoritatively resolve user role from database session if session_token provided
+    resolved_role = (payload.role or "EXECUTION").strip().upper()
+    if payload.session_token:
+        otp_rec = db.query(QuotationAccessOTP).filter(
+            QuotationAccessOTP.assignment_id == assignment.id,
+            QuotationAccessOTP.magic_token == payload.session_token
+        ).first()
+        if otp_rec and otp_rec.role:
+            resolved_role = otp_rec.role.strip().upper()
+
+    return desk_session_service.heartbeat(
+        assignment_id=assignment.id,
+        email=payload.email,
+        name=payload.name,
+        role=resolved_role
+    )
+
+@router.post("/{token}/desk-takeover")
+def desk_takeover(
+    token: str,
+    payload: DeskSessionActionRequest,
+    db: Session = Depends(get_db)
+):
+    """Transfers active quoting control to the requesting dealer with audit trail."""
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    # Authoritatively resolve user role
+    resolved_role = (payload.role or "EXECUTION").strip().upper()
+    if payload.session_token:
+        otp_rec = db.query(QuotationAccessOTP).filter(
+            QuotationAccessOTP.assignment_id == assignment.id,
+            QuotationAccessOTP.magic_token == payload.session_token
+        ).first()
+        if otp_rec and otp_rec.role:
+            resolved_role = otp_rec.role.strip().upper()
+
+    if resolved_role != "EXECUTION":
+        raise HTTPException(status_code=403, detail="Only authorized Execution dealers can take over desk quoting control.")
+
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+
+    status_res = desk_session_service.takeover_desk(
+        assignment_id=assignment.id,
+        email=payload.email,
+        name=payload.name,
+        role=resolved_role
+    )
+
+    # Audit Log the takeover event
+    from app.crud.crud import log_action
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Bank Desk"
+    log_action(
+        db,
+        user_id=None,
+        action_type="DESK_CONTROL_TAKEOVER",
+        entity_type="QuotationBankAssignment",
+        entity_id=None,
+        details={
+            "assignment_id": str(assignment.id),
+            "rfq_ref": rfq.ref_no if rfq else None,
+            "bank_name": bank_name,
+            "new_active_trader": payload.email,
+            "superseded_trader": status_res.get("superseded_trader"),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        },
+        customer_id=rfq.customer_id if rfq else None
+    )
+    db.commit()
+
+    return status_res
+
 @router.post("/offer")
 def submit_fx_offer(
     offer_in: FXSpotOfferCreate,
@@ -451,9 +565,46 @@ def submit_fx_offer(
                 raise HTTPException(status_code=403, detail="Only Execution contacts are authorized to submit bids.")
             submitted_by = otp_rec.email
 
+    # Verify active trader session lock
+    if submitted_by:
+        can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
+        if not can_submit:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
+
+    # Alternative Value Date Validation
+    effective_target_value_date = assignment.value_date or rfq.value_date
+    is_alt_allowed = assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
+
+    def _clean_date_str(d):
+        if not d:
+            return None
+        return str(d).strip().split('T')[0]
+
+    target_date_clean = _clean_date_str(effective_target_value_date)
+    proposed_date_clean = _clean_date_str(offer_in.offered_value_date)
+
+    if not is_alt_allowed or not proposed_date_clean:
+        # Bank is fixed to target settlement date
+        final_offered_value_date = target_date_clean
+    else:
+        # Bank is permitted to propose an alternative date
+        if target_date_clean and proposed_date_clean == target_date_clean:
+            final_offered_value_date = target_date_clean
+        else:
+            # Date cannot be earlier than today (submission date)
+            try:
+                p_date = datetime.strptime(proposed_date_clean, "%Y-%m-%d").date()
+                today_date = datetime.now(timezone.utc).date()
+                if p_date < today_date:
+                    raise HTTPException(status_code=400, detail="Proposed value date cannot be earlier than today.")
+                final_offered_value_date = proposed_date_clean
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid proposed value date format. Expected YYYY-MM-DD.")
+
     offer = QuotationOffer(
         assignment_id=assignment.id,
         price=offer_in.price,
+        offered_value_date=final_offered_value_date,
         notes=offer_in.notes,
         submitted_by_email=submitted_by
     )
@@ -502,6 +653,8 @@ def submit_fx_offer(
     except Exception:
         pass
 
+    desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", offer_in.price)
+
     return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
 
 @router.post("/tbill-offer")
@@ -544,6 +697,12 @@ def submit_tbill_offer(
             if otp_rec.role in ("VIEW_ONLY", "APPROVER"):
                 raise HTTPException(status_code=403, detail="Only Execution contacts are authorized to submit bids.")
             submitted_by = otp_rec.email
+
+    # Verify active trader session lock
+    if submitted_by:
+        can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
+        if not can_submit:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
 
     # Delete existing lines for this exact assignment entirely before repopulating
     db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == assignment.id).delete()
@@ -603,6 +762,9 @@ def submit_tbill_offer(
             }
     except Exception:
         pass
+
+    best_rate = max([line.discountRate for line in offer_in.lines]) if offer_in.lines else 0.0
+    desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", best_rate)
 
     return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
 
@@ -749,28 +911,15 @@ async def approve_rfq_for_bank(
         # Phase 2: Email EXECUTION + VIEW_ONLY contacts WITH active link
         if non_approver_emails:
             link = f"{base_url}/public-quotation/{assignment.token}"
-            subject = f"ACTION REQUIRED: RFQ {rfq.ref_no} Approved - Submit Your Quote"
-            amount_str = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
-            body = f"""
-            <html>
-            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                <p>Dear {bank_name} FX Desk,</p>
-                <p>Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>approved participation</strong> in Request for Quotation (RFQ) <strong>{rfq.ref_no}</strong> for <strong>{customer_name}</strong>.</p>
-                <br/>
-                <ul>
-                    <li><strong>Reference:</strong> {rfq.ref_no}</li>
-                    <li><strong>Product:</strong> {rfq.type}</li>
-                    <li><strong>Pair:</strong> {rfq.buy_currency}/{rfq.sell_currency}</li>
-                    <li><strong>Amount:</strong> {amount_str}</li>
-                </ul>
-                <p>You can now access the live RFQ portal and submit your quote:</p>
-                <p><a href="{link}" style="display: inline-block; background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: 600;">⚡ Access RFQ & Submit Quote</a></p>
-                <br/>
-                <p>Best Regards,</p>
-                <p>Treasury Team</p>
-            </body>
-            </html>
-            """
+            from app.services.unified_email_builder import build_quotation_rfq_bank_email
+            subject, body = build_quotation_rfq_bank_email(
+                rfq=rfq,
+                assignment=assignment,
+                bank_name=bank_name,
+                customer_branding=customer_name,
+                link=link,
+                email_purpose="APPROVED_BY_BANK"
+            )
             background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
 
         # Notify Corporate Admin / Creator

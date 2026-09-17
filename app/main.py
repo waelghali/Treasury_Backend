@@ -181,6 +181,30 @@ def configure_app_instance(fastapi_app: FastAPI):
                         seed_db.add(new_cfg)
                         seed_db.commit()
                         logger.info("Seeded QUOTATION_APPROVAL_REQUIRED into global_configurations.")
+
+                    val_margin_cfg = seed_db.query(GlobalConfiguration).filter(
+                        GlobalConfiguration.key == GlobalConfigKey.QUOTATION_VALUE_DATE_INTEREST_MARGIN
+                    ).first()
+                    if not val_margin_cfg:
+                        new_margin_cfg = GlobalConfiguration(
+                            key=GlobalConfigKey.QUOTATION_VALUE_DATE_INTEREST_MARGIN,
+                            value_default="0.25",
+                            value_min="0",
+                            value_max="5",
+                            unit="percentage",
+                            description="Quotation Alternative Value Date Customer Margin (%)",
+                            module_tags=["quotation", "quotations"]
+                        )
+                        seed_db.add(new_margin_cfg)
+                        seed_db.commit()
+                        logger.info("Seeded QUOTATION_VALUE_DATE_INTEREST_MARGIN into global_configurations.")
+                    elif not val_margin_cfg.unit or not val_margin_cfg.value_max:
+                        val_margin_cfg.unit = "percentage"
+                        val_margin_cfg.value_min = "0"
+                        val_margin_cfg.value_max = "5"
+                        val_margin_cfg.module_tags = ["quotation", "quotations"]
+                        seed_db.commit()
+                        logger.info("Updated QUOTATION_VALUE_DATE_INTEREST_MARGIN metadata.")
             except Exception as seed_err:
                 logger.warning(f"Global configuration seed check skipped: {seed_err}")
 
@@ -472,6 +496,17 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "name": "Daily CBE Exchange Rate Sync",
                 "hours": [15, 23], # Run at 3 PM and 11 PM
                 "minute": 0,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_daily_cbe_lending_rate_sync,
+                "id": "cbe_lending_rate_weekly_job",
+                "name": "Weekly CBE Policy Interest Rates Sync (Thursdays 9PM)",
+                "cron_kwargs": {
+                    "day_of_week": "thu",
+                    "hour": "21",
+                    "minute": "0"
+                },
                 "args": []
             },
             {

@@ -75,6 +75,45 @@ class CRUDQuotation:
                 b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
         return banks
 
+    def get_unique_retender_ref_no(self, db: Session, parent_rfq: QuotationRequest):
+        """
+        Traverses to the root parent, inspects all existing re-tender references in the database,
+        and generates the next available unique sequential ref_no (e.g. RFQ-...-R1, -R2, -R3).
+        """
+        root_parent = parent_rfq
+        while root_parent.parent_rfq_id:
+            ancestor = db.query(QuotationRequest).filter(QuotationRequest.id == root_parent.parent_rfq_id).first()
+            if ancestor:
+                root_parent = ancestor
+            else:
+                break
+
+        base_ref = root_parent.ref_no.split("-R")[0]
+        similar_refs = db.query(QuotationRequest.ref_no).filter(
+            QuotationRequest.ref_no.like(f"{base_ref}%")
+        ).all()
+
+        max_idx = 0
+        for (r_val,) in similar_refs:
+            if "-R" in r_val:
+                try:
+                    suffix = r_val.split("-R")[-1]
+                    idx = int(suffix)
+                    if idx > max_idx:
+                        max_idx = idx
+                except ValueError:
+                    pass
+
+        next_idx = max_idx + 1
+        new_ref = f"{base_ref}-R{next_idx}"
+
+        # Final guarantee: verify non-existence
+        while db.query(QuotationRequest.id).filter(QuotationRequest.ref_no == new_ref).first():
+            next_idx += 1
+            new_ref = f"{base_ref}-R{next_idx}"
+
+        return new_ref, root_parent.id
+
     # --- Requests ---
     def create_request(self, db: Session, customer_id: int, user_id: int, requires_approval: bool, obj_in: QuotationRequestCreate, document_path: str = None):
         rfq_id = str(uuid.uuid4())
@@ -88,16 +127,23 @@ class CRUDQuotation:
             ).first()
 
         if parent_rfq:
-            existing_count = db.query(QuotationRequest).filter(QuotationRequest.parent_rfq_id == parent_rfq.id).count()
-            base_ref = parent_rfq.ref_no.split("-R")[0]
-            ref_no = f"{base_ref}-R{existing_count + 1}"
-            parent_id = parent_rfq.id
+            ref_no, parent_id = self.get_unique_retender_ref_no(db, parent_rfq)
         else:
             prefix = "TB" if obj_in.type == "TBILL" else "RFQ"
             ref_no = f"{prefix}-{date_str}-{uuid.uuid4().hex[:4].upper()}"
+            while db.query(QuotationRequest.id).filter(QuotationRequest.ref_no == ref_no).first():
+                ref_no = f"{prefix}-{date_str}-{uuid.uuid4().hex[:4].upper()}"
             parent_id = None
 
         initial_status = "PENDING_APPROVAL" if requires_approval else "PENDING"
+        allow_alt_master = getattr(obj_in, 'allowAlternativeValueDate', False) or False
+        effective_eval_rate = obj_in.evalRate
+        if effective_eval_rate is None or effective_eval_rate <= 0:
+            try:
+                from app.core.background_tasks import get_effective_quotation_eval_rate
+                effective_eval_rate = get_effective_quotation_eval_rate(db, customer_id)
+            except Exception:
+                effective_eval_rate = 20.25
 
         db_rfq = QuotationRequest(
             id=rfq_id,
@@ -115,11 +161,12 @@ class CRUDQuotation:
             settlement_date_end=obj_in.settlementDateEnd,
             maturity_date_start=obj_in.maturityDateStart,
             maturity_date_end=obj_in.maturityDateEnd,
-            eval_rate=obj_in.evalRate,
+            eval_rate=effective_eval_rate,
             window_start=obj_in.windowStart,
             window_end=obj_in.windowEnd,
             quotation_base=obj_in.quotationBase,
             max_tolerance_percent=obj_in.maxTolerancePercent,
+            allow_alternative_value_date=allow_alt_master,
             document_path=document_path or obj_in.documentPath,
             status=initial_status,
             token_validity_hours=getattr(obj_in, 'token_validity_hours', 24) or 24,
@@ -155,6 +202,9 @@ class CRUDQuotation:
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     is_exec = (obj_in.quotationBase or '').lower() == 'execution' or effective_base == 'execution'
                     bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
+
+                    bank_value_date = b_data.get('valueDate') or obj_in.valueDate
+                    bank_allow_alt = b_data.get('allowAlternativeValueDate')
                     
                     db_assignment = QuotationBankAssignment(
                         id=assignment_id,
@@ -167,6 +217,8 @@ class CRUDQuotation:
                         cost_flat=b_data.get('costFlat', 0.0),
                         quotation_base=q_base_override,
                         is_document_visible=is_doc_vis,
+                        value_date=bank_value_date,
+                        allow_alternative_value_date=bank_allow_alt,
                         approval_status=bank_approval_status
                     )
                     db.add(db_assignment)

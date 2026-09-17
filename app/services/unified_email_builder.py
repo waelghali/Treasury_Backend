@@ -3,7 +3,7 @@ Unified Email Builder Service
 Provides high-aesthetic, corporate SaaS HTML templates for all outgoing platform emails.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 
@@ -306,3 +306,303 @@ def build_security_email_html(
 </body>
 </html>
 """
+
+
+def build_quotation_rfq_bank_email(
+    rfq: Any,
+    assignment: Any = None,
+    bank_name: str = "Bank Partner",
+    customer_branding: str = "Corporate Treasury",
+    link: str = "#",
+    email_purpose: str = "INVITATION",
+    platform_name: str = "Grow Treasury Platform"
+) -> Tuple[str, str]:
+    """
+    Generates a standardized, high-aesthetic HTML quotation email for bank desks.
+    Fully details:
+    - Exact date and time of submission deadline (Cairo local time & UTC)
+    - Formatted amount with thousands separator (e.g. USD 17,092,604.00)
+    - Currency pair (e.g. USD / EGP) and client trade flow (Buy / Sell)
+    - Exact target value date and whether alternative value date is permitted
+    - Quotation base (Indicative vs Firm Execution)
+    - Direct secure CTA button and direct clickable fallback link
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from dateutil import parser
+
+    # 1. Format Submission Deadline
+    window_end = getattr(rfq, "window_end", None)
+    deadline_cairo_str = "N/A"
+    deadline_utc_str = ""
+    if window_end:
+        try:
+            if isinstance(window_end, str):
+                window_end = parser.parse(window_end)
+            if window_end.tzinfo is None:
+                window_end = window_end.replace(tzinfo=timezone.utc)
+            cairo_tz = ZoneInfo("Africa/Cairo")
+            cairo_dt = window_end.astimezone(cairo_tz)
+            deadline_cairo_str = cairo_dt.strftime("%A, %d %b %Y at %H:%M:%S %Z")
+            deadline_utc_str = window_end.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+        except Exception:
+            deadline_cairo_str = str(window_end)
+
+    # 2. Format Target Value Date
+    raw_val_date = (assignment.value_date if assignment and getattr(assignment, "value_date", None) else getattr(rfq, "value_date", None))
+    value_date_display = "N/A"
+    if raw_val_date:
+        clean_vd = str(raw_val_date).strip().split("T")[0]
+        try:
+            d_obj = datetime.strptime(clean_vd, "%Y-%m-%d")
+            value_date_display = f"{d_obj.strftime('%A, %d %b %Y')} ({clean_vd})"
+        except Exception:
+            value_date_display = clean_vd
+
+    # 3. Alternative Value Date Permission
+    is_alt_allowed = False
+    if assignment and getattr(assignment, "allow_alternative_value_date", None) is not None:
+        is_alt_allowed = bool(assignment.allow_alternative_value_date)
+    else:
+        is_alt_allowed = bool(getattr(rfq, "allow_alternative_value_date", False))
+
+    if is_alt_allowed:
+        alt_date_badge = """<span style="background-color: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block;">&#10004; Alternative Date Permitted</span>"""
+        alt_date_desc = "Your desk is permitted to submit an alternative settlement date if necessary."
+    else:
+        alt_date_badge = """<span style="background-color: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block;">Fixed Date Only</span>"""
+        alt_date_desc = "Quotations must settle strictly on the specified value date (Alternative dates not permitted)."
+
+    # 4. Format Amount
+    raw_amount = getattr(rfq, "amount", None)
+    amount_str = "N/A"
+    if raw_amount is not None:
+        try:
+            amount_str = f"{float(raw_amount):,.2f}"
+        except Exception:
+            amount_str = str(raw_amount)
+
+    # 5. Currency Pair & Direction
+    rfq_type = getattr(rfq, "type", "FX_SPOT")
+    buy_curr = getattr(rfq, "buy_currency", None) or ""
+    sell_curr = getattr(rfq, "sell_currency", None) or ""
+    direction = getattr(rfq, "direction", None) or "Buy"
+
+    if rfq_type == "FX_SPOT":
+        pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or "FX")
+        amount_display = f"<strong>{amount_str}</strong> {buy_curr}" if buy_curr else f"<strong>{amount_str}</strong>"
+        if direction.upper() == "BUY":
+            direction_display = f"Client <strong>BUYING {buy_curr}</strong> / <strong>SELLING {sell_curr}</strong>"
+        elif direction.upper() == "SELL":
+            direction_display = f"Client <strong>SELLING {sell_curr or buy_curr}</strong> / <strong>BUYING {buy_curr or sell_curr}</strong>"
+        else:
+            direction_display = direction
+    else:
+        # T-Bill
+        pair_str = "TBILL"
+        amount_display = f"<strong>{amount_str}</strong> {buy_curr or sell_curr or 'EGP'}"
+        direction_display = f"Client <strong>{direction.upper()}</strong> Treasury Bills"
+
+    # 6. Quotation Base
+    q_base = (assignment.quotation_base if assignment and getattr(assignment, "quotation_base", None) else getattr(rfq, "quotation_base", None)) or "Indicative"
+    if q_base.lower() == "indicative":
+        base_badge = """<span style="background-color: #f0f9ff; color: #0284c7; border: 1px solid #bae6fd; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">Indicative Pricing</span>"""
+        base_note = "Non-binding indicative quotation for price discovery and evaluation."
+    else:
+        base_badge = """<span style="background-color: #fef3c7; color: #b45309; border: 1px solid #fde68a; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">Firm Execution</span>"""
+        base_note = "Binding execution quotation subject to prompt corporate allocation upon submission."
+
+    # 7. Subject Line & Email Purpose
+    ref_no = getattr(rfq, "ref_no", "RFQ")
+    if email_purpose == "RE_TENDER":
+        subject = f"ACTION REQUIRED: Re-Tender RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
+        banner_title = "Re-Tender Request for Quotation"
+        intro_text = f"You have received a <strong>re-tendered</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+    elif email_purpose == "REMINDER":
+        subject = f"REMINDER: RFQ Submission Pending - {customer_branding} - {pair_str} - {ref_no}"
+        banner_title = "Quotation Submission Reminder"
+        intro_text = f"This is a reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> for <strong>{customer_branding}</strong> is pending submission."
+    elif email_purpose == "APPROVED_BY_BANK":
+        subject = f"ACTION REQUIRED: RFQ {ref_no} Authorized - Submit Your Quote"
+        banner_title = "RFQ Authorized for Desk Submission"
+        intro_text = f"Your bank's authorized approver has <strong>approved participation</strong> for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong>."
+    else:
+        subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
+        banner_title = "New Request for Quotation"
+        intro_text = f"You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+
+    # 8. Extra T-Bill Rows if applicable
+    tbill_rows = ""
+    if rfq_type == "TBILL":
+        s_start = getattr(rfq, "settlement_date_start", "") or ""
+        s_end = getattr(rfq, "settlement_date_end", "") or ""
+        m_start = getattr(rfq, "maturity_date_start", "") or ""
+        m_end = getattr(rfq, "maturity_date_end", "") or ""
+        
+        settle_range = f"{s_start} to {s_end}" if s_start and s_end and s_start != s_end else (s_start or "N/A")
+        mat_range = f"{m_start} to {m_end}" if m_start and m_end and m_start != m_end else (m_start or "N/A")
+
+        tbill_rows = f"""
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; width: 35%;">Settlement Window</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 600; color: #0f172a;">{settle_range}</td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; width: 35%;">Maturity Window</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 600; color: #0f172a;">{mat_range}</td>
+                        </tr>
+        """
+
+    # 9. HTML Template
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{subject}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
+    <div style="max-width: 650px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025); border: 1px solid #e2e8f0;">
+        
+        <!-- HEADER -->
+        <div style="background-color: #0f172a; padding: 26px 32px; color: #ffffff;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                    <td>
+                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()} &bull; FX &amp; MONEY MARKET</span>
+                        <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff;">{banner_title}</h1>
+                    </td>
+                    <td style="text-align: right; vertical-align: middle;">
+                        <span style="background-color: rgba(56, 189, 248, 0.15); color: #38bdf8; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid rgba(56, 189, 248, 0.3); display: inline-block;">
+                            {customer_branding}
+                        </span>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <!-- BODY -->
+        <div style="padding: 32px;">
+            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
+                Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,
+            </p>
+            <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
+                {intro_text} Please review the required trade specifications below and access the live portal to enter your quotation.
+            </p>
+
+            <!-- SUBMISSION DEADLINE ALERT BOX -->
+            <div style="background-color: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #dc2626; border-radius: 8px; padding: 16px 20px; margin-bottom: 26px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr>
+                        <td style="vertical-align: middle; width: 32px; font-size: 22px; color: #dc2626;">
+                            &#9200;
+                        </td>
+                        <td style="vertical-align: top;">
+                            <span style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px;">
+                                SUBMISSION DEADLINE &bull; MANDATORY CUTOFF
+                            </span>
+                            <div style="font-size: 16px; font-weight: 800; color: #991b1b; line-height: 1.4;">
+                                {deadline_cairo_str}
+                            </div>
+                            {f'<div style="font-size: 12px; font-weight: 600; color: #b91c1c; margin-top: 2px;">({deadline_utc_str})</div>' if deadline_utc_str else ''}
+                            <p style="margin: 6px 0 0 0; font-size: 12px; color: #7f1d1d; line-height: 1.4;">
+                                &#9888; Quotes submitted after this cutoff cannot be accepted. The portal will automatically lock upon window closure.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
+            <!-- CORE TRADE SPECIFICATIONS TABLE -->
+            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 28px;">
+                <div style="background-color: #f8fafc; padding: 12px 18px; border-bottom: 1px solid #e2e8f0;">
+                    <span style="font-size: 12px; font-weight: 800; color: #475569; letter-spacing: 0.5px; text-transform: uppercase;">
+                        Trade Specifications &bull; {ref_no}
+                    </span>
+                </div>
+                <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                    <tbody>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; width: 35%;">RFQ Reference</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a; font-family: monospace;">{ref_no}</td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Product &amp; Quotation Base</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 600; color: #0f172a;">
+                                <span style="margin-right: 8px;"><strong>{rfq_type}</strong></span>
+                                {base_badge}
+                                <div style="font-size: 12px; color: #64748b; margin-top: 4px; font-weight: normal;">{base_note}</div>
+                            </td>
+                        </tr>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Currency Pair &amp; Flow</td>
+                            <td style="padding: 12px 16px; font-size: 14px; color: #0f172a;">
+                                <span style="background-color: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 13px; letter-spacing: 0.5px; margin-right: 8px;">
+                                    {pair_str}
+                                </span>
+                                <span style="font-size: 13px; color: #334155;">{direction_display}</span>
+                            </td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Quotation Amount</td>
+                            <td style="padding: 12px 16px; font-size: 17px; font-weight: 800; color: #0f172a; letter-spacing: 0.5px;">
+                                {amount_display}
+                            </td>
+                        </tr>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Target Value Date</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">
+                                {value_date_display}
+                            </td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Alternative Value Date</td>
+                            <td style="padding: 12px 16px; font-size: 13px; color: #0f172a;">
+                                {alt_date_badge}
+                                <div style="font-size: 12px; color: #64748b; margin-top: 4px;">{alt_date_desc}</div>
+                            </td>
+                        </tr>
+                        {tbill_rows}
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- PRIMARY CALL TO ACTION BUTTON -->
+            <div style="text-align: center; margin: 36px 0 20px 0;">
+                <a href="{link}" style="background-color: #0f172a; color: #ffffff; padding: 15px 36px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 15px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.25); letter-spacing: 0.5px;">
+                    Access Quotation Portal &amp; Submit Quote &rarr;
+                </a>
+            </div>
+
+            <!-- DIRECT LINK FALLBACK -->
+            <p style="text-align: center; margin: 0 0 24px 0; font-size: 12px; color: #64748b; line-height: 1.5;">
+                Or copy and paste this link into your browser:<br/>
+                <a href="{link}" style="color: #0284c7; word-break: break-all; font-size: 12px; text-decoration: underline;">{link}</a>
+            </p>
+
+            <!-- SECURITY & AUTHENTICATION CALLOUT -->
+            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-top: 24px;">
+                <p style="margin: 0; font-size: 12px; color: #475569; line-height: 1.5;">
+                    <strong>Institution-Specific Access:</strong> This secure access token is uniquely generated for <strong>{bank_name}</strong>. Access is protected by 2FA OTP verification delivered directly to registered traders. Please do not forward this message.
+                </p>
+            </div>
+        </div>
+
+        <!-- FOOTER -->
+        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
+            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                {platform_name} &bull; Institutional Financial Trading
+            </p>
+            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                Generated on {current_time_str} for {customer_branding}. Strictly confidential and intended solely for the designated recipient.
+            </p>
+        </div>
+
+    </div>
+</body>
+</html>
+"""
+    return (subject, html_body)
+

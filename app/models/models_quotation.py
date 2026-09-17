@@ -43,6 +43,7 @@ class QuotationRequest(BaseModel):
     window_end = Column(DateTime(timezone=True), nullable=False)
     quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative'")
     max_tolerance_percent = Column(Float, nullable=True, comment="Max allowed % deviation for Execution rates vs Indicative benchmark")
+    allow_alternative_value_date = Column(Boolean, default=False, nullable=False, comment="Whether counterparties are permitted to propose an alternative value date")
     document_path = Column(Text, nullable=True)
     status = Column(String, default="PENDING", comment="'PENDING_APPROVAL', 'NEEDS_REVISION', 'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'REJECTED'")
     token_validity_hours = Column(Integer, default=24, comment="Hours the bank link remains valid after window_end")
@@ -71,6 +72,8 @@ class QuotationBankAssignment(BaseModel):
     cost_flat = Column(Float, default=0.0)
     quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative' override per bank")
     is_document_visible = Column(Boolean, default=True, comment="Controls document attachment visibility for this bank")
+    value_date = Column(String, nullable=True, comment="Custom value date target for this specific bank; falls back to RFQ master value_date")
+    allow_alternative_value_date = Column(Boolean, nullable=True, comment="Per-bank override: True/False, or NULL to inherit from RFQ master")
     
     # Bank Approval Layer (optional, per-assignment)
     approval_status = Column(String, default=None, nullable=True, comment="NULL=no approval needed, 'PENDING', 'APPROVED', 'DECLINED', 'EXPIRED'")
@@ -89,6 +92,7 @@ class QuotationOffer(BaseModel):
     __tablename__ = "quotation_offers"
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False)
     price = Column(Float, nullable=False)
+    offered_value_date = Column(String, nullable=True, comment="Alternative settlement date proposed by counterparty")
     notes = Column(Text, nullable=True, comment="Optional notes or comments from the submitting trader")
     submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())

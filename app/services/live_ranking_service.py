@@ -1,5 +1,6 @@
 # app/services/live_ranking_service.py
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, asc
 import logging
@@ -95,33 +96,78 @@ class LiveRankingService:
             return None
 
         if rfq.type == "FX_SPOT":
+            # Map assignments by id
+            assignment_map = {a.id: a for a in assignments}
+
             # For FX, get latest offer per assignment
             offers = db.query(QuotationOffer).filter(
                 QuotationOffer.assignment_id.in_(assignment_ids)
             ).order_by(QuotationOffer.submitted_at.desc()).all()
 
-            # Deduplicate by assignment_id (keep latest submitted)
-            latest_by_assignment: Dict[str, float] = {}
+            latest_offers_by_assignment = {}
             for off in offers:
-                if off.assignment_id not in latest_by_assignment and off.price is not None:
-                    latest_by_assignment[off.assignment_id] = float(off.price)
+                if off.assignment_id not in latest_offers_by_assignment and off.price is not None:
+                    latest_offers_by_assignment[off.assignment_id] = off
 
-            if assignment_id not in latest_by_assignment:
+            if assignment_id not in latest_offers_by_assignment:
                 return None  # Bank hasn't submitted a quote yet
 
-            # Sort based on direction:
-            # Corporate Buy (e.g. Buy USD): Lower price is best (ascending)
-            # Corporate Sell (e.g. Sell USD): Higher price is best (descending)
-            is_sell = (rfq.direction or "").upper() == "SELL"
-            sorted_items = sorted(
-                latest_by_assignment.items(),
-                key=lambda item: item[1],
-                reverse=is_sell
-            )
+            # Compute normalized economic score for each submitted assignment
+            deal_amount = float(rfq.amount or 1.0)
+            is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
+            rfq_target_val_date = rfq.value_date
+
+            ranked_items = []
+            for aid, off in latest_offers_by_assignment.items():
+                a = assignment_map.get(aid)
+                price = float(off.price)
+
+                # Bank fee calculation
+                raw_fee = 0.0
+                if a:
+                    base_deal_volume = deal_amount * price
+                    raw_fee = (base_deal_volume * (float(a.cost_percent or 0) / 100.0)) + float(a.cost_flat or 0)
+                    if a.cost_min and a.cost_min > 0:
+                        raw_fee = max(raw_fee, float(a.cost_min))
+                    if a.cost_max and a.cost_max > 0:
+                        raw_fee = min(raw_fee, float(a.cost_max))
+
+                fee_per_unit = raw_fee / deal_amount if deal_amount > 0 else 0.0
+                final_all_in_price = round((price - fee_per_unit) if is_sell_dir else (price + fee_per_unit), 5)
+
+                # TVM Normalization against RFQ Master Target Value Date
+                offered_val_date = off.offered_value_date or (a.value_date if a else None) or rfq_target_val_date
+                normalized_price = final_all_in_price
+
+                if rfq_target_val_date and offered_val_date:
+                    try:
+                        target_dt = datetime.strptime(str(rfq_target_val_date).split('T')[0], "%Y-%m-%d").date()
+                        offered_dt = datetime.strptime(str(offered_val_date).split('T')[0], "%Y-%m-%d").date()
+                        delta_days = (offered_dt - target_dt).days
+                        if delta_days != 0:
+                            r_eval = (rfq.eval_rate or 20.25) / 100.0
+                            normalized_price = round(final_all_in_price * (1.0 - (r_eval * (delta_days / 365.0))), 5)
+                    except Exception as err:
+                        logger.warning(f"Error computing TVM for live ranking: {err}")
+
+                sub_ts = off.submitted_at.timestamp() if (off.submitted_at and hasattr(off.submitted_at, 'timestamp')) else float('inf')
+                ranked_items.append({
+                    "assignment_id": aid,
+                    "normalized_price": normalized_price,
+                    "submitted_ts": sub_ts
+                })
+
+            # Sort based on direction and tie-breaker:
+            # Corporate Buy (Lower price is best) -> ascending normalized_price, earlier submission first
+            # Corporate Sell (Higher price is best) -> descending normalized_price, earlier submission first
+            if is_sell_dir:
+                ranked_items.sort(key=lambda item: (-item["normalized_price"], item["submitted_ts"]))
+            else:
+                ranked_items.sort(key=lambda item: (item["normalized_price"], item["submitted_ts"]))
 
             # Find 1-based rank
-            for idx, (aid, _) in enumerate(sorted_items):
-                if aid == assignment_id:
+            for idx, item in enumerate(ranked_items):
+                if item["assignment_id"] == assignment_id:
                     return idx + 1
 
         elif rfq.type == "TBILL":
