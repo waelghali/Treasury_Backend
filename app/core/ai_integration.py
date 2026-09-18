@@ -70,17 +70,46 @@ except ImportError:
     genai = None
     genai_types = None
 
-# Model name constant - configurable via GEMINI_MODEL_NAME environment variable with default fallback
+# Model name constant - configurable via GEMINI_MODEL_NAME environment variable
 DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 
+# Global API Studio client fallback
+_genai_api_client_global = None
+
+def _get_api_genai_client():
+    """Initialize fallback Google AI Studio client using API Key."""
+    global _genai_api_client_global
+    if not GEMINI_AVAILABLE:
+        return None
+    if _genai_api_client_global is None:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if api_key:
+            try:
+                _genai_api_client_global = genai.Client(api_key=api_key)
+            except Exception as e:
+                logger.warning(f"Failed to initialize API Key GenAI client: {e}")
+    return _genai_api_client_global
+
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
-    Returns an ordered list of Gemini models to attempt, starting with requested/configured model
-    and cascading down across active generation models (2.5-flash, 2.5-pro, 3.6-flash, 3.5-flash-lite).
+    Returns an ordered list of Gemini models to attempt across Vertex AI and Google AI API:
+    - Primary configured model
+    - Active Gen 2.5 models (Active through October 16, 2026)
+    - Active Gen 3 models (gemini-3.5-flash, gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash, gemini-3.5-flash-lite)
     """
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
-    candidates = [primary, "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    candidates = [
+        primary,
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite"
+    ]
     seen = set()
     result = []
     for m in candidates:
@@ -100,51 +129,89 @@ def _is_model_unavailable_error(exc: Exception) -> bool:
 
 async def _safe_generate_content_async(client, model: str, contents, config=None):
     """
-    Safely executes an async generate_content call against Google GenAI client.
-    Cascades automatically through supported Gemini models on 404 NOT_FOUND or model deprecation.
+    Safely executes an async generate_content call with dual-client (Vertex AI + Google AI API)
+    and full multi-model cascade across Gen 2.5 and Gen 3 models.
     """
     cascade = _get_model_cascade(model)
     last_err = None
-    for attempt_model in cascade:
-        try:
-            return await client.aio.models.generate_content(
-                model=attempt_model,
-                contents=contents,
-                config=config
-            )
-        except Exception as e:
-            last_err = e
-            if _is_model_unavailable_error(e) and attempt_model != cascade[-1]:
-                logger.warning(f"Gemini model '{attempt_model}' unavailable on Vertex AI ({e}). Attempting next fallback model...")
-                continue
-            raise e
+    
+    # 1. Attempt with primary client (Vertex AI or provided client)
+    if client:
+        for attempt_model in cascade:
+            try:
+                return await client.aio.models.generate_content(
+                    model=attempt_model,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_err = e
+                if _is_model_unavailable_error(e):
+                    continue
+                raise e
+
+    # 2. Seamless Fallback to Google AI API Studio Client
+    api_client = _get_api_genai_client()
+    if api_client and api_client != client:
+        for attempt_model in cascade:
+            try:
+                return await api_client.aio.models.generate_content(
+                    model=attempt_model,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_err = e
+                if _is_model_unavailable_error(e):
+                    continue
+                raise e
+
     if last_err:
         raise last_err
 
 def _safe_generate_content_sync(client, model: str, contents, config=None):
     """
-    Safely executes a sync generate_content call against Google GenAI client.
-    Cascades automatically through supported Gemini models on 404 NOT_FOUND or model deprecation.
+    Safely executes a sync generate_content call with dual-client (Vertex AI + Google AI API)
+    and full multi-model cascade across Gen 2.5 and Gen 3 models.
     """
     cascade = _get_model_cascade(model)
     last_err = None
-    for attempt_model in cascade:
-        try:
-            return client.models.generate_content(
-                model=attempt_model,
-                contents=contents,
-                config=config
-            )
-        except Exception as e:
-            last_err = e
-            if _is_model_unavailable_error(e) and attempt_model != cascade[-1]:
-                logger.warning(f"Gemini model '{attempt_model}' unavailable on Vertex AI ({e}). Attempting next fallback model...")
-                continue
-            raise e
+
+    # 1. Attempt with primary client (Vertex AI or provided client)
+    if client:
+        for attempt_model in cascade:
+            try:
+                return client.models.generate_content(
+                    model=attempt_model,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_err = e
+                if _is_model_unavailable_error(e):
+                    continue
+                raise e
+
+    # 2. Seamless Fallback to Google AI API Studio Client
+    api_client = _get_api_genai_client()
+    if api_client and api_client != client:
+        for attempt_model in cascade:
+            try:
+                return api_client.models.generate_content(
+                    model=attempt_model,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_err = e
+                if _is_model_unavailable_error(e):
+                    continue
+                raise e
+
     if last_err:
         raise last_err
 
-# Try to import Google Document AI
+
 try:
     from google.cloud import documentai_v1 as documentai
     DOCUMENT_AI_AVAILABLE = True
