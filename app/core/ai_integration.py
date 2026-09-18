@@ -77,10 +77,10 @@ GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
     Returns an ordered list of Gemini models to attempt, starting with requested/configured model
-    and cascading down through stable Google GA models (2.0-flash, 2.5-flash, 1.5-flash, 1.5-pro).
+    and cascading down across active generation models (2.5-flash, 2.5-pro, 3.6-flash, 3.5-flash-lite).
     """
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
-    candidates = [primary, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    candidates = [primary, "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
     seen = set()
     result = []
     for m in candidates:
