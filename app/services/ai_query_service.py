@@ -1636,7 +1636,7 @@ class AIQueryAssistantService:
 
         # Dynamic AI synthesis using Grounding Knowledge Base
         try:
-            from app.core.ai_integration import _get_genai_client, GEMINI_MODEL_NAME
+            from app.core.ai_integration import _get_genai_client, _safe_generate_content_sync, GEMINI_MODEL_NAME
             from app.services.system_knowledge_base import get_system_knowledge
             client = _get_genai_client()
             if client:
@@ -1650,7 +1650,8 @@ class AIQueryAssistantService:
                     f"{kb_context}\n"
                     f"--- END KNOWLEDGE BASE ---"
                 )
-                res = client.models.generate_content(
+                res = _safe_generate_content_sync(
+                    client=client,
                     model=GEMINI_MODEL_NAME,
                     contents=prompt
                 )
@@ -1856,12 +1857,13 @@ class AIQueryAssistantService:
                 }
 
             try:
-                from app.core.ai_integration import _get_genai_client, GEMINI_MODEL_NAME
+                from app.core.ai_integration import _get_genai_client, _safe_generate_content_sync, GEMINI_MODEL_NAME
                 client = _get_genai_client()
                 if client:
                     tok_recs, tok_ben, tok_fac, token_map = privacy_tokenizer.tokenize_complex_payload([], {}, [])
                     sanitized_q = privacy_tokenizer.sanitize_user_question(user_question)
-                    response = client.models.generate_content(
+                    response = _safe_generate_content_sync(
+                        client=client,
                         model=GEMINI_MODEL_NAME,
                         contents=f"You are Grow Treasury Assistant. Answer concisely in corporate treasury context: {sanitized_q}"
                     )

@@ -257,7 +257,7 @@ class FxService:
         Returns (rate, tokens_used) or (None, 0).
         """
         import json
-        from app.core.ai_integration import _get_genai_client, GEMINI_MODEL_NAME
+        from app.core.ai_integration import _get_genai_client, _safe_generate_content_sync, GEMINI_MODEL_NAME
 
         client = _get_genai_client()
         if not client:
@@ -273,8 +273,8 @@ class FxService:
         )
 
         try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL_NAME, contents=prompt
+            response = _safe_generate_content_sync(
+                client=client, model=GEMINI_MODEL_NAME, contents=prompt
             )
             raw_text = response.text.strip()
 

@@ -798,7 +798,7 @@ class ReconciliationService:
                                          user_id: int = None) -> List[Dict]:
         """Use Gemini AI to extract LG position rows from unstructured content."""
         try:
-            from app.core.ai_integration import _get_genai_client, log_ai_usage_sync, GEMINI_MODEL_NAME
+            from app.core.ai_integration import _get_genai_client, log_ai_usage_sync, _safe_generate_content_sync, GEMINI_MODEL_NAME
             import fitz  # PyMuPDF
 
             client = _get_genai_client()
@@ -846,8 +846,8 @@ Rules:
 Document text:
 {text}"""
 
-            response = client.models.generate_content(
-                model=GEMINI_MODEL_NAME, contents=prompt
+            response = _safe_generate_content_sync(
+                client=client, model=GEMINI_MODEL_NAME, contents=prompt
             )
             response_text = response.text.strip()
 

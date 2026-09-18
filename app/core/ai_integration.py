@@ -70,53 +70,79 @@ except ImportError:
     genai = None
     genai_types = None
 
-# Model name constant — configurable via GEMINI_MODEL_NAME environment variable with default fallback
-GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
+# Model name constant - configurable via GEMINI_MODEL_NAME environment variable with default fallback
+DEFAULT_PRIMARY_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
+
+def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
+    """
+    Returns an ordered list of Gemini models to attempt, starting with requested/configured model
+    and cascading down through stable Google GA models (2.0-flash, 2.5-flash, 1.5-flash, 1.5-pro).
+    """
+    primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
+    candidates = [primary, "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    seen = set()
+    result = []
+    for m in candidates:
+        if m and m not in seen:
+            seen.add(m)
+            result.append(m)
+    return result
+
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    """Checks if the exception indicates an unavailable, 404, deprecated, or restricted model."""
+    err_str = str(exc).lower()
+    return any(keyword in err_str for keyword in [
+        "404", "not_found", "not found", "does not have access",
+        "publisher model", "is not supported", "deprecated", "unsupported model",
+        "invalid model", "bad request", "400"
+    ])
 
 async def _safe_generate_content_async(client, model: str, contents, config=None):
     """
     Safely executes an async generate_content call against Google GenAI client.
-    If the requested model produces a 404 NOT_FOUND (e.g. model name mismatch or regional rollout),
-    it automatically falls back to 'gemini-2.5-flash'.
+    Cascades automatically through supported Gemini models on 404 NOT_FOUND or model deprecation.
     """
-    try:
-        return await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config
-        )
-    except Exception as e:
-        err_str = str(e)
-        if ("404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower()) and model != "gemini-2.5-flash":
-            logger.warning(f"Gemini model '{model}' not available on Vertex AI ({e}). Falling back to 'gemini-2.5-flash'.")
+    cascade = _get_model_cascade(model)
+    last_err = None
+    for attempt_model in cascade:
+        try:
             return await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model=attempt_model,
                 contents=contents,
                 config=config
             )
-        raise
+        except Exception as e:
+            last_err = e
+            if _is_model_unavailable_error(e) and attempt_model != cascade[-1]:
+                logger.warning(f"Gemini model '{attempt_model}' unavailable on Vertex AI ({e}). Attempting next fallback model...")
+                continue
+            raise e
+    if last_err:
+        raise last_err
 
 def _safe_generate_content_sync(client, model: str, contents, config=None):
     """
     Safely executes a sync generate_content call against Google GenAI client.
-    Falls back to 'gemini-2.5-flash' on 404 NOT_FOUND.
+    Cascades automatically through supported Gemini models on 404 NOT_FOUND or model deprecation.
     """
-    try:
-        return client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config
-        )
-    except Exception as e:
-        err_str = str(e)
-        if ("404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower()) and model != "gemini-2.5-flash":
-            logger.warning(f"Gemini model '{model}' not available on Vertex AI ({e}). Falling back to 'gemini-2.5-flash'.")
+    cascade = _get_model_cascade(model)
+    last_err = None
+    for attempt_model in cascade:
+        try:
             return client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=attempt_model,
                 contents=contents,
                 config=config
             )
-        raise
+        except Exception as e:
+            last_err = e
+            if _is_model_unavailable_error(e) and attempt_model != cascade[-1]:
+                logger.warning(f"Gemini model '{attempt_model}' unavailable on Vertex AI ({e}). Attempting next fallback model...")
+                continue
+            raise e
+    if last_err:
+        raise last_err
 
 # Try to import Google Document AI
 try:
@@ -2366,4 +2392,4 @@ Rules:
         logger.error(f"Facility agreement AI analysis failed: {e}", exc_info=True)
         return {"status": "AI_ERROR", "message": str(e), "extracted_terms": None}
 
-
+
