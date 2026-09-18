@@ -234,7 +234,13 @@ class AIQueryAssistantService:
             r"\bcan\s+i\b", r"\bcan\s+we\b", r"\bhow\s+do\s+we\b",
             r"\bhow\s+can\s+we\b", r"\bhow\s+to\s+change\b", r"\bhow\s+to\s+make\b",
             r"\bwhat\s+does\b", r"\bwhat\s+is\s+going\s+to\s+happen\b",
-            r"\bwhat\s+will\s+happen\b", r"\bif\s+i\s+change\b", r"\bif\s+i\s+did\s+not\b"
+            r"\bwhat\s+will\s+happen\b", r"\bif\s+i\s+change\b", r"\bif\s+i\s+did\s+not\b",
+            r"\bhow\s+does\b", r"\bhow\s+do\b", r"\bhow\s+is\b", r"\bhow\s+are\b",
+            r"\bhow\s+works?\b", r"\bexplain\b", r"\btell\s+me\s+about\b",
+            r"\bwhat\s+is\s+the\s+quotation\b", r"\bwhat\s+is\s+quotation\b",
+            r"\bquotation\s+module\b", r"\bquotations\s+module\b", r"\brfq\b", r"\brfqs\b",
+            r"\bcustody\s+module\b", r"\bissuance\s+module\b", r"\breconciliation\s+module\b",
+            r"\bmaker\s+checker\b", r"\bapproval\s+matrix\b"
         ]
         if is_greeting or any(re.search(pat, q_lower) for pat in guide_patterns):
             return {
@@ -1331,7 +1337,8 @@ class AIQueryAssistantService:
             if is_admin else
             f"\n\n🔒 **Permission Note**: You are currently logged in as **{role_label}**. Only a **Corporate Admin** can modify organization settings (`/corporate-admin/module-configs`). Please refer this change to your Corporate Admin."
         )
-        nav_base = "/corporate-admin" if user_role == "CORPORATE_ADMIN" else ("/system-owner" if user_role == "SYSTEM_OWNER" else "/end-user")
+        role_upper = str(user_role).upper() if user_role else "END_USER"
+        nav_base = "/corporate-admin" if role_upper in ["CORPORATE_ADMIN", "ADMIN"] else ("/system-owner" if role_upper == "SYSTEM_OWNER" else "/end-user")
 
         # 0. Greeting / Fast Intro
         if any(w in q_lower for w in ["hi", "hello", "hey", "who are you", "start", "capabilities"]):
@@ -1348,7 +1355,101 @@ class AIQueryAssistantService:
                 f"- **Treasury Concepts**: *\"What is cash pooling?\"*, *\"How do forward contracts work?\"*"
             )
 
-        # 1. Maker-Checker Removal / Liquidation Dual Control (Custody Truth)
+                # 0.5 FX & T-Bills Quotation Module Guidance
+        if any(w in q_lower for w in [
+            "quotation", "quotations", "rfq", "rfqs", "fx quote", "fx quotation",
+            "t-bill quote", "tbill quote", "t-bill quotation", "treasury bill quote",
+            "quotation module", "request quotation", "request quote"
+        ]):
+            if is_admin:
+                return (
+                    f"**How the FX & T-Bills Quotation Module Works (Corporate Admin Guide)**:\n\n"
+                    f"The Quotation Module provides end-to-end competitive rate discovery, multi-bank digital RFQs (Request for Quote), and automated trade execution for **Foreign Exchange (Spot / Forward)** and **Treasury Bills (T-Bills)**:\n\n"
+                    f"1. **Centralized Quotation Control Center** (`{nav_base}/quotations`):\n"
+                    f"   - View all active, pending, awarded, and expired RFQ rounds across all internal entities.\n"
+                    f"   - Monitor live bank dealer submissions in a real-time side-by-side comparison matrix.\n"
+                    f"   - Compare competitive rates, bid/ask spreads, and yield differences instantly.\n\n"
+                    f"2. **Pre-Broadcast Governance & Approval** (`QUOTATION_APPROVAL_REQUIRED`):\n"
+                    f"   - Located under **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs` Group 4).\n"
+                    f"   - When enabled (`true`), RFQs submitted by End Users are routed to Corporate Admin for verification before being broadcast to bank dealers.\n\n"
+                    f"3. **Awarding Deals & Trade Settlement**:\n"
+                    f"   - Select the winning bank dealer with the most competitive rate and click **Award Deal**.\n"
+                    f"   - Grow automatically dispatches digital trade confirmations to the winning dealer and updates internal treasury exposure records.\n\n"
+                    f"4. **Audit Trail & Bank Performance Analytics**:\n"
+                    f"   - Track dealer participation rates, quote turnaround speed, and pricing competitiveness across all banking partners.\n\n"
+                    f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
+                )
+            else:
+                return (
+                    f"**How the FX & T-Bills Quotation Module Works (End User Guide)**:\n\n"
+                    f"The Quotation Module allows you to broadcast competitive digital RFQs (Request for Quote) to your relationship banks for **Foreign Exchange (Spot / Forward)** and **Treasury Bills (T-Bills)**:\n\n"
+                    f"1. **Initiate an RFQ** (`{nav_base}/quotations`):\n"
+                    f"   - Navigate to **Sidebar ➔ Quotations ➔ Quotation Requests & History** (`{nav_base}/quotations`).\n"
+                    f"   - Click **New Quotation Request (Create RFQ)**.\n"
+                    f"   - Select Instrument Type: **FX Spot**, **FX Forward**, or **Treasury Bills (T-Bills)**.\n"
+                    f"   - Specify Currency Pair, Buy/Sell Amount, Settlement/Value Date, and Tenor/Maturity Date.\n"
+                    f"   - Select the relationship banks you wish to invite to submit live rates.\n"
+                    f"   - Click **Submit RFQ**.\n\n"
+                    f"2. **Bank Dealer Quoting**:\n"
+                    f"   - Invited bank dealers receive a secure, tokenized public portal link (`/public/quotations/:token`) to submit live executable rates without needing system passwords.\n\n"
+                    f"3. **Real-Time Rate Tracking & Awarding**:\n"
+                    f"   - Watch incoming bank bids in real-time as dealers submit their live rates and spreads.\n"
+                    f"   - Review competing quotes and route the best offer for awarding/trade confirmation.\n\n"
+                    f"👉 [Open Quotations Workspace]({nav_base}/quotations)"
+                )
+
+        # 0.6 Bank Reconciliation Module Guidance
+        if any(w in q_lower for w in [
+            "bank reconciliation", "reconciliation module", "reconcile bank",
+            "reconciliation rules", "position reconciliation", "accounting export"
+        ]):
+            return (
+                f"**How the Bank Reconciliation Module Works**:\n\n"
+                f"Grow's Bank Reconciliation Engine automates the matching of bank statement transactions against internal treasury records:\n\n"
+                f"1. **Bank Statement Ingestion** (`{nav_base}/reconciliation`):\n"
+                f"   - Upload MT940, CAMT.053, or CSV electronic bank statements.\n\n"
+                f"2. **Automated Matching & Rules Engine** (`{nav_base}/reconciliation/rules`):\n"
+                f"   - Auto-matches transactions based on reference numbers, amounts, and value dates.\n"
+                f"   - Applies custom reconciliation rules for recurring fees, interest, and commission items.\n\n"
+                f"3. **Position Reconciliation** (`/corporate-admin/issuance/reconciliation`):\n"
+                f"   - Reconciles active LG facility limits and outstanding guarantee liability balances directly against bank facility certificates.\n\n"
+                f"4. **Accounting Export** (`{nav_base}/reconciliation/export`):\n"
+                f"   - Generates ERP-ready journal entries (SAP, Oracle, Microsoft Dynamics) for matched transactions.\n\n"
+                f"👉 [Open Bank Reconciliation Workspace]({nav_base}/reconciliation)"
+            )
+
+        # 0.7 LG Custody vs LG Issuance Module Workflows
+        if any(w in q_lower for w in ["how does custody work", "how does lg custody work", "custody module", "explain custody"]):
+            return (
+                f"**How the LG Custody (Inbound) Module Works**:\n\n"
+                f"LG Custody manages guarantees received by your company (where your company is the Beneficiary or holding incoming guarantees):\n\n"
+                f"1. **Intake & OCR Ingestion** (`{nav_base}/lg-records/new`):\n"
+                f"   - Upload digital scans or paper copies. AI OCR auto-extracts guarantee number, issuing bank, amount, currency, and expiry.\n\n"
+                f"2. **Centralized Vault & Expiry Watch** (`{nav_base}/lg-records`):\n"
+                f"   - Comprehensive search, filtering, and maturity tracking across all business entities.\n\n"
+                f"3. **Operational Lifecycle Maintenance** (Actions Menu):\n"
+                f"   - Execute **Extend**, **Release**, **Liquidate (Claim)**, **Decrease**, and **Amend** operations with automated bank instruction letters.\n\n"
+                f"4. **Action Center & Reminders** (`{nav_base}/action-center`):\n"
+                f"   - Tracks pending bank replies, undelivered letters, and automated bank reminder cadence.\n\n"
+                f"👉 [Open LG Custody Records]({nav_base}/lg-records)"
+            )
+
+        if any(w in q_lower for w in ["how does issuance work", "how does lg issuance work", "issuance module", "explain issuance"]):
+            return (
+                f"**How the LG Issuance (Outbound) Module Works**:\n\n"
+                f"LG Issuance manages guarantees issued on behalf of your company to external beneficiaries against your active credit facilities:\n\n"
+                f"1. **Issuance Request Wizard** (`{nav_base}/issuance/requests/new`):\n"
+                f"   - 3-step structured request wizard specifying applicant entity, LG type, amount, currency, and beneficiary.\n\n"
+                f"2. **Smart Bank Facility Recommendation** (`/corporate-admin/issuance/facilities`):\n"
+                f"   - Evaluates bank headroom, pricing, collateral margin, and SLA turnaround to recommend optimal bank facilities.\n\n"
+                f"3. **Multi-Level Approval Matrix** (`/corporate-admin/approval-requests`):\n"
+                f"   - Routes requests through designated corporate approvers (CFO, Treasury Manager) based on configured authorization thresholds.\n\n"
+                f"4. **Bank Application Form Automation** (`/corporate-admin/issuance/issued-lgs`):\n"
+                f"   - Automatically populates bank-specific application forms (fillable PDF or physical print overlay) for immediate bank dispatch.\n\n"
+                f"👉 [Open LG Issuance Portal]({nav_base}/issuance/requests)"
+            )
+
+# 1. Maker-Checker Removal / Liquidation Dual Control (Custody Truth)
         if ("maker checker" in q_lower or "maker-checker" in q_lower or "dual control" in q_lower) and any(w in q_lower for w in [
             "remove", "disable", "liquidation", "liquidate", "turn off", "bypass", "skip", "without", "can i", "stop"
         ]):

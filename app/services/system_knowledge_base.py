@@ -13,7 +13,7 @@ GROW PLATFORM AUTHORITATIVE CAPABILITIES, SETTINGS & WORKFLOW GROUNDING
 - `system_owner`: Super-Admin. Manages customer onboarding, subscription tiers, global system configurations, bank form templates, background scheduler, and system audit logs.
 - `corporate_admin`: Organization Administrator. Full organization management: users, approval matrix, bank facilities, bank accounts, settings & module configurations (`/corporate-admin/module-configs`), issuance form configs (`/corporate-admin/issuance/form-config`), LG categories (`/corporate-admin/lg-categories`), migration hub, and organization reports.
 - `checker`: Senior Approver. Maker-checker reviews in the Approval Center (approves/rejects LG actions, issuance requests, quotations). Self-Approval is strictly prohibited by system guardrails.
-- `end_user`: Operations Specialist. Records new LGs (AI OCR scan / manual entry), initiates lifecycle maintenance actions (Extend, Release, Liquidate, Decrease, Amend), and submits issuance requests.
+- `end_user`: Operations Specialist. Records new LGs (AI OCR scan / manual entry), initiates lifecycle maintenance actions (Extend, Release, Liquidate, Decrease, Amend), and submits issuance requests and quotation RFQs.
 - `viewer`: Read-only stakeholder. Can view dashboards, LG records, and reports without operational modification privileges.
 
 2. DETAILED NAVIGATION MAP & PAGE DIRECTORY
@@ -143,6 +143,31 @@ Available from LG Details page -> Actions Menu:
 - **Record Delivery Proof**: Logs courier or physical delivery receipt of instructions to bank.
 - **Record Bank Reply**: Logs bank's formal confirmation, acceptance, or debit advice.
 - **Send Bank Reminder**: Generates formal reminder letter (1st, 2nd, final) for pending bank execution within the reminder time window.
+
+5. FX & T-BILLS QUOTATION MODULE WORKFLOWS & CONTROLS
+The Quotation Module provides enterprise multi-bank rate discovery, digital RFQ (Request for Quote) broadcasting, real-time dealer offer comparison, and trade execution for FX Spot, FX Forward, and Treasury Bills:
+- **Core End-to-End Workflow**:
+  1. **RFQ Creation (Requestor / End User)**:
+     - Open **Sidebar ➔ Quotations ➔ Quotation Requests & History** (`/end-user/quotations`).
+     - Click **New RFQ / Request Quotation**.
+     - Choose Instrument Type: **Foreign Exchange (Spot / Forward)** or **Treasury Bills (T-Bills)**.
+     - Specify Currency Pair, Buy/Sell Amount, Settlement/Value Date, Tenor/Maturity Date (for T-Bills), and optional target execution rate.
+     - Select participating banking partners to invite to the competitive quoting round.
+  2. **Corporate Governance & Pre-Broadcast Approval**:
+     - Controlled by setting **`QUOTATION_APPROVAL_REQUIRED`** in **Settings ➔ Group 4** (`/corporate-admin/module-configs`).
+     - If `true`, the RFQ is placed in pending review for Corporate Admin approval before dealers are notified.
+     - If `false`, the RFQ is broadcast instantly upon submission.
+  3. **Dealer Public Quoting Portal**:
+     - Invited bank dealers receive an automated, secure, tokenized invitation link (`/public/quotations/:token`).
+     - Bank dealers open the digital bidding portal on desktop/mobile without needing Grow accounts.
+     - Dealers submit live executable rates, bid/ask spreads, and quotation expiry timestamps in real-time.
+  4. **Quotation Control Center & Deal Awarding (Corporate Admin)**:
+     - Open **Sidebar ➔ Quotations ➔ Quotation Control Center** (`/corporate-admin/quotations`).
+     - Real-time comparison matrix displaying all competing bank quotes ranked by best rate, yield, and spread.
+     - Corporate Admin reviews bids, selects the winning rate, and clicks **Award Deal / Accept Quote**.
+     - Automated confirmation notices and trade settlement confirmations are dispatched to both the winning bank dealer and internal treasury stakeholders.
+  5. **Audit Trail & Rate Analytics**:
+     - All RFQ rounds, dealer quote timestamps, spreads, winning margins, and rejection reasons are permanently archived in the Quotation Audit Log for compliance and banking relationship reviews.
 """
 
 
