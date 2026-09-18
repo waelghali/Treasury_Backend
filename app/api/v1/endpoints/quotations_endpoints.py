@@ -653,19 +653,20 @@ def request_rfq_cancellation(
 
         # Notify Corporate Admin
         from app.models.models_quotation import QuotationNotification
-        from app.models.models import User
+        from app.models import User, UserRole
         admin_users = db.query(User).filter(
             User.customer_id == current_user.customer_id,
-            User.role.in_(['CORPORATE_ADMIN', 'ADMIN', 'TREASURY_ADMIN']),
-            User.is_active == True
+            User.role == UserRole.CORPORATE_ADMIN,
+            User.is_deleted == False
         ).all()
         for admin in admin_users:
             db.add(QuotationNotification(
                 user_id=admin.id,
-                customer_id=current_user.customer_id,
+                type="RFQ_CANCELLATION_REQUESTED",
                 title=f"Cancellation Requested: {rfq.ref_no}",
                 message=f"A cancellation request for RFQ {rfq.ref_no} ({rfq.type}) was submitted by maker. Reason: {payload.reason}",
-                link=f"/corporate-admin/quotations?rfq_id={rfq.id}"
+                link=f"/corporate-admin/quotations?rfq_id={rfq.id}",
+                is_read=False
             ))
         db.commit()
 

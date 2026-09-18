@@ -2244,10 +2244,11 @@ def approve_quotation_cancellation(
     if rfq.created_by_user_id:
         db.add(QuotationNotification(
             user_id=rfq.created_by_user_id,
-            customer_id=corporate_admin_context.customer_id,
+            type="RFQ_CANCELLATION_APPROVED",
             title=f"Cancellation Approved: {rfq.ref_no}",
             message=f"Your cancellation request for RFQ {rfq.ref_no} ({rfq.type}) has been approved by Corporate Admin. Counterparty links have been deactivated.",
-            link=f"/end-user/quotations/history?rfq_id={rfq.id}"
+            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+            is_read=False
         ))
         db.commit()
 
@@ -2294,10 +2295,11 @@ def reject_quotation_cancellation(
     if rfq.created_by_user_id:
         db.add(QuotationNotification(
             user_id=rfq.created_by_user_id,
-            customer_id=corporate_admin_context.customer_id,
+            type="RFQ_CANCELLATION_REJECTED",
             title=f"Cancellation Rejected: {rfq.ref_no}",
             message=f"Your cancellation request for RFQ {rfq.ref_no} was rejected by Corporate Admin. The RFQ remains scheduled. Notes: {rejection_notes}",
-            link=f"/end-user/quotations/history?rfq_id={rfq.id}"
+            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+            is_read=False
         ))
         db.commit()
 
