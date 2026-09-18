@@ -71,7 +71,7 @@ except ImportError:
     genai_types = None
 
 # Model name constant - configurable via GEMINI_MODEL_NAME environment variable with default fallback
-DEFAULT_PRIMARY_MODEL = "gemini-2.0-flash"
+DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
@@ -80,7 +80,7 @@ def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     and cascading down through stable Google GA models (2.0-flash, 2.5-flash, 1.5-flash, 1.5-pro).
     """
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
-    candidates = [primary, "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    candidates = [primary, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     seen = set()
     result = []
     for m in candidates:
