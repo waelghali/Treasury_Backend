@@ -971,7 +971,7 @@ class AIUsageLog(BaseModel):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     doc_name = Column(String, nullable=True, comment="Name of the processed file")
-    model_name = Column(String, nullable=False, default="gemini-2.0-flash")
+    model_name = Column(String, nullable=False, default="gemini-3.5-flash")
     
     prompt_tokens = Column(Integer, default=0, nullable=False)
     completion_tokens = Column(Integer, default=0, nullable=False)

@@ -71,7 +71,7 @@ except ImportError:
     genai_types = None
 
 # Model name constant - configurable via GEMINI_MODEL_NAME environment variable
-DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
+DEFAULT_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 
 # Global API Studio client fallback
@@ -93,22 +93,25 @@ def _get_api_genai_client():
 
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
-    Returns an ordered list of Gemini models to attempt across Vertex AI and Google AI API:
-    - Primary configured model
-    - Active Gen 2.5 models (Active through October 16, 2026)
-    - Active Gen 3 models (gemini-3.5-flash, gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash, gemini-3.5-flash-lite)
+    Optimized Cascade: Quality First, Cost Second for Treasury Document Intelligence:
+    1. gemini-3.5-flash: Top quality document extraction & layout comprehension at lowest cost
+    2. gemini-3.8-flash: High-context vision backup for complex forms & contracts
+    3. gemini-2.5-flash: Enterprise Vertex AI active bridge (active through Oct 16, 2026)
+    4. gemini-3.6-flash: Fast generation 3 alternative
+    5. gemini-3.7-flash: Fast generation 3 alternative
+    6. gemini-3.5-flash-lite: High-speed lightweight fallback
+    7. gemini-2.5-pro: Heavyweight reasoning safety net
     """
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
     candidates = [
         primary,
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash-lite",
         "gemini-3.5-flash",
         "gemini-3.8-flash",
-        "gemini-3.7-flash",
+        "gemini-2.5-flash",
         "gemini-3.6-flash",
-        "gemini-3.5-flash-lite"
+        "gemini-3.7-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-pro"
     ]
     seen = set()
     result = []
