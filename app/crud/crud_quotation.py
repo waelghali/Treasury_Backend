@@ -201,7 +201,8 @@ class CRUDQuotation:
             document_path=document_path or obj_in.documentPath,
             status=initial_status,
             token_validity_hours=getattr(obj_in, 'token_validity_hours', 24) or 24,
-            parent_rfq_id=parent_id
+            parent_rfq_id=parent_id,
+            internal_notes=getattr(obj_in, 'internal_notes', None) or getattr(obj_in, 'internalNotes', None)
         )
         db.add(db_rfq)
         

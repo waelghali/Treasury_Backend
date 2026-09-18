@@ -56,6 +56,7 @@ class QuotationRequest(BaseModel):
     cancellation_requested_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     cancellation_requested_at = Column(DateTime(timezone=True), nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    internal_notes = Column(Text, nullable=True, comment="Internal notes from requestor (e.g. related payments, invoices)")
 
     customer = relationship("Customer")
     entity = relationship("CustomerEntity")

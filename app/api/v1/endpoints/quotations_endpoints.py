@@ -943,6 +943,12 @@ def resubmit_quotation(
         rfq.token_validity_hours = payload.token_validity_hours
     if payload.allow_alternative_value_date is not None:
         rfq.allow_alternative_value_date = payload.allow_alternative_value_date
+    if getattr(payload, 'internal_notes', None) is not None:
+        rfq.internal_notes = payload.internal_notes
+    elif getattr(payload, 'internalNotes', None) is not None:
+        rfq.internal_notes = payload.internalNotes
+    elif getattr(payload, 'user_notes', None) is not None:
+        rfq.internal_notes = payload.user_notes
 
     # If new selected banks provided from the builder, re-sync bank assignments
     if payload.selected_banks:

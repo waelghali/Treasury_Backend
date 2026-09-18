@@ -76,6 +76,8 @@ class QuotationRequestCreate(BaseModel):
     token_validity_hours: Optional[int] = 24
     entity_id: Optional[int] = None
     parent_rfq_id: Optional[str] = None
+    internal_notes: Optional[str] = None
+    internalNotes: Optional[str] = None
 
 class QuotationRequestOut(BaseModel):
     id: str
@@ -103,6 +105,7 @@ class QuotationRequestOut(BaseModel):
     quotation_base: Optional[str] = None
     max_tolerance_percent: Optional[float] = None
     document_path: Optional[str] = None
+    internal_notes: Optional[str] = None
     parent_rfq_id: Optional[str] = None
     parent_rfq_ref: Optional[str] = None
     admin_revision_notes: Optional[str] = None
@@ -155,6 +158,8 @@ class QuotationResubmitRequest(BaseModel):
     selected_bank_ids: Optional[List[int]] = None
     token_validity_hours: Optional[int] = 24
     user_notes: Optional[str] = None
+    internal_notes: Optional[str] = None
+    internalNotes: Optional[str] = None
 
 # --- Bank Offers & OTP Schemas (Public) ---
 class OTPRequestCreate(BaseModel):
