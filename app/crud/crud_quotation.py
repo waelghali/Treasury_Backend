@@ -1,6 +1,6 @@
-# app/crud_quotation.py
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import uuid
 import json
 
@@ -9,6 +9,19 @@ from app.models.models_quotation import (
     QuotationOffer, QuotationTBillOffer, QuotationAnalytics
 )
 from app.schemas.schemas_quotation import QuotationRequestCreate, QuotationBankCreate
+
+def _parse_date_only(val):
+    if not val:
+        return None
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val
+    if isinstance(val, datetime):
+        return val.date()
+    try:
+        clean_str = str(val).strip().split('T')[0]
+        return datetime.strptime(clean_str, "%Y-%m-%d").date()
+    except Exception:
+        return None
 
 class CRUDQuotation:
     
@@ -145,6 +158,24 @@ class CRUDQuotation:
             except Exception:
                 effective_eval_rate = 20.25
 
+        # --- Strict Market Rule: Settlement / Value date cannot precede quotation trade date ---
+        w_date = _parse_date_only(obj_in.windowStart)
+        if w_date:
+            if (obj_in.type == 'FX_SPOT' or not obj_in.type) and obj_in.valueDate:
+                val_d = _parse_date_only(obj_in.valueDate)
+                if val_d and val_d < w_date:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Master Value Date ({val_d}) cannot be earlier than quotation window date ({w_date}). Settlement date can be the same day or later, but never earlier."
+                    )
+            elif obj_in.type == 'TBILL' and obj_in.settlementDateStart:
+                settle_d = _parse_date_only(obj_in.settlementDateStart)
+                if settle_d and settle_d < w_date:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"T-Bill Settlement Date ({settle_d}) cannot be earlier than quotation window date ({w_date})."
+                    )
+
         db_rfq = QuotationRequest(
             id=rfq_id,
             ref_no=ref_no,
@@ -204,6 +235,15 @@ class CRUDQuotation:
                     bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
 
                     bank_value_date = b_data.get('valueDate') or obj_in.valueDate
+                    if w_date and (obj_in.type == 'FX_SPOT' or not obj_in.type) and bank_value_date:
+                        b_val_d = _parse_date_only(bank_value_date)
+                        if b_val_d and b_val_d < w_date:
+                            bank_label = q_bank.bank.name if (q_bank and q_bank.bank) else f"Bank #{b_data.get('id')}"
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Value Date ({b_val_d}) for {bank_label} cannot be earlier than quotation window date ({w_date}). Value date must be on or after the quotation trade date."
+                            )
+
                     bank_allow_alt = b_data.get('allowAlternativeValueDate')
                     
                     db_assignment = QuotationBankAssignment(
@@ -228,6 +268,8 @@ class CRUDQuotation:
                         "token": token,
                         "approval_status": bank_approval_status
                     })
+        except HTTPException:
+            raise
         except Exception as e:
             # Re-raise or handle JSON parsing failure
             raise ValueError(f"Failed to parse selected banks: {e}")

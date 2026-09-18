@@ -607,12 +607,17 @@ def submit_fx_offer(
         if target_date_clean and proposed_date_clean == target_date_clean:
             final_offered_value_date = target_date_clean
         else:
-            # Date cannot be earlier than today (submission date)
+            # Date cannot be earlier than quotation trade date or submission date
             try:
                 p_date = datetime.strptime(proposed_date_clean, "%Y-%m-%d").date()
                 today_date = datetime.now(timezone.utc).date()
-                if p_date < today_date:
-                    raise HTTPException(status_code=400, detail="Proposed value date cannot be earlier than today.")
+                w_trade_date = rfq.window_start.date() if (rfq.window_start and hasattr(rfq.window_start, 'date')) else today_date
+                min_valid_date = max(today_date, w_trade_date)
+                if p_date < min_valid_date:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Proposed value date ({proposed_date_clean}) cannot be earlier than quotation trade date ({min_valid_date})."
+                    )
                 final_offered_value_date = proposed_date_clean
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid proposed value date format. Expected YYYY-MM-DD.")
@@ -719,6 +724,19 @@ def submit_tbill_offer(
         can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
         if not can_submit:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
+
+    w_trade_date = rfq.window_start.date() if (rfq.window_start and hasattr(rfq.window_start, 'date')) else datetime.now(timezone.utc).date()
+    for line in offer_in.lines:
+        if line.settlementDate:
+            try:
+                s_date = datetime.strptime(str(line.settlementDate).split('T')[0], "%Y-%m-%d").date()
+                if s_date < w_trade_date:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Offered settlement date ({s_date}) cannot be earlier than quotation trade date ({w_trade_date})."
+                    )
+            except ValueError:
+                pass
 
     # Delete existing lines for this exact assignment entirely before repopulating
     db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == assignment.id).delete()

@@ -865,6 +865,46 @@ def resubmit_quotation(
     if rfq.status != 'NEEDS_REVISION':
         raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be resubmitted.")
 
+    # Validate date consistency: settlement/value date cannot precede quotation trade date
+    eff_w_start = payload.window_start or rfq.window_start
+    w_date = None
+    if eff_w_start:
+        if hasattr(eff_w_start, 'date'):
+            w_date = eff_w_start.date()
+        else:
+            try:
+                w_date = datetime.strptime(str(eff_w_start).strip().split('T')[0], "%Y-%m-%d").date()
+            except Exception:
+                pass
+
+    def _parse_d(v):
+        if not v:
+            return None
+        try:
+            return datetime.strptime(str(v).strip().split('T')[0], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    eff_type = payload.type or rfq.type
+    eff_val_date = payload.value_date if payload.value_date is not None else rfq.value_date
+    if w_date:
+        if (eff_type == 'FX_SPOT' or not eff_type) and eff_val_date:
+            val_d = _parse_d(eff_val_date)
+            if val_d and val_d < w_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Master Value Date ({val_d}) cannot be earlier than quotation window date ({w_date}). Settlement date can be the same day or later, but never earlier."
+                )
+        elif eff_type == 'TBILL':
+            eff_settle = payload.settlement_date_start if payload.settlement_date_start is not None else rfq.settlement_date_start
+            if eff_settle:
+                s_d = _parse_d(eff_settle)
+                if s_d and s_d < w_date:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Settlement Date ({s_d}) cannot be earlier than quotation window date ({w_date})."
+                    )
+
     if payload.type is not None:
         rfq.type = payload.type
     if payload.direction is not None:
@@ -930,6 +970,15 @@ def resubmit_quotation(
                     bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
 
                     bank_value_date = b_data.get('valueDate') or rfq.value_date
+                    if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
+                        b_val_d = _parse_d(bank_value_date)
+                        if b_val_d and b_val_d < w_date:
+                            bank_label = q_bank.bank.name if (q_bank and q_bank.bank) else f"Bank #{b_data.get('id')}"
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Value Date ({b_val_d}) for {bank_label} cannot be earlier than quotation window date ({w_date}). Value date must be on or after the quotation trade date."
+                            )
+
                     bank_allow_alt = b_data.get('allowAlternativeValueDate')
 
                     db_assignment = QuotationBankAssignment(
@@ -948,6 +997,8 @@ def resubmit_quotation(
                         approval_status=bank_approval_status
                     )
                     db.add(db_assignment)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Failed to update bank assignments on resubmit: {e}")
 
