@@ -397,7 +397,7 @@ def create_rfq(
                         <html>
                         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
                             <p>Dear {bank_name} FX Desk,</p>
-                            <p>A new Request for Quotation (RFQ) has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
+                            <p>A new Request for Quotation (RFQ) on behalf of <strong>{rfq.customer.name if rfq.customer else 'Treasury Customer'}</strong> has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
                             <br/>
                             <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
                                 <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
@@ -806,21 +806,99 @@ def retender_quotation(
             contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
             if not contacts and bank_row.emails:
                 contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
-            
-            bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
-            if bank_emails:
-                link = f"{base_url}/public-quotation/{item['token']}"
-                from app.services.unified_email_builder import build_quotation_rfq_bank_email
-                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
-                subject, body = build_quotation_rfq_bank_email(
-                    rfq=new_rfq,
-                    assignment=item.get("assignment"),
-                    bank_name=bank_display_name,
-                    customer_branding=customer_branding,
-                    link=link,
-                    email_purpose="RE_TENDER"
-                )
-                background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
+            if not contacts:
+                continue
+
+            new_assignment = item.get("assignment")
+            bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+            link = f"{base_url}/public-quotation/{item['token']}"
+
+            if new_assignment and getattr(new_assignment, 'approval_status', None) == 'PENDING':
+                # --- BANK APPROVAL FLOW ---
+                # Phase 1a: APPROVER contacts with magic link
+                approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
+                for app_email in approver_emails:
+                    magic_token = uuid.uuid4().hex
+                    otp_code = f"{secrets.randbelow(900000) + 100000}"
+                    expires_at = datetime.now(timezone.utc) + timedelta(hours=new_rfq.token_validity_hours or 24)
+                    otp_record = QuotationAccessOTP(
+                        assignment_id=new_assignment.id,
+                        email=app_email.lower(),
+                        role="APPROVER",
+                        otp_code=otp_code,
+                        magic_token=magic_token,
+                        expires_at=expires_at,
+                        is_used=False
+                    )
+                    db.add(otp_record)
+                    db.commit()
+
+                    approver_link = f"{base_url}/public-quotation/{item['token']}?magic_token={magic_token}"
+                    approver_subject = f"APPROVAL REQUIRED: Re-Tender RFQ {new_rfq.ref_no} - {new_rfq.buy_currency}/{new_rfq.sell_currency}"
+                    amount_formatted = f"{new_rfq.amount:,.2f}" if new_rfq.amount else "N/A"
+                    approver_body = f"""
+                    <html>
+                    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
+                        <p>Dear {bank_display_name} Authorized Approver,</p>
+                        <p>Your bank has been invited to participate in a <strong>re-tendered Execution</strong> RFQ on behalf of <strong>{customer_branding}</strong>.</p>
+                        <br/>
+                        <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
+                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.ref_no}</td></tr>
+                            <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{new_rfq.type}</td></tr>
+                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair &amp; Direction:</td><td style="padding: 10px;">{new_rfq.buy_currency}/{new_rfq.sell_currency} ({new_rfq.direction or 'Buy'})</td></tr>
+                            <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {new_rfq.buy_currency or ''}</td></tr>
+                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.value_date or 'N/A'}</td></tr>
+                        </table>
+                        <br/>
+                        <p>Please review the RFQ details and authorize your bank's participation. Once authorized, your execution desk will receive the live link to submit their binding quote.</p>
+                        <a href="{approver_link}" style="padding: 14px 28px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 8px; display: inline-block; margin-top: 10px; font-weight: bold;">⚡ Review &amp; Authorize RFQ</a>
+                        <br/><br/>
+                        <p>Best Regards,<br/>Treasury Operations</p>
+                    </body>
+                    </html>
+                    """
+                    background_tasks.add_task(send_email, db, [app_email], approver_subject, approver_body, {}, email_settings)
+
+                # Phase 1b: EXECUTION + VIEW_ONLY with heads-up (NO link)
+                non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
+                if non_approver_emails:
+                    headsup_subject = f"HEADS UP: Re-Tender RFQ Pending Bank Approval - {new_rfq.ref_no}"
+                    amount_formatted = f"{new_rfq.amount:,.2f}" if new_rfq.amount else "N/A"
+                    headsup_body = f"""
+                    <html>
+                    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
+                        <p>Dear {bank_display_name} FX Desk,</p>
+                        <p>A re-tendered Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
+                        <br/>
+                        <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
+                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.ref_no}</td></tr>
+                            <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{new_rfq.type}</td></tr>
+                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair &amp; Direction:</td><td style="padding: 10px;">{new_rfq.buy_currency}/{new_rfq.sell_currency} ({new_rfq.direction or 'Buy'})</td></tr>
+                            <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {new_rfq.buy_currency or ''}</td></tr>
+                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.value_date or 'N/A'}</td></tr>
+                        </table>
+                        <br/>
+                        <p>You will receive a follow-up notification with a secure access link once your bank's approver has authorized participation.</p>
+                        <br/>
+                        <p>Best Regards,<br/>Treasury Operations</p>
+                    </body>
+                    </html>
+                    """
+                    background_tasks.add_task(send_email, db, non_approver_emails, headsup_subject, headsup_body, {}, email_settings)
+            else:
+                # --- STANDARD FLOW (no bank-level approval needed) ---
+                bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
+                if bank_emails:
+                    from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                    subject, body = build_quotation_rfq_bank_email(
+                        rfq=new_rfq,
+                        assignment=new_assignment,
+                        bank_name=bank_display_name,
+                        customer_branding=customer_branding,
+                        link=link,
+                        email_purpose="RE_TENDER"
+                    )
+                    background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
     else:
         # Notify Corporate Admins
         from app.models import User, UserRole
