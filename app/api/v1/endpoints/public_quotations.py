@@ -56,12 +56,6 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
             detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
         )
 
-    if rfq.status == 'CANCEL_REQUESTED':
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This quotation is currently undergoing administrative review and bidding is temporarily paused."
-        )
-
     now = datetime.now(timezone.utc)
     
     # Handle naive vs aware datetimes safely
@@ -244,7 +238,7 @@ async def request_quotation_otp(
             status_code=status.HTTP_410_GONE,
             detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
         )
-    if rfq.status in ('PENDING_APPROVAL', 'CANCEL_REQUESTED'):
+    if rfq.status == 'PENDING_APPROVAL':
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This quotation is not currently open for bidding."
@@ -556,7 +550,7 @@ def submit_fx_offer(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
-    if rfq.status in ('PENDING_APPROVAL', 'CANCEL_REQUESTED', 'CANCELLED'):
+    if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
     
     # Verify quotation approval status
@@ -689,7 +683,7 @@ def submit_tbill_offer(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
-    if rfq.status in ('PENDING_APPROVAL', 'CANCEL_REQUESTED', 'CANCELLED'):
+    if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
     
     # Verify quotation approval status
