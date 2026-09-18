@@ -2234,17 +2234,11 @@ def approve_quotation_cancellation(
             emails_list = [e.strip() for e in (bank_row.emails or "").split(",") if e.strip()]
             contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
 
-        approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
         all_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
 
-        # Targeted routing:
-        # - If PENDING bank approval: Send only to Approvers (deal was never unlocked for execution desk)
-        # - If APPROVED (or standard bank without approval gate): Send to ALL desk contacts
-        target_emails = []
-        if assignment.approval_status == 'PENDING':
-            target_emails = approver_emails if approver_emails else all_emails
-        else:
-            target_emails = all_emails
+        # All contacts received the original RFQ notification (approvers got the approval request,
+        # execution/viewers got a heads-up), so all should be notified of cancellation.
+        target_emails = all_emails
 
         if target_emails:
             bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
