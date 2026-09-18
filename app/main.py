@@ -163,6 +163,13 @@ def configure_app_instance(fastapi_app: FastAPI):
             logger.info("Database tables verified/created.")
 
             try:
+                from sqlalchemy import text
+                with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as ddl_conn:
+                    ddl_conn.execute(text("ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'QUOTATION_CANCELLATION_CUTOFF_MINUTES';"))
+            except Exception as enum_err:
+                logger.debug(f"Enum update skipped (might already exist or not postgres): {enum_err}")
+
+            try:
                 from sqlalchemy.orm import Session as DBSession
                 from app.models.models import GlobalConfiguration
                 from app.constants import GlobalConfigKey
