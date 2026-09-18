@@ -112,9 +112,18 @@ class QuotationRequestOut(BaseModel):
     saved_vs_avg: Optional[float] = None
     allow_alternative_value_date: Optional[bool] = False
     re_tender_count: Optional[int] = 0
+    cancellation_reason: Optional[str] = None
+    cancellation_notes: Optional[str] = None
+    cancellation_requested_by: Optional[int] = None
+    cancellation_requested_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
+
+class QuotationCancellationRequest(BaseModel):
+    reason: str
+    notes: Optional[str] = None
 
 class ReTenderRequest(BaseModel):
     window_start: Optional[datetime] = None

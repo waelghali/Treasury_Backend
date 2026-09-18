@@ -582,8 +582,13 @@ def build_quotation_rfq_bank_email(
                 <a href="{link}" style="color: #0284c7; word-break: break-all; font-size: 12px; text-decoration: underline;">{link}</a>
             </p>
 
+            <!-- INSTITUTIONAL RESERVATION CLAUSE -->
+            <div style="background-color: #f8fafc; border-left: 3px solid #94a3b8; padding: 10px 14px; margin-top: 14px; font-size: 11px; color: #64748b; line-height: 1.4;">
+                <strong>Reservation of Rights:</strong> The corporate treasury desk reserves the right to amend, postpone, or withdraw this quotation request prior to the scheduled quotation window opening. Counterparties will be promptly notified of any schedule alterations.
+            </div>
+
             <!-- SECURITY & AUTHENTICATION CALLOUT -->
-            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-top: 24px;">
+            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-top: 14px;">
                 <p style="margin: 0; font-size: 12px; color: #475569; line-height: 1.5;">
                     <strong>Institution-Specific Access:</strong> This secure access token is uniquely generated for <strong>{bank_name}</strong>. Access is protected by 2FA OTP verification delivered directly to registered traders. Please do not forward this message.
                 </p>
@@ -597,6 +602,117 @@ def build_quotation_rfq_bank_email(
             </p>
             <p style="margin: 0; font-size: 11px; color: #94a3b8;">
                 Generated on {current_time_str} for {customer_branding}. Strictly confidential and intended solely for the designated recipient.
+            </p>
+        </div>
+
+    </div>
+</body>
+</html>
+"""
+    return (subject, html_body)
+
+
+def build_quotation_withdrawn_bank_email(
+    rfq: Any,
+    bank_name: str = "Bank Partner",
+    customer_branding: str = "Corporate Treasury",
+    platform_name: str = "Grow Treasury Platform"
+) -> Tuple[str, str]:
+    """
+    Generates an official, dignified withdrawal notification email to counterparties when an RFQ is cancelled.
+    Notice: Crucially conceals internal corporate cancellation reasons from external banks.
+    """
+    from datetime import datetime
+    ref_no = getattr(rfq, "ref_no", "RFQ")
+    rfq_type = getattr(rfq, "type", "FX_SPOT")
+    buy_curr = getattr(rfq, "buy_currency", None) or ""
+    sell_curr = getattr(rfq, "sell_currency", None) or ""
+    pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or rfq_type)
+
+    raw_amount = getattr(rfq, "amount", None)
+    amount_str = f"{float(raw_amount):,.2f}" if raw_amount is not None else "N/A"
+
+    subject = f"NOTICE OF WITHDRAWAL: RFQ {ref_no} Cancelled - {customer_branding}"
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{subject}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
+    <div style="max-width: 650px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05); border: 1px solid #e2e8f0;">
+        
+        <!-- HEADER -->
+        <div style="background-color: #334155; padding: 26px 32px; color: #ffffff;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                    <td>
+                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; display: block; margin-bottom: 4px;">{platform_name.upper()} &bull; OFFICIAL NOTICE</span>
+                        <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff;">Quotation Request Withdrawn</h1>
+                    </td>
+                    <td style="text-align: right; vertical-align: middle;">
+                        <span style="background-color: rgba(255, 255, 255, 0.15); color: #ffffff; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; display: inline-block;">
+                            {customer_branding}
+                        </span>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <!-- BODY -->
+        <div style="padding: 32px;">
+            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
+                Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,
+            </p>
+            <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
+                Please be advised that Request for Quotation (RFQ) <strong>{ref_no}</strong> previously released on behalf of <strong>{customer_branding}</strong> has been officially <strong>withdrawn and cancelled</strong> prior to execution.
+            </p>
+
+            <!-- WITHDRAWAL NOTICE BOX -->
+            <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-left: 5px solid #64748b; border-radius: 8px; padding: 18px 20px; margin-bottom: 26px;">
+                <p style="margin: 0 0 6px 0; font-size: 14px; font-weight: 700; color: #1e293b;">
+                    No Action or Quotation is Required
+                </p>
+                <p style="margin: 0; font-size: 13px; color: #475569; line-height: 1.5;">
+                    This quotation request was officially withdrawn by the corporate treasury desk. Counterparty portal submission links for this RFQ have been deactivated. We apologize for any inconvenience.
+                </p>
+            </div>
+
+            <!-- RFQ REFERENCE SUMMARY -->
+            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
+                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
+                    <tbody>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b; width: 35%;">RFQ Reference</td>
+                            <td style="padding: 10px 16px; font-weight: 700; color: #0f172a; font-family: monospace;">{ref_no}</td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b;">Instrument / Currency</td>
+                            <td style="padding: 10px 16px; font-weight: 600; color: #0f172a;">{rfq_type} &bull; {pair_str}</td>
+                        </tr>
+                        <tr style="background-color: #ffffff;">
+                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b;">Quotation Amount</td>
+                            <td style="padding: 10px 16px; font-weight: 700; color: #0f172a;">{amount_str} {buy_curr or ''}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <p style="margin: 0; font-size: 13px; color: #64748b; line-height: 1.5;">
+                Should the client reschedule or issue a new request for quotation, your desk will receive a separate formal invitation.
+            </p>
+        </div>
+
+        <!-- FOOTER -->
+        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
+            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                {platform_name} &bull; Institutional Financial Trading
+            </p>
+            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                Notice dispatched on {current_time_str} on behalf of {customer_branding}.
             </p>
         </div>
 

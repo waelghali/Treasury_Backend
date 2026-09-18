@@ -3,7 +3,7 @@
 import os
 import sys
 import importlib.util
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Any, Dict
 import asyncio
 
@@ -2164,6 +2164,154 @@ def approve_quotation_request(
                     )
 
     return {"message": "Quotation status updated successfully.", "status": rfq.status}
+
+
+class QuotationCancellationRejectRequest(BaseModel):
+    rejection_notes: Optional[str] = None
+
+
+@router.get("/quotations/cancellation-requests", response_model=List[QuotationRequestOut])
+def get_cancellation_requests(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Lists all quotations awaiting corporate admin approval for cancellation."""
+    return db.query(QuotationRequest).filter(
+        QuotationRequest.customer_id == corporate_admin_context.customer_id,
+        QuotationRequest.status == 'CANCEL_REQUESTED'
+    ).order_by(QuotationRequest.cancellation_requested_at.desc()).all()
+
+
+@router.post("/quotations/{rfq_id}/approve-cancellation")
+def approve_quotation_cancellation(
+    rfq_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Approves an end-user cancellation request:
+    - Sets RFQ status to CANCELLED.
+    - Dispatches withdrawal notification emails to all invited banks (concealing internal reason).
+    - Notifies the maker.
+    - Audit logs the cancellation.
+    """
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'CANCEL_REQUESTED':
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and has no pending cancellation request.")
+
+    now = datetime.now(timezone.utc)
+    rfq.status = 'CANCELLED'
+    rfq.cancelled_at = now
+    db.commit()
+
+    # Dispatch withdrawal emails to all assigned banks
+    assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+    email_settings = get_global_email_settings(db)
+    customer_branding = rfq.customer.name if rfq.customer else "Corporate Treasury"
+
+    from app.services.unified_email_builder import build_quotation_withdrawn_bank_email
+    for assignment in assignments:
+        bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+        if bank_row and bank_row.emails:
+            bank_emails = [e.strip() for e in bank_row.emails.split(",") if e.strip()]
+            if bank_emails:
+                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                subject, body = build_quotation_withdrawn_bank_email(
+                    rfq=rfq,
+                    bank_name=bank_display_name,
+                    customer_branding=customer_branding
+                )
+                background_tasks.add_task(
+                    send_email,
+                    db,
+                    bank_emails,
+                    subject,
+                    body,
+                    {},
+                    email_settings
+                )
+
+    # Notify maker
+    from app.models.models_quotation import QuotationNotification
+    if rfq.created_by_user_id:
+        db.add(QuotationNotification(
+            user_id=rfq.created_by_user_id,
+            customer_id=corporate_admin_context.customer_id,
+            title=f"Cancellation Approved: {rfq.ref_no}",
+            message=f"Your cancellation request for RFQ {rfq.ref_no} ({rfq.type}) has been approved by Corporate Admin. Counterparty links have been deactivated.",
+            link=f"/end-user/quotations/history?rfq_id={rfq.id}"
+        ))
+        db.commit()
+
+    from app.crud.crud import log_action
+    log_action(
+        db=db,
+        user_id=corporate_admin_context.user_id,
+        action_type="QUOTATION_CANCELLATION_APPROVED",
+        entity_type="QuotationRequest",
+        entity_id=rfq.id,
+        details=f"Corporate admin approved cancellation of RFQ {rfq.ref_no}. Counterparties notified."
+    )
+
+    return {"message": "Quotation cancellation approved and counterparties notified.", "rfq_id": rfq.id, "status": "CANCELLED"}
+
+
+@router.post("/quotations/{rfq_id}/reject-cancellation")
+def reject_quotation_cancellation(
+    rfq_id: str,
+    payload: QuotationCancellationRejectRequest = None,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Rejects a cancellation request, restoring the RFQ status back to PENDING.
+    """
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'CANCEL_REQUESTED':
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and has no pending cancellation request.")
+
+    rfq.status = 'PENDING'
+    db.commit()
+
+    # Notify maker
+    rejection_notes = payload.rejection_notes if payload and payload.rejection_notes else "No specific notes provided."
+    from app.models.models_quotation import QuotationNotification
+    if rfq.created_by_user_id:
+        db.add(QuotationNotification(
+            user_id=rfq.created_by_user_id,
+            customer_id=corporate_admin_context.customer_id,
+            title=f"Cancellation Rejected: {rfq.ref_no}",
+            message=f"Your cancellation request for RFQ {rfq.ref_no} was rejected by Corporate Admin. The RFQ remains scheduled. Notes: {rejection_notes}",
+            link=f"/end-user/quotations/history?rfq_id={rfq.id}"
+        ))
+        db.commit()
+
+    from app.crud.crud import log_action
+    log_action(
+        db=db,
+        user_id=corporate_admin_context.user_id,
+        action_type="QUOTATION_CANCELLATION_REJECTED",
+        entity_type="QuotationRequest",
+        entity_id=rfq.id,
+        details=f"Corporate admin rejected cancellation of RFQ {rfq.ref_no}. Notes: {rejection_notes}"
+    )
+
+    return {"message": "Quotation cancellation request rejected. RFQ restored to active schedule.", "rfq_id": rfq.id, "status": "PENDING"}
 
 
 # ==============================================================================

@@ -23,7 +23,8 @@ from app.schemas.schemas_quotation import (
     QuotationBankCreate, QuotationBankOut,
     QuotationRequestCreate, QuotationRequestOut,
     QuotationResultsOut, QuotationResultItem,
-    ReTenderRequest, QuotationResubmitRequest
+    ReTenderRequest, QuotationResubmitRequest,
+    QuotationCancellationRequest
 )
 from app.crud.crud_quotation import crud_quotation
 from app.models.models_quotation import (
@@ -475,6 +476,9 @@ def get_rfq_history(
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED'
                 changed = True
+            elif r.status == 'CANCEL_REQUESTED':
+                r.status = 'CANCELLED'
+                changed = True
             
             # Auto-expire any bank-level approvals that were still PENDING when window closed
             pending_assignments = db.query(QuotationBankAssignment).filter(
@@ -564,6 +568,124 @@ def get_rfq_timing_recommendations(
     """Returns optimal liquidity timing windows across historical tenders."""
     from app.services.quotation_benchmark_service import get_timing_recommendations
     return get_timing_recommendations(db, trade_type=trade_type)
+
+@router.post("/{rfq_id}/request-cancellation")
+def request_rfq_cancellation(
+    rfq_id: str,
+    payload: QuotationCancellationRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Allows the End User (Maker) to request cancellation of an active or pending quotation.
+    - If PENDING_APPROVAL: Can be immediately cancelled (zero counterparty bank exposure).
+    - If PENDING: Allowed only if current time is before the cutoff window (default 15 minutes before window_start).
+      Transitions status to CANCEL_REQUESTED for Corporate Admin review.
+    - If window is open, evaluating, completed, or already cancelled: Rejected.
+    """
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status in ('CANCELLED', 'REJECTED', 'COMPLETED'):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel quotation with status {rfq.status}.")
+
+    if rfq.status == 'CANCEL_REQUESTED':
+        raise HTTPException(status_code=400, detail="A cancellation request is already pending corporate admin approval.")
+
+    now = datetime.now(timezone.utc)
+    w_start = rfq.window_start
+    if w_start and w_start.tzinfo is None:
+        w_start = w_start.replace(tzinfo=timezone.utc)
+
+    # Case 1: PENDING_APPROVAL - Internal draft only, never sent to banks! Immediate cancellation.
+    if rfq.status == 'PENDING_APPROVAL':
+        rfq.status = 'CANCELLED'
+        rfq.cancellation_reason = payload.reason
+        rfq.cancellation_notes = payload.notes
+        rfq.cancellation_requested_by = current_user.user_id
+        rfq.cancellation_requested_at = now
+        rfq.cancelled_at = now
+        db.commit()
+
+        log_action(
+            db=db,
+            user_id=current_user.user_id,
+            action_type="QUOTATION_CANCELLED_INTERNAL",
+            entity_type="QuotationRequest",
+            entity_id=rfq.id,
+            details=f"Draft RFQ {rfq.ref_no} cancelled prior to corporate admin approval. Reason: {payload.reason}"
+        )
+        return {"message": "Quotation draft cancelled successfully.", "status": "CANCELLED", "rfq_id": rfq.id}
+
+    # Case 2: PENDING (Released to banks, scheduled to open in the future)
+    if rfq.status == 'PENDING':
+        # Retrieve cutoff limit (default 15 minutes)
+        from app.crud.crud_config import crud_customer_configuration
+        from app.constants import GlobalConfigKey
+        cutoff_val = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, customer_id=current_user.customer_id, config_key=GlobalConfigKey.QUOTATION_CANCELLATION_CUTOFF_MINUTES
+        )
+        cutoff_minutes = 15
+        try:
+            if cutoff_val is not None:
+                cutoff_minutes = int(float(str(cutoff_val)))
+        except (ValueError, TypeError):
+            cutoff_minutes = 15
+
+        if w_start:
+            seconds_remaining = (w_start - now).total_seconds()
+            if seconds_remaining < (cutoff_minutes * 60):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Quotation cannot be cancelled within {cutoff_minutes} minutes of the bidding window opening."
+                )
+
+        rfq.status = 'CANCEL_REQUESTED'
+        rfq.cancellation_reason = payload.reason
+        rfq.cancellation_notes = payload.notes
+        rfq.cancellation_requested_by = current_user.user_id
+        rfq.cancellation_requested_at = now
+        db.commit()
+
+        # Notify Corporate Admin
+        from app.models.models_quotation import QuotationNotification
+        from app.models.models import User
+        admin_users = db.query(User).filter(
+            User.customer_id == current_user.customer_id,
+            User.role.in_(['CORPORATE_ADMIN', 'ADMIN', 'TREASURY_ADMIN']),
+            User.is_active == True
+        ).all()
+        for admin in admin_users:
+            db.add(QuotationNotification(
+                user_id=admin.id,
+                customer_id=current_user.customer_id,
+                title=f"Cancellation Requested: {rfq.ref_no}",
+                message=f"A cancellation request for RFQ {rfq.ref_no} ({rfq.type}) was submitted by maker. Reason: {payload.reason}",
+                link=f"/corporate-admin/quotations?rfq_id={rfq.id}"
+            ))
+        db.commit()
+
+        log_action(
+            db=db,
+            user_id=current_user.user_id,
+            action_type="QUOTATION_CANCELLATION_REQUESTED",
+            entity_type="QuotationRequest",
+            entity_id=rfq.id,
+            details=f"Cancellation requested for RFQ {rfq.ref_no}. Reason: {payload.reason}"
+        )
+        return {
+            "message": "Cancellation request submitted for Corporate Admin approval.",
+            "status": "CANCEL_REQUESTED",
+            "rfq_id": rfq.id
+        }
+
+    # For any other status (OPEN, EVALUATING, etc.)
+    raise HTTPException(status_code=400, detail=f"Cannot cancel quotation while in status {rfq.status}.")
+
 
 @router.post("/{rfq_id}/re-tender")
 def retender_quotation(

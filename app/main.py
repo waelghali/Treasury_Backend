@@ -205,8 +205,39 @@ def configure_app_instance(fastapi_app: FastAPI):
                         val_margin_cfg.module_tags = ["quotation", "quotations"]
                         seed_db.commit()
                         logger.info("Updated QUOTATION_VALUE_DATE_INTEREST_MARGIN metadata.")
+                    cutoff_cfg = seed_db.query(GlobalConfiguration).filter(
+                        GlobalConfiguration.key == GlobalConfigKey.QUOTATION_CANCELLATION_CUTOFF_MINUTES
+                    ).first()
+                    if not cutoff_cfg:
+                        new_cutoff_cfg = GlobalConfiguration(
+                            key=GlobalConfigKey.QUOTATION_CANCELLATION_CUTOFF_MINUTES,
+                            value_default="15",
+                            value_min="1",
+                            value_max="120",
+                            unit="minutes",
+                            description="Minimum minutes before quotation window opens after which end-user cancellation requests are locked",
+                            module_tags=["quotation", "quotations"]
+                        )
+                        seed_db.add(new_cutoff_cfg)
+                        seed_db.commit()
+                        logger.info("Seeded QUOTATION_CANCELLATION_CUTOFF_MINUTES into global_configurations.")
             except Exception as seed_err:
                 logger.warning(f"Global configuration seed check skipped: {seed_err}")
+
+            # --- Quotation RFQs Cancellation Schema Migration Check ---
+            try:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS cancellation_reason VARCHAR(255);
+                        ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS cancellation_notes TEXT;
+                        ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS cancellation_requested_by INTEGER REFERENCES users(id);
+                        ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS cancellation_requested_at TIMESTAMP WITH TIME ZONE;
+                        ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP WITH TIME ZONE;
+                    """))
+                    conn.commit()
+            except Exception as ddl_err:
+                logger.warning(f"Quotation RFQs cancellation schema migration check skipped: {ddl_err}")
 
             # --- Cashback Claims Schema Migration Check ---
             try:

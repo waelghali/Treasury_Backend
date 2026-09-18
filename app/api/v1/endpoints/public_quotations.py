@@ -50,6 +50,18 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
             detail="This quotation is awaiting internal corporate approval and is not yet open for bidding."
         )
 
+    if rfq.status == 'CANCELLED':
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
+        )
+
+    if rfq.status == 'CANCEL_REQUESTED':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This quotation is currently undergoing administrative review and bidding is temporarily paused."
+        )
+
     now = datetime.now(timezone.utc)
     
     # Handle naive vs aware datetimes safely
@@ -227,6 +239,16 @@ async def request_quotation_otp(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    if rfq.status == 'CANCELLED':
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
+        )
+    if rfq.status in ('PENDING_APPROVAL', 'CANCEL_REQUESTED'):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This quotation is not currently open for bidding."
+        )
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if not q_bank:
         raise HTTPException(status_code=404, detail="Bank configuration not found")
@@ -534,8 +556,8 @@ def submit_fx_offer(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
-    if rfq.status == 'PENDING_APPROVAL':
-        raise HTTPException(status_code=403, detail="Quotation is not yet approved.")
+    if rfq.status in ('PENDING_APPROVAL', 'CANCEL_REQUESTED', 'CANCELLED'):
+        raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
     
     # Verify quotation approval status
     if assignment.approval_status == 'PENDING':
@@ -667,8 +689,8 @@ def submit_tbill_offer(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
-    if rfq.status == 'PENDING_APPROVAL':
-        raise HTTPException(status_code=403, detail="Quotation is not yet approved.")
+    if rfq.status in ('PENDING_APPROVAL', 'CANCEL_REQUESTED', 'CANCELLED'):
+        raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
     
     # Verify quotation approval status
     if assignment.approval_status == 'PENDING':
