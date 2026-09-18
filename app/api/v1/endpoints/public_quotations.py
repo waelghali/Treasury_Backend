@@ -476,12 +476,22 @@ def desk_heartbeat(
         if otp_rec and otp_rec.role:
             resolved_role = otp_rec.role.strip().upper()
 
-    return desk_session_service.heartbeat(
+    rfq = assignment.rfq
+    if rfq and rfq.status == 'CANCELLED':
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
+        )
+
+    res = desk_session_service.heartbeat(
         assignment_id=assignment.id,
         email=payload.email,
         name=payload.name,
         role=resolved_role
     )
+    if isinstance(res, dict) and rfq:
+        res["rfq_status"] = rfq.status
+    return res
 
 @router.post("/{token}/desk-takeover")
 def desk_takeover(
@@ -493,6 +503,13 @@ def desk_takeover(
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
+
+    rfq = assignment.rfq
+    if rfq and rfq.status == 'CANCELLED':
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
+        )
 
     # Authoritatively resolve user role
     resolved_role = (payload.role or "EXECUTION").strip().upper()

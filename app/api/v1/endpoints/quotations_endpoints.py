@@ -948,8 +948,6 @@ def resubmit_quotation(
         rfq.internal_notes = payload.internal_notes
     elif getattr(payload, 'internalNotes', None) is not None:
         rfq.internal_notes = payload.internalNotes
-    elif getattr(payload, 'user_notes', None) is not None:
-        rfq.internal_notes = payload.user_notes
 
     # If new selected banks provided from the builder, re-sync bank assignments
     if payload.selected_banks:
@@ -1017,7 +1015,8 @@ def resubmit_quotation(
     from app.models.models_quotation import QuotationNotification
     admins = db.query(User).filter(
         User.customer_id == current_user.customer_id,
-        User.role == UserRole.CORPORATE_ADMIN
+        User.role == UserRole.CORPORATE_ADMIN,
+        User.is_deleted == False
     ).all()
     user_note_text = f" Note: {payload.user_notes.strip()}" if payload.user_notes and payload.user_notes.strip() else ""
     for admin in admins:

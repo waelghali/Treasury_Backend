@@ -2214,30 +2214,54 @@ def approve_quotation_cancellation(
 
     # Dispatch withdrawal emails to all assigned banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-    email_settings = get_global_email_settings(db)
+    email_settings = get_global_email_settings()
     customer_branding = rfq.customer.name if rfq.customer else "Corporate Treasury"
 
     from app.services.unified_email_builder import build_quotation_withdrawn_bank_email
     for assignment in assignments:
+        # If bank already declined participation or expired, do not send cancellation emails
+        if assignment.approval_status in ('DECLINED', 'EXPIRED'):
+            continue
+
         bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
-        if bank_row and bank_row.emails:
-            bank_emails = [e.strip() for e in bank_row.emails.split(",") if e.strip()]
-            if bank_emails:
-                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
-                subject, body = build_quotation_withdrawn_bank_email(
-                    rfq=rfq,
-                    bank_name=bank_display_name,
-                    customer_branding=customer_branding
-                )
-                background_tasks.add_task(
-                    send_email,
-                    db,
-                    bank_emails,
-                    subject,
-                    body,
-                    {},
-                    email_settings
-                )
+        if not bank_row:
+            continue
+
+        # Extract structured contacts with roles
+        if bank_row.contacts and isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0:
+            contacts = bank_row.contacts
+        else:
+            emails_list = [e.strip() for e in (bank_row.emails or "").split(",") if e.strip()]
+            contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+
+        approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
+        all_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
+
+        # Targeted routing:
+        # - If PENDING bank approval: Send only to Approvers (deal was never unlocked for execution desk)
+        # - If APPROVED (or standard bank without approval gate): Send to ALL desk contacts
+        target_emails = []
+        if assignment.approval_status == 'PENDING':
+            target_emails = approver_emails if approver_emails else all_emails
+        else:
+            target_emails = all_emails
+
+        if target_emails:
+            bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+            subject, body = build_quotation_withdrawn_bank_email(
+                rfq=rfq,
+                bank_name=bank_display_name,
+                customer_branding=customer_branding
+            )
+            background_tasks.add_task(
+                send_email,
+                db,
+                target_emails,
+                subject,
+                body,
+                {},
+                email_settings
+            )
 
     # Notify maker
     from app.models.models_quotation import QuotationNotification
