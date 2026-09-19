@@ -1897,11 +1897,43 @@ def get_pending_quotation_approvals(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
-    """Lists all quotations awaiting internal corporate approval."""
-    return db.query(QuotationRequest).filter(
+    """Lists all quotations awaiting internal corporate approval with counterparty details."""
+    rfqs = db.query(QuotationRequest).filter(
         QuotationRequest.customer_id == corporate_admin_context.customer_id,
         QuotationRequest.status == 'PENDING_APPROVAL'
     ).order_by(QuotationRequest.created_at.desc()).all()
+
+    results = []
+    for rfq in rfqs:
+        rfq_dict = {c.name: getattr(rfq, c.name) for c in rfq.__table__.columns}
+        # Include creator_name and entity_name if available
+        rfq_dict['entity_name'] = rfq.entity.entity_name if rfq.entity else None
+        rfq_dict['creator_name'] = rfq.created_by.name if hasattr(rfq, 'created_by') and rfq.created_by else None
+
+        banks_list = []
+        for a in rfq.assignments:
+            q_bank = a.quotation_bank
+            b_name = q_bank.bank.name if (q_bank and q_bank.bank) else f"Bank #{a.quotation_bank_id}"
+            assigned_vd = a.value_date or rfq.value_date
+            assigned_vd_str = str(assigned_vd).split('T')[0] if assigned_vd else None
+            assigned_alt = a.allow_alternative_value_date if a.allow_alternative_value_date is not None else bool(rfq.allow_alternative_value_date)
+            assigned_base = a.quotation_base or rfq.quotation_base or "Execution"
+            banks_list.append({
+                "assignment_id": a.id,
+                "bank_id": q_bank.bank_id if q_bank else 0,
+                "bank_name": b_name,
+                "quotation_base": assigned_base,
+                "value_date": assigned_vd_str,
+                "is_custom_value_date": bool(a.value_date and str(a.value_date).split('T')[0] != (str(rfq.value_date).split('T')[0] if rfq.value_date else '')),
+                "allow_alternative_value_date": assigned_alt,
+                "cost_min": a.cost_min or 0.0,
+                "cost_percent": a.cost_percent or 0.0,
+                "cost_max": a.cost_max or 0.0,
+                "cost_flat": a.cost_flat or 0.0,
+            })
+        rfq_dict['assigned_banks'] = banks_list
+        results.append(QuotationRequestOut(**rfq_dict))
+    return results
 
 @router.post("/quotations/{rfq_id}/approve")
 def approve_quotation(
@@ -1923,8 +1955,41 @@ def approve_quotation(
     if rfq.status != 'PENDING_APPROVAL':
         raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be approved.")
 
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
     rfq.status = 'PENDING'
+    rfq.admin_reviewed_at = now_utc
     db.commit()
+
+    # Non-repudiation and regulatory legal accountability audit logging
+    from app.crud.base import log_action
+    client_ip = request.client.host if request and request.client else None
+    user_agent = request.headers.get("user-agent") if request else None
+
+    log_action(
+        db,
+        user_id=corporate_admin_context.user_id,
+        action_type="QUOTATION_RFQ_APPROVED",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": str(rfq.id),
+            "ref_no": rfq.ref_no,
+            "type": rfq.type,
+            "entity_id": rfq.entity_id,
+            "entity_name": rfq.entity.entity_name if rfq.entity else None,
+            "quotation_base": rfq.quotation_base,
+            "legal_disclaimer_accepted": True,
+            "approved_by_user_id": corporate_admin_context.user_id,
+            "approved_by_email": corporate_admin_context.email,
+            "approved_by_role": corporate_admin_context.role,
+            "approved_at": now_utc.isoformat(),
+            "client_ip": client_ip,
+            "user_agent": user_agent
+        },
+        customer_id=corporate_admin_context.customer_id,
+        ip_address=client_ip
+    )
     
     # Broadcast emails to banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
@@ -1937,7 +2002,7 @@ def approve_quotation(
     base_url = get_frontend_base_url(request=request)
     
     # Standard Bank Branding
-    customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+    customer_branding = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
 
     from app.services.unified_email_builder import build_quotation_rfq_bank_email
 
@@ -1959,83 +2024,59 @@ def approve_quotation(
         bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
         link = f"{base_url}/public-quotation/{assignment.token}"
 
-        if assignment.approval_status == 'PENDING':
-            # --- BANK APPROVAL FLOW (Execution RFQ + bank has APPROVER contacts) ---
+        # Collect contacts by role
+        all_bank_emails = list(dict.fromkeys(
+            c.get("email", "").strip() for c in contacts if c.get("email")
+        ))
+        approver_emails = list(dict.fromkeys(
+            c.get("email", "").strip() for c in contacts 
+            if c.get("role") == "APPROVER" and c.get("email")
+        ))
+        approver_set = {e.lower() for e in approver_emails}
+        non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
 
-            # Phase 1a: Email APPROVER contacts with 1-click magic action link
-            approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
+        is_indicative = (getattr(rfq, "quotation_base", "") or "").lower() == "indicative" or (getattr(assignment, "quotation_base", "") or "").lower() == "indicative"
+        has_approver = len(approver_emails) > 0
+        has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+
+        # Bank approval flow ONLY applies if:
+        # 1. Assignment is PENDING approval
+        # 2. Quotation is Execution (not Indicative)
+        # 3. Bank has BOTH APPROVER and EXECUTION contacts
+        if assignment.approval_status == 'PENDING' and not is_indicative and has_approver and has_execution:
+            # Phase 1a: Email APPROVER contacts with review link requiring 2FA OTP verification
             for app_email in approver_emails:
-                magic_token = uuid.uuid4().hex
-                otp_code = f"{secrets.randbelow(900000) + 100000}"
-                expires_at = datetime.now(timezone.utc) + timedelta(hours=rfq.token_validity_hours or 24)
-                otp_record = QuotationAccessOTP(
-                    assignment_id=assignment.id,
-                    email=app_email.lower(),
-                    role="APPROVER",
-                    otp_code=otp_code,
-                    magic_token=magic_token,
-                    expires_at=expires_at,
-                    is_used=False
+                approver_link = f"{base_url}/public-quotation/{assignment.token}?email={app_email}"
+                subject, body = build_quotation_rfq_bank_email(
+                    rfq=rfq,
+                    assignment=assignment,
+                    bank_name=bank_display_name,
+                    customer_branding=customer_branding,
+                    link=approver_link,
+                    email_purpose="BANK_APPROVAL_REQUIRED"
                 )
-                db.add(otp_record)
+                background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+
+            # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link) ALL TOGETHER in ONE email
+            if non_approver_emails:
+                subject, body = build_quotation_rfq_bank_email(
+                    rfq=rfq,
+                    assignment=assignment,
+                    bank_name=bank_display_name,
+                    customer_branding=customer_branding,
+                    link="",
+                    email_purpose="BANK_HEADS_UP"
+                )
+                background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+        else:
+            # --- STANDARD FLOW (No bank-level approval needed: Indicative, or No Approver, or Approver without Execution role) ---
+            # Ensure assignment is not stuck in PENDING approval
+            if assignment.approval_status == 'PENDING':
+                assignment.approval_status = None
                 db.commit()
 
-                approver_link = f"{base_url}/public-quotation/{assignment.token}?magic_token={magic_token}"
-                approver_subject = f"APPROVAL REQUIRED: RFQ {rfq.ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
-                amount_formatted = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
-                approver_body = f"""
-                <html>
-                <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                    <p>Dear {bank_display_name} Authorized Approver,</p>
-                    <p>Your bank has been invited to participate in a new <strong>Execution</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>.</p>
-                    <br/>
-                    <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
-                        <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
-                        <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{rfq.type}</td></tr>
-                        <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair &amp; Direction:</td><td style="padding: 10px;">{rfq.buy_currency}/{rfq.sell_currency} ({rfq.direction or 'Buy'})</td></tr>
-                        <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {rfq.buy_currency or ''}</td></tr>
-                        <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{rfq.value_date or 'N/A'}</td></tr>
-                    </table>
-                    <br/>
-                    <p>Please review the RFQ details and authorize your bank's participation. Once authorized, your execution desk will receive the live link to submit their binding quote.</p>
-                    <a href="{approver_link}" style="padding: 14px 28px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 8px; display: inline-block; margin-top: 10px; font-weight: bold;">⚡ Review &amp; Authorize RFQ</a>
-                    <br/><br/>
-                    <p>Best Regards,<br/>Treasury Operations</p>
-                </body>
-                </html>
-                """
-                background_tasks.add_task(send_email, db, [app_email], approver_subject, approver_body, {}, email_settings)
-
-            # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link)
-            non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
-            if non_approver_emails:
-                headsup_subject = f"HEADS UP: New RFQ Pending Bank Approval - {rfq.ref_no}"
-                amount_formatted = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
-                headsup_body = f"""
-                <html>
-                <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                    <p>Dear {bank_display_name} FX Desk,</p>
-                    <p>A new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
-                    <br/>
-                    <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
-                        <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
-                        <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{rfq.type}</td></tr>
-                        <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair &amp; Direction:</td><td style="padding: 10px;">{rfq.buy_currency}/{rfq.sell_currency} ({rfq.direction or 'Buy'})</td></tr>
-                        <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {rfq.buy_currency or ''}</td></tr>
-                        <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{rfq.value_date or 'N/A'}</td></tr>
-                    </table>
-                    <br/>
-                    <p>You will receive a follow-up notification with a secure access link once your bank's approver has authorized participation.</p>
-                    <br/>
-                    <p>Best Regards,<br/>Treasury Operations</p>
-                </body>
-                </html>
-                """
-                background_tasks.add_task(send_email, db, non_approver_emails, headsup_subject, headsup_body, {}, email_settings)
-        else:
-            # --- STANDARD FLOW (no bank-level approval needed) ---
-            bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
-            if bank_emails:
+            # Send standard invitation email with portal link to ALL contacts from the same bank ALL TOGETHER in the SAME email
+            if all_bank_emails:
                 subject, body = build_quotation_rfq_bank_email(
                     rfq=rfq,
                     assignment=assignment,
@@ -2047,7 +2088,7 @@ def approve_quotation(
                 background_tasks.add_task(
                     send_email,
                     db,
-                    bank_emails,
+                    all_bank_emails,
                     subject,
                     body,
                     {},
@@ -2214,7 +2255,7 @@ def approve_quotation_request(
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         
-        customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+        customer_branding = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
         assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
         for assignment in assignments:
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()

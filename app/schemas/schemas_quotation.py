@@ -17,6 +17,8 @@ class BankApprovalActionCreate(BaseModel):
 class QuotationBankBase(BaseModel):
     bank_id: int
     trade_type: str = "BOTH"
+    entity_scope: Optional[str] = "ALL_ENTITIES"
+    entity_ids: Optional[List[int]] = []
     emails: Optional[str] = None
     contacts: Optional[List[QuotationContactItem]] = None
 
@@ -37,6 +39,8 @@ class QuotationBankOut(QuotationBankBase):
     created_at: datetime
     bank: Optional[BankSimpleOut] = None
     contacts: Optional[List[dict]] = None
+    entity_scope: Optional[str] = "ALL_ENTITIES"
+    entity_ids: Optional[List[int]] = []
     
     class Config:
         from_attributes = True
@@ -78,6 +82,8 @@ class QuotationRequestCreate(BaseModel):
     parent_rfq_id: Optional[str] = None
     internal_notes: Optional[str] = None
     internalNotes: Optional[str] = None
+    legal_disclaimer_accepted: Optional[bool] = False
+    legalDisclaimerAccepted: Optional[bool] = False
 
 class QuotationRequestOut(BaseModel):
     id: str
@@ -100,6 +106,7 @@ class QuotationRequestOut(BaseModel):
     token_validity_hours: Optional[int] = 24
     entity_id: Optional[int] = None
     entity_name: Optional[str] = None
+    entity_code: Optional[str] = None
     created_at: datetime
     creator_name: Optional[str] = None
     quotation_base: Optional[str] = None
@@ -120,6 +127,7 @@ class QuotationRequestOut(BaseModel):
     cancellation_requested_by: Optional[int] = None
     cancellation_requested_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
+    assigned_banks: Optional[List[dict]] = None
 
     class Config:
         from_attributes = True
@@ -130,10 +138,11 @@ class QuotationCancellationRequest(BaseModel):
 
 class ReTenderRequest(BaseModel):
     window_start: Optional[datetime] = None
-    window_end: datetime
+    window_end: Optional[datetime] = None
     amount: Optional[float] = None
     selected_bank_ids: Optional[List[int]] = None
     token_validity_hours: Optional[int] = 24
+    entity_id: Optional[int] = None
 
 class QuotationResubmitRequest(BaseModel):
     type: Optional[str] = None
@@ -157,9 +166,12 @@ class QuotationResubmitRequest(BaseModel):
     selected_banks: Optional[str] = None
     selected_bank_ids: Optional[List[int]] = None
     token_validity_hours: Optional[int] = 24
+    entity_id: Optional[int] = None
     user_notes: Optional[str] = None
     internal_notes: Optional[str] = None
     internalNotes: Optional[str] = None
+    legal_disclaimer_accepted: Optional[bool] = False
+    legalDisclaimerAccepted: Optional[bool] = False
 
 # --- Bank Offers & OTP Schemas (Public) ---
 class OTPRequestCreate(BaseModel):

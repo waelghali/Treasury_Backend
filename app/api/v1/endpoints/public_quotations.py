@@ -180,6 +180,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         pass
 
     effective_value_date = assignment.value_date or rfq.value_date
+    effective_value_date_str = str(effective_value_date).split('T')[0] if effective_value_date else None
     effective_allow_alt = assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
 
     return {
@@ -187,7 +188,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "ref_no": rfq.ref_no,
         "type": rfq.type,
         "direction": rfq.direction,
-        "value_date": effective_value_date,
+        "value_date": effective_value_date_str,
         "allow_alternative_value_date": effective_allow_alt,
         "amount": rfq.amount,
         "min_ticket_amount": rfq.min_ticket_amount,
@@ -207,6 +208,10 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "assignment_id": assignment.id,
         "bank_name": bank_name,
         "customer_name": customer_name,
+        "entity_name": rfq.entity.entity_name if rfq.entity else customer_name,
+        "entity_tax_id": rfq.entity.tax_id if rfq.entity else None,
+        "entity_cr_number": rfq.entity.commercial_register_number if rfq.entity else None,
+        "entity_code": rfq.entity.code if rfq.entity else None,
         "serverTime": now.isoformat(),
         "isWindowOpen": is_open,
         "offers": offers,
@@ -214,6 +219,9 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "approved_by_email": assignment.approved_by_email,
         "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else None,
         "approval_notes": assignment.approval_notes,
+        "has_execution_dealers": any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
+        "total_execution_dealers": sum(1 for c in (_get_bank_contacts_list(q_bank) if q_bank else []) if c.get("role") == "EXECUTION"),
+        "requires_bank_approval": (effective_base != "indicative") and any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])) and any(c.get("role") == "APPROVER" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
         "cbe_benchmark_rate": cbe_benchmark_rate,
         "is_live_ranking_enabled": is_live_ranking_enabled,
         "live_rank": live_rank,
@@ -261,8 +269,20 @@ async def request_quotation_otp(
     role = matched_contact.get("role", "EXECUTION")
     contact_name = matched_contact.get("name") or target_email.split("@")[0]
 
-    # Non-approvers are blocked if bank-level approval has not been granted
-    if role in ("EXECUTION", "VIEW_ONLY"):
+    # Check if bank approval is required for this quotation
+    effective_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") or "Execution").lower()
+    is_indicative = effective_base == "indicative"
+    has_approver = any(c.get("role") == "APPROVER" for c in contacts)
+    has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+    requires_approval = (not is_indicative) and has_approver and has_execution
+
+    # If approval is not required, heal any stale PENDING status
+    if not requires_approval and assignment.approval_status == 'PENDING':
+        assignment.approval_status = None
+        db.commit()
+
+    # Non-approvers are blocked if bank-level approval is required and not granted
+    if role in ("EXECUTION", "VIEW_ONLY") and requires_approval:
         if assignment.approval_status == 'PENDING':
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, 
@@ -308,6 +328,23 @@ async def request_quotation_otp(
     else:
         role_badge = "⚡ Execution Trader"
     
+    action_button_html = f"""
+                <div style="text-align: center; margin-bottom: 24px;">
+                    <a href="{magic_link}" style="display: inline-block; background-color: #2563eb; color: #ffffff; font-size: 14px; font-weight: 600; text-decoration: none; padding: 12px 28px; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(37,99,235,0.2);">
+                        ⚡ 1-Click Instant Direct Access
+                    </a>
+                </div>
+    """ if role != "APPROVER" else f"""
+                <div style="background-color: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 14px 18px; margin-bottom: 24px; text-align: center;">
+                    <p style="margin: 0; font-size: 12px; color: #92400e; font-weight: 700;">
+                        🛡️ 2FA Verification Code Required
+                    </p>
+                    <p style="margin: 4px 0 0 0; font-size: 11px; color: #b45309; line-height: 1.4;">
+                        As an authorized Bank Approver, enter the 6-digit access code above in the verification window to authenticate your identity and review this deal.
+                    </p>
+                </div>
+    """
+
     subject = f"🔐 Access Code {otp_code} for RFQ {rfq.ref_no} - {q_bank.bank.name if q_bank.bank else 'Treasury Portal'}"
     body = f"""
     <!DOCTYPE html>
@@ -335,11 +372,7 @@ async def request_quotation_otp(
                     <span style="display: block; font-size: 12px; color: #94a3b8; margin-top: 8px;">Valid for 15 minutes</span>
                 </div>
 
-                <div style="text-align: center; margin-bottom: 24px;">
-                    <a href="{magic_link}" style="display: inline-block; background-color: #2563eb; color: #ffffff; font-size: 14px; font-weight: 600; text-decoration: none; padding: 12px 28px; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(37,99,235,0.2);">
-                        ⚡ 1-Click Instant Direct Access
-                    </a>
-                </div>
+                {action_button_html}
 
                 <div style="border-top: 1px solid #f1f5f9; padding-top: 16px; font-size: 12px; color: #64748b;">
                     <p style="margin: 0 0 4px 0;"><strong>Assigned Role:</strong> {role_badge}</p>
@@ -407,8 +440,29 @@ def verify_quotation_otp(
     if not otp_record:
         raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
 
+    # Bank Approvers MUST verify with 6-digit OTP code - magic token bypass is strictly forbidden
+    if otp_record.role == "APPROVER" and not req.otp_code:
+        raise HTTPException(
+            status_code=400, 
+            detail="Bank Approvers must verify identity using a 6-digit OTP code."
+        )
+
+    # Check if bank approval is required for this quotation
+    effective_base = (getattr(assignment, "quotation_base", "") or getattr(assignment.rfq, "quotation_base", "") if assignment.rfq else "Execution").lower()
+    is_indicative = effective_base == "indicative"
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+    has_approver = any(c.get("role") == "APPROVER" for c in contacts)
+    has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+    requires_approval = (not is_indicative) and has_approver and has_execution
+
+    # If approval is not required, heal any stale PENDING status
+    if not requires_approval and assignment.approval_status == 'PENDING':
+        assignment.approval_status = None
+        db.commit()
+
     # Non-approvers cannot authenticate while approval is still pending, expired, or declined
-    if otp_record.role in ("EXECUTION", "VIEW_ONLY"):
+    if otp_record.role in ("EXECUTION", "VIEW_ONLY") and requires_approval:
         if assignment.approval_status == 'PENDING':
             raise HTTPException(status_code=403, detail="This quotation is awaiting internal bank approval from your authorized approver.")
         elif assignment.approval_status == 'EXPIRED':
@@ -483,11 +537,56 @@ def desk_heartbeat(
             detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
         )
 
+    # Check if quotation bidding window is currently active
+    now = datetime.now(timezone.utc)
+    def _to_utc_dt(dt):
+        if not dt:
+            return None
+        if isinstance(dt, str):
+            try:
+                from dateutil import parser
+                dt = parser.parse(dt)
+            except Exception:
+                return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+    w_start = _to_utc_dt(rfq.window_start) if rfq else None
+    w_end = _to_utc_dt(rfq.window_end) if rfq else None
+    
+    # Desk session coordination allowed from 10 minutes before window_start until 1 minute after window_end
+    from datetime import timedelta
+    is_session_active = bool(
+        w_start and w_end and 
+        (w_start - timedelta(minutes=10)) <= now <= (w_end + timedelta(minutes=1)) and 
+        rfq.status not in ('CANCELLED', 'REJECTED')
+    )
+
+    if not is_session_active:
+        return {
+            "active_trader_email": None,
+            "active_trader_name": None,
+            "is_active_trader": False,
+            "can_takeover": False,
+            "spectators": [],
+            "rfq_status": rfq.status if rfq else "UNKNOWN",
+            "is_window_open": False
+        }
+
+    # Determine if approver is authorized to quote (indicative or solo bank contact)
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+    has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+    effective_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") if rfq else "Execution").lower()
+    is_indicative = effective_base == "indicative"
+    can_approver_execute = is_indicative or not has_execution_dealers
+
+    desk_role = "EXECUTION" if (resolved_role == "EXECUTION" or (resolved_role == "APPROVER" and can_approver_execute)) else resolved_role
+
     res = desk_session_service.heartbeat(
         assignment_id=assignment.id,
         email=payload.email,
         name=payload.name,
-        role=resolved_role
+        role=desk_role
     )
     if isinstance(res, dict) and rfq:
         res["rfq_status"] = rfq.status
@@ -521,7 +620,15 @@ def desk_takeover(
         if otp_rec and otp_rec.role:
             resolved_role = otp_rec.role.strip().upper()
 
-    if resolved_role != "EXECUTION":
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+    has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+    effective_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") if rfq else "Execution").lower()
+    is_indicative = effective_base == "indicative"
+    can_approver_execute = is_indicative or not has_execution_dealers
+
+    is_allowed = (resolved_role == "EXECUTION") or (resolved_role == "APPROVER" and can_approver_execute)
+    if not is_allowed:
         raise HTTPException(status_code=403, detail="Only authorized Execution dealers can take over desk quoting control.")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
@@ -530,7 +637,7 @@ def desk_takeover(
         assignment_id=assignment.id,
         email=payload.email,
         name=payload.name,
-        role=resolved_role
+        role="EXECUTION"
     )
 
     # Audit Log the takeover event
@@ -567,6 +674,7 @@ def submit_fx_offer(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
     
@@ -594,8 +702,14 @@ def submit_fx_offer(
             QuotationAccessOTP.magic_token == offer_in.session_token
         ).first()
         if otp_rec:
-            if otp_rec.role in ("VIEW_ONLY", "APPROVER"):
-                raise HTTPException(status_code=403, detail="Only Execution contacts are authorized to submit bids.")
+            if otp_rec.role == "VIEW_ONLY":
+                raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
+            elif otp_rec.role == "APPROVER":
+                contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+                has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+                is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
+                if not is_indicative and has_execution_dealers:
+                    raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
             submitted_by = otp_rec.email
 
     # Verify active trader session lock
@@ -705,6 +819,7 @@ def submit_tbill_offer(
         raise HTTPException(status_code=404, detail="Invalid token")
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
     
@@ -732,8 +847,14 @@ def submit_tbill_offer(
             QuotationAccessOTP.magic_token == offer_in.session_token
         ).first()
         if otp_rec:
-            if otp_rec.role in ("VIEW_ONLY", "APPROVER"):
-                raise HTTPException(status_code=403, detail="Only Execution contacts are authorized to submit bids.")
+            if otp_rec.role == "VIEW_ONLY":
+                raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
+            elif otp_rec.role == "APPROVER":
+                contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+                has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+                is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
+                if not is_indicative and has_execution_dealers:
+                    raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
             submitted_by = otp_rec.email
 
     # Verify active trader session lock
@@ -949,17 +1070,21 @@ async def approve_rfq_for_bank(
     assignment.approval_notes = action_in.notes
 
     bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Bank Partner"
-    customer_name = rfq.customer.name if rfq and rfq.customer else "Treasury Client"
+    customer_name = (rfq.entity.entity_name if rfq and rfq.entity else None) or (rfq.customer.name if rfq and rfq.customer else "Treasury Client")
     base_url = get_frontend_base_url(request=request)
     email_settings, source = get_customer_email_settings(db, rfq.customer_id)
 
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
-    non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
+    approver_email_set = {approver_email.lower()} if approver_email else set()
+    non_approver_emails = list(dict.fromkeys(
+        c.get("email", "").strip() for c in contacts 
+        if c.get("role") != "APPROVER" and c.get("email") and c.get("email").strip().lower() not in approver_email_set
+    ))
 
     if action == "APPROVE":
         assignment.approval_status = "APPROVED"
         
-        # Phase 2: Email EXECUTION + VIEW_ONLY contacts WITH active link
+        # Phase 2: Email EXECUTION + VIEW_ONLY contacts WITH active link (ALL TOGETHER in ONE email, NEVER to APPROVER)
         if non_approver_emails:
             link = f"{base_url}/public-quotation/{assignment.token}"
             from app.services.unified_email_builder import build_quotation_rfq_bank_email
@@ -978,7 +1103,7 @@ async def approve_rfq_for_bank(
             user_id=rfq.created_by_user_id,
             type="BANK_APPROVED",
             title=f"Bank Approved: {bank_name}",
-            message=f"{bank_name} approver ({approver_email}) approved participation for {rfq.ref_no}.",
+            message=f"{bank_name} approver ({approver_email}) approved participation for {rfq.ref_no} ({customer_name}).",
             link=f"/end-user/quotations/history?rfq_id={rfq.id}",
             is_read=False
         ))
@@ -989,13 +1114,13 @@ async def approve_rfq_for_bank(
         
         # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
         if non_approver_emails:
-            subject = f"RFQ {rfq.ref_no} - Bank Participation Declined"
+            subject = f"RFQ {rfq.ref_no} ({customer_name}) - Bank Participation Declined"
             notes_html = f"<p><strong>Reason / Notes:</strong> {action_in.notes}</p>" if action_in.notes else ""
             body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
                 <p>Dear {bank_name} FX Desk,</p>
-                <p>Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>declined participation</strong> for RFQ <strong>{rfq.ref_no}</strong>.</p>
+                <p>Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>declined participation</strong> for RFQ <strong>{rfq.ref_no}</strong> on behalf of <strong>{customer_name}</strong>.</p>
                 {notes_html}
                 <p>No further action is required from your desk.</p>
                 <br/>
@@ -1088,7 +1213,9 @@ def get_bank_quotation_history(
 
         # Determine trade outcome
         outcome = "NO_QUOTE"
-        if best_price is not None:
+        if a.approval_status == 'DECLINED':
+            outcome = "PARTICIPATION_DECLINED"
+        elif best_price is not None:
             if rfq.status == "COMPLETED":
                 # Check analytics
                 analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
@@ -1104,6 +1231,8 @@ def get_bank_quotation_history(
         history_items.append({
             "rfq_id": rfq.id,
             "ref_no": rfq.ref_no,
+            "entity_name": rfq.entity.entity_name if rfq.entity else None,
+            "entity_code": rfq.entity.code if rfq.entity else None,
             "type": rfq.type,
             "direction": rfq.direction,
             "amount": rfq.amount,
@@ -1135,19 +1264,39 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
         
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
     
+    # If the bank declined participation, strictly return PARTICIPATION_DECLINED.
+    # Counterparties that declined participation must not know if the deal concluded, executed, or closed without a winner.
+    if assignment.approval_status == 'DECLINED':
+        return {"status": "PARTICIPATION_DECLINED"}
+
     # Lazy evaluation in case history hasn't been fetched
     now = datetime.now(timezone.utc)
-    try:
-        is_closed = now > rfq.window_end
-    except TypeError:
-        is_closed = datetime.now() > rfq.window_end
-        
+
+    def _to_utc_dt(dt):
+        if not dt:
+            return None
+        if isinstance(dt, str):
+            try:
+                from dateutil import parser
+                dt = parser.parse(dt)
+            except Exception:
+                return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+    w_start = _to_utc_dt(rfq.window_start)
+    w_end = _to_utc_dt(rfq.window_end)
+
+    # If quotation bidding window has not opened yet, it can NEVER be closed or completed
+    if w_start and now < w_start:
+        return {"status": "SCHEDULED"}
+
+    is_closed = bool(w_end and now > w_end)
     if is_closed and rfq.status in ('PENDING', 'OPEN'):
         rfq.status = 'COMPLETED'
         db.commit()
 
     if not is_closed and rfq.status not in ('COMPLETED', 'CANCELLED', 'REJECTED'):
-        return {"status": "PENDING"}
+        return {"status": "OPEN" if (w_start and now >= w_start) else "PENDING"}
 
     # Indicative banks are for market sounding only and are never declared winners or sent regret statuses
     q_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()

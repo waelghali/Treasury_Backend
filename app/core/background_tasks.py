@@ -1053,9 +1053,9 @@ async def run_daily_cbe_lending_rate_sync(db: Session):
 run_daily_cbe_interest_rates_sync = run_daily_cbe_lending_rate_sync
 
 
-def get_effective_quotation_eval_rate(db: Session, customer_id: Optional[int] = None) -> float:
+def get_quotation_eval_rate_details(db: Session, customer_id: Optional[int] = None) -> dict:
     """
-    Computes the effective evaluation rate for quotation alternative value dates:
+    Computes detailed evaluation rate components for quotation alternative value dates and T-Bills:
     R_eval = CBE_MID_CORRIDOR_RATE + QUOTATION_VALUE_DATE_INTEREST_MARGIN
     Where CBE_MID_CORRIDOR_RATE is the arithmetic average of Lending and Deposit rates:
       CBE_MID_CORRIDOR_RATE = (CBE_LENDING + CBE_DEPOSIT) / 2.0
@@ -1069,6 +1069,9 @@ def get_effective_quotation_eval_rate(db: Session, customer_id: Optional[int] = 
     from app.crud.crud_config import crud_customer_configuration
 
     cbe_mid = None
+    lending = 20.0
+    deposit = 19.0
+
     # 1. Try reading the arithmetic mid corridor rate directly
     try:
         mid_cfg = db.query(GlobalConfiguration).filter(
@@ -1081,29 +1084,27 @@ def get_effective_quotation_eval_rate(db: Session, customer_id: Optional[int] = 
         cbe_mid = None
 
     # 2. If mid not set, calculate from lending and deposit configs
+    try:
+        lending_cfg = db.query(GlobalConfiguration).filter(
+            cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_LENDING_RATE.value,
+            GlobalConfiguration.is_deleted == False
+        ).first()
+        if lending_cfg and lending_cfg.value_default:
+            lending = float(lending_cfg.value_default)
+    except Exception:
+        pass
+
+    try:
+        deposit_cfg = db.query(GlobalConfiguration).filter(
+            cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_DEPOSIT_RATE.value,
+            GlobalConfiguration.is_deleted == False
+        ).first()
+        if deposit_cfg and deposit_cfg.value_default:
+            deposit = float(deposit_cfg.value_default)
+    except Exception:
+        pass
+
     if cbe_mid is None:
-        lending = 20.0
-        deposit = 19.0
-        try:
-            lending_cfg = db.query(GlobalConfiguration).filter(
-                cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_LENDING_RATE.value,
-                GlobalConfiguration.is_deleted == False
-            ).first()
-            if lending_cfg and lending_cfg.value_default:
-                lending = float(lending_cfg.value_default)
-        except Exception:
-            pass
-
-        try:
-            deposit_cfg = db.query(GlobalConfiguration).filter(
-                cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_DEPOSIT_RATE.value,
-                GlobalConfiguration.is_deleted == False
-            ).first()
-            if deposit_cfg and deposit_cfg.value_default:
-                deposit = float(deposit_cfg.value_default)
-        except Exception:
-            pass
-
         cbe_mid = round((lending + deposit) / 2.0, 4)
 
     margin = 0.25
@@ -1127,7 +1128,17 @@ def get_effective_quotation_eval_rate(db: Session, customer_id: Optional[int] = 
         except Exception:
             margin = 0.25
 
-    return round(cbe_mid + margin, 4)
+    return {
+        "cbe_mid": cbe_mid,
+        "cbe_lending": lending,
+        "cbe_deposit": deposit,
+        "margin": margin,
+        "eval_rate": round(cbe_mid + margin, 4)
+    }
+
+
+def get_effective_quotation_eval_rate(db: Session, customer_id: Optional[int] = None) -> float:
+    return get_quotation_eval_rate_details(db, customer_id)["eval_rate"]
 
 
 async def _check_fx_breach_auto_suspend(db: Session):

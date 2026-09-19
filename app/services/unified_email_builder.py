@@ -327,9 +327,18 @@ def build_quotation_rfq_bank_email(
     - Quotation base (Indicative vs Firm Execution)
     - Direct secure CTA button and direct clickable fallback link
     """
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-    from dateutil import parser
+    # 0. Format Requesting Legal Entity
+    rfq_entity = getattr(rfq, "entity", None)
+    entity_name = (rfq_entity.entity_name if rfq_entity and getattr(rfq_entity, "entity_name", None) else None) or customer_branding
+    entity_cr = getattr(rfq_entity, "cr_number", None) if rfq_entity else None
+    entity_tax = getattr(rfq_entity, "tax_id", None) if rfq_entity else None
+
+    entity_meta_parts = []
+    if entity_cr:
+        entity_meta_parts.append(f"CR: {entity_cr}")
+    if entity_tax:
+        entity_meta_parts.append(f"Tax ID: {entity_tax}")
+    entity_meta_html = f'<div style="font-size: 11px; color: #64748b; font-family: monospace; font-weight: normal; margin-top: 3px;">{" &bull; ".join(entity_meta_parts)}</div>' if entity_meta_parts else ""
 
     # 1. Format Submission Deadline
     window_end = getattr(rfq, "window_end", None)
@@ -417,21 +426,88 @@ def build_quotation_rfq_bank_email(
     if email_purpose == "RE_TENDER":
         subject = f"ACTION REQUIRED: Re-Tender RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
         banner_title = "Re-Tender Request for Quotation"
+        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"You have received a <strong>re-tendered</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
     elif email_purpose == "REMINDER":
         subject = f"REMINDER: RFQ Submission Pending - {customer_branding} - {pair_str} - {ref_no}"
         banner_title = "Quotation Submission Reminder"
+        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"This is a reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> for <strong>{customer_branding}</strong> is pending submission."
+        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
+    elif email_purpose == "BANK_APPROVAL_REQUIRED":
+        subject = f"APPROVAL REQUIRED: RFQ {ref_no} ({customer_branding}) - {pair_str}"
+        banner_title = "Bank Approval Required &bull; RFQ Authorization"
+        salutation = f"Dear <strong>{bank_name} Authorized Approver</strong>,"
+        intro_text = f"Your bank has been invited to participate in a new <strong>Firm Execution</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+        instruction_text = "Please review the required trade specifications below and authorize your bank's participation. Once authorized, your execution desk will receive access to submit quotes."
+    elif email_purpose == "BANK_HEADS_UP":
+        subject = f"HEADS UP: New RFQ Pending Bank Approval ({customer_branding}) - {ref_no}"
+        banner_title = "RFQ Pending Bank Approval"
+        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
+        intro_text = f"A new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your bank and is currently <strong>pending authorization from your bank's designated approver</strong>."
+        instruction_text = "Please review the required trade specifications below. You will receive a direct access link to submit your quotation as soon as your bank's approver authorizes participation."
     elif email_purpose == "APPROVED_BY_BANK":
         subject = f"ACTION REQUIRED: RFQ {ref_no} Authorized - Submit Your Quote"
         banner_title = "RFQ Authorized for Desk Submission"
+        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"Your bank's authorized approver has <strong>approved participation</strong> for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong>."
+        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
     else:
         subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
         banner_title = "New Request for Quotation"
+        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
 
-    # 8. Extra T-Bill Rows if applicable
+    # 8. Action Box / Call To Action
+    if email_purpose == "BANK_HEADS_UP":
+        action_box_html = f"""
+            <!-- PENDING APPROVAL INFORMATION BOX -->
+            <div style="background-color: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #f59e0b; border-radius: 8px; padding: 16px 20px; margin: 28px 0 20px 0; text-align: center;">
+                <span style="font-size: 11px; font-weight: 800; color: #b45309; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px;">
+                    &#9203; ACTION STATUS &bull; PENDING AUTHORIZATION
+                </span>
+                <div style="font-size: 15px; font-weight: 800; color: #92400e; line-height: 1.4;">
+                    Awaiting Bank Approver Authorization
+                </div>
+                <p style="margin: 6px 0 0 0; font-size: 12px; color: #78350f; line-height: 1.4;">
+                    Your bank's designated approver has been notified with a secure authorization link. Once approved, your execution desk will automatically receive an invitation email with the live quotation portal link.
+                </p>
+            </div>
+        """
+    elif email_purpose == "BANK_APPROVAL_REQUIRED":
+        action_box_html = f"""
+            <!-- PRIMARY CALL TO ACTION BUTTON (APPROVER) -->
+            <div style="text-align: center; margin: 36px 0 20px 0;">
+                <a href="{link}" style="background-color: #2563eb; color: #ffffff; padding: 15px 36px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 15px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.3); letter-spacing: 0.5px;">
+                    &#9889; Review &amp; Authorize RFQ Participation &rarr;
+                </a>
+            </div>
+
+            <!-- DIRECT LINK FALLBACK -->
+            <p style="text-align: center; margin: 0 0 24px 0; font-size: 12px; color: #64748b; line-height: 1.5;">
+                Or copy and paste this authorization link into your browser:<br/>
+                <a href="{link}" style="color: #0284c7; word-break: break-all; font-size: 12px; text-decoration: underline;">{link}</a>
+            </p>
+        """
+    else:
+        action_box_html = f"""
+            <!-- PRIMARY CALL TO ACTION BUTTON -->
+            <div style="text-align: center; margin: 36px 0 20px 0;">
+                <a href="{link}" style="background-color: #0f172a; color: #ffffff; padding: 15px 36px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 15px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.25); letter-spacing: 0.5px;">
+                    Access Quotation Portal &amp; Submit Quote &rarr;
+                </a>
+            </div>
+
+            <!-- DIRECT LINK FALLBACK -->
+            <p style="text-align: center; margin: 0 0 24px 0; font-size: 12px; color: #64748b; line-height: 1.5;">
+                Or copy and paste this link into your browser:<br/>
+                <a href="{link}" style="color: #0284c7; word-break: break-all; font-size: 12px; text-decoration: underline;">{link}</a>
+            </p>
+        """
+
+    # 9. Extra T-Bill Rows if applicable
     tbill_rows = ""
     if rfq_type == "TBILL":
         s_start = getattr(rfq, "settlement_date_start", "") or ""
@@ -453,7 +529,7 @@ def build_quotation_rfq_bank_email(
                         </tr>
         """
 
-    # 9. HTML Template
+    # 10. HTML Template
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
 
     html_body = f"""<!DOCTYPE html>
@@ -486,10 +562,10 @@ def build_quotation_rfq_bank_email(
         <!-- BODY -->
         <div style="padding: 32px;">
             <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
-                Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,
+                {salutation}
             </p>
             <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
-                {intro_text} Please review the required trade specifications below and access the live portal to enter your quotation.
+                {intro_text} {instruction_text}
             </p>
 
             <!-- SUBMISSION DEADLINE ALERT BOX -->
@@ -529,6 +605,13 @@ def build_quotation_rfq_bank_email(
                             <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a; font-family: monospace;">{ref_no}</td>
                         </tr>
                         <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Requesting Legal Entity</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">
+                                {entity_name}
+                                {entity_meta_html}
+                            </td>
+                        </tr>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
                             <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Product &amp; Quotation Base</td>
                             <td style="padding: 12px 16px; font-size: 14px; font-weight: 600; color: #0f172a;">
                                 <span style="margin-right: 8px;"><strong>{rfq_type}</strong></span>
@@ -569,18 +652,7 @@ def build_quotation_rfq_bank_email(
                 </table>
             </div>
 
-            <!-- PRIMARY CALL TO ACTION BUTTON -->
-            <div style="text-align: center; margin: 36px 0 20px 0;">
-                <a href="{link}" style="background-color: #0f172a; color: #ffffff; padding: 15px 36px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 15px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.25); letter-spacing: 0.5px;">
-                    Access Quotation Portal &amp; Submit Quote &rarr;
-                </a>
-            </div>
-
-            <!-- DIRECT LINK FALLBACK -->
-            <p style="text-align: center; margin: 0 0 24px 0; font-size: 12px; color: #64748b; line-height: 1.5;">
-                Or copy and paste this link into your browser:<br/>
-                <a href="{link}" style="color: #0284c7; word-break: break-all; font-size: 12px; text-decoration: underline;">{link}</a>
-            </p>
+            {action_box_html}
 
             <!-- INSTITUTIONAL RESERVATION CLAUSE -->
             <div style="background-color: #f8fafc; border-left: 3px solid #94a3b8; padding: 10px 14px; margin-top: 14px; font-size: 11px; color: #64748b; line-height: 1.4;">
@@ -602,6 +674,9 @@ def build_quotation_rfq_bank_email(
             </p>
             <p style="margin: 0; font-size: 11px; color: #94a3b8;">
                 Generated on {current_time_str} for {customer_branding}. Strictly confidential and intended solely for the designated recipient.
+            </p>
+            <p style="margin: 8px auto 0 auto; font-size: 10px; color: #94a3b8; line-height: 1.4; max-width: 540px;">
+                <strong>Legal Notice:</strong> {platform_name} operates solely as an independent communications and workflow technology platform (&ldquo;AS IS&rdquo;). Neither {platform_name} nor its affiliates are party to this transaction or assume credit, market, or settlement liability. All commercial commitments and settlement obligations exist exclusively between {entity_name} and {bank_name}.
             </p>
         </div>
 

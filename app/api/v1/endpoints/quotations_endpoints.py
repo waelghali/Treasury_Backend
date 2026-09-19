@@ -109,13 +109,57 @@ def delete_quotation_bank(
     )
     return {"message": "Bank configuration removed."}
 
-@router.get("/banks", response_model=List[QuotationBankOut])
-def get_quotation_banks(
-    trade_type: str = None,
+@router.get("/entities")
+def get_user_accessible_quotation_entities(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    return crud_quotation.get_quotation_banks(db, customer_id=current_user.customer_id, trade_type=trade_type)
+    """
+    Returns active customer entities accessible by current user for creating or filtering quotations.
+    """
+    from app.models.models import CustomerEntity, User
+    user = db.query(User).filter(User.id == current_user.user_id).first()
+    is_admin = current_user.role in ["corporate_admin", "super_admin"]
+    has_all = getattr(user, "has_all_entity_access", False) if user else False
+
+    if is_admin or has_all:
+        entities = db.query(CustomerEntity).filter(
+            CustomerEntity.customer_id == current_user.customer_id,
+            CustomerEntity.is_active == True,
+            CustomerEntity.is_deleted == False
+        ).order_by(CustomerEntity.entity_name.asc()).all()
+    else:
+        allowed_ids = [assoc.customer_entity_id for assoc in user.entity_associations] if user else []
+        entities = db.query(CustomerEntity).filter(
+            CustomerEntity.id.in_(allowed_ids),
+            CustomerEntity.customer_id == current_user.customer_id,
+            CustomerEntity.is_active == True,
+            CustomerEntity.is_deleted == False
+        ).order_by(CustomerEntity.entity_name.asc()).all()
+
+    return [
+        {
+            "id": e.id,
+            "entity_name": e.entity_name,
+            "name": e.entity_name,
+            "code": e.code,
+            "tax_id": e.tax_id,
+            "commercial_register_number": e.commercial_register_number,
+            "address": e.address
+        }
+        for e in entities
+    ]
+
+@router.get("/banks", response_model=List[QuotationBankOut])
+def get_quotation_banks(
+    trade_type: str = None,
+    entity_id: int = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    return crud_quotation.get_quotation_banks(
+        db, customer_id=current_user.customer_id, trade_type=trade_type, entity_id=entity_id
+    )
 
 @router.get("/banks/latest-costs")
 def get_latest_bank_costs(
@@ -262,6 +306,18 @@ def get_bank_recommendations(
         "recommendations": top_recommendations
     }
 
+@router.get("/evaluation-rate")
+def get_quotation_evaluation_rate(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Returns CBE corridor rates, customer margin, and effective evaluation rate (mid + margin).
+    Used to pre-fill the Evaluation Interest Rate field in T-Bills and alternative value date quotations.
+    """
+    from app.core.background_tasks import get_quotation_eval_rate_details
+    return get_quotation_eval_rate_details(db, customer_id=current_user.customer_id)
+
 @router.post("/", response_model=Any)
 def create_rfq(
     rfq_in: QuotationRequestCreate,
@@ -302,6 +358,28 @@ def create_rfq(
                 if has_range and (rfq_in.evalRate is None or rfq_in.evalRate <= 0):
                     raise HTTPException(status_code=400, detail="Evaluation Interest Rate (%) is required for T-Bill Buy quotations with date ranges.")
 
+        # --- Entity Scope & Access Validation ---
+        from app.models.models import CustomerEntity, User
+        cust_entities = db.query(CustomerEntity).filter(
+            CustomerEntity.customer_id == current_user.customer_id,
+            CustomerEntity.is_active == True,
+            CustomerEntity.is_deleted == False
+        ).all()
+
+        if cust_entities:
+            if len(cust_entities) == 1 and not rfq_in.entity_id:
+                rfq_in.entity_id = cust_entities[0].id
+            elif not rfq_in.entity_id:
+                raise HTTPException(status_code=400, detail="Please select the requesting Legal Entity.")
+
+            user = db.query(User).filter(User.id == current_user.user_id).first()
+            is_admin = current_user.role in ["corporate_admin", "super_admin"]
+            has_all = getattr(user, "has_all_entity_access", False) if user else False
+            if not is_admin and not has_all:
+                user_ids = [assoc.customer_entity_id for assoc in user.entity_associations] if user else []
+                if rfq_in.entity_id not in user_ids:
+                    raise HTTPException(status_code=403, detail="You do not have permission to create quotations for this entity.")
+
         rfq, assignments = crud_quotation.create_request(
             db, 
             customer_id=current_user.customer_id, 
@@ -316,7 +394,14 @@ def create_rfq(
             action_type="QUOTATION_RFQ_CREATED",
             entity_type="QuotationRequest",
             entity_id=None, # UUID string cannot fit into Integer column
-            details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "type": rfq.type},
+            details={
+                "rfq_id": rfq.id,
+                "ref_no": rfq.ref_no,
+                "type": rfq.type,
+                "entity_id": rfq.entity_id,
+                "quotation_base": rfq.quotation_base,
+                "legal_disclaimer_accepted": bool(rfq_in.legal_disclaimer_accepted or rfq_in.legalDisclaimerAccepted)
+            },
             customer_id=current_user.customer_id
         )
         
@@ -325,6 +410,7 @@ def create_rfq(
             email_settings = get_global_email_settings()
             from app.core.routing import get_frontend_base_url
             base_url = get_frontend_base_url(request=request)
+            entity_display_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else 'Corporate Treasury')
             
             for assignment in assignments:
                 q_bank_id = assignment.get("quotation_bank_id")
@@ -341,95 +427,76 @@ def create_rfq(
                 bank_name = bank_row.bank.name if bank_row.bank else 'Bank Partner'
                 link = f"{base_url}/public-quotation/{assignment['token']}"
                 
-                if assignment.get("approval_status") == "PENDING":
-                    # --- BANK APPROVAL FLOW (Execution RFQ + bank has APPROVER contacts) ---
-                    
-                    # Phase 1a: Email APPROVER contacts with 1-click magic action link
-                    approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
-                    for app_email in approver_emails:
-                        magic_token = uuid.uuid4().hex
-                        otp_code = f"{secrets.randbelow(900000) + 100000}"
-                        expires_at = datetime.now(timezone.utc) + timedelta(hours=rfq.token_validity_hours or 24)
-                        otp_record = QuotationAccessOTP(
-                            assignment_id=assignment["id"],
-                            email=app_email.lower(),
-                            role="APPROVER",
-                            otp_code=otp_code,
-                            magic_token=magic_token,
-                            expires_at=expires_at,
-                            is_used=False
-                        )
-                        db.add(otp_record)
-                        db.commit()
+                # Collect contacts by role
+                all_bank_emails = list(dict.fromkeys(
+                    c.get("email", "").strip() for c in contacts if c.get("email")
+                ))
+                approver_emails = list(dict.fromkeys(
+                    c.get("email", "").strip() for c in contacts 
+                    if c.get("role") == "APPROVER" and c.get("email")
+                ))
+                approver_set = {e.lower() for e in approver_emails}
+                non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
 
-                        approver_link = f"{base_url}/public-quotation/{assignment['token']}?magic_token={magic_token}"
-                        approver_subject = f"APPROVAL REQUIRED: RFQ {rfq.ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
-                        amount_formatted = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
-                        approver_body = f"""
-                        <html>
-                        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                            <p>Dear {bank_name} Authorized Approver,</p>
-                            <p>Your bank has been invited to participate in a new <strong>Execution</strong> Request for Quotation (RFQ) on behalf of <strong>{rfq.customer.name if rfq.customer else 'Treasury Customer'}</strong>.</p>
-                            <br/>
-                            <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
-                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
-                                <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{rfq.type}</td></tr>
-                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair & Direction:</td><td style="padding: 10px;">{rfq.buy_currency}/{rfq.sell_currency} ({rfq.direction or 'Buy'})</td></tr>
-                                <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {rfq.buy_currency or ''}</td></tr>
-                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{rfq.value_date or 'N/A'}</td></tr>
-                            </table>
-                            <br/>
-                            <p>Please review the RFQ details and authorize your bank's participation. Once authorized, your execution desk will receive the live link to submit their binding quote.</p>
-                            <a href="{approver_link}" style="padding: 14px 28px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 8px; display: inline-block; margin-top: 10px; font-weight: bold;">⚡ Review & Authorize RFQ</a>
-                            <br/><br/>
-                            <p>Best Regards,<br/>Treasury Operations</p>
-                        </body>
-                        </html>
-                        """
-                        background_tasks.add_task(send_email, db, [app_email], approver_subject, approver_body, {}, email_settings)
-                    
-                    # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link)
-                    non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
-                    if non_approver_emails:
-                        headsup_subject = f"HEADS UP: New RFQ Pending Bank Approval - {rfq.ref_no}"
-                        amount_formatted = f"{rfq.amount:,.2f}" if rfq.amount else "N/A"
-                        headsup_body = f"""
-                        <html>
-                        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                            <p>Dear {bank_name} FX Desk,</p>
-                            <p>A new Request for Quotation (RFQ) on behalf of <strong>{rfq.customer.name if rfq.customer else 'Treasury Customer'}</strong> has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
-                            <br/>
-                            <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
-                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{rfq.ref_no}</td></tr>
-                                <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{rfq.type}</td></tr>
-                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair & Direction:</td><td style="padding: 10px;">{rfq.buy_currency}/{rfq.sell_currency} ({rfq.direction or 'Buy'})</td></tr>
-                                <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {rfq.buy_currency or ''}</td></tr>
-                                <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{rfq.value_date or 'N/A'}</td></tr>
-                            </table>
-                            <br/>
-                            <p>You will receive a follow-up notification with a secure access link once your bank's approver has authorized participation.</p>
-                            <br/>
-                            <p>Best Regards,<br/>Treasury Operations</p>
-                        </body>
-                        </html>
-                        """
-                        background_tasks.add_task(send_email, db, non_approver_emails, headsup_subject, headsup_body, {}, email_settings)
-                else:
-                    # --- STANDARD FLOW (no approval needed) ---
-                    bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
-                    if bank_emails:
+                is_indicative = (getattr(rfq, "quotation_base", "") or "").lower() == "indicative" or (assignment.get("quotation_base") or "").lower() == "indicative"
+                has_approver = len(approver_emails) > 0
+                has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+
+                db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.id == assignment["id"]).first()
+
+                if assignment.get("approval_status") == "PENDING" and not is_indicative and has_approver and has_execution:
+                    # Phase 1a: Email APPROVER contacts with review link requiring 2FA OTP verification
+                    for app_email in approver_emails:
+                        approver_link = f"{base_url}/public-quotation/{assignment['token']}?email={app_email}"
                         from app.services.unified_email_builder import build_quotation_rfq_bank_email
-                        customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
-                        db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.id == assignment["id"]).first()
                         subject, body = build_quotation_rfq_bank_email(
                             rfq=rfq,
                             assignment=db_assignment,
                             bank_name=bank_name,
-                            customer_branding=customer_branding,
+                            customer_branding=entity_display_name,
+                            link=approver_link,
+                            email_purpose="BANK_APPROVAL_REQUIRED"
+                        )
+                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+
+                    # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link) ALL TOGETHER in ONE email
+                    if non_approver_emails:
+                        from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=db_assignment,
+                            bank_name=bank_name,
+                            customer_branding=entity_display_name,
+                            link="",
+                            email_purpose="BANK_HEADS_UP"
+                        )
+                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+                else:
+                    # --- STANDARD FLOW (No bank-level approval needed: Indicative, or No Approver, or Approver without Execution role) ---
+                    if db_assignment and db_assignment.approval_status == 'PENDING':
+                        db_assignment.approval_status = None
+                        db.commit()
+
+                    # Send standard invitation email with portal link to ALL contacts from the same bank ALL TOGETHER in the SAME email
+                    if all_bank_emails:
+                        from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=db_assignment,
+                            bank_name=bank_name,
+                            customer_branding=entity_display_name,
                             link=link,
                             email_purpose="INVITATION"
                         )
-                        background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
+                        background_tasks.add_task(
+                            send_email,
+                            db,
+                            all_bank_emails,
+                            subject,
+                            body,
+                            {},
+                            email_settings,
+                        )
         else:
             # Notify Corporate Admins
             from app.models import User, UserRole
@@ -453,13 +520,492 @@ def create_rfq(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
+def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: bool = False) -> dict:
+    """Institutional RFQ evaluation engine: calculates normalized standings, TVM adjustments, tie-breakers, and winners."""
+    now = datetime.now(timezone.utc)
+
+    def _to_utc_dt(dt):
+        if not dt:
+            return None
+        if isinstance(dt, str):
+            try:
+                from dateutil import parser
+                dt = parser.parse(dt)
+            except Exception:
+                return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+    w_start = _to_utc_dt(rfq.window_start)
+    w_end = _to_utc_dt(rfq.window_end)
+
+    is_scheduled = bool(w_start and now < w_start)
+    is_closed = bool(w_end and now > w_end) and not is_scheduled
+        
+    if is_closed and rfq.status == 'PENDING':
+        rfq.status = 'COMPLETED'
+        db.commit()
+        
+    assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+    
+    results = []
+    winner_bank_id = None
+    is_inconclusive = False
+    inconclusive_reason = None
+    best_indicative_rate = None
+    best_execution_rate = None
+    deviation_percent = None
+    has_execution_banks = False
+    
+    if rfq.type == 'TBILL':
+        all_tbill_offers = []
+        for a in assignments:
+            offers_db = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
+            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+            for o in offers_db:
+                all_tbill_offers.append({
+                    "bank_id": q_bank.bank_id if q_bank else 0,
+                    "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                    "bank_emails": q_bank.emails if q_bank else "",
+                    "settlement_date": o.settlement_date,
+                    "maturity_date": o.maturity_date,
+                    "discount_rate": o.discount_rate,
+                    "max_amount": o.max_amount,
+                    "submitted_at": o.submitted_at
+                })
+
+        if not all_tbill_offers:
+            for a in assignments:
+                q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+                results.append({
+                    "bank_id": q_bank.bank_id if q_bank else 0,
+                    "quotation_bank_id": a.quotation_bank_id,
+                    "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                    "bank_emails": q_bank.emails if q_bank else "",
+                    "offers": [],
+                    "best_score": None,
+                    "token": a.token,
+                    "quotation_base": a.quotation_base or rfq.quotation_base,
+                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                    "approval_status": a.approval_status,
+                    "approved_by_email": a.approved_by_email,
+                    "approved_at": a.approved_at,
+                    "approval_notes": a.approval_notes,
+                    "cost_min": a.cost_min or 0.0,
+                    "cost_percent": a.cost_percent or 0.0,
+                    "cost_max": a.cost_max or 0.0,
+                    "cost_flat": a.cost_flat or 0.0
+                })
+            rfq.winner_bank_name = None
+            rfq.winner_rate = None
+            rfq.saved_vs_avg = None
+            return {
+                "rfq": rfq,
+                "results": results,
+                "winner_bank_id": None,
+                "is_inconclusive": is_closed and not is_scheduled,
+                "inconclusive_reason": "Quotation window closed without receiving any offers from counterparties." if (is_closed and not is_scheduled) else None,
+                "best_indicative_rate": None,
+                "best_execution_rate": None,
+                "deviation_percent": None,
+                "has_execution_banks": True
+            }
+
+        # --- T-Bill Normalization Logic ---
+        is_buy = (rfq.direction and rfq.direction.lower() == 'buy')
+        eval_rate = (rfq.eval_rate or 0) / 100.0
+
+        s_min = None
+        m_max = None
+        
+        parsed_offers = []
+        for o in all_tbill_offers:
+            try:
+                s_dt = datetime.strptime(o['settlement_date'], "%Y-%m-%d")
+                m_dt = datetime.strptime(o['maturity_date'], "%Y-%m-%d")
+                o['s_dt'] = s_dt
+                o['m_dt'] = m_dt
+                parsed_offers.append(o)
+                
+                if s_min is None or s_dt < s_min: s_min = s_dt
+                if m_max is None or m_dt > m_max: m_max = m_dt
+            except Exception:
+                continue
+
+        # Calculate scores
+        for o in parsed_offers:
+            days = (o['m_dt'] - o['s_dt']).days
+            price = 100.0 * (1.0 - (o['discount_rate'] / 100.0) * (days / 360.0))
+            
+            if is_buy:
+                delta_s = (o['s_dt'] - s_min).days
+                delta_m = (m_max - o['m_dt']).days
+                m_accrual_factor = 1.0 + (eval_rate * (delta_m / 360.0))
+                scaled_price = price / m_accrual_factor
+                s_discount_factor = 1.0 - (eval_rate * (delta_s / 360.0))
+                normalized_price = scaled_price * s_discount_factor
+                o['score'] = normalized_price
+            else:
+                o['score'] = o['discount_rate']
+
+        # Group by bank and take the best offer
+        bank_best = {}
+        for o in parsed_offers:
+            bid = o['bank_id']
+            if bid not in bank_best or o['score'] < bank_best[bid]['score']:
+                bank_best[bid] = o
+
+        # Format Final Results
+        for a in assignments:
+            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+            bank_id = q_bank.bank_id if q_bank else 0
+            
+            bank_offers = [o for o in parsed_offers if o['bank_id'] == bank_id]
+            best_offer = bank_best.get(bank_id)
+            
+            results.append({
+                "bank_id": bank_id,
+                "quotation_bank_id": a.quotation_bank_id,
+                "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                "bank_emails": q_bank.emails if q_bank else "",
+                "offers": bank_offers,
+                "best_score": best_offer['score'] if best_offer else None,
+                "submitted_by_email": best_offer.get('submitted_by_email') if best_offer else (bank_offers[0].get('submitted_by_email') if bank_offers else None),
+                "notes": best_offer.get('notes') if best_offer else (bank_offers[0].get('notes') if bank_offers else None),
+                "token": a.token,
+                "quotation_base": a.quotation_base or rfq.quotation_base,
+                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                "approval_status": a.approval_status,
+                "approved_by_email": a.approved_by_email,
+                "approved_at": a.approved_at,
+                "approval_notes": a.approval_notes,
+                "cost_min": a.cost_min or 0.0,
+                "cost_percent": a.cost_percent or 0.0,
+                "cost_max": a.cost_max or 0.0,
+                "cost_flat": a.cost_flat or 0.0
+            })
+
+        results.sort(key=lambda x: (x['best_score'] is None, x['best_score']))
+        if results and results[0].get('best_score') is not None:
+            winner_bank_id = results[0]['bank_id']
+
+    else:
+        # FX_SPOT
+        for a in assignments:
+            offer_db = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
+            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+            
+            assigned_val_date = a.value_date or rfq.value_date
+            allow_alt_val = a.allow_alternative_value_date if a.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
+
+            assigned_val_str = str(assigned_val_date).split('T')[0] if assigned_val_date is not None else None
+            is_custom_date = bool(a.value_date and str(a.value_date).split('T')[0] != (str(rfq.value_date).split('T')[0] if rfq.value_date else ''))
+
+            if not offer_db:
+                results.append({
+                    "bank_id": q_bank.bank_id if q_bank else 0,
+                    "quotation_bank_id": a.quotation_bank_id,
+                    "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                    "bank_emails": q_bank.emails if q_bank else "",
+                    "price": None,
+                    "finalPrice": None,
+                    "normalized_price": None,
+                    "assigned_value_date": assigned_val_str,
+                    "offered_value_date": None,
+                    "allow_alternative_value_date": allow_alt_val,
+                    "is_alternative_value_date": False,
+                    "is_custom_value_date": is_custom_date,
+                    "time_value_adjustment": 0.0,
+                    "notes": None,
+                    "submitted_at": None,
+                    "submitted_by_email": None,
+                    "token": a.token,
+                    "quotation_base": a.quotation_base or rfq.quotation_base,
+                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                    "approval_status": a.approval_status,
+                    "approved_by_email": a.approved_by_email,
+                    "approved_at": a.approved_at,
+                    "approval_notes": a.approval_notes,
+                    "cost_min": a.cost_min or 0.0,
+                    "cost_percent": a.cost_percent or 0.0,
+                    "cost_max": a.cost_max or 0.0,
+                    "cost_flat": a.cost_flat or 0.0
+                })
+                continue
+            
+            price = offer_db.price
+            deal_amount = float(rfq.amount or 1.0)
+            base_deal_volume = deal_amount * price
+            raw_fee = (base_deal_volume * (float(a.cost_percent or 0) / 100.0)) + float(a.cost_flat or 0)
+            clamped_fee = raw_fee
+            if a.cost_min and a.cost_min > 0:
+                clamped_fee = max(clamped_fee, float(a.cost_min))
+            if a.cost_max and a.cost_max > 0:
+                clamped_fee = min(clamped_fee, float(a.cost_max))
+                
+            fee_per_unit = clamped_fee / deal_amount if deal_amount > 0 else 0.0
+            is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
+            final_all_in_price = round((price - fee_per_unit) if is_sell_dir else (price + fee_per_unit), 5)
+
+            rfq_target_val_date = rfq.value_date
+            effective_val_date = offer_db.offered_value_date or assigned_val_date or rfq_target_val_date
+            normalized_price = final_all_in_price
+            tvm_adjustment = 0.0
+            is_alt_date = False
+
+            if rfq_target_val_date and effective_val_date:
+                try:
+                    target_dt = datetime.strptime(str(rfq_target_val_date).split('T')[0], "%Y-%m-%d").date()
+                    offered_dt = datetime.strptime(str(effective_val_date).split('T')[0], "%Y-%m-%d").date()
+                    delta_days = (offered_dt - target_dt).days
+                    if delta_days != 0:
+                        is_alt_date = True
+                        r_eval = (rfq.eval_rate or 20.25) / 100.0
+                        normalized_price = round(final_all_in_price * (1.0 - (r_eval * (delta_days / 365.0))), 5)
+                        tvm_adjustment = round(normalized_price - final_all_in_price, 5)
+                except Exception as tvm_err:
+                    logger.warning(f"Error computing TVM adjustment: {tvm_err}")
+                
+            assigned_val_str = str(assigned_val_date).split('T')[0] if assigned_val_date is not None else (str(rfq.value_date).split('T')[0] if rfq.value_date is not None else None)
+            offered_val_str = str(effective_val_date).split('T')[0] if effective_val_date is not None else None
+
+            results.append({
+                "bank_id": q_bank.bank_id if q_bank else 0,
+                "quotation_bank_id": a.quotation_bank_id,
+                "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                "bank_emails": q_bank.emails if q_bank else "",
+                "price": price,
+                "finalPrice": final_all_in_price,
+                "normalized_price": normalized_price,
+                "assigned_value_date": assigned_val_str,
+                "offered_value_date": offered_val_str,
+                "allow_alternative_value_date": allow_alt_val,
+                "is_alternative_value_date": is_alt_date,
+                "is_custom_value_date": is_custom_date,
+                "time_value_adjustment": tvm_adjustment,
+                "bank_fee_total": clamped_fee,
+                "fee_per_unit": fee_per_unit,
+                "notes": offer_db.notes,
+                "submitted_at": offer_db.submitted_at,
+                "submitted_by_email": offer_db.submitted_by_email,
+                "token": a.token,
+                "quotation_base": a.quotation_base or rfq.quotation_base,
+                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                "approval_status": a.approval_status,
+                "approved_by_email": a.approved_by_email,
+                "approved_at": a.approved_at,
+                "approval_notes": a.approval_notes,
+                "cost_min": a.cost_min or 0.0,
+                "cost_percent": a.cost_percent or 0.0,
+                "cost_max": a.cost_max or 0.0,
+                "cost_flat": a.cost_flat or 0.0
+            })
+            
+        is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
+        valid_results = [r for r in results if r.get('finalPrice') is not None]
+
+        def _sort_ts(r):
+            ts = r.get('submitted_at')
+            if ts and hasattr(ts, 'timestamp'):
+                return ts.timestamp()
+            return float('inf')
+
+        if is_sell:
+            valid_results.sort(key=lambda x: (
+                -(x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
+                _sort_ts(x)
+            ))
+        else:
+            valid_results.sort(key=lambda x: (
+                (x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
+                _sort_ts(x)
+            ))
+        results = valid_results + [r for r in results if r.get('finalPrice') is None]
+        
+        has_execution_banks = any((r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution' for r in results)
+        
+        winner_bank_id = None
+        is_inconclusive = False
+        inconclusive_reason = None
+        best_indicative_rate = None
+        best_execution_rate = None
+        deviation_percent = None
+
+        if not valid_results:
+            if is_closed and not is_scheduled:
+                is_inconclusive = True
+                inconclusive_reason = "Quotation window closed without receiving any quotes from assigned counterparties."
+        elif not has_execution_banks:
+            is_inconclusive = True
+            inconclusive_reason = "All counterparties were requested on an Indicative basis. No binding winner is selected."
+        else:
+            indicative_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'indicative']
+            execution_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution']
+            
+            if not execution_bids and is_closed:
+                is_inconclusive = True
+                inconclusive_reason = "No Execution quotes were submitted before the window closed. Only Indicative quotes were received."
+            
+            if indicative_bids:
+                best_indicative_rate = indicative_bids[0].get('normalized_price') or indicative_bids[0]['finalPrice']
+            if execution_bids:
+                best_execution_rate = execution_bids[0].get('normalized_price') or execution_bids[0]['finalPrice']
+                
+            if execution_bids:
+                best_exec_item = execution_bids[0]
+                if best_indicative_rate is not None and best_execution_rate is not None:
+                    if is_sell:
+                        deviation_percent = ((best_indicative_rate - best_execution_rate) / best_indicative_rate) * 100.0
+                    else:
+                        deviation_percent = ((best_execution_rate - best_indicative_rate) / best_indicative_rate) * 100.0
+                    
+                    if deviation_percent <= 0:
+                        winner_bank_id = best_exec_item['bank_id']
+                    else:
+                        max_tol = rfq.max_tolerance_percent if rfq.max_tolerance_percent is not None else 0.0
+                        if deviation_percent > max_tol:
+                            is_inconclusive = True
+                            inconclusive_reason = (
+                                f"The best Execution rate ({best_execution_rate:.4f}) exceeded the Indicative benchmark "
+                                f"({best_indicative_rate:.4f}) by {deviation_percent:.2f}%, which is higher than the allowed tolerance of {max_tol:.2f}%."
+                            )
+                        else:
+                            winner_bank_id = best_exec_item['bank_id']
+                else:
+                    winner_bank_id = best_exec_item['bank_id']
+
+    # --- Live Trading Floor Presence Telemetry ---
+    total_invited = len(assignments)
+    desks_active = 0
+    quotes_locked = 0
+    approvals_pending = 0
+    approvals_cleared = 0
+
+    for a in assignments:
+        if a.approval_status == 'PENDING':
+            approvals_pending += 1
+        elif a.approval_status == 'APPROVED':
+            approvals_cleared += 1
+
+        otp_exists = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == a.id).first()
+        if otp_exists:
+            desks_active += 1
+
+        if rfq.type == 'TBILL':
+            has_q = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).first()
+        else:
+            has_q = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).first()
+        if has_q:
+            quotes_locked += 1
+
+    live_telemetry = {
+        "total_invited": total_invited,
+        "desks_active": desks_active,
+        "quotes_locked": quotes_locked,
+        "approvals_pending": approvals_pending,
+        "approvals_cleared": approvals_cleared,
+        "summary_text": f"{desks_active} of {total_invited} Desks Active • {quotes_locked} Quote{'s' if quotes_locked != 1 else ''} Locked In"
+    }
+
+    # --- Savings Summary ---
+    savings_summary = None
+    if winner_bank_id and not is_inconclusive:
+        winner_res = next((r for r in results if r['bank_id'] == winner_bank_id), None)
+        if winner_res:
+            if rfq.type == 'FX_SPOT' and valid_results:
+                rates = [r['finalPrice'] for r in valid_results if r.get('finalPrice') is not None]
+                if len(rates) >= 1:
+                    win_rate = winner_res.get('finalPrice') or rates[0]
+                    avg_rate = sum(rates) / len(rates)
+                    worst_rate = max(rates) if not is_sell else min(rates)
+                    amount = float(rfq.amount or 1.0)
+                    
+                    if not is_sell:
+                        saved_vs_avg = max(0.0, (avg_rate - win_rate) * amount)
+                        saved_vs_worst = max(0.0, (worst_rate - win_rate) * amount)
+                    else:
+                        saved_vs_avg = max(0.0, (win_rate - avg_rate) * amount)
+                        saved_vs_worst = max(0.0, (win_rate - worst_rate) * amount)
+
+                    savings_summary = {
+                        "winner_bank_name": winner_res.get('bank_name'),
+                        "winner_rate": round(win_rate, 4),
+                        "avg_rate": round(avg_rate, 4),
+                        "worst_rate": round(worst_rate, 4),
+                        "currency": rfq.sell_currency,
+                        "saved_vs_avg": round(saved_vs_avg, 2),
+                        "saved_vs_worst": round(saved_vs_worst, 2),
+                        "total_quotes": len(rates)
+                    }
+            elif rfq.type == 'TBILL' and valid_results:
+                scores = [r['best_score'] for r in valid_results if r.get('best_score') is not None]
+                if len(scores) >= 1:
+                    win_score = winner_res.get('best_score') or scores[0]
+                    avg_score = sum(scores) / len(scores)
+                    savings_summary = {
+                        "winner_bank_name": winner_res.get('bank_name'),
+                        "winner_rate": round(win_score, 4),
+                        "avg_rate": round(avg_score, 4),
+                        "worst_rate": round(max(scores) if is_buy else min(scores), 4),
+                        "currency": "EGP",
+                        "saved_vs_avg": round(abs(avg_score - win_score) * 1000, 2),
+                        "saved_vs_worst": round(abs(max(scores) - min(scores)) * 1000, 2),
+                        "total_quotes": len(scores)
+                    }
+
+    # Attach winner and rate attributes to RFQ object
+    if savings_summary and not is_inconclusive:
+        rfq.winner_bank_name = savings_summary.get("winner_bank_name")
+        rfq.winner_rate = savings_summary.get("winner_rate")
+        rfq.saved_vs_avg = savings_summary.get("saved_vs_avg")
+    else:
+        rfq.winner_bank_name = None
+        rfq.winner_rate = None
+        rfq.saved_vs_avg = None
+
+    # Auto-dispatch result emails for concluded Execution quotations if not already sent
+    if dispatch_emails and is_closed and winner_bank_id and not is_inconclusive and has_execution_banks:
+        trigger_auto_dispatch_results(rfq.id)
+
+    return {
+        "rfq": rfq,
+        "results": results,
+        "winner_bank_id": winner_bank_id,
+        "is_inconclusive": is_inconclusive,
+        "inconclusive_reason": inconclusive_reason,
+        "best_indicative_rate": best_indicative_rate,
+        "best_execution_rate": best_execution_rate,
+        "deviation_percent": deviation_percent,
+        "has_execution_banks": has_execution_banks,
+        "live_telemetry": live_telemetry,
+        "savings_summary": savings_summary
+    }
+
 @router.get("/", response_model=List[QuotationRequestOut])
 def get_rfq_history(
+    entity_id: int = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Returns the history of quotations for this customer."""
-    reqs = crud_quotation.get_requests(db, customer_id=current_user.customer_id)
+    """Returns the history of quotations for this customer, filtered by user entity access."""
+    from app.models.models import User
+    user = db.query(User).filter(User.id == current_user.user_id).first()
+    is_admin = current_user.role in ["corporate_admin", "super_admin"]
+    has_all = getattr(user, "has_all_entity_access", False) if user else False
+
+    if is_admin or has_all:
+        allowed_entity_ids = [entity_id] if entity_id else None
+    else:
+        user_ids = [assoc.customer_entity_id for assoc in user.entity_associations] if user else []
+        if entity_id:
+            allowed_entity_ids = [entity_id] if entity_id in user_ids else []
+        else:
+            allowed_entity_ids = user_ids
+
+    reqs = crud_quotation.get_requests(db, customer_id=current_user.customer_id, allowed_entity_ids=allowed_entity_ids)
     now = datetime.now(timezone.utc)
     changed = False
     
@@ -489,52 +1035,13 @@ def get_rfq_history(
                 pa.approval_status = 'EXPIRED'
                 changed = True
         
-        # Attach winner and rate data
-        winner_name = None
-        winner_rate = None
-        saved_vs_avg = None
-
-        analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == r.id).first()
-        if analytics and analytics.winner_price:
-            if analytics.winner_bank and analytics.winner_bank.bank:
-                winner_name = analytics.winner_bank.bank.name
-            winner_rate = analytics.winner_price
-            saved_vs_avg = analytics.avg_price_spread
+        # Attach winner and rate data using unified calculation engine
+        if is_closed or r.status in ['COMPLETED', 'TRADED']:
+            compute_rfq_standings(r, db, dispatch_emails=False)
         else:
-            assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == r.id).all()
-            if r.type == 'FX_SPOT':
-                offers = []
-                for a in assignments:
-                    off = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
-                    if off and off.price:
-                        b_name = a.quotation_bank.bank.name if (a.quotation_bank and a.quotation_bank.bank) else "Unknown Bank"
-                        offers.append({'bank_name': b_name, 'price': off.price, 'base': a.quotation_base or r.quotation_base})
-                if offers:
-                    is_sell = (r.direction and r.direction.lower() == 'sell')
-                    exec_offers = [o for o in offers if (o['base'] or 'Execution').lower() == 'execution']
-                    target_offers = exec_offers if exec_offers else offers
-                    target_offers.sort(key=lambda x: x['price'], reverse=is_sell)
-                    winner_name = target_offers[0]['bank_name']
-                    winner_rate = target_offers[0]['price']
-                    if len(target_offers) > 1:
-                        avg_price = sum(o['price'] for o in target_offers) / len(target_offers)
-                        saved_vs_avg = abs(avg_price - winner_rate)
-            else:
-                tb_offers = []
-                for a in assignments:
-                    off = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).order_by(QuotationTBillOffer.discount_rate.asc()).first()
-                    if off and off.discount_rate:
-                        b_name = a.quotation_bank.bank.name if (a.quotation_bank and a.quotation_bank.bank) else "Unknown Bank"
-                        tb_offers.append({'bank_name': b_name, 'rate': off.discount_rate})
-                if tb_offers:
-                    is_buy = (r.direction and r.direction.lower() == 'buy')
-                    tb_offers.sort(key=lambda x: x['rate'], reverse=is_buy)
-                    winner_name = tb_offers[0]['bank_name']
-                    winner_rate = tb_offers[0]['rate']
-
-        r.winner_bank_name = winner_name
-        r.winner_rate = winner_rate
-        r.saved_vs_avg = saved_vs_avg
+            r.winner_bank_name = None
+            r.winner_rate = None
+            r.saved_vs_avg = None
             
         if r.parent_rfq_id:
             parent = db.query(QuotationRequest).filter(QuotationRequest.id == r.parent_rfq_id).first()
@@ -754,7 +1261,8 @@ def retender_quotation(
         document_path=parent.document_path,
         status=initial_status,
         token_validity_hours=payload.token_validity_hours or parent.token_validity_hours or 24,
-        parent_rfq_id=root_parent_id
+        parent_rfq_id=root_parent_id,
+        entity_id=getattr(payload, 'entity_id', None) or parent.entity_id
     )
     db.add(new_rfq)
     db.flush()
@@ -771,7 +1279,8 @@ def retender_quotation(
         bank_row = pa.quotation_bank
         bank_contacts = bank_row.contacts if (bank_row and isinstance(bank_row.contacts, list)) else []
         has_approvers = any(c.get("role") == "APPROVER" for c in bank_contacts)
-        assignment_approval_status = "PENDING" if (has_approvers and parent.quotation_base == "Execution") else None
+        has_execution = any(c.get("role") == "EXECUTION" for c in bank_contacts)
+        assignment_approval_status = "PENDING" if (has_approvers and has_execution and parent.quotation_base == "Execution") else None
 
         new_assignment = QuotationBankAssignment(
             id=str(uuid.uuid4()),
@@ -798,7 +1307,7 @@ def retender_quotation(
         email_settings = get_global_email_settings()
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
-        customer_branding = new_rfq.customer.name if new_rfq.customer else "Treasury Customer"
+        customer_branding = (new_rfq.entity.entity_name if new_rfq.entity else None) or (new_rfq.customer.name if new_rfq.customer else "Corporate Treasury")
 
         for item in assigned_records:
             bank_row = item["bank_row"]
@@ -813,82 +1322,57 @@ def retender_quotation(
             bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
             link = f"{base_url}/public-quotation/{item['token']}"
 
-            if new_assignment and getattr(new_assignment, 'approval_status', None) == 'PENDING':
+            # Collect contacts by role
+            all_bank_emails = list(dict.fromkeys(
+                c.get("email", "").strip() for c in contacts if c.get("email")
+            ))
+            approver_emails = list(dict.fromkeys(
+                c.get("email", "").strip() for c in contacts 
+                if c.get("role") == "APPROVER" and c.get("email")
+            ))
+            approver_set = {e.lower() for e in approver_emails}
+            non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
+
+            is_indicative = (getattr(new_rfq, "quotation_base", "") or "").lower() == "indicative" or (getattr(new_assignment, "quotation_base", "") or "").lower() == "indicative"
+            has_approver = len(approver_emails) > 0
+            has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+
+            if new_assignment and getattr(new_assignment, 'approval_status', None) == 'PENDING' and not is_indicative and has_approver and has_execution:
                 # --- BANK APPROVAL FLOW ---
-                # Phase 1a: APPROVER contacts with magic link
-                approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") == "APPROVER" and c.get("email")]
+                # Phase 1a: APPROVER contacts with review link requiring 2FA OTP verification
                 for app_email in approver_emails:
-                    magic_token = uuid.uuid4().hex
-                    otp_code = f"{secrets.randbelow(900000) + 100000}"
-                    expires_at = datetime.now(timezone.utc) + timedelta(hours=new_rfq.token_validity_hours or 24)
-                    otp_record = QuotationAccessOTP(
-                        assignment_id=new_assignment.id,
-                        email=app_email.lower(),
-                        role="APPROVER",
-                        otp_code=otp_code,
-                        magic_token=magic_token,
-                        expires_at=expires_at,
-                        is_used=False
+                    approver_link = f"{base_url}/public-quotation/{item['token']}?email={app_email}"
+                    from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                    subject, body = build_quotation_rfq_bank_email(
+                        rfq=new_rfq,
+                        assignment=new_assignment,
+                        bank_name=bank_display_name,
+                        customer_branding=customer_branding,
+                        link=approver_link,
+                        email_purpose="BANK_APPROVAL_REQUIRED"
                     )
-                    db.add(otp_record)
+                    background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+
+                # Phase 1b: EXECUTION + VIEW_ONLY with heads-up (NO link) ALL TOGETHER in ONE email
+                if non_approver_emails:
+                    from app.services.unified_email_builder import build_quotation_rfq_bank_email
+                    subject, body = build_quotation_rfq_bank_email(
+                        rfq=new_rfq,
+                        assignment=new_assignment,
+                        bank_name=bank_display_name,
+                        customer_branding=customer_branding,
+                        link="",
+                        email_purpose="BANK_HEADS_UP"
+                    )
+                    background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+            else:
+                # --- STANDARD FLOW (no bank-level approval needed, e.g. Indicative or Execution without Approver) ---
+                if new_assignment and getattr(new_assignment, 'approval_status', None) == 'PENDING':
+                    new_assignment.approval_status = None
                     db.commit()
 
-                    approver_link = f"{base_url}/public-quotation/{item['token']}?magic_token={magic_token}"
-                    approver_subject = f"APPROVAL REQUIRED: Re-Tender RFQ {new_rfq.ref_no} - {new_rfq.buy_currency}/{new_rfq.sell_currency}"
-                    amount_formatted = f"{new_rfq.amount:,.2f}" if new_rfq.amount else "N/A"
-                    approver_body = f"""
-                    <html>
-                    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                        <p>Dear {bank_display_name} Authorized Approver,</p>
-                        <p>Your bank has been invited to participate in a <strong>re-tendered Execution</strong> RFQ on behalf of <strong>{customer_branding}</strong>.</p>
-                        <br/>
-                        <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
-                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.ref_no}</td></tr>
-                            <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{new_rfq.type}</td></tr>
-                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair &amp; Direction:</td><td style="padding: 10px;">{new_rfq.buy_currency}/{new_rfq.sell_currency} ({new_rfq.direction or 'Buy'})</td></tr>
-                            <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {new_rfq.buy_currency or ''}</td></tr>
-                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.value_date or 'N/A'}</td></tr>
-                        </table>
-                        <br/>
-                        <p>Please review the RFQ details and authorize your bank's participation. Once authorized, your execution desk will receive the live link to submit their binding quote.</p>
-                        <a href="{approver_link}" style="padding: 14px 28px; background-color: #2563eb; color: #fff; text-decoration: none; border-radius: 8px; display: inline-block; margin-top: 10px; font-weight: bold;">⚡ Review &amp; Authorize RFQ</a>
-                        <br/><br/>
-                        <p>Best Regards,<br/>Treasury Operations</p>
-                    </body>
-                    </html>
-                    """
-                    background_tasks.add_task(send_email, db, [app_email], approver_subject, approver_body, {}, email_settings)
-
-                # Phase 1b: EXECUTION + VIEW_ONLY with heads-up (NO link)
-                non_approver_emails = [c.get("email", "").strip() for c in contacts if c.get("role") != "APPROVER" and c.get("email")]
-                if non_approver_emails:
-                    headsup_subject = f"HEADS UP: Re-Tender RFQ Pending Bank Approval - {new_rfq.ref_no}"
-                    amount_formatted = f"{new_rfq.amount:,.2f}" if new_rfq.amount else "N/A"
-                    headsup_body = f"""
-                    <html>
-                    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                        <p>Dear {bank_display_name} FX Desk,</p>
-                        <p>A re-tendered Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your bank and is currently <strong>pending approval</strong> from your authorized approver.</p>
-                        <br/>
-                        <table style="border-collapse: collapse; width: 100%; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
-                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Reference:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.ref_no}</td></tr>
-                            <tr><td style="padding: 10px; font-weight: 600;">Product:</td><td style="padding: 10px;">{new_rfq.type}</td></tr>
-                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Pair &amp; Direction:</td><td style="padding: 10px;">{new_rfq.buy_currency}/{new_rfq.sell_currency} ({new_rfq.direction or 'Buy'})</td></tr>
-                            <tr><td style="padding: 10px; font-weight: 600;">Amount:</td><td style="padding: 10px; font-weight: 700;">{amount_formatted} {new_rfq.buy_currency or ''}</td></tr>
-                            <tr style="background: #f8fafc;"><td style="padding: 10px; font-weight: 600;">Target Value Date:</td><td style="padding: 10px; font-weight: 700;">{new_rfq.value_date or 'N/A'}</td></tr>
-                        </table>
-                        <br/>
-                        <p>You will receive a follow-up notification with a secure access link once your bank's approver has authorized participation.</p>
-                        <br/>
-                        <p>Best Regards,<br/>Treasury Operations</p>
-                    </body>
-                    </html>
-                    """
-                    background_tasks.add_task(send_email, db, non_approver_emails, headsup_subject, headsup_body, {}, email_settings)
-            else:
-                # --- STANDARD FLOW (no bank-level approval needed) ---
-                bank_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
-                if bank_emails:
+                # Send standard invitation email with portal link to ALL contacts from the same bank ALL TOGETHER in the SAME email
+                if all_bank_emails:
                     from app.services.unified_email_builder import build_quotation_rfq_bank_email
                     subject, body = build_quotation_rfq_bank_email(
                         rfq=new_rfq,
@@ -898,7 +1382,15 @@ def retender_quotation(
                         link=link,
                         email_purpose="RE_TENDER"
                     )
-                    background_tasks.add_task(send_email, db, bank_emails, subject, body, {}, email_settings)
+                    background_tasks.add_task(
+                        send_email,
+                        db,
+                        all_bank_emails,
+                        subject,
+                        body,
+                        {},
+                        email_settings,
+                    )
     else:
         # Notify Corporate Admins
         from app.models import User, UserRole
@@ -1049,8 +1541,9 @@ def resubmit_quotation(
                     effective_base = (q_base_override or rfq.quotation_base or 'Execution').lower()
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
+                    has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
                     is_exec = (rfq.quotation_base or '').lower() == 'execution' or effective_base == 'execution'
-                    bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
+                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec) else None
 
                     bank_value_date = b_data.get('valueDate') or rfq.value_date
                     if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
@@ -1108,6 +1601,24 @@ def resubmit_quotation(
         ))
     db.commit()
 
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_RFQ_RESUBMITTED",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": rfq.id,
+            "ref_no": rfq.ref_no,
+            "type": rfq.type,
+            "entity_id": rfq.entity_id,
+            "quotation_base": rfq.quotation_base,
+            "legal_disclaimer_accepted": bool(payload.legal_disclaimer_accepted or payload.legalDisclaimerAccepted)
+        },
+        customer_id=current_user.customer_id
+    )
+    db.commit()
+
     return {"message": "Quotation revised and resubmitted for approval.", "rfq_id": rfq.id, "status": rfq.status}
 
 @router.get("/stats")
@@ -1128,72 +1639,20 @@ def get_quotation_stats(
     bank_stats = {}
     
     for r in reqs:
-        # For each RFQ, find all offers and determine ranks
-        assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == r.id).all()
-        
-        offers = []
-        if r.type == 'FX_SPOT':
-            for a in assignments:
-                best_offer = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.price.asc()).first()
-                if best_offer:
-                    offers.append({'bank_id': a.quotation_bank_id, 'price': best_offer.price, 'name': a.quotation_bank.bank.name if a.quotation_bank.bank else 'Unknown'})
-            
-            is_sell = (r.direction and r.direction.lower() == 'sell')
-            sorted_offers = sorted(offers, key=lambda x: x['price'], reverse=is_sell)
-        else: # TBILL
-            # We must normalize all offers for this specific RFQ to determine the correct winner and ranks
-            rfq_offers = []
-            for a in assignments:
-                best_tb_offer = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).order_by(QuotationTBillOffer.discount_rate.asc()).first()
-                if best_tb_offer:
-                    rfq_offers.append({
-                        'bank_id': a.quotation_bank_id, 
-                        'name': a.quotation_bank.bank.name if a.quotation_bank.bank else 'Unknown',
-                        'settlement_date': best_tb_offer.settlement_date,
-                        'maturity_date': best_tb_offer.maturity_date,
-                        'discount_rate': best_tb_offer.discount_rate
-                    })
-            
-            if not rfq_offers:
-                continue
+        standings = compute_rfq_standings(r, db, dispatch_emails=False)
+        if standings.get("is_inconclusive"):
+            continue
 
-            is_buy = (r.direction and r.direction.lower() == 'buy')
-            eval_rate = (r.eval_rate or 0) / 100.0
+        valid_bids = [res for res in standings.get("results", []) if (res.get("finalPrice") is not None or res.get("best_score") is not None)]
+        if not valid_bids:
+            continue
 
-            s_min = None
-            m_max = None
-            
-            for o in rfq_offers:
-                try:
-                    o['s_dt'] = datetime.strptime(o['settlement_date'], "%Y-%m-%d")
-                    o['m_dt'] = datetime.strptime(o['maturity_date'], "%Y-%m-%d")
-                    if s_min is None or o['s_dt'] < s_min: s_min = o['s_dt']
-                    if m_max is None or o['m_dt'] > m_max: m_max = o['m_dt']
-                except Exception: continue
-
-            for o in rfq_offers:
-                days = (o['m_dt'] - o['s_dt']).days
-                price = 100.0 * (1.0 - (o['discount_rate'] / 100.0) * (days / 360.0))
-                if is_buy:
-                    delta_s = (o['s_dt'] - s_min).days
-                    delta_m = (m_max - o['m_dt']).days
-                    m_accrual = 1.0 + (eval_rate * (delta_m / 360.0))
-                    normalized_price = (price / m_accrual) * (1.0 - (eval_rate * (delta_s / 360.0)))
-                    o['final_price'] = normalized_price
-                else:
-                    o['final_price'] = o['discount_rate'] # Lowest DR wins for Sell
-
-            # Normalized "Price" (Score) determining the rank
-            sorted_offers = sorted(rfq_offers, key=lambda x: x['final_price'])
-            # Remap to the format expected by the stats loop
-            sorted_offers = [{'bank_id': o['bank_id'], 'price': o['final_price'], 'name': o['name']} for o in sorted_offers]
-        
-        for i, offer in enumerate(sorted_offers):
-            bid_id = offer['bank_id']
+        for i, offer in enumerate(valid_bids):
+            bid_id = offer['quotation_bank_id']
             if bid_id not in bank_stats:
                 bank_stats[bid_id] = {
                     'bank_id': bid_id,
-                    'bank_name': offer['name'],
+                    'bank_name': offer['bank_name'],
                     'total_participated': 0,
                     'total_won': 0,
                     'ranks': {1: 0, 2: 0, 3: 0},
@@ -1209,9 +1668,10 @@ def get_quotation_stats(
             if rank == 1:
                 stats['total_won'] += 1
             
-            winner_price = sorted_offers[0]['price']
-            if winner_price > 0:
-                spread = abs(offer['price'] - winner_price) / winner_price * 100
+            winner_price = valid_bids[0].get('normalized_price') or valid_bids[0].get('finalPrice') or valid_bids[0].get('best_score') or 0
+            curr_price = offer.get('normalized_price') or offer.get('finalPrice') or offer.get('best_score') or 0
+            if winner_price > 0 and curr_price:
+                spread = abs(curr_price - winner_price) / winner_price * 100
                 stats['total_spread'] += spread
                 stats['spread_count'] += 1
 
@@ -1244,462 +1704,7 @@ def get_rfq_results(
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
         
-    now = datetime.now(timezone.utc)
-    try:
-        is_closed = now > rfq.window_end
-    except TypeError:
-        is_closed = datetime.now() > rfq.window_end
-        
-    if is_closed and rfq.status == 'PENDING':
-        rfq.status = 'COMPLETED'
-        db.commit()
-        
-    assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq_id).all()
-    
-    results = []
-    winner_bank_id = None
-    is_inconclusive = False
-    inconclusive_reason = None
-    best_indicative_rate = None
-    best_execution_rate = None
-    deviation_percent = None
-    has_execution_banks = False
-    
-    if rfq.type == 'TBILL':
-        all_tbill_offers = []
-        for a in assignments:
-            offers_db = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
-            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
-            for o in offers_db:
-                all_tbill_offers.append({
-                    "bank_id": q_bank.bank_id if q_bank else 0,
-                    "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
-                    "bank_emails": q_bank.emails if q_bank else "",
-                    "settlement_date": o.settlement_date,
-                    "maturity_date": o.maturity_date,
-                    "discount_rate": o.discount_rate,
-                    "max_amount": o.max_amount,
-                    "submitted_at": o.submitted_at
-                })
-
-        if not all_tbill_offers:
-            # Return empty structure if no offers
-            for a in assignments:
-                q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
-                results.append({
-                    "bank_id": q_bank.bank_id if q_bank else 0,
-                    "quotation_bank_id": a.quotation_bank_id,
-                    "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
-                    "bank_emails": q_bank.emails if q_bank else "",
-                    "offers": [],
-                    "best_score": None,
-                    "token": a.token,
-                    "quotation_base": a.quotation_base or rfq.quotation_base,
-                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
-                    "approval_status": a.approval_status,
-                    "approved_by_email": a.approved_by_email,
-                    "approved_at": a.approved_at,
-                    "approval_notes": a.approval_notes,
-                    "cost_min": a.cost_min or 0.0,
-                    "cost_percent": a.cost_percent or 0.0,
-                    "cost_max": a.cost_max or 0.0,
-                    "cost_flat": a.cost_flat or 0.0
-                })
-            return {
-                "rfq": rfq,
-                "results": results,
-                "winner_bank_id": None,
-                "is_inconclusive": is_closed,
-                "inconclusive_reason": "Quotation window closed without receiving any offers from counterparties." if is_closed else None,
-                "best_indicative_rate": None,
-                "best_execution_rate": None,
-                "deviation_percent": None,
-                "has_execution_banks": True
-            }
-
-        # --- T-Bill Normalization Logic ---
-        is_buy = (rfq.direction and rfq.direction.lower() == 'buy')
-        eval_rate = (rfq.eval_rate or 0) / 100.0
-
-        s_min = None
-        m_max = None
-        
-        parsed_offers = []
-        for o in all_tbill_offers:
-            try:
-                s_dt = datetime.strptime(o['settlement_date'], "%Y-%m-%d")
-                m_dt = datetime.strptime(o['maturity_date'], "%Y-%m-%d")
-                o['s_dt'] = s_dt
-                o['m_dt'] = m_dt
-                parsed_offers.append(o)
-                
-                if s_min is None or s_dt < s_min: s_min = s_dt
-                if m_max is None or m_dt > m_max: m_max = m_dt
-            except Exception:
-                continue
-
-        # Calculate scores
-        for o in parsed_offers:
-            days = (o['m_dt'] - o['s_dt']).days
-            price = 100.0 * (1.0 - (o['discount_rate'] / 100.0) * (days / 360.0))
-            
-            if is_buy:
-                # Normalize to S_min and M_max
-                delta_s = (o['s_dt'] - s_min).days
-                delta_m = (m_max - o['m_dt']).days
-                
-                # Accrue maturity gap: reinvest the FV until m_max
-                # Scale the price so it represents a value of exactly 100 at m_max
-                m_accrual_factor = 1.0 + (eval_rate * (delta_m / 360.0))
-                scaled_price = price / m_accrual_factor
-                
-                # Discount back for settlement delay
-                s_discount_factor = 1.0 - (eval_rate * (delta_s / 360.0))
-                normalized_price = scaled_price * s_discount_factor
-                o['score'] = normalized_price
-            else:
-                # Sell: Lower Discount Rate wins (Higher proceeds)
-                o['score'] = o['discount_rate']
-
-        # Group by bank and take the best offer
-        bank_best = {}
-        for o in parsed_offers:
-            bid = o['bank_id']
-            if bid not in bank_best or o['score'] < bank_best[bid]['score']:
-                bank_best[bid] = o
-
-        # Format Final Results
-        for a in assignments:
-            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
-            bank_id = q_bank.bank_id if q_bank else 0
-            
-            # All offers from this specific bank
-            bank_offers = [o for o in parsed_offers if o['bank_id'] == bank_id]
-            best_offer = bank_best.get(bank_id)
-            
-            results.append({
-                "bank_id": bank_id,
-                "quotation_bank_id": a.quotation_bank_id,
-                "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
-                "bank_emails": q_bank.emails if q_bank else "",
-                "offers": bank_offers,
-                "best_score": best_offer['score'] if best_offer else None,
-                "submitted_by_email": best_offer.get('submitted_by_email') if best_offer else (bank_offers[0].get('submitted_by_email') if bank_offers else None),
-                "notes": best_offer.get('notes') if best_offer else (bank_offers[0].get('notes') if bank_offers else None),
-                "token": a.token,
-                "quotation_base": a.quotation_base or rfq.quotation_base,
-                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
-                "approval_status": a.approval_status,
-                "approved_by_email": a.approved_by_email,
-                "approved_at": a.approved_at,
-                "approval_notes": a.approval_notes,
-                "cost_min": a.cost_min or 0.0,
-                "cost_percent": a.cost_percent or 0.0,
-                "cost_max": a.cost_max or 0.0,
-                "cost_flat": a.cost_flat or 0.0
-            })
-
-        # Sort results: Lowest score wins (Lowest price for buy, Lowest DR for sell)
-        results.sort(key=lambda x: (x['best_score'] is None, x['best_score']))
-        if results and results[0].get('best_score') is not None:
-            winner_bank_id = results[0]['bank_id']
-
-    else:
-        # FX_SPOT
-        for a in assignments:
-            offer_db = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
-            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
-            
-            assigned_val_date = a.value_date or rfq.value_date
-            allow_alt_val = a.allow_alternative_value_date if a.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
-
-            if not offer_db:
-                results.append({
-                    "bank_id": q_bank.bank_id if q_bank else 0,
-                    "quotation_bank_id": a.quotation_bank_id,
-                    "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
-                    "bank_emails": q_bank.emails if q_bank else "",
-                    "price": None,
-                    "finalPrice": None,
-                    "normalized_price": None,
-                    "assigned_value_date": str(assigned_val_date) if assigned_val_date is not None else None,
-                    "offered_value_date": None,
-                    "allow_alternative_value_date": allow_alt_val,
-                    "is_alternative_value_date": False,
-                    "time_value_adjustment": 0.0,
-                    "notes": None,
-                    "submitted_at": None,
-                    "submitted_by_email": None,
-                    "token": a.token,
-                    "quotation_base": a.quotation_base or rfq.quotation_base,
-                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                    "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
-                    "approval_status": a.approval_status,
-                    "approved_by_email": a.approved_by_email,
-                    "approved_at": a.approved_at,
-                    "approval_notes": a.approval_notes,
-                    "cost_min": a.cost_min or 0.0,
-                    "cost_percent": a.cost_percent or 0.0,
-                    "cost_max": a.cost_max or 0.0,
-                    "cost_flat": a.cost_flat or 0.0
-                })
-                continue
-            
-            price = offer_db.price
-            deal_amount = float(rfq.amount or 1.0)
-            base_deal_volume = deal_amount * price
-            raw_fee = (base_deal_volume * (float(a.cost_percent or 0) / 100.0)) + float(a.cost_flat or 0)
-            clamped_fee = raw_fee
-            if a.cost_min and a.cost_min > 0:
-                clamped_fee = max(clamped_fee, float(a.cost_min))
-            if a.cost_max and a.cost_max > 0:
-                clamped_fee = min(clamped_fee, float(a.cost_max))
-                
-            fee_per_unit = clamped_fee / deal_amount if deal_amount > 0 else 0.0
-            is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
-            final_all_in_price = round((price - fee_per_unit) if is_sell_dir else (price + fee_per_unit), 5)
-
-            # TVM Normalization for Alternative / Custom Value Date
-            # The benchmark for TVM normalization across ALL counterparties is the RFQ's master target value date (rfq.value_date).
-            # Any counterparty settling on a date different from rfq.value_date (whether via per-bank assigned value date or an offered alternative date)
-            # must have TVM adjustment applied against rfq.value_date.
-            rfq_target_val_date = rfq.value_date
-            effective_val_date = offer_db.offered_value_date or assigned_val_date or rfq_target_val_date
-            normalized_price = final_all_in_price
-            tvm_adjustment = 0.0
-            is_alt_date = False
-
-            if rfq_target_val_date and effective_val_date:
-                try:
-                    target_dt = datetime.strptime(str(rfq_target_val_date).split('T')[0], "%Y-%m-%d").date()
-                    offered_dt = datetime.strptime(str(effective_val_date).split('T')[0], "%Y-%m-%d").date()
-                    delta_days = (offered_dt - target_dt).days
-                    if delta_days != 0:
-                        is_alt_date = True
-                        r_eval = (rfq.eval_rate or 20.25) / 100.0
-                        normalized_price = round(final_all_in_price * (1.0 - (r_eval * (delta_days / 365.0))), 5)
-                        tvm_adjustment = round(normalized_price - final_all_in_price, 5)
-                except Exception as tvm_err:
-                    logger.warning(f"Error computing TVM adjustment: {tvm_err}")
-                
-            assigned_val_str = str(assigned_val_date) if assigned_val_date is not None else (str(rfq.value_date) if rfq.value_date is not None else None)
-            offered_val_str = str(effective_val_date) if effective_val_date is not None else None
-
-            results.append({
-                "bank_id": q_bank.bank_id if q_bank else 0,
-                "quotation_bank_id": a.quotation_bank_id,
-                "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
-                "bank_emails": q_bank.emails if q_bank else "",
-                "price": price,
-                "finalPrice": final_all_in_price,
-                "normalized_price": normalized_price,
-                "assigned_value_date": assigned_val_str,
-                "offered_value_date": offered_val_str,
-                "allow_alternative_value_date": allow_alt_val,
-                "is_alternative_value_date": is_alt_date,
-                "time_value_adjustment": tvm_adjustment,
-                "bank_fee_total": clamped_fee,
-                "fee_per_unit": fee_per_unit,
-                "notes": offer_db.notes,
-                "submitted_at": offer_db.submitted_at,
-                "submitted_by_email": offer_db.submitted_by_email,
-                "token": a.token,
-                "quotation_base": a.quotation_base or rfq.quotation_base,
-                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
-                "approval_status": a.approval_status,
-                "approved_by_email": a.approved_by_email,
-                "approved_at": a.approved_at,
-                "approval_notes": a.approval_notes,
-                "cost_min": a.cost_min or 0.0,
-                "cost_percent": a.cost_percent or 0.0,
-                "cost_max": a.cost_max or 0.0,
-                "cost_flat": a.cost_flat or 0.0
-            })
-            
-        # Filter nulls and sort by direction using normalized_price for economic ranking, with earlier submission timestamp as tie-breaker
-        is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
-        valid_results = [r for r in results if r.get('finalPrice') is not None]
-
-        def _sort_ts(r):
-            ts = r.get('submitted_at')
-            if ts and hasattr(ts, 'timestamp'):
-                return ts.timestamp()
-            return float('inf')
-
-        if is_sell:
-            valid_results.sort(key=lambda x: (
-                -(x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
-                _sort_ts(x)
-            ))
-        else:
-            valid_results.sort(key=lambda x: (
-                (x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
-                _sort_ts(x)
-            ))
-        results = valid_results + [r for r in results if r.get('finalPrice') is None]
-        
-        # --- Evaluation Logic: Execution vs Indicative & Max Tolerance Check ---
-        has_execution_banks = any((r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution' for r in results)
-        
-        winner_bank_id = None
-        is_inconclusive = False
-        inconclusive_reason = None
-        best_indicative_rate = None
-        best_execution_rate = None
-        deviation_percent = None
-
-        if not valid_results:
-            if is_closed:
-                is_inconclusive = True
-                inconclusive_reason = "Quotation window closed without receiving any quotes from assigned counterparties."
-        elif not has_execution_banks:
-            # Scenario B: All banks are Indicative -> pure market sounding
-            is_inconclusive = True
-            inconclusive_reason = "All counterparties were requested on an Indicative basis. No binding winner is selected."
-        else:
-            # Separate valid bids into Indicative and Execution pools
-            indicative_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'indicative']
-            execution_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution']
-            
-            if not execution_bids and is_closed:
-                is_inconclusive = True
-                inconclusive_reason = "No Execution quotes were submitted before the window closed. Only Indicative quotes were received."
-            
-            if indicative_bids:
-                best_indicative_rate = indicative_bids[0].get('normalized_price') or indicative_bids[0]['finalPrice']
-            if execution_bids:
-                best_execution_rate = execution_bids[0].get('normalized_price') or execution_bids[0]['finalPrice']
-                
-            if execution_bids:
-                best_exec_item = execution_bids[0]
-                if best_indicative_rate is not None and best_execution_rate is not None:
-                    # Scenario C: Mixed -> Calculate one-directional deviation
-                    if is_sell:
-                        # Sell: Higher rate is better. Deviation is how much lower execution is vs indicative benchmark
-                        deviation_percent = ((best_indicative_rate - best_execution_rate) / best_indicative_rate) * 100.0
-                    else:
-                        # Buy: Lower rate is better. Deviation is how much higher execution is vs indicative benchmark
-                        deviation_percent = ((best_execution_rate - best_indicative_rate) / best_indicative_rate) * 100.0
-                    
-                    if deviation_percent <= 0:
-                        # Execution rate is equal to or better than Indicative benchmark
-                        winner_bank_id = best_exec_item['bank_id']
-                    else:
-                        max_tol = rfq.max_tolerance_percent if rfq.max_tolerance_percent is not None else 0.0
-                        if deviation_percent > max_tol:
-                            is_inconclusive = True
-                            inconclusive_reason = (
-                                f"The best Execution rate ({best_execution_rate:.4f}) exceeded the Indicative benchmark "
-                                f"({best_indicative_rate:.4f}) by {deviation_percent:.2f}%, which is higher than the allowed tolerance of {max_tol:.2f}%."
-                            )
-                        else:
-                            winner_bank_id = best_exec_item['bank_id']
-                else:
-                    # Scenario A: All Execution or no Indicative quotes submitted
-                    winner_bank_id = best_exec_item['bank_id']
-
-    # --- 1. Live Trading Floor Presence Telemetry ---
-    from app.models.models_quotation import QuotationAccessOTP
-    total_invited = len(assignments)
-    desks_active = 0
-    quotes_locked = 0
-    approvals_pending = 0
-    approvals_cleared = 0
-
-    for a in assignments:
-        if a.approval_status == 'PENDING':
-            approvals_pending += 1
-        elif a.approval_status == 'APPROVED':
-            approvals_cleared += 1
-
-        otp_exists = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == a.id).first()
-        if otp_exists:
-            desks_active += 1
-
-        if rfq.type == 'TBILL':
-            has_q = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).first()
-        else:
-            has_q = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).first()
-        if has_q:
-            quotes_locked += 1
-
-    live_telemetry = {
-        "total_invited": total_invited,
-        "desks_active": desks_active,
-        "quotes_locked": quotes_locked,
-        "approvals_pending": approvals_pending,
-        "approvals_cleared": approvals_cleared,
-        "summary_text": f"{desks_active} of {total_invited} Desks Active • {quotes_locked} Quote{'s' if quotes_locked != 1 else ''} Locked In"
-    }
-
-    # --- 2. Best Execution & Monetary Savings Summary ---
-    savings_summary = None
-    if winner_bank_id and not is_inconclusive:
-        winner_res = next((r for r in results if r['bank_id'] == winner_bank_id), None)
-        if winner_res:
-            if rfq.type == 'FX_SPOT' and valid_results:
-                rates = [r['finalPrice'] for r in valid_results if r.get('finalPrice') is not None]
-                if len(rates) >= 1:
-                    win_rate = winner_res.get('finalPrice') or rates[0]
-                    avg_rate = sum(rates) / len(rates)
-                    worst_rate = max(rates) if not is_sell else min(rates)
-                    amount = float(rfq.amount or 1.0)
-                    
-                    if not is_sell:
-                        # Buy: lower price is better
-                        saved_vs_avg = max(0.0, (avg_rate - win_rate) * amount)
-                        saved_vs_worst = max(0.0, (worst_rate - win_rate) * amount)
-                    else:
-                        # Sell: higher price is better
-                        saved_vs_avg = max(0.0, (win_rate - avg_rate) * amount)
-                        saved_vs_worst = max(0.0, (win_rate - worst_rate) * amount)
-
-                    savings_summary = {
-                        "winner_bank_name": winner_res.get('bank_name'),
-                        "winner_rate": round(win_rate, 4),
-                        "avg_rate": round(avg_rate, 4),
-                        "worst_rate": round(worst_rate, 4),
-                        "currency": rfq.sell_currency,
-                        "saved_vs_avg": round(saved_vs_avg, 2),
-                        "saved_vs_worst": round(saved_vs_worst, 2),
-                        "total_quotes": len(rates)
-                    }
-            elif rfq.type == 'TBILL' and valid_results:
-                scores = [r['best_score'] for r in valid_results if r.get('best_score') is not None]
-                if len(scores) >= 1:
-                    win_score = winner_res.get('best_score') or scores[0]
-                    avg_score = sum(scores) / len(scores)
-                    savings_summary = {
-                        "winner_bank_name": winner_res.get('bank_name'),
-                        "winner_rate": round(win_score, 4),
-                        "avg_rate": round(avg_score, 4),
-                        "worst_rate": round(max(scores) if is_buy else min(scores), 4),
-                        "currency": "EGP",
-                        "saved_vs_avg": round(abs(avg_score - win_score) * 1000, 2),
-                        "saved_vs_worst": round(abs(max(scores) - min(scores)) * 1000, 2),
-                        "total_quotes": len(scores)
-                    }
-
-    # Auto-dispatch result emails for concluded Execution quotations if not already sent
-    if is_closed and winner_bank_id and not is_inconclusive and has_execution_banks:
-        trigger_auto_dispatch_results(rfq.id)
-
-    return {
-        "rfq": rfq,
-        "results": results,
-        "winner_bank_id": winner_bank_id,
-        "is_inconclusive": is_inconclusive,
-        "inconclusive_reason": inconclusive_reason,
-        "best_indicative_rate": best_indicative_rate,
-        "best_execution_rate": best_execution_rate,
-        "deviation_percent": deviation_percent,
-        "has_execution_banks": has_execution_banks,
-        "live_telemetry": live_telemetry,
-        "savings_summary": savings_summary
-    }
+    return compute_rfq_standings(rfq, db, dispatch_emails=True)
 
 _DISPATCHING_RFQS = set()
 
@@ -1740,7 +1745,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
     from app.services.unified_email_builder import build_transaction_email_html
     email_settings, source = get_customer_email_settings(db, rfq.customer_id)
 
-    customer_name = rfq.customer.name if rfq.customer else "Treasury Client"
+    customer_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Client")
     ref_no = rfq.ref_no
     emails_dispatched = 0
 
@@ -1773,7 +1778,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
         executed_val_date = bank_res.get('offered_value_date') or bank_res.get('assigned_value_date') or str(rfq.value_date) or 'Standard Spot'
 
         if is_winner:
-            subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
+            subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
             body = build_transaction_email_html(
                 customer_name=customer_name,
                 title="📈 Trade Execution Confirmation",
@@ -1781,6 +1786,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                 transaction_type="RFQ Execution",
                 key_value_dict={
                     "RFQ Reference": ref_no,
+                    "Requesting Legal Entity": customer_name,
                     "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
                     "Direction": rfq.direction,
                     "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
@@ -1794,7 +1800,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                 recipient_name=f"{bank_res['bank_name']} Treasury Desk"
             )
         else:
-            subject = f"RFQ Result Notification: RFQ {ref_no} - {rfq.buy_currency}/{rfq.sell_currency}"
+            subject = f"RFQ Result Notification: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
             quote_display = f"{bank_res['price']:.5f}" if bank_res.get('price') is not None else "No Quote Submitted"
             body = build_transaction_email_html(
                 customer_name=customer_name,
@@ -1803,6 +1809,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                 transaction_type="RFQ Outcome",
                 key_value_dict={
                     "RFQ Reference": ref_no,
+                    "Requesting Legal Entity": customer_name,
                     "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
                     "Direction": rfq.direction,
                     "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
@@ -1933,7 +1940,7 @@ async def resend_rfq_bank_invite(
     link = f"{base_url}/public-quotation/{assignment.token}"
     
     from app.services.unified_email_builder import build_quotation_rfq_bank_email
-    customer_branding = rfq.customer.name if rfq.customer else "Treasury Customer"
+    customer_branding = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
     bank_display_name = q_bank.bank.name if q_bank.bank else "Bank Partner"
     
     subject, body = build_quotation_rfq_bank_email(

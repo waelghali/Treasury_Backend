@@ -45,12 +45,24 @@ class CRUDQuotation:
             QuotationBank.trade_type == (obj_in.trade_type or "BOTH")
         ).first()
         
+        entity_scope = getattr(obj_in, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
+        entity_ids = getattr(obj_in, "entity_ids", []) or []
+
         if existing:
             # Update emails and contacts if changed
             existing.emails = emails_str
             existing.contacts = contacts_data
+            existing.entity_scope = entity_scope
+
+            from app.models.models_quotation import QuotationBankEntity
+            db.query(QuotationBankEntity).filter(QuotationBankEntity.quotation_bank_id == existing.id).delete()
+            if entity_scope == "SPECIFIC_ENTITIES":
+                for eid in entity_ids:
+                    db.add(QuotationBankEntity(quotation_bank_id=existing.id, entity_id=eid))
+
             db.commit()
             db.refresh(existing)
+            existing.entity_ids = entity_ids if entity_scope == "SPECIFIC_ENTITIES" else []
             return existing
 
         db_obj = QuotationBank(
@@ -58,11 +70,20 @@ class CRUDQuotation:
             bank_id=obj_in.bank_id,
             emails=emails_str,
             contacts=contacts_data,
-            trade_type=obj_in.trade_type or "BOTH"
+            trade_type=obj_in.trade_type or "BOTH",
+            entity_scope=entity_scope
         )
         db.add(db_obj)
         db.commit()
         db.refresh(db_obj)
+
+        if entity_scope == "SPECIFIC_ENTITIES":
+            from app.models.models_quotation import QuotationBankEntity
+            for eid in entity_ids:
+                db.add(QuotationBankEntity(quotation_bank_id=db_obj.id, entity_id=eid))
+            db.commit()
+
+        db_obj.entity_ids = entity_ids if entity_scope == "SPECIFIC_ENTITIES" else []
         return db_obj
 
     def delete_quotation_bank(self, db: Session, customer_id: int, bank_id: int):
@@ -76,16 +97,30 @@ class CRUDQuotation:
             return True
         return False
 
-    def get_quotation_banks(self, db: Session, customer_id: int, trade_type: str = None):
+    def get_quotation_banks(self, db: Session, customer_id: int, trade_type: str = None, entity_id: int = None):
+        from app.models.models_quotation import QuotationBankEntity
         query = db.query(QuotationBank).filter(QuotationBank.customer_id == customer_id)
         if trade_type:
             # If trade_type is specified, return banks matching the specific type OR "BOTH"
             query = query.filter(QuotationBank.trade_type.in_([trade_type, "BOTH"]))
+
+        if entity_id:
+            from sqlalchemy import or_
+            query = query.filter(
+                or_(
+                    QuotationBank.entity_scope == 'ALL_ENTITIES',
+                    QuotationBank.id.in_(
+                        db.query(QuotationBankEntity.quotation_bank_id).filter(QuotationBankEntity.entity_id == entity_id)
+                    )
+                )
+            )
+
         banks = query.all()
         for b in banks:
             if not b.contacts:
                 emails_list = [e.strip() for e in (b.emails or "").split(",") if e.strip()]
                 b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+            b.entity_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
         return banks
 
     def get_unique_retender_ref_no(self, db: Session, parent_rfq: QuotationRequest):
@@ -180,6 +215,7 @@ class CRUDQuotation:
             id=rfq_id,
             ref_no=ref_no,
             customer_id=customer_id,
+            entity_id=getattr(obj_in, 'entity_id', None),
             created_by_user_id=user_id,
             type=obj_in.type,
             direction=obj_in.direction,
@@ -232,8 +268,9 @@ class CRUDQuotation:
                     effective_base = (q_base_override or obj_in.quotationBase or 'Execution').lower()
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
+                    has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
                     is_exec = (obj_in.quotationBase or '').lower() == 'execution' or effective_base == 'execution'
-                    bank_approval_status = 'PENDING' if (has_approver and is_exec) else None
+                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec) else None
 
                     bank_value_date = b_data.get('valueDate') or obj_in.valueDate
                     if w_date and (obj_in.type == 'FX_SPOT' or not obj_in.type) and bank_value_date:
@@ -279,16 +316,20 @@ class CRUDQuotation:
         db.refresh(db_rfq)
         return db_rfq, assignments
 
-    def get_requests(self, db: Session, customer_id: int = None):
+    def get_requests(self, db: Session, customer_id: int = None, allowed_entity_ids: list = None):
         query = db.query(QuotationRequest)
         if customer_id is not None:
             query = query.filter(QuotationRequest.customer_id == customer_id)
+        if allowed_entity_ids is not None:
+            query = query.filter(QuotationRequest.entity_id.in_(allowed_entity_ids))
         reqs = query.order_by(QuotationRequest.created_at.desc()).all()
         for r in reqs:
             if r.creator:
                 r.creator_name = r.creator.email.split('@')[0] if r.creator.email else "End User"
             else:
                 r.creator_name = "End User"
+            r.entity_name = r.entity.entity_name if r.entity else None
+            r.entity_code = r.entity.code if r.entity else None
         return reqs
 
     def get_request(self, db: Session, rfq_id: str, customer_id: int):
@@ -296,10 +337,13 @@ class CRUDQuotation:
             QuotationRequest.id == rfq_id,
             QuotationRequest.customer_id == customer_id
         ).first()
-        if r and r.creator:
-            r.creator_name = r.creator.email.split('@')[0] if r.creator.email else "End User"
-        elif r:
-            r.creator_name = "End User"
+        if r:
+            if r.creator:
+                r.creator_name = r.creator.email.split('@')[0] if r.creator.email else "End User"
+            else:
+                r.creator_name = "End User"
+            r.entity_name = r.entity.entity_name if r.entity else None
+            r.entity_code = r.entity.code if r.entity else None
         return r
 
     # --- Background Processing ---

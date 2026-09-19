@@ -3,7 +3,18 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, Foreig
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from app.models import BaseModel
+from app.models import BaseModel, Base
+
+class QuotationBankEntity(Base):
+    """Junction table mapping a QuotationBank to specific CustomerEntities."""
+    __tablename__ = "quotation_bank_entities"
+    id = Column(Integer, primary_key=True, index=True)
+    quotation_bank_id = Column(Integer, ForeignKey("quotation_banks.id", ondelete="CASCADE"), nullable=False, index=True)
+    entity_id = Column(Integer, ForeignKey("customer_entities.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    quotation_bank = relationship("QuotationBank", back_populates="entity_associations")
+    entity = relationship("CustomerEntity")
 
 class QuotationBank(BaseModel):
     """Link table allowing a Customer to configure which core Banks they want to receive quotations, and adding custom emails per bank."""
@@ -11,11 +22,13 @@ class QuotationBank(BaseModel):
     customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
     bank_id = Column(Integer, ForeignKey("banks.id", ondelete="CASCADE"), nullable=False)
     trade_type = Column(String, default="BOTH", comment="'FX_SPOT', 'TBILL', or 'BOTH'")
+    entity_scope = Column(String(30), default="ALL_ENTITIES", nullable=False, comment="'ALL_ENTITIES' or 'SPECIFIC_ENTITIES'")
     emails = Column(Text, nullable=False, comment="Comma-separated emails for this specific customer's counterparty list")
     contacts = Column(JSONB, default=list, nullable=True, comment="Structured contacts list: [{'email': '...', 'name': '...', 'role': 'EXECUTION'|'VIEW_ONLY'}]")
 
     customer = relationship("Customer")
     bank = relationship("Bank")
+    entity_associations = relationship("QuotationBankEntity", back_populates="quotation_bank", cascade="all, delete-orphan")
 
 class QuotationRequest(BaseModel):
     """Core RFQ configuration for FX Spot and T-Bills."""
