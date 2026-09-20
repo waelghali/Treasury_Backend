@@ -1108,31 +1108,31 @@ class CRUDLGRecord(CRUDBase):
             )
 
 
-        email_sent_successfully = await send_email(
-            db=db,
-            to_emails=email_to_send_to,
-            cc_emails=cc_emails,
-            subject_template=email_subject,
-            body_template=email_body_html,
-            template_data={},
-            email_settings=email_settings_to_use,
-            sender_name=lg_record.customer.name
-        )
-        if not email_sent_successfully:
-            log_action(
-                db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+            email_sent_successfully = await send_email(
+                db=db,
+                to_emails=email_to_send_to,
+                cc_emails=cc_emails,
+                subject_template=email_subject,
+                body_template=email_body_html,
+                template_data={},
+                email_settings=email_settings_to_use,
+                sender_name=lg_record.customer.name
             )
-            logger.error(f"LG released (ID: {lg_record.id}), but failed to send email notification.")
-        else:
-            log_action(
-                db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
-                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-            )
+            if not email_sent_successfully:
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
+                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                )
+                logger.error(f"LG released (ID: {lg_record.id}), but failed to send email notification.")
+            else:
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                )
 
-            logger.debug("DEBUG: Email notification logic completed.")
+                logger.debug("DEBUG: Email notification logic completed.")
 
         try:
             log_action(
@@ -1404,29 +1404,29 @@ class CRUDLGRecord(CRUDBase):
             )
 
 
-        email_sent_successfully = await send_email(
-            db=db,
-            to_emails=email_to_send_to,
-            cc_emails=cc_emails,
-            subject_template=email_subject,
-            body_template=email_body_html,
-            template_data={},
-            email_settings=email_settings_to_use,
-            sender_name=lg_record.customer.name
-        )
-        if not email_sent_successfully:
-            log_action(
-                db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
-                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
-                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+            email_sent_successfully = await send_email(
+                db=db,
+                to_emails=email_to_send_to,
+                cc_emails=cc_emails,
+                subject_template=email_subject,
+                body_template=email_body_html,
+                template_data={},
+                email_settings=email_settings_to_use,
+                sender_name=lg_record.customer.name
             )
-            logger.error(f"LG liquidated (ID: {lg_record.id}), but failed to send email notification.")
-        else:
-            log_action(
-                db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
-                details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
-                customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
-            )
+            if not email_sent_successfully:
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_FAILED", entity_type="LGRecord", entity_id=lg_record.id,
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log},
+                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                )
+                logger.error(f"LG liquidated (ID: {lg_record.id}), but failed to send email notification.")
+            else:
+                log_action(
+                    db, user_id=user_id, action_type="NOTIFICATION_SENT", entity_type="LGRecord", entity_id=lg_record.id,
+                    details={"recipient": email_to_send_to, "cc_recipients": cc_emails, "subject": email_subject, "method": email_method_for_log},
+                    customer_id=lg_record.customer_id, lg_record_id=lg_record.id,
+                )
 
 
         db.refresh(lg_record)

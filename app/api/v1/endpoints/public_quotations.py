@@ -684,11 +684,11 @@ def submit_fx_offer(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # 5 seconds buffer check
+    # 3 seconds buffer check for network latency
     now = datetime.now(timezone.utc)
     try:
-        start_ts = rfq.window_start.timestamp() - 5
-        end_ts = rfq.window_end.timestamp() + 5
+        start_ts = rfq.window_start.timestamp() - 3
+        end_ts = rfq.window_end.timestamp() + 3
         if now.timestamp() < start_ts or now.timestamp() > end_ts:
             raise HTTPException(status_code=403, detail="Window is closed.")
     except Exception:
@@ -829,11 +829,11 @@ def submit_tbill_offer(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # Window check logic
+    # 3 seconds buffer check for network latency
     now = datetime.now(timezone.utc)
     try:
-        start_ts = rfq.window_start.timestamp() - 5
-        end_ts = rfq.window_end.timestamp() + 5
+        start_ts = rfq.window_start.timestamp() - 3
+        end_ts = rfq.window_end.timestamp() + 3
         if now.timestamp() < start_ts or now.timestamp() > end_ts:
             raise HTTPException(status_code=403, detail="Window is closed.")
     except Exception:
@@ -1290,7 +1290,8 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     if w_start and now < w_start:
         return {"status": "SCHEDULED"}
 
-    is_closed = bool(w_end and now > w_end)
+    # Align with 3-second network latency buffer
+    is_closed = bool(w_end and now > (w_end + timedelta(seconds=3)))
     if is_closed and rfq.status in ('PENDING', 'OPEN'):
         rfq.status = 'COMPLETED'
         db.commit()

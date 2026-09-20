@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request
 from sqlalchemy.orm import Session
-from typing import List, Any
+from typing import List, Any, Optional, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 import secrets
 import logging
@@ -318,6 +318,128 @@ def get_quotation_evaluation_rate(
     from app.core.background_tasks import get_quotation_eval_rate_details
     return get_quotation_eval_rate_details(db, customer_id=current_user.customer_id)
 
+def _dispatch_quotation_submission_email(
+    db: Session,
+    background_tasks: BackgroundTasks,
+    rfq: Any,
+    current_user: Any,
+    requires_approval: bool,
+    request: Optional[Request] = None,
+    is_retender: bool = False
+):
+    try:
+        from app.models import User, UserRole
+        from app.services.issuance_notifications import get_common_communication_emails
+        from app.services.unified_email_builder import build_transaction_email_html
+        from app.core.background_tasks import get_global_email_settings
+        from app.core.routing import get_frontend_base_url
+        from app.core.email_service import send_email
+
+        admins = db.query(User).filter(
+            User.customer_id == current_user.customer_id,
+            User.role == UserRole.CORPORATE_ADMIN,
+            User.is_deleted == False
+        ).all()
+        admin_emails = list(dict.fromkeys(
+            a.email.strip() for a in admins if a.email and "@" in a.email
+        ))
+        cc_list = get_common_communication_emails(db, current_user.customer_id)
+        admin_set = {e.lower() for e in admin_emails}
+        cc_emails = [e for e in cc_list if e.lower() not in admin_set]
+
+        to_recipients = admin_emails if admin_emails else cc_emails
+        cc_recipients = cc_emails if admin_emails else []
+
+        if not to_recipients:
+            logger.info(f"No recipients found for quotation submission email (RFQ {getattr(rfq, 'ref_no', '')}).")
+            return
+
+        base_url = get_frontend_base_url(request=request)
+        email_settings = get_global_email_settings()
+
+        customer_display_name = (rfq.customer.name if getattr(rfq, "customer", None) and rfq.customer.name else "Corporate Treasury")
+        entity_display_name = (rfq.entity.entity_name if getattr(rfq, "entity", None) and rfq.entity.entity_name else None)
+        submitter_display = getattr(current_user, "email", None) or f"User #{getattr(current_user, 'user_id', '')}"
+
+        kv = {
+            "Quotation Reference": rfq.ref_no,
+            "Type": "FX Spot" if rfq.type == "FX_SPOT" else "Treasury Bill (T-Bill)",
+            "Direction": rfq.direction or "N/A",
+            "Submitted By": submitter_display,
+        }
+        if rfq.type == "FX_SPOT":
+            if rfq.amount:
+                curr = rfq.buy_currency if rfq.direction == "Buy" else rfq.sell_currency
+                kv["Amount"] = f"{rfq.amount:,.2f} {curr or ''}".strip()
+            if rfq.buy_currency and rfq.sell_currency:
+                kv["Currency Pair"] = f"{rfq.buy_currency} / {rfq.sell_currency}"
+            if rfq.value_date:
+                kv["Value Date"] = str(rfq.value_date)
+        else:
+            if rfq.amount:
+                kv["Face Value"] = f"{rfq.amount:,.2f} EGP"
+            if rfq.maturity_date_start:
+                kv["Maturity"] = (
+                    f"{rfq.maturity_date_start} to {rfq.maturity_date_end}"
+                    if rfq.maturity_date_end and rfq.maturity_date_end != rfq.maturity_date_start
+                    else str(rfq.maturity_date_start)
+                )
+
+        if entity_display_name:
+            kv["Entity"] = entity_display_name
+
+        if rfq.window_start and rfq.window_end:
+            w_start_str = rfq.window_start.strftime("%Y-%m-%d %H:%M") if hasattr(rfq.window_start, "strftime") else str(rfq.window_start)
+            w_end_str = rfq.window_end.strftime("%H:%M") if hasattr(rfq.window_end, "strftime") else str(rfq.window_end)
+            kv["Quotation Window"] = f"{w_start_str} &ndash; {w_end_str} UTC"
+
+        action_label = "Re-Tender" if is_retender else "Quotation"
+        if requires_approval:
+            subject = f"ACTION REQUIRED: {action_label} Request {rfq.ref_no} Awaiting Approval"
+            title = f"🔔 {action_label} Awaiting Approval"
+            summary_text = (
+                f"A new {action_label.lower()} request ({rfq.ref_no}) has been submitted by {submitter_display} "
+                f"and is awaiting your review and approval before release to counterparties."
+            )
+            cta_text = "Review & Approve Quotation"
+            cta_url = f"{base_url}/corporate-admin/quotations/history?rfq_id={rfq.id}"
+        else:
+            subject = f"NOTIFICATION: New {action_label} Request {rfq.ref_no} Submitted"
+            title = f"{action_label} Request Submitted"
+            summary_text = (
+                f"A new {action_label.lower()} request ({rfq.ref_no}) has been submitted by {submitter_display} "
+                f"and released to counterparties."
+            )
+            cta_text = "View Quotation"
+            cta_url = f"{base_url}/corporate-admin/quotations/history?rfq_id={rfq.id}"
+
+        body = build_transaction_email_html(
+            customer_name=customer_display_name,
+            title=title,
+            transaction_ref=rfq.ref_no,
+            transaction_type=f"{action_label} Request",
+            key_value_dict=kv,
+            summary_text=summary_text,
+            cta_text=cta_text,
+            cta_url=cta_url,
+            recipient_name="Corporate Admin",
+            platform_name="Grow Treasury Platform"
+        )
+
+        background_tasks.add_task(
+            send_email,
+            db,
+            to_recipients,
+            subject,
+            body,
+            {},
+            email_settings,
+            cc_emails=cc_recipients
+        )
+        logger.info(f"Queued quotation notification email for {to_recipients} (CC: {cc_recipients}) for RFQ {rfq.ref_no}")
+    except Exception as e:
+        logger.error(f"Error queueing quotation submission email for RFQ {getattr(rfq, 'ref_no', '')}: {e}", exc_info=True)
+
 @router.post("/", response_model=Any)
 def create_rfq(
     rfq_in: QuotationRequestCreate,
@@ -516,6 +638,17 @@ def create_rfq(
                 ))
             db.commit()
         
+        # Dispatch submission email to Corporate Admins and Common Communication List
+        _dispatch_quotation_submission_email(
+            db=db,
+            background_tasks=background_tasks,
+            rfq=rfq,
+            current_user=current_user,
+            requires_approval=requires_approval,
+            request=request,
+            is_retender=False
+        )
+
         return {"rfq_id": rfq.id, "ref_no": rfq.ref_no, "assignments": assignments}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -539,7 +672,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     w_end = _to_utc_dt(rfq.window_end)
 
     is_scheduled = bool(w_start and now < w_start)
-    is_closed = bool(w_end and now > w_end) and not is_scheduled
+    # Align evaluation with 3s submission buffer: quotation only closes when buffer elapses
+    is_closed = bool(w_end and now > (w_end + timedelta(seconds=3))) and not is_scheduled
         
     if is_closed and rfq.status == 'PENDING':
         rfq.status = 'COMPLETED'
@@ -1011,9 +1145,12 @@ def get_rfq_history(
     
     for r in reqs:
         try:
-            is_closed = now > r.window_end
-        except TypeError:
-            is_closed = datetime.now() > r.window_end
+            w_end_val = r.window_end
+            if w_end_val and w_end_val.tzinfo is None:
+                w_end_val = w_end_val.replace(tzinfo=timezone.utc)
+            is_closed = bool(w_end_val and now > (w_end_val + timedelta(seconds=3)))
+        except Exception:
+            is_closed = False
             
         if is_closed:
             if r.status == 'PENDING':
@@ -1409,6 +1546,17 @@ def retender_quotation(
                 is_read=False
             ))
         db.commit()
+
+    # Dispatch submission email to Corporate Admins and Common Communication List
+    _dispatch_quotation_submission_email(
+        db=db,
+        background_tasks=background_tasks,
+        rfq=new_rfq,
+        current_user=current_user,
+        requires_approval=requires_approval,
+        request=request,
+        is_retender=True
+    )
 
     return {
         "message": "Quotation re-tendered successfully.",
