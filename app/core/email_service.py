@@ -18,6 +18,8 @@ from app.models import Customer
 
 logger = logging.getLogger(__name__)
 
+import re
+
 # --- Data Structures ---
 
 @dataclass
@@ -29,6 +31,7 @@ class EmailSettings:
     smtp_password: str
     sender_email: str
     sender_display_name: Optional[str] = None
+    reply_to: Optional[str] = None
 
 @dataclass
 class EmailAttachment:
@@ -36,6 +39,25 @@ class EmailAttachment:
     filename: str
     content: bytes
     mime_type: str
+
+
+def clean_subject_line(subject: str) -> str:
+    """
+    Strips emojis, control characters, and high-risk spam-trigger symbols from subject lines
+    to guarantee delivery through enterprise email security filters (e.g. Office 365 ATP, Proofpoint, Mimecast)
+    and prevent UnicodeEncodeError in SMTP protocol handshakes.
+    """
+    if not subject:
+        return ""
+    # Strip emojis and symbols in surrogate/supplemental ranges
+    emoji_pattern = re.compile(
+        r'[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50\u2b55\u200d\ufe0f]+',
+        flags=re.UNICODE
+    )
+    cleaned = emoji_pattern.sub('', subject)
+    # Collapse multiple whitespaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
 
 
 # --- Configuration Retrievers ---
@@ -55,7 +77,8 @@ def get_global_email_settings() -> EmailSettings:
         logger.warning("Missing global email env vars. Using dummy fallback.")
         return EmailSettings(
             smtp_host="", smtp_port=587, smtp_username="", smtp_password="",
-            sender_email="no-reply@example.com", sender_display_name="System Notifications"
+            sender_email="no-reply@example.com", sender_display_name="System Notifications",
+            reply_to="no-reply@example.com"
         )
 
     return EmailSettings(
@@ -64,46 +87,69 @@ def get_global_email_settings() -> EmailSettings:
         smtp_username=smtp_username,
         smtp_password=smtp_password,
         sender_email=sender_email,
-        sender_display_name=display_name
+        sender_display_name=display_name,
+        reply_to=sender_email
     )
 
 def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSettings, str]:
     """
-    Retrieves customer-specific email settings. 
-    Returns: (EmailSettings, source_description_string)
+    Retrieves customer email settings with smart direct-customer delivery and automatic fallback:
+    1. If customer has valid active custom SMTP settings, returns customer-specific settings so
+       emails are sent 100% directly from the customer's email address.
+    2. If customer has no custom settings or incomplete settings, returns platform relay settings
+       with branded display name and Reply-To set to the customer desk.
     """
     customer = db.query(Customer).options(
         selectinload(Customer.customer_email_settings)
     ).filter(Customer.id == customer_id).first()
 
-    # Guard Clause: Check if settings exist, are active, and not soft-deleted
-    if not (customer and customer.customer_email_settings and customer.customer_email_settings.is_active and not customer.customer_email_settings.is_deleted):
-        logger.info(f"Customer {customer_id}: Custom email settings not found/inactive/deleted. Using Global.")
-        return get_global_email_settings(), "global"
+    customer_name = customer.name if customer and customer.name else "Corporate Treasury"
+    display_name = f"{customer_name} via Grow Treasury"
 
-    settings = customer.customer_email_settings
+    # Check for valid active custom SMTP settings
+    if (
+        customer 
+        and customer.customer_email_settings 
+        and customer.customer_email_settings.is_active 
+        and not customer.customer_email_settings.is_deleted
+    ):
+        settings = customer.customer_email_settings
+        if all([settings.smtp_host, settings.smtp_username, settings.smtp_password_encrypted, settings.sender_email]):
+            try:
+                decrypted_password = decrypt_data(settings.smtp_password_encrypted)
+                custom_display = settings.sender_display_name or customer_name
+                logger.info(f"Customer {customer_id}: Using direct custom SMTP ({settings.sender_email} via {settings.smtp_host})")
+                return EmailSettings(
+                    smtp_host=settings.smtp_host,
+                    smtp_port=settings.smtp_port,
+                    smtp_username=settings.smtp_username,
+                    smtp_password=decrypted_password,
+                    sender_email=settings.sender_email,
+                    sender_display_name=custom_display,
+                    reply_to=settings.sender_email
+                ), "customer_specific"
+            except Exception as e:
+                logger.error(f"Customer {customer_id}: decryption failed ({e}). Fallback to Global.", exc_info=True)
 
-    # Guard Clause: Check for incomplete data
-    if not all([settings.smtp_host, settings.smtp_username, settings.smtp_password_encrypted, settings.sender_email]):
-        logger.warning(f"Customer {customer_id}: Custom settings incomplete. Fallback to Global.")
-        return get_global_email_settings(), "global_fallback_incomplete"
+    # Fallback to platform global relay
+    global_settings = get_global_email_settings()
+    reply_to = global_settings.sender_email
+    if customer and customer.customer_email_settings and not customer.customer_email_settings.is_deleted:
+        settings = customer.customer_email_settings
+        if settings.sender_display_name:
+            display_name = settings.sender_display_name
+        if settings.sender_email and "@" in settings.sender_email:
+            reply_to = settings.sender_email
 
-    try:
-        decrypted_password = decrypt_data(settings.smtp_password_encrypted)
-        logger.info(f"Customer {customer_id}: Using custom email settings.")
-        
-        return EmailSettings(
-            smtp_host=settings.smtp_host,
-            smtp_port=settings.smtp_port,
-            smtp_username=settings.smtp_username,
-            smtp_password=decrypted_password,
-            sender_email=settings.sender_email,
-            sender_display_name=settings.sender_display_name,
-        ), "customer_specific"
-
-    except Exception as e:
-        logger.error(f"Customer {customer_id}: decryption failed ({e}). Fallback to Global.", exc_info=True)
-        return get_global_email_settings(), "global_fallback_error"
+    return EmailSettings(
+        smtp_host=global_settings.smtp_host,
+        smtp_port=global_settings.smtp_port,
+        smtp_username=global_settings.smtp_username,
+        smtp_password=global_settings.smtp_password,
+        sender_email=global_settings.sender_email,
+        sender_display_name=display_name,
+        reply_to=reply_to
+    ), "platform_relay_branded"
 
 
 # --- Test Domain Filtering ---
@@ -136,11 +182,13 @@ async def send_email(
     email_settings: EmailSettings,
     cc_emails: Optional[List[str]] = None,
     sender_name: Optional[str] = None,
-    attachments: Optional[List[EmailAttachment]] = None
+    attachments: Optional[List[EmailAttachment]] = None,
+    reply_to: Optional[str] = None
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using provided settings.
     Filters out dummy test domain addresses before sending.
+    Encodes subject and headers with RFC 2047 UTF-8 compliance and sets Reply-To.
     """
     to_emails = process_recipients(to_emails)
     cc_emails = process_recipients(cc_emails or [])
@@ -149,24 +197,30 @@ async def send_email(
         logger.info("Email delivery suppressed: All recipients belong to dummy/test domains.")
         return True, None
 
-
     # Logic to handle display name override
     display_name = sender_name if sender_name else email_settings.sender_display_name
     if display_name:
-        # This encodes Arabic names into a format like =?utf-8?b?...?= 
-        # which SMTP servers accept as valid ASCII.
+        # Encodes display names into RFC 2047 format: =?utf-8?b?...?=
         encoded_name = Header(display_name, 'utf-8').encode()
         sender_header = f"{encoded_name} <{email_settings.sender_email}>"
     else:
         sender_header = email_settings.sender_email
 
+    effective_reply_to = reply_to or getattr(email_settings, 'reply_to', None)
+
     # 1. Build Message
     msg = MIMEMultipart('mixed')
     msg['From'] = sender_header
     msg['To'] = ", ".join(to_emails)
-    msg['Subject'] = subject_template
+    
+    # Universal RFC-2047 Subject sanitization and UTF-8 encoding
+    clean_subj = clean_subject_line(subject_template)
+    msg['Subject'] = Header(clean_subj, 'utf-8').encode()
+    
     if cc_emails:
         msg['Cc'] = ", ".join(cc_emails)
+    if effective_reply_to:
+        msg['Reply-To'] = effective_reply_to
 
     # Ensure all outgoing emails have high-aesthetic corporate SaaS styling
     body_to_send = body_template or ""
@@ -215,14 +269,14 @@ async def send_email(
         logger.info("Email delivery suppressed: No valid recipients found after filtering.")
         return True, None
 
-    # 4. Send via SMTP in background worker thread with 10s socket timeout
+    # 4. Send via SMTP in background worker thread with 8s socket timeout
     logger.debug(f"Connecting to SMTP: {email_settings.smtp_host}:{email_settings.smtp_port}")
 
     def _send_smtp():
         if email_settings.smtp_port == 465:
-            server = smtplib.SMTP_SSL(email_settings.smtp_host, email_settings.smtp_port, timeout=10)
+            server = smtplib.SMTP_SSL(email_settings.smtp_host, email_settings.smtp_port, timeout=8)
         else:
-            server = smtplib.SMTP(email_settings.smtp_host, email_settings.smtp_port, timeout=10)
+            server = smtplib.SMTP(email_settings.smtp_host, email_settings.smtp_port, timeout=8)
             server.starttls()
 
         server.login(email_settings.smtp_username, email_settings.smtp_password)
@@ -248,8 +302,8 @@ async def send_email(
                 global_settings.smtp_username != email_settings.smtp_username
             ):
                 def _send_global_fallback():
-                    # Update From header for global delivery
-                    from_name = sender_name or global_settings.sender_display_name or "Treasury Notifications"
+                    # Update From header for global delivery, preserving customer identity in display name
+                    from_name = f"{email_settings.sender_display_name or 'Corporate Treasury'} ({email_settings.sender_email})"
                     encoded_name = Header(from_name, 'utf-8').encode()
                     from_header = f"{encoded_name} <{global_settings.sender_email}>"
                     if 'From' in msg:
@@ -260,12 +314,12 @@ async def send_email(
                     msg['Sender'] = global_settings.sender_email
                     if 'Reply-To' in msg:
                         del msg['Reply-To']
-                    msg['Reply-To'] = global_settings.sender_email
+                    msg['Reply-To'] = email_settings.sender_email
 
                     if global_settings.smtp_port == 465:
-                        fb_server = smtplib.SMTP_SSL(global_settings.smtp_host, global_settings.smtp_port, timeout=10)
+                        fb_server = smtplib.SMTP_SSL(global_settings.smtp_host, global_settings.smtp_port, timeout=8)
                     else:
-                        fb_server = smtplib.SMTP(global_settings.smtp_host, global_settings.smtp_port, timeout=10)
+                        fb_server = smtplib.SMTP(global_settings.smtp_host, global_settings.smtp_port, timeout=8)
                         fb_server.starttls()
 
                     fb_server.login(global_settings.smtp_username, global_settings.smtp_password)
@@ -349,7 +403,7 @@ def verify_smtp_connection(
     smtp_username: str,
     smtp_password: str,
     customer_id: Optional[int] = None,
-    timeout: int = 10
+    timeout: int = 4
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Tests connection and authentication to an SMTP server with Account Lockout Protection.
@@ -412,7 +466,7 @@ def verify_imap_connection(
     imap_password: str,
     use_ssl: bool = True,
     customer_id: Optional[int] = None,
-    timeout: int = 10
+    timeout: int = 4
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Tests connection and authentication to an IMAP server with Account Lockout Protection.
