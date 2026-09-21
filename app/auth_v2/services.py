@@ -506,7 +506,7 @@ class AuthService:
         return {
             "access_token": new_access_token,
             "token_type": "bearer",
-            "must_accept_policies": must_accept_policies_status
+            "must_accept_policies": new_token_data.get("must_accept_policies", False)
         }
 
     async def initiate_password_reset(self, db: Session, email: str, request_ip: Optional[str] = None, request: Optional[Request] = None) -> None:
