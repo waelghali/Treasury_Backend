@@ -303,9 +303,12 @@ async def refresh_token(
     new_data = {
         "sub": current_user.email,
         "user_id": current_user.user_id,
-        "role": current_user.role.value,
+        "role": current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+        "permissions": current_user.permissions,
         "customer_id": current_user.customer_id,
+        "customer_name": getattr(current_user, 'customer_name', None),
         "subscription_status": current_user.subscription_status.value if current_user.subscription_status else None,
+        "subscription_end_date": getattr(current_user, 'subscription_end_date', None),
         "has_all_entity_access": current_user.has_all_entity_access,
         "entity_ids": current_user.entity_ids,
         "must_change_password": current_user.must_change_password,

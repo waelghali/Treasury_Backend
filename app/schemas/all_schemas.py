@@ -366,7 +366,7 @@ class CustomerConfigurationBase(BaseModel):
     configured_value: str = Field(..., description="The value set by the customer, overriding the global default")
 
 class CustomerConfigurationCreate(CustomerConfigurationBase):
-    pass
+    customer_id: Optional[int] = Field(None, description="ID of the customer")
 
 class CustomerConfigurationUpdate(BaseModel):
     configured_value: str = Field(..., description="The new value for the customer's configuration")

@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.abspath("."))
 from sqlalchemy import create_engine, text, MetaData, Table
 
 LOCAL_DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:Voda%21%4012@localhost:5432/grow")
-STAGING_DB_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
+STAGING_DB_URL = os.getenv("STAGING_DB_URL", "postgresql://treasury_staging_db2_user:p6LvCt0ZloPjhSpKrk5wMeTsvESNTsgT@dpg-daogub3m8hqs73el19a0-a.frankfurt-postgres.render.com/treasury_staging_db2")
 
 def clone():
     start_time = time.time()

@@ -46,6 +46,8 @@ class TokenData(BaseModel):
     has_quotation_module: bool = Field(False, description="True if the customer's subscription includes Quotations.")
     has_reconciliation_module: bool = Field(False, description="True if the customer's subscription includes Bank Reconciliation.")
     can_email_inbox: bool = Field(True, description="True if the customer's subscription includes Smart Inbox.")
+    customer_name: Optional[str] = Field(None, description="Customer organization name")
+    subscription_end_date: Optional[str] = Field(None, description="Subscription expiration date in ISO format")
 
 # --- Core Functions ---
 
@@ -141,7 +143,9 @@ async def get_current_user(
             has_issuance_module=payload.get("has_issuance_module", False),
             has_quotation_module=payload.get("has_quotation_module", True),
             has_reconciliation_module=payload.get("has_reconciliation_module", True),
-            can_email_inbox=payload.get("can_email_inbox", True)
+            can_email_inbox=payload.get("can_email_inbox", True),
+            customer_name=payload.get("customer_name"),
+            subscription_end_date=payload.get("subscription_end_date"),
         )
     except (JWTError, ValueError):
         raise HTTPException(
@@ -158,6 +162,18 @@ async def get_current_user(
             detail="User account is inactive or deleted.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # 4. Synchronize active module access directly from customer's subscription plan
+    is_so = (token_data.role == UserRole.SYSTEM_OWNER)
+    if user.customer and user.customer.subscription_plan:
+        plan = user.customer.subscription_plan
+        token_data.has_custody_module = is_so or bool(plan.has_custody_module)
+        token_data.has_issuance_module = is_so or bool(plan.has_issuance_module)
+        token_data.has_quotation_module = is_so or bool(plan.has_quotation_module)
+        token_data.has_reconciliation_module = is_so or bool(plan.has_reconciliation_module)
+        token_data.can_email_inbox = is_so or bool(getattr(plan, 'can_email_inbox', True))
+        if not token_data.customer_name and user.customer.name:
+            token_data.customer_name = user.customer.name
     
     return token_data
 

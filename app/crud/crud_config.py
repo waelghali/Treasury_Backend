@@ -451,7 +451,30 @@ class CRUDCustomerConfiguration(CRUDBase):
                 },
                 customer_id=customer_id,
             )
-        target_config = updated_config if customer_config else new_config
+            target_config = updated_config
+        else:
+            new_config = super().create(
+                db,
+                obj_in=CustomerConfigurationCreate(
+                    customer_id=customer_id,
+                    global_config_id=global_config_id,
+                    configured_value=configured_value,
+                ),
+                customer_id=customer_id,
+            )
+            log_action(
+                db,
+                user_id=user_id,
+                action_type="CREATE",
+                entity_type="CustomerConfiguration",
+                entity_id=new_config.id,
+                details={
+                    "global_config_key": global_config.key.value,
+                    "new_value": configured_value,
+                },
+                customer_id=customer_id,
+            )
+            target_config = new_config
 
         # Two-way sync with CustomerFormConfiguration.verification_policy
         if getattr(global_config.key, 'value', str(global_config.key)) == "ISSUED_LG_VERIFICATION_POLICY":

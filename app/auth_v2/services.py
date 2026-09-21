@@ -190,6 +190,62 @@ class AuthService:
                 detail="Password must contain at least one digit."
             )
 
+    async def build_user_token_data(self, db: Session, user: User) -> Dict[str, Any]:
+        from app.crud.crud import crud_role_permission
+        from sqlalchemy.orm import selectinload
+
+        # Ensure customer and subscription_plan are loaded
+        customer = user.customer
+        if user.customer_id and (not customer or not hasattr(customer, 'subscription_plan') or customer.subscription_plan is None):
+            customer = db.query(models.Customer).options(
+                selectinload(models.Customer.subscription_plan)
+            ).filter(models.Customer.id == user.customer_id).first()
+
+        role_str = user.role.value if hasattr(user.role, 'value') else str(user.role)
+        db_permissions = crud_role_permission.get_permissions_for_role(db, role_str)
+        permission_names = [p.name for p in db_permissions]
+
+        customer_name = customer.name if customer else None
+
+        must_accept_policies = False
+        is_so = (user.role == UserRole.SYSTEM_OWNER) if hasattr(UserRole, 'SYSTEM_OWNER') else (role_str == 'system_owner')
+        if not is_so:
+            latest_versions = await self._get_legal_artifact_versions(db)
+            latest_system_version = max(latest_versions.get("tc_version", 0.0), latest_versions.get("pp_version", 0.0))
+            if user.last_accepted_legal_version is None or user.last_accepted_legal_version < latest_system_version:
+                must_accept_policies = True
+
+        plan = customer.subscription_plan if (customer and customer.subscription_plan) else None
+
+        sub_status = None
+        if customer and customer.status:
+            sub_status = customer.status.value if hasattr(customer.status, 'value') else str(customer.status)
+
+        sub_end = None
+        if customer and customer.end_date:
+            sub_end = customer.end_date.isoformat()
+
+        return {
+            "sub": user.email,
+            "user_id": user.id,
+            "role": role_str,
+            "permissions": permission_names,
+            "customer_id": user.customer_id,
+            "customer_name": customer_name,
+            "has_all_entity_access": user.has_all_entity_access,
+            "entity_ids": [assoc.customer_entity_id for assoc in user.entity_associations] if (hasattr(user, 'entity_associations') and user.entity_associations and not user.has_all_entity_access) else [],
+            "must_change_password": user.must_change_password,
+            "must_accept_policies": must_accept_policies,
+            "last_accepted_legal_version": user.last_accepted_legal_version,
+            "subscription_status": sub_status,
+            "subscription_end_date": sub_end,
+            "has_custody_module": is_so or (bool(plan.has_custody_module) if plan else False),
+            "has_issuance_module": is_so or (bool(plan.has_issuance_module) if plan else False),
+            "has_quotation_module": is_so or (bool(plan.has_quotation_module) if plan else False),
+            "has_reconciliation_module": is_so or (bool(plan.has_reconciliation_module) if plan else False),
+            "can_email_inbox": is_so or (bool(getattr(plan, 'can_email_inbox', True)) if plan else False),
+        }
+
     async def authenticate_user(
         self, db: Session, email: str, password: str, request_ip: str, device_id: str, remember_me: bool
     ) -> Dict[str, Any]:
@@ -199,7 +255,7 @@ class AuthService:
 
         # 1. Fetch the user with necessary relations
         user = db.query(User).options(
-            selectinload(User.customer),
+            selectinload(User.customer).selectinload(models.Customer.subscription_plan),
             selectinload(User.entity_associations)
         ).filter(
             func.lower(User.email) == email.lower(), 
@@ -358,41 +414,7 @@ class AuthService:
             }
         
         # --- PROCEED TO FULL LOGIN (Always runs for trusted devices) ---
-
-        db_permissions = crud_role_permission.get_permissions_for_role(db, user.role.value)
-        permission_names = [p.name for p in db_permissions]
-
-        customer_name = user.customer.name if (user.customer_id and user.customer) else None
-
-        must_accept_policies = False
-        if user.role != UserRole.SYSTEM_OWNER:
-            latest_versions = await self._get_legal_artifact_versions(db)
-            latest_system_version = max(latest_versions.get("tc_version", 0.0), latest_versions.get("pp_version", 0.0))
-            
-            if user.last_accepted_legal_version is None or user.last_accepted_legal_version < latest_system_version:
-                must_accept_policies = True
-
-        token_data = {
-            "sub": user.email,
-            "user_id": user.id,
-            "role": user.role.value,
-            "permissions": permission_names,
-            "customer_id": user.customer_id,
-            "customer_name": customer_name,
-            "has_all_entity_access": user.has_all_entity_access,
-            "entity_ids": [assoc.customer_entity_id for assoc in user.entity_associations] if not user.has_all_entity_access else [],
-            "must_change_password": user.must_change_password,
-            "must_accept_policies": must_accept_policies,
-            "last_accepted_legal_version": user.last_accepted_legal_version,
-            "subscription_status": user.customer.status.value if user.customer else None,
-            "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None,
-            "has_custody_module": user.customer.subscription_plan.has_custody_module if user.customer and user.customer.subscription_plan else True,
-            "has_issuance_module": user.customer.subscription_plan.has_issuance_module if user.customer and user.customer.subscription_plan else False,
-            "has_quotation_module": user.customer.subscription_plan.has_quotation_module if user.customer and user.customer.subscription_plan else True,
-            "has_reconciliation_module": user.customer.subscription_plan.has_reconciliation_module if user.customer and user.customer.subscription_plan else True,
-            "can_email_inbox": getattr(user.customer.subscription_plan, 'can_email_inbox', True) if user.customer and user.customer.subscription_plan else True,
-        }
-
+        token_data = await self.build_user_token_data(db, user)
         access_token = create_access_token(data=token_data)
 
         log_action(
@@ -409,14 +431,14 @@ class AuthService:
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "must_accept_policies": must_accept_policies,
+            "must_accept_policies": token_data.get("must_accept_policies", False),
             "user": {
                 "id": user.id,
                 "email": user.email,
-                "role": user.role.value,
+                "role": token_data["role"],
                 "customer_id": user.customer_id,
-                "subscription_status": user.customer.status.value if user.customer else None, # Also add here
-                "subscription_end_date": user.customer.end_date.isoformat() if user.customer and user.customer.end_date else None
+                "subscription_status": token_data.get("subscription_status"),
+                "subscription_end_date": token_data.get("subscription_end_date")
             },
         }
     
@@ -463,31 +485,8 @@ class AuthService:
         db.add(db_user)
         db.flush() # Flush to persist changes before logging and token creation
 
-        # Re-generate token after password change to reflect must_change_password = False
-        # Fetch current permissions from DB to ensure token is up-to-date
-        from app.crud.crud import crud_role_permission # Late import
-        db_permissions = crud_role_permission.get_permissions_for_role(db, db_user.role.value)
-        permission_names = [p.name for p in db_permissions]
-
-        # ADDED: Fetch must_accept_policies and last_accepted_legal_version from the db_user object
-        must_accept_policies_status = False
-        latest_versions = await self._get_legal_artifact_versions(db)
-        latest_system_version = max(latest_versions.get("tc_version", 0.0), latest_versions.get("pp_version", 0.0))
-        if db_user.last_accepted_legal_version is None or db_user.last_accepted_legal_version < latest_system_version:
-            must_accept_policies_status = True
-
-        new_token_data = {
-            "sub": db_user.email,
-            "user_id": db_user.id,
-            "role": db_user.role.value,
-            "permissions": permission_names,
-            "customer_id": db_user.customer_id,
-            "has_all_entity_access": db_user.has_all_entity_access,
-            "entity_ids": [assoc.customer_entity_id for assoc in db_user.entity_associations] if not db_user.has_all_entity_access else [],
-            "must_change_password": False, # Explicitly false now
-            "must_accept_policies": must_accept_policies_status, # MODIFIED: Use the newly computed value
-            "last_accepted_legal_version": db_user.last_accepted_legal_version
-        }
+        new_token_data = await self.build_user_token_data(db, db_user)
+        new_token_data["must_change_password"] = False
         new_access_token = create_access_token(data=new_token_data)
 
         log_action_type = AUDIT_ACTION_TYPE_PASSWORD_CHANGE_FIRST_LOGIN_SUCCESS if is_first_login_change else AUDIT_ACTION_TYPE_UPDATE
@@ -1095,31 +1094,26 @@ class AuthService:
         """
         Helper to generate the final JWT and handle post-login logic (like IP logging).
         """
-        # 1. Create the access token
-        # Adjust the 'data' dictionary to match what your app currently uses in JWTs
-        access_token = create_access_token(
-            data={
-                "sub": user.email, 
-                "user_id": user.id, 
-                "role": user.role.value,
-                "customer_id": user.customer_id, # CRITICAL: This was missing!
-                "is_mfa_verified": True
-            }
-        )
+        token_data = await self.build_user_token_data(db, user)
+        token_data["is_mfa_verified"] = True
+        access_token = create_access_token(data=token_data)
 
         # 2. Reset failed attempts
         user.failed_login_attempts = 0
         db.commit()
 
         return {
-                "access_token": access_token,
-                "token_type": "bearer",
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "role": user.role.value,
-                    "customer_id": user.customer_id,
-                    "must_change_password": user.must_change_password
-                }
+            "access_token": access_token,
+            "token_type": "bearer",
+            "must_accept_policies": token_data.get("must_accept_policies", False),
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "role": token_data["role"],
+                "customer_id": user.customer_id,
+                "must_change_password": user.must_change_password,
+                "subscription_status": token_data.get("subscription_status"),
+                "subscription_end_date": token_data.get("subscription_end_date")
             }
+        }
 auth_service = AuthService()

@@ -200,7 +200,7 @@ def get_my_subscription_details(
 # --- Password Change Endpoint (Forced Login) ---
 # This endpoint should NOT be protected by subscription status checks
 @router.post("/users/change-password-on-first-login", response_model=Token)
-def change_password_on_first_login(
+async def change_password_on_first_login(
     new_password: str = Body(..., embed=True, min_length=8),
     db: Session = Depends(get_db),
     current_user_token_data: TokenData = Depends(get_current_user),
@@ -226,19 +226,9 @@ def change_password_on_first_login(
     try:
         updated_user = crud_user.change_password_on_first_login(db, db_user, new_password, current_user_token_data.user_id)
 
-        db_permissions = crud_role_permission.get_permissions_for_role(db, updated_user.role.value)
-        permission_names = [p.name for p in db_permissions]
-
-        new_token_data = {
-            "sub": updated_user.email,
-            "user_id": updated_user.id,
-            "role": updated_user.role.value,
-            "permissions": permission_names,
-            "customer_id": updated_user.customer_id,
-            "has_all_entity_access": updated_user.has_all_entity_access,
-            "entity_ids": [assoc.customer_entity.id for assoc in updated_user.entity_associations] if not updated_user.has_all_entity_access else [],
-            "must_change_password": False,
-        }
+        from app.auth_v2.services import auth_service
+        new_token_data = await auth_service.build_user_token_data(db, updated_user)
+        new_token_data["must_change_password"] = False
         access_token_expires = timedelta(minutes=core_security.ACCESS_TOKEN_EXPIRE_MINUTES)
         new_access_token = core_security.create_access_token(
             data=new_token_data, expires_delta=access_token_expires
@@ -1058,8 +1048,9 @@ def update_customer_configuration(
                 global_value_default=db_customer_config.global_configuration.value_default,
                 global_value_min=db_customer_config.global_configuration.value_min,
                 global_value_max=db_customer_config.global_configuration.value_max,
-                unit=db_customer_config.global_configuration.unit,
-                description=db_customer_config.global_configuration.description,
+                global_unit=db_customer_config.global_configuration.unit,
+                global_description=db_customer_config.global_configuration.description,
+                global_module_tags=db_customer_config.global_configuration.module_tags,
                 created_at=db_customer_config.created_at,
                 updated_at=db_customer_config.updated_at,
                 is_deleted=db_customer_config.is_deleted,
