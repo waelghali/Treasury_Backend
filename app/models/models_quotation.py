@@ -179,7 +179,7 @@ class QuotationNotification(BaseModel):
 
     user = relationship("User")
 
-class QuotationAnonymousBenchmark(BaseModel):
+class QuotationAnonymousBenchmark(Base):
     """
     Zero-Knowledge Anonymous Aggregation Mart.
     Stores stripped, normalized macro metrics across all tenders with 0% confidentiality risk.
