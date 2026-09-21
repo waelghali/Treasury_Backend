@@ -183,12 +183,14 @@ async def send_email(
     cc_emails: Optional[List[str]] = None,
     sender_name: Optional[str] = None,
     attachments: Optional[List[EmailAttachment]] = None,
-    reply_to: Optional[str] = None
+    reply_to: Optional[str] = None,
+    save_copy: bool = True
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using provided settings.
     Filters out dummy test domain addresses before sending.
     Encodes subject and headers with RFC 2047 UTF-8 compliance and sets Reply-To.
+    When save_copy=False, Exchange EWS uses MessageDisposition="SendOnly" to avoid cluttering Sent Items.
     """
     to_emails = process_recipients(to_emails)
     cc_emails = process_recipients(cc_emails or [])
@@ -289,6 +291,12 @@ async def send_email(
         if cc_emails:
             cc_recipients_xml = f"<t:CcRecipients>{''.join([f'<t:Mailbox><t:EmailAddress>{escape(addr)}</t:EmailAddress></t:Mailbox>' for addr in cc_emails])}</t:CcRecipients>"
 
+        # SendAndSaveCopy saves to Sent Items; SendOnly sends and leaves zero trace in Sent Items (for OTPs)
+        disposition = "SendAndSaveCopy" if save_copy else "SendOnly"
+        saved_folder_xml = """<m:SavedItemFolderId>
+        <t:DistinguishedFolderId Id="sentitems" />
+      </m:SavedItemFolderId>""" if save_copy else ""
+
         soap_payload = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
                xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" 
@@ -298,10 +306,8 @@ async def send_email(
     <t:RequestServerVersion Version="Exchange2016" />
   </soap:Header>
   <soap:Body>
-    <m:CreateItem MessageDisposition="SendAndSaveCopy">
-      <m:SavedItemFolderId>
-        <t:DistinguishedFolderId Id="sentitems" />
-      </m:SavedItemFolderId>
+    <m:CreateItem MessageDisposition="{disposition}">
+      {saved_folder_xml}
       <m:Items>
         <t:Message>
           <t:ItemClass>IPM.Note</t:ItemClass>
@@ -317,7 +323,7 @@ async def send_email(
         headers = {'Content-Type': 'text/xml; charset=utf-8'}
         resp = requests.post(url, data=soap_payload.encode('utf-8'), auth=auth, headers=headers, timeout=20)
         if resp.status_code == 200 and "NoError" in resp.text:
-            logger.info(f"Email successfully dispatched via Microsoft Exchange EWS (443) for {email_settings.sender_email}!")
+            logger.info(f"Email successfully dispatched via Microsoft Exchange EWS (443, disposition={disposition}) for {email_settings.sender_email}!")
             return True
         raise RuntimeError(f"Exchange EWS dispatch failed (HTTP {resp.status_code}): {resp.text[:250]}")
 

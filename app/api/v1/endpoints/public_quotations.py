@@ -400,7 +400,8 @@ async def request_quotation_otp(
         body_template=body,
         template_data={},
         email_settings=email_settings,
-        sender_name=sender_name
+        sender_name=sender_name,
+        save_copy=False
     )
 
     return {
