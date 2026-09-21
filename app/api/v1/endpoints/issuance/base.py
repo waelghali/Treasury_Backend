@@ -1437,7 +1437,11 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
         db_settings = crud_customer_email_setting.get(db, payload.get("setting_id"))
         if db_settings and db_settings.customer_id == change_req.customer_id:
             # Apply only non-password fields (password was applied immediately at request time)
-            for field in ("smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active"):
+            email_fields = (
+                "smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active",
+                "imap_host", "imap_port", "imap_username", "imap_use_ssl", "imap_inbox_folder", "imap_processed_folder", "imap_is_active"
+            )
+            for field in email_fields:
                 if field in payload.get("new_value", {}):
                     setattr(db_settings, field, payload["new_value"][field])
             db.add(db_settings)
@@ -1446,11 +1450,15 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
         from app.crud.crud import crud_customer_email_setting
         from app.models import CustomerEmailSetting
         nv = payload.get("new_value", {})
+        email_fields = (
+            "smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active",
+            "imap_host", "imap_port", "imap_username", "imap_use_ssl", "imap_inbox_folder", "imap_processed_folder", "imap_is_active"
+        )
         # Check if a record already exists (e.g. password was pre-applied)
         existing = crud_customer_email_setting.get_by_customer_id(db, change_req.customer_id)
         if existing:
             # Update the existing record with the approved non-password fields
-            for field in ("smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active"):
+            for field in email_fields:
                 if field in nv:
                     setattr(existing, field, nv[field])
             existing.is_deleted = False
@@ -1465,6 +1473,13 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
                 sender_email=nv.get("sender_email", ""),
                 sender_display_name=nv.get("sender_display_name"),
                 is_active=nv.get("is_active", True),
+                imap_host=nv.get("imap_host"),
+                imap_port=nv.get("imap_port", 993),
+                imap_username=nv.get("imap_username"),
+                imap_use_ssl=nv.get("imap_use_ssl", True),
+                imap_inbox_folder=nv.get("imap_inbox_folder", "INBOX"),
+                imap_processed_folder=nv.get("imap_processed_folder", "Processed"),
+                imap_is_active=nv.get("imap_is_active", False),
             )
             db.add(db_settings)
 

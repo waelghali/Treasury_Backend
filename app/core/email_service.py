@@ -248,3 +248,90 @@ async def send_email(
         err = f"Unexpected error sending email: {e}"
         logger.error(err)
         return False, err
+
+
+def verify_smtp_connection(
+    smtp_host: str,
+    smtp_port: int,
+    smtp_username: str,
+    smtp_password: str,
+    timeout: int = 10
+) -> Tuple[bool, Optional[str]]:
+    """
+    Tests connection and authentication to an SMTP server.
+    Returns (True, None) if successful, or (False, error_message).
+    """
+    import socket
+    if not smtp_host:
+        return False, "SMTP Host is required."
+    if not smtp_username or not smtp_password:
+        return False, "SMTP Username and Password are required."
+
+    server = None
+    try:
+        if int(smtp_port) == 465:
+            server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=timeout)
+        else:
+            server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=timeout)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+        server.login(smtp_username, smtp_password)
+        server.quit()
+        return True, None
+    except smtplib.SMTPAuthenticationError as e:
+        msg = e.smtp_error.decode("utf-8", errors="replace") if isinstance(e.smtp_error, bytes) else str(e.smtp_error or e)
+        return False, f"SMTP Authentication failed for '{smtp_username}': {msg}"
+    except (smtplib.SMTPConnectError, socket.error, OSError) as e:
+        return False, f"Could not connect to SMTP server {smtp_host}:{smtp_port}: {e}"
+    except Exception as e:
+        return False, f"SMTP verification error ({smtp_host}:{smtp_port}): {e}"
+    finally:
+        if server:
+            try:
+                server.close()
+            except Exception:
+                pass
+
+
+def verify_imap_connection(
+    imap_host: str,
+    imap_port: int,
+    imap_username: str,
+    imap_password: str,
+    use_ssl: bool = True,
+    timeout: int = 10
+) -> Tuple[bool, Optional[str]]:
+    """
+    Tests connection and authentication to an IMAP server.
+    Returns (True, None) if successful, or (False, error_message).
+    """
+    import imaplib
+    import socket
+    if not imap_host:
+        return False, "IMAP Host is required."
+    if not imap_username or not imap_password:
+        return False, "IMAP Username and Password are required."
+
+    port = int(imap_port) if imap_port else (993 if use_ssl else 143)
+    mail = None
+    try:
+        if use_ssl:
+            mail = imaplib.IMAP4_SSL(imap_host, port, timeout=timeout)
+        else:
+            mail = imaplib.IMAP4(imap_host, port, timeout=timeout)
+        mail.login(imap_username, imap_password)
+        mail.logout()
+        return True, None
+    except imaplib.IMAP4.error as e:
+        return False, f"IMAP Authentication failed for '{imap_username}': {e}"
+    except (socket.error, OSError) as e:
+        return False, f"Could not connect to IMAP server {imap_host}:{port}: {e}"
+    except Exception as e:
+        return False, f"IMAP verification error ({imap_host}:{port}): {e}"
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass

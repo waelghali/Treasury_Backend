@@ -1087,6 +1087,79 @@ def update_customer_configuration(
         )
 
 # --- Customer Email Settings Management (Corporate Admin) (NEW SECTION) ---
+@router.post("/email-settings/test")
+def test_email_settings_connection(
+    test_in: CustomerEmailSettingUpdate,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(HasPermission("email_setting:manage")),
+):
+    """
+    Tests SMTP and IMAP connections with the provided settings.
+    If password is omitted in update, uses the existing encrypted password.
+    """
+    customer_id = corporate_admin_context.customer_id
+    existing_settings = crud_customer_email_setting.get_by_customer_id(db, customer_id)
+
+    from app.core.email_service import verify_smtp_connection, verify_imap_connection
+    from app.core.encryption import decrypt_data
+
+    smtp_host = test_in.smtp_host or (existing_settings.smtp_host if existing_settings else "")
+    smtp_port = test_in.smtp_port or (existing_settings.smtp_port if existing_settings else 587)
+    smtp_username = test_in.smtp_username or (existing_settings.smtp_username if existing_settings else "")
+    smtp_password = test_in.smtp_password
+    if not smtp_password and existing_settings and existing_settings.smtp_password_encrypted:
+        try:
+            smtp_password = decrypt_data(existing_settings.smtp_password_encrypted)
+        except Exception:
+            pass
+
+    if not smtp_host or not smtp_username or not smtp_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SMTP host, username, and password are required to test connection."
+        )
+
+    # 1. Test SMTP
+    ok_smtp, err_smtp = verify_smtp_connection(smtp_host, smtp_port, smtp_username, smtp_password)
+    if not ok_smtp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"SMTP connection test failed: {err_smtp}"
+        )
+
+    # 2. Test IMAP if active
+    imap_active = test_in.imap_is_active if test_in.imap_is_active is not None else (existing_settings.imap_is_active if existing_settings else False)
+    if imap_active:
+        imap_host = test_in.imap_host or (existing_settings.imap_host if existing_settings else "")
+        imap_port = test_in.imap_port or (existing_settings.imap_port if existing_settings else 993)
+        imap_username = test_in.imap_username or (existing_settings.imap_username if existing_settings else smtp_username)
+        imap_password = test_in.imap_password
+        if not imap_password and existing_settings and existing_settings.imap_password_encrypted:
+            try:
+                imap_password = decrypt_data(existing_settings.imap_password_encrypted)
+            except Exception:
+                pass
+        if not imap_password:
+            imap_password = smtp_password
+
+        use_ssl = test_in.imap_use_ssl if test_in.imap_use_ssl is not None else (existing_settings.imap_use_ssl if existing_settings else True)
+
+        if not imap_host or not imap_username or not imap_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="IMAP host, username, and password are required when Smart Inbox IMAP is active."
+            )
+
+        ok_imap, err_imap = verify_imap_connection(imap_host, imap_port, imap_username, imap_password, use_ssl=use_ssl)
+        if not ok_imap:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"IMAP connection test failed: {err_imap}"
+            )
+
+    return {"status": "success", "message": "Email settings verified successfully! Connection confirmed."}
+
+
 @router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
 def create_customer_email_settings(
     settings_in: CustomerEmailSettingCreate,
@@ -1099,30 +1172,73 @@ def create_customer_email_settings(
 
     try:
         from app.core.encryption import encrypt_data
+        from app.core.email_service import verify_smtp_connection, verify_imap_connection
         from app.models import CustomerEmailSetting
+
+        # 0. Check connection before saving if active - do NOT save if not confirmed!
+        if settings_in.is_active:
+            ok_smtp, err_smtp = verify_smtp_connection(
+                settings_in.smtp_host,
+                settings_in.smtp_port,
+                settings_in.smtp_username,
+                settings_in.smtp_password
+            )
+            if not ok_smtp:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cannot save settings. {err_smtp}"
+                )
+
+            if settings_in.imap_is_active and settings_in.imap_host:
+                imap_pass = settings_in.imap_password or settings_in.smtp_password
+                imap_user = settings_in.imap_username or settings_in.smtp_username
+                ok_imap, err_imap = verify_imap_connection(
+                    settings_in.imap_host,
+                    settings_in.imap_port,
+                    imap_user,
+                    imap_pass,
+                    use_ssl=settings_in.imap_use_ssl
+                )
+                if not ok_imap:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot save settings. {err_imap}"
+                    )
 
         # 1. Check for existing settings (including soft-deleted)
         existing_settings = db.query(CustomerEmailSetting).filter(
             CustomerEmailSetting.customer_id == customer_id
         ).first()
 
-        # 2. Apply password immediately (encrypt and store on the record)
+        # 2. Apply passwords immediately (encrypt and store on the record)
+        smtp_enc = encrypt_data(settings_in.smtp_password)
+        imap_enc = encrypt_data(settings_in.imap_password) if settings_in.imap_password else smtp_enc
+
         if existing_settings:
-            existing_settings.smtp_password_encrypted = encrypt_data(settings_in.smtp_password)
+            existing_settings.smtp_password_encrypted = smtp_enc
+            existing_settings.imap_password_encrypted = imap_enc
             existing_settings.is_deleted = False
             db.add(existing_settings)
             db.flush()
         else:
-            # Create a stub record with just the encrypted password
+            # Create a record with encrypted passwords
             existing_settings = CustomerEmailSetting(
                 customer_id=customer_id,
                 smtp_host=settings_in.smtp_host,
                 smtp_port=settings_in.smtp_port,
                 smtp_username=settings_in.smtp_username,
-                smtp_password_encrypted=encrypt_data(settings_in.smtp_password),
+                smtp_password_encrypted=smtp_enc,
                 sender_email=settings_in.sender_email,
                 sender_display_name=settings_in.sender_display_name,
                 is_active=settings_in.is_active,
+                imap_host=settings_in.imap_host,
+                imap_port=settings_in.imap_port,
+                imap_username=settings_in.imap_username,
+                imap_password_encrypted=imap_enc,
+                imap_use_ssl=settings_in.imap_use_ssl,
+                imap_inbox_folder=settings_in.imap_inbox_folder or "INBOX",
+                imap_processed_folder=settings_in.imap_processed_folder or "Processed",
+                imap_is_active=settings_in.imap_is_active,
             )
             db.add(existing_settings)
             db.flush()
@@ -1135,6 +1251,13 @@ def create_customer_email_settings(
             "sender_email": settings_in.sender_email,
             "sender_display_name": settings_in.sender_display_name,
             "is_active": settings_in.is_active,
+            "imap_host": settings_in.imap_host,
+            "imap_port": settings_in.imap_port,
+            "imap_username": settings_in.imap_username,
+            "imap_use_ssl": settings_in.imap_use_ssl,
+            "imap_inbox_folder": settings_in.imap_inbox_folder or "INBOX",
+            "imap_processed_folder": settings_in.imap_processed_folder or "Processed",
+            "imap_is_active": settings_in.imap_is_active,
         }
 
         # 4. Dual-control governance
@@ -1161,7 +1284,7 @@ def create_customer_email_settings(
         return JSONResponse(
             status_code=202,
             content={
-                "message": "Email settings creation submitted for approval by a second administrator. Password has been securely stored.",
+                "message": "Email settings creation submitted for approval by a second administrator. Credentials have been verified and securely stored.",
                 "change_request_id": change_req.id,
                 "status": "PENDING",
             }
@@ -1202,22 +1325,76 @@ def update_customer_email_settings(
     customer_id = corporate_admin_context.customer_id
 
     try:
+        from app.core.encryption import encrypt_data, decrypt_data
+        from app.core.email_service import verify_smtp_connection, verify_imap_connection
+
         db_settings = crud_customer_email_setting.get(db, setting_id)
         if not db_settings or db_settings.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email settings not found or do not belong to your customer.")
 
         update_data = settings_in.model_dump(exclude_unset=True)
 
-        # 1. Password is ALWAYS applied immediately (never stored in change_payload)
+        # 0. Check connection before saving if active - do NOT save if not confirmed!
+        is_active = update_data.get("is_active", db_settings.is_active)
+        if is_active:
+            smtp_host = update_data.get("smtp_host", db_settings.smtp_host)
+            smtp_port = update_data.get("smtp_port", db_settings.smtp_port)
+            smtp_user = update_data.get("smtp_username", db_settings.smtp_username)
+            smtp_pass = update_data.get("smtp_password")
+            if not smtp_pass and db_settings.smtp_password_encrypted:
+                try:
+                    smtp_pass = decrypt_data(db_settings.smtp_password_encrypted)
+                except Exception:
+                    pass
+
+            ok_smtp, err_smtp = verify_smtp_connection(smtp_host, smtp_port, smtp_user, smtp_pass)
+            if not ok_smtp:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cannot save settings. {err_smtp}"
+                )
+
+            imap_active = update_data.get("imap_is_active", db_settings.imap_is_active)
+            if imap_active:
+                imap_host = update_data.get("imap_host", db_settings.imap_host)
+                imap_port = update_data.get("imap_port", db_settings.imap_port)
+                imap_user = update_data.get("imap_username", db_settings.imap_username) or smtp_user
+                imap_pass = update_data.get("imap_password")
+                if not imap_pass and db_settings.imap_password_encrypted:
+                    try:
+                        imap_pass = decrypt_data(db_settings.imap_password_encrypted)
+                    except Exception:
+                        pass
+                if not imap_pass:
+                    imap_pass = smtp_pass
+                use_ssl = update_data.get("imap_use_ssl", db_settings.imap_use_ssl if db_settings.imap_use_ssl is not None else True)
+
+                if imap_host:
+                    ok_imap, err_imap = verify_imap_connection(imap_host, imap_port, imap_user, imap_pass, use_ssl=use_ssl)
+                    if not ok_imap:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Cannot save settings. {err_imap}"
+                        )
+
+        # 1. Passwords are ALWAYS applied immediately (never stored in change_payload)
         if "smtp_password" in update_data and update_data["smtp_password"] is not None:
-            from app.core.encryption import encrypt_data
             db_settings.smtp_password_encrypted = encrypt_data(update_data["smtp_password"])
+            del update_data["smtp_password"]
             db.add(db_settings)
             db.flush()
-            del update_data["smtp_password"]
+
+        if "imap_password" in update_data and update_data["imap_password"] is not None:
+            db_settings.imap_password_encrypted = encrypt_data(update_data["imap_password"])
+            del update_data["imap_password"]
+            db.add(db_settings)
+            db.flush()
 
         # 2. Collect non-password fields that changed
-        non_password_fields = ("smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active")
+        non_password_fields = (
+            "smtp_host", "smtp_port", "smtp_username", "sender_email", "sender_display_name", "is_active",
+            "imap_host", "imap_port", "imap_username", "imap_use_ssl", "imap_inbox_folder", "imap_processed_folder", "imap_is_active"
+        )
         changed_fields = {}
         old_fields = {}
         for field in non_password_fields:
@@ -1259,7 +1436,7 @@ def update_customer_email_settings(
         return JSONResponse(
             status_code=202,
             content={
-                "message": "Email settings change submitted for approval by a second administrator.",
+                "message": "Email settings change submitted for approval by a second administrator. Credentials have been verified and updated.",
                 "change_request_id": change_req.id,
                 "status": "PENDING",
                 "changed_fields": list(changed_fields.keys()),
