@@ -549,12 +549,20 @@ def create_user(
         
         return db_user
     except HTTPException as e:
+        db.rollback()
         log_details["reason"] = str(e.detail)
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details=log_details, customer_id=customer_id, ip_address=client_host)
+        try:
+            log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details=log_details, customer_id=customer_id, ip_address=client_host)
+        except Exception:
+            pass
         raise
     except Exception as e:
+        db.rollback()
         log_details["reason"] = str(e)
-        log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details=log_details, customer_id=customer_id, ip_address=client_host)
+        try:
+            log_action(db, user_id=corporate_admin_context.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details=log_details, customer_id=customer_id, ip_address=client_host)
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"

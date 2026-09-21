@@ -41,6 +41,18 @@ class CRUDUser(CRUDBase):
         )
 
     def create_user(self, db: Session, user_in: UserCreate, user_id_caller: Optional[int] = None) -> User:
+        existing_user = db.query(self.model).filter(self.model.email == user_in.email).first()
+        if existing_user:
+            if existing_user.is_deleted:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"A user with email '{user_in.email}' was previously deleted. Please restore the user instead of creating a new one."
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"User with email '{user_in.email}' already exists."
+            )
+
         customer = (
             db.query(Customer)
             .options(selectinload(Customer.subscription_plan))
@@ -125,13 +137,22 @@ class CRUDUser(CRUDBase):
 
 
     def create_user_by_corporate_admin(self, db: Session, user_in: UserCreateCorporateAdmin, customer_id: int, user_id_caller: int) -> User:
-        # Check for existing user with the same email address
-        existing_user = self.get_by_email(db, user_in.email)
+        # Check for existing user with the same email address (including soft-deleted)
+        existing_user = db.query(self.model).filter(self.model.email == user_in.email).first()
+        is_reactivation = False
         if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"User with email '{user_in.email}' already exists."
-            )
+            if existing_user.is_deleted and existing_user.customer_id == customer_id:
+                is_reactivation = True
+            elif existing_user.is_deleted:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"User with email '{user_in.email}' is already registered in another organization."
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"User with email '{user_in.email}' already exists and is active."
+                )
 
         customer = (
             db.query(Customer)
@@ -191,10 +212,23 @@ class CRUDUser(CRUDBase):
 
         user_data.pop("must_change_password", None)
 
-        db_user = self.model(must_change_password=True, customer_id=customer_id, **user_data)
-        db_user.set_password(password)
+        if is_reactivation:
+            db_user = existing_user
+            db_user.restore()
+            for key, val in user_data.items():
+                if hasattr(db_user, key):
+                    setattr(db_user, key, val)
+            db_user.must_change_password = True
+            db_user.set_password(password)
+            db.query(UserCustomerEntityAssociation).filter(
+                UserCustomerEntityAssociation.user_id == db_user.id
+            ).delete()
+            db.add(db_user)
+        else:
+            db_user = self.model(must_change_password=True, customer_id=customer_id, **user_data)
+            db_user.set_password(password)
+            db.add(db_user)
 
-        db.add(db_user)
         db.flush()
 
         if not db_user.has_all_entity_access and entity_ids:
