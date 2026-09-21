@@ -2624,8 +2624,13 @@ def approve_quotation_cancellation(
         user_id=corporate_admin_context.user_id,
         action_type="QUOTATION_CANCELLATION_APPROVED",
         entity_type="QuotationRequest",
-        entity_id=rfq.id,
-        details=f"Corporate admin approved cancellation of RFQ {rfq.ref_no}. Counterparties notified."
+        entity_id=None,
+        details={
+            "rfq_id": rfq.id,
+            "ref_no": rfq.ref_no,
+            "message": f"Corporate admin approved cancellation of RFQ {rfq.ref_no}. Counterparties notified."
+        },
+        customer_id=corporate_admin_context.customer_id
     )
 
     return {"message": "Quotation cancellation approved and counterparties notified.", "rfq_id": rfq.id, "status": "CANCELLED"}
@@ -2675,8 +2680,14 @@ def reject_quotation_cancellation(
         user_id=corporate_admin_context.user_id,
         action_type="QUOTATION_CANCELLATION_REJECTED",
         entity_type="QuotationRequest",
-        entity_id=rfq.id,
-        details=f"Corporate admin rejected cancellation of RFQ {rfq.ref_no}. Notes: {rejection_notes}"
+        entity_id=None,
+        details={
+            "rfq_id": rfq.id,
+            "ref_no": rfq.ref_no,
+            "notes": rejection_notes,
+            "message": f"Corporate admin rejected cancellation of RFQ {rfq.ref_no}."
+        },
+        customer_id=corporate_admin_context.customer_id
     )
 
     return {"message": "Quotation cancellation request rejected. RFQ restored to active schedule.", "rfq_id": rfq.id, "status": "PENDING"}

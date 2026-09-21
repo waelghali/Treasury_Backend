@@ -119,6 +119,12 @@ def sanitize_log_details(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
     if not data:
         return None
 
+    if isinstance(data, str):
+        return {"message": data}
+
+    if not isinstance(data, dict):
+        return {"details": str(data)}
+
     sensitive_keys = [
         "password",
         "new_password",
@@ -159,8 +165,8 @@ def log_action(
     user_id: Optional[int],
     action_type: str,
     entity_type: str,
-    entity_id: Optional[int],
-    details: Optional[Dict[str, Any]] = None,
+    entity_id: Optional[Any],
+    details: Optional[Any] = None,
     customer_id: Optional[int] = None,
     lg_record_id: Optional[int] = None,
     ip_address: Optional[str] = None,
@@ -175,11 +181,20 @@ def log_action(
         # CRITICAL CHANGE: Sanitize the details dictionary before creating the log
         sanitized_details = sanitize_log_details(details)
         
+        safe_entity_id = None
+        if entity_id is not None:
+            try:
+                safe_entity_id = int(entity_id)
+            except (ValueError, TypeError):
+                safe_entity_id = None
+                if isinstance(sanitized_details, dict) and "entity_id" not in sanitized_details:
+                    sanitized_details["entity_id"] = str(entity_id)
+
         audit_log_entry = AuditLog(
             user_id=user_id,
             action_type=action_type,
             entity_type=entity_type,
-            entity_id=entity_id,
+            entity_id=safe_entity_id,
             details=sanitized_details, # Use the sanitized data
             customer_id=customer_id,
             lg_record_id=lg_record_id,

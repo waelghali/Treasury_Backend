@@ -564,7 +564,11 @@ def create_rfq(
                 has_approver = len(approver_emails) > 0
                 has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
 
-                db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.id == assignment["id"]).first()
+                db_assignment = None
+                if assignment.get("id"):
+                    db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.id == assignment["id"]).first()
+                elif assignment.get("token"):
+                    db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == assignment["token"]).first()
 
                 if assignment.get("approval_status") == "PENDING" and not is_indicative and has_approver and has_execution:
                     # Phase 1a: Email APPROVER contacts with review link requiring 2FA OTP verification
@@ -1260,8 +1264,15 @@ def request_rfq_cancellation(
             user_id=current_user.user_id,
             action_type="QUOTATION_CANCELLED_INTERNAL",
             entity_type="QuotationRequest",
-            entity_id=rfq.id,
-            details=f"Draft RFQ {rfq.ref_no} cancelled prior to corporate admin approval. Reason: {payload.reason}"
+            entity_id=None,
+            details={
+                "rfq_id": rfq.id,
+                "ref_no": rfq.ref_no,
+                "reason": payload.reason,
+                "notes": payload.notes,
+                "message": f"Draft RFQ {rfq.ref_no} cancelled prior to corporate admin approval."
+            },
+            customer_id=current_user.customer_id
         )
         return {"message": "Quotation draft cancelled successfully.", "status": "CANCELLED", "rfq_id": rfq.id}
 
@@ -1319,8 +1330,15 @@ def request_rfq_cancellation(
             user_id=current_user.user_id,
             action_type="QUOTATION_CANCELLATION_REQUESTED",
             entity_type="QuotationRequest",
-            entity_id=rfq.id,
-            details=f"Cancellation requested for RFQ {rfq.ref_no}. Reason: {payload.reason}"
+            entity_id=None,
+            details={
+                "rfq_id": rfq.id,
+                "ref_no": rfq.ref_no,
+                "reason": payload.reason,
+                "notes": payload.notes,
+                "message": f"Cancellation requested for RFQ {rfq.ref_no}."
+            },
+            customer_id=current_user.customer_id
         )
         return {
             "message": "Cancellation request submitted for Corporate Admin approval.",

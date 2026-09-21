@@ -301,6 +301,7 @@ class CRUDQuotation:
                     )
                     db.add(db_assignment)
                     assignments.append({
+                        "id": assignment_id,
                         "bankId": b_data.get('id'),
                         "quotation_bank_id": q_bank.id,
                         "token": token,
