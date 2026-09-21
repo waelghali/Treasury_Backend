@@ -76,9 +76,9 @@ def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSet
         selectinload(Customer.customer_email_settings)
     ).filter(Customer.id == customer_id).first()
 
-    # Guard Clause: Check if settings exist and are active
-    if not (customer and customer.customer_email_settings and customer.customer_email_settings.is_active):
-        logger.info(f"Customer {customer_id}: Custom email settings not found/inactive. Using Global.")
+    # Guard Clause: Check if settings exist, are active, and not soft-deleted
+    if not (customer and customer.customer_email_settings and customer.customer_email_settings.is_active and not customer.customer_email_settings.is_deleted):
+        logger.info(f"Customer {customer_id}: Custom email settings not found/inactive/deleted. Using Global.")
         return get_global_email_settings(), "global"
 
     settings = customer.customer_email_settings
@@ -249,12 +249,18 @@ async def send_email(
             ):
                 def _send_global_fallback():
                     # Update From header for global delivery
-                    from_name = global_settings.sender_display_name or "Treasury Notifications"
-                    from_header = f"{from_name} <{global_settings.sender_email}>"
+                    from_name = sender_name or global_settings.sender_display_name or "Treasury Notifications"
+                    encoded_name = Header(from_name, 'utf-8').encode()
+                    from_header = f"{encoded_name} <{global_settings.sender_email}>"
                     if 'From' in msg:
-                        msg.replace_header('From', from_header)
-                    else:
-                        msg['From'] = from_header
+                        del msg['From']
+                    msg['From'] = from_header
+                    if 'Sender' in msg:
+                        del msg['Sender']
+                    msg['Sender'] = global_settings.sender_email
+                    if 'Reply-To' in msg:
+                        del msg['Reply-To']
+                    msg['Reply-To'] = global_settings.sender_email
 
                     if global_settings.smtp_port == 465:
                         fb_server = smtplib.SMTP_SSL(global_settings.smtp_host, global_settings.smtp_port, timeout=10)
