@@ -1178,6 +1178,7 @@ class CustomerEmailSettingBase(BaseModel):
     imap_inbox_folder: Optional[str] = Field("INBOX", description="Folder to poll")
     imap_processed_folder: Optional[str] = Field("Processed", description="Folder for processed emails")
     imap_is_active: bool = Field(False, description="Whether inbound polling is active")
+    allow_fallback_on_unreachable: Optional[bool] = Field(True, description="Allow saving even if host is unreachable/times out from cloud; automatic fallback will be used")
 
 class CustomerEmailSettingCreate(CustomerEmailSettingBase):
     pass
@@ -1200,6 +1201,7 @@ class CustomerEmailSettingUpdate(BaseModel):
     imap_inbox_folder: Optional[str] = Field(None, description="Folder to poll")
     imap_processed_folder: Optional[str] = Field(None, description="Folder for processed emails")
     imap_is_active: Optional[bool] = Field(None, description="Whether inbound polling is active")
+    allow_fallback_on_unreachable: Optional[bool] = Field(True, description="Allow saving even if host is unreachable/times out from cloud; automatic fallback will be used")
 
 class CustomerEmailSettingOut(BaseSchema):
     customer_id: int

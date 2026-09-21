@@ -1120,12 +1120,19 @@ def test_email_settings_connection(
         )
 
     # 1. Test SMTP
-    ok_smtp, err_smtp = verify_smtp_connection(smtp_host, smtp_port, smtp_username, smtp_password)
+    ok_smtp, cat_smtp, err_smtp = verify_smtp_connection(smtp_host, smtp_port, smtp_username, smtp_password, customer_id=customer_id)
     if not ok_smtp:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"SMTP connection test failed: {err_smtp}"
-        )
+        if cat_smtp in ("AUTH_ERROR", "LOCKED"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err_smtp
+            )
+        # Network timeout / unreachable
+        return {
+            "status": "warning",
+            "category": "NETWORK_ERROR",
+            "message": f"{err_smtp}. Automatic fallback to generic system email is enabled to ensure delivery."
+        }
 
     # 2. Test IMAP if active
     imap_active = test_in.imap_is_active if test_in.imap_is_active is not None else (existing_settings.imap_is_active if existing_settings else False)
@@ -1150,14 +1157,20 @@ def test_email_settings_connection(
                 detail="IMAP host, username, and password are required when Smart Inbox IMAP is active."
             )
 
-        ok_imap, err_imap = verify_imap_connection(imap_host, imap_port, imap_username, imap_password, use_ssl=use_ssl)
+        ok_imap, cat_imap, err_imap = verify_imap_connection(imap_host, imap_port, imap_username, imap_password, use_ssl=use_ssl, customer_id=customer_id)
         if not ok_imap:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"IMAP connection test failed: {err_imap}"
-            )
+            if cat_imap in ("AUTH_ERROR", "LOCKED"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=err_imap
+                )
+            return {
+                "status": "warning",
+                "category": "NETWORK_ERROR",
+                "message": f"SMTP confirmed, but {err_imap}"
+            }
 
-    return {"status": "success", "message": "Email settings verified successfully! Connection confirmed."}
+    return {"status": "success", "message": "Email settings verified successfully! Connection and credentials confirmed."}
 
 
 @router.post("/email-settings/", response_model=CustomerEmailSettingOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
@@ -1175,35 +1188,52 @@ def create_customer_email_settings(
         from app.core.email_service import verify_smtp_connection, verify_imap_connection
         from app.models import CustomerEmailSetting
 
-        # 0. Check connection before saving if active - do NOT save if not confirmed!
+        # 0. Check connection before saving if active - protect against bad passwords/AD lockout!
         if settings_in.is_active:
-            ok_smtp, err_smtp = verify_smtp_connection(
+            ok_smtp, cat_smtp, err_smtp = verify_smtp_connection(
                 settings_in.smtp_host,
                 settings_in.smtp_port,
                 settings_in.smtp_username,
-                settings_in.smtp_password
+                settings_in.smtp_password,
+                customer_id=customer_id
             )
             if not ok_smtp:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Cannot save settings. {err_smtp}"
-                )
+                if cat_smtp in ("AUTH_ERROR", "LOCKED"):
+                    # Strictly block saving invalid credentials that could lock corporate AD accounts
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot save settings. {err_smtp}"
+                    )
+                if not getattr(settings_in, "allow_fallback_on_unreachable", True):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot save settings. {err_smtp}"
+                    )
+                logger.warning(f"Customer {customer_id}: SMTP verification timed out ({err_smtp}). Proceeding with save because generic global fallback is active.")
 
             if settings_in.imap_is_active and settings_in.imap_host:
                 imap_pass = settings_in.imap_password or settings_in.smtp_password
                 imap_user = settings_in.imap_username or settings_in.smtp_username
-                ok_imap, err_imap = verify_imap_connection(
+                ok_imap, cat_imap, err_imap = verify_imap_connection(
                     settings_in.imap_host,
                     settings_in.imap_port,
                     imap_user,
                     imap_pass,
-                    use_ssl=settings_in.imap_use_ssl
+                    use_ssl=settings_in.imap_use_ssl,
+                    customer_id=customer_id
                 )
                 if not ok_imap:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Cannot save settings. {err_imap}"
-                    )
+                    if cat_imap in ("AUTH_ERROR", "LOCKED"):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Cannot save settings. {err_imap}"
+                        )
+                    if not getattr(settings_in, "allow_fallback_on_unreachable", True):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Cannot save settings. {err_imap}"
+                        )
+                    logger.warning(f"Customer {customer_id}: IMAP verification timed out ({err_imap}). Proceeding with save.")
 
         # 1. Check for existing settings (including soft-deleted)
         existing_settings = db.query(CustomerEmailSetting).filter(
@@ -1333,6 +1363,7 @@ def update_customer_email_settings(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email settings not found or do not belong to your customer.")
 
         update_data = settings_in.model_dump(exclude_unset=True)
+        allow_fallback = update_data.pop("allow_fallback_on_unreachable", True)
 
         # 0. Check connection before saving if active - do NOT save if not confirmed!
         is_active = update_data.get("is_active", db_settings.is_active)
@@ -1347,12 +1378,19 @@ def update_customer_email_settings(
                 except Exception:
                     pass
 
-            ok_smtp, err_smtp = verify_smtp_connection(smtp_host, smtp_port, smtp_user, smtp_pass)
+            ok_smtp, cat_smtp, err_smtp = verify_smtp_connection(smtp_host, smtp_port, smtp_user, smtp_pass, customer_id=customer_id)
             if not ok_smtp:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Cannot save settings. {err_smtp}"
-                )
+                if cat_smtp in ("AUTH_ERROR", "LOCKED"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot save settings. {err_smtp}"
+                    )
+                if not allow_fallback:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot save settings. {err_smtp}"
+                    )
+                logger.warning(f"Customer {customer_id}: SMTP verification timed out or unreachable ({err_smtp}). Proceeding with save (fallback to generic email enabled).")
 
             imap_active = update_data.get("imap_is_active", db_settings.imap_is_active)
             if imap_active:
@@ -1370,12 +1408,19 @@ def update_customer_email_settings(
                 use_ssl = update_data.get("imap_use_ssl", db_settings.imap_use_ssl if db_settings.imap_use_ssl is not None else True)
 
                 if imap_host:
-                    ok_imap, err_imap = verify_imap_connection(imap_host, imap_port, imap_user, imap_pass, use_ssl=use_ssl)
+                    ok_imap, cat_imap, err_imap = verify_imap_connection(imap_host, imap_port, imap_user, imap_pass, use_ssl=use_ssl, customer_id=customer_id)
                     if not ok_imap:
-                        raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Cannot save settings. {err_imap}"
-                        )
+                        if cat_imap in ("AUTH_ERROR", "LOCKED"):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Cannot save settings. {err_imap}"
+                            )
+                        if not allow_fallback:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Cannot save settings. {err_imap}"
+                            )
+                        logger.warning(f"Customer {customer_id}: IMAP verification timed out or unreachable ({err_imap}). Proceeding with save.")
 
         # 1. Passwords are ALWAYS applied immediately (never stored in change_payload)
         if "smtp_password" in update_data and update_data["smtp_password"] is not None:

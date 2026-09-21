@@ -164,6 +164,17 @@ class InboxPollingService:
             return None
 
         port = settings.imap_port or (993 if settings.imap_use_ssl else 143)
+        account_key = f"{settings.customer_id}:{settings.imap_username}"
+
+        from app.core.email_service import AccountLockoutTracker
+        is_locked, remaining_mins = AccountLockoutTracker.is_locked(account_key)
+        if is_locked:
+            logger.warning(
+                f"Customer {settings.customer_id}: IMAP polling paused for {remaining_mins} min "
+                f"due to Account Lockout Protection for '{settings.imap_username}'."
+            )
+            return None
+
         for attempt in range(2):
             mail = None
             try:
@@ -173,7 +184,18 @@ class InboxPollingService:
                     mail = imaplib.IMAP4(settings.imap_host, port, timeout=15)
                 
                 mail.login(settings.imap_username, password)
+                AccountLockoutTracker.record_success(account_key)
                 return mail
+            except imaplib.IMAP4.error as auth_err:
+                # Do NOT retry authentication failures - protect Active Directory from lockout!
+                AccountLockoutTracker.record_failure(account_key)
+                logger.error(f"IMAP auth failed for customer {settings.customer_id} on {settings.imap_host}: {auth_err}. Aborting retry to prevent account lockout.")
+                if mail:
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
+                return None
             except Exception as e:
                 if mail:
                     try:
@@ -183,7 +205,7 @@ class InboxPollingService:
                 if attempt == 0:
                     time.sleep(1.0)
                     continue
-                logger.error(f"IMAP login failed for customer {settings.customer_id} on {settings.imap_host}:{port}: {e}")
+                logger.error(f"IMAP connection failed for customer {settings.customer_id} on {settings.imap_host}:{port}: {e}")
                 return None
 
     def poll_customer_mailbox(self, db: Session, customer_id: int) -> List[InboxItem]:
