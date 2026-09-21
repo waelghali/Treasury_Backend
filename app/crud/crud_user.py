@@ -141,18 +141,20 @@ class CRUDUser(CRUDBase):
         existing_user = db.query(self.model).filter(self.model.email == user_in.email).first()
         is_reactivation = False
         if existing_user:
-            if existing_user.is_deleted and existing_user.customer_id == customer_id:
+            if existing_user.is_deleted:
+                # User was deleted in this or another organization: adopt and reactivate under this customer
                 is_reactivation = True
-            elif existing_user.is_deleted:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"User with email '{user_in.email}' is already registered in another organization."
-                )
             else:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"User with email '{user_in.email}' already exists and is active."
-                )
+                if existing_user.customer_id == customer_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"User with email '{user_in.email}' is already active in your organization."
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"User with email '{user_in.email}' is already an active user in another organization."
+                    )
 
         customer = (
             db.query(Customer)
@@ -215,6 +217,7 @@ class CRUDUser(CRUDBase):
         if is_reactivation:
             db_user = existing_user
             db_user.restore()
+            db_user.customer_id = customer_id
             for key, val in user_data.items():
                 if hasattr(db_user, key):
                     setattr(db_user, key, val)
