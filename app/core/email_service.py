@@ -269,8 +269,57 @@ async def send_email(
         logger.info("Email delivery suppressed: No valid recipients found after filtering.")
         return True, None
 
-    # 4. Send via SMTP in background worker thread with 8s socket timeout
-    logger.debug(f"Connecting to SMTP: {email_settings.smtp_host}:{email_settings.smtp_port}")
+    # 4. Send via SMTP or Exchange EWS in background worker thread
+    logger.debug(f"Connecting to Mail Server: {email_settings.smtp_host}:{email_settings.smtp_port}")
+
+    def _send_exchange_ews():
+        """Dispatches email via Microsoft Exchange Web Services (EWS) over HTTPS/443 with NTLM authentication."""
+        from requests_ntlm import HttpNtlmAuth
+        import requests
+        from xml.sax.saxutils import escape
+
+        auth = HttpNtlmAuth(email_settings.smtp_username, email_settings.smtp_password)
+        url = f"https://{email_settings.smtp_host}/ews/exchange.asmx"
+
+        escaped_subj = escape(clean_subj)
+        escaped_body = escape(body_to_send)
+
+        to_recipients_xml = "".join([f"<t:Mailbox><t:EmailAddress>{escape(addr)}</t:EmailAddress></t:Mailbox>" for addr in to_emails])
+        cc_recipients_xml = ""
+        if cc_emails:
+            cc_recipients_xml = f"<t:CcRecipients>{''.join([f'<t:Mailbox><t:EmailAddress>{escape(addr)}</t:EmailAddress></t:Mailbox>' for addr in cc_emails])}</t:CcRecipients>"
+
+        soap_payload = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" 
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <t:RequestServerVersion Version="Exchange2016" />
+  </soap:Header>
+  <soap:Body>
+    <m:CreateItem MessageDisposition="SendAndSaveCopy">
+      <m:SavedItemFolderId>
+        <t:DistinguishedFolderId Id="sentitems" />
+      </m:SavedItemFolderId>
+      <m:Items>
+        <t:Message>
+          <t:ItemClass>IPM.Note</t:ItemClass>
+          <t:Subject>{escaped_subj}</t:Subject>
+          <t:Body BodyType="HTML">{escaped_body}</t:Body>
+          <t:ToRecipients>{to_recipients_xml}</t:ToRecipients>
+          {cc_recipients_xml}
+        </t:Message>
+      </m:Items>
+    </m:CreateItem>
+  </soap:Body>
+</soap:Envelope>"""
+        headers = {'Content-Type': 'text/xml; charset=utf-8'}
+        resp = requests.post(url, data=soap_payload.encode('utf-8'), auth=auth, headers=headers, timeout=20)
+        if resp.status_code == 200 and "NoError" in resp.text:
+            logger.info(f"Email successfully dispatched via Microsoft Exchange EWS (443) for {email_settings.sender_email}!")
+            return True
+        raise RuntimeError(f"Exchange EWS dispatch failed (HTTP {resp.status_code}): {resp.text[:250]}")
 
     def _send_smtp():
         if email_settings.smtp_port == 465:
@@ -283,10 +332,16 @@ async def send_email(
         server.send_message(msg, from_addr=email_settings.sender_email, to_addrs=all_recipients)
         server.quit()
 
+    def _send_worker():
+        if int(email_settings.smtp_port) == 443:
+            _send_exchange_ews()
+        else:
+            _send_smtp()
+
     try:
         import asyncio
-        await asyncio.to_thread(_send_smtp)
-        logger.info(f"Email sent to {all_recipients} via {email_settings.smtp_host}")
+        await asyncio.to_thread(_send_worker)
+        logger.info(f"Email sent to {all_recipients} via {email_settings.smtp_host}:{email_settings.smtp_port}")
         return True, None
     except Exception as primary_err:
         logger.warning(
@@ -423,6 +478,25 @@ def verify_smtp_connection(
             f"Account Lockout Protection Active: {AccountLockoutTracker.MAX_CONSECUTIVE_FAILURES} consecutive login failures detected for '{smtp_username}'. "
             f"To protect your corporate account from being locked by your company's Active Directory security policy, testing is paused for approximately {remaining_mins} more minute(s)."
         )
+
+    # Check for Microsoft Exchange on Port 443 (EWS over HTTPS)
+    if int(smtp_port) == 443:
+        try:
+            from requests_ntlm import HttpNtlmAuth
+            import requests
+            auth = HttpNtlmAuth(smtp_username, smtp_password)
+            url = f"https://{smtp_host}/ews/exchange.asmx"
+            r = requests.get(url, auth=auth, timeout=timeout or 8)
+            if r.status_code == 200:
+                AccountLockoutTracker.record_success(account_key)
+                return True, "SUCCESS", None
+            elif r.status_code in (401, 403):
+                AccountLockoutTracker.record_failure(account_key)
+                return False, "AUTH_ERROR", f"Exchange authentication failed for '{smtp_username}' on port 443."
+            else:
+                return False, "NETWORK_ERROR", f"Exchange server responded with HTTP {r.status_code}"
+        except Exception as e:
+            return False, "NETWORK_ERROR", f"Could not connect to Exchange server at {smtp_host}:443: {e}"
 
     server = None
     try:
