@@ -2427,6 +2427,9 @@ async def run_daily_reconciliation_reminders(db: Session):
 
             if to_emails:
                 try:
+                    from app.services.issuance_notifications import get_common_communication_emails
+                    email_settings, _ = get_customer_email_settings(db, customer.id)
+                    cc_emails = get_common_communication_emails(db, customer.id)
                     recon_body_html = build_alert_email_html(
                         customer_name=customer.name,
                         title="Action Required: LG Position Reconciliation Overdue",

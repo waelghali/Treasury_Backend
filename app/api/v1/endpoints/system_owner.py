@@ -3218,6 +3218,7 @@ async def approve_trial_registration(
 
         logger.info(f"Looking for PDF at: {pdf_path}")
 
+        email_settings = get_global_email_settings()
         try:
             with open(pdf_path, "rb") as f:
                 attachment = EmailAttachment("Quick_Start_Guide.pdf", f.read(), "application/pdf")

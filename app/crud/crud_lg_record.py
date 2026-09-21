@@ -2351,7 +2351,7 @@ class CRUDLGRecord(CRUDBase):
             query = query.filter(self.model.beneficiary_corporate_id.in_(user_allowed_entity_ids))
         # ----------------------------------------
 
-        return query.options(
+        lg_records = query.options(
             selectinload(models.LGRecord.beneficiary_corporate),
             selectinload(models.LGRecord.lg_currency),
             selectinload(models.LGRecord.lg_payable_currency),

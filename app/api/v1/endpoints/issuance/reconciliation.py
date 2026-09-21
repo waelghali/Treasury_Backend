@@ -324,7 +324,7 @@ async def create_reconciliation_session(
 def list_reconciliation_sessions(
     bank_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_treasury_context),
+    current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """List reconciliation sessions for the customer."""
     q = db.query(ReconSession).filter(
@@ -340,7 +340,7 @@ def list_reconciliation_sessions(
 def get_reconciliation_session(
     session_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_treasury_context),
+    current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """Get detailed reconciliation session."""
     session = db.query(ReconSession).filter(
@@ -374,7 +374,7 @@ def get_reconciliation_results(
     mismatch_type: Optional[str] = Query(None),
     resolved: Optional[bool] = Query(None),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_treasury_context),
+    current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """Get reconciliation results with optional filters."""
     # Verify session access
@@ -415,7 +415,7 @@ def get_reconciliation_results(
 def get_reconciliation_bank_rows(
     session_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_treasury_context),
+    current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """Get all parsed bank rows for a session."""
     session = db.query(ReconSession).filter(

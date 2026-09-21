@@ -2164,7 +2164,7 @@ def get_maintenance_approval_history(
 @router.get("/maintenance/pending-print")
 def get_maintenance_pending_print(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_treasury_context),
+    current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """
     Returns maintenance actions with instruction letters pending print.

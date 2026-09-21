@@ -527,6 +527,9 @@ def create_user(
         base_url = get_frontend_base_url(request=request)
         login_url = f"{base_url}/login"
 
+        welcome_subject = f"Welcome to the Platform, {db_user.email}!"
+        user_name = db_user.email
+
         welcome_body = f"""
             <html><body>
                 <p>Hello {user_name},</p>
