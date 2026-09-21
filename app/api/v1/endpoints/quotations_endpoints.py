@@ -331,9 +331,8 @@ def _dispatch_quotation_submission_email(
         from app.models import User, UserRole
         from app.services.issuance_notifications import get_common_communication_emails
         from app.services.unified_email_builder import build_transaction_email_html
-        from app.core.background_tasks import get_global_email_settings
+        from app.core.email_service import get_global_email_settings, send_email
         from app.core.routing import get_frontend_base_url
-        from app.core.email_service import send_email
 
         admins = db.query(User).filter(
             User.customer_id == current_user.customer_id,
