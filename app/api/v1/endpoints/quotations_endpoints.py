@@ -528,6 +528,17 @@ def create_rfq(
         
         # Trigger immediate email dispatch if not requiring corporate-level approval
         if not requires_approval:
+            # Schedule 15m prior reminder if window_start - now >= 60 min
+            try:
+                from app.services.quotation_reminder_service import schedule_rfq_15m_reminder
+                schedule_rfq_15m_reminder(
+                    rfq_id=rfq.id,
+                    window_start=rfq.window_start,
+                    release_time=rfq.created_at or datetime.now(timezone.utc)
+                )
+            except Exception as rem_err:
+                logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
+
             email_settings = get_global_email_settings()
             from app.core.routing import get_frontend_base_url
             base_url = get_frontend_base_url(request=request)
@@ -1258,6 +1269,13 @@ def request_rfq_cancellation(
         rfq.cancelled_at = now
         db.commit()
 
+        # Cancel scheduled 15m reminder if registered
+        try:
+            from app.services.quotation_reminder_service import cancel_rfq_15m_reminder
+            cancel_rfq_15m_reminder(rfq_id=rfq.id)
+        except Exception as rem_err:
+            logger.warning(f"Failed to cancel 15m reminder for RFQ {rfq.id}: {rem_err}")
+
         log_action(
             db=db,
             user_id=current_user.user_id,
@@ -1458,6 +1476,17 @@ def retender_quotation(
 
     # If no internal approval required, dispatch bank notification emails
     if not requires_approval:
+        # Schedule 15m prior reminder if window_start - now >= 60 min
+        try:
+            from app.services.quotation_reminder_service import schedule_rfq_15m_reminder
+            schedule_rfq_15m_reminder(
+                rfq_id=new_rfq.id,
+                window_start=new_rfq.window_start,
+                release_time=new_rfq.created_at or datetime.now(timezone.utc)
+            )
+        except Exception as rem_err:
+            logger.warning(f"Failed to schedule 15m reminder for RFQ {new_rfq.id}: {rem_err}")
+
         email_settings = get_global_email_settings()
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)

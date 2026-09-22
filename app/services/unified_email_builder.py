@@ -453,6 +453,18 @@ def build_quotation_rfq_bank_email(
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"Your bank's authorized approver has <strong>approved participation</strong> for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong>."
         instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
+    elif email_purpose == "WINDOW_START_REMINDER_APPROVER":
+        subject = f"URGENT: RFQ {ref_no} Starts in 15 Minutes - Bank Approval Required ({customer_branding})"
+        banner_title = "Urgent: RFQ Window Opens in 15 Minutes &bull; Approval Required"
+        salutation = f"Dear <strong>{bank_name} Authorized Approver</strong>,"
+        intro_text = f"This is an urgent reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong> will open for live quotation in <strong>15 minutes</strong>, but your bank's authorization is still <strong>pending</strong>."
+        instruction_text = "Please authorize your bank's participation immediately so your execution desk can submit quotes as soon as the window opens."
+    elif email_purpose == "WINDOW_START_REMINDER_EXECUTION":
+        subject = f"REMINDER: RFQ {ref_no} Opens in 15 Minutes - Prepare Your Quotation ({customer_branding})"
+        banner_title = "Quotation Window Opens in 15 Minutes"
+        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
+        intro_text = f"This is a reminder that the live quotation window for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong> will open in <strong>15 minutes</strong>."
+        instruction_text = "Please access the quotation portal below to review terms and be ready to submit your quote when the window opens."
     else:
         subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
         banner_title = "New Request for Quotation"
@@ -476,7 +488,7 @@ def build_quotation_rfq_bank_email(
                 </p>
             </div>
         """
-    elif email_purpose == "BANK_APPROVAL_REQUIRED":
+    elif email_purpose in ("BANK_APPROVAL_REQUIRED", "WINDOW_START_REMINDER_APPROVER"):
         action_box_html = f"""
             <!-- PRIMARY CALL TO ACTION BUTTON (APPROVER) -->
             <div style="text-align: center; margin: 36px 0 20px 0;">

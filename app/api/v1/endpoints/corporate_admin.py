@@ -2215,8 +2215,16 @@ def approve_quotation(
         ip_address=client_ip
     )
     
+    # Schedule 15-minute prior reminder if window_start - now >= 60 minutes
+    try:
+        from app.services.quotation_reminder_service import schedule_rfq_15m_reminder
+        schedule_rfq_15m_reminder(rfq_id=rfq.id, window_start=rfq.window_start, release_time=now_utc)
+    except Exception as rem_err:
+        logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
+
     # Broadcast emails to banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+
     
     # Use Customer Specific Email Settings
     from app.core.email_service import get_customer_email_settings
@@ -2473,6 +2481,16 @@ def approve_quotation_request(
     ))
     db.commit()
 
+    # Schedule or cancel 15-minute prior reminder
+    try:
+        from app.services.quotation_reminder_service import schedule_rfq_15m_reminder, cancel_rfq_15m_reminder
+        if approval_in.status == "PENDING":
+            schedule_rfq_15m_reminder(rfq_id=rfq.id, window_start=rfq.window_start, release_time=datetime.now(timezone.utc))
+        else:
+            cancel_rfq_15m_reminder(rfq_id=rfq.id)
+    except Exception as rem_err:
+        logger.warning(f"Failed to handle 15m reminder for RFQ {rfq.id}: {rem_err}")
+
     # Dispatch Emails if Approved
     if approval_in.status == "PENDING":
         email_settings = get_global_email_settings()
@@ -2559,6 +2577,13 @@ def approve_quotation_cancellation(
     rfq.status = 'CANCELLED'
     rfq.cancelled_at = now
     db.commit()
+
+    # Cancel scheduled 15m reminder if registered
+    try:
+        from app.services.quotation_reminder_service import cancel_rfq_15m_reminder
+        cancel_rfq_15m_reminder(rfq_id=rfq.id)
+    except Exception as rem_err:
+        logger.warning(f"Failed to cancel 15m reminder for RFQ {rfq.id}: {rem_err}")
 
     # Dispatch withdrawal emails to all assigned banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()

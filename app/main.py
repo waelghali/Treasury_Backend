@@ -564,6 +564,13 @@ def configure_app_instance(fastapi_app: FastAPI):
         scheduler.start()
         logger.info("APScheduler started.")
 
+        # Re-register dynamic 15-minute prior quotation reminders for active RFQs
+        try:
+            from app.services.quotation_reminder_service import sync_pending_rfq_reminders_on_startup
+            sync_pending_rfq_reminders_on_startup(scheduler, SessionLocal)
+        except Exception as sync_err:
+            logger.warning(f"Startup sync of RFQ 15m reminders encountered error: {sync_err}")
+
     @fastapi_app.on_event("shutdown")
     async def shutdown_scheduler():
         try:
