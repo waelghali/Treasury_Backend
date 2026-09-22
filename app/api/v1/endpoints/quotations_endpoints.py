@@ -15,7 +15,7 @@ import asyncio
 from app.database import get_db
 from app.core.security import get_current_active_user, TokenData
 from app.crud.crud import log_action
-from app.core.email_service import send_email, get_global_email_settings
+from app.core.email_service import send_email, get_global_email_settings, get_customer_email_settings
 from app.services.unified_email_builder import build_transaction_email_html, build_standard_email_html
 
 
@@ -331,7 +331,7 @@ def _dispatch_quotation_submission_email(
         from app.models import User, UserRole
         from app.services.issuance_notifications import get_common_communication_emails
         from app.services.unified_email_builder import build_transaction_email_html
-        from app.core.email_service import get_global_email_settings, send_email
+        from app.core.email_service import get_customer_email_settings, send_email
         from app.core.routing import get_frontend_base_url
 
         admins = db.query(User).filter(
@@ -354,7 +354,7 @@ def _dispatch_quotation_submission_email(
             return
 
         base_url = get_frontend_base_url(request=request)
-        email_settings = get_global_email_settings()
+        email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
 
         customer_display_name = (rfq.customer.name if getattr(rfq, "customer", None) and rfq.customer.name else "Corporate Treasury")
         entity_display_name = (rfq.entity.entity_name if getattr(rfq, "entity", None) and rfq.entity.entity_name else None)
@@ -539,7 +539,7 @@ def create_rfq(
             except Exception as rem_err:
                 logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
 
-            email_settings = get_global_email_settings()
+            email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
             from app.core.routing import get_frontend_base_url
             base_url = get_frontend_base_url(request=request)
             entity_display_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else 'Corporate Treasury')
@@ -1487,7 +1487,7 @@ def retender_quotation(
         except Exception as rem_err:
             logger.warning(f"Failed to schedule 15m reminder for RFQ {new_rfq.id}: {rem_err}")
 
-        email_settings = get_global_email_settings()
+        email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         customer_branding = (new_rfq.entity.entity_name if new_rfq.entity else None) or (new_rfq.customer.name if new_rfq.customer else "Corporate Treasury")
@@ -2127,7 +2127,7 @@ async def resend_rfq_bank_invite(
     if not q_bank or not q_bank.emails:
         raise HTTPException(status_code=400, detail="No email address configured for this bank")
         
-    email_settings = get_global_email_settings()
+    email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
     from app.core.routing import get_frontend_base_url
     base_url = get_frontend_base_url(request=request)
     bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]

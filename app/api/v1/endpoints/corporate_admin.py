@@ -2493,7 +2493,7 @@ def approve_quotation_request(
 
     # Dispatch Emails if Approved
     if approval_in.status == "PENDING":
-        email_settings = get_global_email_settings()
+        email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         
@@ -2587,7 +2587,7 @@ def approve_quotation_cancellation(
 
     # Dispatch withdrawal emails to all assigned banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-    email_settings = get_global_email_settings()
+    email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
     customer_branding = rfq.customer.name if rfq.customer else "Corporate Treasury"
 
     from app.services.unified_email_builder import build_quotation_withdrawn_bank_email
