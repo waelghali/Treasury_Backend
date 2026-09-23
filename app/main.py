@@ -2,6 +2,7 @@
 import sys
 import os
 import re
+import asyncio
 import logging
 import pytz
 from datetime import datetime, timedelta
@@ -330,6 +331,9 @@ def configure_app_instance(fastapi_app: FastAPI):
         db_session = next(get_db())
         try:
             await task_func(db_session, *args, **kwargs)
+        except asyncio.CancelledError:
+            # Expected during server shutdown / hot-reload — not a real error
+            logger.info(f"Scheduled task {task_func.__name__} cancelled (server shutdown or reload).")
         except Exception as e:
             logger.error(f"Error in scheduled task {task_func.__name__}: {e}", exc_info=True)
         finally:
@@ -570,6 +574,13 @@ def configure_app_instance(fastapi_app: FastAPI):
             sync_pending_rfq_reminders_on_startup(scheduler, SessionLocal)
         except Exception as sync_err:
             logger.warning(f"Startup sync of RFQ 15m reminders encountered error: {sync_err}")
+
+        # Re-register scheduled RFQ bank releases
+        try:
+            from app.services.quotation_release_scheduler import sync_pending_scheduled_releases_on_startup
+            sync_pending_scheduled_releases_on_startup(scheduler, SessionLocal)
+        except Exception as rel_err:
+            logger.warning(f"Startup sync of scheduled RFQ releases encountered error: {rel_err}")
 
     @fastapi_app.on_event("shutdown")
     async def shutdown_scheduler():

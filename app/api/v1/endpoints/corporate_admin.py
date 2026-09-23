@@ -63,7 +63,7 @@ from app.core.ai_integration import generate_signed_gcs_url, _check_bucket_acces
 # Although you are currently only using get_global_email_settings, keeping 
 # get_customer_email_settings imported is generally safer for a complex file.
 from app.core.email_service import (
-    get_customer_email_settings, 
+    get_customer_email_settings as get_customer_email_settings_service, 
     get_global_email_settings, # <-- CRITICAL ADDITION
     send_email, 
     EmailSettings
@@ -2098,10 +2098,13 @@ async def get_active_system_notifications_corporate_admin( # Use your existing f
 # ==============================================================================
 
 from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationBank
-from app.schemas.schemas_quotation import QuotationRequestOut
+from app.schemas.schemas_quotation import QuotationRequestOut, QuotationApprovalRequest, QuotationRescheduleRequest
 from pydantic import BaseModel
 from app.core.email_service import send_email, get_global_email_settings
 from fastapi import BackgroundTasks
+from app.services.quotation_release_scheduler import (
+    broadcast_rfq_to_banks, schedule_rfq_bank_release, cancel_scheduled_rfq_release
+)
 import os
 from app.schemas.all_schemas import BankOut
 from app.crud.crud import crud_bank
@@ -2121,16 +2124,15 @@ def get_pending_quotation_approvals(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
-    """Lists all quotations awaiting internal corporate approval with counterparty details."""
+    """Lists all quotations awaiting internal corporate approval or scheduled for delayed release."""
     rfqs = db.query(QuotationRequest).filter(
         QuotationRequest.customer_id == corporate_admin_context.customer_id,
-        QuotationRequest.status == 'PENDING_APPROVAL'
+        QuotationRequest.status.in_(['PENDING_APPROVAL', 'APPROVED_SCHEDULED'])
     ).order_by(QuotationRequest.created_at.desc()).all()
 
     results = []
     for rfq in rfqs:
         rfq_dict = {c.name: getattr(rfq, c.name) for c in rfq.__table__.columns}
-        # Include creator_name and entity_name if available
         rfq_dict['entity_name'] = rfq.entity.entity_name if rfq.entity else None
         rfq_dict['creator_name'] = rfq.created_by.name if hasattr(rfq, 'created_by') and rfq.created_by else None
 
@@ -2163,11 +2165,12 @@ def get_pending_quotation_approvals(
 def approve_quotation(
     rfq_id: str,
     background_tasks: BackgroundTasks,
+    payload: Optional[QuotationApprovalRequest] = None,
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
     request: Request = None
 ):
-    """Approves a quotation and broadcasts it to assigned banks."""
+    """Approves a quotation and broadcasts it to assigned banks (or schedules delayed release)."""
     rfq = db.query(QuotationRequest).filter(
         QuotationRequest.id == rfq_id,
         QuotationRequest.customer_id == corporate_admin_context.customer_id
@@ -2176,19 +2179,92 @@ def approve_quotation(
     if not rfq:
         raise HTTPException(status_code=404, detail="Quotation not found.")
     
-    if rfq.status != 'PENDING_APPROVAL':
+    if rfq.status not in ['PENDING_APPROVAL', 'NEEDS_REVISION']:
         raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be approved.")
 
     from datetime import datetime, timezone
     now_utc = datetime.now(timezone.utc)
-    rfq.status = 'PENDING'
     rfq.admin_reviewed_at = now_utc
-    db.commit()
 
-    # Non-repudiation and regulatory legal accountability audit logging
     from app.crud.base import log_action
     client_ip = request.client.host if request and request.client else None
     user_agent = request.headers.get("user-agent") if request else None
+
+    # Check if a future scheduled release time was specified
+    scheduled_time = payload.scheduled_release_at if payload else None
+    if scheduled_time:
+        if scheduled_time.tzinfo is None:
+            scheduled_time = scheduled_time.replace(tzinfo=timezone.utc)
+        else:
+            scheduled_time = scheduled_time.astimezone(timezone.utc)
+
+        if scheduled_time <= now_utc:
+            scheduled_time = None  # Immediate if not in the future
+
+    if scheduled_time:
+        w_end = rfq.window_end
+        if w_end and w_end.tzinfo is None:
+            w_end = w_end.replace(tzinfo=timezone.utc)
+        
+        if w_end and scheduled_time >= w_end:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Scheduled release time must be earlier than the quotation window close time ({w_end.strftime('%Y-%m-%d %H:%M UTC')})."
+            )
+
+        rfq.status = 'APPROVED_SCHEDULED'
+        rfq.scheduled_release_at = scheduled_time
+        rfq.is_dispatched = False
+        db.commit()
+
+        job_id = schedule_rfq_bank_release(rfq_id=rfq.id, release_at=scheduled_time)
+        rfq.scheduled_release_job_id = job_id
+        db.commit()
+
+        log_action(
+            db,
+            user_id=corporate_admin_context.user_id,
+            action_type="QUOTATION_RFQ_APPROVED_SCHEDULED",
+            entity_type="QuotationRequest",
+            entity_id=None,
+            details={
+                "rfq_id": str(rfq.id),
+                "ref_no": rfq.ref_no,
+                "scheduled_release_at": scheduled_time.isoformat(),
+                "approved_by_user_id": corporate_admin_context.user_id,
+                "approved_by_email": corporate_admin_context.email,
+                "client_ip": client_ip,
+                "user_agent": user_agent
+            },
+            customer_id=corporate_admin_context.customer_id,
+            ip_address=client_ip
+        )
+        db.commit()
+
+        if rfq.created_by_user_id:
+            from app.models.models_quotation import QuotationNotification
+            db.add(QuotationNotification(
+                user_id=rfq.created_by_user_id,
+                type="RFQ_APPROVED_SCHEDULED",
+                title=f"RFQ {rfq.ref_no} Approved & Scheduled",
+                message=f"Your RFQ {rfq.ref_no} has been approved and scheduled for bank release at {scheduled_time.strftime('%Y-%m-%d %H:%M UTC')}.",
+                link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+                is_read=False
+            ))
+            db.commit()
+
+        return {
+            "message": f"Quotation approved and scheduled for bank release at {scheduled_time.strftime('%Y-%m-%d %H:%M UTC')}.",
+            "rfq_id": rfq.id,
+            "status": rfq.status,
+            "scheduled_release_at": rfq.scheduled_release_at
+        }
+
+    # Standard Immediate Release Flow
+    rfq.status = 'PENDING'
+    rfq.scheduled_release_at = None
+    rfq.scheduled_release_job_id = None
+    db.commit()
 
     log_action(
         db,
@@ -2214,134 +2290,109 @@ def approve_quotation(
         customer_id=corporate_admin_context.customer_id,
         ip_address=client_ip
     )
-    
-    # Schedule 15-minute prior reminder if window_start - now >= 60 minutes
-    try:
-        from app.services.quotation_reminder_service import schedule_rfq_15m_reminder
-        schedule_rfq_15m_reminder(rfq_id=rfq.id, window_start=rfq.window_start, release_time=now_utc)
-    except Exception as rem_err:
-        logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
+    db.commit()
 
-    # Broadcast emails to banks
-    assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-
-    
-    # Use Customer Specific Email Settings
-    from app.core.email_service import get_customer_email_settings
     from app.core.routing import get_frontend_base_url
-    email_settings, source = get_customer_email_settings(db, rfq.customer_id)
-    
     base_url = get_frontend_base_url(request=request)
-    
-    # Standard Bank Branding
-    customer_branding = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
+    background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url)
 
-    from app.services.unified_email_builder import build_quotation_rfq_bank_email
+    return {"message": "Quotation approved and released to banks immediately.", "rfq_id": rfq.id, "status": rfq.status}
 
-    import uuid
-    import secrets
-    from app.models.models_quotation import QuotationAccessOTP
+@router.post("/quotations/{rfq_id}/reschedule-release")
+def reschedule_quotation_release(
+    rfq_id: str,
+    payload: QuotationRescheduleRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    request: Request = None
+):
+    """Reschedules or immediately releases an RFQ currently waiting in APPROVED_SCHEDULED status."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
 
-    for assignment in assignments:
-        bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
-        if not bank_row:
-            continue
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
 
-        contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
-        if not contacts and bank_row.emails:
-            contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
-        if not contacts:
-            continue
+    if rfq.status != 'APPROVED_SCHEDULED' or rfq.is_dispatched:
+        raise HTTPException(status_code=400, detail="Only scheduled quotations awaiting dispatch can be rescheduled.")
 
-        bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
-        link = f"{base_url}/public-quotation/{assignment.token}"
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+    cancel_scheduled_rfq_release(rfq.id)
 
-        # Collect contacts by role
-        all_bank_emails = list(dict.fromkeys(
-            c.get("email", "").strip() for c in contacts if c.get("email")
-        ))
-        approver_emails = list(dict.fromkeys(
-            c.get("email", "").strip() for c in contacts 
-            if c.get("role") == "APPROVER" and c.get("email")
-        ))
-        approver_set = {e.lower() for e in approver_emails}
-        non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
+    # Option A: Release immediately
+    if payload.release_now:
+        rfq.status = 'PENDING'
+        rfq.scheduled_release_at = None
+        rfq.scheduled_release_job_id = None
+        db.commit()
 
-        is_indicative = (getattr(rfq, "quotation_base", "") or "").lower() == "indicative" or (getattr(assignment, "quotation_base", "") or "").lower() == "indicative"
-        has_approver = len(approver_emails) > 0
-        has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+        from app.core.routing import get_frontend_base_url
+        base_url = get_frontend_base_url(request=request)
+        background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url)
 
-        # Bank approval flow ONLY applies if:
-        # 1. Assignment is PENDING approval
-        # 2. Quotation is Execution (not Indicative)
-        # 3. Bank has BOTH APPROVER and EXECUTION contacts
-        if assignment.approval_status == 'PENDING' and not is_indicative and has_approver and has_execution:
-            # Phase 1a: Email APPROVER contacts with review link requiring 2FA OTP verification
-            for app_email in approver_emails:
-                approver_link = f"{base_url}/public-quotation/{assignment.token}?email={app_email}"
-                subject, body = build_quotation_rfq_bank_email(
-                    rfq=rfq,
-                    assignment=assignment,
-                    bank_name=bank_display_name,
-                    customer_branding=customer_branding,
-                    link=approver_link,
-                    email_purpose="BANK_APPROVAL_REQUIRED"
-                )
-                background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+        return {"message": "Quotation released to banks immediately.", "rfq_id": rfq.id, "status": rfq.status}
 
-            # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link) ALL TOGETHER in ONE email
-            if non_approver_emails:
-                subject, body = build_quotation_rfq_bank_email(
-                    rfq=rfq,
-                    assignment=assignment,
-                    bank_name=bank_display_name,
-                    customer_branding=customer_branding,
-                    link="",
-                    email_purpose="BANK_HEADS_UP"
-                )
-                background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
-        else:
-            # --- STANDARD FLOW (No bank-level approval needed: Indicative, or No Approver, or Approver without Execution role) ---
-            # Ensure assignment is not stuck in PENDING approval
-            if assignment.approval_status == 'PENDING':
-                assignment.approval_status = None
-                db.commit()
+    # Option B: Reschedule for a new time
+    if not payload.scheduled_release_at:
+        raise HTTPException(status_code=400, detail="New scheduled release time or release_now=true is required.")
 
-            # Send standard invitation email with portal link to ALL contacts from the same bank ALL TOGETHER in the SAME email
-            if all_bank_emails:
-                subject, body = build_quotation_rfq_bank_email(
-                    rfq=rfq,
-                    assignment=assignment,
-                    bank_name=bank_display_name,
-                    customer_branding=customer_branding,
-                    link=link,
-                    email_purpose="INVITATION"
-                )
-                background_tasks.add_task(
-                    send_email,
-                    db,
-                    all_bank_emails,
-                    subject,
-                    body,
-                    {},
-                    email_settings,
-                )
-            
+    new_time = payload.scheduled_release_at
+    if new_time.tzinfo is None:
+        new_time = new_time.replace(tzinfo=timezone.utc)
+    else:
+        new_time = new_time.astimezone(timezone.utc)
+
+    if new_time <= now_utc:
+        raise HTTPException(status_code=400, detail="New scheduled release time must be in the future.")
+
+    w_end = rfq.window_end
+    if w_end and w_end.tzinfo is None:
+        w_end = w_end.replace(tzinfo=timezone.utc)
+    if w_end and new_time >= w_end:
+        raise HTTPException(status_code=400, detail="New scheduled release time must be earlier than the quotation window close time.")
+
+    job_id = schedule_rfq_bank_release(rfq_id=rfq.id, release_at=new_time)
+    rfq.scheduled_release_at = new_time
+    rfq.scheduled_release_job_id = job_id
     db.commit()
-    
-    # Notify End User
-    from app.models.models_quotation import QuotationNotification
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="RFQ_APPROVED",
-        title=f"RFQ {rfq.ref_no} Approved",
-        message=f"Your {rfq.type} quotation request has been approved and released to banks.",
-        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-        is_read=False
-    ))
+
+    return {
+        "message": f"Bank release rescheduled for {new_time.strftime('%Y-%m-%d %H:%M UTC')}.",
+        "rfq_id": rfq.id,
+        "status": rfq.status,
+        "scheduled_release_at": rfq.scheduled_release_at
+    }
+
+@router.post("/quotations/{rfq_id}/cancel-scheduled-release")
+def cancel_scheduled_quotation_release(
+    rfq_id: str,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """Cancels a scheduled release and returns the RFQ to PENDING_APPROVAL status."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'APPROVED_SCHEDULED' or rfq.is_dispatched:
+        raise HTTPException(status_code=400, detail="Only scheduled quotations awaiting dispatch can be cancelled.")
+
+    cancel_scheduled_rfq_release(rfq.id)
+
+    rfq.status = 'PENDING_APPROVAL'
+    rfq.scheduled_release_at = None
+    rfq.scheduled_release_job_id = None
     db.commit()
-    
-    return {"message": "Quotation approved and broadcasted to banks.", "rfq_id": rfq.id}
+
+    return {"message": "Scheduled release cancelled. RFQ returned to pending approval.", "rfq_id": rfq.id, "status": rfq.status}
 
 @router.post("/quotations/{rfq_id}/reject")
 def reject_quotation(
@@ -2493,7 +2544,7 @@ def approve_quotation_request(
 
     # Dispatch Emails if Approved
     if approval_in.status == "PENDING":
-        email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
+        email_settings, _ = get_customer_email_settings_service(db, rfq.customer_id)
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         
@@ -2587,7 +2638,7 @@ def approve_quotation_cancellation(
 
     # Dispatch withdrawal emails to all assigned banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-    email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
+    email_settings, _ = get_customer_email_settings_service(db, rfq.customer_id)
     customer_branding = rfq.customer.name if rfq.customer else "Corporate Treasury"
 
     from app.services.unified_email_builder import build_quotation_withdrawn_bank_email

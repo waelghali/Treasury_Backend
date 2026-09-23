@@ -127,10 +127,21 @@ class QuotationRequestOut(BaseModel):
     cancellation_requested_by: Optional[int] = None
     cancellation_requested_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
+    scheduled_release_at: Optional[datetime] = None
+    is_dispatched: Optional[bool] = False
+    dispatched_at: Optional[datetime] = None
     assigned_banks: Optional[List[dict]] = None
 
     class Config:
         from_attributes = True
+
+class QuotationApprovalRequest(BaseModel):
+    legal_disclaimer_accepted: Optional[bool] = True
+    scheduled_release_at: Optional[datetime] = None
+
+class QuotationRescheduleRequest(BaseModel):
+    scheduled_release_at: Optional[datetime] = None
+    release_now: Optional[bool] = False
 
 class QuotationCancellationRequest(BaseModel):
     reason: str

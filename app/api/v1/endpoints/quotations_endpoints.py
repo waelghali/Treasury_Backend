@@ -24,7 +24,7 @@ from app.schemas.schemas_quotation import (
     QuotationRequestCreate, QuotationRequestOut,
     QuotationResultsOut, QuotationResultItem,
     ReTenderRequest, QuotationResubmitRequest,
-    QuotationCancellationRequest
+    QuotationCancellationRequest, QuotationRescheduleRequest
 )
 from app.crud.crud_quotation import crud_quotation
 from app.models.models_quotation import (
@@ -387,10 +387,30 @@ def _dispatch_quotation_submission_email(
         if entity_display_name:
             kv["Entity"] = entity_display_name
 
-        if rfq.window_start and rfq.window_end:
-            w_start_str = rfq.window_start.strftime("%Y-%m-%d %H:%M") if hasattr(rfq.window_start, "strftime") else str(rfq.window_start)
-            w_end_str = rfq.window_end.strftime("%H:%M") if hasattr(rfq.window_end, "strftime") else str(rfq.window_end)
-            kv["Quotation Window"] = f"{w_start_str} &ndash; {w_end_str} UTC"
+        if rfq.window_start or rfq.window_end:
+            try:
+                from zoneinfo import ZoneInfo
+                cairo_tz = ZoneInfo("Africa/Cairo")
+                if rfq.window_start:
+                    ws = rfq.window_start
+                    if hasattr(ws, "tzinfo") and ws.tzinfo is None:
+                        from datetime import timezone as _tz
+                        ws = ws.replace(tzinfo=_tz.utc)
+                    ws_cairo = ws.astimezone(cairo_tz)
+                    kv["Window Opens"] = ws_cairo.strftime("%A, %d %b %Y at %H:%M %Z")
+                if rfq.window_end:
+                    we = rfq.window_end
+                    if hasattr(we, "tzinfo") and we.tzinfo is None:
+                        from datetime import timezone as _tz
+                        we = we.replace(tzinfo=_tz.utc)
+                    we_cairo = we.astimezone(cairo_tz)
+                    kv["Submission Deadline"] = we_cairo.strftime("%A, %d %b %Y at %H:%M %Z")
+            except Exception:
+                # Fallback: show raw values if timezone conversion fails
+                if rfq.window_start:
+                    kv["Window Opens"] = str(rfq.window_start)
+                if rfq.window_end:
+                    kv["Submission Deadline"] = str(rfq.window_end)
 
         action_label = "Re-Tender" if is_retender else "Quotation"
         if requires_approval:
@@ -1259,15 +1279,24 @@ def request_rfq_cancellation(
     if w_start and w_start.tzinfo is None:
         w_start = w_start.replace(tzinfo=timezone.utc)
 
-    # Case 1: PENDING_APPROVAL - Internal draft only, never sent to banks! Immediate cancellation.
-    if rfq.status == 'PENDING_APPROVAL':
+    # Case 1: PENDING_APPROVAL or APPROVED_SCHEDULED - Internal draft or unsent schedule only, never sent to banks! Immediate cancellation.
+    if rfq.status in ('PENDING_APPROVAL', 'APPROVED_SCHEDULED'):
         rfq.status = 'CANCELLED'
         rfq.cancellation_reason = payload.reason
         rfq.cancellation_notes = payload.notes
         rfq.cancellation_requested_by = current_user.user_id
         rfq.cancellation_requested_at = now
         rfq.cancelled_at = now
+        rfq.scheduled_release_at = None
+        rfq.scheduled_release_job_id = None
         db.commit()
+
+        # Cancel scheduled release if registered
+        try:
+            from app.services.quotation_release_scheduler import cancel_scheduled_rfq_release
+            cancel_scheduled_rfq_release(rfq_id=rfq.id)
+        except Exception as rel_err:
+            logger.warning(f"Failed to cancel scheduled release for RFQ {rfq.id}: {rel_err}")
 
         # Cancel scheduled 15m reminder if registered
         try:
@@ -1287,11 +1316,11 @@ def request_rfq_cancellation(
                 "ref_no": rfq.ref_no,
                 "reason": payload.reason,
                 "notes": payload.notes,
-                "message": f"Draft RFQ {rfq.ref_no} cancelled prior to corporate admin approval."
+                "message": f"Draft/scheduled RFQ {rfq.ref_no} cancelled prior to bank dispatch."
             },
             customer_id=current_user.customer_id
         )
-        return {"message": "Quotation draft cancelled successfully.", "status": "CANCELLED", "rfq_id": rfq.id}
+        return {"message": "Quotation cancelled successfully before bank dispatch.", "status": "CANCELLED", "rfq_id": rfq.id}
 
     # Case 2: PENDING (Released to banks, scheduled to open in the future)
     if rfq.status == 'PENDING':
@@ -1365,6 +1394,97 @@ def request_rfq_cancellation(
 
     # For any other status (OPEN, EVALUATING, etc.)
     raise HTTPException(status_code=400, detail=f"Cannot cancel quotation while in status {rfq.status}.")
+
+
+@router.post("/{rfq_id}/reschedule-release")
+def reschedule_rfq_release_maker(
+    rfq_id: str,
+    payload: QuotationRescheduleRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user),
+    request: Request = None
+):
+    """Allows Maker or Admin to reschedule or immediately release an RFQ in APPROVED_SCHEDULED status."""
+    rfq = crud_quotation.get_request(db, rfq_id=rfq_id, customer_id=current_user.customer_id)
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'APPROVED_SCHEDULED' or rfq.is_dispatched:
+        raise HTTPException(status_code=400, detail="Only scheduled quotations awaiting dispatch can be rescheduled.")
+
+    from app.services.quotation_release_scheduler import (
+        cancel_scheduled_rfq_release, schedule_rfq_bank_release, broadcast_rfq_to_banks
+    )
+    now_utc = datetime.now(timezone.utc)
+    cancel_scheduled_rfq_release(rfq.id)
+
+    if payload.release_now:
+        rfq.status = 'PENDING'
+        rfq.scheduled_release_at = None
+        rfq.scheduled_release_job_id = None
+        db.commit()
+
+        from app.core.routing import get_frontend_base_url
+        base_url = get_frontend_base_url(request=request)
+        background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url)
+
+        return {"message": "Quotation released to banks immediately.", "rfq_id": rfq.id, "status": rfq.status}
+
+    if not payload.scheduled_release_at:
+        raise HTTPException(status_code=400, detail="New scheduled release time or release_now=true is required.")
+
+    new_time = payload.scheduled_release_at
+    if new_time.tzinfo is None:
+        new_time = new_time.replace(tzinfo=timezone.utc)
+    else:
+        new_time = new_time.astimezone(timezone.utc)
+
+    if new_time <= now_utc:
+        raise HTTPException(status_code=400, detail="New scheduled release time must be in the future.")
+
+    w_end = rfq.window_end
+    if w_end and w_end.tzinfo is None:
+        w_end = w_end.replace(tzinfo=timezone.utc)
+    if w_end and new_time >= w_end:
+        raise HTTPException(status_code=400, detail="New scheduled release time must be earlier than the quotation window close time.")
+
+    job_id = schedule_rfq_bank_release(rfq_id=rfq.id, release_at=new_time)
+    rfq.scheduled_release_at = new_time
+    rfq.scheduled_release_job_id = job_id
+    db.commit()
+
+    return {
+        "message": f"Bank release rescheduled for {new_time.strftime('%Y-%m-%d %H:%M UTC')}.",
+        "rfq_id": rfq.id,
+        "status": rfq.status,
+        "scheduled_release_at": rfq.scheduled_release_at
+    }
+
+
+@router.post("/{rfq_id}/cancel-scheduled-release")
+def cancel_rfq_release_maker(
+    rfq_id: str,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Allows Maker or Admin to cancel a scheduled release and revert RFQ to PENDING_APPROVAL."""
+    rfq = crud_quotation.get_request(db, rfq_id=rfq_id, customer_id=current_user.customer_id)
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    if rfq.status != 'APPROVED_SCHEDULED' or rfq.is_dispatched:
+        raise HTTPException(status_code=400, detail="Only scheduled quotations awaiting dispatch can be cancelled.")
+
+    from app.services.quotation_release_scheduler import cancel_scheduled_rfq_release
+    cancel_scheduled_rfq_release(rfq.id)
+
+    rfq.status = 'PENDING_APPROVAL'
+    rfq.scheduled_release_at = None
+    rfq.scheduled_release_job_id = None
+    db.commit()
+
+    return {"message": "Scheduled release cancelled. RFQ returned to pending approval.", "rfq_id": rfq.id, "status": rfq.status}
 
 
 @router.post("/{rfq_id}/re-tender")

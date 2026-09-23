@@ -70,6 +70,10 @@ class QuotationRequest(BaseModel):
     cancellation_requested_at = Column(DateTime(timezone=True), nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
     internal_notes = Column(Text, nullable=True, comment="Internal notes from requestor (e.g. related payments, invoices)")
+    scheduled_release_at = Column(DateTime(timezone=True), nullable=True, comment="Future scheduled time for bank email dispatch")
+    scheduled_release_job_id = Column(String(100), nullable=True, comment="APScheduler job ID for scheduled release")
+    is_dispatched = Column(Boolean, default=False, nullable=False, comment="Whether quotation invitation emails have been dispatched to banks")
+    dispatched_at = Column(DateTime(timezone=True), nullable=True, comment="Timestamp when quotation invitation emails were dispatched")
 
     customer = relationship("Customer")
     entity = relationship("CustomerEntity")
