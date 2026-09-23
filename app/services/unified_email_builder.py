@@ -4,7 +4,9 @@ Provides high-aesthetic, corporate SaaS HTML templates for all outgoing platform
 """
 
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from dateutil import parser
 
 
 def build_standard_email_html(
@@ -340,22 +342,27 @@ def build_quotation_rfq_bank_email(
         entity_meta_parts.append(f"Tax ID: {entity_tax}")
     entity_meta_html = f'<div style="font-size: 11px; color: #64748b; font-family: monospace; font-weight: normal; margin-top: 3px;">{" &bull; ".join(entity_meta_parts)}</div>' if entity_meta_parts else ""
 
-    # 1. Format Submission Deadline
-    window_end = getattr(rfq, "window_end", None)
-    deadline_cairo_str = "N/A"
-    deadline_utc_str = ""
-    if window_end:
+    # 1. Format Quotation Window (Start & Deadline) in Cairo Local Time
+    cairo_tz = ZoneInfo("Africa/Cairo")
+
+    def _format_cairo_dt(dt_val):
+        if not dt_val:
+            return "N/A"
         try:
-            if isinstance(window_end, str):
-                window_end = parser.parse(window_end)
-            if window_end.tzinfo is None:
-                window_end = window_end.replace(tzinfo=timezone.utc)
-            cairo_tz = ZoneInfo("Africa/Cairo")
-            cairo_dt = window_end.astimezone(cairo_tz)
-            deadline_cairo_str = cairo_dt.strftime("%A, %d %b %Y at %H:%M:%S %Z")
-            deadline_utc_str = window_end.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+            if isinstance(dt_val, str):
+                dt_val = parser.parse(dt_val)
+            if hasattr(dt_val, "tzinfo") and dt_val.tzinfo is None:
+                dt_val = dt_val.replace(tzinfo=timezone.utc)
+            cairo_dt = dt_val.astimezone(cairo_tz)
+            return cairo_dt.strftime("%A, %d %b %Y at %H:%M %Z")
         except Exception:
-            deadline_cairo_str = str(window_end)
+            return str(dt_val)
+
+    window_start = getattr(rfq, "window_start", None)
+    window_end = getattr(rfq, "window_end", None)
+
+    window_start_cairo_str = _format_cairo_dt(window_start)
+    deadline_cairo_str = _format_cairo_dt(window_end)
 
     # 2. Format Target Value Date
     raw_val_date = (assignment.value_date if assignment and getattr(assignment, "value_date", None) else getattr(rfq, "value_date", None))
@@ -581,21 +588,27 @@ def build_quotation_rfq_bank_email(
             </p>
 
             <!-- SUBMISSION DEADLINE ALERT BOX -->
-            <div style="background-color: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #dc2626; border-radius: 8px; padding: 16px 20px; margin-bottom: 26px;">
+            <div style="background-color: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #dc2626; border-radius: 8px; padding: 18px 22px; margin-bottom: 26px;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <tr>
-                        <td style="vertical-align: middle; width: 32px; font-size: 22px; color: #dc2626;">
+                        <td style="vertical-align: top; width: 34px; font-size: 24px; color: #dc2626; padding-top: 2px;">
                             &#9200;
                         </td>
                         <td style="vertical-align: top;">
-                            <span style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px;">
-                                SUBMISSION DEADLINE &bull; MANDATORY CUTOFF
+                            <span style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1.5px; text-transform: uppercase; display: block; margin-bottom: 8px;">
+                                QUOTATION WINDOW &bull; CAIRO LOCAL TIME
                             </span>
-                            <div style="font-size: 16px; font-weight: 800; color: #991b1b; line-height: 1.4;">
-                                {deadline_cairo_str}
-                            </div>
-                            {f'<div style="font-size: 12px; font-weight: 600; color: #b91c1c; margin-top: 2px;">({deadline_utc_str})</div>' if deadline_utc_str else ''}
-                            <p style="margin: 6px 0 0 0; font-size: 12px; color: #7f1d1d; line-height: 1.4;">
+                            <table style="width: 100%; border-collapse: collapse; margin-bottom: 6px;">
+                                <tr>
+                                    <td style="font-size: 13px; font-weight: 600; color: #7f1d1d; width: 160px; padding: 4px 0;">Window Opens:</td>
+                                    <td style="font-size: 14px; font-weight: 700; color: #1e293b; padding: 4px 0;">{window_start_cairo_str}</td>
+                                </tr>
+                                <tr>
+                                    <td style="font-size: 13px; font-weight: 700; color: #991b1b; width: 160px; padding: 4px 0;">Submission Deadline:</td>
+                                    <td style="font-size: 15px; font-weight: 800; color: #991b1b; padding: 4px 0;">{deadline_cairo_str}</td>
+                                </tr>
+                            </table>
+                            <p style="margin: 8px 0 0 0; font-size: 12px; color: #7f1d1d; line-height: 1.4;">
                                 &#9888; Quotes submitted after this cutoff cannot be accepted. The portal will automatically lock upon window closure.
                             </p>
                         </td>
@@ -630,6 +643,14 @@ def build_quotation_rfq_bank_email(
                                 {base_badge}
                                 <div style="font-size: 12px; color: #64748b; margin-top: 4px; font-weight: normal;">{base_note}</div>
                             </td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Quotation Window Opens</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">{window_start_cairo_str}</td>
+                        </tr>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Submission Deadline</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 800; color: #b91c1c;">{deadline_cairo_str}</td>
                         </tr>
                         <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
                             <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Currency Pair &amp; Flow</td>
