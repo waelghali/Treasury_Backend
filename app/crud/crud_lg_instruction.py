@@ -555,6 +555,7 @@ class CRUDLGInstruction(CRUDBase):
         generated_html = reminder_template.content
         for key, value in template_data.items():
             str_value = str(value) if value is not None else ""
+            generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
         generated_content_path = None
         new_reminder_instruction = await self.create(
             db,
@@ -564,7 +565,6 @@ class CRUDLGInstruction(CRUDBase):
                 serial_number=None,
                 template_id=reminder_template.id,
                 status="Instruction Issued",
-                # Syntax Error Removed Here
                 details={
                     "original_instruction_id": str(original_instruction.id),
                     "original_instruction_serial": original_instruction.serial_number,
@@ -602,6 +602,17 @@ class CRUDLGInstruction(CRUDBase):
             customer_id=customer_id,
             lg_record_id=lg_record.id,
         )
+
+        # Generate the PDF bytes from the populated reminder template HTML
+        try:
+            generated_pdf_bytes = await generate_pdf_from_html(
+                generated_html,
+                filename_hint=f"lg_bank_reminder_{new_reminder_instruction.serial_number or reminder_serial_number}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate reminder PDF for original instruction {original_instruction_id}: {e}", exc_info=True)
+            generated_pdf_bytes = None
+
         logger.info(f"Bank reminder issued successfully for original instruction '{original_instruction.serial_number}' (Reminder Serial: {new_reminder_instruction.serial_number}).")
         db.refresh(new_reminder_instruction)
         return lg_record, new_reminder_instruction.id, generated_pdf_bytes
