@@ -1,7 +1,7 @@
-# app/api/v1/endpoints/public_quotations.py
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict
 import os
 import secrets
 import uuid
@@ -13,7 +13,7 @@ from app.models.models_quotation import (
     QuotationNotification
 )
 from app.schemas.schemas_quotation import (
-    FXSpotOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate,
+    FXSpotOfferCreate, FXSpotMultiOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate,
     BankApprovalActionCreate, DeskSessionActionRequest
 )
 from app.services.desk_session_service import desk_session_service
@@ -183,6 +183,90 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     effective_value_date_str = str(effective_value_date).split('T')[0] if effective_value_date else None
     effective_allow_alt = assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
 
+    # Build legs structure for multi-pair RFQ
+    portal_legs = []
+    rfq_legs = rfq.legs if rfq.legs else []
+    from app.services.fx_service import fx_service
+
+    for leg in rfq_legs:
+        leg_cfg = assignment.get_config_for_leg(leg.id)
+        cfg_val_date = leg_cfg.value_date if leg_cfg and leg_cfg.value_date else (assignment.value_date or rfq.value_date)
+        cfg_allow_alt = (leg_cfg.allow_alternative_value_date if leg_cfg and leg_cfg.allow_alternative_value_date is not None 
+                         else (assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None 
+                               else (rfq.allow_alternative_value_date or False)))
+        cfg_base = (leg_cfg.quotation_base if leg_cfg and leg_cfg.quotation_base 
+                    else (assignment.quotation_base or rfq.quotation_base or 'Execution'))
+        cfg_doc_vis = (leg_cfg.is_document_visible if leg_cfg and leg_cfg.is_document_visible is not None 
+                       else (assignment.is_document_visible is not False))
+        cfg_cost_pct = leg_cfg.cost_percent if leg_cfg else (assignment.cost_percent or 0.0)
+        cfg_cost_flat = leg_cfg.cost_flat if leg_cfg else (assignment.cost_flat or 0.0)
+        cfg_cost_min = leg_cfg.cost_min if leg_cfg else (assignment.cost_min or 0.0)
+        cfg_cost_max = leg_cfg.cost_max if leg_cfg else (assignment.cost_max or 0.0)
+
+        # Submitted offer for this leg by this bank
+        leg_offer = db.query(QuotationOffer).filter(
+            QuotationOffer.assignment_id == assignment.id,
+            QuotationOffer.leg_id == leg.id
+        ).order_by(QuotationOffer.submitted_at.desc()).first()
+
+        if not leg_offer and len(rfq_legs) == 1:
+            leg_offer = db.query(QuotationOffer).filter(
+                QuotationOffer.assignment_id == assignment.id
+            ).order_by(QuotationOffer.submitted_at.desc()).first()
+
+        leg_offers_list = []
+        if leg_offer:
+            leg_offers_list.append({
+                "price": leg_offer.price,
+                "offered_value_date": str(leg_offer.offered_value_date).split('T')[0] if leg_offer.offered_value_date else None,
+                "notes": leg_offer.notes,
+                "submitted_by_email": leg_offer.submitted_by_email,
+                "submitted_at": leg_offer.submitted_at
+            })
+
+        # Leg CBE benchmark
+        leg_bm = None
+        if rfq.type == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
+            try:
+                bm_val = fx_service.get_rate_by_code(db, from_code=leg.buy_currency, to_code=leg.sell_currency, allow_ai=False)
+                if bm_val is not None:
+                    leg_bm = float(bm_val)
+            except Exception:
+                pass
+
+        # Leg Live Rank
+        leg_rank = None
+        if is_live_ranking_enabled and leg_offers_list:
+            try:
+                from app.services.live_ranking_service import live_ranking_service
+                leg_rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id, leg_id=leg.id)
+            except Exception:
+                pass
+
+        portal_legs.append({
+            "id": leg.id,
+            "pair_order": leg.pair_order,
+            "currency_pair": leg.currency_pair,
+            "buy_currency": leg.buy_currency,
+            "sell_currency": leg.sell_currency,
+            "direction": leg.direction,
+            "amount": leg.amount,
+            "min_ticket_amount": leg.min_ticket_amount,
+            "eval_rate": leg.eval_rate,
+            "tolerance_percent": leg.tolerance_percent,
+            "value_date": str(cfg_val_date).split('T')[0] if cfg_val_date else None,
+            "allow_alternative_value_date": cfg_allow_alt,
+            "quotation_base": cfg_base,
+            "is_document_visible": cfg_doc_vis,
+            "cost_percent": cfg_cost_pct,
+            "cost_flat": cfg_cost_flat,
+            "cost_min": cfg_cost_min,
+            "cost_max": cfg_cost_max,
+            "offers": leg_offers_list,
+            "cbe_benchmark_rate": leg_bm,
+            "live_rank": leg_rank
+        })
+
     return {
         "id": rfq.id,
         "ref_no": rfq.ref_no,
@@ -215,6 +299,7 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "serverTime": now.isoformat(),
         "isWindowOpen": is_open,
         "offers": offers,
+        "legs": portal_legs,
         "approval_status": assignment.approval_status,
         "approved_by_email": assignment.approved_by_email,
         "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else None,
@@ -720,9 +805,24 @@ def submit_fx_offer(
         if not can_submit:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
 
-    # Alternative Value Date Validation
-    effective_target_value_date = assignment.value_date or rfq.value_date
-    is_alt_allowed = assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
+    # Determine target leg
+    target_leg_id = offer_in.leg_id
+    if not target_leg_id and rfq.legs:
+        target_leg_id = rfq.legs[0].id
+
+    # Retrieve leg-specific or assignment config for value date
+    leg_cfg = assignment.get_config_for_leg(target_leg_id) if target_leg_id else None
+    if leg_cfg and leg_cfg.value_date:
+        effective_target_value_date = leg_cfg.value_date
+    else:
+        effective_target_value_date = assignment.value_date or rfq.value_date
+
+    if leg_cfg and leg_cfg.allow_alternative_value_date is not None:
+        is_alt_allowed = leg_cfg.allow_alternative_value_date
+    elif assignment.allow_alternative_value_date is not None:
+        is_alt_allowed = assignment.allow_alternative_value_date
+    else:
+        is_alt_allowed = rfq.allow_alternative_value_date or False
 
     def _clean_date_str(d):
         if not d:
@@ -760,7 +860,8 @@ def submit_fx_offer(
         price=offer_in.price,
         offered_value_date=final_offered_value_date,
         notes=offer_in.notes,
-        submitted_by_email=submitted_by
+        submitted_by_email=submitted_by,
+        leg_id=target_leg_id
     )
     db.add(offer)
     db.commit()
@@ -790,19 +891,21 @@ def submit_fx_offer(
             entity_id=rfq_entity_id, trade_type=rfq.type or 'FX_SPOT'
         )
         if is_enabled:
-            rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id)
+            rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id, leg_id=target_leg_id)
             all_assignments = db.query(QuotationBankAssignment).filter(
                 QuotationBankAssignment.rfq_id == rfq.id
             ).all()
+            q_filter = [QuotationOffer.assignment_id.in_([a.id for a in all_assignments])]
+            if target_leg_id:
+                q_filter.append(QuotationOffer.leg_id == target_leg_id)
             submitted_ids = set(
-                o.assignment_id for o in db.query(QuotationOffer).filter(
-                    QuotationOffer.assignment_id.in_([a.id for a in all_assignments])
-                ).all()
+                o.assignment_id for o in db.query(QuotationOffer).filter(*q_filter).all()
             )
             live_rank_data = {
                 "rank": rank,
                 "total_quotes": len(submitted_ids),
-                "is_leading": rank == 1
+                "is_leading": rank == 1 if rank else False,
+                "leg_id": target_leg_id
             }
     except Exception:
         pass
@@ -810,6 +913,141 @@ def submit_fx_offer(
     desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", offer_in.price)
 
     return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
+
+
+@router.post("/offers-batch")
+def submit_fx_offers_batch(
+    payload: FXSpotMultiOfferCreate,
+    db: Session = Depends(get_db)
+):
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == payload.token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
+        raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
+    
+    if assignment.approval_status == 'PENDING':
+        raise HTTPException(status_code=403, detail="Quotation is pending approval from your bank's authorized approver.")
+    if assignment.approval_status in ('DECLINED', 'EXPIRED'):
+        raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
+
+    # 3 seconds buffer check for network latency
+    now = datetime.now(timezone.utc)
+    try:
+        start_ts = rfq.window_start.timestamp() - 3
+        end_ts = rfq.window_end.timestamp() + 3
+        if now.timestamp() < start_ts or now.timestamp() > end_ts:
+            raise HTTPException(status_code=403, detail="Window is closed.")
+    except Exception:
+        pass
+
+    # Authorize submitter
+    submitted_by = payload.email
+    if payload.session_token:
+        otp_rec = db.query(QuotationAccessOTP).filter(
+            QuotationAccessOTP.assignment_id == assignment.id,
+            QuotationAccessOTP.magic_token == payload.session_token
+        ).first()
+        if otp_rec:
+            if otp_rec.role == "VIEW_ONLY":
+                raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
+            elif otp_rec.role == "APPROVER":
+                contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+                has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+                is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
+                if not is_indicative and has_execution_dealers:
+                    raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
+            submitted_by = otp_rec.email
+
+    if submitted_by:
+        can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
+        if not can_submit:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
+
+    def _clean_date_str(d):
+        if not d:
+            return None
+        return str(d).strip().split('T')[0]
+
+    submitted_offers = []
+    for item in payload.quotes:
+        leg_cfg = assignment.get_config_for_leg(item.leg_id) if item.leg_id else None
+        eff_target_val_date = (leg_cfg.value_date if leg_cfg and leg_cfg.value_date 
+                               else (assignment.value_date or rfq.value_date))
+        is_alt_allowed = (leg_cfg.allow_alternative_value_date if leg_cfg and leg_cfg.allow_alternative_value_date is not None
+                          else (assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None 
+                                else (rfq.allow_alternative_value_date or False)))
+
+        target_date_clean = _clean_date_str(eff_target_val_date)
+        prop_date_clean = _clean_date_str(item.offered_value_date)
+
+        if not is_alt_allowed or not prop_date_clean:
+            final_val_date = target_date_clean
+        else:
+            if target_date_clean and prop_date_clean == target_date_clean:
+                final_val_date = target_date_clean
+            else:
+                try:
+                    p_date = datetime.strptime(prop_date_clean, "%Y-%m-%d").date()
+                    today_date = datetime.now(timezone.utc).date()
+                    w_trade_date = rfq.window_start.date() if (rfq.window_start and hasattr(rfq.window_start, 'date')) else today_date
+                    min_valid = max(today_date, w_trade_date)
+                    if p_date < min_valid:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Proposed value date ({prop_date_clean}) cannot be earlier than quotation trade date ({min_valid})."
+                        )
+                    final_val_date = prop_date_clean
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid proposed value date format. Expected YYYY-MM-DD.")
+
+        offer = QuotationOffer(
+            assignment_id=assignment.id,
+            price=item.price,
+            offered_value_date=final_val_date,
+            notes=item.notes,
+            submitted_by_email=submitted_by,
+            leg_id=item.leg_id
+        )
+        db.add(offer)
+        submitted_offers.append(offer)
+
+    db.commit()
+
+    # Notify Creator
+    from app.models.models_quotation import QuotationNotification
+    by_text = f" by {submitted_by}" if submitted_by else ""
+    db.add(QuotationNotification(
+        user_id=rfq.created_by_user_id,
+        type="NEW_OFFER",
+        title=f"New Quotes: {rfq.ref_no}",
+        message=f"{len(submitted_offers)} quote(s) were submitted{by_text} for your {rfq.type} request.",
+        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
+        is_read=False
+    ))
+    db.commit()
+
+    # Calculate live ranks per leg
+    ranks_by_leg = {}
+    try:
+        from app.services.live_ranking_service import live_ranking_service
+        ranks_by_leg = live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id)
+    except Exception:
+        pass
+
+    if submitted_offers:
+        best_price = submitted_offers[0].price
+        desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", best_price)
+
+    return {
+        "success": True,
+        "submitted_by": submitted_by,
+        "quotes_count": len(submitted_offers),
+        "ranks_by_leg": ranks_by_leg
+    }
 
 @router.post("/tbill-offer")
 def submit_tbill_offer(
@@ -943,7 +1181,7 @@ def submit_tbill_offer(
     return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
 
 @router.get("/{token}/live-rank")
-def get_live_rank(token: str, db: Session = Depends(get_db)):
+def get_live_rank(token: str, leg_id: Optional[str] = None, db: Session = Depends(get_db)):
     """Lightweight polling endpoint: returns the bank's current rank among submitted quotes."""
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
@@ -965,9 +1203,10 @@ def get_live_rank(token: str, db: Session = Depends(get_db)):
     )
 
     if not is_enabled:
-        return {"is_live_ranking_enabled": False, "rank": None, "total_quotes": 0}
+        return {"is_live_ranking_enabled": False, "rank": None, "ranks_by_leg": {}, "total_quotes": 0}
 
-    rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id)
+    rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id, leg_id=leg_id)
+    ranks_by_leg = live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id)
 
     # Count total submitted banks
     all_assignments = db.query(QuotationBankAssignment).filter(
@@ -980,10 +1219,11 @@ def get_live_rank(token: str, db: Session = Depends(get_db)):
             ).all()
         )
     else:
+        q_filter = [QuotationOffer.assignment_id.in_([a.id for a in all_assignments])]
+        if leg_id:
+            q_filter.append(QuotationOffer.leg_id == leg_id)
         submitted_ids = set(
-            o.assignment_id for o in db.query(QuotationOffer).filter(
-                QuotationOffer.assignment_id.in_([a.id for a in all_assignments])
-            ).all()
+            o.assignment_id for o in db.query(QuotationOffer).filter(*q_filter).all()
         )
 
     # Check if window is still open
@@ -1001,6 +1241,8 @@ def get_live_rank(token: str, db: Session = Depends(get_db)):
     return {
         "is_live_ranking_enabled": True,
         "rank": rank,
+        "ranks_by_leg": ranks_by_leg,
+        "leg_id": leg_id,
         "total_quotes": len(submitted_ids),
         "is_leading": rank == 1 if rank else False,
         "isWindowOpen": is_open

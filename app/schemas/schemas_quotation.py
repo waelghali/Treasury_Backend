@@ -57,6 +57,18 @@ class BankSelection(BaseModel):
     valueDate: Optional[str] = None
     allowAlternativeValueDate: Optional[bool] = None
 
+class QuotationLegCreate(BaseModel):
+    direction: Optional[str] = "Buy"
+    buyCurrency: Optional[str] = "USD"
+    sellCurrency: Optional[str] = "EGP"
+    amount: Optional[float] = None
+    minTicketAmount: Optional[float] = None
+    valueDate: Optional[Union[str, date]] = None
+    allowAlternativeValueDate: Optional[bool] = False
+    quotationBase: Optional[str] = None
+    maxTolerancePercent: Optional[float] = None
+    selectedBanks: Optional[Union[str, List[dict]]] = None
+
 class QuotationRequestCreate(BaseModel):
     type: str = "FX_SPOT"
     direction: Optional[str] = None
@@ -76,7 +88,7 @@ class QuotationRequestCreate(BaseModel):
     maxTolerancePercent: Optional[float] = None
     allowAlternativeValueDate: Optional[bool] = False
     documentPath: Optional[str] = None
-    selectedBanks: str # JSON string matching Node module format, or we can parse it in FastAPI
+    selectedBanks: Optional[str] = "[]" # JSON string matching Node module format, or we can parse it in FastAPI
     token_validity_hours: Optional[int] = 24
     entity_id: Optional[int] = None
     parent_rfq_id: Optional[str] = None
@@ -84,6 +96,8 @@ class QuotationRequestCreate(BaseModel):
     internalNotes: Optional[str] = None
     legal_disclaimer_accepted: Optional[bool] = False
     legalDisclaimerAccepted: Optional[bool] = False
+    pairs: Optional[List[QuotationLegCreate]] = None
+    legs: Optional[List[QuotationLegCreate]] = None
 
 class QuotationBankLegConfigOut(BaseModel):
     id: str
@@ -250,8 +264,21 @@ class DeskSessionActionRequest(BaseModel):
 class FXSpotOfferCreate(BaseModel):
     token: str
     price: float
-    offered_value_date: Optional[str] = None
+    offered_value_date: Optional[Union[str, date]] = None
     notes: Optional[str] = None
+    session_token: Optional[str] = None
+    email: Optional[str] = None
+    leg_id: Optional[str] = None
+
+class FXSpotOfferItem(BaseModel):
+    leg_id: str
+    price: float
+    offered_value_date: Optional[Union[str, date]] = None
+    notes: Optional[str] = None
+
+class FXSpotMultiOfferCreate(BaseModel):
+    token: str
+    quotes: List[FXSpotOfferItem]
     session_token: Optional[str] = None
     email: Optional[str] = None
 
@@ -302,6 +329,7 @@ class QuotationResultItem(BaseModel):
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut
     results: List[QuotationResultItem]
+    legs: Optional[List[dict]] = None
     winner_bank_id: Optional[int] = None
     is_inconclusive: bool = False
     inconclusive_reason: Optional[str] = None

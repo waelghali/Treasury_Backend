@@ -123,6 +123,20 @@ class QuotationLeg(BaseModel):
     tbill_offers = relationship("QuotationTBillOffer", back_populates="leg", cascade="all, delete-orphan")
     bank_configs = relationship("QuotationBankLegConfig", back_populates="leg", cascade="all, delete-orphan")
 
+    @property
+    def currency_pair(self) -> str:
+        if self.buy_currency and self.sell_currency:
+            return f"{self.buy_currency}/{self.sell_currency}"
+        return ""
+
+    @property
+    def pair_order(self) -> int:
+        return self.leg_index
+
+    @property
+    def tolerance_percent(self) -> float:
+        return self.max_tolerance_percent
+
 class QuotationBankAssignment(BaseModel):
     """Junction table connecting an RFQ strictly to a QuotationBank (1 token per bank per RFQ session)."""
     __tablename__ = "quotation_bank_assignments"

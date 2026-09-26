@@ -77,10 +77,11 @@ class LiveRankingService:
     def calculate_bank_live_rank(
         db: Session,
         rfq_id: str,
-        assignment_id: str
+        assignment_id: str,
+        leg_id: Optional[str] = None
     ) -> Optional[int]:
         """
-        Calculates the 1-based numerical rank of the bank among submitted quotes.
+        Calculates the 1-based numerical rank of the bank among submitted quotes for an RFQ or specific leg.
         Strict Privacy: Only returns the integer rank (1, 2, 3...). Never returns competitor names or prices.
         """
         rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
@@ -95,14 +96,26 @@ class LiveRankingService:
         if assignment_id not in assignment_ids:
             return None
 
+        # Resolve target leg
+        from app.models.models_quotation import QuotationLeg
+        target_leg = None
+        if leg_id:
+            target_leg = db.query(QuotationLeg).filter(QuotationLeg.id == leg_id, QuotationLeg.rfq_id == rfq_id).first()
+        elif rfq.legs:
+            target_leg = rfq.legs[0]
+
         if rfq.type == "FX_SPOT":
-            # Map assignments by id
             assignment_map = {a.id: a for a in assignments}
 
-            # For FX, get latest offer per assignment
-            offers = db.query(QuotationOffer).filter(
+            # Filter offers by target leg if available
+            offers_query = db.query(QuotationOffer).filter(
                 QuotationOffer.assignment_id.in_(assignment_ids)
-            ).order_by(QuotationOffer.submitted_at.desc()).all()
+            )
+            if target_leg:
+                offers_query = offers_query.filter(
+                    (QuotationOffer.leg_id == target_leg.id) | (QuotationOffer.leg_id.is_(None))
+                )
+            offers = offers_query.order_by(QuotationOffer.submitted_at.desc()).all()
 
             latest_offers_by_assignment = {}
             for off in offers:
@@ -110,32 +123,33 @@ class LiveRankingService:
                     latest_offers_by_assignment[off.assignment_id] = off
 
             if assignment_id not in latest_offers_by_assignment:
-                return None  # Bank hasn't submitted a quote yet
+                return None  # Bank hasn't submitted a quote yet for this leg
 
-            # Compute normalized economic score for each submitted assignment
-            deal_amount = float(rfq.amount or 1.0)
-            is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
-            rfq_target_val_date = rfq.value_date
+            deal_amount = float((target_leg.amount if target_leg and target_leg.amount else rfq.amount) or 1.0)
+            trade_direction = (target_leg.direction if target_leg and target_leg.direction else rfq.direction) or 'Buy'
+            is_sell_dir = (trade_direction.lower() == 'sell')
+            rfq_target_val_date = (target_leg.value_date if target_leg and target_leg.value_date else rfq.value_date)
 
             ranked_items = []
             for aid, off in latest_offers_by_assignment.items():
                 a = assignment_map.get(aid)
                 price = float(off.price)
 
-                # Bank fee calculation
+                # Bank fee calculation using pair config if available
                 raw_fee = 0.0
                 if a:
+                    cfg = a.get_config_for_leg(target_leg.id) if target_leg else a
                     base_deal_volume = deal_amount * price
-                    raw_fee = (base_deal_volume * (float(a.cost_percent or 0) / 100.0)) + float(a.cost_flat or 0)
-                    if a.cost_min and a.cost_min > 0:
-                        raw_fee = max(raw_fee, float(a.cost_min))
-                    if a.cost_max and a.cost_max > 0:
-                        raw_fee = min(raw_fee, float(a.cost_max))
+                    raw_fee = (base_deal_volume * (float(cfg.cost_percent or 0) / 100.0)) + float(cfg.cost_flat or 0)
+                    if cfg.cost_min and cfg.cost_min > 0:
+                        raw_fee = max(raw_fee, float(cfg.cost_min))
+                    if cfg.cost_max and cfg.cost_max > 0:
+                        raw_fee = min(raw_fee, float(cfg.cost_max))
 
                 fee_per_unit = raw_fee / deal_amount if deal_amount > 0 else 0.0
                 final_all_in_price = round((price - fee_per_unit) if is_sell_dir else (price + fee_per_unit), 5)
 
-                # TVM Normalization against RFQ Master Target Value Date
+                # TVM Normalization against Target Value Date
                 offered_val_date = off.offered_value_date or (a.value_date if a else None) or rfq_target_val_date
                 normalized_price = final_all_in_price
 
@@ -157,9 +171,7 @@ class LiveRankingService:
                     "submitted_ts": sub_ts
                 })
 
-            # Sort based on direction and tie-breaker:
-            # Corporate Buy (Lower price is best) -> ascending normalized_price, earlier submission first
-            # Corporate Sell (Higher price is best) -> descending normalized_price, earlier submission first
+            # Sort based on direction and tie-breaker
             if is_sell_dir:
                 ranked_items.sort(key=lambda item: (-item["normalized_price"], item["submitted_ts"]))
             else:
@@ -202,5 +214,22 @@ class LiveRankingService:
                     return idx + 1
 
         return None
+
+    @staticmethod
+    def calculate_bank_live_ranks_by_leg(
+        db: Session,
+        rfq_id: str,
+        assignment_id: str
+    ) -> Dict[str, Optional[int]]:
+        """Calculates live rank for every leg of an RFQ where the bank is invited."""
+        rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
+        if not rfq:
+            return {}
+        results = {}
+        for leg in rfq.legs:
+            results[leg.id] = LiveRankingService.calculate_bank_live_rank(
+                db=db, rfq_id=rfq_id, assignment_id=assignment_id, leg_id=leg.id
+            )
+        return results
 
 live_ranking_service = LiveRankingService()

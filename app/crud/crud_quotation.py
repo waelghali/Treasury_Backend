@@ -6,7 +6,8 @@ import json
 
 from app.models.models_quotation import (
     QuotationBank, QuotationRequest, QuotationBankAssignment, 
-    QuotationOffer, QuotationTBillOffer, QuotationAnalytics
+    QuotationOffer, QuotationTBillOffer, QuotationAnalytics,
+    QuotationLeg, QuotationBankLegConfig
 )
 from app.schemas.schemas_quotation import QuotationRequestCreate, QuotationBankCreate
 
@@ -22,6 +23,20 @@ def _parse_date_only(val):
         return datetime.strptime(clean_str, "%Y-%m-%d").date()
     except Exception:
         return None
+
+def _parse_banks_payload(raw_data):
+    if not raw_data:
+        return []
+    if isinstance(raw_data, list):
+        return [b.dict() if hasattr(b, 'dict') else b for b in raw_data]
+    if isinstance(raw_data, str):
+        try:
+            parsed = json.loads(raw_data)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return []
+    return []
 
 class CRUDQuotation:
     
@@ -211,19 +226,35 @@ class CRUDQuotation:
                         detail=f"T-Bill Settlement Date ({settle_d}) cannot be earlier than quotation window date ({w_date})."
                     )
 
+        # Determine multi-pair vs single-ticket
+        pairs_list = getattr(obj_in, 'pairs', None) or getattr(obj_in, 'legs', None) or []
+        is_multi_pair = len(pairs_list) > 0
+
+        first_pair = pairs_list[0] if is_multi_pair else None
+        p_type = obj_in.type or "FX_SPOT"
+        p_direction = (first_pair.direction if is_multi_pair and first_pair.direction else obj_in.direction) or "Buy"
+        p_val_date = (first_pair.valueDate if is_multi_pair and first_pair.valueDate else obj_in.valueDate)
+        p_amount = (first_pair.amount if is_multi_pair and first_pair.amount is not None else obj_in.amount)
+        p_min_ticket = (first_pair.minTicketAmount if is_multi_pair and first_pair.minTicketAmount is not None else obj_in.minTicketAmount)
+        p_buy_curr = (first_pair.buyCurrency if is_multi_pair and first_pair.buyCurrency else obj_in.buyCurrency) or "USD"
+        p_sell_curr = (first_pair.sellCurrency if is_multi_pair and first_pair.sellCurrency else obj_in.sellCurrency) or "EGP"
+        p_base = (first_pair.quotationBase if is_multi_pair and first_pair.quotationBase else obj_in.quotationBase) or "Execution"
+        p_tol = (first_pair.maxTolerancePercent if is_multi_pair and first_pair.maxTolerancePercent is not None else obj_in.maxTolerancePercent)
+        p_alt_val = bool(first_pair.allowAlternativeValueDate if is_multi_pair else allow_alt_master)
+
         db_rfq = QuotationRequest(
             id=rfq_id,
             ref_no=ref_no,
             customer_id=customer_id,
             entity_id=getattr(obj_in, 'entity_id', None),
             created_by_user_id=user_id,
-            type=obj_in.type,
-            direction=obj_in.direction,
-            value_date=obj_in.valueDate,
-            amount=obj_in.amount,
-            min_ticket_amount=obj_in.minTicketAmount,
-            buy_currency=obj_in.buyCurrency,
-            sell_currency=obj_in.sellCurrency,
+            type=p_type,
+            direction=p_direction,
+            value_date=str(p_val_date) if p_val_date else None,
+            amount=p_amount,
+            min_ticket_amount=p_min_ticket,
+            buy_currency=p_buy_curr,
+            sell_currency=p_sell_curr,
             settlement_date_start=obj_in.settlementDateStart,
             settlement_date_end=obj_in.settlementDateEnd,
             maturity_date_start=obj_in.maturityDateStart,
@@ -231,9 +262,9 @@ class CRUDQuotation:
             eval_rate=effective_eval_rate,
             window_start=obj_in.windowStart,
             window_end=obj_in.windowEnd,
-            quotation_base=obj_in.quotationBase,
-            max_tolerance_percent=obj_in.maxTolerancePercent,
-            allow_alternative_value_date=allow_alt_master,
+            quotation_base=p_base,
+            max_tolerance_percent=p_tol,
+            allow_alternative_value_date=p_alt_val,
             document_path=document_path or obj_in.documentPath,
             status=initial_status,
             token_validity_hours=getattr(obj_in, 'token_validity_hours', 24) or 24,
@@ -241,51 +272,100 @@ class CRUDQuotation:
             internal_notes=getattr(obj_in, 'internal_notes', None) or getattr(obj_in, 'internalNotes', None)
         )
         db.add(db_rfq)
-        
-        # Parse assigned banks
+        db.flush()
+
+        # Create Legs
+        created_legs = []
+        if is_multi_pair:
+            for idx, p_item in enumerate(pairs_list, start=1):
+                leg_id = f"{rfq_id}-leg-{idx}"
+                leg_val_d = getattr(p_item, 'valueDate', None)
+                leg_obj = QuotationLeg(
+                    id=leg_id,
+                    rfq_id=rfq_id,
+                    leg_index=idx,
+                    type=p_type,
+                    direction=getattr(p_item, 'direction', None) or p_direction,
+                    buy_currency=getattr(p_item, 'buyCurrency', None) or p_buy_curr,
+                    sell_currency=getattr(p_item, 'sellCurrency', None) or p_sell_curr,
+                    amount=getattr(p_item, 'amount', None),
+                    min_ticket_amount=getattr(p_item, 'minTicketAmount', None),
+                    value_date=str(leg_val_d) if leg_val_d else None,
+                    allow_alternative_value_date=bool(getattr(p_item, 'allowAlternativeValueDate', False)),
+                    quotation_base=getattr(p_item, 'quotationBase', None) or p_base,
+                    max_tolerance_percent=getattr(p_item, 'maxTolerancePercent', None) or p_tol,
+                    status=initial_status,
+                    entity_id=getattr(obj_in, 'entity_id', None)
+                )
+                db.add(leg_obj)
+                created_legs.append((leg_obj, p_item))
+        else:
+            leg_id = f"{rfq_id}-leg-1"
+            leg_obj = QuotationLeg(
+                id=leg_id,
+                rfq_id=rfq_id,
+                leg_index=1,
+                type=obj_in.type,
+                direction=obj_in.direction,
+                buy_currency=obj_in.buyCurrency,
+                sell_currency=obj_in.sellCurrency,
+                amount=obj_in.amount,
+                min_ticket_amount=obj_in.minTicketAmount,
+                value_date=str(obj_in.valueDate) if obj_in.valueDate else None,
+                allow_alternative_value_date=allow_alt_master,
+                quotation_base=obj_in.quotationBase,
+                max_tolerance_percent=obj_in.maxTolerancePercent,
+                status=initial_status,
+                entity_id=getattr(obj_in, 'entity_id', None)
+            )
+            db.add(leg_obj)
+            created_legs.append((leg_obj, obj_in))
+
+        db.flush()
+
+        # Parse assigned banks across all pairs (Single token per bank per RFQ session)
         assignments = []
-        try:
-            banks_data = json.loads(obj_in.selectedBanks)
-            for b_data in banks_data:
-                assignment_id = str(uuid.uuid4())
-                token = str(uuid.uuid4())
-                
-                # Fetch the quotation bank id based on the standard bank id and the rfq trade type
+        assignment_by_bank_id = {} # bank_id -> QuotationBankAssignment
+
+        root_banks_data = _parse_banks_payload(getattr(obj_in, 'selectedBanks', None))
+
+        for leg_obj, p_source in created_legs:
+            leg_banks = _parse_banks_payload(getattr(p_source, 'selectedBanks', None))
+            # Fall back to root banks if pair didn't specify banks
+            if not leg_banks:
+                leg_banks = root_banks_data
+
+            for b_data in leg_banks:
+                raw_bank_id = b_data.get('id')
+                if not raw_bank_id:
+                    continue
+
                 q_bank = db.query(QuotationBank).filter(
                     QuotationBank.customer_id == customer_id,
-                    QuotationBank.bank_id == b_data.get('id'),
-                    QuotationBank.trade_type.in_([obj_in.type, "BOTH"])
+                    QuotationBank.bank_id == raw_bank_id,
+                    QuotationBank.trade_type.in_([p_type, "BOTH"])
                 ).first()
-                
-                if q_bank:
-                    q_base_override = b_data.get('quotationBase') or obj_in.quotationBase
-                    is_doc_vis = b_data.get('isDocumentVisible', True)
-                    if is_doc_vis is None:
-                        is_doc_vis = True
-                    
-                    # Determine if bank-level approval is required
-                    # Approval activates for Execution RFQs when the bank has APPROVER contacts
-                    effective_base = (q_base_override or obj_in.quotationBase or 'Execution').lower()
+
+                if not q_bank:
+                    continue
+
+                # Ensure single QuotationBankAssignment per bank per RFQ session
+                if raw_bank_id not in assignment_by_bank_id:
+                    assign_id = str(uuid.uuid4())
+                    token = str(uuid.uuid4())
+
+                    q_base_override = b_data.get('quotationBase') or p_base
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                    is_exec = (obj_in.quotationBase or '').lower() == 'execution' or effective_base == 'execution'
+                    is_exec = (p_base or '').lower() == 'execution' or (q_base_override or '').lower() == 'execution'
                     bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec) else None
 
-                    bank_value_date = b_data.get('valueDate') or obj_in.valueDate
-                    if w_date and (obj_in.type == 'FX_SPOT' or not obj_in.type) and bank_value_date:
-                        b_val_d = _parse_date_only(bank_value_date)
-                        if b_val_d and b_val_d < w_date:
-                            bank_label = q_bank.bank.name if (q_bank and q_bank.bank) else f"Bank #{b_data.get('id')}"
-                            raise HTTPException(
-                                status_code=status.HTTP_400_BAD_REQUEST,
-                                detail=f"Value Date ({b_val_d}) for {bank_label} cannot be earlier than quotation window date ({w_date}). Value date must be on or after the quotation trade date."
-                            )
+                    b_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
+                    b_allow_alt = b_data.get('allowAlternativeValueDate')
 
-                    bank_allow_alt = b_data.get('allowAlternativeValueDate')
-                    
                     db_assignment = QuotationBankAssignment(
-                        id=assignment_id,
+                        id=assign_id,
                         rfq_id=rfq_id,
                         quotation_bank_id=q_bank.id,
                         token=token,
@@ -294,24 +374,42 @@ class CRUDQuotation:
                         cost_max=b_data.get('costMax', 0.0),
                         cost_flat=b_data.get('costFlat', 0.0),
                         quotation_base=q_base_override,
-                        is_document_visible=is_doc_vis,
-                        value_date=bank_value_date,
-                        allow_alternative_value_date=bank_allow_alt,
+                        is_document_visible=b_data.get('isDocumentVisible', True),
+                        value_date=b_val_d,
+                        allow_alternative_value_date=b_allow_alt,
                         approval_status=bank_approval_status
                     )
                     db.add(db_assignment)
+                    db.flush()
+                    assignment_by_bank_id[raw_bank_id] = db_assignment
                     assignments.append({
-                        "id": assignment_id,
-                        "bankId": b_data.get('id'),
+                        "id": assign_id,
+                        "bankId": raw_bank_id,
                         "quotation_bank_id": q_bank.id,
                         "token": token,
                         "approval_status": bank_approval_status
                     })
-        except HTTPException:
-            raise
-        except Exception as e:
-            # Re-raise or handle JSON parsing failure
-            raise ValueError(f"Failed to parse selected banks: {e}")
+
+                db_assign = assignment_by_bank_id[raw_bank_id]
+
+                # Create pair-level bank config
+                cfg_id = str(uuid.uuid4())
+                leg_cfg_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
+                leg_bank_cfg = QuotationBankLegConfig(
+                    id=cfg_id,
+                    assignment_id=db_assign.id,
+                    leg_id=leg_obj.id,
+                    is_invited=True,
+                    cost_min=b_data.get('costMin', 0.0),
+                    cost_percent=b_data.get('costPercent', 0.0),
+                    cost_max=b_data.get('costMax', 0.0),
+                    cost_flat=b_data.get('costFlat', 0.0),
+                    quotation_base=b_data.get('quotationBase') or leg_obj.quotation_base,
+                    is_document_visible=b_data.get('isDocumentVisible', True),
+                    value_date=leg_cfg_val_d,
+                    allow_alternative_value_date=b_data.get('allowAlternativeValueDate')
+                )
+                db.add(leg_bank_cfg)
 
         db.commit()
         db.refresh(db_rfq)

@@ -859,191 +859,298 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             winner_bank_id = results[0]['bank_id']
 
     else:
-        # FX_SPOT
-        for a in assignments:
-            offer_db = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
-            q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
-            
-            assigned_val_date = a.value_date or rfq.value_date
-            allow_alt_val = a.allow_alternative_value_date if a.allow_alternative_value_date is not None else (rfq.allow_alternative_value_date or False)
+        # FX_SPOT: Evaluate per currency pair leg
+        rfq_legs = rfq.legs if (rfq.legs and len(rfq.legs) > 0) else []
 
-            assigned_val_str = str(assigned_val_date).split('T')[0] if assigned_val_date is not None else None
-            is_custom_date = bool(a.value_date and str(a.value_date).split('T')[0] != (str(rfq.value_date).split('T')[0] if rfq.value_date else ''))
+        if not rfq_legs:
+            from app.models.models_quotation import QuotationLeg
+            virtual_leg = QuotationLeg(
+                id=f"{rfq.id}-leg-1",
+                rfq_id=rfq.id,
+                leg_index=1,
+                type=rfq.type or "FX_SPOT",
+                direction=rfq.direction or "Buy",
+                buy_currency=rfq.buy_currency or "USD",
+                sell_currency=rfq.sell_currency or "EGP",
+                amount=rfq.amount,
+                value_date=rfq.value_date,
+                allow_alternative_value_date=rfq.allow_alternative_value_date,
+                quotation_base=rfq.quotation_base,
+                max_tolerance_percent=rfq.max_tolerance_percent,
+                status=rfq.status
+            )
+            rfq_legs = [virtual_leg]
 
-            if not offer_db:
-                results.append({
+        legs_data = []
+
+        for leg in rfq_legs:
+            leg_dir_str = (leg.direction or rfq.direction or "Buy").lower()
+            is_sell = (leg_dir_str == 'sell')
+            leg_amount = float((leg.amount if leg.amount is not None else rfq.amount) or 1.0)
+            leg_target_val_date = leg.value_date or rfq.value_date
+            leg_base = (leg.quotation_base or rfq.quotation_base or 'Execution').lower()
+            leg_tol = leg.max_tolerance_percent if leg.max_tolerance_percent is not None else (rfq.max_tolerance_percent or 0.0)
+
+            leg_results = []
+            for a in assignments:
+                cfg = a.get_config_for_leg(leg.id)
+                if getattr(cfg, 'is_invited', True) is False:
+                    continue
+
+                q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+                assigned_val_date = cfg.value_date or a.value_date or leg_target_val_date
+                assigned_base = cfg.quotation_base or a.quotation_base or leg.quotation_base or rfq.quotation_base or "Execution"
+                allow_alt_val = cfg.allow_alternative_value_date if cfg.allow_alternative_value_date is not None else (
+                    a.allow_alternative_value_date if a.allow_alternative_value_date is not None else (leg.allow_alternative_value_date or False)
+                )
+
+                assigned_val_str = str(assigned_val_date).split('T')[0] if assigned_val_date is not None else None
+                is_custom_date = bool(cfg.value_date and str(cfg.value_date).split('T')[0] != (str(leg_target_val_date).split('T')[0] if leg_target_val_date else ''))
+
+                offer_db = db.query(QuotationOffer).filter(
+                    QuotationOffer.assignment_id == a.id,
+                    (QuotationOffer.leg_id == leg.id) | (QuotationOffer.leg_id.is_(None) if len(rfq_legs) == 1 else False)
+                ).order_by(QuotationOffer.submitted_at.desc()).first()
+
+                if not offer_db:
+                    leg_results.append({
+                        "bank_id": q_bank.bank_id if q_bank else 0,
+                        "quotation_bank_id": a.quotation_bank_id,
+                        "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                        "bank_emails": q_bank.emails if q_bank else "",
+                        "price": None,
+                        "finalPrice": None,
+                        "normalized_price": None,
+                        "assigned_value_date": assigned_val_str,
+                        "offered_value_date": None,
+                        "allow_alternative_value_date": allow_alt_val,
+                        "is_alternative_value_date": False,
+                        "is_custom_value_date": is_custom_date,
+                        "time_value_adjustment": 0.0,
+                        "notes": None,
+                        "submitted_at": None,
+                        "submitted_by_email": None,
+                        "token": a.token,
+                        "quotation_base": assigned_base,
+                        "is_document_visible": cfg.is_document_visible if hasattr(cfg, 'is_document_visible') else True,
+                        "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                        "approval_status": a.approval_status,
+                        "approved_by_email": a.approved_by_email,
+                        "approved_at": a.approved_at,
+                        "approval_notes": a.approval_notes,
+                        "cost_min": cfg.cost_min or 0.0,
+                        "cost_percent": cfg.cost_percent or 0.0,
+                        "cost_max": cfg.cost_max or 0.0,
+                        "cost_flat": cfg.cost_flat or 0.0
+                    })
+                    continue
+
+                price = offer_db.price
+                base_deal_volume = leg_amount * price
+                raw_fee = (base_deal_volume * (float(cfg.cost_percent or 0) / 100.0)) + float(cfg.cost_flat or 0)
+                clamped_fee = raw_fee
+                if cfg.cost_min and cfg.cost_min > 0:
+                    clamped_fee = max(clamped_fee, float(cfg.cost_min))
+                if cfg.cost_max and cfg.cost_max > 0:
+                    clamped_fee = min(clamped_fee, float(cfg.cost_max))
+
+                fee_per_unit = clamped_fee / leg_amount if leg_amount > 0 else 0.0
+                final_all_in_price = round((price - fee_per_unit) if is_sell else (price + fee_per_unit), 5)
+
+                effective_val_date = offer_db.offered_value_date or assigned_val_date or leg_target_val_date
+                normalized_price = final_all_in_price
+                tvm_adjustment = 0.0
+                is_alt_date = False
+
+                if leg_target_val_date and effective_val_date:
+                    try:
+                        target_dt = datetime.strptime(str(leg_target_val_date).split('T')[0], "%Y-%m-%d").date()
+                        offered_dt = datetime.strptime(str(effective_val_date).split('T')[0], "%Y-%m-%d").date()
+                        delta_days = (offered_dt - target_dt).days
+                        if delta_days != 0:
+                            is_alt_date = True
+                            r_eval = (rfq.eval_rate or 20.25) / 100.0
+                            normalized_price = round(final_all_in_price * (1.0 - (r_eval * (delta_days / 365.0))), 5)
+                            tvm_adjustment = round(normalized_price - final_all_in_price, 5)
+                    except Exception as tvm_err:
+                        logger.warning(f"Error computing TVM adjustment: {tvm_err}")
+
+                offered_val_str = str(effective_val_date).split('T')[0] if effective_val_date is not None else None
+
+                leg_results.append({
                     "bank_id": q_bank.bank_id if q_bank else 0,
                     "quotation_bank_id": a.quotation_bank_id,
                     "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
                     "bank_emails": q_bank.emails if q_bank else "",
-                    "price": None,
-                    "finalPrice": None,
-                    "normalized_price": None,
+                    "price": price,
+                    "finalPrice": final_all_in_price,
+                    "normalized_price": normalized_price,
                     "assigned_value_date": assigned_val_str,
-                    "offered_value_date": None,
+                    "offered_value_date": offered_val_str,
                     "allow_alternative_value_date": allow_alt_val,
-                    "is_alternative_value_date": False,
+                    "is_alternative_value_date": is_alt_date,
                     "is_custom_value_date": is_custom_date,
-                    "time_value_adjustment": 0.0,
-                    "notes": None,
-                    "submitted_at": None,
-                    "submitted_by_email": None,
+                    "time_value_adjustment": tvm_adjustment,
+                    "bank_fee_total": clamped_fee,
+                    "fee_per_unit": fee_per_unit,
+                    "notes": offer_db.notes,
+                    "submitted_at": offer_db.submitted_at,
+                    "submitted_by_email": offer_db.submitted_by_email,
                     "token": a.token,
-                    "quotation_base": a.quotation_base or rfq.quotation_base,
-                    "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
+                    "quotation_base": assigned_base,
+                    "is_document_visible": cfg.is_document_visible if hasattr(cfg, 'is_document_visible') else True,
                     "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                     "approval_status": a.approval_status,
                     "approved_by_email": a.approved_by_email,
                     "approved_at": a.approved_at,
                     "approval_notes": a.approval_notes,
-                    "cost_min": a.cost_min or 0.0,
-                    "cost_percent": a.cost_percent or 0.0,
-                    "cost_max": a.cost_max or 0.0,
-                    "cost_flat": a.cost_flat or 0.0
+                    "cost_min": cfg.cost_min or 0.0,
+                    "cost_percent": cfg.cost_percent or 0.0,
+                    "cost_max": cfg.cost_max or 0.0,
+                    "cost_flat": cfg.cost_flat or 0.0
                 })
-                continue
-            
-            price = offer_db.price
-            deal_amount = float(rfq.amount or 1.0)
-            base_deal_volume = deal_amount * price
-            raw_fee = (base_deal_volume * (float(a.cost_percent or 0) / 100.0)) + float(a.cost_flat or 0)
-            clamped_fee = raw_fee
-            if a.cost_min and a.cost_min > 0:
-                clamped_fee = max(clamped_fee, float(a.cost_min))
-            if a.cost_max and a.cost_max > 0:
-                clamped_fee = min(clamped_fee, float(a.cost_max))
-                
-            fee_per_unit = clamped_fee / deal_amount if deal_amount > 0 else 0.0
-            is_sell_dir = (rfq.direction and rfq.direction.lower() == 'sell')
-            final_all_in_price = round((price - fee_per_unit) if is_sell_dir else (price + fee_per_unit), 5)
 
-            rfq_target_val_date = rfq.value_date
-            effective_val_date = offer_db.offered_value_date or assigned_val_date or rfq_target_val_date
-            normalized_price = final_all_in_price
-            tvm_adjustment = 0.0
-            is_alt_date = False
+            valid_leg_results = [r for r in leg_results if r.get('finalPrice') is not None]
 
-            if rfq_target_val_date and effective_val_date:
-                try:
-                    target_dt = datetime.strptime(str(rfq_target_val_date).split('T')[0], "%Y-%m-%d").date()
-                    offered_dt = datetime.strptime(str(effective_val_date).split('T')[0], "%Y-%m-%d").date()
-                    delta_days = (offered_dt - target_dt).days
-                    if delta_days != 0:
-                        is_alt_date = True
-                        r_eval = (rfq.eval_rate or 20.25) / 100.0
-                        normalized_price = round(final_all_in_price * (1.0 - (r_eval * (delta_days / 365.0))), 5)
-                        tvm_adjustment = round(normalized_price - final_all_in_price, 5)
-                except Exception as tvm_err:
-                    logger.warning(f"Error computing TVM adjustment: {tvm_err}")
-                
-            assigned_val_str = str(assigned_val_date).split('T')[0] if assigned_val_date is not None else (str(rfq.value_date).split('T')[0] if rfq.value_date is not None else None)
-            offered_val_str = str(effective_val_date).split('T')[0] if effective_val_date is not None else None
+            def _sort_ts(r):
+                ts = r.get('submitted_at')
+                if ts and hasattr(ts, 'timestamp'):
+                    return ts.timestamp()
+                return float('inf')
 
-            results.append({
-                "bank_id": q_bank.bank_id if q_bank else 0,
-                "quotation_bank_id": a.quotation_bank_id,
-                "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
-                "bank_emails": q_bank.emails if q_bank else "",
-                "price": price,
-                "finalPrice": final_all_in_price,
-                "normalized_price": normalized_price,
-                "assigned_value_date": assigned_val_str,
-                "offered_value_date": offered_val_str,
-                "allow_alternative_value_date": allow_alt_val,
-                "is_alternative_value_date": is_alt_date,
-                "is_custom_value_date": is_custom_date,
-                "time_value_adjustment": tvm_adjustment,
-                "bank_fee_total": clamped_fee,
-                "fee_per_unit": fee_per_unit,
-                "notes": offer_db.notes,
-                "submitted_at": offer_db.submitted_at,
-                "submitted_by_email": offer_db.submitted_by_email,
-                "token": a.token,
-                "quotation_base": a.quotation_base or rfq.quotation_base,
-                "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
-                "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
-                "approval_status": a.approval_status,
-                "approved_by_email": a.approved_by_email,
-                "approved_at": a.approved_at,
-                "approval_notes": a.approval_notes,
-                "cost_min": a.cost_min or 0.0,
-                "cost_percent": a.cost_percent or 0.0,
-                "cost_max": a.cost_max or 0.0,
-                "cost_flat": a.cost_flat or 0.0
-            })
-            
-        is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
-        valid_results = [r for r in results if r.get('finalPrice') is not None]
+            if is_sell:
+                valid_leg_results.sort(key=lambda x: (
+                    -(x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
+                    _sort_ts(x)
+                ))
+            else:
+                valid_leg_results.sort(key=lambda x: (
+                    (x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
+                    _sort_ts(x)
+                ))
+            leg_results = valid_leg_results + [r for r in leg_results if r.get('finalPrice') is None]
 
-        def _sort_ts(r):
-            ts = r.get('submitted_at')
-            if ts and hasattr(ts, 'timestamp'):
-                return ts.timestamp()
-            return float('inf')
+            leg_has_execution = any((r.get('quotation_base') or 'Execution').lower() == 'execution' for r in leg_results)
+            leg_winner_bank_id = None
+            leg_is_inconclusive = False
+            leg_inconclusive_reason = None
+            leg_best_indicative = None
+            leg_best_execution = None
+            leg_deviation_pct = None
 
-        if is_sell:
-            valid_results.sort(key=lambda x: (
-                -(x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
-                _sort_ts(x)
-            ))
-        else:
-            valid_results.sort(key=lambda x: (
-                (x.get('normalized_price') if x.get('normalized_price') is not None else x['finalPrice']),
-                _sort_ts(x)
-            ))
-        results = valid_results + [r for r in results if r.get('finalPrice') is None]
-        
-        has_execution_banks = any((r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution' for r in results)
-        
-        winner_bank_id = None
-        is_inconclusive = False
-        inconclusive_reason = None
-        best_indicative_rate = None
-        best_execution_rate = None
-        deviation_percent = None
+            if not valid_leg_results:
+                if is_closed and not is_scheduled:
+                    leg_is_inconclusive = True
+                    leg_inconclusive_reason = "Quotation window closed without receiving any quotes for this currency pair."
+            elif not leg_has_execution:
+                leg_is_inconclusive = True
+                leg_inconclusive_reason = "All counterparties were requested on an Indicative basis for this currency pair."
+            else:
+                indicative_bids = [r for r in valid_leg_results if (r.get('quotation_base') or 'Execution').lower() == 'indicative']
+                execution_bids = [r for r in valid_leg_results if (r.get('quotation_base') or 'Execution').lower() == 'execution']
 
-        if not valid_results:
-            if is_closed and not is_scheduled:
-                is_inconclusive = True
-                inconclusive_reason = "Quotation window closed without receiving any quotes from assigned counterparties."
-        elif not has_execution_banks:
-            is_inconclusive = True
-            inconclusive_reason = "All counterparties were requested on an Indicative basis. No binding winner is selected."
-        else:
-            indicative_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'indicative']
-            execution_bids = [r for r in valid_results if (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution']
-            
-            if not execution_bids and is_closed:
-                is_inconclusive = True
-                inconclusive_reason = "No Execution quotes were submitted before the window closed. Only Indicative quotes were received."
-            
-            if indicative_bids:
-                best_indicative_rate = indicative_bids[0].get('normalized_price') or indicative_bids[0]['finalPrice']
-            if execution_bids:
-                best_execution_rate = execution_bids[0].get('normalized_price') or execution_bids[0]['finalPrice']
-                
-            if execution_bids:
-                best_exec_item = execution_bids[0]
-                if best_indicative_rate is not None and best_execution_rate is not None:
-                    if is_sell:
-                        deviation_percent = ((best_indicative_rate - best_execution_rate) / best_indicative_rate) * 100.0
-                    else:
-                        deviation_percent = ((best_execution_rate - best_indicative_rate) / best_indicative_rate) * 100.0
-                    
-                    if deviation_percent <= 0:
-                        winner_bank_id = best_exec_item['bank_id']
-                    else:
-                        max_tol = rfq.max_tolerance_percent if rfq.max_tolerance_percent is not None else 0.0
-                        if deviation_percent > max_tol:
-                            is_inconclusive = True
-                            inconclusive_reason = (
-                                f"The best Execution rate ({best_execution_rate:.4f}) exceeded the Indicative benchmark "
-                                f"({best_indicative_rate:.4f}) by {deviation_percent:.2f}%, which is higher than the allowed tolerance of {max_tol:.2f}%."
-                            )
+                if not execution_bids and is_closed:
+                    leg_is_inconclusive = True
+                    leg_inconclusive_reason = "No Execution quotes were submitted before the window closed for this currency pair."
+
+                if indicative_bids:
+                    leg_best_indicative = indicative_bids[0].get('normalized_price') or indicative_bids[0]['finalPrice']
+                if execution_bids:
+                    leg_best_execution = execution_bids[0].get('normalized_price') or execution_bids[0]['finalPrice']
+
+                if execution_bids:
+                    best_exec_item = execution_bids[0]
+                    if leg_best_indicative is not None and leg_best_execution is not None:
+                        if is_sell:
+                            leg_deviation_pct = ((leg_best_indicative - leg_best_execution) / leg_best_indicative) * 100.0
                         else:
-                            winner_bank_id = best_exec_item['bank_id']
-                else:
-                    winner_bank_id = best_exec_item['bank_id']
+                            leg_deviation_pct = ((leg_best_execution - leg_best_indicative) / leg_best_indicative) * 100.0
+
+                        if leg_deviation_pct <= 0:
+                            leg_winner_bank_id = best_exec_item['bank_id']
+                        else:
+                            if leg_deviation_pct > leg_tol:
+                                leg_is_inconclusive = True
+                                leg_inconclusive_reason = (
+                                    f"The best Execution rate ({leg_best_execution:.4f}) exceeded the Indicative benchmark "
+                                    f"({leg_best_indicative:.4f}) by {leg_deviation_pct:.2f}%, which is higher than the allowed tolerance of {leg_tol:.2f}%."
+                                )
+                            else:
+                                leg_winner_bank_id = best_exec_item['bank_id']
+                    else:
+                        leg_winner_bank_id = best_exec_item['bank_id']
+
+            leg_savings_summary = None
+            if leg_winner_bank_id and not leg_is_inconclusive and valid_leg_results:
+                winner_res = next((r for r in valid_leg_results if r['bank_id'] == leg_winner_bank_id), None)
+                if winner_res:
+                    rates = [r['finalPrice'] for r in valid_leg_results if r.get('finalPrice') is not None]
+                    if len(rates) >= 1:
+                        win_rate = winner_res.get('finalPrice') or rates[0]
+                        avg_rate = sum(rates) / len(rates)
+                        worst_rate = max(rates) if not is_sell else min(rates)
+                        if not is_sell:
+                            s_vs_avg = max(0.0, (avg_rate - win_rate) * leg_amount)
+                            s_vs_worst = max(0.0, (worst_rate - win_rate) * leg_amount)
+                        else:
+                            s_vs_avg = max(0.0, (win_rate - avg_rate) * leg_amount)
+                            s_vs_worst = max(0.0, (win_rate - worst_rate) * leg_amount)
+
+                        leg_savings_summary = {
+                            "winner_bank_name": winner_res.get('bank_name'),
+                            "winner_rate": round(win_rate, 4),
+                            "avg_rate": round(avg_rate, 4),
+                            "worst_rate": round(worst_rate, 4),
+                            "currency": leg.sell_currency,
+                            "saved_vs_avg": round(s_vs_avg, 2),
+                            "saved_vs_worst": round(s_vs_worst, 2),
+                            "total_quotes": len(rates)
+                        }
+
+            if hasattr(leg, 'id') and leg_savings_summary and not leg_is_inconclusive:
+                leg.winner_bank_name = leg_savings_summary.get("winner_bank_name")
+                leg.winner_bank_id = leg_winner_bank_id
+                leg.winner_rate = leg_savings_summary.get("winner_rate")
+                leg.saved_vs_avg = leg_savings_summary.get("saved_vs_avg")
+            elif hasattr(leg, 'id'):
+                leg.winner_bank_name = None
+                leg.winner_bank_id = None
+                leg.winner_rate = None
+                leg.saved_vs_avg = None
+
+            if is_closed and getattr(leg, 'status', None) == 'PENDING':
+                leg.status = 'COMPLETED'
+
+            legs_data.append({
+                "leg_id": leg.id,
+                "leg_index": leg.leg_index,
+                "type": leg.type or "FX_SPOT",
+                "direction": leg.direction or "Buy",
+                "buy_currency": leg.buy_currency,
+                "sell_currency": leg.sell_currency,
+                "pair_name": f"{leg.buy_currency}/{leg.sell_currency}",
+                "currency_pair": f"{leg.buy_currency}/{leg.sell_currency}",
+                "amount": leg.amount,
+                "value_date": str(leg.value_date).split('T')[0] if leg.value_date else None,
+                "quotation_base": leg.quotation_base or "Execution",
+                "max_tolerance_percent": leg.max_tolerance_percent,
+                "status": leg.status,
+                "results": leg_results,
+                "ladder": leg_results,
+                "winner_bank_id": leg_winner_bank_id,
+                "winner_bank_name": leg_savings_summary.get("winner_bank_name") if leg_savings_summary else None,
+                "winner_rate": leg_savings_summary.get("winner_rate") if leg_savings_summary else None,
+                "saved_vs_avg": leg_savings_summary.get("saved_vs_avg") if leg_savings_summary else None,
+                "savings_amount": leg_savings_summary.get("saved_vs_avg", 0.0) if leg_savings_summary else 0.0,
+                "savings_percent": round((leg_savings_summary.get("saved_vs_avg", 0.0) / (leg.amount * leg_savings_summary.get("avg_rate", 1.0))) * 100, 2) if (leg_savings_summary and leg.amount and leg_savings_summary.get("avg_rate")) else 0.0,
+                "is_inconclusive": leg_is_inconclusive,
+                "inconclusive_reason": leg_inconclusive_reason,
+                "best_indicative_rate": leg_best_indicative,
+                "best_execution_rate": leg_best_execution,
+                "deviation_percent": leg_deviation_pct,
+                "has_execution_banks": leg_has_execution,
+                "savings_summary": leg_savings_summary
+            })
 
     # --- Live Trading Floor Presence Telemetry ---
     total_invited = len(assignments)
@@ -1124,6 +1231,19 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "total_quotes": len(scores)
                     }
 
+    # Backward compatibility: populate root fields from primary leg if multi-pair
+    primary_leg = legs_data[0] if legs_data else None
+    if primary_leg:
+        results = primary_leg["results"]
+        winner_bank_id = primary_leg["winner_bank_id"]
+        is_inconclusive = all(l["is_inconclusive"] for l in legs_data)
+        inconclusive_reason = primary_leg["inconclusive_reason"]
+        best_indicative_rate = primary_leg["best_indicative_rate"]
+        best_execution_rate = primary_leg["best_execution_rate"]
+        deviation_percent = primary_leg["deviation_percent"]
+        has_execution_banks = any(l["has_execution_banks"] for l in legs_data)
+        savings_summary = primary_leg["savings_summary"]
+
     # Attach winner and rate attributes to RFQ object
     if savings_summary and not is_inconclusive:
         rfq.winner_bank_name = savings_summary.get("winner_bank_name")
@@ -1138,8 +1258,11 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     if dispatch_emails and is_closed and winner_bank_id and not is_inconclusive and has_execution_banks:
         trigger_auto_dispatch_results(rfq.id)
 
+    db.commit()
+
     return {
         "rfq": rfq,
+        "legs": legs_data,
         "results": results,
         "winner_bank_id": winner_bank_id,
         "is_inconclusive": is_inconclusive,
