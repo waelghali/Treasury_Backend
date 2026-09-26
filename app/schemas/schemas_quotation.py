@@ -41,6 +41,7 @@ class QuotationBankOut(QuotationBankBase):
     contacts: Optional[List[dict]] = None
     entity_scope: Optional[str] = "ALL_ENTITIES"
     entity_ids: Optional[List[int]] = []
+    is_cross_entity: Optional[bool] = False
     
     class Config:
         from_attributes = True
@@ -189,6 +190,11 @@ class QuotationRequestOut(BaseModel):
     scheduled_release_at: Optional[datetime] = None
     is_dispatched: Optional[bool] = False
     dispatched_at: Optional[datetime] = None
+    acceptance_timeout_seconds: Optional[int] = None
+    acceptance_timeout_action: Optional[str] = None
+    acceptance_deadline: Optional[datetime] = None
+    acceptance_status: Optional[str] = None
+    acceptance_resolved_at: Optional[datetime] = None
     assigned_banks: Optional[List[dict]] = None
     legs: Optional[List[QuotationLegOut]] = []
 

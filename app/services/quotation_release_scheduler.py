@@ -63,9 +63,12 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
 
         now_utc = datetime.now(timezone.utc)
 
-        # Transition status from APPROVED_SCHEDULED to PENDING (active / awaiting window)
-        if rfq.status == "APPROVED_SCHEDULED":
+        # Transition status from APPROVED_SCHEDULED or PENDING_APPROVAL to PENDING (active / awaiting window)
+        if rfq.status in ("APPROVED_SCHEDULED", "PENDING_APPROVAL"):
             rfq.status = "PENDING"
+        for leg in (rfq.legs or []):
+            if leg.status in ("APPROVED_SCHEDULED", "PENDING_APPROVAL"):
+                leg.status = "PENDING"
 
         rfq.is_dispatched = True
         rfq.dispatched_at = now_utc

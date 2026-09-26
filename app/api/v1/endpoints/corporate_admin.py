@@ -2215,6 +2215,9 @@ def approve_quotation(
         rfq.status = 'APPROVED_SCHEDULED'
         rfq.scheduled_release_at = scheduled_time
         rfq.is_dispatched = False
+        for leg in (rfq.legs or []):
+            if leg.status == 'PENDING_APPROVAL':
+                leg.status = 'APPROVED_SCHEDULED'
         db.commit()
 
         job_id = schedule_rfq_bank_release(rfq_id=rfq.id, release_at=scheduled_time)
@@ -2264,6 +2267,9 @@ def approve_quotation(
     rfq.status = 'PENDING'
     rfq.scheduled_release_at = None
     rfq.scheduled_release_job_id = None
+    for leg in (rfq.legs or []):
+        if leg.status in ('PENDING_APPROVAL', 'APPROVED_SCHEDULED'):
+            leg.status = 'PENDING'
     db.commit()
 
     log_action(
@@ -2328,6 +2334,9 @@ def reschedule_quotation_release(
         rfq.status = 'PENDING'
         rfq.scheduled_release_at = None
         rfq.scheduled_release_job_id = None
+        for leg in (rfq.legs or []):
+            if leg.status in ('PENDING_APPROVAL', 'APPROVED_SCHEDULED'):
+                leg.status = 'PENDING'
         db.commit()
 
         from app.core.routing import get_frontend_base_url
@@ -2767,6 +2776,136 @@ def reject_quotation_cancellation(
     )
 
     return {"message": "Quotation cancellation request rejected. RFQ restored to active schedule.", "rfq_id": rfq.id, "status": "PENDING"}
+
+
+@router.post("/quotations/{rfq_id}/accept-deal")
+async def accept_quotation_deal(
+    rfq_id: str,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Corporate Admin manually confirms acceptance of the winning quotation deal.
+    Finalizes the status, commits the trade execution, and dispatches confirmation/regret emails.
+    """
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+
+    rfq.status = 'COMPLETED'
+    rfq.acceptance_status = 'ACCEPTED'
+    rfq.acceptance_resolved_at = now_utc
+    rfq.acceptance_resolved_by_user_id = corporate_admin_context.user_id
+
+    for leg in (rfq.legs or []):
+        if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
+            leg.status = 'ACCEPTED'
+        elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
+            leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+
+    db.commit()
+
+    from app.crud.crud import log_action
+    log_action(
+        db=db,
+        user_id=corporate_admin_context.user_id,
+        action_type="QUOTATION_DEAL_ACCEPTED",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": rfq.id,
+            "ref_no": rfq.ref_no,
+            "message": f"Corporate admin accepted winning quote for RFQ {rfq.ref_no}."
+        },
+        customer_id=corporate_admin_context.customer_id
+    )
+
+    # Automatically dispatch result emails to counterparties
+    try:
+        from app.api.v1.endpoints.quotations_endpoints import dispatch_rfq_result_emails
+        await dispatch_rfq_result_emails(rfq.id, db, force=True)
+    except Exception as e:
+        logger.error(f"Error auto-dispatching result emails on deal accept: {e}")
+
+    return {
+        "status": "success",
+        "message": f"Deal accepted successfully for RFQ {rfq.ref_no}! Trade execution confirmed and counterparties notified.",
+        "rfq_id": rfq.id,
+        "rfq_status": rfq.status,
+        "acceptance_status": rfq.acceptance_status
+    }
+
+
+@router.post("/quotations/{rfq_id}/decline-deal")
+async def decline_quotation_deal(
+    rfq_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Corporate Admin manually declines/rejects the deal outcome.
+    Marks RFQ as rejected and records reason.
+    """
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    reason = body.get("reason", "Declined by corporate treasury desk")
+
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+
+    rfq.status = 'REJECTED'
+    rfq.acceptance_status = 'REJECTED'
+    rfq.admin_revision_notes = reason
+    rfq.acceptance_resolved_at = now_utc
+    rfq.acceptance_resolved_by_user_id = corporate_admin_context.user_id
+
+    for leg in (rfq.legs or []):
+        leg.status = 'REJECTED'
+        leg.rejection_reason = reason
+
+    db.commit()
+
+    from app.crud.crud import log_action
+    log_action(
+        db=db,
+        user_id=corporate_admin_context.user_id,
+        action_type="QUOTATION_DEAL_DECLINED",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": rfq.id,
+            "ref_no": rfq.ref_no,
+            "reason": reason,
+            "message": f"Corporate admin declined deal for RFQ {rfq.ref_no}."
+        },
+        customer_id=corporate_admin_context.customer_id
+    )
+
+    return {
+        "status": "success",
+        "message": f"Deal declined for RFQ {rfq.ref_no}.",
+        "rfq_id": rfq.id,
+        "rfq_status": rfq.status
+    }
 
 
 # ==============================================================================

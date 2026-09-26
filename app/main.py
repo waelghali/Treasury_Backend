@@ -19,7 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # Database imports
-from app.database import get_db, Base, engine
+from app.database import get_db, Base, engine, SessionLocal
 
 # ==============================================================================
 # Production-Ready Log Filter: masks sensitive metadata from all log output

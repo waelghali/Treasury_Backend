@@ -29,6 +29,12 @@ def _get_bank_contacts_list(q_bank: QuotationBank):
     emails_list = [e.strip() for e in (q_bank.emails or "").split(",") if e.strip()]
     return [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
 
+def _clean_magic_token(token_str: Optional[str]) -> Optional[str]:
+    """Extracts raw magic token if appended with tab-specific concurrency salt."""
+    if not token_str:
+        return None
+    return token_str.split('_tab_')[0] if '_tab_' in token_str else token_str
+
 @router.get("/{token}")
 async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     """Fetch RFQ details securely using token."""
@@ -235,11 +241,12 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
                 pass
 
         # Leg Live Rank
-        leg_rank = None
+        leg_rank_info = None
         if is_live_ranking_enabled and leg_offers_list:
             try:
                 from app.services.live_ranking_service import live_ranking_service
-                leg_rank = live_ranking_service.calculate_bank_live_rank(db, rfq.id, assignment.id, leg_id=leg.id)
+                leg_ranks_map = live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id)
+                leg_rank_info = leg_ranks_map.get(leg.id) or leg_ranks_map.get(str(leg.id))
             except Exception:
                 pass
 
@@ -264,8 +271,32 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
             "cost_max": cfg_cost_max,
             "offers": leg_offers_list,
             "cbe_benchmark_rate": leg_bm,
-            "live_rank": leg_rank
+            "live_rank": leg_rank_info
         })
+
+    # Acceptance timeout countdown configured by Corporate Admin (default: 120s for TBILL, 30s for FX_SPOT)
+    acceptance_timeout_seconds = 120 if rfq.type == "TBILL" else 30
+    try:
+        from app.crud.crud_config import crud_customer_configuration
+        from app.constants import GlobalConfigKey
+        cfg_key = GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_TBILL if rfq.type == "TBILL" else GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_FX_SPOT
+        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(db, rfq.customer_id, cfg_key)
+        if cfg and cfg.get("effective_value"):
+            acceptance_timeout_seconds = int(cfg["effective_value"])
+    except Exception:
+        pass
+
+    # Check if this multi-pair package is mixed (contains both Execution and Indicative legs)
+    bank_assigned_base = (assignment.quotation_base or rfq.quotation_base or "Execution").capitalize()
+    leg_bases = list(set((l.get("quotation_base") or bank_assigned_base).capitalize() for l in portal_legs)) if portal_legs else [bank_assigned_base]
+    has_exec_leg = any(b.lower() == "execution" for b in leg_bases)
+    has_indic_leg = any(b.lower() == "indicative" for b in leg_bases)
+    is_mixed_rfq = bool(portal_legs and len(leg_bases) > 1 and has_exec_leg and has_indic_leg)
+
+    overall_quotation_base = "Mixed" if is_mixed_rfq else (leg_bases[0] if (portal_legs and len(leg_bases) == 1) else bank_assigned_base)
+
+    # Bank approval is required ONLY if ANY leg is execution (or overall execution) and bank has appropriate roles
+    requires_bank_approval = has_exec_leg and any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])) and any(c.get("role") == "APPROVER" for c in (_get_bank_contacts_list(q_bank) if q_bank else []))
 
     return {
         "id": rfq.id,
@@ -285,32 +316,38 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
         "eval_rate": rfq.eval_rate,
         "window_start": rfq.window_start,
         "window_end": rfq.window_end,
-        "quotation_base": assignment.quotation_base or rfq.quotation_base,
-        "document_path": rfq.document_path if (effective_base != 'indicative' and assignment.is_document_visible is not False) else None,
+        "acceptance_timeout_seconds": acceptance_timeout_seconds,
+        "quotation_base": overall_quotation_base,
+        "is_mixed": is_mixed_rfq,
+        "has_execution_legs": has_exec_leg,
+        "is_all_indicative": not has_exec_leg,
+        "document_path": rfq.document_path if (has_exec_leg and assignment.is_document_visible is not False) else None,
         "documents": parsed_docs,
         "status": rfq.status,
         "assignment_id": assignment.id,
+        "is_cross_entity": bool(assignment.is_cross_entity),
         "bank_name": bank_name,
         "customer_name": customer_name,
-        "entity_name": rfq.entity.entity_name if rfq.entity else customer_name,
-        "entity_tax_id": rfq.entity.tax_id if rfq.entity else None,
-        "entity_cr_number": rfq.entity.commercial_register_number if rfq.entity else None,
-        "entity_code": rfq.entity.code if rfq.entity else None,
+        "entity_name": customer_name if assignment.is_cross_entity else (rfq.entity.entity_name if rfq.entity else customer_name),
+        "entity_tax_id": None if assignment.is_cross_entity else (rfq.entity.tax_id if rfq.entity else None),
+        "entity_cr_number": None if assignment.is_cross_entity else (rfq.entity.commercial_register_number if rfq.entity else None),
+        "entity_code": None if assignment.is_cross_entity else (rfq.entity.code if rfq.entity else None),
         "serverTime": now.isoformat(),
         "isWindowOpen": is_open,
         "offers": offers,
         "legs": portal_legs,
-        "approval_status": assignment.approval_status,
+        "approval_status": assignment.approval_status if has_exec_leg else None,
         "approved_by_email": assignment.approved_by_email,
         "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else None,
         "approval_notes": assignment.approval_notes,
         "has_execution_dealers": any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
         "total_execution_dealers": sum(1 for c in (_get_bank_contacts_list(q_bank) if q_bank else []) if c.get("role") == "EXECUTION"),
-        "requires_bank_approval": (effective_base != "indicative") and any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])) and any(c.get("role") == "APPROVER" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
+        "requires_bank_approval": requires_bank_approval,
         "cbe_benchmark_rate": cbe_benchmark_rate,
         "is_live_ranking_enabled": is_live_ranking_enabled,
         "live_rank": live_rank,
-        "total_quotes": total_quotes
+        "total_quotes": total_quotes,
+        "ranks_by_leg": (live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id) if is_live_ranking_enabled else {})
     }
 
 @router.post("/request-otp")
@@ -610,9 +647,10 @@ def desk_heartbeat(
     # Authoritatively resolve user role from database session if session_token provided
     resolved_role = (payload.role or "EXECUTION").strip().upper()
     if payload.session_token:
+        clean_magic = payload.session_token.split('_tab_')[0] if '_tab_' in payload.session_token else payload.session_token
         otp_rec = db.query(QuotationAccessOTP).filter(
             QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == payload.session_token
+            QuotationAccessOTP.magic_token == clean_magic
         ).first()
         if otp_rec and otp_rec.role:
             resolved_role = otp_rec.role.strip().upper()
@@ -624,7 +662,7 @@ def desk_heartbeat(
             detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
         )
 
-    # Check if quotation bidding window is currently active
+    # Check if quotation bidding window or corporate acceptance period is currently active
     now = datetime.now(timezone.utc)
     def _to_utc_dt(dt):
         if not dt:
@@ -640,11 +678,27 @@ def desk_heartbeat(
     w_start = _to_utc_dt(rfq.window_start) if rfq else None
     w_end = _to_utc_dt(rfq.window_end) if rfq else None
     
-    # Desk session coordination allowed from 10 minutes before window_start until 1 minute after window_end
+    # Retrieve customer-configured corporate acceptance timeout (default: 120s for TBILL, 30s for FX_SPOT)
+    acceptance_timeout_seconds = 120 if (rfq and rfq.type == "TBILL") else 30
+    if rfq and rfq.customer_id:
+        try:
+            from app.crud.crud_config import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg_key = GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_TBILL if rfq.type == "TBILL" else GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_FX_SPOT
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(db, rfq.customer_id, cfg_key)
+            if cfg and cfg.get("effective_value"):
+                acceptance_timeout_seconds = int(cfg["effective_value"])
+        except Exception:
+            pass
+
+    # Desk session coordination allowed from 10 minutes before window_start
+    # until (Corporate Acceptance Timeout + 1 minute buffer) after window_end,
+    # as counterparties must remain connected at their desk during the corporate acceptance period.
     from datetime import timedelta
+    post_buffer = timedelta(seconds=acceptance_timeout_seconds + 60)
     is_session_active = bool(
         w_start and w_end and 
-        (w_start - timedelta(minutes=10)) <= now <= (w_end + timedelta(minutes=1)) and 
+        (w_start - timedelta(minutes=10)) <= now <= (w_end + post_buffer) and 
         rfq.status not in ('CANCELLED', 'REJECTED')
     )
 
@@ -673,7 +727,8 @@ def desk_heartbeat(
         assignment_id=assignment.id,
         email=payload.email,
         name=payload.name,
-        role=desk_role
+        role=desk_role,
+        session_token=payload.session_token
     )
     if isinstance(res, dict) and rfq:
         res["rfq_status"] = rfq.status
@@ -700,9 +755,10 @@ def desk_takeover(
     # Authoritatively resolve user role
     resolved_role = (payload.role or "EXECUTION").strip().upper()
     if payload.session_token:
+        clean_magic = payload.session_token.split('_tab_')[0] if '_tab_' in payload.session_token else payload.session_token
         otp_rec = db.query(QuotationAccessOTP).filter(
             QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == payload.session_token
+            QuotationAccessOTP.magic_token == clean_magic
         ).first()
         if otp_rec and otp_rec.role:
             resolved_role = otp_rec.role.strip().upper()
@@ -724,8 +780,11 @@ def desk_takeover(
         assignment_id=assignment.id,
         email=payload.email,
         name=payload.name,
-        role="EXECUTION"
+        role="EXECUTION",
+        session_token=payload.session_token
     )
+    if isinstance(status_res, dict) and rfq:
+        status_res["rfq_status"] = rfq.status
 
     # Audit Log the takeover event
     from app.crud.crud import log_action
@@ -784,9 +843,10 @@ def submit_fx_offer(
     # Verify submitter authorization & role if session provided
     submitted_by = offer_in.email
     if offer_in.session_token:
+        clean_token = _clean_magic_token(offer_in.session_token)
         otp_rec = db.query(QuotationAccessOTP).filter(
             QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == offer_in.session_token
+            QuotationAccessOTP.magic_token == clean_token
         ).first()
         if otp_rec:
             if otp_rec.role == "VIEW_ONLY":
@@ -801,7 +861,11 @@ def submit_fx_offer(
 
     # Verify active trader session lock
     if submitted_by:
-        can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
+        can_submit, block_reason = desk_session_service.can_submit_quote(
+            assignment.id, 
+            submitted_by, 
+            session_token=offer_in.session_token
+        )
         if not can_submit:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
 
@@ -910,9 +974,16 @@ def submit_fx_offer(
     except Exception:
         pass
 
+    ranks_by_leg = {}
+    try:
+        if is_enabled:
+            ranks_by_leg = live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id)
+    except Exception:
+        pass
+
     desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", offer_in.price)
 
-    return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
+    return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data, "ranks_by_leg": ranks_by_leg}
 
 
 @router.post("/offers-batch")
@@ -947,9 +1018,10 @@ def submit_fx_offers_batch(
     # Authorize submitter
     submitted_by = payload.email
     if payload.session_token:
+        clean_token = _clean_magic_token(payload.session_token)
         otp_rec = db.query(QuotationAccessOTP).filter(
             QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == payload.session_token
+            QuotationAccessOTP.magic_token == clean_token
         ).first()
         if otp_rec:
             if otp_rec.role == "VIEW_ONLY":
@@ -963,7 +1035,11 @@ def submit_fx_offers_batch(
             submitted_by = otp_rec.email
 
     if submitted_by:
-        can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
+        can_submit, block_reason = desk_session_service.can_submit_quote(
+            assignment.id, 
+            submitted_by, 
+            session_token=payload.session_token
+        )
         if not can_submit:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
 
@@ -1030,11 +1106,19 @@ def submit_fx_offers_batch(
     ))
     db.commit()
 
-    # Calculate live ranks per leg
+    # Calculate live ranks per leg only if bank is eligible in system-owner live ranking
     ranks_by_leg = {}
     try:
         from app.services.live_ranking_service import live_ranking_service
-        ranks_by_leg = live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id)
+        q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+        actual_bank_id = q_bank.bank_id if q_bank else None
+        rfq_entity_id = getattr(rfq, 'entity_id', None)
+        is_live_ranking_enabled = live_ranking_service.evaluate_live_ranking_eligibility(
+            db, bank_id=actual_bank_id, customer_id=rfq.customer_id,
+            entity_id=rfq_entity_id, trade_type=rfq.type or 'FX_SPOT'
+        )
+        if is_live_ranking_enabled:
+            ranks_by_leg = live_ranking_service.calculate_bank_live_ranks_by_leg(db, rfq.id, assignment.id)
     except Exception:
         pass
 
@@ -1082,9 +1166,10 @@ def submit_tbill_offer(
     # Verify submitter authorization & role if session provided
     submitted_by = offer_in.email
     if offer_in.session_token:
+        clean_token = _clean_magic_token(offer_in.session_token)
         otp_rec = db.query(QuotationAccessOTP).filter(
             QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == offer_in.session_token
+            QuotationAccessOTP.magic_token == clean_token
         ).first()
         if otp_rec:
             if otp_rec.role == "VIEW_ONLY":
@@ -1099,7 +1184,11 @@ def submit_tbill_offer(
 
     # Verify active trader session lock
     if submitted_by:
-        can_submit, block_reason = desk_session_service.can_submit_quote(assignment.id, submitted_by)
+        can_submit, block_reason = desk_session_service.can_submit_quote(
+            assignment.id, 
+            submitted_by, 
+            session_token=offer_in.session_token
+        )
         if not can_submit:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=block_reason)
 
@@ -1268,9 +1357,10 @@ async def approve_rfq_for_bank(
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
 
     # Authenticate session & verify role
+    clean_token = _clean_magic_token(action_in.session_token)
     otp_rec = db.query(QuotationAccessOTP).filter(
         QuotationAccessOTP.assignment_id == assignment.id,
-        QuotationAccessOTP.magic_token == action_in.session_token
+        QuotationAccessOTP.magic_token == clean_token
     ).first()
     if not otp_rec:
         raise HTTPException(status_code=401, detail="Invalid or expired session. Please log in again.")
@@ -1358,21 +1448,22 @@ async def approve_rfq_for_bank(
         
         # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
         if non_approver_emails:
+            from app.services.unified_email_builder import build_alert_email_html
             subject = f"RFQ {rfq.ref_no} ({customer_name}) - Bank Participation Declined"
-            notes_html = f"<p><strong>Reason / Notes:</strong> {action_in.notes}</p>" if action_in.notes else ""
-            body = f"""
-            <html>
-            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b;">
-                <p>Dear {bank_name} FX Desk,</p>
-                <p>Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>declined participation</strong> for RFQ <strong>{rfq.ref_no}</strong> on behalf of <strong>{customer_name}</strong>.</p>
-                {notes_html}
-                <p>No further action is required from your desk.</p>
-                <br/>
-                <p>Best Regards,</p>
-                <p>Treasury Team</p>
-            </body>
-            </html>
-            """
+            reason_part = f"<br/><br/><strong>Approver Notes / Justification:</strong> {action_in.notes}" if action_in.notes else ""
+            msg = (
+                f"Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>declined participation</strong> "
+                f"for RFQ <strong>{rfq.ref_no}</strong> on behalf of <strong>{customer_name}</strong>.{reason_part}<br/><br/>"
+                f"No further action is required from your execution desk for this quotation request."
+            )
+            body = build_alert_email_html(
+                customer_name=customer_name,
+                title=f"Participation Declined &bull; RFQ {rfq.ref_no}",
+                alert_type="warning",
+                message=msg,
+                recipient_name=f"{bank_name} FX &amp; Treasury Desk",
+                platform_name="Grow Treasury Platform"
+            )
             background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
 
         # Notify Corporate Admin / Creator
@@ -1536,22 +1627,137 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
 
     # Align with 3-second network latency buffer
     is_closed = bool(w_end and now > (w_end + timedelta(seconds=3)))
-    if is_closed and rfq.status in ('PENDING', 'OPEN'):
-        rfq.status = 'COMPLETED'
-        db.commit()
 
     if not is_closed and rfq.status not in ('COMPLETED', 'CANCELLED', 'REJECTED'):
         return {"status": "OPEN" if (w_start and now >= w_start) else "PENDING"}
-
-    # Indicative banks are for market sounding only and are never declared winners or sent regret statuses
-    q_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
-    if q_base == 'indicative':
-        return {"status": "INDICATIVE_ONLY"}
 
     # Calculate results using central endpoint evaluation logic
     from app.api.v1.endpoints.quotations_endpoints import get_rfq_results
     try:
         res_data = get_rfq_results(rfq.id, db, current_user=None)
+        db.refresh(rfq)
+
+        # Check if ALL legs requested from this counterparty are Indicative (non-binding)
+        legs_data = res_data.get("legs", [])
+        bank_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
+
+        has_any_execution_for_bank = False
+        if legs_data:
+            for l in legs_data:
+                cfg = assignment.get_config_for_leg(l.get("leg_id"))
+                assigned_base = (getattr(cfg, 'quotation_base', None) or assignment.quotation_base or l.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
+                if assigned_base == 'execution':
+                    has_any_execution_for_bank = True
+                    break
+        else:
+            q_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
+            has_any_execution_for_bank = (q_base == 'execution')
+
+        # If everything requested from this counterparty is Indicative:
+        # Counterparty should immediately see thank you note and NEVER see "Selection in Progress"!
+        if not has_any_execution_for_bank:
+            return {
+                "status": "INDICATIVE_ONLY",
+                "detail": "Indicative pricing received. Thank you for your quote."
+            }
+
+        # If acceptance is currently pending corporate decision (ONLY for Execution deals!)
+        if getattr(rfq, 'acceptance_status', None) == 'PENDING':
+            return {
+                "status": "AWAITING_MANUAL_SELECTION",
+                "message": "Quotation window closed. Awaiting corporate treasury acceptance.",
+                "acceptance_deadline": rfq.acceptance_deadline.isoformat() if getattr(rfq, 'acceptance_deadline', None) else None
+            }
+
+        # If deal was rejected or auto-rejected
+        if rfq.status == 'REJECTED' or getattr(rfq, 'acceptance_status', None) in ('REJECTED', 'AUTO_REJECTED'):
+            return {
+                "status": "NOT_SELECTED",
+                "detail": "Quotation deal was declined by corporate treasury or expired without acceptance."
+            }
+
+        bank_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
+        legs_data = res_data.get("legs", [])
+
+        if legs_data and len(legs_data) > 1:
+            won_legs = []
+            lost_legs = []
+            inconclusive_legs = []
+            indicative_legs = []
+            legs_breakdown = {}
+
+            for l in legs_data:
+                leg_id = l.get("leg_id")
+                leg_base = (l.get("quotation_base") or "").lower()
+                pair_name = l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}"
+                l_winner_id = l.get("winner_bank_id")
+                l_inconclusive = l.get("is_inconclusive", False)
+
+                if leg_base == "indicative":
+                    indicative_legs.append(l)
+                    leg_status = "INDICATIVE"
+                    is_leg_win = False
+                elif l_inconclusive or not l_winner_id:
+                    inconclusive_legs.append(l)
+                    leg_status = "INCONCLUSIVE"
+                    is_leg_win = False
+                elif bank_id and l_winner_id == bank_id:
+                    won_legs.append(l)
+                    leg_status = "WON"
+                    is_leg_win = True
+                else:
+                    lost_legs.append(l)
+                    leg_status = "LOST"
+                    is_leg_win = False
+
+                leg_item = {
+                    "leg_id": str(leg_id) if leg_id is not None else None,
+                    "leg_index": l.get("leg_index"),
+                    "pair": pair_name,
+                    "currency_pair": pair_name,
+                    "quotation_base": l.get("quotation_base", "Execution"),
+                    "is_winner": is_leg_win,
+                    "won": is_leg_win,
+                    "status": "WINNER" if is_leg_win else ("NOT_SELECTED" if leg_status == "LOST" else leg_status),
+                    "raw_status": leg_status,
+                    "winner_rate": l.get("winner_rate") if is_leg_win else None
+                }
+                legs_breakdown[leg_id] = leg_item
+                if leg_id is not None:
+                    legs_breakdown[str(leg_id)] = leg_item
+                if l.get("leg_index") is not None:
+                    legs_breakdown[l.get("leg_index") - 1] = leg_item
+                    legs_breakdown[str(l.get("leg_index") - 1)] = leg_item
+                legs_breakdown[pair_name] = leg_item
+
+            if len(won_legs) == len(legs_data):
+                overall_status = "WINNER"
+            elif len(won_legs) > 0:
+                overall_status = "PARTIALLY_WON"
+            elif len(won_legs) == 0 and len(lost_legs) > 0:
+                overall_status = "NOT_SELECTED"
+            elif len(indicative_legs) == len(legs_data):
+                overall_status = "INDICATIVE_ONLY"
+            else:
+                overall_status = "INCONCLUSIVE"
+
+            return {
+                "status": overall_status,
+                "won_legs_count": len(won_legs),
+                "lost_legs_count": len(lost_legs),
+                "inconclusive_legs_count": len(inconclusive_legs),
+                "total_legs_count": len(legs_data),
+                "won_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in won_legs],
+                "lost_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in lost_legs],
+                "inconclusive_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in inconclusive_legs],
+                "legs_breakdown": legs_breakdown
+            }
+
+        # Single-leg or master RFQ evaluation
+        q_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
+        if q_base == 'indicative':
+            return {"status": "INDICATIVE_ONLY"}
+
         winner_bank_id = res_data.get("winner_bank_id")
         is_inconclusive = res_data.get("is_inconclusive", False)
 

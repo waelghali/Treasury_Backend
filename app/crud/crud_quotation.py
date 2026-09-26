@@ -1,5 +1,5 @@
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timezone, date
 import uuid
 import json
@@ -37,6 +37,26 @@ def _parse_banks_payload(raw_data):
         except Exception:
             return []
     return []
+
+def _normalize_leg_trade_key(buy_curr: str, sell_curr: str, direction: str) -> str:
+    b = (buy_curr or '').strip().upper()
+    s = (sell_curr or '').strip().upper()
+    d = (direction or 'Buy').strip().upper()
+    if b <= s:
+        return f"{b}/{s}:{d}"
+    else:
+        inv_d = 'SELL' if d == 'BUY' else 'BUY'
+        return f"{s}/{b}:{inv_d}"
+
+def get_bank_leg_signature(buy_curr: str, sell_curr: str, direction: str, value_date, quotation_base: str) -> str:
+    """
+    Modular signature for bank leg uniqueness.
+    Easily hardened or eased by adjusting what fields are included in the signature.
+    """
+    trade_key = _normalize_leg_trade_key(buy_curr, sell_curr, direction)
+    val_date_str = str(value_date).strip().split('T')[0] if value_date else ''
+    base_str = (quotation_base or 'Execution').strip().lower()
+    return f"{trade_key}:{val_date_str}:{base_str}"
 
 class CRUDQuotation:
     
@@ -114,29 +134,71 @@ class CRUDQuotation:
 
     def get_quotation_banks(self, db: Session, customer_id: int, trade_type: str = None, entity_id: int = None):
         from app.models.models_quotation import QuotationBankEntity
+        from app.crud.crud_config import crud_customer_configuration
+        from app.constants import GlobalConfigKey
+
         query = db.query(QuotationBank).filter(QuotationBank.customer_id == customer_id)
         if trade_type:
             # If trade_type is specified, return banks matching the specific type OR "BOTH"
             query = query.filter(QuotationBank.trade_type.in_([trade_type, "BOTH"]))
 
-        if entity_id:
-            from sqlalchemy import or_
-            query = query.filter(
-                or_(
-                    QuotationBank.entity_scope == 'ALL_ENTITIES',
-                    QuotationBank.id.in_(
-                        db.query(QuotationBankEntity.quotation_bank_id).filter(QuotationBankEntity.entity_id == entity_id)
+        allow_cross = False
+        try:
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id=customer_id, config_key=GlobalConfigKey.ALLOW_CROSS_ENTITY_INDICATIVE_QUOTES
+            )
+            if cfg and cfg.get("effective_value"):
+                allow_cross = str(cfg["effective_value"]).strip().lower() in ("true", "1", "yes")
+        except Exception:
+            allow_cross = False
+
+        if not entity_id or not allow_cross:
+            if entity_id:
+                from sqlalchemy import or_
+                query = query.filter(
+                    or_(
+                        QuotationBank.entity_scope == 'ALL_ENTITIES',
+                        QuotationBank.id.in_(
+                            db.query(QuotationBankEntity.quotation_bank_id).filter(QuotationBankEntity.entity_id == entity_id)
+                        )
                     )
                 )
-            )
 
-        banks = query.all()
-        for b in banks:
+            banks = query.all()
+            for b in banks:
+                if not b.contacts:
+                    emails_list = [e.strip() for e in (b.emails or "").split(",") if e.strip()]
+                    b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+                b.entity_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
+                b.is_cross_entity = False
+            return banks
+
+        # When entity_id and allow_cross are active:
+        all_banks = query.all()
+        direct_banks = []
+        cross_banks = []
+        direct_bank_ids = set()
+
+        for b in all_banks:
+            assoc_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
+            b.entity_ids = assoc_ids
             if not b.contacts:
                 emails_list = [e.strip() for e in (b.emails or "").split(",") if e.strip()]
                 b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
-            b.entity_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
-        return banks
+
+            is_direct = (b.entity_scope == 'ALL_ENTITIES') or (entity_id in assoc_ids)
+            if is_direct:
+                b.is_cross_entity = False
+                direct_banks.append(b)
+                direct_bank_ids.add(b.bank_id)
+
+        for b in all_banks:
+            if b.bank_id not in direct_bank_ids:
+                b.is_cross_entity = True
+                cross_banks.append(b)
+
+        # Smart filtering: If no new unique cross-entity banks exist, cross_banks will naturally be empty
+        return direct_banks + cross_banks
 
     def get_unique_retender_ref_no(self, db: Session, parent_rfq: QuotationRequest):
         """
@@ -266,6 +328,24 @@ class CRUDQuotation:
         p_tol = (first_pair.maxTolerancePercent if is_multi_pair and first_pair.maxTolerancePercent is not None else obj_in.maxTolerancePercent)
         p_alt_val = bool(first_pair.allowAlternativeValueDate if is_multi_pair else allow_alt_master)
 
+        # Resolve Acceptance Timeout & Default Action from Customer Configuration
+        acc_timeout_secs = 120 if p_type == "TBILL" else 30
+        acc_action = "AUTO_REJECT"
+        try:
+            from app.crud.crud_config import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg_key = GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_TBILL if p_type == "TBILL" else GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_FX_SPOT
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(db, customer_id, cfg_key)
+            if cfg and cfg.get("effective_value"):
+                acc_timeout_secs = int(cfg["effective_value"])
+
+            cfg_act = crud_customer_configuration.get_customer_config_or_global_fallback(db, customer_id, GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION)
+            if cfg_act and cfg_act.get("effective_value"):
+                raw_act = str(cfg_act.get("effective_value")).strip().upper()
+                acc_action = "AUTO_ACCEPT" if raw_act in ("AUTO_ACCEPT", "ACCEPT", "TRUE", "1") else "AUTO_REJECT"
+        except Exception:
+            pass
+
         db_rfq = QuotationRequest(
             id=rfq_id,
             ref_no=ref_no,
@@ -291,6 +371,8 @@ class CRUDQuotation:
             allow_alternative_value_date=p_alt_val,
             document_path=document_path or obj_in.documentPath,
             status=initial_status,
+            acceptance_timeout_seconds=acc_timeout_secs,
+            acceptance_timeout_action=acc_action,
             token_validity_hours=getattr(obj_in, 'token_validity_hours', 24) or 24,
             parent_rfq_id=parent_id,
             internal_notes=getattr(obj_in, 'internal_notes', None) or getattr(obj_in, 'internalNotes', None)
@@ -350,6 +432,7 @@ class CRUDQuotation:
         # Parse assigned banks across all pairs (Single token per bank per RFQ session)
         assignments = []
         assignment_by_bank_id = {} # bank_id -> QuotationBankAssignment
+        bank_seen_signatures = {} # raw_bank_id -> set of signatures
 
         root_banks_data = _parse_banks_payload(getattr(obj_in, 'selectedBanks', None))
 
@@ -378,12 +461,40 @@ class CRUDQuotation:
                     assign_id = str(uuid.uuid4())
                     token = str(uuid.uuid4())
 
-                    q_base_override = b_data.get('quotationBase') or p_base
+                    root_bank_info = next((rb for rb in root_banks_data if str(rb.get('id')) == str(raw_bank_id)), None)
+                    q_base_override = b_data.get('quotationBase') or (root_bank_info.get('quotationBase') if root_bank_info else None) or p_base
+
+                    # Check if bank is cross-entity for this RFQ's entity
+                    is_cross_bank = False
+                    if db_rfq.entity_id and q_bank.entity_scope != 'ALL_ENTITIES':
+                        assoc_eids = [assoc.entity_id for assoc in q_bank.entity_associations] if q_bank.entity_associations else []
+                        if db_rfq.entity_id not in assoc_eids:
+                            is_cross_bank = True
+
+                    if is_cross_bank:
+                        from app.crud.crud_config import crud_customer_configuration
+                        from app.constants import GlobalConfigKey
+                        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                            db, customer_id=customer_id, config_key=GlobalConfigKey.ALLOW_CROSS_ENTITY_INDICATIVE_QUOTES
+                        )
+                        allow_cross_cfg = False
+                        if cfg and cfg.get("effective_value"):
+                            allow_cross_cfg = str(cfg["effective_value"]).strip().lower() in ("true", "1", "yes")
+                        if not allow_cross_cfg:
+                            db.rollback()
+                            b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
+                            )
+                        # HARD GUARDRAIL: Cross-entity bank MUST be Indicative only!
+                        q_base_override = "Indicative"
+
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                    is_exec = (p_base or '').lower() == 'execution' or (q_base_override or '').lower() == 'execution'
-                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec) else None
+                    is_exec = (q_base_override or '').lower() == 'execution'
+                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec and not is_cross_bank) else None
 
                     b_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
                     b_allow_alt = b_data.get('allowAlternativeValueDate')
@@ -416,9 +527,38 @@ class CRUDQuotation:
 
                 db_assign = assignment_by_bank_id[raw_bank_id]
 
+                # Check if this bank is cross-entity for pair config
+                is_cross_bank = False
+                if db_rfq.entity_id and q_bank.entity_scope != 'ALL_ENTITIES':
+                    assoc_eids = [assoc.entity_id for assoc in q_bank.entity_associations] if q_bank.entity_associations else []
+                    if db_rfq.entity_id not in assoc_eids:
+                        is_cross_bank = True
+
                 # Create pair-level bank config
                 cfg_id = str(uuid.uuid4())
                 leg_cfg_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
+                leg_quotation_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or db_assign.quotation_base or leg_obj.quotation_base or 'Execution')
+
+                # Bank-level leg uniqueness check
+                if p_type == 'FX_SPOT':
+                    sig = get_bank_leg_signature(
+                        leg_obj.buy_currency,
+                        leg_obj.sell_currency,
+                        leg_obj.direction,
+                        leg_cfg_val_d,
+                        leg_quotation_base
+                    )
+                    if raw_bank_id not in bank_seen_signatures:
+                        bank_seen_signatures[raw_bank_id] = set()
+                    if sig in bank_seen_signatures[raw_bank_id]:
+                        db.rollback()
+                        b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Counterparty conflict for {b_name}: Multiple legs requested for {leg_obj.buy_currency}/{leg_obj.sell_currency} with matching effective settlement date ({leg_cfg_val_d}) and quotation base ({str(leg_quotation_base).capitalize()}). A bank cannot receive identical quote requests."
+                        )
+                    bank_seen_signatures[raw_bank_id].add(sig)
+
                 leg_bank_cfg = QuotationBankLegConfig(
                     id=cfg_id,
                     assignment_id=db_assign.id,
@@ -428,7 +568,7 @@ class CRUDQuotation:
                     cost_percent=b_data.get('costPercent', 0.0),
                     cost_max=b_data.get('costMax', 0.0),
                     cost_flat=b_data.get('costFlat', 0.0),
-                    quotation_base=b_data.get('quotationBase') or leg_obj.quotation_base,
+                    quotation_base=leg_quotation_base,
                     is_document_visible=b_data.get('isDocumentVisible', True),
                     value_date=leg_cfg_val_d,
                     allow_alternative_value_date=b_data.get('allowAlternativeValueDate')
@@ -440,7 +580,11 @@ class CRUDQuotation:
         return db_rfq, assignments
 
     def get_requests(self, db: Session, customer_id: int = None, allowed_entity_ids: list = None):
-        query = db.query(QuotationRequest)
+        query = db.query(QuotationRequest).options(
+            selectinload(QuotationRequest.creator),
+            selectinload(QuotationRequest.entity),
+            selectinload(QuotationRequest.legs)
+        )
         if customer_id is not None:
             query = query.filter(QuotationRequest.customer_id == customer_id)
         if allowed_entity_ids is not None:

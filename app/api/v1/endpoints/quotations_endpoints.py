@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from typing import List, Any, Optional, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -26,7 +27,7 @@ from app.schemas.schemas_quotation import (
     ReTenderRequest, QuotationResubmitRequest,
     QuotationCancellationRequest, QuotationRescheduleRequest
 )
-from app.crud.crud_quotation import crud_quotation
+from app.crud.crud_quotation import crud_quotation, get_bank_leg_signature
 from app.models.models_quotation import (
     QuotationRequest, QuotationBankAssignment, QuotationOffer, 
     QuotationTBillOffer, QuotationBank, QuotationAnalytics, QuotationAccessOTP,
@@ -367,14 +368,30 @@ def _dispatch_quotation_submission_email(
             "Direction": rfq.direction or "N/A",
             "Submitted By": submitter_display,
         }
+        legs_list = getattr(rfq, "legs", []) or []
         if rfq.type == "FX_SPOT":
-            if rfq.amount:
-                curr = rfq.buy_currency if rfq.direction == "Buy" else rfq.sell_currency
-                kv["Amount"] = f"{rfq.amount:,.2f} {curr or ''}".strip()
-            if rfq.buy_currency and rfq.sell_currency:
-                kv["Currency Pair"] = f"{rfq.buy_currency} / {rfq.sell_currency}"
-            if rfq.value_date:
-                kv["Value Date"] = str(rfq.value_date)
+            if len(legs_list) > 1:
+                leg_bases = list(set((l.quotation_base or "Execution").capitalize() for l in legs_list))
+                is_mixed = len(leg_bases) > 1
+                mixed_str = " &bull; Mixed Execution &amp; Indicative" if is_mixed else ""
+                kv["Package Structure"] = f"Multi-Currency Package ({len(legs_list)} Pairs{mixed_str})"
+                for idx, leg in enumerate(legs_list, 1):
+                    leg_dir = leg.direction or "Buy"
+                    leg_amt = f"{leg.amount:,.2f} {leg.buy_currency}" if leg.amount else "N/A"
+                    leg_pair = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                    leg_val = str(leg.value_date) if leg.value_date else "Standard"
+                    leg_base = leg.quotation_base or "Execution"
+                    kv[f"Leg #{idx}: {leg_pair}"] = f"{leg_dir} {leg_amt} | Value: {leg_val} | Base: {leg_base}"
+            else:
+                if rfq.amount:
+                    curr = rfq.buy_currency if rfq.direction == "Buy" else rfq.sell_currency
+                    kv["Amount"] = f"{rfq.amount:,.2f} {curr or ''}".strip()
+                if rfq.buy_currency and rfq.sell_currency:
+                    kv["Currency Pair"] = f"{rfq.buy_currency} / {rfq.sell_currency}"
+                if rfq.value_date:
+                    kv["Value Date"] = str(rfq.value_date)
+                if rfq.quotation_base:
+                    kv["Quotation Base"] = rfq.quotation_base
         else:
             if rfq.amount:
                 kv["Face Value"] = f"{rfq.amount:,.2f} EGP"
@@ -413,21 +430,45 @@ def _dispatch_quotation_submission_email(
                 if rfq.window_end:
                     kv["Submission Deadline"] = str(rfq.window_end)
 
+        # Expected Results Window duration based on Customer Configuration
+        admin_timeout_sec = 120 if rfq.type == "TBILL" else 30
+        try:
+            from app.crud.crud_config import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg_key = GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_TBILL if rfq.type == "TBILL" else GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_FX_SPOT
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(db, current_user.customer_id, cfg_key)
+            if cfg and cfg.get("effective_value"):
+                admin_timeout_sec = int(cfg["effective_value"])
+        except Exception:
+            pass
+
+        if admin_timeout_sec < 60:
+            res_dur_str = f"{admin_timeout_sec} seconds"
+        elif admin_timeout_sec == 60:
+            res_dur_str = "1 minute (60 seconds)"
+        elif admin_timeout_sec % 60 == 0:
+            res_dur_str = f"{admin_timeout_sec // 60} minutes ({admin_timeout_sec} seconds)"
+        else:
+            res_dur_str = f"{admin_timeout_sec // 60} min {admin_timeout_sec % 60} sec ({admin_timeout_sec}s)"
+
+        kv["Expected Results Window"] = f"Within {res_dur_str} after deadline"
+
         action_label = "Re-Tender" if is_retender else "Quotation"
+        multi_label = f" ({len(legs_list)} Pairs)" if len(legs_list) > 1 else ""
         if requires_approval:
-            subject = f"ACTION REQUIRED: {action_label} Request {rfq.ref_no} Awaiting Approval"
+            subject = f"ACTION REQUIRED: {action_label} Request {rfq.ref_no}{multi_label} Awaiting Approval"
             title = f"🔔 {action_label} Awaiting Approval"
             summary_text = (
-                f"A new {action_label.lower()} request ({rfq.ref_no}) has been submitted by {submitter_display} "
+                f"A new {action_label.lower()} request ({rfq.ref_no}){f' for {len(legs_list)} currency pairs' if len(legs_list) > 1 else ''} has been submitted by {submitter_display} "
                 f"and is awaiting your review and approval before release to counterparties."
             )
             cta_text = "Review & Approve Quotation"
             cta_url = f"{base_url}/corporate-admin/quotations/history?rfq_id={rfq.id}"
         else:
-            subject = f"NOTIFICATION: New {action_label} Request {rfq.ref_no} Submitted"
+            subject = f"NOTIFICATION: New {action_label} Request {rfq.ref_no}{multi_label} Submitted"
             title = f"{action_label} Request Submitted"
             summary_text = (
-                f"A new {action_label.lower()} request ({rfq.ref_no}) has been submitted by {submitter_display} "
+                f"A new {action_label.lower()} request ({rfq.ref_no}){f' for {len(legs_list)} currency pairs' if len(legs_list) > 1 else ''} has been submitted by {submitter_display} "
                 f"and released to counterparties."
             )
             cta_text = "View Quotation"
@@ -709,10 +750,99 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     is_scheduled = bool(w_start and now < w_start)
     # Align evaluation with 3s submission buffer: quotation only closes when buffer elapses
     is_closed = bool(w_end and now > (w_end + timedelta(seconds=3))) and not is_scheduled
-        
-    if is_closed and rfq.status == 'PENDING':
-        rfq.status = 'COMPLETED'
-        db.commit()
+
+    # Resolve Acceptance Timeout and Default Action from Customer Configuration
+    try:
+        from app.crud.crud_config import crud_customer_configuration
+        from app.constants import GlobalConfigKey
+        cfg_key = GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_TBILL if rfq.type == "TBILL" else GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_FX_SPOT
+        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(db, rfq.customer_id, cfg_key)
+        effective_timeout = int(cfg["effective_value"]) if (cfg and cfg.get("effective_value")) else (120 if rfq.type == "TBILL" else 30)
+        if rfq.acceptance_timeout_seconds is None or (rfq.acceptance_status is None and rfq.acceptance_timeout_seconds != effective_timeout):
+            rfq.acceptance_timeout_seconds = effective_timeout
+    except Exception:
+        if rfq.acceptance_timeout_seconds is None:
+            rfq.acceptance_timeout_seconds = 120 if rfq.type == "TBILL" else 30
+
+    if rfq.acceptance_timeout_action is None or rfq.acceptance_status is None:
+        try:
+            from app.crud.crud_config import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg_act = crud_customer_configuration.get_customer_config_or_global_fallback(db, rfq.customer_id, GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION)
+            raw_act = (cfg_act.get("effective_value") if cfg_act else None) or "AUTO_REJECT"
+            rfq.acceptance_timeout_action = "AUTO_ACCEPT" if str(raw_act).strip().upper() in ("AUTO_ACCEPT", "ACCEPT", "TRUE", "1") else "AUTO_REJECT"
+        except Exception:
+            rfq.acceptance_timeout_action = "AUTO_REJECT"
+
+    if w_end and (rfq.acceptance_deadline is None or (rfq.acceptance_status is None and rfq.acceptance_deadline != w_end + timedelta(seconds=rfq.acceptance_timeout_seconds))):
+        rfq.acceptance_deadline = w_end + timedelta(seconds=rfq.acceptance_timeout_seconds)
+
+    acc_deadline = _to_utc_dt(rfq.acceptance_deadline) or (w_end + timedelta(seconds=rfq.acceptance_timeout_seconds) if w_end else None)
+
+    q_base_str = (rfq.quotation_base or "Execution").lower()
+    is_indicative_only = q_base_str == "indicative" and not getattr(rfq, "legs", [])
+
+    if is_closed:
+        if is_indicative_only:
+            rfq.status = 'COMPLETED'
+            rfq.acceptance_status = 'INDICATIVE_COMPLETED'
+            db.commit()
+        elif rfq.acceptance_status in ('ACCEPTED', 'AUTO_ACCEPTED'):
+            rfq.status = 'COMPLETED'
+            db.commit()
+        elif rfq.acceptance_status in ('REJECTED', 'AUTO_REJECTED') or rfq.status == 'REJECTED':
+            rfq.status = 'REJECTED'
+            if not rfq.acceptance_status:
+                rfq.acceptance_status = 'REJECTED'
+            db.commit()
+        else:
+            # Acceptance decision is still pending. Check if acceptance window has expired!
+            if acc_deadline and now > acc_deadline:
+                from app.crud.crud import log_action
+                if rfq.acceptance_timeout_action == "AUTO_ACCEPT":
+                    rfq.status = 'COMPLETED'
+                    rfq.acceptance_status = 'AUTO_ACCEPTED'
+                    rfq.acceptance_resolved_at = now
+                    for leg in (rfq.legs or []):
+                        if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
+                            leg.status = 'ACCEPTED'
+                        elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
+                            leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+                    db.commit()
+                    log_action(
+                        db=db,
+                        user_id=None,
+                        action_type="QUOTATION_DEAL_AUTO_ACCEPTED",
+                        entity_type="QuotationRequest",
+                        entity_id=None,
+                        details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "reason": "Acceptance window expired with policy AUTO_ACCEPT"},
+                        customer_id=rfq.customer_id
+                    )
+                else:
+                    # Policy is AUTO_REJECT (user's configuration!)
+                    rfq.status = 'REJECTED'
+                    rfq.acceptance_status = 'AUTO_REJECTED'
+                    rfq.admin_revision_notes = "Quotation auto-rejected: corporate acceptance window expired with default action AUTO_REJECT."
+                    rfq.acceptance_resolved_at = now
+                    for leg in (rfq.legs or []):
+                        leg.status = 'REJECTED'
+                        leg.rejection_reason = "Auto-rejected on acceptance timeout"
+                    db.commit()
+                    log_action(
+                        db=db,
+                        user_id=None,
+                        action_type="QUOTATION_DEAL_AUTO_REJECTED",
+                        entity_type="QuotationRequest",
+                        entity_id=None,
+                        details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "reason": "Acceptance window expired with policy AUTO_REJECT"},
+                        customer_id=rfq.customer_id
+                    )
+            else:
+                # Acceptance window is still active! Awaiting Corporate Admin manual decision
+                rfq.acceptance_status = 'PENDING'
+                if rfq.status not in ('REJECTED', 'CANCELLED'):
+                    rfq.status = 'EVALUATING'
+                db.commit()
         
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
     
@@ -754,6 +884,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "best_score": None,
                     "token": a.token,
                     "quotation_base": a.quotation_base or rfq.quotation_base,
+                    "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
                     "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
                     "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                     "approval_status": a.approval_status,
@@ -843,6 +974,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 "notes": best_offer.get('notes') if best_offer else (bank_offers[0].get('notes') if bank_offers else None),
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
+                "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
                 "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
                 "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                 "approval_status": a.approval_status,
@@ -856,8 +988,9 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             })
 
         results.sort(key=lambda x: (x['best_score'] is None, x['best_score']))
-        if results and results[0].get('best_score') is not None:
-            winner_bank_id = results[0]['bank_id']
+        exec_results = [r for r in results if (r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity')]
+        if exec_results and exec_results[0].get('best_score') is not None:
+            winner_bank_id = exec_results[0]['bank_id']
 
     else:
         # FX_SPOT: Evaluate per currency pair leg
@@ -933,6 +1066,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "submitted_by_email": None,
                         "token": a.token,
                         "quotation_base": assigned_base,
+                        "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
                         "is_document_visible": cfg.is_document_visible if hasattr(cfg, 'is_document_visible') else True,
                         "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                         "approval_status": a.approval_status,
@@ -999,6 +1133,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "submitted_by_email": offer_db.submitted_by_email,
                     "token": a.token,
                     "quotation_base": assigned_base,
+                    "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
                     "is_document_visible": cfg.is_document_visible if hasattr(cfg, 'is_document_visible') else True,
                     "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                     "approval_status": a.approval_status,
@@ -1031,7 +1166,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 ))
             leg_results = valid_leg_results + [r for r in leg_results if r.get('finalPrice') is None]
 
-            leg_has_execution = any((r.get('quotation_base') or 'Execution').lower() == 'execution' for r in leg_results)
+            leg_has_execution = any((r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity') for r in leg_results)
             leg_winner_bank_id = None
             leg_is_inconclusive = False
             leg_inconclusive_reason = None
@@ -1047,8 +1182,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 leg_is_inconclusive = True
                 leg_inconclusive_reason = "All counterparties were requested on an Indicative basis for this currency pair."
             else:
-                indicative_bids = [r for r in valid_leg_results if (r.get('quotation_base') or 'Execution').lower() == 'indicative']
-                execution_bids = [r for r in valid_leg_results if (r.get('quotation_base') or 'Execution').lower() == 'execution']
+                indicative_bids = [r for r in valid_leg_results if (r.get('quotation_base') or 'Execution').lower() == 'indicative' or r.get('is_cross_entity')]
+                execution_bids = [r for r in valid_leg_results if (r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity')]
 
                 if not execution_bids and is_closed:
                     leg_is_inconclusive = True
@@ -1119,8 +1254,12 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 leg.winner_rate = None
                 leg.saved_vs_avg = None
 
-            if is_closed and getattr(leg, 'status', None) == 'PENDING':
-                leg.status = 'COMPLETED'
+            if is_closed and hasattr(leg, 'id'):
+                if leg_is_inconclusive:
+                    if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                        leg.status = 'INCONCLUSIVE'
+                elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
+                    leg.status = 'COMPLETED'
 
             legs_data.append({
                 "leg_id": leg.id,
@@ -1255,8 +1394,9 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         rfq.winner_rate = None
         rfq.saved_vs_avg = None
 
-    # Auto-dispatch result emails for concluded Execution quotations if not already sent
-    if dispatch_emails and is_closed and winner_bank_id and not is_inconclusive and has_execution_banks:
+    # Auto-dispatch result emails ONLY if the deal was accepted (manually or auto-accepted)
+    is_deal_confirmed = rfq.acceptance_status in ('ACCEPTED', 'AUTO_ACCEPTED') or (rfq.status == 'COMPLETED' and is_indicative_only)
+    if dispatch_emails and is_closed and is_deal_confirmed and winner_bank_id and not is_inconclusive and has_execution_banks:
         trigger_auto_dispatch_results(rfq.id)
 
     db.commit()
@@ -1301,6 +1441,22 @@ def get_rfq_history(
     now = datetime.now(timezone.utc)
     changed = False
     
+    # 1. Batch fetch parent RFQ references & re-tender counts in 2 queries instead of 2 * N queries
+    req_ids = [r.id for r in reqs]
+    parent_ids = list({r.parent_rfq_id for r in reqs if r.parent_rfq_id})
+
+    parent_map = {}
+    if parent_ids:
+        parent_rows = db.query(QuotationRequest.id, QuotationRequest.ref_no).filter(QuotationRequest.id.in_(parent_ids)).all()
+        parent_map = {row[0]: row[1] for row in parent_rows}
+
+    retender_counts = {}
+    if req_ids:
+        retender_rows = db.query(QuotationRequest.parent_rfq_id, func.count(QuotationRequest.id)).filter(
+            QuotationRequest.parent_rfq_id.in_(req_ids)
+        ).group_by(QuotationRequest.parent_rfq_id).all()
+        retender_counts = {row[0]: row[1] for row in retender_rows}
+
     for r in reqs:
         try:
             w_end_val = r.window_end
@@ -1310,40 +1466,63 @@ def get_rfq_history(
         except Exception:
             is_closed = False
             
+        status_changed = False
         if is_closed:
-            if r.status == 'PENDING':
+            if r.status in ('PENDING', 'OPEN'):
                 r.status = 'COMPLETED'
                 changed = True
+                status_changed = True
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED'
                 changed = True
+                status_changed = True
             elif r.status == 'CANCEL_REQUESTED':
                 r.status = 'CANCELLED'
                 changed = True
+                status_changed = True
             
             # Auto-expire any bank-level approvals that were still PENDING when window closed
-            pending_assignments = db.query(QuotationBankAssignment).filter(
-                QuotationBankAssignment.rfq_id == r.id,
-                QuotationBankAssignment.approval_status == 'PENDING'
-            ).all()
-            for pa in pending_assignments:
-                pa.approval_status = 'EXPIRED'
-                changed = True
+            if status_changed:
+                pending_assignments = db.query(QuotationBankAssignment).filter(
+                    QuotationBankAssignment.rfq_id == r.id,
+                    QuotationBankAssignment.approval_status == 'PENDING'
+                ).all()
+                for pa in pending_assignments:
+                    pa.approval_status = 'EXPIRED'
         
-        # Attach winner and rate data using unified calculation engine
-        if is_closed or r.status in ['COMPLETED', 'TRADED']:
+        # Attach winner and rate data:
+        # For concluded RFQs, winner info is already persisted on QuotationLeg! Read directly.
+        if hasattr(r, 'legs') and r.legs:
+            winning_legs = [l for l in r.legs if l.winner_bank_name is not None]
+            if len(r.legs) > 1:
+                if len(winning_legs) == len(r.legs) and len(set(l.winner_bank_name for l in winning_legs)) == 1:
+                    r.winner_bank_name = winning_legs[0].winner_bank_name
+                    r.winner_rate = None
+                    r.saved_vs_avg = sum(l.saved_vs_avg or 0.0 for l in r.legs)
+                elif winning_legs:
+                    unique_winners = list(set(l.winner_bank_name for l in winning_legs))
+                    if len(unique_winners) == 1:
+                        r.winner_bank_name = f"{unique_winners[0]} ({len(winning_legs)}/{len(r.legs)} Legs)"
+                    else:
+                        r.winner_bank_name = f"Split Award ({len(winning_legs)}/{len(r.legs)} Legs)"
+                    r.winner_rate = None
+                    r.saved_vs_avg = sum(l.saved_vs_avg or 0.0 for l in r.legs)
+                else:
+                    r.winner_bank_name = None
+                    r.winner_rate = None
+                    r.saved_vs_avg = None
+            else:
+                first_leg = r.legs[0]
+                r.winner_bank_name = first_leg.winner_bank_name
+                r.winner_rate = first_leg.winner_rate
+                r.saved_vs_avg = first_leg.saved_vs_avg
+        elif is_closed and r.status in ('PENDING', 'OPEN', 'EVALUATING'):
             compute_rfq_standings(r, db, dispatch_emails=False)
-        else:
-            r.winner_bank_name = None
-            r.winner_rate = None
-            r.saved_vs_avg = None
+        elif r.status in ['COMPLETED', 'TRADED']:
+            compute_rfq_standings(r, db, dispatch_emails=False)
             
-        if r.parent_rfq_id:
-            parent = db.query(QuotationRequest).filter(QuotationRequest.id == r.parent_rfq_id).first()
-            if parent:
-                r.parent_rfq_ref = parent.ref_no
-                
-        r.re_tender_count = db.query(QuotationRequest).filter(QuotationRequest.parent_rfq_id == r.id).count()
+        r.parent_rfq_ref = parent_map.get(r.parent_rfq_id)
+        r.re_tender_count = retender_counts.get(r.id, 0)
             
     if changed:
         db.commit()
@@ -1676,6 +1855,8 @@ def retender_quotation(
         allow_alternative_value_date=parent.allow_alternative_value_date or False,
         document_path=parent.document_path,
         status=initial_status,
+        acceptance_timeout_seconds=parent.acceptance_timeout_seconds,
+        acceptance_timeout_action=parent.acceptance_timeout_action,
         token_validity_hours=payload.token_validity_hours or parent.token_validity_hours or 24,
         parent_rfq_id=root_parent_id,
         entity_id=getattr(payload, 'entity_id', None) or parent.entity_id
@@ -2022,7 +2203,32 @@ def resubmit_quotation(
                     QuotationBank.trade_type.in_([rfq.type, "BOTH"])
                 ).first()
                 if q_bank:
-                    q_base_override = b_data.get('quotationBase') or rfq.quotation_base
+                    # Check if bank is cross-entity for this RFQ's entity
+                    is_cross_bank = False
+                    if rfq.entity_id and q_bank.entity_scope != 'ALL_ENTITIES':
+                        assoc_eids = [assoc.entity_id for assoc in q_bank.entity_associations] if q_bank.entity_associations else []
+                        if rfq.entity_id not in assoc_eids:
+                            is_cross_bank = True
+
+                    if is_cross_bank:
+                        from app.crud.crud_config import crud_customer_configuration
+                        from app.constants import GlobalConfigKey
+                        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                            db, customer_id=current_user.customer_id, config_key=GlobalConfigKey.ALLOW_CROSS_ENTITY_INDICATIVE_QUOTES
+                        )
+                        allow_cross_cfg = False
+                        if cfg and cfg.get("effective_value"):
+                            allow_cross_cfg = str(cfg["effective_value"]).strip().lower() in ("true", "1", "yes")
+                        if not allow_cross_cfg:
+                            b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{b_data.get('id')}")
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
+                            )
+                        q_base_override = "Indicative"
+                    else:
+                        q_base_override = b_data.get('quotationBase') or rfq.quotation_base
+
                     is_doc_vis = b_data.get('isDocumentVisible', True)
                     if is_doc_vis is None:
                         is_doc_vis = True
@@ -2031,7 +2237,7 @@ def resubmit_quotation(
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
                     is_exec = (rfq.quotation_base or '').lower() == 'execution' or effective_base == 'execution'
-                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec) else None
+                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec and not is_cross_bank) else None
 
                     bank_value_date = b_data.get('valueDate') or rfq.value_date
                     if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
@@ -2063,9 +2269,28 @@ def resubmit_quotation(
                     db.add(db_assignment)
                     db.flush()
 
+                    bank_seen_signatures = set()
                     for leg_obj in current_legs:
                         cfg_id = str(uuid.uuid4())
                         leg_cfg_val_d = _parse_d(b_data.get('valueDate') or leg_obj.value_date)
+                        leg_q_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or leg_obj.quotation_base or 'Execution')
+
+                        if (rfq.type == 'FX_SPOT' or not rfq.type):
+                            sig = get_bank_leg_signature(
+                                leg_obj.buy_currency,
+                                leg_obj.sell_currency,
+                                leg_obj.direction,
+                                leg_cfg_val_d,
+                                leg_q_base
+                            )
+                            if sig in bank_seen_signatures:
+                                b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{b_data.get('id')}")
+                                raise HTTPException(
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"Counterparty conflict for {b_name}: Multiple legs requested for {leg_obj.buy_currency}/{leg_obj.sell_currency} with matching effective settlement date ({leg_cfg_val_d}) and quotation base ({str(leg_q_base).capitalize()}). A bank cannot receive identical quote requests."
+                                )
+                            bank_seen_signatures.add(sig)
+
                         leg_bank_cfg = QuotationBankLegConfig(
                             id=cfg_id,
                             assignment_id=db_assignment.id,
@@ -2075,7 +2300,7 @@ def resubmit_quotation(
                             cost_percent=b_data.get('costPercent', 0.0),
                             cost_max=b_data.get('costMax', 0.0),
                             cost_flat=b_data.get('costFlat', 0.0),
-                            quotation_base=b_data.get('quotationBase') or leg_obj.quotation_base,
+                            quotation_base=leg_q_base,
                             is_document_visible=is_doc_vis,
                             value_date=leg_cfg_val_d,
                             allow_alternative_value_date=bank_allow_alt
@@ -2297,22 +2522,51 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
             lost_legs = [l for l in legs_data if l.get("winner_bank_id") != b_id and any(r.get("bank_id") == b_id for r in l.get("results", []))]
 
             if won_legs:
-                # Execution confirmation email
-                subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - Multi-Currency Package ({len(won_legs)} Leg{'s' if len(won_legs) > 1 else ''})"
+                is_partial = len(won_legs) < len(legs_data)
+                if is_partial:
+                    inconclusive_lost = [l for l in lost_legs if l.get("is_inconclusive") or not l.get("winner_bank_id")]
+                    awarded_other_lost = [l for l in lost_legs if not l.get("is_inconclusive") and l.get("winner_bank_id")]
+                    if inconclusive_lost and awarded_other_lost:
+                        remain_str = f"The remaining {len(lost_legs)} unselected pair(s) were concluded ({len(awarded_other_lost)} awarded to competing counterparties, {len(inconclusive_lost)} closed without execution)."
+                    elif inconclusive_lost:
+                        remain_str = f"The remaining {len(lost_legs)} unselected pair(s) closed without execution (inconclusive / exceeded tolerance limits)."
+                    else:
+                        remain_str = f"The remaining {len(lost_legs)} unselected pair(s) were concluded and awarded to competing counterparties."
+                    subject = f"TRADE EXECUTION (PARTIAL): RFQ {ref_no} ({customer_name}) - Awarded {len(won_legs)} of {len(legs_data)} Legs"
+                    alloc_str = f"<span style='color: #16a34a; font-weight: 700;'>Partially Awarded ({len(won_legs)} of {len(legs_data)} Currency Pairs)</span>"
+                    summary_text = f"We are pleased to confirm the execution of <strong>{len(won_legs)} of {len(legs_data)} currency pairs</strong> with <strong>{customer_name}</strong> based on your winning quotes. {remain_str}"
+                else:
+                    subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - Full Multi-Currency Package ({len(won_legs)} Legs)"
+                    alloc_str = f"<span style='color: #16a34a; font-weight: 700;'>100% Package Awarded ({len(won_legs)} of {len(legs_data)} Pairs)</span>"
+                    summary_text = f"We are pleased to confirm the execution of all {len(won_legs)} currency pair trades in this package with <strong>{customer_name}</strong> based on your winning quotes."
+
                 key_vals = {
                     "RFQ Reference": ref_no,
                     "Requesting Legal Entity": customer_name,
-                    "Total Package Legs Won": f"<span style='color: #16a34a; font-weight: 700;'>{len(won_legs)} of {len(legs_data)} Currency Pairs</span>"
+                    "Package Allocation": alloc_str,
                 }
                 for i, leg in enumerate(won_legs):
                     b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
                     p_str = f"{b_res.get('price', 0):.5f}" if b_res.get('price') is not None else "N/A"
                     val_date_str = str(b_res.get('offered_value_date') or b_res.get('assigned_value_date') or leg.get('value_date') or 'Standard Spot')
                     pair_label = leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
-                    key_vals[f"Awarded Leg {i+1} ({pair_label})"] = (
-                        f"{leg.get('direction', 'BUY')} {leg.get('amount', 0):,.2f} {leg.get('buy_currency', '')} "
+                    key_vals[f"Awarded Leg #{i+1} ({pair_label})"] = (
+                        f"🏆 Client {leg.get('direction', 'BUY')} {leg.get('amount', 0):,.2f} {leg.get('buy_currency', '')} "
                         f"@ <strong style='color: #16a34a;'>{p_str}</strong> (Value Date: {val_date_str})"
                     )
+
+                if is_partial and lost_legs:
+                    for i, leg in enumerate(lost_legs):
+                        b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
+                        p_str = f"{b_res.get('price', 0):.5f}" if b_res.get('price') is not None else "No Quote"
+                        pair_label = leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
+                        if leg.get("is_inconclusive") or not leg.get("winner_bank_id"):
+                            status_suffix = "Concluded Without Execution (Tolerance Exceeded / Inconclusive)"
+                        else:
+                            status_suffix = "Concluded &amp; Awarded to Competing Counterparty"
+                        key_vals[f"Unselected Leg ({pair_label})"] = (
+                            f"<span style='color: #64748b;'>Your Quote: {p_str} &bull; {status_suffix}</span>"
+                        )
 
                 body = build_transaction_email_html(
                     customer_name=customer_name,
@@ -2320,7 +2574,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                     transaction_ref=ref_no,
                     transaction_type="RFQ Multi-Leg Execution",
                     key_value_dict=key_vals,
-                    summary_text=f"We are pleased to confirm the execution of the following currency pair trades with <strong>{customer_name}</strong> based on your winning quotes.",
+                    summary_text=summary_text,
                     recipient_name=f"{b_info['bank_name']} Treasury Desk"
                 )
             elif lost_legs:
@@ -2330,13 +2584,13 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                     "RFQ Reference": ref_no,
                     "Requesting Legal Entity": customer_name,
                     "Participating Package Legs": f"{len(lost_legs)} Currency Pairs",
-                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Other Counterparties</span>"
+                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Competing Counterparties</span>"
                 }
                 for i, leg in enumerate(lost_legs):
                     b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
                     p_str = f"{b_res.get('price', 0):.5f}" if b_res.get('price') is not None else "No Quote Submitted"
                     pair_label = leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
-                    key_vals[f"Leg {i+1} ({pair_label})"] = f"Your Quote: {p_str} — Concluded"
+                    key_vals[f"Leg #{i+1} ({pair_label})"] = f"Your Quote: {p_str} &bull; Concluded"
 
                 body = build_transaction_email_html(
                     customer_name=customer_name,
@@ -2344,7 +2598,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                     transaction_ref=ref_no,
                     transaction_type="RFQ Outcome",
                     key_value_dict=key_vals,
-                    summary_text=f"Thank you for submitting quotes for RFQ <strong>{ref_no}</strong> with <strong>{customer_name}</strong>. We are writing to inform you that these transactions have concluded and were executed with other counterparties offering more competitive pricing.",
+                    summary_text=f"Thank you for submitting quotes for RFQ <strong>{ref_no}</strong> with <strong>{customer_name}</strong>. We are writing to inform you that all trades in this package have concluded and were awarded to other counterparties offering more competitive pricing.",
                     recipient_name=f"{b_info['bank_name']} Treasury Desk"
                 )
             else:
@@ -2405,7 +2659,8 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                         "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
                         "Settlement Value Date": executed_val_date,
                         "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
-                        "Execution Timestamp": sub_time_str
+                        "Execution Timestamp": sub_time_str,
+                        "Outcome Status": "<span style='color: #16a34a; font-weight: 700;'>🏆 Awarded &amp; Executed</span>"
                     },
                     summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
                     recipient_name=f"{bank_res['bank_name']} Treasury Desk"
@@ -2426,9 +2681,9 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
                         "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
                         "Target Value Date": executed_val_date,
                         "Your Submitted Quote": quote_display,
-                        "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Another Counterparty</span>"
+                        "Deal Status": "<span style='color: #64748b; font-weight: 700;'>❌ Executed with Competing Counterparty</span>"
                     },
-                    summary_text=f"Thank you for submitting your quote for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this transaction has concluded and was executed with another counterparty who offered a more competitive all-in rate.",
+                    summary_text=f"Thank you for submitting your quote for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this transaction has concluded and was awarded to another counterparty offering a more competitive all-in rate.",
                     recipient_name=f"{bank_res['bank_name']} Treasury Desk"
                 )
 
@@ -2630,13 +2885,49 @@ def export_quotations_csv(
             winner_bank_id = res_data.get("winner_bank_id")
             creator_name = (rfq.creator.email.split('@')[0] if (rfq.creator and rfq.creator.email) else getattr(rfq, 'creator_name', 'End User')) or "End User"
             
-            if not results:
+            created_at_str = rfq.created_at
+            if created_at_str and hasattr(created_at_str, 'isoformat'):
+                created_at_str = created_at_str.isoformat()
+            else:
+                created_at_str = str(created_at_str or "")
+
+            legs_data = res_data.get("legs", [])
+            if legs_data and len(legs_data) > 1:
+                for leg in legs_data:
+                    leg_results = leg.get("results", [])
+                    leg_winner_id = leg.get("winner_bank_id")
+                    if not leg_results:
+                        writer.writerow([
+                            rfq.ref_no, f"FX_PORTFOLIO (Leg {leg.get('leg_index', 1)})", leg.get("direction") or rfq.direction or "", leg.get("amount") or 0,
+                            leg.get("buy_currency") or "", leg.get("sell_currency") or "", leg.get("value_date") or "",
+                            leg.get("status") or rfq.status, leg.get("quotation_base") or rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
+                            "No Quotes", "", "", "", "", "", "", "NO",
+                            creator_name, created_at_str
+                        ])
+                    else:
+                        for b in leg_results:
+                            is_win = "YES" if (leg_winner_id and b.get("bank_id") == leg_winner_id) else "NO"
+                            sub_time = b.get("submitted_at")
+                            sub_time_str = sub_time.isoformat() if (sub_time and hasattr(sub_time, 'isoformat')) else str(sub_time or "")
+                            writer.writerow([
+                                rfq.ref_no, f"FX_PORTFOLIO (Leg {leg.get('leg_index', 1)})", leg.get("direction") or rfq.direction or "", leg.get("amount") or 0,
+                                leg.get("buy_currency") or "", leg.get("sell_currency") or "", leg.get("value_date") or "",
+                                leg.get("status") or rfq.status, leg.get("quotation_base") or rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
+                                b.get("bank_name", ""), b.get("quotation_base", ""),
+                                "YES" if b.get("is_document_visible") else "NO",
+                                b.get("price") if b.get("price") is not None else "No Quote",
+                                b.get("bank_fee_total") if b.get("bank_fee_total") is not None else "",
+                                b.get("finalPrice") if b.get("finalPrice") is not None else "",
+                                sub_time_str,
+                                is_win, creator_name, created_at_str
+                            ])
+            elif not results:
                 writer.writerow([
                     rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,
                     rfq.buy_currency or "", rfq.sell_currency or "", rfq.value_date or "",
                     rfq.status, rfq.quotation_base or "Execution", rfq.max_tolerance_percent or "",
                     "No Banks Assigned", "", "", "", "", "", "", "NO",
-                    creator_name, rfq.created_at.isoformat() if (rfq.created_at and hasattr(rfq.created_at, 'isoformat')) else str(rfq.created_at or "")
+                    creator_name, created_at_str
                 ])
             else:
                 for b in results:
@@ -2646,12 +2937,6 @@ def export_quotations_csv(
                         sub_time = sub_time.isoformat()
                     else:
                         sub_time = str(sub_time or "")
-
-                    created_at_str = rfq.created_at
-                    if created_at_str and hasattr(created_at_str, 'isoformat'):
-                        created_at_str = created_at_str.isoformat()
-                    else:
-                        created_at_str = str(created_at_str or "")
 
                     writer.writerow([
                         rfq.ref_no, rfq.type, rfq.direction or "", rfq.amount or 0,

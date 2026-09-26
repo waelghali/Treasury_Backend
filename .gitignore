@@ -41,3 +41,6 @@ interactive-experience/
 *.mp3
 *.wav
 *.m4a
+
+# Temporary scratch and debug artifacts
+scratch/

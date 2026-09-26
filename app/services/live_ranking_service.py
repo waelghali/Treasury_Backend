@@ -220,16 +220,85 @@ class LiveRankingService:
         db: Session,
         rfq_id: str,
         assignment_id: str
-    ) -> Dict[str, Optional[int]]:
-        """Calculates live rank for every leg of an RFQ where the bank is invited."""
+    ) -> Dict[Any, Any]:
+        """Calculates rich live rank information for every leg of an RFQ where the bank is invited."""
+        from app.models.models_quotation import QuotationBankAssignment, QuotationOffer, QuotationTBillOffer
         rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
         if not rfq:
             return {}
+
+        all_assignments = db.query(QuotationBankAssignment).filter(
+            QuotationBankAssignment.rfq_id == rfq_id
+        ).all()
+        all_assignment_ids = [a.id for a in all_assignments]
+
         results = {}
-        for leg in rfq.legs:
-            results[leg.id] = LiveRankingService.calculate_bank_live_rank(
-                db=db, rfq_id=rfq_id, assignment_id=assignment_id, leg_id=leg.id
+        legs = rfq.legs or []
+        if legs:
+            for idx, leg in enumerate(legs):
+                rank = LiveRankingService.calculate_bank_live_rank(
+                    db=db, rfq_id=rfq_id, assignment_id=assignment_id, leg_id=leg.id
+                )
+                
+                # Count total quotes for this specific leg
+                if rfq.type == 'TBILL':
+                    leg_submitted_ids = set(
+                        o.assignment_id for o in db.query(QuotationTBillOffer).filter(
+                            QuotationTBillOffer.assignment_id.in_(all_assignment_ids)
+                        ).all()
+                    )
+                else:
+                    leg_submitted_ids = set(
+                        o.assignment_id for o in db.query(QuotationOffer).filter(
+                            QuotationOffer.assignment_id.in_(all_assignment_ids),
+                            (QuotationOffer.leg_id == leg.id) | (QuotationOffer.leg_id.is_(None))
+                        ).all()
+                    )
+
+                pair_name = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                leg_info = {
+                    "leg_id": str(leg.id),
+                    "pair": pair_name,
+                    "rank": rank,
+                    "total_quotes": len(leg_submitted_ids),
+                    "is_leading": (rank == 1) if rank else False
+                }
+
+                # Multi-key index so frontend can access by leg UUID, string UUID, 0-based index, or currency pair
+                results[leg.id] = leg_info
+                results[str(leg.id)] = leg_info
+                results[idx] = leg_info
+                results[str(idx)] = leg_info
+                results[pair_name] = leg_info
+        else:
+            rank = LiveRankingService.calculate_bank_live_rank(
+                db=db, rfq_id=rfq_id, assignment_id=assignment_id, leg_id=None
             )
+            if rfq.type == 'TBILL':
+                sub_ids = set(
+                    o.assignment_id for o in db.query(QuotationTBillOffer).filter(
+                        QuotationTBillOffer.assignment_id.in_(all_assignment_ids)
+                    ).all()
+                )
+            else:
+                sub_ids = set(
+                    o.assignment_id for o in db.query(QuotationOffer).filter(
+                        QuotationOffer.assignment_id.in_(all_assignment_ids)
+                    ).all()
+                )
+            pair_name = f"{rfq.buy_currency}/{rfq.sell_currency}" if rfq.buy_currency else "FX"
+            single_info = {
+                "leg_id": str(rfq.id),
+                "pair": pair_name,
+                "rank": rank,
+                "total_quotes": len(sub_ids),
+                "is_leading": (rank == 1) if rank else False
+            }
+            results[str(rfq.id)] = single_info
+            results[0] = single_info
+            results["0"] = single_info
+            results[pair_name] = single_info
+
         return results
 
 live_ranking_service = LiveRankingService()

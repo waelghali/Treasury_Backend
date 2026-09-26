@@ -74,6 +74,12 @@ class QuotationRequest(BaseModel):
     scheduled_release_job_id = Column(String(100), nullable=True, comment="APScheduler job ID for scheduled release")
     is_dispatched = Column(Boolean, default=False, nullable=False, comment="Whether quotation invitation emails have been dispatched to banks")
     dispatched_at = Column(DateTime(timezone=True), nullable=True, comment="Timestamp when quotation invitation emails were dispatched")
+    acceptance_timeout_seconds = Column(Integer, nullable=True)
+    acceptance_timeout_action = Column(String(50), nullable=True, comment="'AUTO_ACCEPT' or 'AUTO_REJECT'")
+    acceptance_deadline = Column(DateTime(timezone=True), nullable=True)
+    acceptance_status = Column(String(50), nullable=True, comment="'PENDING', 'ACCEPTED', 'REJECTED', 'AUTO_ACCEPTED', 'AUTO_REJECTED', 'INDICATIVE_COMPLETED'")
+    acceptance_resolved_at = Column(DateTime(timezone=True), nullable=True)
+    acceptance_resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     customer = relationship("Customer")
     entity = relationship("CustomerEntity")
@@ -174,6 +180,16 @@ class QuotationBankAssignment(BaseModel):
                 if cfg.leg_id == leg_id:
                     return cfg
         return self
+
+    @property
+    def is_cross_entity(self) -> bool:
+        """Determines if this bank assignment is a cross-entity benchmark (not directly scoped to the RFQ entity)."""
+        if not self.rfq or not self.rfq.entity_id or not self.quotation_bank:
+            return False
+        if self.quotation_bank.entity_scope == 'ALL_ENTITIES':
+            return False
+        assoc_ids = [assoc.entity_id for assoc in self.quotation_bank.entity_associations] if self.quotation_bank.entity_associations else []
+        return self.rfq.entity_id not in assoc_ids
 
 class QuotationBankLegConfig(BaseModel):
     """Per-bank configuration for a specific currency pair leg within a quotation session."""

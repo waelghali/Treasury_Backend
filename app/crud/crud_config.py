@@ -97,7 +97,13 @@ class CRUDGlobalConfiguration(CRUDBase):
                 pass
 
     def _validate_config_value(global_config, configured_value):
-        if global_config.unit and global_config.unit.lower() == 'boolean':
+        if global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+            if configured_value.strip().lower() not in ['true', 'false', 'auto_accept', 'auto_reject', 'accept', 'reject']:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Value for '{global_config.key.value}' must be 'AUTO_ACCEPT', 'AUTO_REJECT', 'true', or 'false'."
+                )
+        elif global_config.unit and global_config.unit.lower() == 'boolean':
             if configured_value.lower() not in ['true', 'false']:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -320,9 +326,22 @@ class CRUDCustomerConfiguration(CRUDBase):
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Configured value {configured_value} exceeds the maximum allowed value of {global_config.value_max} {global_config.unit}.",
                     )
-            elif global_config.unit == "boolean":
-                if configured_value.lower() not in ['true', 'false']:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Value must be 'true' or 'false'.")
+            elif global_config.unit == "boolean" or global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+                val_clean = configured_value.strip().lower()
+                if global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+                    if val_clean in ['auto_accept', 'accept', 'true', '1']:
+                        configured_value = "AUTO_ACCEPT"
+                    elif val_clean in ['auto_reject', 'reject', 'false', '0']:
+                        configured_value = "AUTO_REJECT"
+                    else:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Value must be 'AUTO_ACCEPT', 'AUTO_REJECT', 'true', or 'false'."
+                        )
+                else:
+                    if val_clean not in ['true', 'false']:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Value must be 'true' or 'false'.")
+                    configured_value = val_clean
             elif global_config.key == GlobalConfigKey.COMMON_COMMUNICATION_LIST:
                 try:
                     parsed_list = json.loads(configured_value)

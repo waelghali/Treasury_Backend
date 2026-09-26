@@ -317,7 +317,9 @@ def build_quotation_rfq_bank_email(
     customer_branding: str = "Corporate Treasury",
     link: str = "#",
     email_purpose: str = "INVITATION",
-    platform_name: str = "Grow Treasury Platform"
+    platform_name: str = "Grow Treasury Platform",
+    db: Any = None,
+    acceptance_timeout_seconds: Optional[int] = None
 ) -> Tuple[str, str]:
     """
     Generates a standardized, high-aesthetic HTML quotation email for bank desks.
@@ -326,21 +328,28 @@ def build_quotation_rfq_bank_email(
     - Formatted amount with thousands separator (e.g. USD 17,092,604.00)
     - Currency pair (e.g. USD / EGP) and client trade flow (Buy / Sell)
     - Exact target value date and whether alternative value date is permitted
-    - Quotation base (Indicative vs Firm Execution)
+    - Quotation base (Indicative vs Firm Execution vs Mixed Package)
+    - Clear expected results timeline duration based on customer SLA configuration
     - Direct secure CTA button and direct clickable fallback link
     """
     # 0. Format Requesting Legal Entity
-    rfq_entity = getattr(rfq, "entity", None)
-    entity_name = (rfq_entity.entity_name if rfq_entity and getattr(rfq_entity, "entity_name", None) else None) or customer_branding
-    entity_cr = getattr(rfq_entity, "cr_number", None) if rfq_entity else None
-    entity_tax = getattr(rfq_entity, "tax_id", None) if rfq_entity else None
+    is_cross_entity_bank = bool(assignment and getattr(assignment, "is_cross_entity", False))
 
-    entity_meta_parts = []
-    if entity_cr:
-        entity_meta_parts.append(f"CR: {entity_cr}")
-    if entity_tax:
-        entity_meta_parts.append(f"Tax ID: {entity_tax}")
-    entity_meta_html = f'<div style="font-size: 11px; color: #64748b; font-family: monospace; font-weight: normal; margin-top: 3px;">{" &bull; ".join(entity_meta_parts)}</div>' if entity_meta_parts else ""
+    if is_cross_entity_bank:
+        entity_name = customer_branding or "Corporate Group Treasury"
+        entity_meta_html = '<div style="font-size: 11px; color: #2563eb; font-weight: 600; margin-top: 3px;">🌐 Corporate Group Treasury &bull; Market Indicative Benchmarking</div>'
+    else:
+        rfq_entity = getattr(rfq, "entity", None)
+        entity_name = (rfq_entity.entity_name if rfq_entity and getattr(rfq_entity, "entity_name", None) else None) or customer_branding
+        entity_cr = getattr(rfq_entity, "cr_number", None) if rfq_entity else None
+        entity_tax = getattr(rfq_entity, "tax_id", None) if rfq_entity else None
+
+        entity_meta_parts = []
+        if entity_cr:
+            entity_meta_parts.append(f"CR: {entity_cr}")
+        if entity_tax:
+            entity_meta_parts.append(f"Tax ID: {entity_tax}")
+        entity_meta_html = f'<div style="font-size: 11px; color: #64748b; font-family: monospace; font-weight: normal; margin-top: 3px;">{" &bull; ".join(entity_meta_parts)}</div>' if entity_meta_parts else ""
 
     # 1. Format Quotation Window (Start & Deadline) in Cairo Local Time
     cairo_tz = ZoneInfo("Africa/Cairo")
@@ -403,83 +412,175 @@ def build_quotation_rfq_bank_email(
     buy_curr = getattr(rfq, "buy_currency", None) or ""
     sell_curr = getattr(rfq, "sell_currency", None) or ""
     direction = getattr(rfq, "direction", None) or "Buy"
+    legs = getattr(rfq, "legs", []) or []
+    is_multi_pair = len(legs) > 1 and rfq_type == "FX_SPOT"
+
+    # Quotation Base & Multi-Leg Mixed Package Detection
+    q_base = (assignment.quotation_base if assignment and getattr(assignment, "quotation_base", None) else getattr(rfq, "quotation_base", None)) or "Indicative"
+    leg_bases = []
+    if is_multi_pair:
+        for l in legs:
+            cfg = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == l.id), None) if assignment else None
+            l_base = (cfg.quotation_base if cfg and getattr(cfg, 'quotation_base', None) else l.quotation_base) or q_base
+            leg_bases.append((l_base or 'Indicative').capitalize())
+
+    is_mixed = bool(is_multi_pair and len(set(leg_bases)) > 1)
 
     if rfq_type == "FX_SPOT":
-        pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or "FX")
-        amount_display = f"<strong>{amount_str}</strong> {buy_curr}" if buy_curr else f"<strong>{amount_str}</strong>"
-        if direction.upper() == "BUY":
-            direction_display = f"Client <strong>BUYING {buy_curr}</strong> / <strong>SELLING {sell_curr}</strong>"
-        elif direction.upper() == "SELL":
-            direction_display = f"Client <strong>SELLING {sell_curr or buy_curr}</strong> / <strong>BUYING {buy_curr or sell_curr}</strong>"
+        if is_multi_pair:
+            pairs_summary = ", ".join([l.currency_pair or f"{l.buy_currency}/{l.sell_currency}" for l in legs])
+            if is_mixed:
+                pair_str = f"Mixed Package ({len(legs)} Pairs: {pairs_summary})"
+                amount_display = f"<strong>Multi-Currency Package ({len(legs)} Pairs &bull; Mixed Execution &amp; Indicative)</strong>"
+            else:
+                pair_str = f"Multi-Currency ({len(legs)} Pairs: {pairs_summary})"
+                amount_display = f"<strong>Portfolio Package ({len(legs)} Pairs)</strong>"
+            direction_display = "Multi-Currency Package"
         else:
-            direction_display = direction
+            pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or "FX")
+            amount_display = f"<strong>{amount_str}</strong> {buy_curr}" if buy_curr else f"<strong>{amount_str}</strong>"
+            if direction.upper() == "BUY":
+                direction_display = f"Client <strong>BUYING {buy_curr}</strong> / <strong>SELLING {sell_curr}</strong>"
+            elif direction.upper() == "SELL":
+                direction_display = f"Client <strong>SELLING {sell_curr or buy_curr}</strong> / <strong>BUYING {buy_curr or sell_curr}</strong>"
+            else:
+                direction_display = direction
     else:
         # T-Bill
         pair_str = "TBILL"
         amount_display = f"<strong>{amount_str}</strong> {buy_curr or sell_curr or 'EGP'}"
         direction_display = f"Client <strong>{direction.upper()}</strong> Treasury Bills"
 
-    # 6. Quotation Base
-    q_base = (assignment.quotation_base if assignment and getattr(assignment, "quotation_base", None) else getattr(rfq, "quotation_base", None)) or "Indicative"
-    if q_base.lower() == "indicative":
-        base_badge = """<span style="background-color: #f0f9ff; color: #0284c7; border: 1px solid #bae6fd; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">Indicative Pricing</span>"""
-        base_note = "Non-binding indicative quotation for price discovery and evaluation."
-    else:
-        base_badge = """<span style="background-color: #fef3c7; color: #b45309; border: 1px solid #fde68a; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">Firm Execution</span>"""
-        base_note = "Binding execution quotation subject to prompt corporate allocation upon submission."
+    # 6. Quotation Base Badging & Notes
+    is_all_indicative = is_cross_entity_bank or (
+        not is_mixed and (
+            (q_base or '').lower() == "indicative" or 
+            (leg_bases and all(b.lower() == 'indicative' for b in leg_bases))
+        )
+    )
 
-    # 7. Subject Line & Email Purpose
+    if is_mixed:
+        base_badge = """<span style="background-color: #fef3c7; color: #92400e; border: 1px solid #fde68a; padding: 4px 10px; border-radius: 6px; font-weight: 800; font-size: 12px; display: inline-block;">⚡ Mixed Package (Execution &amp; Indicative)</span>"""
+        base_note = "This package contains both binding Firm Execution legs and non-binding Indicative legs as detailed in the breakdown below."
+    elif is_all_indicative:
+        base_badge = """<span style="background-color: #f0f9ff; color: #0284c7; border: 1px solid #bae6fd; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block;">📊 Indicative Pricing</span>"""
+        base_note = "Non-binding indicative quotation for price discovery and market rate evaluation."
+    else:
+        base_badge = """<span style="background-color: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block;">⚡ Firm Execution</span>"""
+        base_note = "Binding execution quotation subject to prompt corporate allocation upon window close."
+
+    # 7. Customer Configuration for Expected Result Announcement Duration
+    default_timeout = 120 if rfq_type == "TBILL" else 30
+    if acceptance_timeout_seconds is None:
+        acceptance_timeout_seconds = default_timeout
+        try:
+            from sqlalchemy.orm import object_session
+            session = db or object_session(rfq) or (object_session(assignment) if assignment else None)
+            cust_id = getattr(rfq, "customer_id", None)
+            if session and cust_id:
+                from app.crud.crud_config import crud_customer_configuration
+                from app.constants import GlobalConfigKey
+                cfg_key = GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_TBILL if rfq_type == "TBILL" else GlobalConfigKey.QUOTATION_ACCEPTANCE_TIMEOUT_FX_SPOT
+                cfg = crud_customer_configuration.get_customer_config_or_global_fallback(session, cust_id, cfg_key)
+                if cfg and cfg.get("effective_value"):
+                    acceptance_timeout_seconds = int(cfg["effective_value"])
+        except Exception:
+            pass
+
+    if acceptance_timeout_seconds < 60:
+        result_window_str = f"{acceptance_timeout_seconds} seconds"
+    elif acceptance_timeout_seconds == 60:
+        result_window_str = "1 minute (60 seconds)"
+    elif acceptance_timeout_seconds % 60 == 0:
+        result_window_str = f"{acceptance_timeout_seconds // 60} minutes ({acceptance_timeout_seconds} seconds)"
+    else:
+        result_window_str = f"{acceptance_timeout_seconds // 60} min {acceptance_timeout_seconds % 60} sec ({acceptance_timeout_seconds}s)"
+
+    # 8. Subject Line & Email Purpose
     ref_no = getattr(rfq, "ref_no", "RFQ")
+    rfq_kind_str = "Mixed Package" if is_mixed else ("Firm Execution" if (q_base or '').lower() != "indicative" else "Indicative")
+
     if email_purpose == "RE_TENDER":
         subject = f"ACTION REQUIRED: Re-Tender RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
         banner_title = "Re-Tender Request for Quotation"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"You have received a <strong>re-tendered</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
-        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
+        if is_all_indicative:
+            instruction_text = f"Please review the updated indicative trade specifications below and access the live portal to enter your quotation before <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"Please review the updated trade specifications below and access the live portal to enter your quotation. Submission closes at <strong>{deadline_cairo_str}</strong>. Allocation decisions will be announced within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "REMINDER":
         subject = f"REMINDER: RFQ Submission Pending - {customer_branding} - {pair_str} - {ref_no}"
         banner_title = "Quotation Submission Reminder"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
-        intro_text = f"This is a reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> for <strong>{customer_branding}</strong> is pending submission."
-        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
+        intro_text = f"This is a reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> for <strong>{customer_branding}</strong> is currently pending your submission."
+        if is_all_indicative:
+            instruction_text = f"Please review the required trade specifications below and submit your quote before the window closes at <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"Please review the required trade specifications below and submit your quote before the window closes at <strong>{deadline_cairo_str}</strong>. Expected result announcement: within <strong>{result_window_str}</strong> after window close."
     elif email_purpose == "BANK_APPROVAL_REQUIRED":
         subject = f"APPROVAL REQUIRED: RFQ {ref_no} ({customer_branding}) - {pair_str}"
         banner_title = "Bank Approval Required &bull; RFQ Authorization"
         salutation = f"Dear <strong>{bank_name} Authorized Approver</strong>,"
-        intro_text = f"Your bank has been invited to participate in a new <strong>Firm Execution</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
-        instruction_text = "Please review the required trade specifications below and authorize your bank's participation. Once authorized, your execution desk will receive access to submit quotes."
+        intro_text = f"Your bank has been invited to participate in a new <strong>{rfq_kind_str}</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+        if is_all_indicative:
+            instruction_text = f"In accordance with institutional governance, your bank's designated approver must authorize participation before dealers can enter quotes. Once authorized, your desk will receive immediate access to quote. The window closes at <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"In accordance with institutional governance, your bank's designated approver must authorize participation before execution dealers can enter binding quotes. Once authorized, your desk will receive immediate access to quote. The window closes at <strong>{deadline_cairo_str}</strong>, with trade results announced within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "BANK_HEADS_UP":
         subject = f"HEADS UP: New RFQ Pending Bank Approval ({customer_branding}) - {ref_no}"
         banner_title = "RFQ Pending Bank Approval"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
-        intro_text = f"A new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your bank and is currently <strong>pending authorization from your bank's designated approver</strong>."
-        instruction_text = "Please review the required trade specifications below. You will receive a direct access link to submit your quotation as soon as your bank's approver authorizes participation."
+        intro_text = f"A new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your institution and is currently <strong>pending authorization from your bank's designated approver</strong>."
+        if is_all_indicative:
+            instruction_text = f"Please review the trade specifications below. You will receive an invitation email with a direct access link as soon as your bank's approver authorizes participation. The submission window closes at <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"Please review the trade specifications below. You will receive an invitation email with a direct access link as soon as your bank's approver authorizes participation. The submission window closes at <strong>{deadline_cairo_str}</strong>, with trade results expected within <strong>{result_window_str}</strong> of closure."
     elif email_purpose == "APPROVED_BY_BANK":
-        subject = f"ACTION REQUIRED: RFQ {ref_no} Authorized - Submit Your Quote"
+        subject = f"ACTION REQUIRED: RFQ {ref_no} Authorized - Submit Your Quote ({customer_branding})"
         banner_title = "RFQ Authorized for Desk Submission"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"Your bank's authorized approver has <strong>approved participation</strong> for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong>."
-        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
+        if is_all_indicative:
+            instruction_text = f"Your live quotation portal is now active. Please review the trade specifications below and access the live portal to enter your quotation before <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"Your live quotation portal is now active. Please review the trade specifications below and access the live portal to enter your quotation before <strong>{deadline_cairo_str}</strong>. Trade outcome and allocation results will appear within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "WINDOW_START_REMINDER_APPROVER":
-        subject = f"URGENT: RFQ {ref_no} Starts in 15 Minutes - Bank Approval Required ({customer_branding})"
+        subject = f"URGENT: RFQ {ref_no} Opens in 15 Minutes - Authorization Pending ({customer_branding})"
         banner_title = "Urgent: RFQ Window Opens in 15 Minutes &bull; Approval Required"
         salutation = f"Dear <strong>{bank_name} Authorized Approver</strong>,"
         intro_text = f"This is an urgent reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong> will open for live quotation in <strong>15 minutes</strong>, but your bank's authorization is still <strong>pending</strong>."
-        instruction_text = "Please authorize your bank's participation immediately so your execution desk can submit quotes as soon as the window opens."
+        if is_all_indicative:
+            instruction_text = f"Please authorize your bank's participation immediately via the secure link below so your desk can submit quotes as soon as the window opens. Submission deadline: <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"Please authorize your bank's participation immediately via the secure link below so your execution desk can submit quotes as soon as the window opens. Submission deadline: <strong>{deadline_cairo_str}</strong>; trade results expected within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "WINDOW_START_REMINDER_EXECUTION":
         subject = f"REMINDER: RFQ {ref_no} Opens in 15 Minutes - Prepare Your Quotation ({customer_branding})"
         banner_title = "Quotation Window Opens in 15 Minutes"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"This is a reminder that the live quotation window for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong> will open in <strong>15 minutes</strong>."
-        instruction_text = "Please access the quotation portal below to review terms and be ready to submit your quote when the window opens."
+        if is_all_indicative:
+            instruction_text = f"Please access the quotation portal below to review terms and be ready to submit your quote when the window opens. Window closes at <strong>{deadline_cairo_str}</strong>."
+        else:
+            instruction_text = f"Please access the quotation portal below to review terms and be ready to submit your quote when the window opens. Window closes at <strong>{deadline_cairo_str}</strong>. Trade results are announced within <strong>{result_window_str}</strong> following window close."
     else:
-        subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
-        banner_title = "New Request for Quotation"
-        salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
-        intro_text = f"You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
-        instruction_text = "Please review the required trade specifications below and access the live portal to enter your quotation."
+        if is_cross_entity_bank:
+            subject = f"INDICATIVE BENCHMARK: Group Market Quotation Request from {customer_branding} - {pair_str} - {ref_no}"
+            banner_title = "Group Indicative Market Quotation"
+            salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
+            intro_text = f"You have received a <strong>non-binding indicative quotation request</strong> from <strong>{customer_branding} Group Treasury</strong> for comparative market price benchmarking."
+            instruction_text = f"Please review the indicative trade specifications below and enter your quote via the secure link before <strong>{deadline_cairo_str}</strong>. This quotation request is strictly indicative for group price discovery and does not constitute a firm trade commitment."
+        else:
+            subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
+            banner_title = "New Request for Quotation"
+            salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
+            intro_text = f"You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
+            if is_all_indicative:
+                instruction_text = f"Please review the required trade specifications below and access the live portal to enter your quotation before <strong>{deadline_cairo_str}</strong>."
+            else:
+                instruction_text = f"Please review the required trade specifications below and access the live portal to enter your quotation before <strong>{deadline_cairo_str}</strong>. Trade outcome and allocation results will appear within <strong>{result_window_str}</strong> of window close."
 
-    # 8. Action Box / Call To Action
+    # 9. Action Box / Call To Action
     if email_purpose == "BANK_HEADS_UP":
         action_box_html = f"""
             <!-- PENDING APPROVAL INFORMATION BOX -->
@@ -526,7 +627,7 @@ def build_quotation_rfq_bank_email(
             </p>
         """
 
-    # 9. Extra T-Bill Rows if applicable
+    # 10. Extra T-Bill Rows if applicable
     tbill_rows = ""
     if rfq_type == "TBILL":
         s_start = getattr(rfq, "settlement_date_start", "") or ""
@@ -548,8 +649,118 @@ def build_quotation_rfq_bank_email(
                         </tr>
         """
 
-    # 10. HTML Template
+    if is_multi_pair:
+        leg_rows_list = []
+        for idx, leg in enumerate(legs, 1):
+            cfg = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == leg.id), None) if assignment else None
+            leg_q_base = (cfg.quotation_base if cfg and getattr(cfg, 'quotation_base', None) else leg.quotation_base) or q_base
+            leg_is_exec = (leg_q_base or '').lower() == 'execution'
+            leg_badge_html = """<span style="background-color: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 11px;">⚡ Firm Execution</span>""" if leg_is_exec else """<span style="background-color: #f0f9ff; color: #0284c7; border: 1px solid #bae6fd; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 11px;">📊 Indicative</span>"""
+            leg_amt_val = f"{float(leg.amount):,.2f}" if leg.amount else "N/A"
+            leg_val_d = (cfg.value_date if cfg and getattr(cfg, 'value_date', None) else leg.value_date) or "Standard"
+            leg_dir = (leg.direction or 'BUY').upper()
+            leg_pair_name = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+            row_bg = "#ffffff" if idx % 2 != 0 else "#f8fafc"
+            alt_info = " &bull; <span style='color: #0284c7; font-weight: 600;'>Alternative Date Allowed</span>" if (cfg.allow_alternative_value_date if cfg and cfg.allow_alternative_value_date is not None else leg.allow_alternative_value_date) else ""
+            leg_rows_list.append(f"""
+                        <tr style="background-color: {row_bg}; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 700; color: #0f172a; vertical-align: top; width: 35%;">
+                                <span style="background-color: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 13px; letter-spacing: 0.5px; margin-right: 6px;">
+                                    Leg #{idx}: {leg_pair_name}
+                                </span>
+                                <div style="margin-top: 6px;">{leg_badge_html}</div>
+                            </td>
+                            <td style="padding: 12px 16px; font-size: 14px; color: #0f172a; vertical-align: top;">
+                                <div>Client <strong>{leg_dir} {leg_amt_val} {leg.buy_currency}</strong> / Selling {leg.sell_currency}</div>
+                                <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
+                                    Target Settlement: <strong style="color: #0f172a;">{leg_val_d}</strong>{alt_info}
+                                </div>
+                            </td>
+                        </tr>
+            """)
+        package_status_badge = """<span style="background-color: #fef3c7; color: #92400e; border: 1px solid #fde68a; padding: 2px 7px; border-radius: 4px; font-weight: 800; font-size: 11px; margin-left: 8px;">Mixed Package</span>""" if is_mixed else ""
+        trade_specs_rows = f"""
+                        <tr style="background-color: #f1f5f9; border-bottom: 2px solid #cbd5e1;">
+                            <td colspan="2" style="padding: 10px 16px; font-size: 12px; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.5px;">
+                                📦 Multi-Currency Package Breakdown ({len(legs)} Pairs){package_status_badge}
+                            </td>
+                        </tr>
+                        {''.join(leg_rows_list)}
+        """
+    else:
+        trade_specs_rows = f"""
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Currency Pair &amp; Flow</td>
+                            <td style="padding: 12px 16px; font-size: 14px; color: #0f172a;">
+                                <span style="background-color: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 13px; letter-spacing: 0.5px; margin-right: 8px;">
+                                    {pair_str}
+                                </span>
+                                <span style="font-size: 13px; color: #334155;">{direction_display}</span>
+                            </td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Quotation Amount</td>
+                            <td style="padding: 12px 16px; font-size: 17px; font-weight: 800; color: #0f172a; letter-spacing: 0.5px;">
+                                {amount_display}
+                            </td>
+                        </tr>
+                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Target Value Date</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">
+                                {value_date_display}
+                            </td>
+                        </tr>
+                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Alternative Value Date</td>
+                            <td style="padding: 12px 16px; font-size: 13px; color: #0f172a;">
+                                {alt_date_badge}
+                                <div style="font-size: 12px; color: #64748b; margin-top: 4px;">{alt_date_desc}</div>
+                            </td>
+                        </tr>
+        """
+
+    # 11. HTML Template
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
+
+    if is_all_indicative:
+        timeline_results_row = ""
+        timeline_warning_text = (
+            "&#9888; Quotes submitted after the cutoff cannot be accepted. The portal will automatically lock upon window closure. "
+            "Submitted indicative quotes are non-binding and utilized strictly for corporate market evaluation and price discovery."
+        )
+        specs_results_window_html = """
+                        <tr style="background-color: #f0f9ff; border-bottom: 1px solid #e0f2fe;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 700; color: #0369a1;">Execution Commitment</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 800; color: #0284c7;">
+                                Non-Binding Indicative Benchmark
+                                <div style="font-size: 12px; color: #0369a1; font-weight: normal; margin-top: 3px;">
+                                    This quotation request is for price discovery only; no trade execution or instant desk allocation applies.
+                                </div>
+                            </td>
+                        </tr>
+        """
+    else:
+        timeline_results_row = f"""
+                                <tr>
+                                    <td style="font-size: 13px; font-weight: 700; color: #0369a1; width: 190px; padding: 4px 0;">Expected Results Window:</td>
+                                    <td style="font-size: 14px; font-weight: 800; color: #0284c7; padding: 4px 0;">Within {result_window_str} of window close</td>
+                                </tr>
+        """
+        timeline_warning_text = (
+            f"&#9888; Quotes submitted after the cutoff cannot be accepted. The portal will automatically lock upon window closure. "
+            f"Trade outcome decisions will appear within <strong>{result_window_str}</strong> after closure; dealers must remain active at their desk."
+        )
+        specs_results_window_html = f"""
+                        <tr style="background-color: #f0fdf4; border-bottom: 1px solid #bbf7d0;">
+                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 700; color: #166534;">Expected Results Window</td>
+                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 800; color: #15803d;">
+                                Within {result_window_str} after submission deadline
+                                <div style="font-size: 12px; color: #166534; font-weight: normal; margin-top: 3px;">
+                                    Trade allocation and outcome are rendered within {result_window_str} per customer configuration.
+                                </div>
+                            </td>
+                        </tr>
+        """
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -596,20 +807,21 @@ def build_quotation_rfq_bank_email(
                         </td>
                         <td style="vertical-align: top;">
                             <span style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1.5px; text-transform: uppercase; display: block; margin-bottom: 8px;">
-                                QUOTATION WINDOW &bull; CAIRO LOCAL TIME
+                                QUOTATION TIMELINE &bull; CAIRO LOCAL TIME
                             </span>
                             <table style="width: 100%; border-collapse: collapse; margin-bottom: 6px;">
                                 <tr>
-                                    <td style="font-size: 13px; font-weight: 600; color: #7f1d1d; width: 160px; padding: 4px 0;">Window Opens:</td>
+                                    <td style="font-size: 13px; font-weight: 600; color: #7f1d1d; width: 190px; padding: 4px 0;">Window Opens:</td>
                                     <td style="font-size: 14px; font-weight: 700; color: #1e293b; padding: 4px 0;">{window_start_cairo_str}</td>
                                 </tr>
                                 <tr>
-                                    <td style="font-size: 13px; font-weight: 700; color: #991b1b; width: 160px; padding: 4px 0;">Submission Deadline:</td>
+                                    <td style="font-size: 13px; font-weight: 700; color: #991b1b; width: 190px; padding: 4px 0;">Submission Deadline:</td>
                                     <td style="font-size: 15px; font-weight: 800; color: #991b1b; padding: 4px 0;">{deadline_cairo_str}</td>
                                 </tr>
+                                {timeline_results_row}
                             </table>
                             <p style="margin: 8px 0 0 0; font-size: 12px; color: #7f1d1d; line-height: 1.4;">
-                                &#9888; Quotes submitted after this cutoff cannot be accepted. The portal will automatically lock upon window closure.
+                                {timeline_warning_text}
                             </p>
                         </td>
                     </tr>
@@ -652,34 +864,8 @@ def build_quotation_rfq_bank_email(
                             <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Submission Deadline</td>
                             <td style="padding: 12px 16px; font-size: 14px; font-weight: 800; color: #b91c1c;">{deadline_cairo_str}</td>
                         </tr>
-                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Currency Pair &amp; Flow</td>
-                            <td style="padding: 12px 16px; font-size: 14px; color: #0f172a;">
-                                <span style="background-color: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 13px; letter-spacing: 0.5px; margin-right: 8px;">
-                                    {pair_str}
-                                </span>
-                                <span style="font-size: 13px; color: #334155;">{direction_display}</span>
-                            </td>
-                        </tr>
-                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Quotation Amount</td>
-                            <td style="padding: 12px 16px; font-size: 17px; font-weight: 800; color: #0f172a; letter-spacing: 0.5px;">
-                                {amount_display}
-                            </td>
-                        </tr>
-                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Target Value Date</td>
-                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">
-                                {value_date_display}
-                            </td>
-                        </tr>
-                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Alternative Value Date</td>
-                            <td style="padding: 12px 16px; font-size: 13px; color: #0f172a;">
-                                {alt_date_badge}
-                                <div style="font-size: 12px; color: #64748b; margin-top: 4px;">{alt_date_desc}</div>
-                            </td>
-                        </tr>
+                        {specs_results_window_html}
+                        {trade_specs_rows}
                         {tbill_rows}
                     </tbody>
                 </table>
