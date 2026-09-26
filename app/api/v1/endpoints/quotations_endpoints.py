@@ -2221,12 +2221,21 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
     is_inconclusive = res_data.get("is_inconclusive", False)
     inconclusive_reason = res_data.get("inconclusive_reason")
     winner_bank_id = res_data.get("winner_bank_id")
+    legs_data = res_data.get("legs", [])
+    is_multi_leg = bool(legs_data and len(legs_data) > 1)
 
-    if is_inconclusive:
-        return {"status": "skipped", "detail": f"RFQ ended without a conclusive winner: {inconclusive_reason}"}
-
-    if not winner_bank_id:
-        return {"status": "skipped", "detail": "No winning Execution quote found."}
+    if is_multi_leg:
+        all_legs_inconclusive = all(l.get("is_inconclusive", False) for l in legs_data)
+        if all_legs_inconclusive:
+            return {"status": "skipped", "detail": f"RFQ ended without any conclusive leg winners: {inconclusive_reason}"}
+        has_any_winner = any(l.get("winner_bank_id") and not l.get("is_inconclusive") for l in legs_data)
+        if not has_any_winner:
+            return {"status": "skipped", "detail": "No winning Execution quotes found for any leg."}
+    else:
+        if is_inconclusive:
+            return {"status": "skipped", "detail": f"RFQ ended without a conclusive winner: {inconclusive_reason}"}
+        if not winner_bank_id:
+            return {"status": "skipped", "detail": "No winning Execution quote found."}
 
     from app.core.email_service import get_customer_email_settings, send_email
     from app.services.unified_email_builder import build_transaction_email_html
@@ -2235,91 +2244,183 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
     customer_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Client")
     ref_no = rfq.ref_no
     emails_dispatched = 0
+    sender_name = "Treasury Quotations" if source != "customer_specific" else email_settings.sender_display_name
 
-    for bank_res in results:
-        # Strictly for Execution banks only - Indicative quotes are for sounding only
-        q_base = (bank_res.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
-        if q_base == 'indicative':
-            continue
+    if is_multi_leg:
+        # Multi-Leg: Group participants across all legs
+        banks_map = {}
+        for leg in legs_data:
+            for r in leg.get("results", []):
+                q_base = (r.get('quotation_base') or leg.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
+                if q_base == 'indicative':
+                    continue
+                b_id = r.get("bank_id")
+                if b_id and b_id not in banks_map:
+                    bank_emails = []
+                    if r.get('contacts') and isinstance(r['contacts'], list):
+                        bank_emails = [c.get('email', '').strip() for c in r['contacts'] if c.get('email')]
+                    if not bank_emails and r.get('bank_emails'):
+                        bank_emails = [e.strip() for e in r['bank_emails'].split(',') if e.strip()]
+                    banks_map[b_id] = {
+                        "bank_id": b_id,
+                        "bank_name": r.get("bank_name"),
+                        "bank_emails": bank_emails,
+                        "submitted_by_email": r.get("submitted_by_email")
+                    }
 
-        bank_emails = []
-        if bank_res.get('contacts') and isinstance(bank_res['contacts'], list):
-            bank_emails = [c.get('email', '').strip() for c in bank_res['contacts'] if c.get('email')]
-        if not bank_emails and bank_res.get('bank_emails'):
-            bank_emails = [e.strip() for e in bank_res['bank_emails'].split(',') if e.strip()]
+        for b_id, b_info in banks_map.items():
+            if not b_info["bank_emails"]:
+                continue
 
-        if not bank_emails:
-            continue
+            won_legs = [l for l in legs_data if l.get("winner_bank_id") == b_id and not l.get("is_inconclusive")]
+            lost_legs = [l for l in legs_data if l.get("winner_bank_id") != b_id and any(r.get("bank_id") == b_id for r in l.get("results", []))]
 
-        is_winner = (bank_res['bank_id'] == winner_bank_id)
-
-        # Identify dealer who confirmed / submitted the deal
-        dealer_identity = bank_res.get('submitted_by_email') or "Authorized Execution Dealer"
-        sub_time_str = "N/A"
-        if bank_res.get('submitted_at'):
-            try:
-                sub_time_str = bank_res['submitted_at'].strftime("%d %b %Y, %H:%M:%S UTC")
-            except Exception:
-                sub_time_str = str(bank_res['submitted_at'])
-
-        executed_val_date = bank_res.get('offered_value_date') or bank_res.get('assigned_value_date') or str(rfq.value_date) or 'Standard Spot'
-
-        if is_winner:
-            subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
-            body = build_transaction_email_html(
-                customer_name=customer_name,
-                title="📈 Trade Execution Confirmation",
-                transaction_ref=ref_no,
-                transaction_type="RFQ Execution",
-                key_value_dict={
+            if won_legs:
+                # Execution confirmation email
+                subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - Multi-Currency Package ({len(won_legs)} Leg{'s' if len(won_legs) > 1 else ''})"
+                key_vals = {
                     "RFQ Reference": ref_no,
                     "Requesting Legal Entity": customer_name,
-                    "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
-                    "Direction": rfq.direction,
-                    "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
-                    "Executed Rate": f"<span style='color: #16a34a; font-weight: 700;'>{bank_res['price']:.5f}</span>",
-                    "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
-                    "Settlement Value Date": executed_val_date,
-                    "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
-                    "Execution Timestamp": sub_time_str
-                },
-                summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
-                recipient_name=f"{bank_res['bank_name']} Treasury Desk"
-            )
-        else:
-            subject = f"RFQ Result Notification: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
-            quote_display = f"{bank_res['price']:.5f}" if bank_res.get('price') is not None else "No Quote Submitted"
-            body = build_transaction_email_html(
-                customer_name=customer_name,
-                title="RFQ Concluded - Trade Outcome Notification",
-                transaction_ref=ref_no,
-                transaction_type="RFQ Outcome",
-                key_value_dict={
+                    "Total Package Legs Won": f"<span style='color: #16a34a; font-weight: 700;'>{len(won_legs)} of {len(legs_data)} Currency Pairs</span>"
+                }
+                for i, leg in enumerate(won_legs):
+                    b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
+                    p_str = f"{b_res.get('price', 0):.5f}" if b_res.get('price') is not None else "N/A"
+                    val_date_str = str(b_res.get('offered_value_date') or b_res.get('assigned_value_date') or leg.get('value_date') or 'Standard Spot')
+                    pair_label = leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
+                    key_vals[f"Awarded Leg {i+1} ({pair_label})"] = (
+                        f"{leg.get('direction', 'BUY')} {leg.get('amount', 0):,.2f} {leg.get('buy_currency', '')} "
+                        f"@ <strong style='color: #16a34a;'>{p_str}</strong> (Value Date: {val_date_str})"
+                    )
+
+                body = build_transaction_email_html(
+                    customer_name=customer_name,
+                    title="📈 Multi-Currency Trade Execution Confirmation",
+                    transaction_ref=ref_no,
+                    transaction_type="RFQ Multi-Leg Execution",
+                    key_value_dict=key_vals,
+                    summary_text=f"We are pleased to confirm the execution of the following currency pair trades with <strong>{customer_name}</strong> based on your winning quotes.",
+                    recipient_name=f"{b_info['bank_name']} Treasury Desk"
+                )
+            elif lost_legs:
+                # Regret notification email
+                subject = f"RFQ Result Notification: RFQ {ref_no} ({customer_name}) - Multi-Currency Package"
+                key_vals = {
                     "RFQ Reference": ref_no,
                     "Requesting Legal Entity": customer_name,
-                    "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
-                    "Direction": rfq.direction,
-                    "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
-                    "Target Value Date": executed_val_date,
-                    "Your Submitted Quote": quote_display,
-                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Another Counterparty</span>"
-                },
-                summary_text=f"Thank you for submitting your quote for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this transaction has concluded and was executed with another counterparty who offered a more competitive all-in rate.",
-                recipient_name=f"{bank_res['bank_name']} Treasury Desk"
+                    "Participating Package Legs": f"{len(lost_legs)} Currency Pairs",
+                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Other Counterparties</span>"
+                }
+                for i, leg in enumerate(lost_legs):
+                    b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
+                    p_str = f"{b_res.get('price', 0):.5f}" if b_res.get('price') is not None else "No Quote Submitted"
+                    pair_label = leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
+                    key_vals[f"Leg {i+1} ({pair_label})"] = f"Your Quote: {p_str} — Concluded"
+
+                body = build_transaction_email_html(
+                    customer_name=customer_name,
+                    title="RFQ Concluded - Trade Outcome Notification",
+                    transaction_ref=ref_no,
+                    transaction_type="RFQ Outcome",
+                    key_value_dict=key_vals,
+                    summary_text=f"Thank you for submitting quotes for RFQ <strong>{ref_no}</strong> with <strong>{customer_name}</strong>. We are writing to inform you that these transactions have concluded and were executed with other counterparties offering more competitive pricing.",
+                    recipient_name=f"{b_info['bank_name']} Treasury Desk"
+                )
+            else:
+                continue
+
+            await send_email(
+                db=db,
+                to_emails=b_info["bank_emails"],
+                subject_template=subject,
+                body_template=body,
+                template_data={},
+                email_settings=email_settings,
+                sender_name=sender_name
             )
+            emails_dispatched += 1
 
-        sender_name = "Treasury Quotations" if source != "customer_specific" else email_settings.sender_display_name
+    else:
+        # Single-Ticket execution
+        for bank_res in results:
+            q_base = (bank_res.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
+            if q_base == 'indicative':
+                continue
 
-        await send_email(
-            db=db,
-            to_emails=bank_emails,
-            subject_template=subject,
-            body_template=body,
-            template_data={},
-            email_settings=email_settings,
-            sender_name=sender_name
-        )
-        emails_dispatched += 1
+            bank_emails = []
+            if bank_res.get('contacts') and isinstance(bank_res['contacts'], list):
+                bank_emails = [c.get('email', '').strip() for c in bank_res['contacts'] if c.get('email')]
+            if not bank_emails and bank_res.get('bank_emails'):
+                bank_emails = [e.strip() for e in bank_res['bank_emails'].split(',') if e.strip()]
+
+            if not bank_emails:
+                continue
+
+            is_winner = (bank_res['bank_id'] == winner_bank_id)
+            dealer_identity = bank_res.get('submitted_by_email') or "Authorized Execution Dealer"
+            sub_time_str = "N/A"
+            if bank_res.get('submitted_at'):
+                try:
+                    sub_time_str = bank_res['submitted_at'].strftime("%d %b %Y, %H:%M:%S UTC")
+                except Exception:
+                    sub_time_str = str(bank_res['submitted_at'])
+
+            executed_val_date = bank_res.get('offered_value_date') or bank_res.get('assigned_value_date') or str(rfq.value_date) or 'Standard Spot'
+
+            if is_winner:
+                subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
+                body = build_transaction_email_html(
+                    customer_name=customer_name,
+                    title="📈 Trade Execution Confirmation",
+                    transaction_ref=ref_no,
+                    transaction_type="RFQ Execution",
+                    key_value_dict={
+                        "RFQ Reference": ref_no,
+                        "Requesting Legal Entity": customer_name,
+                        "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                        "Direction": rfq.direction,
+                        "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
+                        "Executed Rate": f"<span style='color: #16a34a; font-weight: 700;'>{bank_res['price']:.5f}</span>",
+                        "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
+                        "Settlement Value Date": executed_val_date,
+                        "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
+                        "Execution Timestamp": sub_time_str
+                    },
+                    summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
+                    recipient_name=f"{bank_res['bank_name']} Treasury Desk"
+                )
+            else:
+                subject = f"RFQ Result Notification: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
+                quote_display = f"{bank_res['price']:.5f}" if bank_res.get('price') is not None else "No Quote Submitted"
+                body = build_transaction_email_html(
+                    customer_name=customer_name,
+                    title="RFQ Concluded - Trade Outcome Notification",
+                    transaction_ref=ref_no,
+                    transaction_type="RFQ Outcome",
+                    key_value_dict={
+                        "RFQ Reference": ref_no,
+                        "Requesting Legal Entity": customer_name,
+                        "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                        "Direction": rfq.direction,
+                        "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
+                        "Target Value Date": executed_val_date,
+                        "Your Submitted Quote": quote_display,
+                        "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Another Counterparty</span>"
+                    },
+                    summary_text=f"Thank you for submitting your quote for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this transaction has concluded and was executed with another counterparty who offered a more competitive all-in rate.",
+                    recipient_name=f"{bank_res['bank_name']} Treasury Desk"
+                )
+
+            await send_email(
+                db=db,
+                to_emails=bank_emails,
+                subject_template=subject,
+                body_template=body,
+                template_data={},
+                email_settings=email_settings,
+                sender_name=sender_name
+            )
+            emails_dispatched += 1
 
     # Record audit log for idempotency
     log_action(
@@ -2333,6 +2434,7 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
             "ref_no": rfq.ref_no,
             "winner_bank_id": winner_bank_id,
             "emails_count": emails_dispatched,
+            "is_multi_leg": is_multi_leg,
             "dispatched_at": datetime.now(timezone.utc).isoformat()
         },
         customer_id=rfq.customer_id
