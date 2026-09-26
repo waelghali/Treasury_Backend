@@ -230,6 +230,30 @@ class CRUDQuotation:
         pairs_list = getattr(obj_in, 'pairs', None) or getattr(obj_in, 'legs', None) or []
         is_multi_pair = len(pairs_list) > 0
 
+        if is_multi_pair:
+            if len(pairs_list) > 4:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A maximum of 4 currency pairs can be submitted in a single quotation request."
+                )
+
+            # Validate against similar/duplicate pairs (same currencies, same value date, and same quotation base)
+            seen_pair_keys = set()
+            for idx, p_item in enumerate(pairs_list, start=1):
+                b_curr = (getattr(p_item, 'buyCurrency', None) or getattr(p_item, 'buy_currency', None) or obj_in.buyCurrency or 'USD').strip().upper()
+                s_curr = (getattr(p_item, 'sellCurrency', None) or getattr(p_item, 'sell_currency', None) or obj_in.sellCurrency or 'EGP').strip().upper()
+                v_date = str(getattr(p_item, 'valueDate', None) or getattr(p_item, 'value_date', None) or obj_in.valueDate or '').strip()
+                q_b = (getattr(p_item, 'quotationBase', None) or getattr(p_item, 'quotation_base', None) or obj_in.quotationBase or 'Execution').strip().lower()
+
+                # Currencies set handles both matching and reversed currencies (e.g., USD/EGP vs EGP/USD)
+                pair_key = (frozenset([b_curr, s_curr]), v_date, q_b)
+                if pair_key in seen_pair_keys:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Duplicate currency pair detected: Multiple legs requested for {b_curr}/{s_curr} with the same settlement date ({v_date}) and quotation base ({q_b.capitalize()}). Similar pairs with matching settlement date and quotation base are not permitted."
+                    )
+                seen_pair_keys.add(pair_key)
+
         first_pair = pairs_list[0] if is_multi_pair else None
         p_type = obj_in.type or "FX_SPOT"
         p_direction = (first_pair.direction if is_multi_pair and first_pair.direction else obj_in.direction) or "Buy"
