@@ -29,7 +29,7 @@ class CRUDGlobalConfiguration(CRUDBase):
         try:
             return (
                 db.query(self.model)
-                .filter(cast(self.model.key, String) == key_val, self.model.is_deleted == False)
+                .filter(cast(self.model.key, String) == key_val, self.model.is_deleted.isnot(True))
                 .first()
             )
         except Exception:
@@ -250,7 +250,7 @@ class CRUDCustomerConfiguration(CRUDBase):
         customer_configs_map = {
             cc.global_config_id: cc
             for cc in db.query(CustomerConfiguration)
-            .filter(CustomerConfiguration.customer_id == customer_id, CustomerConfiguration.is_deleted == False)
+            .filter(CustomerConfiguration.customer_id == customer_id, CustomerConfiguration.is_deleted.isnot(True))
             .all()
         }
 
@@ -526,7 +526,7 @@ class CRUDCustomerConfiguration(CRUDBase):
         
         customer_configs_to_check = db.query(self.model).filter(
             self.model.global_config_id == global_config_id,
-            self.model.is_deleted == False
+            self.model.is_deleted.isnot(True)
         ).all()
         
         corrected_configs = []

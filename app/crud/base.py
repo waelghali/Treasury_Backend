@@ -21,12 +21,10 @@ class CRUDBase:
         self.model = model
 
     def get(self, db: Session, id: Any) -> Optional[ModelType]:
-        
-        return db.query(self.model).filter(self.model.id == id, self.model.is_deleted == False).first() 
+        return db.query(self.model).filter(self.model.id == id, self.model.is_deleted.isnot(True)).first() 
 
-    def get_all(self, db: Session, skip: int = 0, limit: int = 100) -> List[ModelType]:
-        
-        return db.query(self.model).filter(self.model.is_deleted == False).offset(skip).limit(limit).all() 
+    def get_all(self, db: Session, skip: int = 0, limit: int = 500) -> List[ModelType]:
+        return db.query(self.model).filter(self.model.is_deleted.isnot(True)).offset(skip).limit(limit).all() 
 
     def create(self, db: Session, obj_in: Any, **kwargs: Any) -> ModelType:
         
