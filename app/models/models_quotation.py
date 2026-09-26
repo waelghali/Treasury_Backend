@@ -1,5 +1,5 @@
 # app/models_quotation.py
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, Text, Index
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, Text, Index, Date
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -80,10 +80,51 @@ class QuotationRequest(BaseModel):
     creator = relationship("User", foreign_keys=[created_by_user_id])
     cancellation_requestor = relationship("User", foreign_keys=[cancellation_requested_by])
     assignments = relationship("QuotationBankAssignment", back_populates="rfq", cascade="all, delete-orphan")
+    legs = relationship("QuotationLeg", back_populates="rfq", cascade="all, delete-orphan", order_by="QuotationLeg.leg_index")
     parent_rfq = relationship("QuotationRequest", remote_side=[id], backref="re_tenders")
 
+class QuotationLeg(BaseModel):
+    """Individual currency pair or trade leg within a QuotationRequest session."""
+    __tablename__ = "quotation_legs"
+    id = Column(String, primary_key=True)
+    rfq_id = Column(String, ForeignKey("quotation_rfqs.id", ondelete="CASCADE"), nullable=False, index=True)
+    leg_index = Column(Integer, default=1, nullable=False)
+    
+    type = Column(String, default="FX_SPOT", comment="'FX_SPOT' or 'TBILL'")
+    direction = Column(String, nullable=True, comment="'Buy' or 'Sell'")
+    buy_currency = Column(String, nullable=True)
+    sell_currency = Column(String, nullable=True)
+    amount = Column(Float, nullable=True)
+    min_ticket_amount = Column(Float, nullable=True)
+    value_date = Column(String, nullable=True)
+    allow_alternative_value_date = Column(Boolean, default=False, nullable=False)
+    quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative'")
+    max_tolerance_percent = Column(Float, nullable=True)
+    
+    settlement_date_start = Column(String, nullable=True)
+    settlement_date_end = Column(String, nullable=True)
+    maturity_date_start = Column(String, nullable=True)
+    maturity_date_end = Column(String, nullable=True)
+    eval_rate = Column(Float, nullable=True)
+    
+    status = Column(String, default="PENDING", comment="'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'ACCEPTED', 'REJECTED', 'INCONCLUSIVE', 'EXPIRED'")
+    winner_bank_id = Column(Integer, nullable=True)
+    winner_bank_name = Column(String(255), nullable=True)
+    winner_rate = Column(Float, nullable=True)
+    saved_vs_avg = Column(Float, nullable=True)
+    execution_reference = Column(String(50), nullable=True)
+    deal_slip_pdf_path = Column(String(500), nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    document_path = Column(Text, nullable=True)
+    entity_id = Column(Integer, ForeignKey("customer_entities.id", ondelete="SET NULL"), nullable=True)
+
+    rfq = relationship("QuotationRequest", back_populates="legs")
+    offers = relationship("QuotationOffer", back_populates="leg", cascade="all, delete-orphan")
+    tbill_offers = relationship("QuotationTBillOffer", back_populates="leg", cascade="all, delete-orphan")
+    bank_configs = relationship("QuotationBankLegConfig", back_populates="leg", cascade="all, delete-orphan")
+
 class QuotationBankAssignment(BaseModel):
-    """Junction table connecting an RFQ strictly to a QuotationBank."""
+    """Junction table connecting an RFQ strictly to a QuotationBank (1 token per bank per RFQ session)."""
     __tablename__ = "quotation_bank_assignments"
     id = Column(String, primary_key=True)
     rfq_id = Column(String, ForeignKey("quotation_rfqs.id", ondelete="CASCADE"), nullable=False)
@@ -96,7 +137,7 @@ class QuotationBankAssignment(BaseModel):
     cost_flat = Column(Float, default=0.0)
     quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative' override per bank")
     is_document_visible = Column(Boolean, default=True, comment="Controls document attachment visibility for this bank")
-    value_date = Column(String, nullable=True, comment="Custom value date target for this specific bank; falls back to RFQ master value_date")
+    value_date = Column(Date, nullable=True, comment="Custom value date target for this specific bank; falls back to RFQ master value_date")
     allow_alternative_value_date = Column(Boolean, nullable=True, comment="Per-bank override: True/False, or NULL to inherit from RFQ master")
     
     # Bank Approval Layer (optional, per-assignment)
@@ -110,23 +151,55 @@ class QuotationBankAssignment(BaseModel):
     offers = relationship("QuotationOffer", back_populates="assignment", cascade="all, delete-orphan")
     tbill_offers = relationship("QuotationTBillOffer", back_populates="assignment", cascade="all, delete-orphan")
     otps = relationship("QuotationAccessOTP", back_populates="assignment", cascade="all, delete-orphan")
+    leg_configs = relationship("QuotationBankLegConfig", back_populates="assignment", cascade="all, delete-orphan")
+
+    def get_config_for_leg(self, leg_id: str):
+        """Returns the specific configuration for a leg, or falls back to assignment level."""
+        if self.leg_configs:
+            for cfg in self.leg_configs:
+                if cfg.leg_id == leg_id:
+                    return cfg
+        return self
+
+class QuotationBankLegConfig(BaseModel):
+    """Per-bank configuration for a specific currency pair leg within a quotation session."""
+    __tablename__ = "quotation_bank_leg_configs"
+    id = Column(String, primary_key=True)
+    assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False, index=True)
+    leg_id = Column(String, ForeignKey("quotation_legs.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    is_invited = Column(Boolean, default=True, nullable=False)
+    cost_min = Column(Float, default=0.0)
+    cost_percent = Column(Float, default=0.0)
+    cost_max = Column(Float, default=0.0)
+    cost_flat = Column(Float, default=0.0)
+    quotation_base = Column(String, nullable=True, comment="'Execution' or 'Indicative' override per bank for this leg")
+    is_document_visible = Column(Boolean, default=True)
+    value_date = Column(Date, nullable=True, comment="Custom value date target for this specific bank on this leg")
+    allow_alternative_value_date = Column(Boolean, nullable=True, comment="Per-bank override for this leg")
+
+    assignment = relationship("QuotationBankAssignment", back_populates="leg_configs")
+    leg = relationship("QuotationLeg", back_populates="bank_configs")
 
 class QuotationOffer(BaseModel):
     """FX Spot Offers from banks."""
     __tablename__ = "quotation_offers"
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False)
+    leg_id = Column(String, ForeignKey("quotation_legs.id", ondelete="CASCADE"), nullable=True, index=True)
     price = Column(Float, nullable=False)
-    offered_value_date = Column(String, nullable=True, comment="Alternative settlement date proposed by counterparty")
+    offered_value_date = Column(Date, nullable=True, comment="Alternative settlement date proposed by counterparty")
     notes = Column(Text, nullable=True, comment="Optional notes or comments from the submitting trader")
     submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assignment = relationship("QuotationBankAssignment", back_populates="offers")
+    leg = relationship("QuotationLeg", back_populates="offers")
 
 class QuotationTBillOffer(BaseModel):
     """T-Bill specific quotation lines."""
     __tablename__ = "quotation_tbill_offers"
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False)
+    leg_id = Column(String, ForeignKey("quotation_legs.id", ondelete="CASCADE"), nullable=True, index=True)
     settlement_date = Column(String, nullable=False)
     maturity_date = Column(String, nullable=False)
     discount_rate = Column(Float, nullable=False)
@@ -136,6 +209,7 @@ class QuotationTBillOffer(BaseModel):
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assignment = relationship("QuotationBankAssignment", back_populates="tbill_offers")
+    leg = relationship("QuotationLeg", back_populates="tbill_offers")
 
 class QuotationAccessOTP(BaseModel):
     """Stores OTPs and magic access tokens for bank desk authentication."""

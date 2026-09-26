@@ -85,6 +85,51 @@ class QuotationRequestCreate(BaseModel):
     legal_disclaimer_accepted: Optional[bool] = False
     legalDisclaimerAccepted: Optional[bool] = False
 
+class QuotationBankLegConfigOut(BaseModel):
+    id: str
+    assignment_id: str
+    leg_id: str
+    is_invited: bool = True
+    cost_min: float = 0.0
+    cost_percent: float = 0.0
+    cost_max: float = 0.0
+    cost_flat: float = 0.0
+    quotation_base: Optional[str] = None
+    is_document_visible: bool = True
+    value_date: Optional[Union[str, date]] = None
+    allow_alternative_value_date: Optional[bool] = None
+
+    class Config:
+        from_attributes = True
+
+class QuotationLegOut(BaseModel):
+    id: str
+    rfq_id: str
+    leg_index: int = 1
+    type: str = "FX_SPOT"
+    direction: Optional[str] = None
+    buy_currency: Optional[str] = None
+    sell_currency: Optional[str] = None
+    amount: Optional[float] = None
+    min_ticket_amount: Optional[float] = None
+    value_date: Optional[Union[str, date]] = None
+    allow_alternative_value_date: Optional[bool] = False
+    quotation_base: Optional[str] = None
+    max_tolerance_percent: Optional[float] = None
+    status: str = "PENDING"
+    winner_bank_id: Optional[int] = None
+    winner_bank_name: Optional[str] = None
+    winner_rate: Optional[float] = None
+    saved_vs_avg: Optional[float] = None
+    execution_reference: Optional[str] = None
+    deal_slip_pdf_path: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    document_path: Optional[str] = None
+    bank_configs: Optional[List[QuotationBankLegConfigOut]] = []
+
+    class Config:
+        from_attributes = True
+
 class QuotationRequestOut(BaseModel):
     id: str
     ref_no: str
@@ -131,6 +176,7 @@ class QuotationRequestOut(BaseModel):
     is_dispatched: Optional[bool] = False
     dispatched_at: Optional[datetime] = None
     assigned_banks: Optional[List[dict]] = None
+    legs: Optional[List[QuotationLegOut]] = []
 
     class Config:
         from_attributes = True
