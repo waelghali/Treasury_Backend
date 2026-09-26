@@ -29,7 +29,8 @@ from app.schemas.schemas_quotation import (
 from app.crud.crud_quotation import crud_quotation
 from app.models.models_quotation import (
     QuotationRequest, QuotationBankAssignment, QuotationOffer, 
-    QuotationTBillOffer, QuotationBank, QuotationAnalytics, QuotationAccessOTP
+    QuotationTBillOffer, QuotationBank, QuotationAnalytics, QuotationAccessOTP,
+    QuotationLeg, QuotationBankLegConfig
 )
 
 logger = logging.getLogger(__name__)
@@ -1956,12 +1957,41 @@ def resubmit_quotation(
     elif getattr(payload, 'internalNotes', None) is not None:
         rfq.internal_notes = payload.internalNotes
 
+    # Handle multi-pair legs re-creation if provided
+    resubmit_pairs = getattr(payload, 'pairs', None) or getattr(payload, 'legs', None)
+    if resubmit_pairs:
+        db.query(QuotationLeg).filter(QuotationLeg.rfq_id == rfq.id).delete()
+        for idx, p_item in enumerate(resubmit_pairs, start=1):
+            leg_id = f"{rfq.id}-leg-{idx}"
+            leg_val_d = getattr(p_item, 'valueDate', None)
+            leg_obj = QuotationLeg(
+                id=leg_id,
+                rfq_id=rfq.id,
+                leg_index=idx,
+                type=rfq.type,
+                direction=getattr(p_item, 'direction', None) or rfq.direction or "Buy",
+                buy_currency=getattr(p_item, 'buyCurrency', None) or rfq.buy_currency or "USD",
+                sell_currency=getattr(p_item, 'sellCurrency', None) or rfq.sell_currency or "EGP",
+                amount=getattr(p_item, 'amount', None),
+                min_ticket_amount=getattr(p_item, 'minTicketAmount', None),
+                value_date=str(leg_val_d) if leg_val_d else None,
+                allow_alternative_value_date=bool(getattr(p_item, 'allowAlternativeValueDate', False)),
+                quotation_base=getattr(p_item, 'quotationBase', None) or rfq.quotation_base,
+                max_tolerance_percent=getattr(p_item, 'maxTolerancePercent', None) or rfq.max_tolerance_percent,
+                status='PENDING_APPROVAL',
+                entity_id=rfq.entity_id
+            )
+            db.add(leg_obj)
+        db.flush()
+
     # If new selected banks provided from the builder, re-sync bank assignments
     if payload.selected_banks:
         try:
             banks_data = json.loads(payload.selected_banks) if isinstance(payload.selected_banks, str) else payload.selected_banks
             # Remove previous unsubmitted assignments
             db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).delete()
+            current_legs = db.query(QuotationLeg).filter(QuotationLeg.rfq_id == rfq.id).order_by(QuotationLeg.leg_index.asc()).all()
+
             for b_data in banks_data:
                 assignment_id = str(uuid.uuid4())
                 token = str(uuid.uuid4())
@@ -2010,6 +2040,26 @@ def resubmit_quotation(
                         approval_status=bank_approval_status
                     )
                     db.add(db_assignment)
+                    db.flush()
+
+                    for leg_obj in current_legs:
+                        cfg_id = str(uuid.uuid4())
+                        leg_cfg_val_d = _parse_d(b_data.get('valueDate') or leg_obj.value_date)
+                        leg_bank_cfg = QuotationBankLegConfig(
+                            id=cfg_id,
+                            assignment_id=db_assignment.id,
+                            leg_id=leg_obj.id,
+                            is_invited=True,
+                            cost_min=b_data.get('costMin', 0.0),
+                            cost_percent=b_data.get('costPercent', 0.0),
+                            cost_max=b_data.get('costMax', 0.0),
+                            cost_flat=b_data.get('costFlat', 0.0),
+                            quotation_base=b_data.get('quotationBase') or leg_obj.quotation_base,
+                            is_document_visible=is_doc_vis,
+                            value_date=leg_cfg_val_d,
+                            allow_alternative_value_date=bank_allow_alt
+                        )
+                        db.add(leg_bank_cfg)
         except HTTPException:
             raise
         except Exception as e:

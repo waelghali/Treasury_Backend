@@ -243,6 +243,8 @@ class QuotationResubmitRequest(BaseModel):
     internalNotes: Optional[str] = None
     legal_disclaimer_accepted: Optional[bool] = False
     legalDisclaimerAccepted: Optional[bool] = False
+    pairs: Optional[List[QuotationLegCreate]] = None
+    legs: Optional[List[QuotationLegCreate]] = None
 
 # --- Bank Offers & OTP Schemas (Public) ---
 class OTPRequestCreate(BaseModel):
