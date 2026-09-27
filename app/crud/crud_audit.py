@@ -164,10 +164,15 @@ def enrich_audit_log(db: Session, log: AuditLog) -> "AuditLogOut":
         if log.lg_record:
             lg_number = log.lg_record.lg_number
             entity_name = lg_number
-        elif log.entity_type == "QuotationRequest" and log.entity_id:
-            from app.models.models_quotation import QuotationRequest
-            qr = db.query(QuotationRequest).filter(QuotationRequest.id == log.entity_id).first()
-            entity_name = qr.ref_no if qr else f"RFQ #{log.entity_id}"
+        elif log.entity_type == "QuotationRequest":
+            if isinstance(log.details, dict) and log.details.get("ref_no"):
+                entity_name = str(log.details.get("ref_no"))
+            elif isinstance(log.details, dict) and log.details.get("rfq_id"):
+                from app.models.models_quotation import QuotationRequest
+                qr = db.query(QuotationRequest).filter(QuotationRequest.id == str(log.details.get("rfq_id"))).first()
+                entity_name = qr.ref_no if qr else f"RFQ {str(log.details.get('rfq_id'))[:8]}"
+            else:
+                entity_name = "Quotation Request"
         elif log.entity_type == "User" and log.entity_id:
             u = db.query(User).filter(User.id == log.entity_id).first()
             entity_name = u.email if u else f"User #{log.entity_id}"

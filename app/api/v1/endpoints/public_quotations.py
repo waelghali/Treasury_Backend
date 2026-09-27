@@ -7,7 +7,6 @@ import secrets
 import uuid
 
 from app.database import get_db
-from app.models.models import AuditLog
 from app.crud.base import log_action
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
@@ -23,6 +22,20 @@ from app.core.email_service import send_email, get_customer_email_settings, get_
 from app.core.routing import get_frontend_base_url
 
 router = APIRouter()
+
+_RECENT_ACCESS_LOGS: Dict[str, datetime] = {}
+
+def _should_debounce_access_log(key: str, now: datetime, cooldown_seconds: int = 60) -> bool:
+    last_time = _RECENT_ACCESS_LOGS.get(key)
+    if last_time and (now - last_time).total_seconds() < cooldown_seconds:
+        return True
+    _RECENT_ACCESS_LOGS[key] = now
+    if len(_RECENT_ACCESS_LOGS) > 1000:
+        cutoff = now - timedelta(minutes=10)
+        to_del = [k for k, v in _RECENT_ACCESS_LOGS.items() if v < cutoff]
+        for k in to_del:
+            _RECENT_ACCESS_LOGS.pop(k, None)
+    return False
 
 def _format_time_diff(seconds: float) -> str:
     sec = max(1, int(abs(seconds)))
@@ -89,27 +102,23 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     if window_start and window_end:
         is_open = (window_start <= now <= window_end)
 
-    # Clean audit logging of portal visits (debounced per 60s per RFQ to avoid flooding on browser refreshes)
+    # Clean audit logging of portal visits (debounced per 60s per assignment/action in-memory)
     client_host = request.client.host if request and request.client else None
     if window_end and now > window_end:
         diff_sec = (now - window_end).total_seconds()
         diff_str = _format_time_diff(diff_sec)
-        recent_log = db.query(AuditLog).filter(
-            AuditLog.entity_type == "QuotationRequest",
-            AuditLog.entity_id == rfq.id,
-            AuditLog.action_type == "QUOTATION_BANK_LATE_ACCESS_ATTEMPT",
-            AuditLog.timestamp >= now - timedelta(seconds=60)
-        ).first()
-        if not recent_log:
+        debounce_key = f"{assignment.id}:LATE"
+        if not _should_debounce_access_log(debounce_key, now, cooldown_seconds=60):
             log_action(
                 db=db,
                 user_id=None,
                 action_type="QUOTATION_BANK_LATE_ACCESS_ATTEMPT",
                 entity_type="QuotationRequest",
-                entity_id=rfq.id,
+                entity_id=None,
                 details={
-                    "bank_name": bank_name,
+                    "rfq_id": str(rfq.id),
                     "ref_no": rfq.ref_no,
+                    "bank_name": bank_name,
                     "action_description": f"Bank counterparty accessed portal {diff_str} after bidding window closed. Inputs locked/dimmed.",
                     "window_start": window_start.strftime("%Y-%m-%d %H:%M:%S UTC") if window_start else None,
                     "window_end": window_end.strftime("%Y-%m-%d %H:%M:%S UTC") if window_end else None,
@@ -124,22 +133,18 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     elif window_start and now < window_start:
         diff_sec = (window_start - now).total_seconds()
         diff_str = _format_time_diff(diff_sec)
-        recent_log = db.query(AuditLog).filter(
-            AuditLog.entity_type == "QuotationRequest",
-            AuditLog.entity_id == rfq.id,
-            AuditLog.action_type == "QUOTATION_BANK_EARLY_ACCESS_ATTEMPT",
-            AuditLog.timestamp >= now - timedelta(seconds=60)
-        ).first()
-        if not recent_log:
+        debounce_key = f"{assignment.id}:EARLY"
+        if not _should_debounce_access_log(debounce_key, now, cooldown_seconds=60):
             log_action(
                 db=db,
                 user_id=None,
                 action_type="QUOTATION_BANK_EARLY_ACCESS_ATTEMPT",
                 entity_type="QuotationRequest",
-                entity_id=rfq.id,
+                entity_id=None,
                 details={
-                    "bank_name": bank_name,
+                    "rfq_id": str(rfq.id),
                     "ref_no": rfq.ref_no,
+                    "bank_name": bank_name,
                     "action_description": f"Bank counterparty accessed portal {diff_str} before bidding window opened. Inputs locked until window opens.",
                     "window_start": window_start.strftime("%Y-%m-%d %H:%M:%S UTC") if window_start else None,
                     "window_end": window_end.strftime("%Y-%m-%d %H:%M:%S UTC") if window_end else None,
@@ -620,8 +625,9 @@ async def request_quotation_otp(
             user_id=None,
             action_type="QUOTATION_BANK_LATE_ACCESS_ATTEMPT",
             entity_type="QuotationRequest",
-            entity_id=rfq.id,
+            entity_id=None,
             details={
+                "rfq_id": str(rfq.id),
                 "bank_name": bank_display,
                 "dealer_email": target_email,
                 "dealer_role": role,
@@ -644,8 +650,9 @@ async def request_quotation_otp(
             user_id=None,
             action_type="QUOTATION_BANK_EARLY_ACCESS_ATTEMPT",
             entity_type="QuotationRequest",
-            entity_id=rfq.id,
+            entity_id=None,
             details={
+                "rfq_id": str(rfq.id),
                 "bank_name": bank_display,
                 "dealer_email": target_email,
                 "dealer_role": role,
@@ -666,8 +673,9 @@ async def request_quotation_otp(
             user_id=None,
             action_type="QUOTATION_PORTAL_ACCESSED",
             entity_type="QuotationRequest",
-            entity_id=rfq.id,
+            entity_id=None,
             details={
+                "rfq_id": str(rfq.id),
                 "bank_name": bank_display,
                 "dealer_email": target_email,
                 "dealer_role": role,
@@ -777,8 +785,9 @@ def verify_quotation_otp(
             user_id=None,
             action_type="QUOTATION_PORTAL_AUTHENTICATED",
             entity_type="QuotationRequest",
-            entity_id=rfq.id,
+            entity_id=None,
             details={
+                "rfq_id": str(rfq.id),
                 "bank_name": bank_name,
                 "dealer_email": otp_record.email,
                 "dealer_role": otp_record.role,
@@ -1185,8 +1194,9 @@ def submit_fx_offer(
         user_id=None,
         action_type="QUOTATION_OFFER_SUBMITTED",
         entity_type="QuotationRequest",
-        entity_id=rfq.id,
+        entity_id=None,
         details={
+            "rfq_id": str(rfq.id),
             "bank_name": bank_name,
             "dealer_email": submitted_by or "Authorized Bank Dealer",
             "action_description": f"Bank submitted quotation offer for {rfq.type} ({rfq.ref_no}).",
@@ -1350,8 +1360,9 @@ def submit_fx_offers_batch(
         user_id=None,
         action_type="QUOTATION_OFFER_SUBMITTED",
         entity_type="QuotationRequest",
-        entity_id=rfq.id,
+        entity_id=None,
         details={
+            "rfq_id": str(rfq.id),
             "bank_name": bank_name,
             "dealer_email": submitted_by or "Authorized Bank Dealer",
             "action_description": f"Bank submitted multi-leg quotation package ({len(submitted_offers)} leg(s)) for {rfq.ref_no}.",
@@ -1516,8 +1527,9 @@ def submit_tbill_offer(
         user_id=None,
         action_type="QUOTATION_OFFER_SUBMITTED",
         entity_type="QuotationRequest",
-        entity_id=rfq.id,
+        entity_id=None,
         details={
+            "rfq_id": str(rfq.id),
             "bank_name": bank_name,
             "dealer_email": submitted_by or "Authorized Bank Dealer",
             "action_description": f"Bank submitted T-Bill quotation ({len(offer_in.lines)} line(s)) for {rfq.ref_no}.",
@@ -1753,8 +1765,9 @@ async def approve_rfq_for_bank(
         user_id=None,
         action_type=action_type,
         entity_type="QuotationRequest",
-        entity_id=rfq.id,
+        entity_id=None,
         details={
+            "rfq_id": str(rfq.id),
             "bank_name": bank_name,
             "approver_email": approver_email,
             "decision": action,
