@@ -141,7 +141,21 @@ def enrich_audit_log(db: Session, log: AuditLog) -> "AuditLogOut":
     )
     from app.schemas.all_schemas import AuditLogOut
 
-    user_name = log.user.email if (log.user and getattr(log.user, 'email', None)) else ("System" if not log.user_id else f"User #{log.user_id}")
+    if log.user and getattr(log.user, 'email', None):
+        user_name = log.user.email
+    elif not log.user_id:
+        if isinstance(log.details, dict) and (log.details.get("bank_name") or log.details.get("dealer_email") or log.details.get("approver_email")):
+            b_name = log.details.get("bank_name", "")
+            d_email = log.details.get("dealer_email") or log.details.get("approver_email", "")
+            if b_name and d_email:
+                user_name = f"{b_name} ({d_email})"
+            else:
+                user_name = b_name or d_email or "System"
+        else:
+            user_name = "System"
+    else:
+        user_name = f"User #{log.user_id}"
+
     customer_name = log.customer.name if (log.customer and getattr(log.customer, 'name', None)) else None
     lg_number = None
 
@@ -150,6 +164,10 @@ def enrich_audit_log(db: Session, log: AuditLog) -> "AuditLogOut":
         if log.lg_record:
             lg_number = log.lg_record.lg_number
             entity_name = lg_number
+        elif log.entity_type == "QuotationRequest" and log.entity_id:
+            from app.models.models_quotation import QuotationRequest
+            qr = db.query(QuotationRequest).filter(QuotationRequest.id == log.entity_id).first()
+            entity_name = qr.ref_no if qr else f"RFQ #{log.entity_id}"
         elif log.entity_type == "User" and log.entity_id:
             u = db.query(User).filter(User.id == log.entity_id).first()
             entity_name = u.email if u else f"User #{log.entity_id}"

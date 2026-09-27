@@ -7,6 +7,8 @@ import secrets
 import uuid
 
 from app.database import get_db
+from app.models.models import AuditLog
+from app.crud.base import log_action
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
     QuotationTBillOffer, QuotationBank, QuotationAccessOTP, QuotationAnalytics,
@@ -22,6 +24,16 @@ from app.core.routing import get_frontend_base_url
 
 router = APIRouter()
 
+def _format_time_diff(seconds: float) -> str:
+    sec = max(1, int(abs(seconds)))
+    mins, s = divmod(sec, 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m {s}s"
+    if mins > 0:
+        return f"{mins}m {s}s"
+    return f"{s}s"
+
 def _get_bank_contacts_list(q_bank: QuotationBank):
     """Helper to extract normalized contacts list with roles."""
     if q_bank.contacts and isinstance(q_bank.contacts, list) and len(q_bank.contacts) > 0:
@@ -36,7 +48,7 @@ def _clean_magic_token(token_str: Optional[str]) -> Optional[str]:
     return token_str.split('_tab_')[0] if '_tab_' in token_str else token_str
 
 @router.get("/{token}")
-async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
+async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(get_db)):
     """Fetch RFQ details securely using token."""
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
@@ -76,6 +88,69 @@ async def get_rfq_by_token(token: str, db: Session = Depends(get_db)):
     is_open = False
     if window_start and window_end:
         is_open = (window_start <= now <= window_end)
+
+    # Clean audit logging of portal visits (debounced per 60s per RFQ to avoid flooding on browser refreshes)
+    client_host = request.client.host if request and request.client else None
+    if window_end and now > window_end:
+        diff_sec = (now - window_end).total_seconds()
+        diff_str = _format_time_diff(diff_sec)
+        recent_log = db.query(AuditLog).filter(
+            AuditLog.entity_type == "QuotationRequest",
+            AuditLog.entity_id == rfq.id,
+            AuditLog.action_type == "QUOTATION_BANK_LATE_ACCESS_ATTEMPT",
+            AuditLog.timestamp >= now - timedelta(seconds=60)
+        ).first()
+        if not recent_log:
+            log_action(
+                db=db,
+                user_id=None,
+                action_type="QUOTATION_BANK_LATE_ACCESS_ATTEMPT",
+                entity_type="QuotationRequest",
+                entity_id=rfq.id,
+                details={
+                    "bank_name": bank_name,
+                    "ref_no": rfq.ref_no,
+                    "action_description": f"Bank counterparty accessed portal {diff_str} after bidding window closed. Inputs locked/dimmed.",
+                    "window_start": window_start.strftime("%Y-%m-%d %H:%M:%S UTC") if window_start else None,
+                    "window_end": window_end.strftime("%Y-%m-%d %H:%M:%S UTC") if window_end else None,
+                    "attempted_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "seconds_past_deadline": int(diff_sec),
+                    "status": "CLOSED"
+                },
+                customer_id=rfq.customer_id,
+                ip_address=client_host
+            )
+            db.commit()
+    elif window_start and now < window_start:
+        diff_sec = (window_start - now).total_seconds()
+        diff_str = _format_time_diff(diff_sec)
+        recent_log = db.query(AuditLog).filter(
+            AuditLog.entity_type == "QuotationRequest",
+            AuditLog.entity_id == rfq.id,
+            AuditLog.action_type == "QUOTATION_BANK_EARLY_ACCESS_ATTEMPT",
+            AuditLog.timestamp >= now - timedelta(seconds=60)
+        ).first()
+        if not recent_log:
+            log_action(
+                db=db,
+                user_id=None,
+                action_type="QUOTATION_BANK_EARLY_ACCESS_ATTEMPT",
+                entity_type="QuotationRequest",
+                entity_id=rfq.id,
+                details={
+                    "bank_name": bank_name,
+                    "ref_no": rfq.ref_no,
+                    "action_description": f"Bank counterparty accessed portal {diff_str} before bidding window opened. Inputs locked until window opens.",
+                    "window_start": window_start.strftime("%Y-%m-%d %H:%M:%S UTC") if window_start else None,
+                    "window_end": window_end.strftime("%Y-%m-%d %H:%M:%S UTC") if window_end else None,
+                    "attempted_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "seconds_until_open": int(diff_sec),
+                    "status": "PRE_WINDOW"
+                },
+                customer_id=rfq.customer_id,
+                ip_address=client_host
+            )
+            db.commit()
 
     # Process Token Validity Expiry
     validity_hours = rfq.token_validity_hours or 24
@@ -526,6 +601,88 @@ async def request_quotation_otp(
         save_copy=False
     )
 
+    # Audit log the dealer's verification request (Zero-Knowledge: strictly NO otp_code or magic_token logged)
+    w_start = rfq.window_start
+    w_end = rfq.window_end
+    if w_start and w_start.tzinfo is None:
+        w_start = w_start.replace(tzinfo=timezone.utc)
+    if w_end and w_end.tzinfo is None:
+        w_end = w_end.replace(tzinfo=timezone.utc)
+
+    now_utc = datetime.now(timezone.utc)
+    client_ip = request.client.host if request and request.client else None
+
+    if w_end and now_utc > w_end:
+        diff_sec = (now_utc - w_end).total_seconds()
+        diff_str = _format_time_diff(diff_sec)
+        log_action(
+            db=db,
+            user_id=None,
+            action_type="QUOTATION_BANK_LATE_ACCESS_ATTEMPT",
+            entity_type="QuotationRequest",
+            entity_id=rfq.id,
+            details={
+                "bank_name": bank_display,
+                "dealer_email": target_email,
+                "dealer_role": role,
+                "action_description": f"Dealer requested verification code {diff_str} after bidding window closed. Inputs locked.",
+                "ref_no": rfq.ref_no,
+                "window_start": w_start.strftime("%Y-%m-%d %H:%M:%S UTC") if w_start else None,
+                "window_end": w_end.strftime("%Y-%m-%d %H:%M:%S UTC") if w_end else None,
+                "attempted_at": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "seconds_past_deadline": int(diff_sec),
+                "status": "CLOSED"
+            },
+            customer_id=rfq.customer_id,
+            ip_address=client_ip
+        )
+    elif w_start and now_utc < w_start:
+        diff_sec = (w_start - now_utc).total_seconds()
+        diff_str = _format_time_diff(diff_sec)
+        log_action(
+            db=db,
+            user_id=None,
+            action_type="QUOTATION_BANK_EARLY_ACCESS_ATTEMPT",
+            entity_type="QuotationRequest",
+            entity_id=rfq.id,
+            details={
+                "bank_name": bank_display,
+                "dealer_email": target_email,
+                "dealer_role": role,
+                "action_description": f"Dealer requested verification code {diff_str} before bidding window opened.",
+                "ref_no": rfq.ref_no,
+                "window_start": w_start.strftime("%Y-%m-%d %H:%M:%S UTC") if w_start else None,
+                "window_end": w_end.strftime("%Y-%m-%d %H:%M:%S UTC") if w_end else None,
+                "attempted_at": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "seconds_until_open": int(diff_sec),
+                "status": "PRE_WINDOW"
+            },
+            customer_id=rfq.customer_id,
+            ip_address=client_ip
+        )
+    else:
+        log_action(
+            db=db,
+            user_id=None,
+            action_type="QUOTATION_PORTAL_ACCESSED",
+            entity_type="QuotationRequest",
+            entity_id=rfq.id,
+            details={
+                "bank_name": bank_display,
+                "dealer_email": target_email,
+                "dealer_role": role,
+                "action_description": "Dealer requested verification code during active bidding window.",
+                "ref_no": rfq.ref_no,
+                "window_start": w_start.strftime("%Y-%m-%d %H:%M:%S UTC") if w_start else None,
+                "window_end": w_end.strftime("%Y-%m-%d %H:%M:%S UTC") if w_end else None,
+                "attempted_at": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "status": "OPEN"
+            },
+            customer_id=rfq.customer_id,
+            ip_address=client_ip
+        )
+    db.commit()
+
     return {
         "message": f"Verification code sent to {target_email}",
         "email": target_email,
@@ -536,6 +693,7 @@ async def request_quotation_otp(
 @router.post("/verify-otp")
 def verify_quotation_otp(
     req: OTPVerifyCreate,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     """Verifies 6-digit OTP code or Magic Link token and establishes authenticated portal session."""
@@ -597,7 +755,44 @@ def verify_quotation_otp(
     otp_record.is_used = True
     db.commit()
 
-    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    rfq = assignment.rfq or db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    w_start = rfq.window_start if rfq else None
+    w_end = rfq.window_end if rfq else None
+    if w_start and w_start.tzinfo is None:
+        w_start = w_start.replace(tzinfo=timezone.utc)
+    if w_end and w_end.tzinfo is None:
+        w_end = w_end.replace(tzinfo=timezone.utc)
+    
+    w_status = "OPEN"
+    if w_end and now > w_end:
+        w_status = "CLOSED"
+    elif w_start and now < w_start:
+        w_status = "PRE_WINDOW"
+
+    client_ip = request.client.host if request and request.client else None
+    if rfq:
+        bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
+        log_action(
+            db=db,
+            user_id=None,
+            action_type="QUOTATION_PORTAL_AUTHENTICATED",
+            entity_type="QuotationRequest",
+            entity_id=rfq.id,
+            details={
+                "bank_name": bank_name,
+                "dealer_email": otp_record.email,
+                "dealer_role": otp_record.role,
+                "auth_method": "6_DIGIT_OTP" if req.otp_code else "1_CLICK_MAGIC_LINK",
+                "action_description": "Bank dealer successfully authenticated and entered the quotation portal.",
+                "ref_no": rfq.ref_no,
+                "authenticated_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "window_status": w_status
+            },
+            customer_id=rfq.customer_id,
+            ip_address=client_ip
+        )
+        db.commit()
+
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
     matched = next((c for c in contacts if c.get("email", "").strip().lower() == otp_record.email.lower()), None)
     contact_name = matched.get("name") if matched else otp_record.email.split("@")[0]
@@ -813,6 +1008,7 @@ def desk_takeover(
 @router.post("/offer")
 def submit_fx_offer(
     offer_in: FXSpotOfferCreate,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == offer_in.token).first()
@@ -981,6 +1177,29 @@ def submit_fx_offer(
     except Exception:
         pass
 
+    # Clean non-sensitive audit log (Zero-Knowledge: strictly NO prices or bid numbers)
+    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
+    client_ip = request.client.host if request and request.client else None
+    log_action(
+        db=db,
+        user_id=None,
+        action_type="QUOTATION_OFFER_SUBMITTED",
+        entity_type="QuotationRequest",
+        entity_id=rfq.id,
+        details={
+            "bank_name": bank_name,
+            "dealer_email": submitted_by or "Authorized Bank Dealer",
+            "action_description": f"Bank submitted quotation offer for {rfq.type} ({rfq.ref_no}).",
+            "ref_no": rfq.ref_no,
+            "trade_type": rfq.type,
+            "legs_quoted_count": 1,
+            "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        },
+        customer_id=rfq.customer_id,
+        ip_address=client_ip
+    )
+    db.commit()
+
     desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", offer_in.price)
 
     return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data, "ranks_by_leg": ranks_by_leg}
@@ -989,6 +1208,7 @@ def submit_fx_offer(
 @router.post("/offers-batch")
 def submit_fx_offers_batch(
     payload: FXSpotMultiOfferCreate,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == payload.token).first()
@@ -1122,6 +1342,29 @@ def submit_fx_offers_batch(
     except Exception:
         pass
 
+    # Clean non-sensitive audit log (Zero-Knowledge: strictly NO prices or bid numbers)
+    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
+    client_ip = request.client.host if request and request.client else None
+    log_action(
+        db=db,
+        user_id=None,
+        action_type="QUOTATION_OFFER_SUBMITTED",
+        entity_type="QuotationRequest",
+        entity_id=rfq.id,
+        details={
+            "bank_name": bank_name,
+            "dealer_email": submitted_by or "Authorized Bank Dealer",
+            "action_description": f"Bank submitted multi-leg quotation package ({len(submitted_offers)} leg(s)) for {rfq.ref_no}.",
+            "ref_no": rfq.ref_no,
+            "trade_type": rfq.type,
+            "legs_quoted_count": len(submitted_offers),
+            "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        },
+        customer_id=rfq.customer_id,
+        ip_address=client_ip
+    )
+    db.commit()
+
     if submitted_offers:
         best_price = submitted_offers[0].price
         desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", best_price)
@@ -1136,6 +1379,7 @@ def submit_fx_offers_batch(
 @router.post("/tbill-offer")
 def submit_tbill_offer(
     offer_in: TBillOfferCreate,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == offer_in.token).first()
@@ -1263,6 +1507,29 @@ def submit_tbill_offer(
             }
     except Exception:
         pass
+
+    # Clean non-sensitive audit log (Zero-Knowledge: strictly NO rates or bid numbers)
+    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
+    client_ip = request.client.host if request and request.client else None
+    log_action(
+        db=db,
+        user_id=None,
+        action_type="QUOTATION_OFFER_SUBMITTED",
+        entity_type="QuotationRequest",
+        entity_id=rfq.id,
+        details={
+            "bank_name": bank_name,
+            "dealer_email": submitted_by or "Authorized Bank Dealer",
+            "action_description": f"Bank submitted T-Bill quotation ({len(offer_in.lines)} line(s)) for {rfq.ref_no}.",
+            "ref_no": rfq.ref_no,
+            "trade_type": "TBILL",
+            "lines_quoted_count": len(offer_in.lines),
+            "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        },
+        customer_id=rfq.customer_id,
+        ip_address=client_ip
+    )
+    db.commit()
 
     best_rate = max([line.discountRate for line in offer_in.lines]) if offer_in.lines else 0.0
     desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", best_rate)
@@ -1476,6 +1743,28 @@ async def approve_rfq_for_bank(
             is_read=False
         ))
 
+    db.commit()
+
+    # Clean non-sensitive audit log
+    client_ip = request.client.host if request and request.client else None
+    action_type = "QUOTATION_BANK_APPROVED" if action == "APPROVE" else "QUOTATION_BANK_DECLINED"
+    log_action(
+        db=db,
+        user_id=None,
+        action_type=action_type,
+        entity_type="QuotationRequest",
+        entity_id=rfq.id,
+        details={
+            "bank_name": bank_name,
+            "approver_email": approver_email,
+            "decision": action,
+            "action_description": f"Bank Approver {action.lower()}d participation for {rfq.ref_no}.",
+            "ref_no": rfq.ref_no,
+            "notes": action_in.notes
+        },
+        customer_id=rfq.customer_id,
+        ip_address=client_ip
+    )
     db.commit()
 
     return {
