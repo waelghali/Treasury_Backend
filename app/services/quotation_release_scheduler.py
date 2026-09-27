@@ -195,6 +195,16 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
             ))
             db.commit()
 
+        # Schedule 15m reminder before bidding window starts if lead time >= 60m
+        try:
+            schedule_rfq_15m_reminder(
+                rfq_id=rfq.id,
+                window_start=rfq.window_start,
+                release_time=rfq.dispatched_at or datetime.now(timezone.utc)
+            )
+        except Exception as rem_err:
+            logger.warning(f"broadcast_rfq_to_banks: Failed to schedule 15m reminder for {rfq.id}: {rem_err}")
+
         logger.info(f"broadcast_rfq_to_banks: Successfully dispatched RFQ {rfq_id} to banks ({emails_sent} recipients).")
         return {"status": "success", "emails_sent": emails_sent, "rfq_id": rfq_id}
 
