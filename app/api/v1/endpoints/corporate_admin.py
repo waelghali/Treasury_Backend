@@ -2830,7 +2830,7 @@ async def accept_quotation_deal(
     # Automatically dispatch result emails to counterparties
     try:
         from app.api.v1.endpoints.quotations_endpoints import dispatch_rfq_result_emails
-        await dispatch_rfq_result_emails(rfq.id, db, force=True)
+        await dispatch_rfq_result_emails(rfq.id, db, force=False)
     except Exception as e:
         logger.error(f"Error auto-dispatching result emails on deal accept: {e}")
 

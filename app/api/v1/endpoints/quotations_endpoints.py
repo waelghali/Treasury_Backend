@@ -1394,9 +1394,10 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         rfq.winner_rate = None
         rfq.saved_vs_avg = None
 
-    # Auto-dispatch result emails ONLY if the deal was accepted (manually or auto-accepted)
-    is_deal_confirmed = rfq.acceptance_status in ('ACCEPTED', 'AUTO_ACCEPTED') or (rfq.status == 'COMPLETED' and is_indicative_only)
-    if dispatch_emails and is_closed and is_deal_confirmed and winner_bank_id and not is_inconclusive and has_execution_banks:
+    # Auto-dispatch result emails ONLY for automated deal confirmations (AUTO_ACCEPTED or INDICATIVE_COMPLETED)
+    # Note: Manually accepted deals (ACCEPTED) are dispatched immediately and exclusively by the corporate_admin deal acceptance endpoint.
+    is_auto_deal_confirmed = (rfq.acceptance_status == 'AUTO_ACCEPTED') or (rfq.status == 'COMPLETED' and is_indicative_only)
+    if dispatch_emails and is_closed and is_auto_deal_confirmed and winner_bank_id and not is_inconclusive and has_execution_banks:
         trigger_auto_dispatch_results(rfq.id)
 
     db.commit()
@@ -2440,9 +2441,23 @@ def get_rfq_results(
     return compute_rfq_standings(rfq, db, dispatch_emails=True)
 
 _DISPATCHING_RFQS = set()
+_DISPATCH_LOCK = threading.Lock()
 
 async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = False) -> dict:
     """Sends winner & regret emails to assigned Execution banks for a completed RFQ."""
+    with _DISPATCH_LOCK:
+        if rfq_id in _DISPATCHING_RFQS:
+            logger.info(f"RFQ {rfq_id} result emails are already being dispatched by an active process. Skipping duplicate.")
+            return {"status": "skipped", "detail": "Result emails are currently being dispatched for this RFQ"}
+        _DISPATCHING_RFQS.add(rfq_id)
+
+    try:
+        return await _execute_dispatch_rfq_result_emails(rfq_id, db, force)
+    finally:
+        with _DISPATCH_LOCK:
+            _DISPATCHING_RFQS.discard(rfq_id)
+
+async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = False) -> dict:
     from app.models.models import AuditLog
     from app.crud.crud import log_action
 
@@ -2451,24 +2466,53 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
         return {"status": "error", "detail": "RFQ not found"}
 
     # Idempotency check: only send once automatically unless manually forced by admin
-    if not force:
-        already_sent = db.query(AuditLog).filter(
-            AuditLog.action_type == "QUOTATION_RESULTS_SENT",
-            AuditLog.entity_type == "QuotationRequest"
-        ).filter(
-            AuditLog.details["rfq_id"].astext == str(rfq.id)
-        ).first()
-        if already_sent:
-            return {"status": "skipped", "detail": "Result emails already dispatched for this RFQ"}
+    already_sent = db.query(AuditLog).filter(
+        AuditLog.action_type == "QUOTATION_RESULTS_SENT",
+        AuditLog.entity_type == "QuotationRequest"
+    ).filter(
+        AuditLog.details["rfq_id"].astext == str(rfq.id)
+    ).first()
 
-    # Evaluate results using central evaluation engine
-    res_data = get_rfq_results(rfq_id, db, current_user=None)
+    if already_sent and not force:
+        return {"status": "skipped", "detail": "Result emails already dispatched for this RFQ"}
+
+    # Debounce safeguard even when forced: prevent rapid duplicate clicks (<15s)
+    if force and already_sent and already_sent.timestamp:
+        now_utc = datetime.now(timezone.utc)
+        ts = already_sent.timestamp.replace(tzinfo=timezone.utc) if already_sent.timestamp.tzinfo is None else already_sent.timestamp
+        if (now_utc - ts).total_seconds() < 15:
+            return {"status": "skipped", "detail": "Result emails were recently sent. Please wait before retrying."}
+
+    # Evaluate results using central evaluation engine WITHOUT recursive dispatch
+    res_data = compute_rfq_standings(rfq, db, dispatch_emails=False)
     results = res_data.get("results", [])
     is_inconclusive = res_data.get("is_inconclusive", False)
     inconclusive_reason = res_data.get("inconclusive_reason")
     winner_bank_id = res_data.get("winner_bank_id")
     legs_data = res_data.get("legs", [])
     is_multi_leg = bool(legs_data and len(legs_data) > 1)
+
+    # Pre-claim in AuditLog to guarantee atomic DB-level idempotency across concurrent workers
+    audit_entry = None
+    if not force:
+        audit_entry = log_action(
+            db,
+            user_id=rfq.created_by_user_id,
+            action_type="QUOTATION_RESULTS_SENT",
+            entity_type="QuotationRequest",
+            entity_id=None,
+            details={
+                "rfq_id": str(rfq.id),
+                "ref_no": rfq.ref_no,
+                "winner_bank_id": winner_bank_id,
+                "emails_count": 0,
+                "is_multi_leg": is_multi_leg,
+                "status": "in_progress",
+                "dispatched_at": datetime.now(timezone.utc).isoformat()
+            },
+            customer_id=rfq.customer_id
+        )
+        db.commit()
 
     if is_multi_leg:
         all_legs_inconclusive = all(l.get("is_inconclusive", False) for l in legs_data)
@@ -2698,24 +2742,37 @@ async def dispatch_rfq_result_emails(rfq_id: str, db: Session, force: bool = Fal
             )
             emails_dispatched += 1
 
-    # Record audit log for idempotency
-    log_action(
-        db,
-        user_id=rfq.created_by_user_id,
-        action_type="QUOTATION_RESULTS_SENT",
-        entity_type="QuotationRequest",
-        entity_id=None,
-        details={
+    # Finalize or record audit log for idempotency
+    if audit_entry:
+        audit_entry.details = {
             "rfq_id": str(rfq.id),
             "ref_no": rfq.ref_no,
             "winner_bank_id": winner_bank_id,
             "emails_count": emails_dispatched,
             "is_multi_leg": is_multi_leg,
+            "status": "completed",
             "dispatched_at": datetime.now(timezone.utc).isoformat()
-        },
-        customer_id=rfq.customer_id
-    )
-    db.commit()
+        }
+        db.commit()
+    else:
+        log_action(
+            db,
+            user_id=rfq.created_by_user_id,
+            action_type="QUOTATION_RESULTS_SENT",
+            entity_type="QuotationRequest",
+            entity_id=None,
+            details={
+                "rfq_id": str(rfq.id),
+                "ref_no": rfq.ref_no,
+                "winner_bank_id": winner_bank_id,
+                "emails_count": emails_dispatched,
+                "is_multi_leg": is_multi_leg,
+                "status": "completed",
+                "dispatched_at": datetime.now(timezone.utc).isoformat()
+            },
+            customer_id=rfq.customer_id
+        )
+        db.commit()
 
     return {"status": "sent", "dispatched_count": emails_dispatched, "winner_bank_id": winner_bank_id}
 
@@ -2740,13 +2797,12 @@ def _run_auto_dispatch(rfq_id: str):
     except Exception as err:
         logger.warning(f"Auto-dispatching result emails failed for RFQ {rfq_id}: {err}")
     finally:
-        _DISPATCHING_RFQS.discard(rfq_id)
         db_local.close()
 
 def trigger_auto_dispatch_results(rfq_id: str):
-    if rfq_id in _DISPATCHING_RFQS:
-        return
-    _DISPATCHING_RFQS.add(rfq_id)
+    with _DISPATCH_LOCK:
+        if rfq_id in _DISPATCHING_RFQS:
+            return
     thread = threading.Thread(target=_run_auto_dispatch, args=(rfq_id,))
     thread.daemon = True
     thread.start()
