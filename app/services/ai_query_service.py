@@ -239,6 +239,10 @@ class AIQueryAssistantService:
             r"\bhow\s+works?\b", r"\bexplain\b", r"\btell\s+me\s+about\b",
             r"\bwhat\s+is\s+the\s+quotation\b", r"\bwhat\s+is\s+quotation\b",
             r"\bquotation\s+module\b", r"\bquotations\s+module\b", r"\brfq\b", r"\brfqs\b",
+            r"\bacceptance\s+window\b", r"\bacceptance\s+timeout\b", r"\bauto[-_]?accept\b", r"\bauto[-_]?reject\b",
+            r"\btolerance\s+limit\b", r"\btolerance\s+percent\b", r"\bcbe\s+benchmark\b",
+            r"\bdealer\s+roles?\b", r"\btrader\s+takeover\b", r"\bmulti[- ]leg\b",
+            r"\badditional\s+costs?\b", r"\bfinal\s+adjusted\s+price\b",
             r"\bcustody\s+module\b", r"\bissuance\s+module\b", r"\breconciliation\s+module\b",
             r"\bmaker\s+checker\b", r"\bapproval\s+matrix\b"
         ]
@@ -1355,7 +1359,80 @@ class AIQueryAssistantService:
                 f"- **Treasury Concepts**: *\"What is cash pooling?\"*, *\"How do forward contracts work?\"*"
             )
 
-                # 0.5 FX & T-Bills Quotation Module Guidance
+                # 0.4a Quotation Acceptance Window & Timeout Policies Guidance
+        if any(w in q_lower for w in [
+            "acceptance window", "acceptance timeout", "auto_accept", "auto_reject",
+            "auto accept", "auto reject", "acceptance policy"
+        ]):
+            return (
+                f"**How the Corporate Acceptance Window & Timeout Policies Work**:\n\n"
+                f"When a quotation bidding window closes, Corporate Treasury enters a dedicated **Acceptance Window** (e.g. 30 seconds to 2 minutes) to review firm quotes and execute the trade:\n\n"
+                f"1. **Live Synchronized Countdowns**:\n"
+                f"   - **Corporate Admin Cockpit** (`{nav_base}/quotations`): Shows a prominent countdown timer with instant **Accept Winner** and **Decline Deal** buttons.\n"
+                f"   - **Bank Bidding Portal**: Displays a live `Selection in Progress [⏱ XXs remaining]` badge so bank dealers know exactly how long their firm quotes must be held.\n\n"
+                f"2. **Timeout Policies (Configured per RFQ)**:\n"
+                f"   - **AUTO_ACCEPT**: If the timer hits zero without manual action, the engine **automatically awards** the deal to the lowest/best valid rate, generates the deal slip, and emails trade execution tickets to the winning desk.\n"
+                f"   - **AUTO_REJECT**: If the timer hits zero without confirmation, the RFQ transitions to `REJECTED`, all quotes are preserved for internal review, and a neutral closure notification is sent to quoting banks without executing any trade.\n\n"
+                f"3. **Manual Decision Overrides**:\n"
+                f"   - Corporate Admin can manually accept the winner or decline the deal at any second during the active window.\n\n"
+                f"👉 [Review Quotation Requests]({nav_base}/quotations)"
+            )
+
+        # 0.4b Quotation Tolerance Limits & Central Bank Benchmarks
+        if any(w in q_lower for w in [
+            "tolerance limit", "tolerance percent", "cbe benchmark", "inconclusive", "max tolerance"
+        ]):
+            return (
+                f"**How Tolerance Limits & Central Bank (CBE) Benchmarks Work**:\n\n"
+                f"To protect corporate treasury from executing trades at off-market spreads, the system enforces **Tolerance Limit Controls**:\n\n"
+                f"1. **Benchmark Reference**:\n"
+                f"   - The RFQ compares incoming quotes against the Central Bank (CBE) benchmark rate or indicative reference pricing.\n\n"
+                f"2. **Tolerance Threshold (`max_tolerance_percent`)**:\n"
+                f"   - If the best submitted execution rate deviates from the benchmark by more than the allowed tolerance percentage (e.g. > 0.5%), the trade is automatically flagged as **INCONCLUSIVE**.\n\n"
+                f"3. **Execution Safeguard**:\n"
+                f"   - Inconclusive deals cannot be accidentally auto-accepted, protecting the company from adverse market shifts.\n\n"
+                f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
+            )
+
+        # 0.4c Bank Dealer Roles & Takeover Mechanism
+        if any(w in q_lower for w in [
+            "bank role", "bank dealer role", "approver role", "execution dealer", "trader takeover", "bank roles"
+        ]):
+            return (
+                f"**Bank Counterparty Roles & Quoting Portal Architecture**:\n\n"
+                f"Each invited banking institution operates with structured dealer roles configured under `{nav_base}/settings` (Bank Counterparties):\n\n"
+                f"1. **APPROVER (Internal Bank Authorization)**:\n"
+                f"   - An authorized bank signatory who must approve participation before the trading desk can bid. If declined, the bank's portal locks with `PARTICIPATION_DECLINED`.\n\n"
+                f"2. **EXECUTION (Active Quoting Trader)**:\n"
+                f"   - Desk trader authorized to enter firm buy/sell rates and submit quotes during the bidding window.\n\n"
+                f"3. **VIEW_ONLY (Spectator / Risk Monitor)**:\n"
+                f"   - Read-only observer who can monitor window timings and RFQ specifications without quoting capability.\n\n"
+                f"4. **Trader Takeover Mechanism**:\n"
+                f"   - If another execution dealer from the same bank opens the link, they can seamlessly assume active quoting with one click, gracefully transitioning the previous trader to spectator mode.\n\n"
+                f"5. **Zero-Password Authentication**:\n"
+                f"   - Counterparties authenticate securely via 6-Digit OTP or 1-Click Magic Link with full audit logging.\n\n"
+                f"👉 [Manage Bank Counterparties]({nav_base}/settings)"
+            )
+
+        # 0.4d Multi-Leg Baskets & Additional Cost Matrix
+        if any(w in q_lower for w in [
+            "multi leg", "multi-leg", "currency basket", "partial award", "additional cost", "final adjusted price"
+        ]):
+            return (
+                f"**Multi-Leg Baskets & Final Adjusted Price Matrix**:\n\n"
+                f"Grow supports complex multi-currency RFQ packages and true all-in pricing economics:\n\n"
+                f"1. **Multi-Leg Baskets**:\n"
+                f"   - Bundle multiple currency pairs (e.g. EUR/EGP + USD/EGP) into a single RFQ.\n"
+                f"   - Banks submit quotes across all legs simultaneously.\n"
+                f"   - Corporate Treasury can award individual legs to different banks or award the entire basket.\n\n"
+                f"2. **Additional Cost Matrix (Spreads & Bank Fees)**:\n"
+                f"   - Configure bank-specific fees: Percentage (%), Minimum fee, Maximum cap, and Flat fee.\n"
+                f"   - The system automatically calculates the **Final Adjusted Price** = Quoted Rate + Additional Costs.\n"
+                f"   - Winners are determined by the best Final Adjusted Price to reflect the true net economic cost.\n\n"
+                f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
+            )
+
+        # 0.5 FX & T-Bills Quotation Module Guidance
         if any(w in q_lower for w in [
             "quotation", "quotations", "rfq", "rfqs", "fx quote", "fx quotation",
             "t-bill quote", "tbill quote", "t-bill quotation", "treasury bill quote",
@@ -1367,16 +1444,19 @@ class AIQueryAssistantService:
                     f"The Quotation Module provides end-to-end competitive rate discovery, multi-bank digital RFQs (Request for Quote), and automated trade execution for **Foreign Exchange (Spot / Forward)** and **Treasury Bills (T-Bills)**:\n\n"
                     f"1. **Centralized Quotation Control Center** (`{nav_base}/quotations`):\n"
                     f"   - View all active, pending, awarded, and expired RFQ rounds across all internal entities.\n"
-                    f"   - Monitor live bank dealer submissions in a real-time side-by-side comparison matrix.\n"
-                    f"   - Compare competitive rates, bid/ask spreads, and yield differences instantly.\n\n"
+                    f"   - Monitor live bank dealer submissions in a real-time side-by-side comparison matrix with **Final Adjusted Prices**.\n"
+                    f"   - Compare competitive rates, bid/ask spreads, and T-Bill yield curves after 20% withholding tax.\n\n"
                     f"2. **Pre-Broadcast Governance & Approval** (`QUOTATION_APPROVAL_REQUIRED`):\n"
                     f"   - Located under **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs` Group 4).\n"
                     f"   - When enabled (`true`), RFQs submitted by End Users are routed to Corporate Admin for verification before being broadcast to bank dealers.\n\n"
-                    f"3. **Awarding Deals & Trade Settlement**:\n"
-                    f"   - Select the winning bank dealer with the most competitive rate and click **Award Deal**.\n"
-                    f"   - Grow automatically dispatches digital trade confirmations to the winning dealer and updates internal treasury exposure records.\n\n"
-                    f"4. **Audit Trail & Bank Performance Analytics**:\n"
-                    f"   - Track dealer participation rates, quote turnaround speed, and pricing competitiveness across all banking partners.\n\n"
+                    f"3. **Acceptance Window & Execution Policies**:\n"
+                    f"   - A synchronized decision window (e.g. 30s) activates immediately upon bidding closure.\n"
+                    f"   - Supports **AUTO_ACCEPT** (auto-awards best quote upon timeout) or **AUTO_REJECT** (auto-declines trade on timeout while preserving quotes for audit).\n\n"
+                    f"4. **Awarding Deals & Trade Settlement**:\n"
+                    f"   - Select winning counterparties per currency pair or award multi-leg packages.\n"
+                    f"   - Automatically dispatches official trade execution tickets to winners and neutral outcome notifications to unselected counterparties.\n\n"
+                    f"5. **Audit Trail & Bank Performance Analytics**:\n"
+                    f"   - Complete audit trail tracking portal access, IP addresses, quoting timestamps, and pricing competitiveness across all banking partners.\n\n"
                     f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
                 )
             else:
@@ -1387,14 +1467,14 @@ class AIQueryAssistantService:
                     f"   - Navigate to **Sidebar ➔ Quotations ➔ Quotation Requests & History** (`{nav_base}/quotations`).\n"
                     f"   - Click **New Quotation Request (Create RFQ)**.\n"
                     f"   - Select Instrument Type: **FX Spot**, **FX Forward**, or **Treasury Bills (T-Bills)**.\n"
-                    f"   - Specify Currency Pair, Buy/Sell Amount, Settlement/Value Date, and Tenor/Maturity Date.\n"
-                    f"   - Select the relationship banks you wish to invite to submit live rates.\n"
-                    f"   - Click **Submit RFQ**.\n\n"
+                    f"   - Specify Currency Pair, Buy/Sell Direction, Amount, and Settlement/Value Dates.\n"
+                    f"   - Bundle multiple pairs into a **Multi-Leg Basket** if required.\n"
+                    f"   - Select relationship banks and submit for approval or release.\n\n"
                     f"2. **Bank Dealer Quoting**:\n"
                     f"   - Invited bank dealers receive a secure, tokenized public portal link (`/public/quotations/:token`) to submit live executable rates without needing system passwords.\n\n"
                     f"3. **Real-Time Rate Tracking & Awarding**:\n"
-                    f"   - Watch incoming bank bids in real-time as dealers submit their live rates and spreads.\n"
-                    f"   - Review competing quotes and route the best offer for awarding/trade confirmation.\n\n"
+                    f"   - Watch incoming bank bids in real-time as dealers submit live rates and spreads.\n"
+                    f"   - Review competing quotes and route the best offer for awarding or corporate acceptance.\n\n"
                     f"👉 [Open Quotations Workspace]({nav_base}/quotations)"
                 )
 
@@ -1861,11 +1941,19 @@ class AIQueryAssistantService:
                 client = _get_genai_client()
                 if client:
                     tok_recs, tok_ben, tok_fac, token_map = privacy_tokenizer.tokenize_complex_payload([], {}, [])
-                    sanitized_q = privacy_tokenizer.sanitize_user_question(user_question)
+                    genai_contents = (
+                        "You are Grow Treasury Assistant, an institutional corporate treasury AI expert embedded in the Grow Treasury System. "
+                        "You have full knowledge of Grow modules: Letter of Guarantee (Custody & Issuance), Bank Reconciliation, and "
+                        "the FX & T-Bill Digital Quotation Module (multi-bank RFQs, bidding window timers, post-window corporate acceptance "
+                        "windows with AUTO_ACCEPT/AUTO_REJECT policies, multi-currency basket packages with partial leg awards, bank dealer roles "
+                        "[Approver, Execution Trader, View-Only], additional cost matrices [Min, %, Max, Flat], Central Bank tolerance limits, "
+                        "and neutral outcome conclusion notifications). Answer professionally, accurately, and concisely. "
+                        f"User question: {sanitized_q}"
+                    )
                     response = _safe_generate_content_sync(
                         client=client,
                         model=GEMINI_MODEL_NAME,
-                        contents=f"You are Grow Treasury Assistant. Answer concisely in corporate treasury context: {sanitized_q}"
+                        contents=genai_contents
                     )
                     raw_text = response.text or ""
                     final_answer = privacy_tokenizer.detokenize_response(raw_text, token_map)

@@ -2900,6 +2900,9 @@ async def decline_quotation_deal(
         customer_id=corporate_admin_context.customer_id
     )
 
+    from app.api.v1.endpoints.quotations_endpoints import trigger_auto_dispatch_results
+    trigger_auto_dispatch_results(rfq.id)
+
     return {
         "status": "success",
         "message": f"Deal declined for RFQ {rfq.ref_no}.",

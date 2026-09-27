@@ -837,6 +837,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "reason": "Acceptance window expired with policy AUTO_REJECT"},
                         customer_id=rfq.customer_id
                     )
+                    trigger_auto_dispatch_results(rfq.id)
             else:
                 # Acceptance window is still active! Awaiting Corporate Admin manual decision
                 rfq.acceptance_status = 'PENDING'
@@ -1394,10 +1395,9 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         rfq.winner_rate = None
         rfq.saved_vs_avg = None
 
-    # Auto-dispatch result emails ONLY for automated deal confirmations (AUTO_ACCEPTED or INDICATIVE_COMPLETED)
-    # Note: Manually accepted deals (ACCEPTED) are dispatched immediately and exclusively by the corporate_admin deal acceptance endpoint.
-    is_auto_deal_confirmed = (rfq.acceptance_status == 'AUTO_ACCEPTED') or (rfq.status == 'COMPLETED' and is_indicative_only)
-    if dispatch_emails and is_closed and is_auto_deal_confirmed and winner_bank_id and not is_inconclusive and has_execution_banks:
+    # Auto-dispatch result emails for automated deal confirmations OR auto-rejections
+    is_auto_deal_concluded = (rfq.acceptance_status in ('AUTO_ACCEPTED', 'AUTO_REJECTED')) or (rfq.status == 'COMPLETED' and is_indicative_only)
+    if dispatch_emails and is_closed and is_auto_deal_concluded and has_execution_banks:
         trigger_auto_dispatch_results(rfq.id)
 
     db.commit()
@@ -2514,18 +2514,16 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
         )
         db.commit()
 
-    if is_multi_leg:
-        all_legs_inconclusive = all(l.get("is_inconclusive", False) for l in legs_data)
-        if all_legs_inconclusive:
-            return {"status": "skipped", "detail": f"RFQ ended without any conclusive leg winners: {inconclusive_reason}"}
-        has_any_winner = any(l.get("winner_bank_id") and not l.get("is_inconclusive") for l in legs_data)
-        if not has_any_winner:
-            return {"status": "skipped", "detail": "No winning Execution quotes found for any leg."}
-    else:
-        if is_inconclusive:
-            return {"status": "skipped", "detail": f"RFQ ended without a conclusive winner: {inconclusive_reason}"}
-        if not winner_bank_id:
-            return {"status": "skipped", "detail": "No winning Execution quote found."}
+    # Verify if there are any submitted execution quotes to notify
+    has_any_execution_quotes = any(
+        (r.get('quotation_base') or rfq.quotation_base or 'Execution').lower() == 'execution' and r.get('price') is not None
+        for r in results
+    ) if not is_multi_leg else any(
+        any((r.get('quotation_base') or l.get('quotation_base') or 'Execution').lower() == 'execution' and r.get('price') is not None for r in l.get('results', []))
+        for l in legs_data
+    )
+    if not has_any_execution_quotes:
+        return {"status": "skipped", "detail": "No Execution quotes received to dispatch outcome emails."}
 
     from app.core.email_service import get_customer_email_settings, send_email
     from app.services.unified_email_builder import build_transaction_email_html
@@ -2562,8 +2560,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
             if not b_info["bank_emails"]:
                 continue
 
-            won_legs = [l for l in legs_data if l.get("winner_bank_id") == b_id and not l.get("is_inconclusive")]
-            lost_legs = [l for l in legs_data if l.get("winner_bank_id") != b_id and any(r.get("bank_id") == b_id for r in l.get("results", []))]
+            won_legs = [l for l in legs_data if l.get("winner_bank_id") == b_id and not l.get("is_inconclusive") and rfq.status not in ('REJECTED', 'CANCELLED')]
+            lost_legs = [l for l in legs_data if l not in won_legs and any(r.get("bank_id") == b_id for r in l.get("results", []))]
 
             if won_legs:
                 is_partial = len(won_legs) < len(legs_data)
@@ -2604,12 +2602,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
                         p_str = f"{b_res.get('price', 0):.5f}" if b_res.get('price') is not None else "No Quote"
                         pair_label = leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
-                        if leg.get("is_inconclusive") or not leg.get("winner_bank_id"):
-                            status_suffix = "Concluded Without Execution (Tolerance Exceeded / Inconclusive)"
-                        else:
-                            status_suffix = "Concluded &amp; Awarded to Competing Counterparty"
                         key_vals[f"Unselected Leg ({pair_label})"] = (
-                            f"<span style='color: #64748b;'>Your Quote: {p_str} &bull; {status_suffix}</span>"
+                            f"<span style='color: #64748b;'>Your Quote: {p_str} &bull; Concluded &bull; Not Selected</span>"
                         )
 
                 body = build_transaction_email_html(
@@ -2623,12 +2617,12 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                 )
             elif lost_legs:
                 # Regret notification email
-                subject = f"RFQ Result Notification: RFQ {ref_no} ({customer_name}) - Multi-Currency Package"
+                subject = f"RFQ Outcome Notification: RFQ {ref_no} ({customer_name}) - Multi-Currency Package"
                 key_vals = {
                     "RFQ Reference": ref_no,
                     "Requesting Legal Entity": customer_name,
                     "Participating Package Legs": f"{len(lost_legs)} Currency Pairs",
-                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Executed with Competing Counterparties</span>"
+                    "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Concluded &bull; Not Selected</span>"
                 }
                 for i, leg in enumerate(lost_legs):
                     b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
@@ -2642,7 +2636,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                     transaction_ref=ref_no,
                     transaction_type="RFQ Outcome",
                     key_value_dict=key_vals,
-                    summary_text=f"Thank you for submitting quotes for RFQ <strong>{ref_no}</strong> with <strong>{customer_name}</strong>. We are writing to inform you that all trades in this package have concluded and were awarded to other counterparties offering more competitive pricing.",
+                    summary_text=f"Thank you for submitting your quotation for RFQ <strong>{ref_no}</strong> with <strong>{customer_name}</strong>. We are writing to inform you that this quotation request has concluded and your offer was not selected for trade execution on this occasion. We appreciate your prompt participation and look forward to collaborating on future transactions.",
                     recipient_name=f"{b_info['bank_name']} Treasury Desk"
                 )
             else:
@@ -2675,7 +2669,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
             if not bank_emails:
                 continue
 
-            is_winner = (bank_res['bank_id'] == winner_bank_id)
+            is_winner = (bank_res['bank_id'] == winner_bank_id) and (rfq.status not in ('REJECTED', 'CANCELLED'))
             dealer_identity = bank_res.get('submitted_by_email') or "Authorized Execution Dealer"
             sub_time_str = "N/A"
             if bank_res.get('submitted_at'):
@@ -2710,7 +2704,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                     recipient_name=f"{bank_res['bank_name']} Treasury Desk"
                 )
             else:
-                subject = f"RFQ Result Notification: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
+                subject = f"RFQ Outcome Notification: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
                 quote_display = f"{bank_res['price']:.5f}" if bank_res.get('price') is not None else "No Quote Submitted"
                 body = build_transaction_email_html(
                     customer_name=customer_name,
@@ -2725,9 +2719,9 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
                         "Target Value Date": executed_val_date,
                         "Your Submitted Quote": quote_display,
-                        "Deal Status": "<span style='color: #64748b; font-weight: 700;'>❌ Executed with Competing Counterparty</span>"
+                        "Deal Status": "<span style='color: #64748b; font-weight: 700;'>Concluded &bull; Not Selected</span>"
                     },
-                    summary_text=f"Thank you for submitting your quote for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this transaction has concluded and was awarded to another counterparty offering a more competitive all-in rate.",
+                    summary_text=f"Thank you for submitting your quotation for RFQ <strong>{ref_no}</strong> ({rfq.buy_currency}/{rfq.sell_currency}) with <strong>{customer_name}</strong>. We are writing to inform you that this quotation request has concluded and your offer was not selected for trade execution on this occasion. We appreciate your prompt participation and look forward to collaborating on future transactions.",
                     recipient_name=f"{bank_res['bank_name']} Treasury Desk"
                 )
 

@@ -1975,7 +1975,7 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
         if rfq.status == 'REJECTED' or getattr(rfq, 'acceptance_status', None) in ('REJECTED', 'AUTO_REJECTED'):
             return {
                 "status": "UNEXECUTED",
-                "detail": "Quotation deal closed without execution (declined or expired without corporate acceptance)."
+                "detail": "This quotation request has concluded and your offer was not selected for trade execution on this occasion."
             }
 
         bank_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
