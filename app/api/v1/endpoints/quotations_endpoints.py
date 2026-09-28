@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from typing import List, Any, Optional, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -169,7 +169,7 @@ def get_latest_bank_costs(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Retrieves cost settings from the most recent approved RFQ for a given bank."""
+    """Retrieves cost settings from the most recent RFQ for a given bank that actually had non-zero cost parameters."""
     q_banks = db.query(QuotationBank).filter(
         QuotationBank.customer_id == current_user.customer_id,
         QuotationBank.bank_id == bank_id
@@ -179,12 +179,19 @@ def get_latest_bank_costs(
     if not q_bank_ids:
         return {"cost_min": 0.0, "cost_percent": 0.0, "cost_max": 0.0, "cost_flat": 0.0}
         
+    # First, search QuotationBankAssignment for most recent non-zero cost
     latest_assignment = db.query(QuotationBankAssignment).join(
         QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
     ).filter(
         QuotationBankAssignment.quotation_bank_id.in_(q_bank_ids),
         QuotationRequest.customer_id == current_user.customer_id,
-        QuotationRequest.status.in_(['PENDING', 'EVALUATING', 'COMPLETED'])
+        QuotationRequest.status.in_(['PENDING', 'EVALUATING', 'COMPLETED']),
+        or_(
+            QuotationBankAssignment.cost_min > 0,
+            QuotationBankAssignment.cost_percent > 0,
+            QuotationBankAssignment.cost_max > 0,
+            QuotationBankAssignment.cost_flat > 0
+        )
     ).order_by(QuotationRequest.created_at.desc()).first()
     
     if latest_assignment:
@@ -196,6 +203,32 @@ def get_latest_bank_costs(
             "quotation_base": latest_assignment.quotation_base
         }
         
+    # Also search QuotationBankLegConfig in case costs were configured per currency leg
+    latest_leg_cfg = db.query(QuotationBankLegConfig).join(
+        QuotationBankAssignment, QuotationBankLegConfig.assignment_id == QuotationBankAssignment.id
+    ).join(
+        QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
+    ).filter(
+        QuotationBankAssignment.quotation_bank_id.in_(q_bank_ids),
+        QuotationRequest.customer_id == current_user.customer_id,
+        QuotationRequest.status.in_(['PENDING', 'EVALUATING', 'COMPLETED']),
+        or_(
+            QuotationBankLegConfig.cost_min > 0,
+            QuotationBankLegConfig.cost_percent > 0,
+            QuotationBankLegConfig.cost_max > 0,
+            QuotationBankLegConfig.cost_flat > 0
+        )
+    ).order_by(QuotationRequest.created_at.desc()).first()
+
+    if latest_leg_cfg:
+        return {
+            "cost_min": latest_leg_cfg.cost_min or 0.0,
+            "cost_percent": latest_leg_cfg.cost_percent or 0.0,
+            "cost_max": latest_leg_cfg.cost_max or 0.0,
+            "cost_flat": latest_leg_cfg.cost_flat or 0.0,
+            "quotation_base": latest_leg_cfg.quotation_base
+        }
+
     return {"cost_min": 0.0, "cost_percent": 0.0, "cost_max": 0.0, "cost_flat": 0.0}
 
 @router.get("/recommendations")
@@ -540,6 +573,23 @@ def create_rfq(
                             (rfq_in.maturityDateEnd and rfq_in.maturityDateEnd != rfq_in.maturityDateStart)
                 if has_range and (rfq_in.evalRate is None or rfq_in.evalRate <= 0):
                     raise HTTPException(status_code=400, detail="Evaluation Interest Rate (%) is required for T-Bill Buy quotations with date ranges.")
+
+        # --- Strict Positive Amount Validation ---
+        if rfq_in.type == 'FX_SPOT':
+            legs_list = rfq_in.legs or rfq_in.pairs
+            if legs_list:
+                for idx, leg in enumerate(legs_list):
+                    if leg.amount is None or leg.amount <= 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Trade amount for Pair #{idx + 1} ({leg.buyCurrency or 'USD'}/{leg.sellCurrency or 'EGP'}) must be a positive number strictly greater than 0."
+                        )
+            else:
+                if rfq_in.amount is None or rfq_in.amount <= 0:
+                    raise HTTPException(status_code=400, detail="Trade amount must be a positive number strictly greater than 0.")
+        elif rfq_in.type == 'TBILL':
+            if rfq_in.amount is None or rfq_in.amount <= 0:
+                raise HTTPException(status_code=400, detail="Total amount must be a positive number strictly greater than 0.")
 
         # --- Entity Scope & Access Validation ---
         from app.models.models import CustomerEntity, User
