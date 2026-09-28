@@ -507,10 +507,21 @@ async def request_quotation_otp(
                 detail="Your bank's approver declined participation in this quotation."
             )
 
+    # Invalidate any prior unverified OTPs for this assignment and email so only 1 OTP is active at a time
+    now_utc = datetime.now(timezone.utc)
+    db.query(QuotationAccessOTP).filter(
+        QuotationAccessOTP.assignment_id == assignment.id,
+        QuotationAccessOTP.email == target_email,
+        QuotationAccessOTP.is_used == False
+    ).update({
+        QuotationAccessOTP.is_used: True,
+        QuotationAccessOTP.expires_at: now_utc
+    }, synchronize_session=False)
+
     # Generate 6-digit OTP & Magic Token
     otp_code = f"{secrets.randbelow(900000) + 100000}"
     magic_token = uuid.uuid4().hex
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expires_at = now_utc + timedelta(minutes=15)
 
     otp_record = QuotationAccessOTP(
         assignment_id=assignment.id,
@@ -719,7 +730,8 @@ def verify_quotation_otp(
 
     query = db.query(QuotationAccessOTP).filter(
         QuotationAccessOTP.assignment_id == assignment.id,
-        QuotationAccessOTP.expires_at > now
+        QuotationAccessOTP.expires_at > now,
+        QuotationAccessOTP.is_used == False
     )
 
     if req.magic_token:
