@@ -401,6 +401,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "is_mixed": is_mixed_rfq,
         "has_execution_legs": has_exec_leg,
         "is_all_indicative": not has_exec_leg,
+        "has_execution_dealers": any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
         "document_path": rfq.document_path if (has_exec_leg and assignment.is_document_visible is not False) else None,
         "documents": parsed_docs,
         "status": rfq.status,
@@ -472,11 +473,16 @@ async def request_quotation_otp(
     contact_name = matched_contact.get("name") or target_email.split("@")[0]
 
     # Check if bank approval is required for this quotation
-    effective_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") or "Execution").lower()
-    is_indicative = effective_base == "indicative"
+    leg_cfgs = getattr(assignment, "leg_configs", []) or []
+    if leg_cfgs:
+        has_exec_leg = any((c.quotation_base or "").lower() == "execution" for c in leg_cfgs)
+    else:
+        has_exec_leg = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") or "Execution").lower() in ("execution", "mixed")
+    if getattr(assignment, "is_cross_entity", False):
+        has_exec_leg = False
     has_approver = any(c.get("role") == "APPROVER" for c in contacts)
     has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
-    requires_approval = (not is_indicative) and has_approver and has_execution
+    requires_approval = has_exec_leg and has_approver and has_execution
 
     # If approval is not required, heal any stale PENDING status
     if not requires_approval and assignment.approval_status == 'PENDING':
@@ -738,13 +744,18 @@ def verify_quotation_otp(
         )
 
     # Check if bank approval is required for this quotation
-    effective_base = (getattr(assignment, "quotation_base", "") or getattr(assignment.rfq, "quotation_base", "") if assignment.rfq else "Execution").lower()
-    is_indicative = effective_base == "indicative"
+    leg_cfgs = getattr(assignment, "leg_configs", []) or []
+    if leg_cfgs:
+        has_exec_leg = any((c.quotation_base or "").lower() == "execution" for c in leg_cfgs)
+    else:
+        has_exec_leg = (getattr(assignment, "quotation_base", "") or getattr(assignment.rfq, "quotation_base", "") if assignment.rfq else "Execution").lower() in ("execution", "mixed")
+    if getattr(assignment, "is_cross_entity", False):
+        has_exec_leg = False
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
     has_approver = any(c.get("role") == "APPROVER" for c in contacts)
     has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
-    requires_approval = (not is_indicative) and has_approver and has_execution
+    requires_approval = has_exec_leg and has_approver and has_execution
 
     # If approval is not required, heal any stale PENDING status
     if not requires_approval and assignment.approval_status == 'PENDING':
@@ -917,13 +928,11 @@ def desk_heartbeat(
             "is_window_open": False
         }
 
-    # Determine if approver is authorized to quote (indicative or solo bank contact)
+    # Determine if approver is authorized to quote (only when bank has no execution dealers)
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
     has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-    effective_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") if rfq else "Execution").lower()
-    is_indicative = effective_base == "indicative"
-    can_approver_execute = is_indicative or not has_execution_dealers
+    can_approver_execute = not has_execution_dealers
 
     desk_role = "EXECUTION" if (resolved_role == "EXECUTION" or (resolved_role == "APPROVER" and can_approver_execute)) else resolved_role
 
@@ -970,9 +979,7 @@ def desk_takeover(
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
     has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-    effective_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") if rfq else "Execution").lower()
-    is_indicative = effective_base == "indicative"
-    can_approver_execute = is_indicative or not has_execution_dealers
+    can_approver_execute = not has_execution_dealers
 
     is_allowed = (resolved_role == "EXECUTION") or (resolved_role == "APPROVER" and can_approver_execute)
     if not is_allowed:
@@ -1259,8 +1266,7 @@ def submit_fx_offers_batch(
             elif otp_rec.role == "APPROVER":
                 contacts = _get_bank_contacts_list(q_bank) if q_bank else []
                 has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-                is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
-                if not is_indicative and has_execution_dealers:
+                if has_execution_dealers:
                     raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
             submitted_by = otp_rec.email
 
@@ -1378,7 +1384,20 @@ def submit_fx_offers_batch(
 
     if submitted_offers:
         best_price = submitted_offers[0].price
-        desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", best_price)
+        legs_payload = {
+            str(item.leg_id or "default"): {
+                "price": item.price,
+                "offered_value_date": getattr(item, "offered_value_date", None),
+                "notes": getattr(item, "notes", None)
+            }
+            for item in payload.quotes
+        }
+        desk_session_service.record_quote_submission(
+            assignment.id,
+            submitted_by or "Dealer",
+            best_price,
+            legs_quotes=legs_payload
+        )
 
     return {
         "success": True,
@@ -1432,8 +1451,7 @@ def submit_tbill_offer(
             elif otp_rec.role == "APPROVER":
                 contacts = _get_bank_contacts_list(q_bank) if q_bank else []
                 has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-                is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
-                if not is_indicative and has_execution_dealers:
+                if has_execution_dealers:
                     raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
             submitted_by = otp_rec.email
 
@@ -1994,10 +2012,15 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 pair_name = l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}"
                 l_winner_id = l.get("winner_bank_id")
                 l_inconclusive = l.get("is_inconclusive", False)
+                l_status = (l.get("status") or "").upper()
 
                 if leg_base == "indicative":
                     indicative_legs.append(l)
                     leg_status = "INDICATIVE"
+                    is_leg_win = False
+                elif l_status in ("REJECTED", "CANCELLED", "DECLINED"):
+                    lost_legs.append(l)
+                    leg_status = "NOT_SELECTED"
                     is_leg_win = False
                 elif l_inconclusive or not l_winner_id:
                     inconclusive_legs.append(l)
@@ -2020,7 +2043,7 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                     "quotation_base": l.get("quotation_base", "Execution"),
                     "is_winner": is_leg_win,
                     "won": is_leg_win,
-                    "status": "WINNER" if is_leg_win else ("NOT_SELECTED" if leg_status == "LOST" else leg_status),
+                    "status": "WINNER" if is_leg_win else ("NOT_SELECTED" if leg_status in ("LOST", "NOT_SELECTED") else leg_status),
                     "raw_status": leg_status,
                     "winner_rate": l.get("winner_rate") if is_leg_win else None
                 }
@@ -2062,6 +2085,10 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
 
         winner_bank_id = res_data.get("winner_bank_id")
         is_inconclusive = res_data.get("is_inconclusive", False)
+        rfq_res_status = (res_data.get("status") or (rfq.status if rfq else "")).upper()
+
+        if rfq_res_status in ("REJECTED", "CANCELLED", "DECLINED"):
+            return {"status": "NOT_SELECTED"}
 
         if is_inconclusive or not winner_bank_id:
             return {"status": "INCONCLUSIVE"}

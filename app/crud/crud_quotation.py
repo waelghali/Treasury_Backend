@@ -324,7 +324,21 @@ class CRUDQuotation:
         p_min_ticket = (first_pair.minTicketAmount if is_multi_pair and first_pair.minTicketAmount is not None else obj_in.minTicketAmount)
         p_buy_curr = (first_pair.buyCurrency if is_multi_pair and first_pair.buyCurrency else obj_in.buyCurrency) or "USD"
         p_sell_curr = (first_pair.sellCurrency if is_multi_pair and first_pair.sellCurrency else obj_in.sellCurrency) or "EGP"
-        p_base = (first_pair.quotationBase if is_multi_pair and first_pair.quotationBase else obj_in.quotationBase) or "Execution"
+        if is_multi_pair:
+            pair_bases = [
+                (getattr(p, 'quotationBase', None) or getattr(p, 'quotation_base', None) or obj_in.quotationBase or 'Execution').strip().capitalize()
+                for p in pairs_list
+            ]
+            has_rfq_exec = any(b.lower() == 'execution' for b in pair_bases)
+            has_rfq_indic = any(b.lower() == 'indicative' for b in pair_bases)
+            if has_rfq_exec and has_rfq_indic:
+                p_base = "Mixed"
+            elif has_rfq_indic:
+                p_base = "Indicative"
+            else:
+                p_base = "Execution"
+        else:
+            p_base = (obj_in.quotationBase or "Execution").strip().capitalize()
         p_tol = (first_pair.maxTolerancePercent if is_multi_pair and first_pair.maxTolerancePercent is not None else obj_in.maxTolerancePercent)
         p_alt_val = bool(first_pair.allowAlternativeValueDate if is_multi_pair else allow_alt_master)
 
@@ -436,6 +450,20 @@ class CRUDQuotation:
 
         root_banks_data = _parse_banks_payload(getattr(obj_in, 'selectedBanks', None))
 
+        # Pre-scan legs per bank to determine order-independent assignment parameters
+        bank_legs_catalog = {} # raw_bank_id -> list of dicts: {'leg_obj': leg_obj, 'b_data': b_data}
+        for leg_obj, p_source in created_legs:
+            leg_banks = _parse_banks_payload(getattr(p_source, 'selectedBanks', None))
+            if not leg_banks:
+                leg_banks = root_banks_data
+            for b_data in leg_banks:
+                bid = b_data.get('id')
+                if not bid:
+                    continue
+                if bid not in bank_legs_catalog:
+                    bank_legs_catalog[bid] = []
+                bank_legs_catalog[bid].append({'leg_obj': leg_obj, 'b_data': b_data})
+
         for leg_obj, p_source in created_legs:
             leg_banks = _parse_banks_payload(getattr(p_source, 'selectedBanks', None))
             # Fall back to root banks if pair didn't specify banks
@@ -462,7 +490,6 @@ class CRUDQuotation:
                     token = str(uuid.uuid4())
 
                     root_bank_info = next((rb for rb in root_banks_data if str(rb.get('id')) == str(raw_bank_id)), None)
-                    q_base_override = b_data.get('quotationBase') or (root_bank_info.get('quotationBase') if root_bank_info else None) or p_base
 
                     # Check if bank is cross-entity for this RFQ's entity
                     is_cross_bank = False
@@ -487,14 +514,34 @@ class CRUDQuotation:
                                 status_code=status.HTTP_403_FORBIDDEN,
                                 detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
                             )
-                        # HARD GUARDRAIL: Cross-entity bank MUST be Indicative only!
-                        q_base_override = "Indicative"
+
+                    # Compute order-independent quotation base across ALL legs for this bank
+                    if is_cross_bank:
+                        bank_overall_base = "Indicative"
+                        has_any_exec = False
+                    else:
+                        bank_legs = bank_legs_catalog.get(raw_bank_id, [{'leg_obj': leg_obj, 'b_data': b_data}])
+                        leg_bases = []
+                        for item in bank_legs:
+                            l_b_data = item['b_data']
+                            l_leg_obj = item['leg_obj']
+                            base_val = l_b_data.get('quotationBase') or (root_bank_info.get('quotationBase') if root_bank_info else None) or l_leg_obj.quotation_base or p_base
+                            leg_bases.append((base_val or 'Execution').strip().capitalize())
+
+                        has_exec = any(b.lower() == 'execution' for b in leg_bases)
+                        has_indic = any(b.lower() == 'indicative' for b in leg_bases)
+                        has_any_exec = has_exec
+                        if has_exec and has_indic:
+                            bank_overall_base = "Mixed"
+                        elif has_indic:
+                            bank_overall_base = "Indicative"
+                        else:
+                            bank_overall_base = "Execution"
 
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                    is_exec = (q_base_override or '').lower() == 'execution'
-                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec and not is_cross_bank) else None
+                    bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec and not is_cross_bank) else None
 
                     b_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
                     b_allow_alt = b_data.get('allowAlternativeValueDate')
@@ -508,7 +555,7 @@ class CRUDQuotation:
                         cost_percent=b_data.get('costPercent', 0.0),
                         cost_max=b_data.get('costMax', 0.0),
                         cost_flat=b_data.get('costFlat', 0.0),
-                        quotation_base=q_base_override,
+                        quotation_base=bank_overall_base,
                         is_document_visible=b_data.get('isDocumentVisible', True),
                         value_date=b_val_d,
                         allow_alternative_value_date=b_allow_alt,
@@ -522,6 +569,7 @@ class CRUDQuotation:
                         "bankId": raw_bank_id,
                         "quotation_bank_id": q_bank.id,
                         "token": token,
+                        "quotation_base": bank_overall_base,
                         "approval_status": bank_approval_status
                     })
 
@@ -537,7 +585,7 @@ class CRUDQuotation:
                 # Create pair-level bank config
                 cfg_id = str(uuid.uuid4())
                 leg_cfg_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
-                leg_quotation_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or db_assign.quotation_base or leg_obj.quotation_base or 'Execution')
+                leg_quotation_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or leg_obj.quotation_base or db_assign.quotation_base or 'Execution')
 
                 # Bank-level leg uniqueness check
                 if p_type == 'FX_SPOT':

@@ -2422,8 +2422,9 @@ def reject_quotation(
         raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be rejected.")
 
     rfq.status = 'REJECTED'
-    db.commit()
-    
+    for leg in (rfq.legs or []):
+        if leg.status not in ('REJECTED', 'CANCELLED'):
+            leg.status = 'REJECTED'
     db.commit()
     
     # Notify End User
@@ -2636,6 +2637,9 @@ def approve_quotation_cancellation(
     now = datetime.now(timezone.utc)
     rfq.status = 'CANCELLED'
     rfq.cancelled_at = now
+    for leg in (rfq.legs or []):
+        if leg.status not in ('CANCELLED',):
+            leg.status = 'CANCELLED'
     db.commit()
 
     # Cancel scheduled 15m reminder if registered
@@ -2781,12 +2785,14 @@ def reject_quotation_cancellation(
 @router.post("/quotations/{rfq_id}/accept-deal")
 async def accept_quotation_deal(
     rfq_id: str,
+    request: Request = None,
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
     Corporate Admin manually confirms acceptance of the winning quotation deal.
     Finalizes the status, commits the trade execution, and dispatches confirmation/regret emails.
+    Optionally accepts a list of specific accepted_leg_ids and declined_leg_ids for multi-leg RFQs.
     """
     rfq = db.query(QuotationRequest).filter(
         QuotationRequest.id == rfq_id,
@@ -2796,19 +2802,60 @@ async def accept_quotation_deal(
     if not rfq:
         raise HTTPException(status_code=404, detail="Quotation not found.")
 
+    body = {}
+    if request:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    accepted_leg_ids = body.get("accepted_leg_ids")
+    declined_leg_ids = body.get("declined_leg_ids")
+
     from datetime import datetime, timezone
     now_utc = datetime.now(timezone.utc)
 
-    rfq.status = 'COMPLETED'
-    rfq.acceptance_status = 'ACCEPTED'
     rfq.acceptance_resolved_at = now_utc
     rfq.acceptance_resolved_by_user_id = corporate_admin_context.user_id
 
-    for leg in (rfq.legs or []):
-        if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
-            leg.status = 'ACCEPTED'
-        elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
-            leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+    if accepted_leg_ids is not None:
+        accepted_set = {str(x) for x in accepted_leg_ids}
+        declined_set = {str(x) for x in declined_leg_ids} if declined_leg_ids is not None else set()
+        for leg in (rfq.legs or []):
+            leg_key = str(leg.id)
+            if leg_key in accepted_set:
+                if leg.winner_bank_id:
+                    leg.status = 'ACCEPTED'
+                else:
+                    leg.status = 'INCONCLUSIVE'
+            elif leg_key in declined_set or (declined_leg_ids is not None and len(declined_set) > 0 and leg_key not in accepted_set):
+                leg.status = 'REJECTED'
+                leg.winner_bank_id = None
+                leg.winner_bank_name = None
+                leg.winner_rate = None
+                leg.saved_vs_avg = None
+                leg.rejection_reason = "Declined by Corporate Admin during deal acceptance"
+            elif leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
+                leg.status = 'ACCEPTED'
+            elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
+                leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+
+        any_accepted = any(l.status == 'ACCEPTED' for l in (rfq.legs or []))
+        if any_accepted:
+            rfq.status = 'COMPLETED'
+            rfq.acceptance_status = 'ACCEPTED'
+        else:
+            rfq.status = 'REJECTED'
+            rfq.acceptance_status = 'REJECTED'
+            rfq.admin_revision_notes = "All legs declined by Corporate Admin"
+    else:
+        rfq.status = 'COMPLETED'
+        rfq.acceptance_status = 'ACCEPTED'
+        for leg in (rfq.legs or []):
+            if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
+                leg.status = 'ACCEPTED'
+            elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
+                leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
 
     db.commit()
 

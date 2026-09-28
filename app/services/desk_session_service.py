@@ -29,6 +29,7 @@ class DeskState:
 
         # Latest quote mirrored state
         self.last_quote_price: Optional[float] = None
+        self.last_quote_legs: Optional[Dict[str, Any]] = None
         self.last_quote_by: Optional[str] = None
         self.last_quote_at: Optional[datetime] = None
 
@@ -260,11 +261,18 @@ class DeskSessionService:
 
             return False, f"Desk is actively controlled by {desk.active_trader_name or desk.active_trader_email}. Click 'Take Over Desk' to submit quotes."
 
-    def record_quote_submission(self, assignment_id: str, email: str, price: float):
+    def record_quote_submission(
+        self, 
+        assignment_id: str, 
+        email: str, 
+        price: Optional[float] = None,
+        legs_quotes: Optional[Dict[str, Any]] = None
+    ):
         """Mirrors latest submitted quote to all desk observers."""
         with self._lock:
             desk = self._get_or_create(assignment_id)
             desk.last_quote_price = price
+            desk.last_quote_legs = legs_quotes
             desk.last_quote_by = email.strip().lower()
             desk.last_quote_at = datetime.now(timezone.utc)
 
@@ -312,6 +320,7 @@ class DeskSessionService:
             "superseded_trader": superseded_trader,
             "mirrored_quote": {
                 "price": desk.last_quote_price,
+                "legs_quotes": desk.last_quote_legs,
                 "by": desk.last_quote_by,
                 "at": desk.last_quote_at.isoformat() if desk.last_quote_at else None
             }

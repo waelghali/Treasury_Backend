@@ -136,7 +136,16 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
             approver_set = {e.lower() for e in approver_emails}
             non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
 
-            is_indicative = (getattr(rfq, "quotation_base", "") or "").lower() == "indicative" or (getattr(assignment, "quotation_base", "") or "").lower() == "indicative"
+            leg_cfgs = getattr(assignment, "leg_configs", []) if assignment else []
+            if leg_cfgs:
+                has_exec_leg = any((c.quotation_base or "").lower() == "execution" for c in leg_cfgs)
+            else:
+                ass_base = (getattr(assignment, "quotation_base", "") or getattr(rfq, "quotation_base", "") or "Execution").lower()
+                has_exec_leg = ass_base in ("execution", "mixed")
+            if assignment and getattr(assignment, "is_cross_entity", False):
+                has_exec_leg = False
+
+            is_indicative = not has_exec_leg
             has_approver = len(approver_emails) > 0
             has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
 

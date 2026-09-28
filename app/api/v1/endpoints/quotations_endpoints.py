@@ -632,15 +632,24 @@ def create_rfq(
                 approver_set = {e.lower() for e in approver_emails}
                 non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
 
-                is_indicative = (getattr(rfq, "quotation_base", "") or "").lower() == "indicative" or (assignment.get("quotation_base") or "").lower() == "indicative"
-                has_approver = len(approver_emails) > 0
-                has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
-
                 db_assignment = None
                 if assignment.get("id"):
                     db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.id == assignment["id"]).first()
                 elif assignment.get("token"):
                     db_assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == assignment["token"]).first()
+
+                leg_cfgs = getattr(db_assignment, "leg_configs", []) if db_assignment else []
+                if leg_cfgs:
+                    has_exec_leg = any((c.quotation_base or "").lower() == "execution" for c in leg_cfgs)
+                else:
+                    ass_base = (assignment.get("quotation_base") or getattr(rfq, "quotation_base", "") or "Execution").lower()
+                    has_exec_leg = ass_base in ("execution", "mixed")
+                if db_assignment and getattr(db_assignment, "is_cross_entity", False):
+                    has_exec_leg = False
+
+                is_indicative = not has_exec_leg
+                has_approver = len(approver_emails) > 0
+                has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
 
                 if assignment.get("approval_status") == "PENDING" and not is_indicative and has_approver and has_execution:
                     # Phase 1a: Email APPROVER contacts with review link requiring 2FA OTP verification
@@ -1244,7 +1253,13 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                             "total_quotes": len(rates)
                         }
 
-            if hasattr(leg, 'id') and leg_savings_summary and not leg_is_inconclusive:
+            leg_status_val = getattr(leg, 'status', None)
+            is_leg_declined = leg_status_val in ('REJECTED', 'CANCELLED')
+            if is_leg_declined:
+                leg_winner_bank_id = None
+                leg_savings_summary = None
+
+            if hasattr(leg, 'id') and leg_savings_summary and not leg_is_inconclusive and not is_leg_declined:
                 leg.winner_bank_name = leg_savings_summary.get("winner_bank_name")
                 leg.winner_bank_id = leg_winner_bank_id
                 leg.winner_rate = leg_savings_summary.get("winner_rate")
@@ -1473,14 +1488,23 @@ def get_rfq_history(
                 r.status = 'COMPLETED'
                 changed = True
                 status_changed = True
+                for leg in (r.legs or []):
+                    if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED', 'INCONCLUSIVE', 'COMPLETED'):
+                        leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED'
                 changed = True
                 status_changed = True
+                for leg in (r.legs or []):
+                    if leg.status not in ('REJECTED', 'CANCELLED'):
+                        leg.status = 'REJECTED'
             elif r.status == 'CANCEL_REQUESTED':
                 r.status = 'CANCELLED'
                 changed = True
                 status_changed = True
+                for leg in (r.legs or []):
+                    if leg.status not in ('CANCELLED',):
+                        leg.status = 'CANCELLED'
             
             # Auto-expire any bank-level approvals that were still PENDING when window closed
             if status_changed:
@@ -1878,7 +1902,10 @@ def retender_quotation(
         bank_contacts = bank_row.contacts if (bank_row and isinstance(bank_row.contacts, list)) else []
         has_approvers = any(c.get("role") == "APPROVER" for c in bank_contacts)
         has_execution = any(c.get("role") == "EXECUTION" for c in bank_contacts)
-        assignment_approval_status = "PENDING" if (has_approvers and has_execution and parent.quotation_base == "Execution") else None
+        has_exec_retender = (pa.quotation_base or parent.quotation_base or "Execution").lower() in ("execution", "mixed")
+        if getattr(pa, "is_cross_entity", False):
+            has_exec_retender = False
+        assignment_approval_status = "PENDING" if (has_approvers and has_execution and has_exec_retender) else None
 
         new_assignment = QuotationBankAssignment(
             id=str(uuid.uuid4()),
@@ -1942,7 +1969,16 @@ def retender_quotation(
             approver_set = {e.lower() for e in approver_emails}
             non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
 
-            is_indicative = (getattr(new_rfq, "quotation_base", "") or "").lower() == "indicative" or (getattr(new_assignment, "quotation_base", "") or "").lower() == "indicative"
+            leg_cfgs = getattr(new_assignment, "leg_configs", []) if new_assignment else []
+            if leg_cfgs:
+                has_exec_leg = any((c.quotation_base or "").lower() == "execution" for c in leg_cfgs)
+            else:
+                ass_base = (getattr(new_assignment, "quotation_base", "") or getattr(new_rfq, "quotation_base", "") or "Execution").lower()
+                has_exec_leg = ass_base in ("execution", "mixed")
+            if new_assignment and getattr(new_assignment, "is_cross_entity", False):
+                has_exec_leg = False
+
+            is_indicative = not has_exec_leg
             has_approver = len(approver_emails) > 0
             has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
 
@@ -2226,19 +2262,34 @@ def resubmit_quotation(
                                 status_code=status.HTTP_403_FORBIDDEN,
                                 detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
                             )
+                    if is_cross_bank:
                         q_base_override = "Indicative"
+                        has_any_exec_leg = False
                     else:
-                        q_base_override = b_data.get('quotationBase') or rfq.quotation_base
+                        leg_bases = []
+                        for leg_obj in (current_legs or []):
+                            l_b = b_data.get('quotationBase') or leg_obj.quotation_base or rfq.quotation_base or 'Execution'
+                            leg_bases.append((l_b or 'Execution').strip().capitalize())
+                        if not leg_bases:
+                            leg_bases = [(b_data.get('quotationBase') or rfq.quotation_base or 'Execution').strip().capitalize()]
+
+                        has_exec = any(b.lower() == 'execution' for b in leg_bases)
+                        has_indic = any(b.lower() == 'indicative' for b in leg_bases)
+                        has_any_exec_leg = has_exec
+                        if has_exec and has_indic:
+                            q_base_override = "Mixed"
+                        elif has_indic:
+                            q_base_override = "Indicative"
+                        else:
+                            q_base_override = "Execution"
 
                     is_doc_vis = b_data.get('isDocumentVisible', True)
                     if is_doc_vis is None:
                         is_doc_vis = True
-                    effective_base = (q_base_override or rfq.quotation_base or 'Execution').lower()
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                    is_exec = (rfq.quotation_base or '').lower() == 'execution' or effective_base == 'execution'
-                    bank_approval_status = 'PENDING' if (has_approver and has_execution and is_exec and not is_cross_bank) else None
+                    bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec_leg and not is_cross_bank) else None
 
                     bank_value_date = b_data.get('valueDate') or rfq.value_date
                     if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
