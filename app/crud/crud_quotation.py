@@ -61,7 +61,13 @@ def get_bank_leg_signature(buy_curr: str, sell_curr: str, direction: str, value_
 class CRUDQuotation:
     
     # --- Quotation Banks ---
-    def create_quotation_bank(self, db: Session, customer_id: int, obj_in: QuotationBankCreate):
+    def create_quotation_bank(self, db: Session, customer_id: int, obj_in: QuotationBankCreate, current_user_email: str = None):
+        from app.models.models import Customer, Bank
+        from app.core.bank_validation import validate_bank_contact_email
+
+        customer = db.query(Customer).filter(Customer.id == customer_id).first()
+        bank = db.query(Bank).filter(Bank.id == obj_in.bank_id).first()
+
         contacts_data = []
         if obj_in.contacts:
             contacts_data = [c.dict() if hasattr(c, 'dict') else c for c in obj_in.contacts]
@@ -72,6 +78,19 @@ class CRUDQuotation:
             emails_str = ", ".join(emails_list)
         else:
             emails_str = ""
+
+        # Validate each contact email against Bank Domain, Negative List & Customer Corporate Domain
+        for c in contacts_data:
+            c_email = (c.get("email") or "").strip()
+            if c_email:
+                is_valid, err_msg = validate_bank_contact_email(
+                    email=c_email,
+                    bank=bank,
+                    customer=customer,
+                    current_user_email=current_user_email
+                )
+                if not is_valid:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
 
         # Check if already exists for this customer and trade_type
         existing = db.query(QuotationBank).filter(

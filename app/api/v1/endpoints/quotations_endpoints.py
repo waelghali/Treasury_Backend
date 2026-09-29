@@ -18,6 +18,7 @@ from app.core.security import get_current_active_user, TokenData
 from app.crud.crud import log_action
 from app.core.email_service import send_email, get_global_email_settings, get_customer_email_settings
 from app.services.unified_email_builder import build_transaction_email_html, build_standard_email_html
+from app.constants import UserRole
 
 
 from app.schemas.schemas_quotation import (
@@ -72,18 +73,70 @@ def create_quotation_bank(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Adds a Bank to a specific Customer's Quotation Roster."""
-    bank = crud_quotation.create_quotation_bank(db, customer_id=current_user.customer_id, obj_in=bank_in)
+    """Adds or updates a Bank in a specific Customer's Quotation Roster."""
+    # RBAC Guard: Strictly restricted to Corporate Administrators and System Owners
+    if current_user.role not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER, "corporate_admin", "super_admin", "system_owner"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Corporate Administrators are authorized to configure bank counterparty rosters."
+        )
+
+    # Capture previous state for structured role audit
+    existing_bank = db.query(QuotationBank).filter(
+        QuotationBank.customer_id == current_user.customer_id,
+        QuotationBank.bank_id == bank_in.bank_id,
+        QuotationBank.trade_type == (bank_in.trade_type or "BOTH")
+    ).first()
+    old_contacts = list(existing_bank.contacts) if (existing_bank and existing_bank.contacts) else []
+
+    bank = crud_quotation.create_quotation_bank(
+        db,
+        customer_id=current_user.customer_id,
+        obj_in=bank_in,
+        current_user_email=current_user.email
+    )
     
-    # Audit log
-    # entity_id is Int in audit_logs, so we safely put the string ID in details instead.
+    # Structured Audit Log: Track additions, removals, and role elevations
+    new_contacts = list(bank.contacts) if bank.contacts else []
+    old_map = {c.get("email", "").strip().lower(): c for c in old_contacts if c.get("email")}
+    new_map = {c.get("email", "").strip().lower(): c for c in new_contacts if c.get("email")}
+
+    added_contacts = [
+        {"email": email, "name": data.get("name", ""), "role": data.get("role", "EXECUTION")}
+        for email, data in new_map.items() if email not in old_map
+    ]
+    removed_contacts = [
+        {"email": email, "name": data.get("name", ""), "role": data.get("role", "EXECUTION")}
+        for email, data in old_map.items() if email not in new_map
+    ]
+    role_changes = []
+    for email, new_data in new_map.items():
+        if email in old_map:
+            old_role = old_map[email].get("role", "EXECUTION")
+            new_role = new_data.get("role", "EXECUTION")
+            if old_role != new_role:
+                role_changes.append({
+                    "email": email,
+                    "name": new_data.get("name", ""),
+                    "from_role": old_role,
+                    "to_role": new_role
+                })
+
     log_action(
         db,
         user_id=current_user.user_id,
-        action_type="QUOTATION_BANK_ADDED",
+        action_type="QUOTATION_BANK_ROSTER_UPDATED" if existing_bank else "QUOTATION_BANK_ADDED",
         entity_type="QuotationBank",
-        entity_id=bank.id, # QuotationBank.id is Integer, so this is fine
-        details={"bank_id": bank_in.bank_id, "emails": bank_in.emails},
+        entity_id=bank.id,
+        details={
+            "bank_id": bank_in.bank_id,
+            "bank_name": bank.bank.name if bank.bank else f"Bank {bank_in.bank_id}",
+            "trade_type": bank.trade_type,
+            "added_contacts": added_contacts,
+            "removed_contacts": removed_contacts,
+            "role_changes": role_changes,
+            "total_contacts": len(new_contacts)
+        },
         customer_id=current_user.customer_id
     )
     return bank
@@ -95,6 +148,13 @@ def delete_quotation_bank(
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """Removes a Bank from the Customer's Quotation Roster."""
+    # RBAC Guard: Strictly restricted to Corporate Administrators and System Owners
+    if current_user.role not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER, "corporate_admin", "super_admin", "system_owner"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Corporate Administrators are authorized to remove bank counterparties."
+        )
+
     success = crud_quotation.delete_quotation_bank(db, customer_id=current_user.customer_id, bank_id=bank_id)
     if not success:
         raise HTTPException(status_code=404, detail="Bank configuration not found.")
