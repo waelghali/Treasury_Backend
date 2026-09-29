@@ -1945,21 +1945,83 @@ def get_bank_quotation_history(
                 notes = fx_offer.notes
 
         # Determine trade outcome
+        bank_system_id = q_bank.bank_id
+        rfq_legs = rfq.legs or []
+        won_legs = [l for l in rfq_legs if l.winner_bank_id == bank_system_id and (l.status not in ('REJECTED', 'CANCELLED', 'DECLINED'))]
+        is_multi_leg = len(rfq_legs) > 1
+
+        legs_info = []
+        if is_multi_leg:
+            for l in rfq_legs:
+                l_offer = db.query(QuotationOffer).filter(
+                    QuotationOffer.assignment_id == a.id,
+                    QuotationOffer.leg_id == l.id
+                ).order_by(QuotationOffer.submitted_at.desc()).first()
+
+                is_l_won = (l.winner_bank_id == bank_system_id and l.status not in ('REJECTED', 'CANCELLED', 'DECLINED'))
+                if is_l_won:
+                    l_outcome = "WON"
+                elif l.status in ('REJECTED', 'CANCELLED'):
+                    l_outcome = "REJECTED"
+                elif l.status == 'INCONCLUSIVE':
+                    l_outcome = "INCONCLUSIVE"
+                elif l_offer and l_offer.price is not None:
+                    l_outcome = "NOT_SELECTED" if rfq.status == "COMPLETED" else "SUBMITTED"
+                else:
+                    l_outcome = "NO_QUOTE"
+
+                legs_info.append({
+                    "leg_id": l.id,
+                    "leg_index": l.leg_index,
+                    "pair": f"{l.buy_currency}/{l.sell_currency}",
+                    "direction": l.direction,
+                    "amount": l.amount,
+                    "buy_currency": l.buy_currency,
+                    "sell_currency": l.sell_currency,
+                    "value_date": l.value_date,
+                    "submitted_price": l_offer.price if l_offer else None,
+                    "outcome": l_outcome,
+                    "is_winner": is_l_won
+                })
+
         outcome = "NO_QUOTE"
         if a.approval_status == 'DECLINED':
             outcome = "PARTICIPATION_DECLINED"
-        elif best_price is not None:
-            if rfq.status == "COMPLETED":
-                # Check analytics
-                analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-                if analytics and analytics.winner_quotation_bank_id == q_bank_id:
-                    outcome = "WON"
+        elif a.approval_status == 'EXPIRED':
+            outcome = "EXPIRED"
+        elif rfq.status == "COMPLETED":
+            if won_legs:
+                if is_multi_leg and len(won_legs) < len(rfq_legs):
+                    outcome = "PARTIALLY_WON"
                 else:
-                    outcome = "NOT_SELECTED"
-            elif rfq.status in ["OPEN", "PENDING", "EVALUATING"]:
-                outcome = "SUBMITTED"
+                    outcome = "WON"
             else:
-                outcome = rfq.status
+                # Fallback check for single-ticket or T-Bills without persisted legs
+                winner_id = None
+                try:
+                    from app.api.v1.endpoints.quotations_endpoints import compute_rfq_standings
+                    standings = compute_rfq_standings(rfq, db, dispatch_emails=False)
+                    winner_id = standings.get("winner_bank_id")
+                except Exception:
+                    pass
+
+                if winner_id and winner_id == bank_system_id:
+                    outcome = "WON"
+                elif best_price is not None or any(l.get("submitted_price") is not None for l in legs_info):
+                    outcome = "NOT_SELECTED"
+                else:
+                    outcome = "NO_QUOTE"
+        elif rfq.status in ["REJECTED", "CANCELLED"]:
+            outcome = rfq.status
+        elif rfq.status in ["OPEN", "PENDING", "EVALUATING", "APPROVED_SCHEDULED"]:
+            outcome = "SUBMITTED" if (best_price is not None or any(l.get("submitted_price") is not None for l in legs_info)) else "NO_QUOTE"
+        else:
+            outcome = rfq.status
+
+        display_pair = (
+            f"Package ({len(rfq_legs)} Pairs)" if is_multi_leg 
+            else (f"{rfq.buy_currency}/{rfq.sell_currency}" if rfq.buy_currency else None)
+        )
 
         history_items.append({
             "rfq_id": rfq.id,
@@ -1969,7 +2031,7 @@ def get_bank_quotation_history(
             "type": rfq.type,
             "direction": rfq.direction,
             "amount": rfq.amount,
-            "currency_pair": f"{rfq.buy_currency}/{rfq.sell_currency}" if rfq.buy_currency else None,
+            "currency_pair": display_pair,
             "value_date": rfq.value_date,
             "window_end": rfq.window_end,
             "status": rfq.status,
@@ -1979,8 +2041,12 @@ def get_bank_quotation_history(
             "submitted_by": submitted_by,
             "submitted_at": submitted_at,
             "outcome": outcome,
-            "offers_count": len(offers_info) if rfq.type == "TBILL" else (1 if best_price else 0),
-            "created_at": rfq.created_at
+            "offers_count": len(offers_info) if rfq.type == "TBILL" else (len([l for l in legs_info if l.get('submitted_price') is not None]) if is_multi_leg else (1 if best_price else 0)),
+            "created_at": rfq.created_at,
+            "is_multi_leg": is_multi_leg,
+            "legs_count": len(rfq_legs),
+            "won_legs_count": len(won_legs),
+            "legs": legs_info
         })
 
     return {

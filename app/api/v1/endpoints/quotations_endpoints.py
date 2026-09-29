@@ -297,14 +297,21 @@ def get_bank_recommendations(
     buy_currency: str = None,
     sell_currency: str = None,
     amount: float = None,
+    quotation_base: str = "Execution",
+    currency_pairs: str = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """
-    Analyzes historical quotation outcomes for this customer to recommend the top 3 best-performing counterparties.
-    Calculates win rates, response times, and spread performance.
+    Multi-dimensional Smart Counterparty Recommendation Engine.
+    Evaluates:
+    1. Direct Pair Win Rate & Currency Specialization (Affinity).
+    2. Competitive Proximity / Runner-Up Index (Metric A: Finished Top 2 / within tight spread).
+    3. Ticket Size Appetite (Metric B: Win and quote rate on large tickets >= $1M).
+    4. Pure Participation Rate (Drop response-time penalty; measure commitments delivered).
+    5. Multi-Leg Basket Coverage for complex multi-pair portfolios.
     """
-    from app.models.models_quotation import QuotationBank, QuotationRequest, QuotationBankAssignment, QuotationAnalytics, QuotationOffer
+    from app.models.models_quotation import QuotationBank, QuotationRequest, QuotationBankAssignment, QuotationOffer
 
     q = db.query(QuotationBank).filter(
         QuotationBank.customer_id == current_user.customer_id
@@ -314,91 +321,193 @@ def get_bank_recommendations(
     customer_banks = q.all()
 
     if not customer_banks:
-        return {"recommended_bank_ids": [], "recommendations": []}
+        return {"recommended_bank_ids": [], "recommendations": [], "all_bank_analytics": {}}
 
+    target_pairs = set()
+    if buy_currency and sell_currency:
+        target_pairs.add(f"{buy_currency.upper()}/{sell_currency.upper()}")
+    if currency_pairs:
+        for p in currency_pairs.split(','):
+            p_clean = p.strip().upper()
+            if '/' in p_clean:
+                target_pairs.add(p_clean)
+
+    is_large_ticket_request = bool(amount and amount >= 1000000.0)
     bank_stats = []
+
     for qb in customer_banks:
+        b_name = qb.bank.name if qb.bank else f"Bank {qb.bank_id}"
+
+        # All closed assignments
         assignments = db.query(QuotationBankAssignment).join(
             QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
         ).filter(
             QuotationBankAssignment.quotation_bank_id == qb.id,
-            QuotationRequest.status.in_(['COMPLETED', 'EXPIRED'])
-        )
-
-        # Pair-specific filter if provided and enough history exists
-        if buy_currency and sell_currency:
-            pair_filtered = assignments.filter(
-                QuotationRequest.buy_currency == buy_currency,
-                QuotationRequest.sell_currency == sell_currency
-            ).all()
-            if len(pair_filtered) >= 1:
-                assignments = pair_filtered
-            else:
-                assignments = assignments.all()
-        else:
-            assignments = assignments.all()
+            QuotationRequest.status.in_(['COMPLETED', 'EXPIRED', 'REJECTED'])
+        ).all()
 
         total_invited = len(assignments)
+        if total_invited == 0:
+            bank_stats.append({
+                "bank_id": qb.bank_id,
+                "quotation_bank_id": qb.id,
+                "bank_name": b_name,
+                "score": 50.0,
+                "participation_rate": 100.0,
+                "global_win_rate": 0.0,
+                "pair_win_rate": 0.0,
+                "top_2_rate": 0.0,
+                "total_won": 0,
+                "total_participated": 0,
+                "total_invited": 0,
+                "highlight": "Roster Bank • Ready to Quote",
+                "badges": ["✨ New Roster Bank"]
+            })
+            continue
+
         total_responded = 0
-        total_won = 0
-        response_times_sec = []
+        total_legs_quoted = 0
+        total_legs_won = 0
+
+        pair_legs_quoted = 0
+        pair_legs_won = 0
+
+        top_2_count = 0
+
+        large_ticket_quoted = 0
+        large_ticket_won = 0
+
+        multi_leg_packages_invited = 0
+        multi_leg_packages_fully_quoted = 0
 
         for a in assignments:
-            offers = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).all()
+            rfq = a.rfq
+            offers = a.offers or []
             if offers:
                 total_responded += 1
-                first_offer = sorted(offers, key=lambda o: o.submitted_at)[0]
-                rfq = a.rfq
-                ref_time = rfq.window_start or rfq.created_at
-                if first_offer.submitted_at and ref_time:
-                    try:
-                        delta = (first_offer.submitted_at - ref_time).total_seconds()
-                        if 0 < delta < 86400:
-                            response_times_sec.append(delta)
-                    except Exception:
-                        pass
 
-            analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == a.rfq_id).first()
-            if analytics and analytics.winner_quotation_bank_id == qb.id:
-                total_won += 1
+            rfq_legs = rfq.legs or []
+            if len(rfq_legs) > 1:
+                multi_leg_packages_invited += 1
+                legs_with_quotes = set(o.leg_id for o in offers if o.leg_id)
+                if len(legs_with_quotes) >= len(rfq_legs):
+                    multi_leg_packages_fully_quoted += 1
 
-        win_rate = (total_won / total_responded * 100) if total_responded > 0 else 0.0
-        response_rate = (total_responded / total_invited * 100) if total_invited > 0 else 100.0
-        avg_resp_min = (sum(response_times_sec) / len(response_times_sec) / 60) if response_times_sec else None
+            is_large_rfq = ((rfq.amount or 0) >= 1000000.0) or any((l.amount or 0) >= 1000000.0 for l in rfq_legs)
+            if is_large_rfq and offers:
+                large_ticket_quoted += 1
 
-        score = (win_rate * 0.6) + (response_rate * 0.3) + (10 if total_won > 0 else 0)
+            for leg in rfq_legs:
+                leg_offers = [o for o in offers if (o.leg_id == leg.id or (not o.leg_id and len(rfq_legs) == 1))]
+                if not leg_offers:
+                    continue
 
-        # Smart contextual highlight
-        pair_label = f" in {buy_currency}/{sell_currency}" if (buy_currency and sell_currency) else ""
-        if total_won > 0 and avg_resp_min:
-            highlight = f"{win_rate:.0f}% Win Rate{pair_label} • Avg {avg_resp_min:.1f}m"
-        elif total_won > 0:
-            highlight = f"{win_rate:.0f}% Win Rate ({total_won} deals won)"
-        elif total_responded > 0:
-            highlight = f"Active Counterparty ({total_responded} quotes)"
-        else:
-            highlight = "Roster Bank • Ready to Quote"
+                total_legs_quoted += 1
+                leg_pair_str = f"{(leg.buy_currency or '').upper()}/{(leg.sell_currency or '').upper()}"
+                is_pair_match = leg_pair_str in target_pairs if target_pairs else False
 
-        bank_name = qb.bank.name if qb.bank else f"Bank {qb.bank_id}"
+                if is_pair_match:
+                    pair_legs_quoted += 1
+
+                is_leg_won = (leg.winner_bank_id == qb.bank_id)
+                if is_leg_won:
+                    total_legs_won += 1
+                    if is_pair_match:
+                        pair_legs_won += 1
+                    if is_large_rfq:
+                        large_ticket_won += 1
+
+                # Competitive Proximity (Top 2 Rank in this leg - Metric A)
+                all_comp_quotes = []
+                for other_a in rfq.assignments:
+                    o_offers = [o for o in other_a.offers if (o.leg_id == leg.id or (not o.leg_id and len(rfq_legs) == 1))]
+                    if o_offers:
+                        best_p = min(o.price for o in o_offers) if (leg.direction or 'Buy').lower() == 'buy' else max(o.price for o in o_offers)
+                        all_comp_quotes.append({
+                            "bank_id": other_a.quotation_bank.bank_id,
+                            "price": best_p
+                        })
+
+                if (leg.direction or 'Buy').lower() == 'buy':
+                    all_comp_quotes.sort(key=lambda x: x['price'])
+                else:
+                    all_comp_quotes.sort(key=lambda x: x['price'], reverse=True)
+
+                top_2_ids = [item['bank_id'] for item in all_comp_quotes[:2]]
+                if qb.bank_id in top_2_ids:
+                    top_2_count += 1
+
+        participation_rate = (total_responded / total_invited * 100) if total_invited > 0 else 0.0
+        global_win_rate = (total_legs_won / total_legs_quoted * 100) if total_legs_quoted > 0 else 0.0
+        pair_win_rate = (pair_legs_won / pair_legs_quoted * 100) if pair_legs_quoted > 0 else 0.0
+        top_2_rate = (top_2_count / total_legs_quoted * 100) if total_legs_quoted > 0 else 0.0
+
+        badges = []
+
+        # 1. Pair Specialist Badge (Affinity)
+        active_pair_label = list(target_pairs)[0] if target_pairs else ""
+        if pair_legs_won >= 2 and pair_win_rate >= 40.0:
+            badges.append(f"⭐ {active_pair_label} Specialist ({pair_legs_won} of {pair_legs_quoted} won)")
+        elif pair_legs_won >= 1 and pair_win_rate >= 40.0:
+            badges.append(f"⭐ Proven in {active_pair_label}")
+
+        # 2. Competitive Proximity Badge (Metric A)
+        if top_2_count >= 2 and top_2_rate >= 50.0:
+            badges.append(f"🎯 Tight Competitor (Top 2 in {top_2_rate:.0f}% of quotes)")
+
+        # 3. Ticket Size Appetite Badge (Metric B)
+        if is_large_ticket_request and large_ticket_won >= 1:
+            badges.append(f"🏛️ Mega-Ticket Dominance ({large_ticket_won} deals > $1M)")
+        elif large_ticket_won >= 2:
+            badges.append(f"🏛️ Large-Ticket Proven ({large_ticket_won} deals > $1M)")
+
+        # 4. Multi-Leg Basket Badge
+        if len(target_pairs) > 1 and multi_leg_packages_fully_quoted >= 2:
+            badges.append("📦 Full Basket Quoter")
+
+        # 5. Pure Participation Badge (No response-time penalty)
+        if participation_rate >= 85.0:
+            badges.append(f"⚡ Highly Active ({participation_rate:.0f}% participation)")
+        elif participation_rate < 40.0 and total_invited >= 3:
+            badges.append(f"⚠️ Low Response Rate ({total_responded}/{total_invited} quoted)")
+
+        # Transparent Scoring Model (Out of 100)
+        eff_win = pair_win_rate if pair_legs_quoted >= 2 else global_win_rate
+        score = (eff_win * 0.40) + (top_2_rate * 0.35) + (participation_rate * 0.25)
+        if is_large_ticket_request and large_ticket_won >= 1:
+            score += 10.0
+        if participation_rate < 40.0 and total_invited >= 3:
+            score = max(0.0, score - 15.0)
+
+        primary_highlight = badges[0] if badges else (f"{global_win_rate:.0f}% Win Rate" if total_legs_won > 0 else "Active Counterparty")
+
         bank_stats.append({
             "bank_id": qb.bank_id,
             "quotation_bank_id": qb.id,
-            "bank_name": bank_name,
-            "win_rate": round(win_rate, 1),
-            "total_won": total_won,
+            "bank_name": b_name,
+            "score": round(score, 1),
+            "participation_rate": round(participation_rate, 1),
+            "global_win_rate": round(global_win_rate, 1),
+            "pair_win_rate": round(pair_win_rate, 1),
+            "top_2_rate": round(top_2_rate, 1),
+            "total_won": total_legs_won,
             "total_participated": total_responded,
-            "avg_response_minutes": round(avg_resp_min, 1) if avg_resp_min else None,
-            "highlight": highlight,
-            "score": score
+            "total_invited": total_invited,
+            "highlight": primary_highlight,
+            "badges": badges
         })
 
     bank_stats.sort(key=lambda x: x["score"], reverse=True)
     top_recommendations = bank_stats[:3]
     rec_bank_ids = [r["bank_id"] for r in top_recommendations]
 
+    for b in bank_stats:
+        b["is_top_recommended"] = b["bank_id"] in rec_bank_ids
+
     return {
         "recommended_bank_ids": rec_bank_ids,
-        "recommendations": top_recommendations
+        "recommendations": top_recommendations,
+        "all_bank_analytics": {r["bank_id"]: r for r in bank_stats}
     }
 
 @router.get("/evaluation-rate")
