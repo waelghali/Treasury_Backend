@@ -20,6 +20,8 @@ from app.schemas.schemas_quotation import (
 from app.services.desk_session_service import desk_session_service
 from app.core.email_service import send_email, get_customer_email_settings, get_global_email_settings
 from app.core.routing import get_frontend_base_url
+from app.core.rate_limiter import quotation_rate_limiter
+from app.core.otp_security import hash_otp_code, verify_otp_code, MAX_OTP_FAILED_ATTEMPTS
 
 router = APIRouter()
 
@@ -443,6 +445,17 @@ async def request_quotation_otp(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
+    # Rate Limiting: Max 3 requests per 5 minutes (300 seconds) per client IP + assignment token
+    client_ip = request.client.host if request and request.client else "unknown"
+    rate_key = f"otp_req:{client_ip}:{assignment.token}"
+    is_limited, retry_after = quotation_rate_limiter.is_rate_limited(rate_key, max_requests=3, window_seconds=300)
+    if is_limited:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many verification code requests. Please wait {retry_after} seconds before requesting a new code.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
     if rfq.status == 'CANCELLED':
         raise HTTPException(
@@ -522,15 +535,17 @@ async def request_quotation_otp(
     otp_code = f"{secrets.randbelow(900000) + 100000}"
     magic_token = uuid.uuid4().hex
     expires_at = now_utc + timedelta(minutes=15)
+    hashed_otp = hash_otp_code(otp_code)
 
     otp_record = QuotationAccessOTP(
         assignment_id=assignment.id,
         email=target_email,
         role=role,
-        otp_code=otp_code,
+        otp_code=hashed_otp,
         magic_token=magic_token,
         expires_at=expires_at,
-        is_used=False
+        is_used=False,
+        failed_attempts=0
     )
     db.add(otp_record)
     db.commit()
@@ -726,34 +741,85 @@ def verify_quotation_otp(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
+    # 1. Rate limiting (max 5 verification attempts per 60 seconds per IP + assignment token)
+    client_ip = request.client.host if request and request.client else "unknown"
+    rate_key = f"otp_verify:{client_ip}:{assignment.token}"
+    is_limited, retry_after = quotation_rate_limiter.is_rate_limited(rate_key, max_requests=5, window_seconds=60)
+    if is_limited:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many verification attempts. Please wait {retry_after} seconds before trying again.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
     now = datetime.now(timezone.utc)
 
-    query = db.query(QuotationAccessOTP).filter(
-        QuotationAccessOTP.assignment_id == assignment.id,
-        QuotationAccessOTP.expires_at > now,
-        QuotationAccessOTP.is_used == False
-    )
-
     if req.magic_token:
-        query = query.filter(QuotationAccessOTP.magic_token == req.magic_token)
+        otp_record = db.query(QuotationAccessOTP).filter(
+            QuotationAccessOTP.assignment_id == assignment.id,
+            QuotationAccessOTP.magic_token == req.magic_token,
+            QuotationAccessOTP.expires_at > now,
+            QuotationAccessOTP.is_used == False
+        ).order_by(QuotationAccessOTP.created_at.desc()).first()
+
+        if not otp_record:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification link.")
+
+        # Bank Approvers MUST verify with 6-digit OTP code - magic token bypass is strictly forbidden
+        if otp_record.role == "APPROVER":
+            raise HTTPException(
+                status_code=400, 
+                detail="Bank Approvers must verify identity using a 6-digit OTP code."
+            )
+        quotation_rate_limiter.reset_key(rate_key)
+
     elif req.email and req.otp_code:
-        query = query.filter(
-            QuotationAccessOTP.email == req.email.strip().lower(),
-            QuotationAccessOTP.otp_code == req.otp_code.strip()
-        )
+        clean_email = req.email.strip().lower()
+        clean_otp = req.otp_code.strip()
+
+        # Find the latest unexpired, unused OTP record for this assignment and email
+        otp_record = db.query(QuotationAccessOTP).filter(
+            QuotationAccessOTP.assignment_id == assignment.id,
+            QuotationAccessOTP.email == clean_email,
+            QuotationAccessOTP.expires_at > now,
+            QuotationAccessOTP.is_used == False
+        ).order_by(QuotationAccessOTP.created_at.desc()).first()
+
+        if not otp_record:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification code. Please request a new code.")
+
+        # Check if already locked (3 failed attempts reached)
+        if otp_record.failed_attempts is not None and otp_record.failed_attempts >= MAX_OTP_FAILED_ATTEMPTS:
+            otp_record.is_used = True
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail="This verification code was locked due to too many failed attempts. Please request a new code."
+            )
+
+        # Constant-time cryptographic verification
+        if not verify_otp_code(clean_otp, otp_record.otp_code):
+            otp_record.failed_attempts = (otp_record.failed_attempts or 0) + 1
+            remaining = MAX_OTP_FAILED_ATTEMPTS - otp_record.failed_attempts
+            if remaining <= 0:
+                otp_record.is_used = True
+                db.commit()
+                raise HTTPException(
+                    status_code=400,
+                    detail="Too many failed attempts. This code is no longer valid. Please request a new verification code."
+                )
+            else:
+                db.commit()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid verification code. {remaining} attempt{'s' if remaining > 1 else ''} remaining."
+                )
+
+        # Successful verification: reset rate limiting bucket for this key
+        quotation_rate_limiter.reset_key(rate_key)
+
     else:
         raise HTTPException(status_code=400, detail="Must provide either magic_token or email + otp_code")
-
-    otp_record = query.order_by(QuotationAccessOTP.created_at.desc()).first()
-    if not otp_record:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
-
-    # Bank Approvers MUST verify with 6-digit OTP code - magic token bypass is strictly forbidden
-    if otp_record.role == "APPROVER" and not req.otp_code:
-        raise HTTPException(
-            status_code=400, 
-            detail="Bank Approvers must verify identity using a 6-digit OTP code."
-        )
 
     # Check if bank approval is required for this quotation
     leg_cfgs = getattr(assignment, "leg_configs", []) or []
@@ -2078,6 +2144,36 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
             else:
                 overall_status = "INCONCLUSIVE"
 
+            receipt = None
+            if won_legs and assignment.quotation_bank and bank_id:
+                try:
+                    customer_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
+                    bank_display = assignment.quotation_bank.bank.name if assignment.quotation_bank.bank else "Bank Partner"
+                    exec_legs_data = []
+                    for wl in won_legs:
+                        exec_legs_data.append({
+                            "leg_id": str(wl.get("leg_id", "")),
+                            "pair": wl.get("currency_pair") or f"{wl.get('buy_currency')}/{wl.get('sell_currency')}",
+                            "direction": wl.get("direction", "BUY"),
+                            "amount": float(wl.get("amount", 0)),
+                            "currency": wl.get("buy_currency", ""),
+                            "rate": float(wl.get("winner_rate") or 0.0),
+                            "value_date": str(wl.get("value_date") or 'Standard Spot')
+                        })
+                    exec_time = rfq.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC") if rfq.updated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    from app.core.otp_security import generate_scoped_deal_receipt
+                    receipt = generate_scoped_deal_receipt(
+                        rfq_id=str(rfq.id),
+                        ref_no=rfq.ref_no,
+                        customer_name=customer_name,
+                        bank_id=bank_id,
+                        bank_name=bank_display,
+                        executed_legs=exec_legs_data,
+                        executed_at=exec_time
+                    )
+                except Exception:
+                    receipt = None
+
             return {
                 "status": overall_status,
                 "won_legs_count": len(won_legs),
@@ -2087,7 +2183,8 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 "won_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in won_legs],
                 "lost_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in lost_legs],
                 "inconclusive_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in inconclusive_legs],
-                "legs_breakdown": legs_breakdown
+                "legs_breakdown": legs_breakdown,
+                "receipt": receipt
             }
 
         # Single-leg or master RFQ evaluation
@@ -2106,7 +2203,32 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
             return {"status": "INCONCLUSIVE"}
 
         if assignment.quotation_bank and assignment.quotation_bank.bank_id == winner_bank_id:
-            return {"status": "WINNER"}
+            receipt = None
+            try:
+                customer_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
+                bank_display = assignment.quotation_bank.bank.name if assignment.quotation_bank.bank else "Bank Partner"
+                single_leg_data = [{
+                    "pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                    "direction": rfq.direction,
+                    "amount": float(rfq.amount),
+                    "currency": rfq.buy_currency,
+                    "rate": float(res_data.get("winner_rate") or 0.0),
+                    "value_date": str(rfq.value_date or 'Standard Spot')
+                }]
+                exec_time = rfq.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC") if rfq.updated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                from app.core.otp_security import generate_scoped_deal_receipt
+                receipt = generate_scoped_deal_receipt(
+                    rfq_id=str(rfq.id),
+                    ref_no=rfq.ref_no,
+                    customer_name=customer_name,
+                    bank_id=assignment.quotation_bank.bank_id,
+                    bank_name=bank_display,
+                    executed_legs=single_leg_data,
+                    executed_at=exec_time
+                )
+            except Exception:
+                receipt = None
+            return {"status": "WINNER", "receipt": receipt}
         else:
             return {"status": "NOT_SELECTED"}
     except Exception:

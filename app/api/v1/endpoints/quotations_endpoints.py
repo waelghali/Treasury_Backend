@@ -2758,6 +2758,32 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         f"@ <strong style='color: #16a34a;'>{p_str}</strong> (Value Date: {val_date_str})"
                     )
 
+                from app.core.otp_security import generate_scoped_deal_receipt
+                exec_legs_data = []
+                for leg in won_legs:
+                    b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
+                    exec_legs_data.append({
+                        "leg_id": str(leg.get("id", "") or leg.get("leg_id", "")),
+                        "pair": leg.get('currency_pair') or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}",
+                        "direction": leg.get('direction', 'BUY'),
+                        "amount": float(leg.get('amount', 0)),
+                        "currency": leg.get('buy_currency', ''),
+                        "rate": float(b_res.get('price', 0)) if b_res.get('price') is not None else 0.0,
+                        "value_date": str(b_res.get('offered_value_date') or b_res.get('assigned_value_date') or leg.get('value_date') or 'Standard Spot')
+                    })
+                exec_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                receipt_info = generate_scoped_deal_receipt(
+                    rfq_id=str(rfq.id),
+                    ref_no=ref_no,
+                    customer_name=customer_name,
+                    bank_id=b_id,
+                    bank_name=b_info['bank_name'],
+                    executed_legs=exec_legs_data,
+                    executed_at=exec_timestamp
+                )
+                key_vals["Deal Execution Receipt"] = f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>"
+                key_vals["Cryptographic Signature"] = f"<span style='font-family: monospace; font-size: 10px; color: #475569;'>{receipt_info['signature_hash']}</span>"
+
                 if is_partial and lost_legs:
                     for i, leg in enumerate(lost_legs):
                         b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
@@ -2842,6 +2868,25 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
             executed_val_date = bank_res.get('offered_value_date') or bank_res.get('assigned_value_date') or str(rfq.value_date) or 'Standard Spot'
 
             if is_winner:
+                from app.core.otp_security import generate_scoped_deal_receipt
+                single_leg_data = [{
+                    "pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                    "direction": rfq.direction,
+                    "amount": float(rfq.amount),
+                    "currency": rfq.buy_currency,
+                    "rate": float(bank_res['price']),
+                    "value_date": executed_val_date
+                }]
+                exec_timestamp = sub_time_str if sub_time_str != "N/A" else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                receipt_info = generate_scoped_deal_receipt(
+                    rfq_id=str(rfq.id),
+                    ref_no=ref_no,
+                    customer_name=customer_name,
+                    bank_id=bank_res['bank_id'],
+                    bank_name=bank_res['bank_name'],
+                    executed_legs=single_leg_data,
+                    executed_at=exec_timestamp
+                )
                 subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
                 body = build_transaction_email_html(
                     customer_name=customer_name,
@@ -2859,6 +2904,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         "Settlement Value Date": executed_val_date,
                         "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
                         "Execution Timestamp": sub_time_str,
+                        "Deal Execution Receipt": f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>",
+                        "Cryptographic Signature": f"<span style='font-family: monospace; font-size: 10px; color: #475569;'>{receipt_info['signature_hash']}</span>",
                         "Outcome Status": "<span style='color: #16a34a; font-weight: 700;'>🏆 Awarded &amp; Executed</span>"
                     },
                     summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",

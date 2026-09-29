@@ -252,6 +252,7 @@ class QuotationAccessOTP(BaseModel):
     magic_token = Column(String, unique=True, index=True, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     is_used = Column(Boolean, default=False)
+    failed_attempts = Column(Integer, default=0, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assignment = relationship("QuotationBankAssignment", back_populates="otps")
