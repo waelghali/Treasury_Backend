@@ -345,6 +345,8 @@ class QuotationResultsOut(BaseModel):
     best_execution_rate: Optional[float] = None
     deviation_percent: Optional[float] = None
     has_execution_banks: bool = True
+    savings_summary: Optional[dict] = None
+    live_telemetry: Optional[dict] = None
 
 # --- Bank Live Ranking Schemas ---
 class BankLiveRankingConfigCreate(BaseModel):

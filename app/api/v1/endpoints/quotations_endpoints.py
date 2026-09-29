@@ -2782,7 +2782,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                     executed_at=exec_timestamp
                 )
                 key_vals["Deal Execution Receipt"] = f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>"
-                key_vals["Cryptographic Signature"] = f"<span style='font-family: monospace; font-size: 10px; color: #475569;'>{receipt_info['signature_hash']}</span>"
+                key_vals["Cryptographic Signature"] = f"<span style='font-family: monospace; font-size: 10px; color: #334155; word-break: break-all;'>{receipt_info['signature_hash']}</span>"
 
                 if is_partial and lost_legs:
                     for i, leg in enumerate(lost_legs):
@@ -2905,7 +2905,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
                         "Execution Timestamp": sub_time_str,
                         "Deal Execution Receipt": f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>",
-                        "Cryptographic Signature": f"<span style='font-family: monospace; font-size: 10px; color: #475569;'>{receipt_info['signature_hash']}</span>",
+                        "Cryptographic Signature": f"<span style='font-family: monospace; font-size: 10px; color: #334155; word-break: break-all;'>{receipt_info['signature_hash']}</span>",
                         "Outcome Status": "<span style='color: #16a34a; font-weight: 700;'>🏆 Awarded &amp; Executed</span>"
                     },
                     summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
