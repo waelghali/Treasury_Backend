@@ -81,13 +81,29 @@ class QuotationRequest(BaseModel):
     acceptance_resolved_at = Column(DateTime(timezone=True), nullable=True)
     acceptance_resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
+    # Acceptance Delegation
+    delegated_to_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, comment="Corporate colleague authorized to accept/reject deal on behalf of maker")
+    delegated_at = Column(DateTime(timezone=True), nullable=True)
+    delegated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
     customer = relationship("Customer")
     entity = relationship("CustomerEntity")
     creator = relationship("User", foreign_keys=[created_by_user_id])
     cancellation_requestor = relationship("User", foreign_keys=[cancellation_requested_by])
+    delegate = relationship("User", foreign_keys=[delegated_to_user_id])
+    delegator = relationship("User", foreign_keys=[delegated_by_user_id])
     assignments = relationship("QuotationBankAssignment", back_populates="rfq", cascade="all, delete-orphan")
     legs = relationship("QuotationLeg", back_populates="rfq", cascade="all, delete-orphan", order_by="QuotationLeg.leg_index")
     parent_rfq = relationship("QuotationRequest", remote_side=[id], backref="re_tenders")
+
+    @property
+    def delegated_to_name(self):
+        if self.delegate:
+            first_n = getattr(self.delegate, 'first_name', '') or ''
+            last_n = getattr(self.delegate, 'last_name', '') or ''
+            name = f"{first_n} {last_n}".strip()
+            return name or self.delegate.email
+        return None
 
 class QuotationLeg(BaseModel):
     """Individual currency pair or trade leg within a QuotationRequest session."""

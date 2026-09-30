@@ -26,7 +26,8 @@ from app.schemas.schemas_quotation import (
     QuotationRequestCreate, QuotationRequestOut,
     QuotationResultsOut, QuotationResultItem,
     ReTenderRequest, QuotationResubmitRequest,
-    QuotationCancellationRequest, QuotationRescheduleRequest
+    QuotationCancellationRequest, QuotationRescheduleRequest,
+    QuotationDelegateRequest
 )
 from app.crud.crud_quotation import crud_quotation, get_bank_leg_signature
 from app.models.models_quotation import (
@@ -3331,3 +3332,103 @@ def export_quotations_csv(
             "Access-Control-Expose-Headers": "Content-Disposition"
         }
     )
+
+
+@router.get("/delegation-colleagues")
+def get_delegation_colleagues(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Returns active corporate colleagues under the same customer available for deal acceptance delegation."""
+    from app.models.models import User
+    users = db.query(User).filter(
+        User.customer_id == current_user.customer_id,
+        User.is_deleted == False
+    ).all()
+
+    return [
+        {
+            "id": u.id,
+            "email": u.email,
+            "role": u.role.value if hasattr(u.role, 'value') else str(u.role),
+            "display_name": f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip() or u.email
+        }
+        for u in users
+    ]
+
+
+@router.patch("/{rfq_id}/delegate")
+def delegate_deal_acceptance(
+    rfq_id: str,
+    payload: QuotationDelegateRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Delegates deal acceptance authority for an RFQ to another corporate colleague.
+    Only the Maker or a Corporate Admin can delegate.
+    """
+    from app.services.deal_acceptance_service import execute_deal_delegation
+    return execute_deal_delegation(
+        rfq_id=rfq_id,
+        delegator_user_id=current_user.user_id,
+        delegatee_user_id=payload.delegated_to_user_id,
+        db=db
+    )
+
+
+@router.post("/{rfq_id}/accept-deal")
+async def accept_quotation_deal_enduser(
+    rfq_id: str,
+    request: Request = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Accepts winning quotation deal.
+    Accessible by Corporate Admin, Maker (RFQ creator), or designated Delegated Colleague.
+    """
+    from app.services.deal_acceptance_service import execute_shared_deal_acceptance
+    body = {}
+    if request:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    return await execute_shared_deal_acceptance(
+        rfq_id=rfq_id,
+        user_id=current_user.user_id,
+        accepted_leg_ids=body.get("accepted_leg_ids"),
+        declined_leg_ids=body.get("declined_leg_ids"),
+        db=db
+    )
+
+
+@router.post("/{rfq_id}/decline-deal")
+async def decline_quotation_deal_enduser(
+    rfq_id: str,
+    request: Request = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Declines quotation deal outcome.
+    Accessible by Corporate Admin, Maker (RFQ creator), or designated Delegated Colleague.
+    """
+    from app.services.deal_acceptance_service import execute_shared_deal_decline
+    body = {}
+    if request:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    reason = body.get("reason", "Declined by corporate treasury desk")
+    return await execute_shared_deal_decline(
+        rfq_id=rfq_id,
+        user_id=current_user.user_id,
+        reason=reason,
+        db=db
+    )
+

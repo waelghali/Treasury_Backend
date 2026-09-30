@@ -195,11 +195,18 @@ class QuotationRequestOut(BaseModel):
     acceptance_deadline: Optional[datetime] = None
     acceptance_status: Optional[str] = None
     acceptance_resolved_at: Optional[datetime] = None
+    delegated_to_user_id: Optional[int] = None
+    delegated_at: Optional[datetime] = None
+    delegated_by_user_id: Optional[int] = None
+    delegated_to_name: Optional[str] = None
     assigned_banks: Optional[List[dict]] = None
     legs: Optional[List[QuotationLegOut]] = []
 
     class Config:
         from_attributes = True
+
+class QuotationDelegateRequest(BaseModel):
+    delegated_to_user_id: int
 
 class QuotationApprovalRequest(BaseModel):
     legal_disclaimer_accepted: Optional[bool] = True
