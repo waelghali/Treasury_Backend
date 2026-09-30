@@ -169,6 +169,51 @@ class QuotationRequest(BaseModel):
             pass
         return None
 
+    @property
+    def release_docs_to_winner_only(self) -> bool:
+        if not self.document_path:
+            return False
+        try:
+            import json
+            data = json.loads(self.document_path)
+            if isinstance(data, dict):
+                return bool(data.get("release_to_winner_only"))
+            elif isinstance(data, list) and data and isinstance(data[0], dict):
+                return any(bool(d.get("release_to_winner_only")) for d in data)
+        except Exception:
+            pass
+        return False
+
+    def get_parsed_documents(self) -> list:
+        if not self.document_path:
+            return []
+        try:
+            import json, os
+            data = json.loads(self.document_path)
+            if isinstance(data, dict):
+                return data.get("documents", [])
+            elif isinstance(data, list):
+                return data
+        except Exception:
+            import os
+            return [{"name": os.path.basename(p.strip()), "path": p.strip()} for p in self.document_path.split(',') if p.strip()]
+        return []
+
+    def get_documents_for_leg(self, leg_index: int = None, leg_id: str = None) -> list:
+        """Returns documents associated with a specific leg_index (or global docs applicable to all legs)."""
+        docs = self.get_parsed_documents()
+        filtered = []
+        for d in docs:
+            d_idx = d.get("leg_index")
+            d_id = str(d.get("leg_id") or "")
+            if d_idx is None and not d_id:
+                filtered.append(d)
+            elif leg_index is not None and (d_idx == leg_index or d_idx == (leg_index - 1)):
+                filtered.append(d)
+            elif leg_id and d_id and d_id == str(leg_id):
+                filtered.append(d)
+        return filtered
+
 class QuotationLeg(BaseModel):
     """Individual currency pair or trade leg within a QuotationRequest session."""
     __tablename__ = "quotation_legs"
@@ -222,6 +267,21 @@ class QuotationLeg(BaseModel):
     @property
     def tolerance_percent(self) -> float:
         return self.max_tolerance_percent
+
+    def get_parsed_documents(self) -> list:
+        if not self.document_path:
+            return []
+        try:
+            import json, os
+            data = json.loads(self.document_path)
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                return data.get("documents", [])
+        except Exception:
+            import os
+            return [{"name": os.path.basename(p.strip()), "path": p.strip()} for p in self.document_path.split(',') if p.strip()]
+        return []
 
 class QuotationBankAssignment(BaseModel):
     """Junction table connecting an RFQ strictly to a QuotationBank (1 token per bank per RFQ session)."""

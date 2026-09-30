@@ -97,6 +97,8 @@ class QuotationRequestCreate(BaseModel):
     internalNotes: Optional[str] = None
     comments_to_banks: Optional[str] = None
     commentsToBanks: Optional[str] = None
+    release_docs_to_winner_only: Optional[bool] = False
+    releaseDocsToWinnerOnly: Optional[bool] = False
     legal_disclaimer_accepted: Optional[bool] = False
     legalDisclaimerAccepted: Optional[bool] = False
     pairs: Optional[List[QuotationLegCreate]] = None
@@ -209,6 +211,7 @@ class QuotationRequestOut(BaseModel):
     delegated_at: Optional[datetime] = None
     delegated_by_user_id: Optional[int] = None
     delegated_to_name: Optional[str] = None
+    release_docs_to_winner_only: Optional[bool] = False
     assigned_banks: Optional[List[dict]] = None
     legs: Optional[List[QuotationLegOut]] = []
 
@@ -257,6 +260,8 @@ class QuotationResubmitRequest(BaseModel):
     max_tolerance_percent: Optional[float] = None
     allow_alternative_value_date: Optional[bool] = None
     document_path: Optional[str] = None
+    release_docs_to_winner_only: Optional[bool] = None
+    releaseDocsToWinnerOnly: Optional[bool] = None
     selected_banks: Optional[str] = None
     selected_bank_ids: Optional[List[int]] = None
     token_validity_hours: Optional[int] = 24

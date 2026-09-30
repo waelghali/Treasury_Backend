@@ -2445,6 +2445,7 @@ def resubmit_quotation(
                 allow_alternative_value_date=bool(getattr(p_item, 'allowAlternativeValueDate', False)),
                 quotation_base=getattr(p_item, 'quotationBase', None) or rfq.quotation_base,
                 max_tolerance_percent=getattr(p_item, 'maxTolerancePercent', None) or rfq.max_tolerance_percent,
+                document_path=json.dumps(rfq.get_documents_for_leg(leg_index=idx)) if rfq.get_documents_for_leg(leg_index=idx) else None,
                 status='PENDING_APPROVAL',
                 entity_id=rfq.entity_id
             )
@@ -2902,6 +2903,37 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                 key_vals["Deal Execution Receipt"] = f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>"
                 key_vals["Cryptographic Signature"] = f"<span style='font-family: monospace; font-size: 10px; color: #334155; word-break: break-all;'>{receipt_info['signature_hash']}</span>"
 
+                # Attached Supporting Documents for Won Legs
+                won_docs = []
+                seen_doc_paths = set()
+                from app.core.ai_integration import generate_signed_gcs_url
+                for leg in won_legs:
+                    l_idx = leg.get("leg_index")
+                    l_id = str(leg.get("id") or leg.get("leg_id") or "")
+                    l_docs = rfq.get_documents_for_leg(leg_index=l_idx, leg_id=l_id)
+                    for d in l_docs:
+                        p_val = d.get("path")
+                        if p_val and p_val not in seen_doc_paths:
+                            seen_doc_paths.add(p_val)
+                            p_signed = p_val
+                            if str(p_val).startswith("gs://"):
+                                try:
+                                    signed = await generate_signed_gcs_url(p_val, expiration=604800)
+                                    p_signed = signed or p_val
+                                except Exception:
+                                    pass
+                            won_docs.append({
+                                "name": d.get("name") or "Document",
+                                "path": p_signed,
+                                "pair": d.get("pair") or leg.get("currency_pair")
+                            })
+                if won_docs:
+                    doc_html_links = []
+                    for wd in won_docs:
+                        pair_str = f" <span style='color: #64748b; font-size: 11px;'>({wd['pair']})</span>" if wd.get('pair') else ""
+                        doc_html_links.append(f"<a href='{wd['path']}' target='_blank' style='color: #0284c7; text-decoration: underline; font-weight: 600;'>📄 {wd['name']}</a>{pair_str}")
+                    key_vals["Trade Supporting Documents"] = "<br/>".join(doc_html_links)
+
                 if is_partial and lost_legs:
                     for i, leg in enumerate(lost_legs):
                         b_res = next((r for r in leg.get("results", []) if r.get("bank_id") == b_id), {})
@@ -3005,27 +3037,45 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                     executed_legs=single_leg_data,
                     executed_at=exec_timestamp
                 )
+                single_key_vals = {
+                    "RFQ Reference": ref_no,
+                    "Requesting Legal Entity": customer_name,
+                    "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
+                    "Direction": rfq.direction,
+                    "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
+                    "Executed Rate": f"<span style='color: #16a34a; font-weight: 700;'>{bank_res['price']:.5f}</span>",
+                    "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
+                    "Settlement Value Date": executed_val_date,
+                    "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
+                    "Execution Timestamp": sub_time_str,
+                    "Deal Execution Receipt": f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>",
+                    "Cryptographic Signature": f"<span style='font-family: monospace; font-size: 10px; color: #334155; word-break: break-all;'>{receipt_info['signature_hash']}</span>",
+                    "Outcome Status": "<span style='color: #16a34a; font-weight: 700;'>🏆 Awarded &amp; Executed</span>"
+                }
+
+                single_docs = rfq.get_parsed_documents()
+                if single_docs:
+                    from app.core.ai_integration import generate_signed_gcs_url
+                    doc_html_links = []
+                    for sd in single_docs:
+                        p_val = sd.get("path")
+                        p_signed = p_val
+                        if str(p_val).startswith("gs://"):
+                            try:
+                                signed = await generate_signed_gcs_url(p_val, expiration=604800)
+                                p_signed = signed or p_val
+                            except Exception:
+                                pass
+                        doc_html_links.append(f"<a href='{p_signed}' target='_blank' style='color: #0284c7; text-decoration: underline; font-weight: 600;'>📄 {sd.get('name') or 'Document'}</a>")
+                    single_key_vals["Trade Supporting Documents"] = "<br/>".join(doc_html_links)
+
                 subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
                 body = build_transaction_email_html(
                     customer_name=customer_name,
                     title="📈 Trade Execution Confirmation",
                     transaction_ref=ref_no,
                     transaction_type="RFQ Execution",
-                    key_value_dict={
-                        "RFQ Reference": ref_no,
-                        "Requesting Legal Entity": customer_name,
-                        "Pair": f"{rfq.buy_currency}/{rfq.sell_currency}",
-                        "Direction": rfq.direction,
-                        "Amount": f"{rfq.amount:,.2f} {rfq.buy_currency}",
-                        "Executed Rate": f"<span style='color: #16a34a; font-weight: 700;'>{bank_res['price']:.5f}</span>",
-                        "All-In Effective Rate": f"{bank_res['finalPrice']:.5f}",
-                        "Settlement Value Date": executed_val_date,
-                        "Confirmed / Executed By": f"<span style='color: #0f172a; font-weight: 700;'>{dealer_identity}</span>",
-                        "Execution Timestamp": sub_time_str,
-                        "Deal Execution Receipt": f"<span style='font-family: monospace; font-size: 11px; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; color: #0f172a; font-weight: 700;'>{receipt_info['receipt_id']}</span>",
-                        "Cryptographic Signature": f"<span style='font-family: monospace; font-size: 10px; color: #334155; word-break: break-all;'>{receipt_info['signature_hash']}</span>",
-                        "Outcome Status": "<span style='color: #16a34a; font-weight: 700;'>🏆 Awarded &amp; Executed</span>"
-                    },
+                    key_value_dict=single_key_vals,
                     summary_text=f"We are pleased to confirm the execution of the trade with <strong>{customer_name}</strong> based on your winning quote.",
                     recipient_name=f"{bank_res['bank_name']} Treasury Desk"
                 )

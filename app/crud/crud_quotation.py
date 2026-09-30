@@ -420,6 +420,7 @@ class CRUDQuotation:
             for idx, p_item in enumerate(pairs_list, start=1):
                 leg_id = f"{rfq_id}-leg-{idx}"
                 leg_val_d = getattr(p_item, 'valueDate', None)
+                leg_docs = db_rfq.get_documents_for_leg(leg_index=idx)
                 leg_obj = QuotationLeg(
                     id=leg_id,
                     rfq_id=rfq_id,
@@ -434,6 +435,7 @@ class CRUDQuotation:
                     allow_alternative_value_date=bool(getattr(p_item, 'allowAlternativeValueDate', False)),
                     quotation_base=getattr(p_item, 'quotationBase', None) or p_base,
                     max_tolerance_percent=getattr(p_item, 'maxTolerancePercent', None) or p_tol,
+                    document_path=json.dumps(leg_docs) if leg_docs else None,
                     status=initial_status,
                     entity_id=getattr(obj_in, 'entity_id', None)
                 )
@@ -441,6 +443,7 @@ class CRUDQuotation:
                 created_legs.append((leg_obj, p_item))
         else:
             leg_id = f"{rfq_id}-leg-1"
+            leg_docs = db_rfq.get_parsed_documents()
             leg_obj = QuotationLeg(
                 id=leg_id,
                 rfq_id=rfq_id,
@@ -455,6 +458,7 @@ class CRUDQuotation:
                 allow_alternative_value_date=allow_alt_master,
                 quotation_base=obj_in.quotationBase,
                 max_tolerance_percent=obj_in.maxTolerancePercent,
+                document_path=json.dumps(leg_docs) if leg_docs else db_rfq.document_path,
                 status=initial_status,
                 entity_id=getattr(obj_in, 'entity_id', None)
             )

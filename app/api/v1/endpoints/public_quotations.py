@@ -194,13 +194,21 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     effective_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
 
     parsed_docs = []
-    # Indicative RFQs never share documents, and document visibility flag is respected
-    if effective_base != 'indicative' and (assignment.is_document_visible is not False) and rfq.document_path:
+    # Indicative RFQs never share documents, and document visibility flag is respected.
+    # If release_docs_to_winner_only is active, documents are strictly withheld during the bidding window.
+    if (
+        effective_base != 'indicative' 
+        and (assignment.is_document_visible is not False) 
+        and rfq.document_path 
+        and not getattr(rfq, 'release_docs_to_winner_only', False)
+    ):
         raw_docs = []
         try:
             import json
             loaded = json.loads(rfq.document_path)
-            if isinstance(loaded, list):
+            if isinstance(loaded, dict):
+                raw_docs = loaded.get("documents", [])
+            elif isinstance(loaded, list):
                 raw_docs = loaded
             elif isinstance(loaded, str):
                 raw_docs = [{"name": os.path.basename(loaded), "path": loaded}]
@@ -404,7 +412,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "has_execution_legs": has_exec_leg,
         "is_all_indicative": not has_exec_leg,
         "has_execution_dealers": any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
-        "document_path": rfq.document_path if (has_exec_leg and assignment.is_document_visible is not False) else None,
+        "document_path": rfq.document_path if (has_exec_leg and assignment.is_document_visible is not False and not getattr(rfq, 'release_docs_to_winner_only', False)) else None,
         "documents": parsed_docs,
         "status": rfq.status,
         "comments_to_banks": rfq.comments_to_banks,
@@ -2057,7 +2065,7 @@ def get_bank_quotation_history(
     }
 
 @router.get("/{token}/result")
-def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
+async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
@@ -2241,6 +2249,31 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 except Exception:
                     receipt = None
 
+            released_docs = []
+            if won_legs:
+                seen_paths = set()
+                from app.core.ai_integration import generate_signed_gcs_url
+                for wl in won_legs:
+                    wl_idx = wl.get("leg_index")
+                    wl_id = str(wl.get("leg_id") or "")
+                    leg_docs = rfq.get_documents_for_leg(leg_index=wl_idx, leg_id=wl_id)
+                    for d in leg_docs:
+                        p_val = d.get("path")
+                        if p_val and p_val not in seen_paths:
+                            seen_paths.add(p_val)
+                            p_signed = p_val
+                            if str(p_val).startswith("gs://"):
+                                try:
+                                    signed = await generate_signed_gcs_url(p_val, expiration=604800)
+                                    p_signed = signed or p_val
+                                except Exception:
+                                    pass
+                            released_docs.append({
+                                "name": d.get("name") or "Document",
+                                "path": p_signed,
+                                "pair": d.get("pair") or wl.get("currency_pair")
+                            })
+
             return {
                 "status": overall_status,
                 "won_legs_count": len(won_legs),
@@ -2251,23 +2284,24 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 "lost_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in lost_legs],
                 "inconclusive_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in inconclusive_legs],
                 "legs_breakdown": legs_breakdown,
-                "receipt": receipt
+                "receipt": receipt,
+                "released_documents": released_docs
             }
 
         # Single-leg or master RFQ evaluation
         q_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
         if q_base == 'indicative':
-            return {"status": "INDICATIVE_ONLY"}
+            return {"status": "INDICATIVE_ONLY", "released_documents": []}
 
         winner_bank_id = res_data.get("winner_bank_id")
         is_inconclusive = res_data.get("is_inconclusive", False)
         rfq_res_status = (res_data.get("status") or (rfq.status if rfq else "")).upper()
 
         if rfq_res_status in ("REJECTED", "CANCELLED", "DECLINED"):
-            return {"status": "NOT_SELECTED"}
+            return {"status": "NOT_SELECTED", "released_documents": []}
 
         if is_inconclusive or not winner_bank_id:
-            return {"status": "INCONCLUSIVE"}
+            return {"status": "INCONCLUSIVE", "released_documents": []}
 
         if assignment.quotation_bank and assignment.quotation_bank.bank_id == winner_bank_id:
             receipt = None
@@ -2295,8 +2329,27 @@ def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 )
             except Exception:
                 receipt = None
-            return {"status": "WINNER", "receipt": receipt}
+
+            released_docs = []
+            all_docs = rfq.get_parsed_documents()
+            from app.core.ai_integration import generate_signed_gcs_url
+            for d in all_docs:
+                p_val = d.get("path")
+                p_signed = p_val
+                if str(p_val).startswith("gs://"):
+                    try:
+                        signed = await generate_signed_gcs_url(p_val, expiration=604800)
+                        p_signed = signed or p_val
+                    except Exception:
+                        pass
+                released_docs.append({
+                    "name": d.get("name") or "Document",
+                    "path": p_signed,
+                    "pair": d.get("pair") or f"{rfq.buy_currency}/{rfq.sell_currency}"
+                })
+
+            return {"status": "WINNER", "receipt": receipt, "released_documents": released_docs}
         else:
-            return {"status": "NOT_SELECTED"}
+            return {"status": "NOT_SELECTED", "released_documents": []}
     except Exception:
-        return {"status": "COMPLETED"}
+        return {"status": "COMPLETED", "released_documents": []}
