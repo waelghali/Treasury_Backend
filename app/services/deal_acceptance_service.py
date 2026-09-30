@@ -20,6 +20,12 @@ def check_deal_authority(rfq: QuotationRequest, user: User, action_name: str = "
     3. Designated Delegate (assigned by Maker or Corporate Admin)
     """
     user_role = user.role.value if hasattr(user.role, 'value') else str(user.role)
+    if user_role != "super_admin" and user.customer_id != rfq.customer_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to perform actions on an RFQ belonging to another organization."
+        )
+
     is_admin = user_role in ["corporate_admin", "super_admin"]
     is_maker = (user.id == rfq.created_by_user_id)
     is_delegate = (rfq.delegated_to_user_id is not None and user.id == rfq.delegated_to_user_id)
