@@ -3347,22 +3347,29 @@ def get_delegation_colleagues(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Returns active corporate colleagues under the same customer available for deal acceptance delegation."""
+    """Returns active corporate colleagues under the same customer available for deal acceptance delegation.
+    Corporate Admins are excluded as they already possess global authority to accept/decline deals."""
     from app.models.models import User
     users = db.query(User).filter(
         User.customer_id == current_user.customer_id,
         User.is_deleted == False
     ).all()
 
-    return [
-        {
+    valid_colleagues = []
+    for u in users:
+        u_role = (u.role.value if hasattr(u.role, 'value') else str(u.role or '')).lower()
+        if u_role in ('corporate_admin', 'super_admin'):
+            continue
+        if u.id == current_user.user_id:
+            continue
+        valid_colleagues.append({
             "id": u.id,
             "email": u.email,
-            "role": u.role.value if hasattr(u.role, 'value') else str(u.role),
+            "role": u_role,
             "display_name": f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip() or u.email
-        }
-        for u in users
-    ]
+        })
+
+    return valid_colleagues
 
 
 @router.patch("/{rfq_id}/delegate")

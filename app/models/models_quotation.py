@@ -93,6 +93,7 @@ class QuotationRequest(BaseModel):
     cancellation_requestor = relationship("User", foreign_keys=[cancellation_requested_by])
     delegate = relationship("User", foreign_keys=[delegated_to_user_id])
     delegator = relationship("User", foreign_keys=[delegated_by_user_id])
+    acceptance_resolved_by = relationship("User", foreign_keys=[acceptance_resolved_by_user_id])
     assignments = relationship("QuotationBankAssignment", back_populates="rfq", cascade="all, delete-orphan")
     legs = relationship("QuotationLeg", back_populates="rfq", cascade="all, delete-orphan", order_by="QuotationLeg.leg_index")
     parent_rfq = relationship("QuotationRequest", remote_side=[id], backref="re_tenders")
@@ -104,6 +105,68 @@ class QuotationRequest(BaseModel):
             last_n = getattr(self.delegate, 'last_name', '') or ''
             name = f"{first_n} {last_n}".strip()
             return name or self.delegate.email
+        return None
+
+    @property
+    def acceptance_resolved_by_name(self):
+        if self.acceptance_resolved_by:
+            first_n = getattr(self.acceptance_resolved_by, 'first_name', '') or ''
+            last_n = getattr(self.acceptance_resolved_by, 'last_name', '') or ''
+            name = f"{first_n} {last_n}".strip()
+            return name or self.acceptance_resolved_by.email
+        return None
+
+    @property
+    def acceptance_resolved_by_email(self):
+        if self.acceptance_resolved_by:
+            return self.acceptance_resolved_by.email
+        return None
+
+    @property
+    def approved_by_name(self):
+        from sqlalchemy.orm import object_session
+        session = object_session(self)
+        if not session or not self.admin_reviewed_at:
+            return None
+        try:
+            from app.models.models import AuditLog
+            logs = session.query(AuditLog).filter(
+                AuditLog.action_type.in_(["QUOTATION_RFQ_APPROVED", "QUOTATION_RFQ_APPROVED_SCHEDULED"]),
+                AuditLog.customer_id == self.customer_id
+            ).order_by(AuditLog.id.desc()).all()
+            for l in logs:
+                d = l.details or {}
+                if str(d.get("rfq_id")) == str(self.id):
+                    if l.user:
+                        first_n = getattr(l.user, 'first_name', '') or ''
+                        last_n = getattr(l.user, 'last_name', '') or ''
+                        name = f"{first_n} {last_n}".strip()
+                        return name or l.user.email
+                    app_email = d.get("approved_by_email")
+                    if app_email:
+                        return app_email
+        except Exception:
+            pass
+        return None
+
+    @property
+    def approved_by_email(self):
+        from sqlalchemy.orm import object_session
+        session = object_session(self)
+        if not session or not self.admin_reviewed_at:
+            return None
+        try:
+            from app.models.models import AuditLog
+            logs = session.query(AuditLog).filter(
+                AuditLog.action_type.in_(["QUOTATION_RFQ_APPROVED", "QUOTATION_RFQ_APPROVED_SCHEDULED"]),
+                AuditLog.customer_id == self.customer_id
+            ).order_by(AuditLog.id.desc()).all()
+            for l in logs:
+                d = l.details or {}
+                if str(d.get("rfq_id")) == str(self.id):
+                    return d.get("approved_by_email")
+        except Exception:
+            pass
         return None
 
 class QuotationLeg(BaseModel):

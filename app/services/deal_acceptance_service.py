@@ -169,6 +169,9 @@ async def execute_shared_deal_acceptance(
             elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
                 leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
 
+    rfq.acceptance_resolved_at = datetime.now(timezone.utc)
+    rfq.acceptance_resolved_by_user_id = user.id
+
     db.commit()
 
     log_action(

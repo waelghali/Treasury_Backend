@@ -200,6 +200,11 @@ class QuotationRequestOut(BaseModel):
     acceptance_deadline: Optional[datetime] = None
     acceptance_status: Optional[str] = None
     acceptance_resolved_at: Optional[datetime] = None
+    acceptance_resolved_by_user_id: Optional[int] = None
+    acceptance_resolved_by_name: Optional[str] = None
+    acceptance_resolved_by_email: Optional[str] = None
+    approved_by_name: Optional[str] = None
+    approved_by_email: Optional[str] = None
     delegated_to_user_id: Optional[int] = None
     delegated_at: Optional[datetime] = None
     delegated_by_user_id: Optional[int] = None
