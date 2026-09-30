@@ -1014,7 +1014,8 @@ class AuthService:
             sender_name="Grow Security",
             body_template=mfa_body,
             template_data={},
-            email_settings=email_settings
+            email_settings=email_settings,
+            save_copy=False
         )
 
         

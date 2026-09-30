@@ -159,12 +159,13 @@ def public_verify_domain(
     """
     background_tasks.add_task(
         send_email,
-        db,
-        [email],
-        subject,
-        body,
-        {},
-        email_settings,
+        db=db,
+        to_emails=[email],
+        subject_template=subject,
+        body_template=body,
+        template_data={},
+        email_settings=email_settings,
+        save_copy=False
     )
     print(f"[DEBUG EMAIL] verify-domain: OTP email queued for {email}")
     

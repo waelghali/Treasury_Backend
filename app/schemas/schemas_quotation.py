@@ -170,6 +170,8 @@ class QuotationRequestOut(BaseModel):
     entity_name: Optional[str] = None
     entity_code: Optional[str] = None
     created_at: datetime
+    created_by_user_id: Optional[int] = None
+    customer_id: Optional[int] = None
     creator_name: Optional[str] = None
     quotation_base: Optional[str] = None
     max_tolerance_percent: Optional[float] = None
