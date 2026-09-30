@@ -646,7 +646,7 @@ class CRUDQuotation:
         db.refresh(db_rfq)
         return db_rfq, assignments
 
-    def get_requests(self, db: Session, customer_id: int = None, allowed_entity_ids: list = None):
+    def get_requests(self, db: Session, customer_id: int = None, allowed_entity_ids: list = None, user_id: int = None):
         query = db.query(QuotationRequest).options(
             selectinload(QuotationRequest.creator),
             selectinload(QuotationRequest.entity),
@@ -655,7 +655,17 @@ class CRUDQuotation:
         if customer_id is not None:
             query = query.filter(QuotationRequest.customer_id == customer_id)
         if allowed_entity_ids is not None:
-            query = query.filter(QuotationRequest.entity_id.in_(allowed_entity_ids))
+            if user_id:
+                from sqlalchemy import or_
+                query = query.filter(
+                    or_(
+                        QuotationRequest.entity_id.in_(allowed_entity_ids),
+                        QuotationRequest.delegated_to_user_id == user_id,
+                        QuotationRequest.created_by_user_id == user_id
+                    )
+                )
+            else:
+                query = query.filter(QuotationRequest.entity_id.in_(allowed_entity_ids))
         reqs = query.order_by(QuotationRequest.created_at.desc()).all()
         for r in reqs:
             if r.creator:

@@ -1673,7 +1673,7 @@ def get_rfq_history(
         else:
             allowed_entity_ids = user_ids
 
-    reqs = crud_quotation.get_requests(db, customer_id=current_user.customer_id, allowed_entity_ids=allowed_entity_ids)
+    reqs = crud_quotation.get_requests(db, customer_id=current_user.customer_id, allowed_entity_ids=allowed_entity_ids, user_id=current_user.user_id)
     now = datetime.now(timezone.utc)
     changed = False
     
