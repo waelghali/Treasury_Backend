@@ -1837,6 +1837,9 @@ def request_rfq_cancellation(
         rfq.cancelled_at = now
         rfq.scheduled_release_at = None
         rfq.scheduled_release_job_id = None
+        for leg in (rfq.legs or []):
+            if leg.status not in ('CANCELLED',):
+                leg.status = 'CANCELLED'
         db.commit()
 
         # Cancel scheduled release if registered
