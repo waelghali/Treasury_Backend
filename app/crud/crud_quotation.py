@@ -408,7 +408,8 @@ class CRUDQuotation:
             acceptance_timeout_action=acc_action,
             token_validity_hours=getattr(obj_in, 'token_validity_hours', 24) or 24,
             parent_rfq_id=parent_id,
-            internal_notes=getattr(obj_in, 'internal_notes', None) or getattr(obj_in, 'internalNotes', None)
+            internal_notes=getattr(obj_in, 'internal_notes', None) or getattr(obj_in, 'internalNotes', None),
+            comments_to_banks=getattr(obj_in, 'comments_to_banks', None) or getattr(obj_in, 'commentsToBanks', None)
         )
         db.add(db_rfq)
         db.flush()

@@ -95,6 +95,8 @@ class QuotationRequestCreate(BaseModel):
     parent_rfq_id: Optional[str] = None
     internal_notes: Optional[str] = None
     internalNotes: Optional[str] = None
+    comments_to_banks: Optional[str] = None
+    commentsToBanks: Optional[str] = None
     legal_disclaimer_accepted: Optional[bool] = False
     legalDisclaimerAccepted: Optional[bool] = False
     pairs: Optional[List[QuotationLegCreate]] = None
@@ -173,6 +175,7 @@ class QuotationRequestOut(BaseModel):
     max_tolerance_percent: Optional[float] = None
     document_path: Optional[str] = None
     internal_notes: Optional[str] = None
+    comments_to_banks: Optional[str] = None
     parent_rfq_id: Optional[str] = None
     parent_rfq_ref: Optional[str] = None
     admin_revision_notes: Optional[str] = None
@@ -254,6 +257,8 @@ class QuotationResubmitRequest(BaseModel):
     user_notes: Optional[str] = None
     internal_notes: Optional[str] = None
     internalNotes: Optional[str] = None
+    comments_to_banks: Optional[str] = None
+    commentsToBanks: Optional[str] = None
     legal_disclaimer_accepted: Optional[bool] = False
     legalDisclaimerAccepted: Optional[bool] = False
     pairs: Optional[List[QuotationLegCreate]] = None

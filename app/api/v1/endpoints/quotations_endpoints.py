@@ -2107,7 +2107,8 @@ def retender_quotation(
         acceptance_timeout_action=parent.acceptance_timeout_action,
         token_validity_hours=payload.token_validity_hours or parent.token_validity_hours or 24,
         parent_rfq_id=root_parent_id,
-        entity_id=getattr(payload, 'entity_id', None) or parent.entity_id
+        entity_id=getattr(payload, 'entity_id', None) or parent.entity_id,
+        comments_to_banks=parent.comments_to_banks
     )
     db.add(new_rfq)
     db.flush()
@@ -2397,6 +2398,10 @@ def resubmit_quotation(
         rfq.internal_notes = payload.internal_notes
     elif getattr(payload, 'internalNotes', None) is not None:
         rfq.internal_notes = payload.internalNotes
+    if getattr(payload, 'comments_to_banks', None) is not None:
+        rfq.comments_to_banks = payload.comments_to_banks
+    elif getattr(payload, 'commentsToBanks', None) is not None:
+        rfq.comments_to_banks = payload.commentsToBanks
 
     # Handle multi-pair legs re-creation if provided
     resubmit_pairs = getattr(payload, 'pairs', None) or getattr(payload, 'legs', None)

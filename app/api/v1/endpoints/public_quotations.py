@@ -407,6 +407,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "document_path": rfq.document_path if (has_exec_leg and assignment.is_document_visible is not False) else None,
         "documents": parsed_docs,
         "status": rfq.status,
+        "comments_to_banks": rfq.comments_to_banks,
         "assignment_id": assignment.id,
         "is_cross_entity": bool(assignment.is_cross_entity),
         "bank_name": bank_name,

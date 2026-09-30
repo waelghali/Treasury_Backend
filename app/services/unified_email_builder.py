@@ -762,6 +762,22 @@ def build_quotation_rfq_bank_email(
                         </tr>
         """
 
+    comments_to_banks = getattr(rfq, "comments_to_banks", None)
+    comments_box_html = ""
+    if comments_to_banks and str(comments_to_banks).strip():
+        safe_comments = str(comments_to_banks).strip().replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
+        comments_box_html = f"""
+            <!-- SPECIAL INSTRUCTIONS / CLIENT COMMENTS -->
+            <div style="background-color: #f0fdf4; border: 1px solid #bbf7d0; border-left: 5px solid #16a34a; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
+                <span style="font-size: 11px; font-weight: 800; color: #166534; letter-spacing: 1.2px; text-transform: uppercase; display: block; margin-bottom: 6px;">
+                    &#128221; SPECIAL INSTRUCTIONS &bull; CLIENT COMMENTS
+                </span>
+                <div style="font-size: 13px; color: #14532d; line-height: 1.6; font-weight: 500;">
+                    {safe_comments}
+                </div>
+            </div>
+        """
+
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -829,7 +845,7 @@ def build_quotation_rfq_bank_email(
             </div>
 
             <!-- CORE TRADE SPECIFICATIONS TABLE -->
-            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 28px;">
+            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
                 <div style="background-color: #f8fafc; padding: 12px 18px; border-bottom: 1px solid #e2e8f0;">
                     <span style="font-size: 12px; font-weight: 800; color: #475569; letter-spacing: 0.5px; text-transform: uppercase;">
                         Trade Specifications &bull; {ref_no}
@@ -870,6 +886,8 @@ def build_quotation_rfq_bank_email(
                     </tbody>
                 </table>
             </div>
+
+            {comments_box_html}
 
             {action_box_html}
 
