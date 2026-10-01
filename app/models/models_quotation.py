@@ -226,19 +226,46 @@ class QuotationRequest(BaseModel):
             return [{"name": os.path.basename(p.strip()), "path": p.strip()} for p in self.document_path.split(',') if p.strip()]
         return []
 
-    def get_documents_for_leg(self, leg_index: int = None, leg_id: str = None) -> list:
-        """Returns documents associated with a specific leg_index (or global docs applicable to all legs)."""
+    def get_documents_for_leg(self, leg_index: int = None, leg_id: str = None, pair: str = None) -> list:
+        """Returns documents associated with a specific leg (or global docs applicable to all legs)."""
         docs = self.get_parsed_documents()
         filtered = []
+
+        # Check if 0-based indexing is used in the uploaded doc set (e.g. frontend pIdx 0, 1...)
+        has_zero_indexed = any(d.get("leg_index") == 0 for d in docs if d.get("leg_index") is not None)
+
+        clean_pair = pair.strip().upper() if pair else None
+        clean_leg_id = str(leg_id).strip() if leg_id else None
+
         for d in docs:
             d_idx = d.get("leg_index")
-            d_id = str(d.get("leg_id") or "")
-            if d_idx is None and not d_id:
+            d_id = str(d.get("leg_id") or "").strip()
+            d_pair = str(d.get("pair") or "").strip().upper()
+
+            # Global documents (no leg_index, no leg_id, no pair specified) apply to all legs
+            if d_idx is None and not d_id and not d_pair:
                 filtered.append(d)
-            elif leg_index is not None and (d_idx == leg_index or d_idx == (leg_index - 1)):
+                continue
+
+            # Exact leg_id match
+            if clean_leg_id and d_id and d_id == clean_leg_id:
                 filtered.append(d)
-            elif leg_id and d_id and d_id == str(leg_id):
+                continue
+
+            # Exact pair match if provided
+            if clean_pair and d_pair and d_pair == clean_pair:
                 filtered.append(d)
+                continue
+
+            # Accurate index matching:
+            # If doc set contains index 0, then 0-based mapping applies (Leg 1 is index 0, Leg 2 is index 1...)
+            # Never use ambiguous 'OR' that matches both index 0 and 1 for Leg 1!
+            if leg_index is not None and d_idx is not None:
+                expected_idx = (leg_index - 1) if (has_zero_indexed and leg_index >= 1) else leg_index
+                if d_idx == expected_idx:
+                    filtered.append(d)
+                    continue
+
         return filtered
 
 class QuotationLeg(BaseModel):

@@ -430,7 +430,8 @@ class CRUDQuotation:
             for idx, p_item in enumerate(pairs_list, start=1):
                 leg_id = f"{rfq_id}-leg-{idx}"
                 leg_val_d = getattr(p_item, 'valueDate', None)
-                leg_docs = db_rfq.get_documents_for_leg(leg_index=idx)
+                leg_pair = f"{getattr(p_item, 'buyCurrency', None) or p_buy_curr}/{getattr(p_item, 'sellCurrency', None) or p_sell_curr}"
+                leg_docs = db_rfq.get_documents_for_leg(leg_index=idx, pair=leg_pair)
                 leg_obj = QuotationLeg(
                     id=leg_id,
                     rfq_id=rfq_id,

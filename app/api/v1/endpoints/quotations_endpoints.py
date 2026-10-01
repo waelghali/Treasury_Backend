@@ -2749,7 +2749,7 @@ def resubmit_quotation(
                 allow_alternative_value_date=bool(getattr(p_item, 'allowAlternativeValueDate', False)),
                 quotation_base=getattr(p_item, 'quotationBase', None) or rfq.quotation_base,
                 max_tolerance_percent=getattr(p_item, 'maxTolerancePercent', None) or rfq.max_tolerance_percent,
-                document_path=json.dumps(rfq.get_documents_for_leg(leg_index=idx)) if rfq.get_documents_for_leg(leg_index=idx) else None,
+                document_path=json.dumps(rfq.get_documents_for_leg(leg_index=idx, pair=f"{getattr(p_item, 'buyCurrency', None) or rfq.buy_currency or 'USD'}/{getattr(p_item, 'sellCurrency', None) or rfq.sell_currency or 'EGP'}")) if rfq.get_documents_for_leg(leg_index=idx, pair=f"{getattr(p_item, 'buyCurrency', None) or rfq.buy_currency or 'USD'}/{getattr(p_item, 'sellCurrency', None) or rfq.sell_currency or 'EGP'}") else None,
                 status='PENDING_APPROVAL',
                 entity_id=rfq.entity_id
             )
@@ -3212,9 +3212,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                 seen_doc_paths = set()
                 from app.core.ai_integration import generate_signed_gcs_url
                 for leg in won_legs:
-                    l_idx = leg.get("leg_index")
-                    l_id = str(leg.get("id") or leg.get("leg_id") or "")
-                    l_docs = rfq.get_documents_for_leg(leg_index=l_idx, leg_id=l_id)
+                    l_pair = leg.get("currency_pair") or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
+                    l_docs = rfq.get_documents_for_leg(leg_index=l_idx, leg_id=l_id, pair=l_pair)
                     for d in l_docs:
                         p_val = d.get("path")
                         if p_val and p_val not in seen_doc_paths:

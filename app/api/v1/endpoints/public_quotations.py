@@ -2262,7 +2262,8 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 for wl in won_legs:
                     wl_idx = wl.get("leg_index")
                     wl_id = str(wl.get("leg_id") or "")
-                    leg_docs = rfq.get_documents_for_leg(leg_index=wl_idx, leg_id=wl_id)
+                    wl_pair = wl.get("currency_pair") or f"{wl.get('buy_currency')}/{wl.get('sell_currency')}"
+                    leg_docs = rfq.get_documents_for_leg(leg_index=wl_idx, leg_id=wl_id, pair=wl_pair)
                     for d in leg_docs:
                         p_val = d.get("path")
                         if p_val and p_val not in seen_paths:
