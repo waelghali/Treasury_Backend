@@ -153,7 +153,7 @@ def create_quotation_bank(
             cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
             customer_name = cust.name if cust else "Corporate Treasury"
             bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
-            email_settings = get_customer_email_settings(db, current_user.customer_id)
+            email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
             
             subj, body = build_bank_roster_governance_email(
                 customer_branding=customer_name,
@@ -213,7 +213,7 @@ def send_bank_roster_report(
     cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
     customer_name = cust.name if cust else "Corporate Treasury"
     bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
-    email_settings = get_customer_email_settings(db, current_user.customer_id)
+    email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
 
     contacts_list = list(bank.contacts) if bank.contacts else []
     subj, body = build_bank_roster_governance_email(
