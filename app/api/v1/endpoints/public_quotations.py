@@ -2353,3 +2353,96 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
             return {"status": "NOT_SELECTED", "released_documents": []}
     except Exception:
         return {"status": "COMPLETED", "released_documents": []}
+
+
+@router.get("/bank-handshake/{token}")
+def get_bank_handshake_details(token: str, db: Session = Depends(get_db)):
+    """Validates the bank handshake token and returns bank info and contacts for verification."""
+    from app.core.security import SECRET_KEY, ALGORITHM
+    import jwt
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") != "bank_handshake":
+            raise ValueError("Invalid token type")
+    except Exception:
+        raise HTTPException(status_code=400, detail="The handshake verification link is invalid or has expired.")
+
+    bank_config_id = payload.get("bank_config_id")
+    customer_id = payload.get("customer_id")
+    
+    qb = db.query(QuotationBank).filter(
+        QuotationBank.id == bank_config_id,
+        QuotationBank.customer_id == customer_id
+    ).first()
+
+    if not qb:
+        raise HTTPException(status_code=404, detail="Bank counterparty configuration not found.")
+
+    from app.models.models import Customer
+    cust = db.query(Customer).filter(Customer.id == customer_id).first()
+    customer_name = cust.name if cust else "Corporate Treasury"
+    bank_name = qb.bank.name if qb.bank else f"Bank {qb.bank_id}"
+
+    return {
+        "status": "success",
+        "bank_name": bank_name,
+        "customer_name": customer_name,
+        "authorized_contact_email": qb.authorized_contact_email,
+        "authorized_contact_name": qb.authorized_contact_name,
+        "contacts": list(qb.contacts) if qb.contacts else [],
+        "handshake_confirmed_at": qb.handshake_confirmed_at.isoformat() if qb.handshake_confirmed_at else None,
+        "already_confirmed": bool(qb.handshake_confirmed_at)
+    }
+
+
+@router.post("/bank-handshake/{token}/confirm")
+def confirm_bank_handshake(token: str, request: Request, db: Session = Depends(get_db)):
+    """Confirms the counterparty governance handshake by the bank officer."""
+    from app.core.security import SECRET_KEY, ALGORITHM
+    import jwt
+    from datetime import datetime, timezone
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") != "bank_handshake":
+            raise ValueError("Invalid token type")
+    except Exception:
+        raise HTTPException(status_code=400, detail="The handshake verification link is invalid or has expired.")
+
+    bank_config_id = payload.get("bank_config_id")
+    customer_id = payload.get("customer_id")
+
+    qb = db.query(QuotationBank).filter(
+        QuotationBank.id == bank_config_id,
+        QuotationBank.customer_id == customer_id
+    ).first()
+
+    if not qb:
+        raise HTTPException(status_code=404, detail="Bank counterparty configuration not found.")
+
+    now_utc = datetime.now(timezone.utc)
+    qb.handshake_confirmed_at = now_utc
+    db.commit()
+
+    # Log audit action
+    client_ip = request.client.host if request and request.client else "unknown"
+    log_action(
+        db,
+        user_id=None,
+        action_type="QUOTATION_BANK_HANDSHAKE_CONFIRMED",
+        entity_type="QuotationBank",
+        entity_id=qb.id,
+        details={
+            "bank_id": qb.bank_id,
+            "bank_name": qb.bank.name if qb.bank else f"Bank {qb.bank_id}",
+            "confirmed_by_email": payload.get("email"),
+            "confirmed_at": now_utc.isoformat(),
+            "ip_address": client_ip
+        },
+        customer_id=customer_id
+    )
+
+    return {
+        "status": "success",
+        "message": f"Counterparty trading roster confirmed successfully for {qb.bank.name if qb.bank else 'your bank'}.",
+        "confirmed_at": now_utc.isoformat()
+    }

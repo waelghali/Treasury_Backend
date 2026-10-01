@@ -1042,39 +1042,38 @@ def build_bank_roster_governance_email(
     authorized_contact_name: Optional[str],
     contacts: List[Dict[str, Any]],
     email_purpose: str = "HANDSHAKE",
+    handshake_link: Optional[str] = None,
     platform_name: str = "Grow Treasury Platform"
 ) -> Tuple[str, str]:
     """
-    Builds an institutional governance confirmation or audit email sent to the bank's
+    Builds a direct, simple governance confirmation or audit email sent to the bank's
     designated Authorized Governance Contact, presenting the official roster of dealers and their roles.
     """
     now = datetime.now()
     current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
-    recipient_greeting = f"Dear <strong>{authorized_contact_name}</strong>," if authorized_contact_name else f"Dear <strong>{bank_name} Treasury Governance Officer</strong>,"
+    recipient_greeting = f"Hello <strong>{authorized_contact_name}</strong>," if authorized_contact_name else f"Hello <strong>{bank_name} Desk Contact</strong>,"
 
     is_handshake = (email_purpose.upper() == "HANDSHAKE")
     if is_handshake:
-        subject = f"[Official Governance Handshake] {bank_name} Counterparty Roster Confirmation – {customer_branding}"
-        title = "🤝 Official Counterparty Governance Confirmation"
-        intro_badge = "GOVERNANCE HANDSHAKE"
+        subject = f"[Action Required] Confirm {bank_name} Trading Contacts – {customer_branding}"
+        title = "🤝 Confirm Trading Contacts"
+        intro_badge = "TRADING ROSTER"
         badge_color = "#10b981"
         badge_bg = "rgba(16, 185, 129, 0.15)"
-        headline = "Authorized Trading Representatives & Quoting Permissions"
+        headline = "Trading Contacts & Quoting Roles"
         intro_text = f"""
-        We are pleased to confirm <strong>{bank_name}</strong> as an approved treasury counterparty on the <strong>{customer_branding}</strong> Treasury Platform.<br/><br/>
-        You have been designated as the <strong>Authorized Bank Governance Officer</strong> for {bank_name}. In compliance with institutional risk and Central Bank governance guidelines, 
-        all official requests to add new trading representatives, delete departed personnel, or modify quoting authority must originate from this authorized email address.
+        A new trading contact has been added or updated for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform.<br/><br/>
+        Below is the updated list. Please review and click the button below to confirm the roster:
         """
     else:
-        subject = f"[Roster Audit Report] Authorized {bank_name} Trading Representatives – {customer_branding}"
-        title = "📋 Counterparty Trading Roster Audit Report"
-        intro_badge = "ROSTER AUDIT REPORT"
+        subject = f"[Roster Update] {bank_name} Trading Contacts – {customer_branding}"
+        title = "📋 Trading Contacts Update"
+        intro_badge = "CONTACT LIST"
         badge_color = "#38bdf8"
         badge_bg = "rgba(56, 189, 248, 0.15)"
-        headline = "Periodic Trading Roster & Permissions Audit"
+        headline = "Current Trading Contacts & Roles"
         intro_text = f"""
-        Please find below the official audit statement of <strong>{bank_name}</strong> trading personnel and quoting authority currently registered on the <strong>{customer_branding}</strong> Treasury Platform as of <strong>{current_time_str}</strong>.<br/><br/>
-        Please review this active roster to ensure all personnel and permissions reflect your current trading desk authorization.
+        Below is the current list of authorized trading contacts for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform as of <strong>{current_time_str}</strong>.
         """
 
     # Build contacts table rows
@@ -1103,6 +1102,20 @@ def build_bank_roster_governance_email(
 
     contacts_table_rows = "".join(rows_html) if rows_html else '<tr><td colspan="4" style="padding: 16px; text-align: center; color: #94a3b8; font-size: 13px;">No active desk contacts configured yet.</td></tr>'
 
+    cta_button_html = ""
+    if handshake_link:
+        btn_label = "Confirm Roster & Complete Handshake &rarr;" if is_handshake else "View &amp; Verify Roster Online &rarr;"
+        cta_button_html = f"""
+        <div style="text-align: center; margin: 26px 0 20px 0;">
+            <a href="{handshake_link}" style="background-color: #0f172a; color: #ffffff; padding: 13px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.2);">
+                {btn_label}
+            </a>
+        </div>
+        <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: -10px; margin-bottom: 24px;">
+            Or open: <a href="{handshake_link}" style="color: #0284c7; word-break: break-all;">{handshake_link}</a>
+        </p>
+        """
+
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1114,7 +1127,7 @@ def build_bank_roster_governance_email(
     <div style="max-width: 680px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025); border: 1px solid #e2e8f0;">
         
         <!-- HEADER -->
-        <div style="background-color: #0f172a; padding: 26px 32px; color: #ffffff;">
+        <div style="background-color: #0f172a; padding: 24px 32px; color: #ffffff;">
             <table style="width: 100%; border-collapse: collapse;">
                 <tr>
                     <td>
@@ -1131,30 +1144,21 @@ def build_bank_roster_governance_email(
         </div>
 
         <!-- CONTENT BODY -->
-        <div style="padding: 32px;">
-            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #0f172a;">
+        <div style="padding: 30px 32px;">
+            <p style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #0f172a;">
                 {recipient_greeting}
             </p>
-            <p style="margin-top: 0; margin-bottom: 24px; font-size: 13.5px; color: #334155; line-height: 1.6;">
+            <p style="margin-top: 0; margin-bottom: 18px; font-size: 13.5px; color: #334155; line-height: 1.6;">
                 {intro_text}
             </p>
 
-            <!-- GOVERNANCE BOX -->
-            <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-left: 5px solid #0284c7; border-radius: 8px; padding: 16px 18px; margin-bottom: 24px;">
-                <p style="margin: 0 0 4px 0; font-size: 13px; font-weight: 700; color: #0f172a;">
-                    Designated Bank Governance Contact:
-                </p>
-                <p style="margin: 0; font-size: 12.5px; color: #475569; line-height: 1.5;">
-                    Official Email: <strong style="font-family: monospace; color: #0284c7;">{authorized_contact_email}</strong>
-                    {f" &bull; Name/Title: <strong>{authorized_contact_name}</strong>" if authorized_contact_name else ""}
-                </p>
-            </div>
+            {cta_button_html}
 
             <!-- ROSTER TABLE -->
-            <h3 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px;">
+            <h3 style="margin: 22px 0 12px 0; font-size: 13.5px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px;">
                 {headline}
             </h3>
-            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
+            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 22px;">
                 <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
                     <thead>
                         <tr style="background-color: #f8fafc; border-bottom: 2px solid #e2e8f0;">
@@ -1171,14 +1175,9 @@ def build_bank_roster_governance_email(
             </div>
 
             <!-- CHANGE INSTRUCTIONS -->
-            <div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 14px 16px;">
-                <p style="margin: 0 0 4px 0; font-size: 12px; font-weight: 700; color: #334155;">
-                    To Request Changes or Roster Amendments:
-                </p>
-                <p style="margin: 0; font-size: 12px; color: #64748b; line-height: 1.5;">
-                    Under our bilateral governance protocol, any requests to add new trading representatives, delete departed personnel, or elevate roles to Firm Execution must originate from this authorized email address. To request changes, simply reply to this email.
-                </p>
-            </div>
+            <p style="margin: 0; font-size: 12.5px; color: #64748b; line-height: 1.5;">
+                If you need to add, delete, or update any trading representatives, please reply directly to this email.
+            </p>
         </div>
 
         <!-- FOOTER -->

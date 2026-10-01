@@ -72,6 +72,7 @@ async def upload_quotation_documents(
 def create_quotation_bank(
     bank_in: QuotationBankCreate,
     background_tasks: BackgroundTasks,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
@@ -149,11 +150,28 @@ def create_quotation_bank(
             from app.models.models import Customer
             from app.services.unified_email_builder import build_bank_roster_governance_email
             from app.core.email_service import get_customer_email_settings
+            from app.core.routing import get_frontend_base_url
+            from app.core.security import SECRET_KEY, ALGORITHM
+            import jwt
+            from datetime import datetime, timezone, timedelta
             
             cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
             customer_name = cust.name if cust else "Corporate Treasury"
             bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
             email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+
+            # Generate secure cryptographic token for bank handshake
+            token_payload = {
+                "sub": "bank_handshake",
+                "bank_config_id": bank.id,
+                "bank_id": bank.bank_id,
+                "customer_id": current_user.customer_id,
+                "email": bank.authorized_contact_email,
+                "exp": datetime.now(timezone.utc) + timedelta(days=14)
+            }
+            handshake_token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
+            frontend_base = get_frontend_base_url(request)
+            handshake_link = f"{frontend_base}/public/bank-handshake/{handshake_token}"
             
             subj, body = build_bank_roster_governance_email(
                 customer_branding=customer_name,
@@ -161,7 +179,8 @@ def create_quotation_bank(
                 authorized_contact_email=bank.authorized_contact_email,
                 authorized_contact_name=bank.authorized_contact_name,
                 contacts=new_contacts,
-                email_purpose="HANDSHAKE"
+                email_purpose="HANDSHAKE",
+                handshake_link=handshake_link
             )
             background_tasks.add_task(
                 send_email,
@@ -182,6 +201,7 @@ def create_quotation_bank(
 def send_bank_roster_report(
     bank_config_id: int,
     background_tasks: BackgroundTasks,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
@@ -209,11 +229,28 @@ def send_bank_roster_report(
     from app.models.models import Customer
     from app.services.unified_email_builder import build_bank_roster_governance_email
     from app.core.email_service import get_customer_email_settings
+    from app.core.routing import get_frontend_base_url
+    from app.core.security import SECRET_KEY, ALGORITHM
+    import jwt
+    from datetime import datetime, timezone, timedelta
     
     cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
     customer_name = cust.name if cust else "Corporate Treasury"
     bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+
+    # Generate tokenized link
+    token_payload = {
+        "sub": "bank_handshake",
+        "bank_config_id": bank.id,
+        "bank_id": bank.bank_id,
+        "customer_id": current_user.customer_id,
+        "email": bank.authorized_contact_email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=14)
+    }
+    handshake_token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
+    frontend_base = get_frontend_base_url(request)
+    handshake_link = f"{frontend_base}/public/bank-handshake/{handshake_token}"
 
     contacts_list = list(bank.contacts) if bank.contacts else []
     subj, body = build_bank_roster_governance_email(
@@ -222,7 +259,8 @@ def send_bank_roster_report(
         authorized_contact_email=bank.authorized_contact_email,
         authorized_contact_name=bank.authorized_contact_name,
         contacts=contacts_list,
-        email_purpose="ROSTER_AUDIT"
+        email_purpose="ROSTER_AUDIT",
+        handshake_link=handshake_link
     )
 
     background_tasks.add_task(
