@@ -1122,6 +1122,8 @@ def submit_fx_offer(
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
+    if rfq.status in ('COMPLETED', 'REJECTED'):
+        raise HTTPException(status_code=403, detail="Quotation is closed and no longer accepting bids.")
     
     # Verify quotation approval status
     if assignment.approval_status == 'PENDING':
@@ -1129,15 +1131,15 @@ def submit_fx_offer(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # 3 seconds buffer check for network latency
+    # Strict bidding window check (with 3 seconds network latency buffer)
     now = datetime.now(timezone.utc)
-    try:
-        start_ts = rfq.window_start.timestamp() - 3
-        end_ts = rfq.window_end.timestamp() + 3
-        if now.timestamp() < start_ts or now.timestamp() > end_ts:
-            raise HTTPException(status_code=403, detail="Window is closed.")
-    except Exception:
-        pass
+    w_start = rfq.window_start if (rfq.window_start and rfq.window_start.tzinfo) else (rfq.window_start.replace(tzinfo=timezone.utc) if rfq.window_start else None)
+    w_end = rfq.window_end if (rfq.window_end and rfq.window_end.tzinfo) else (rfq.window_end.replace(tzinfo=timezone.utc) if rfq.window_end else None)
+
+    if w_start and now < (w_start - timedelta(seconds=3)):
+        raise HTTPException(status_code=403, detail="Bidding window has not opened yet.")
+    if w_end and now > (w_end + timedelta(seconds=3)):
+        raise HTTPException(status_code=403, detail="Bidding window is closed.")
 
     # Verify submitter authorization & role if session provided
     submitted_by = offer_in.email
@@ -1323,21 +1325,23 @@ def submit_fx_offers_batch(
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
+    if rfq.status in ('COMPLETED', 'REJECTED'):
+        raise HTTPException(status_code=403, detail="Quotation is closed and no longer accepting bids.")
     
     if assignment.approval_status == 'PENDING':
         raise HTTPException(status_code=403, detail="Quotation is pending approval from your bank's authorized approver.")
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # 3 seconds buffer check for network latency
+    # Strict bidding window check (with 3 seconds network latency buffer)
     now = datetime.now(timezone.utc)
-    try:
-        start_ts = rfq.window_start.timestamp() - 3
-        end_ts = rfq.window_end.timestamp() + 3
-        if now.timestamp() < start_ts or now.timestamp() > end_ts:
-            raise HTTPException(status_code=403, detail="Window is closed.")
-    except Exception:
-        pass
+    w_start = rfq.window_start if (rfq.window_start and rfq.window_start.tzinfo) else (rfq.window_start.replace(tzinfo=timezone.utc) if rfq.window_start else None)
+    w_end = rfq.window_end if (rfq.window_end and rfq.window_end.tzinfo) else (rfq.window_end.replace(tzinfo=timezone.utc) if rfq.window_end else None)
+
+    if w_start and now < (w_start - timedelta(seconds=3)):
+        raise HTTPException(status_code=403, detail="Bidding window has not opened yet.")
+    if w_end and now > (w_end + timedelta(seconds=3)):
+        raise HTTPException(status_code=403, detail="Bidding window is closed.")
 
     # Authorize submitter
     submitted_by = payload.email
@@ -1507,6 +1511,8 @@ def submit_tbill_offer(
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if rfq.status in ('PENDING_APPROVAL', 'CANCELLED'):
         raise HTTPException(status_code=403, detail="Quotation is cancelled or not currently open for bidding.")
+    if rfq.status in ('COMPLETED', 'REJECTED'):
+        raise HTTPException(status_code=403, detail="Quotation is closed and no longer accepting bids.")
     
     # Verify quotation approval status
     if assignment.approval_status == 'PENDING':
@@ -1514,15 +1520,15 @@ def submit_tbill_offer(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # 3 seconds buffer check for network latency
+    # Strict bidding window check (with 3 seconds network latency buffer)
     now = datetime.now(timezone.utc)
-    try:
-        start_ts = rfq.window_start.timestamp() - 3
-        end_ts = rfq.window_end.timestamp() + 3
-        if now.timestamp() < start_ts or now.timestamp() > end_ts:
-            raise HTTPException(status_code=403, detail="Window is closed.")
-    except Exception:
-        pass
+    w_start = rfq.window_start if (rfq.window_start and rfq.window_start.tzinfo) else (rfq.window_start.replace(tzinfo=timezone.utc) if rfq.window_start else None)
+    w_end = rfq.window_end if (rfq.window_end and rfq.window_end.tzinfo) else (rfq.window_end.replace(tzinfo=timezone.utc) if rfq.window_end else None)
+
+    if w_start and now < (w_start - timedelta(seconds=3)):
+        raise HTTPException(status_code=403, detail="Bidding window has not opened yet.")
+    if w_end and now > (w_end + timedelta(seconds=3)):
+        raise HTTPException(status_code=403, detail="Bidding window is closed.")
     
     # Verify submitter authorization & role if session provided
     submitted_by = offer_in.email
