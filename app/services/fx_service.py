@@ -166,17 +166,27 @@ class FxService:
 
         return None
 
-    def _get_latest_cbe_rate(self, db: Session, currency_id: int) -> Optional[Decimal]:
-        """Get the latest sell_rate for a currency vs EGP."""
+    def _get_latest_cbe_rate(self, db: Session, currency_id: int, mode: str = "mid") -> Optional[Decimal]:
+        """Get the latest CBE rate for a currency vs EGP (default 'mid' = (buy + sell) / 2)."""
         from app.models.models import CurrencyExchangeRate
 
         latest = db.query(CurrencyExchangeRate).filter(
             CurrencyExchangeRate.currency_id == currency_id
         ).order_by(desc(CurrencyExchangeRate.rate_date)).first()
 
-        if latest and latest.sell_rate:
-            return Decimal(str(latest.sell_rate))
-        return None
+        if not latest:
+            return None
+
+        buy = Decimal(str(latest.buy_rate)) if latest.buy_rate else None
+        sell = Decimal(str(latest.sell_rate)) if latest.sell_rate else None
+
+        if mode == "buy" and buy:
+            return buy
+        if mode == "sell" and sell:
+            return sell
+        if buy and sell:
+            return (buy + sell) / Decimal("2")
+        return sell or buy
 
     # ──────────────────────────────────────────────────────────────────────
     # TIER 2: AI FALLBACK (with 24h cache)
