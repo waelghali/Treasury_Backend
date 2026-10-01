@@ -21,6 +21,9 @@ class QuotationBankBase(BaseModel):
     entity_ids: Optional[List[int]] = []
     emails: Optional[str] = None
     contacts: Optional[List[QuotationContactItem]] = None
+    authorized_contact_email: Optional[str] = None
+    authorized_contact_name: Optional[str] = None
+    handshake_confirmed_at: Optional[datetime] = None
 
 class QuotationBankCreate(QuotationBankBase):
     pass
@@ -42,6 +45,9 @@ class QuotationBankOut(QuotationBankBase):
     entity_scope: Optional[str] = "ALL_ENTITIES"
     entity_ids: Optional[List[int]] = []
     is_cross_entity: Optional[bool] = False
+    authorized_contact_email: Optional[str] = None
+    authorized_contact_name: Optional[str] = None
+    handshake_confirmed_at: Optional[datetime] = None
     
     class Config:
         from_attributes = True

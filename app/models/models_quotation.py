@@ -25,6 +25,9 @@ class QuotationBank(BaseModel):
     entity_scope = Column(String(30), default="ALL_ENTITIES", nullable=False, comment="'ALL_ENTITIES' or 'SPECIFIC_ENTITIES'")
     emails = Column(Text, nullable=False, comment="Comma-separated emails for this specific customer's counterparty list")
     contacts = Column(JSONB, default=list, nullable=True, comment="Structured contacts list: [{'email': '...', 'name': '...', 'role': 'EXECUTION'|'VIEW_ONLY'}]")
+    authorized_contact_email = Column(String(255), nullable=True, comment="Designated bank officer email authorized to request roster updates")
+    authorized_contact_name = Column(String(255), nullable=True, comment="Name or title of authorized bank governance officer")
+    handshake_confirmed_at = Column(DateTime(timezone=True), nullable=True, comment="Timestamp when bank governance handshake was confirmed")
 
     customer = relationship("Customer")
     bank = relationship("Bank")

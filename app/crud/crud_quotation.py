@@ -102,11 +102,16 @@ class CRUDQuotation:
         entity_scope = getattr(obj_in, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
         entity_ids = getattr(obj_in, "entity_ids", []) or []
 
+        auth_email = getattr(obj_in, 'authorized_contact_email', None)
+        auth_name = getattr(obj_in, 'authorized_contact_name', None)
+
         if existing:
             # Update emails and contacts if changed
             existing.emails = emails_str
             existing.contacts = contacts_data
             existing.entity_scope = entity_scope
+            existing.authorized_contact_email = (auth_email.strip() if auth_email else None)
+            existing.authorized_contact_name = (auth_name.strip() if auth_name else None)
 
             from app.models.models_quotation import QuotationBankEntity
             db.query(QuotationBankEntity).filter(QuotationBankEntity.quotation_bank_id == existing.id).delete()
@@ -125,7 +130,9 @@ class CRUDQuotation:
             emails=emails_str,
             contacts=contacts_data,
             trade_type=obj_in.trade_type or "BOTH",
-            entity_scope=entity_scope
+            entity_scope=entity_scope,
+            authorized_contact_email=(auth_email.strip() if auth_email else None),
+            authorized_contact_name=(auth_name.strip() if auth_name else None)
         )
         db.add(db_obj)
         db.commit()

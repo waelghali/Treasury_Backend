@@ -71,6 +71,7 @@ async def upload_quotation_documents(
 @router.post("/banks", response_model=QuotationBankOut)
 def create_quotation_bank(
     bank_in: QuotationBankCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
@@ -89,6 +90,7 @@ def create_quotation_bank(
         QuotationBank.trade_type == (bank_in.trade_type or "BOTH")
     ).first()
     old_contacts = list(existing_bank.contacts) if (existing_bank and existing_bank.contacts) else []
+    old_auth_email = getattr(existing_bank, 'authorized_contact_email', None) if existing_bank else None
 
     bank = crud_quotation.create_quotation_bank(
         db,
@@ -140,7 +142,119 @@ def create_quotation_bank(
         },
         customer_id=current_user.customer_id
     )
+
+    # Automated Handshake Welcome Email: dispatched to Authorized Bank Governance Contact upon save
+    if bank.authorized_contact_email:
+        try:
+            from app.models.models import Customer
+            from app.services.unified_email_builder import build_bank_roster_governance_email
+            from app.core.email_service import get_customer_email_settings
+            
+            cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+            customer_name = cust.name if cust else "Corporate Treasury"
+            bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
+            email_settings = get_customer_email_settings(db, current_user.customer_id)
+            
+            subj, body = build_bank_roster_governance_email(
+                customer_branding=customer_name,
+                bank_name=bank_name,
+                authorized_contact_email=bank.authorized_contact_email,
+                authorized_contact_name=bank.authorized_contact_name,
+                contacts=new_contacts,
+                email_purpose="HANDSHAKE"
+            )
+            background_tasks.add_task(
+                send_email,
+                db,
+                [bank.authorized_contact_email],
+                subj,
+                body,
+                {},
+                email_settings
+            )
+        except Exception as email_err:
+            logger.warning(f"Could not dispatch automated bank handshake welcome email: {email_err}")
+
     return bank
+
+
+@router.post("/banks/{bank_config_id}/send-roster-report")
+def send_bank_roster_report(
+    bank_config_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Dispatches an on-demand official trading roster audit report to the bank's Authorized Governance Contact."""
+    if current_user.role not in [UserRole.CORPORATE_ADMIN, UserRole.SYSTEM_OWNER, "corporate_admin", "super_admin", "system_owner"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Corporate Administrators can send counterparty roster audit reports."
+        )
+
+    bank = db.query(QuotationBank).filter(
+        QuotationBank.id == bank_config_id,
+        QuotationBank.customer_id == current_user.customer_id
+    ).first()
+
+    if not bank:
+        raise HTTPException(status_code=404, detail="Bank counterparty configuration not found.")
+
+    if not bank.authorized_contact_email:
+        raise HTTPException(
+            status_code=400,
+            detail="No Authorized Bank Governance Officer email is configured for this bank. Please provide and save an authorized email first."
+        )
+
+    from app.models.models import Customer
+    from app.services.unified_email_builder import build_bank_roster_governance_email
+    from app.core.email_service import get_customer_email_settings
+    
+    cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+    customer_name = cust.name if cust else "Corporate Treasury"
+    bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
+    email_settings = get_customer_email_settings(db, current_user.customer_id)
+
+    contacts_list = list(bank.contacts) if bank.contacts else []
+    subj, body = build_bank_roster_governance_email(
+        customer_branding=customer_name,
+        bank_name=bank_name,
+        authorized_contact_email=bank.authorized_contact_email,
+        authorized_contact_name=bank.authorized_contact_name,
+        contacts=contacts_list,
+        email_purpose="ROSTER_AUDIT"
+    )
+
+    background_tasks.add_task(
+        send_email,
+        db,
+        [bank.authorized_contact_email],
+        subj,
+        body,
+        {},
+        email_settings
+    )
+
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_BANK_ROSTER_REPORT_SENT",
+        entity_type="QuotationBank",
+        entity_id=bank.id,
+        details={
+            "bank_id": bank.bank_id,
+            "bank_name": bank_name,
+            "recipient_email": bank.authorized_contact_email,
+            "total_contacts": len(contacts_list)
+        },
+        customer_id=current_user.customer_id
+    )
+
+    return {
+        "status": "success",
+        "message": f"Official roster audit report successfully sent to {bank.authorized_contact_email}.",
+        "recipient": bank.authorized_contact_email
+    }
 
 @router.delete("/banks/{bank_id}")
 def delete_quotation_bank(
