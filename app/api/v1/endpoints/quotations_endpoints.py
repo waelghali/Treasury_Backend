@@ -152,7 +152,7 @@ def create_quotation_bank(
             from app.core.email_service import get_customer_email_settings
             from app.core.routing import get_frontend_base_url
             from app.core.security import SECRET_KEY, ALGORITHM
-            import jwt
+            from jose import jwt
             from datetime import datetime, timezone, timedelta
             
             cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
@@ -231,7 +231,7 @@ def send_bank_roster_report(
     from app.core.email_service import get_customer_email_settings
     from app.core.routing import get_frontend_base_url
     from app.core.security import SECRET_KEY, ALGORITHM
-    import jwt
+    from jose import jwt
     from datetime import datetime, timezone, timedelta
     
     cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()

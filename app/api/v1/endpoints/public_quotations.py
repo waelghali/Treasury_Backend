@@ -2359,7 +2359,7 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
 def get_bank_handshake_details(token: str, db: Session = Depends(get_db)):
     """Validates the bank handshake token and returns bank info and contacts for verification."""
     from app.core.security import SECRET_KEY, ALGORITHM
-    import jwt
+    from jose import jwt
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("sub") != "bank_handshake":
@@ -2399,7 +2399,7 @@ def get_bank_handshake_details(token: str, db: Session = Depends(get_db)):
 def confirm_bank_handshake(token: str, request: Request, db: Session = Depends(get_db)):
     """Confirms the counterparty governance handshake by the bank officer."""
     from app.core.security import SECRET_KEY, ALGORITHM
-    import jwt
+    from jose import jwt
     from datetime import datetime, timezone
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])

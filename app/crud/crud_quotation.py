@@ -114,14 +114,16 @@ class CRUDQuotation:
             existing.authorized_contact_name = (auth_name.strip() if auth_name else None)
 
             from app.models.models_quotation import QuotationBankEntity
-            db.query(QuotationBankEntity).filter(QuotationBankEntity.quotation_bank_id == existing.id).delete()
+            existing.entity_associations.clear()
+            db.flush()
             if entity_scope == "SPECIFIC_ENTITIES":
-                for eid in entity_ids:
-                    db.add(QuotationBankEntity(quotation_bank_id=existing.id, entity_id=eid))
+                unique_eids = list(dict.fromkeys(entity_ids))
+                for eid in unique_eids:
+                    existing.entity_associations.append(QuotationBankEntity(entity_id=eid))
 
             db.commit()
             db.refresh(existing)
-            existing.entity_ids = entity_ids if entity_scope == "SPECIFIC_ENTITIES" else []
+            existing.entity_ids = [a.entity_id for a in existing.entity_associations] if entity_scope == "SPECIFIC_ENTITIES" else []
             return existing
 
         db_obj = QuotationBank(
@@ -135,16 +137,17 @@ class CRUDQuotation:
             authorized_contact_name=(auth_name.strip() if auth_name else None)
         )
         db.add(db_obj)
-        db.commit()
-        db.refresh(db_obj)
+        db.flush()
 
         if entity_scope == "SPECIFIC_ENTITIES":
             from app.models.models_quotation import QuotationBankEntity
-            for eid in entity_ids:
-                db.add(QuotationBankEntity(quotation_bank_id=db_obj.id, entity_id=eid))
-            db.commit()
+            unique_eids = list(dict.fromkeys(entity_ids))
+            for eid in unique_eids:
+                db_obj.entity_associations.append(QuotationBankEntity(entity_id=eid))
 
-        db_obj.entity_ids = entity_ids if entity_scope == "SPECIFIC_ENTITIES" else []
+        db.commit()
+        db.refresh(db_obj)
+        db_obj.entity_ids = [a.entity_id for a in db_obj.entity_associations] if entity_scope == "SPECIFIC_ENTITIES" else []
         return db_obj
 
     def delete_quotation_bank(self, db: Session, customer_id: int, bank_id: int):
