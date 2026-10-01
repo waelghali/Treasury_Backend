@@ -7,7 +7,29 @@ from datetime import datetime, date
 class QuotationContactItem(BaseModel):
     email: str
     name: Optional[str] = None
+    title: Optional[str] = None
     role: str = "EXECUTION" # "EXECUTION", "VIEW_ONLY", or "APPROVER"
+
+class QuotationContactInvitationCreate(BaseModel):
+    email: str
+    title: Optional[str] = None
+    role: str = "EXECUTION"
+
+class QuotationContactInvitationOut(BaseModel):
+    id: int
+    customer_id: int
+    bank_id: int
+    quotation_bank_id: Optional[int] = None
+    email: str
+    title: Optional[str] = None
+    role: str
+    status: str
+    expires_at: datetime
+    accepted_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 class BankApprovalActionCreate(BaseModel):
     action: str  # "APPROVE" or "DECLINE"

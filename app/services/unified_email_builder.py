@@ -1041,40 +1041,26 @@ def build_bank_roster_governance_email(
     authorized_contact_email: str,
     authorized_contact_name: Optional[str],
     contacts: List[Dict[str, Any]],
-    email_purpose: str = "HANDSHAKE",
-    handshake_link: Optional[str] = None,
+    email_purpose: str = "ROSTER_AUDIT",
     platform_name: str = "Grow Treasury Platform"
 ) -> Tuple[str, str]:
     """
-    Builds a direct, simple governance confirmation or audit email sent to the bank's
-    designated Authorized Governance Contact, presenting the official roster of dealers and their roles.
+    Builds a direct, simple roster audit email sent on-demand to the bank's
+    Authorized Contact, presenting the official roster of active dealers and their roles.
     """
     now = datetime.now()
     current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
     recipient_greeting = f"Hello <strong>{authorized_contact_name}</strong>," if authorized_contact_name else f"Hello <strong>{bank_name} Desk Contact</strong>,"
 
-    is_handshake = (email_purpose.upper() == "HANDSHAKE")
-    if is_handshake:
-        subject = f"[Action Required] Confirm {bank_name} Trading Contacts – {customer_branding}"
-        title = "🤝 Confirm Trading Contacts"
-        intro_badge = "TRADING ROSTER"
-        badge_color = "#10b981"
-        badge_bg = "rgba(16, 185, 129, 0.15)"
-        headline = "Trading Contacts & Quoting Roles"
-        intro_text = f"""
-        A new trading contact has been added or updated for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform.<br/><br/>
-        Below is the updated list. Please review and click the button below to confirm the roster:
-        """
-    else:
-        subject = f"[Roster Update] {bank_name} Trading Contacts – {customer_branding}"
-        title = "📋 Trading Contacts Update"
-        intro_badge = "CONTACT LIST"
-        badge_color = "#38bdf8"
-        badge_bg = "rgba(56, 189, 248, 0.15)"
-        headline = "Current Trading Contacts & Roles"
-        intro_text = f"""
-        Below is the current list of authorized trading contacts for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform as of <strong>{current_time_str}</strong>.
-        """
+    subject = f"[Roster Report] {bank_name} Trading Contacts – {customer_branding}"
+    title = "📋 Trading Contacts Report"
+    intro_badge = "ROSTER REPORT"
+    badge_color = "#38bdf8"
+    badge_bg = "rgba(56, 189, 248, 0.15)"
+    headline = "Current Active Trading Representatives & Roles"
+    intro_text = f"""
+    Below is the current list of authorized trading contacts registered for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform as of <strong>{current_time_str}</strong>.
+    """
 
     # Build contacts table rows
     rows_html = []
@@ -1082,7 +1068,7 @@ def build_bank_roster_governance_email(
         c_email = (c.get("email") or "").strip()
         if not c_email:
             continue
-        c_name = (c.get("name") or "—").strip()
+        c_name = (c.get("title") or c.get("name") or "—").strip()
         c_role = (c.get("role") or "EXECUTION").upper()
         if c_role == "EXECUTION":
             role_badge = '<span style="background: #ecfdf5; color: #047857; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 11px; border: 1px solid #a7f3d0;">⚡ Execution Dealer (Firm Bidding)</span>'
@@ -1101,20 +1087,6 @@ def build_bank_roster_governance_email(
         """)
 
     contacts_table_rows = "".join(rows_html) if rows_html else '<tr><td colspan="4" style="padding: 16px; text-align: center; color: #94a3b8; font-size: 13px;">No active desk contacts configured yet.</td></tr>'
-
-    cta_button_html = ""
-    if handshake_link:
-        btn_label = "Confirm Roster & Complete Handshake &rarr;" if is_handshake else "View &amp; Verify Roster Online &rarr;"
-        cta_button_html = f"""
-        <div style="text-align: center; margin: 26px 0 20px 0;">
-            <a href="{handshake_link}" style="background-color: #0f172a; color: #ffffff; padding: 13px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.2);">
-                {btn_label}
-            </a>
-        </div>
-        <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: -10px; margin-bottom: 24px;">
-            Or open: <a href="{handshake_link}" style="color: #0284c7; word-break: break-all;">{handshake_link}</a>
-        </p>
-        """
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1151,8 +1123,6 @@ def build_bank_roster_governance_email(
             <p style="margin-top: 0; margin-bottom: 18px; font-size: 13.5px; color: #334155; line-height: 1.6;">
                 {intro_text}
             </p>
-
-            {cta_button_html}
 
             <!-- ROSTER TABLE -->
             <h3 style="margin: 22px 0 12px 0; font-size: 13.5px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px;">
@@ -1194,6 +1164,129 @@ def build_bank_roster_governance_email(
 </body>
 </html>
 """
-    return (subject, html_body)
+    return subject, html_body
+
+
+def build_dealer_invitation_email(
+    customer_branding: str,
+    bank_name: str,
+    dealer_email: str,
+    dealer_title: Optional[str],
+    role: str,
+    handshake_link: str,
+    platform_name: str = "Grow Treasury Platform"
+) -> Tuple[str, str]:
+    """
+    Builds the individual invitation & handshake email sent directly to a newly added bank dealer.
+    """
+    now = datetime.now()
+    current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
+    greeting = f"Hello <strong>{dealer_title}</strong>," if dealer_title else "Hello,"
+
+    r = (role or "EXECUTION").upper()
+    if r == "EXECUTION":
+        role_badge = '<span style="background: #ecfdf5; color: #047857; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #a7f3d0;">⚡ Execution Dealer (Firm Bidding)</span>'
+        role_desc = "Submit firm binding quotations and execute treasury transactions."
+    elif r == "APPROVER":
+        role_badge = '<span style="background: #fffbeb; color: #b45309; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #fde68a;">🛡️ Approver</span>'
+        role_desc = "Authorize and approve submitted bank quotes."
+    else:
+        role_badge = '<span style="background: #f1f5f9; color: #475569; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #cbd5e1;">👁️ View Only</span>'
+        role_desc = "View live RFQs and transaction telemetry without quoting authority."
+
+    subject = f"Invitation: Join {bank_name} Trading Desk for {customer_branding}"
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{subject}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
+    <div style="max-width: 620px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05); border: 1px solid #e2e8f0;">
+        
+        <!-- HEADER -->
+        <div style="background-color: #0f172a; padding: 24px 32px; color: #ffffff;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                    <td>
+                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #10b981; display: block; margin-bottom: 4px;">INVITATION</span>
+                        <h1 style="margin: 0; font-size: 18px; font-weight: 700; color: #ffffff;">Trading Desk Access Invitation</h1>
+                    </td>
+                    <td style="text-align: right; vertical-align: middle;">
+                        <span style="background-color: rgba(16, 185, 129, 0.15); color: #10b981; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid #10b981;">
+                            {customer_branding}
+                        </span>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <!-- CONTENT BODY -->
+        <div style="padding: 30px 32px;">
+            <p style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #0f172a;">
+                {greeting}
+            </p>
+            <p style="margin-top: 0; margin-bottom: 20px; font-size: 13.5px; color: #334155; line-height: 1.6;">
+                You have been invited by <strong>{customer_branding}</strong> to join the treasury counterparty roster for <strong>{bank_name}</strong> on the {platform_name}.
+            </p>
+
+            <!-- ROLE CARD -->
+            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 20px; margin-bottom: 24px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr>
+                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; width: 140px;">Counterparty Bank:</td>
+                        <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{bank_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Registered Email:</td>
+                        <td style="padding-bottom: 8px; font-size: 13px; font-family: monospace; color: #0f172a; font-weight: 700;">{dealer_email}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Assigned Role:</td>
+                        <td style="padding-bottom: 8px;">{role_badge}</td>
+                    </tr>
+                    <tr>
+                        <td style="font-size: 12px; color: #64748b; font-weight: 600;">Authority Scope:</td>
+                        <td style="font-size: 12px; color: #475569;">{role_desc}</td>
+                    </tr>
+                </table>
+            </div>
+
+            <p style="margin-top: 0; margin-bottom: 24px; font-size: 13px; color: #334155; line-height: 1.5;">
+                Please click the button below to confirm your contact details and activate your quoting access:
+            </p>
+
+            <!-- ACTION BUTTON -->
+            <div style="text-align: center; margin: 26px 0 20px 0;">
+                <a href="{handshake_link}" style="background-color: #0f172a; color: #ffffff; padding: 13px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.2);">
+                    🤝 Accept Invitation &amp; Activate Access &rarr;
+                </a>
+            </div>
+            <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: -10px; margin-bottom: 24px;">
+                Or open: <a href="{handshake_link}" style="color: #0284c7; word-break: break-all;">{handshake_link}</a>
+            </p>
+
+            <p style="margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.5; border-top: 1px solid #f1f5f9; padding-top: 16px;">
+                If you believe you received this invitation in error, you may disregard this email or reply to contact the treasury team.
+            </p>
+        </div>
+
+        <!-- FOOTER -->
+        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 32px; text-align: center;">
+            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                {platform_name} &bull; Institutional Financial Trading
+            </p>
+            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                Dispatched on {current_time_str} on behalf of {customer_branding} Treasury Desk.
+            </p>
+        </div>
+
+    </div>
+</body>
+</html>
+"""
+    return subject, html_body
 
 

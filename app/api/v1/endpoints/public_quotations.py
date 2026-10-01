@@ -10,7 +10,7 @@ from app.database import get_db
 from app.crud.base import log_action
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
-    QuotationTBillOffer, QuotationBank, QuotationAccessOTP, QuotationAnalytics,
+    QuotationTBillOffer, QuotationBank, QuotationBankContactInvitation, QuotationAccessOTP, QuotationAnalytics,
     QuotationNotification
 )
 from app.schemas.schemas_quotation import (
@@ -2445,4 +2445,132 @@ def confirm_bank_handshake(token: str, request: Request, db: Session = Depends(g
         "status": "success",
         "message": f"Counterparty trading roster confirmed successfully for {qb.bank.name if qb.bank else 'your bank'}.",
         "confirmed_at": now_utc.isoformat()
+    }
+
+
+# --- Public Dealer Handshake & Self-Activation Endpoints ---
+
+@router.get("/dealer-handshake/{token}")
+def get_dealer_handshake_details(token: str, db: Session = Depends(get_db)):
+    """Validates the dealer invitation token and returns invitation details for verification."""
+    inv = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.token == token
+    ).first()
+
+    if not inv:
+        raise HTTPException(status_code=404, detail="The invitation link is invalid or has expired.")
+
+    from app.models.models import Customer, Bank
+    cust = db.query(Customer).filter(Customer.id == inv.customer_id).first()
+    bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
+
+    now_utc = datetime.now(timezone.utc)
+    is_expired = inv.expires_at < now_utc if inv.expires_at else False
+
+    return {
+        "status": inv.status,
+        "is_expired": is_expired,
+        "email": inv.email,
+        "title": inv.title,
+        "role": inv.role,
+        "bank_name": bank.name if bank else f"Bank {inv.bank_id}",
+        "customer_name": cust.name if cust else "Corporate Treasury",
+        "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None,
+        "already_accepted": (inv.status == "ACCEPTED")
+    }
+
+
+@router.post("/dealer-handshake/{token}/accept")
+def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(get_db)):
+    """Accepts the dealer invitation and promotes the contact into quotation_banks.contacts."""
+    inv = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.token == token
+    ).first()
+
+    if not inv:
+        raise HTTPException(status_code=404, detail="The invitation link is invalid or has expired.")
+
+    if inv.status == "ACCEPTED":
+        return {
+            "status": "already_accepted",
+            "message": "This invitation has already been accepted and your trading access is active.",
+            "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None
+        }
+
+    if inv.status == "REVOKED":
+        raise HTTPException(status_code=400, detail="This invitation has been revoked by the corporate treasury administrator.")
+
+    now_utc = datetime.now(timezone.utc)
+    if inv.expires_at and inv.expires_at < now_utc:
+        raise HTTPException(status_code=400, detail="This invitation has expired. Please request a new invitation link from your corporate treasury administrator.")
+
+    # Promote contact to QuotationBank
+    qb = db.query(QuotationBank).filter(
+        QuotationBank.customer_id == inv.customer_id,
+        QuotationBank.bank_id == inv.bank_id
+    ).first()
+
+    from app.models.models import Bank, Customer
+    bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
+    cust = db.query(Customer).filter(Customer.id == inv.customer_id).first()
+
+    new_contact_entry = {
+        "email": inv.email.strip().lower(),
+        "title": inv.title or "",
+        "name": inv.title or "",
+        "role": (inv.role or "EXECUTION").upper()
+    }
+
+    if qb:
+        existing_contacts = list(qb.contacts) if qb.contacts else []
+        idx = next((i for i, c in enumerate(existing_contacts) if c.get("email", "").strip().lower() == new_contact_entry["email"]), -1)
+        if idx >= 0:
+            existing_contacts[idx] = new_contact_entry
+        else:
+            existing_contacts.append(new_contact_entry)
+
+        qb.contacts = existing_contacts
+        qb.emails = ",".join(c.get("email", "").strip() for c in existing_contacts if c.get("email"))
+    else:
+        qb = QuotationBank(
+            customer_id=inv.customer_id,
+            bank_id=inv.bank_id,
+            trade_type="BOTH",
+            entity_scope="ALL_ENTITIES",
+            emails=new_contact_entry["email"],
+            contacts=[new_contact_entry]
+        )
+        db.add(qb)
+        db.flush()
+
+    inv.status = "ACCEPTED"
+    inv.accepted_at = now_utc
+    inv.quotation_bank_id = qb.id
+
+    db.commit()
+
+    client_ip = request.client.host if request and request.client else "unknown"
+    log_action(
+        db,
+        user_id=None,
+        action_type="QUOTATION_BANK_DEALER_HANDSHAKE_ACCEPTED",
+        entity_type="QuotationBankContactInvitation",
+        entity_id=inv.id,
+        details={
+            "bank_id": inv.bank_id,
+            "bank_name": bank.name if bank else f"Bank {inv.bank_id}",
+            "dealer_email": inv.email,
+            "role": inv.role,
+            "ip_address": client_ip
+        },
+        customer_id=inv.customer_id
+    )
+
+    return {
+        "status": "success",
+        "message": f"Welcome aboard! Your trading access for {bank.name if bank else 'your bank'} is now active.",
+        "accepted_at": now_utc.isoformat(),
+        "bank_name": bank.name if bank else "",
+        "customer_name": cust.name if cust else ""
     }

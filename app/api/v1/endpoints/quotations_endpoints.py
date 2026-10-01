@@ -23,6 +23,7 @@ from app.constants import UserRole
 
 from app.schemas.schemas_quotation import (
     QuotationBankCreate, QuotationBankOut,
+    QuotationContactInvitationCreate, QuotationContactInvitationOut,
     QuotationRequestCreate, QuotationRequestOut,
     QuotationResultsOut, QuotationResultItem,
     ReTenderRequest, QuotationResubmitRequest,
@@ -32,7 +33,7 @@ from app.schemas.schemas_quotation import (
 from app.crud.crud_quotation import crud_quotation, get_bank_leg_signature
 from app.models.models_quotation import (
     QuotationRequest, QuotationBankAssignment, QuotationOffer, 
-    QuotationTBillOffer, QuotationBank, QuotationAnalytics, QuotationAccessOTP,
+    QuotationTBillOffer, QuotationBank, QuotationBankContactInvitation, QuotationAnalytics, QuotationAccessOTP,
     QuotationLeg, QuotationBankLegConfig
 )
 
@@ -144,56 +145,6 @@ def create_quotation_bank(
         customer_id=current_user.customer_id
     )
 
-    # Automated Handshake Welcome Email: dispatched to Authorized Bank Governance Contact upon save
-    if bank.authorized_contact_email:
-        try:
-            from app.models.models import Customer
-            from app.services.unified_email_builder import build_bank_roster_governance_email
-            from app.core.email_service import get_customer_email_settings
-            from app.core.routing import get_frontend_base_url
-            from app.core.security import SECRET_KEY, ALGORITHM
-            from jose import jwt
-            from datetime import datetime, timezone, timedelta
-            
-            cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
-            customer_name = cust.name if cust else "Corporate Treasury"
-            bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
-            email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
-
-            # Generate secure cryptographic token for bank handshake
-            token_payload = {
-                "sub": "bank_handshake",
-                "bank_config_id": bank.id,
-                "bank_id": bank.bank_id,
-                "customer_id": current_user.customer_id,
-                "email": bank.authorized_contact_email,
-                "exp": datetime.now(timezone.utc) + timedelta(days=14)
-            }
-            handshake_token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
-            frontend_base = get_frontend_base_url(request)
-            handshake_link = f"{frontend_base}/public/bank-handshake/{handshake_token}"
-            
-            subj, body = build_bank_roster_governance_email(
-                customer_branding=customer_name,
-                bank_name=bank_name,
-                authorized_contact_email=bank.authorized_contact_email,
-                authorized_contact_name=bank.authorized_contact_name,
-                contacts=new_contacts,
-                email_purpose="HANDSHAKE",
-                handshake_link=handshake_link
-            )
-            background_tasks.add_task(
-                send_email,
-                db,
-                [bank.authorized_contact_email],
-                subj,
-                body,
-                {},
-                email_settings
-            )
-        except Exception as email_err:
-            logger.warning(f"Could not dispatch automated bank handshake welcome email: {email_err}")
-
     return bank
 
 
@@ -229,28 +180,11 @@ def send_bank_roster_report(
     from app.models.models import Customer
     from app.services.unified_email_builder import build_bank_roster_governance_email
     from app.core.email_service import get_customer_email_settings
-    from app.core.routing import get_frontend_base_url
-    from app.core.security import SECRET_KEY, ALGORITHM
-    from jose import jwt
-    from datetime import datetime, timezone, timedelta
     
     cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
     customer_name = cust.name if cust else "Corporate Treasury"
     bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
-
-    # Generate tokenized link
-    token_payload = {
-        "sub": "bank_handshake",
-        "bank_config_id": bank.id,
-        "bank_id": bank.bank_id,
-        "customer_id": current_user.customer_id,
-        "email": bank.authorized_contact_email,
-        "exp": datetime.now(timezone.utc) + timedelta(days=14)
-    }
-    handshake_token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
-    frontend_base = get_frontend_base_url(request)
-    handshake_link = f"{frontend_base}/public/bank-handshake/{handshake_token}"
 
     contacts_list = list(bank.contacts) if bank.contacts else []
     subj, body = build_bank_roster_governance_email(
@@ -259,8 +193,7 @@ def send_bank_roster_report(
         authorized_contact_email=bank.authorized_contact_email,
         authorized_contact_name=bank.authorized_contact_name,
         contacts=contacts_list,
-        email_purpose="ROSTER_AUDIT",
-        handshake_link=handshake_link
+        email_purpose="ROSTER_AUDIT"
     )
 
     background_tasks.add_task(
@@ -272,6 +205,225 @@ def send_bank_roster_report(
         {},
         email_settings
     )
+
+
+# --- Staged Dealer Contact Invitations & Handshake Management ---
+
+@router.get("/banks/{bank_id}/invitations", response_model=List[QuotationContactInvitationOut])
+def get_bank_contact_invitations(
+    bank_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Retrieves all pending staged invitations for a given bank partner."""
+    invitations = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.customer_id == current_user.customer_id,
+        QuotationBankContactInvitation.bank_id == bank_id,
+        QuotationBankContactInvitation.status == "PENDING"
+    ).order_by(QuotationBankContactInvitation.created_at.desc()).all()
+    return invitations
+
+
+@router.post("/banks/{bank_id}/invite-contact", response_model=QuotationContactInvitationOut)
+def invite_bank_contact(
+    bank_id: int,
+    body: QuotationContactInvitationCreate,
+    background_tasks: BackgroundTasks,
+    request: Request = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Stages a new trading representative in the invitation table and dispatches
+    a personal tokenized welcome handshake email to the dealer.
+    Enforces all counterparty controls (bank domain, public provider blocks, anti-collusion, duplicates).
+    """
+    from app.models.models import Bank, Customer
+    from app.core.bank_validation import validate_bank_contact_email
+    from app.services.unified_email_builder import build_dealer_invitation_email
+    from app.core.routing import get_frontend_base_url
+    from app.core.email_service import get_customer_email_settings
+
+    bank = db.query(Bank).filter(Bank.id == bank_id).first()
+    if not bank:
+        raise HTTPException(status_code=404, detail="Bank not found.")
+
+    cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+    clean_email = body.email.strip().lower()
+
+    # 1. Enforce Counterparty Integrity & Domain Validation Controls
+    is_valid, err_msg = validate_bank_contact_email(
+        email=clean_email,
+        bank=bank,
+        customer=cust,
+        current_user_email=current_user.email
+    )
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=err_msg)
+
+    # 2. Check if already active in quotation_banks.contacts
+    qb = db.query(QuotationBank).filter(
+        QuotationBank.customer_id == current_user.customer_id,
+        QuotationBank.bank_id == bank_id
+    ).first()
+    if qb and qb.contacts:
+        active_emails = [(c.get("email") or "").strip().lower() for c in qb.contacts]
+        if clean_email in active_emails:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{clean_email} is already an active registered trading representative for this bank."
+            )
+
+    # 3. Check if already pending an invitation
+    existing_inv = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.customer_id == current_user.customer_id,
+        QuotationBankContactInvitation.bank_id == bank_id,
+        QuotationBankContactInvitation.email == clean_email,
+        QuotationBankContactInvitation.status == "PENDING"
+    ).first()
+    if existing_inv:
+        raise HTTPException(
+            status_code=400,
+            detail=f"An invitation is already pending for {clean_email}. Use the resend option to refresh it."
+        )
+
+    # 4. Create staged invitation record
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+
+    invitation = QuotationBankContactInvitation(
+        customer_id=current_user.customer_id,
+        bank_id=bank_id,
+        quotation_bank_id=qb.id if qb else None,
+        email=clean_email,
+        title=body.title.strip() if body.title else None,
+        role=(body.role or "EXECUTION").upper(),
+        token=token,
+        status="PENDING",
+        invited_by_user_id=current_user.user_id,
+        expires_at=expires_at
+    )
+    db.add(invitation)
+    db.commit()
+    db.refresh(invitation)
+
+    # 5. Dispatch dealer invitation handshake email
+    try:
+        frontend_base = get_frontend_base_url(request)
+        handshake_link = f"{frontend_base}/public/dealer-handshake/{token}"
+        subj, email_html = build_dealer_invitation_email(
+            customer_branding=cust.name if cust else "Corporate Treasury",
+            bank_name=bank.name,
+            dealer_email=invitation.email,
+            dealer_title=invitation.title,
+            role=invitation.role,
+            handshake_link=handshake_link
+        )
+        email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+        background_tasks.add_task(
+            send_email,
+            db,
+            [invitation.email],
+            subj,
+            email_html,
+            {},
+            email_settings
+        )
+    except Exception as email_err:
+        logger.warning(f"Could not dispatch dealer handshake invitation email: {email_err}")
+
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_BANK_DEALER_INVITED",
+        entity_type="QuotationBankContactInvitation",
+        entity_id=invitation.id,
+        details={
+            "bank_id": bank_id,
+            "bank_name": bank.name,
+            "email": invitation.email,
+            "title": invitation.title,
+            "role": invitation.role
+        },
+        customer_id=current_user.customer_id
+    )
+
+    return invitation
+
+
+@router.post("/banks/invitations/{invitation_id}/resend")
+def resend_contact_invitation(
+    invitation_id: int,
+    background_tasks: BackgroundTasks,
+    request: Request = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Refreshes the token and resends the invitation email to the pending dealer."""
+    from app.models.models import Bank, Customer
+    from app.services.unified_email_builder import build_dealer_invitation_email
+    from app.core.routing import get_frontend_base_url
+    from app.core.email_service import get_customer_email_settings
+
+    inv = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.id == invitation_id,
+        QuotationBankContactInvitation.customer_id == current_user.customer_id
+    ).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    if inv.status != "PENDING":
+        raise HTTPException(status_code=400, detail=f"Cannot resend invitation with status '{inv.status}'.")
+
+    # Refresh token and expiration
+    inv.token = secrets.token_urlsafe(32)
+    inv.expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+    db.commit()
+    db.refresh(inv)
+
+    cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+    bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
+    frontend_base = get_frontend_base_url(request)
+    handshake_link = f"{frontend_base}/public/dealer-handshake/{inv.token}"
+
+    subj, email_html = build_dealer_invitation_email(
+        customer_branding=cust.name if cust else "Corporate Treasury",
+        bank_name=bank.name if bank else f"Bank {inv.bank_id}",
+        dealer_email=inv.email,
+        dealer_title=inv.title,
+        role=inv.role,
+        handshake_link=handshake_link
+    )
+    email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+    background_tasks.add_task(
+        send_email,
+        db,
+        [inv.email],
+        subj,
+        email_html,
+        {},
+        email_settings
+    )
+
+    return {"status": "success", "message": f"Invitation resent to {inv.email}."}
+
+
+@router.delete("/banks/invitations/{invitation_id}")
+def revoke_contact_invitation(
+    invitation_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Revokes / deletes a pending contact invitation."""
+    inv = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.id == invitation_id,
+        QuotationBankContactInvitation.customer_id == current_user.customer_id
+    ).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+
+    db.delete(inv)
+    db.commit()
+    return {"status": "success", "message": "Invitation cancelled."}
 
     log_action(
         db,

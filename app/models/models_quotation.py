@@ -33,6 +33,30 @@ class QuotationBank(BaseModel):
     bank = relationship("Bank")
     entity_associations = relationship("QuotationBankEntity", back_populates="quotation_bank", cascade="all, delete-orphan")
 
+
+class QuotationBankContactInvitation(Base):
+    """Staging table for pending counterparty dealer invitations and handshakes."""
+    __tablename__ = "quotation_bank_contact_invitations"
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
+    bank_id = Column(Integer, ForeignKey("banks.id", ondelete="CASCADE"), nullable=False, index=True)
+    quotation_bank_id = Column(Integer, ForeignKey("quotation_banks.id", ondelete="CASCADE"), nullable=True)
+    email = Column(String(255), nullable=False)
+    title = Column(String(255), nullable=True)
+    role = Column(String(50), default="EXECUTION")
+    token = Column(String(255), nullable=False, unique=True, index=True)
+    status = Column(String(30), default="PENDING")  # 'PENDING', 'ACCEPTED', 'REVOKED'
+    invited_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    customer = relationship("Customer")
+    bank = relationship("Bank")
+    quotation_bank = relationship("QuotationBank")
+
+
 class QuotationRequest(BaseModel):
     """Core RFQ configuration for FX Spot and T-Bills."""
     __tablename__ = "quotation_rfqs"
