@@ -388,6 +388,15 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     # Bank approval is required ONLY if ANY leg is execution (or overall execution) and bank has appropriate roles
     requires_bank_approval = has_exec_leg and any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])) and any(c.get("role") == "APPROVER" for c in (_get_bank_contacts_list(q_bank) if q_bank else []))
 
+    rfq_approved_by_email = rfq.approved_by_email
+    rfq_approved_by_name = rfq.approved_by_name
+    rfq_approved_at = rfq.admin_reviewed_at.isoformat() if rfq.admin_reviewed_at else None
+
+    if not rfq_approved_by_email and rfq.creator and 'ADMIN' in (getattr(rfq.creator, 'role', '') or '').upper():
+        rfq_approved_by_email = rfq.creator.email
+        rfq_approved_by_name = (getattr(rfq.creator, "full_name", None) or getattr(rfq.creator, "name", None) or rfq.creator.email)
+        rfq_approved_at = rfq.created_at.isoformat() if rfq.created_at else None
+
     return {
         "id": rfq.id,
         "ref_no": rfq.ref_no,
@@ -428,6 +437,9 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "created_at": rfq.created_at.isoformat() if rfq.created_at else None,
         "created_by_email": rfq.creator.email if rfq.creator else None,
         "created_by_name": (getattr(rfq.creator, "full_name", None) or getattr(rfq.creator, "name", None) or (rfq.creator.email.split("@")[0].replace(".", " ").title() if rfq.creator and rfq.creator.email else None)),
+        "rfq_approved_by_email": rfq_approved_by_email,
+        "rfq_approved_by_name": rfq_approved_by_name,
+        "rfq_approved_at": rfq_approved_at,
         "isWindowOpen": is_open,
         "offers": offers,
         "legs": portal_legs,
