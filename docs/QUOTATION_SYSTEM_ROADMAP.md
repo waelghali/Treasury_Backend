@@ -8,9 +8,11 @@
 ## 📌 Table of Contents
 1. [Executive Summary & Vision](#1-executive-summary--vision)
 2. [Phase 1: Counterparty Integrity & Security Controls (Completed)](#2-phase-1-counterparty-integrity--security-controls-completed)
-3. [Phase 2: Governance & Institutional Controls (Queued)](#3-phase-2-governance--institutional-controls-queued)
+3. [Phase 2: Bank Protection & Cryptographic Security Hardening (Completed)](#3-phase-2-bank-protection--cryptographic-security-hardening-completed--verified-)
 4. [Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion](#4-phase-3-multi-leg-invisible-legs--selective-counterparty-exclusion)
 5. [Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine](#5-phase-4-smart-counterparty-intelligence--dynamic-recommendation-engine)
+6. [Phase 5: Institutional Banking Cyber Security & Compliance Readiness](#6-phase-5-institutional-banking-cyber-security--compliance-readiness-enterprise-onboarding-track)
+7. [Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture](#7-phase-6-selective-leg-quoting-uncontested-deal-governance--unified-skipped-bank-architecture)
 
 ---
 
@@ -174,3 +176,183 @@ Enhance `@router.get("/recommendations")` from a simple volume counter into a **
 
 ### 6.4 Key Management & Envelope Encryption (KMS / HSM)
 - **Scope**: Transition sensitive database credentials and encryption keys from environment files to a dedicated Hardware Security Module (HSM) or Cloud KMS (AWS KMS / HashiCorp Vault / GCP KMS) with automated 90-day key rotation.
+
+---
+
+## 7. Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture
+
+### 7.1 Strategic Objective & Executive Context
+In multi-currency portfolios, concurrent swap legs, and single-pair spot RFQs, bank counterparties do not always possess appetite, credit lines, or currency inventory to quote on every individual leg. 
+
+Concurrently, corporate treasuries require institutional-grade protections:
+1. Counterparties must be empowered to quote selectively without being forced into an all-or-nothing submission or accidental draft errors.
+2. Corporate treasuries must be protected against **uncontested monopoly pricing** where only a single counterparty provides a quote.
+3. Automated deal execution (`AUTO_ACCEPT`) must never bypass human review on uncontested quotes without explicit, audited corporate consent.
+4. Corporate users require full transparency on **why** any counterparty in the invited pool did not quote on any specific leg.
+
+---
+
+### 7.2 Core Architectural Principles & Key Design Notes
+
+#### 1. The Unified "Skipped Bank" Matrix (Intersection with Phase 3 Invisible Legs)
+- **The Conceptual Insight**: In any tender session, the invited counterparty pool represents the starting universe. When a bank does not have a quote on a specific leg, that bank was **skipped on that leg**.
+- **The Two Sources of Skipping**:
+  - **Corporate-Initiated Skipping (Phase 3 "Invisible Legs")**: The Corporate Client intentionally hides/excludes Bank B from Leg 2 prior to RFQ dispatch (e.g. for confidentiality, credit line ceiling, or currency specialization). Bank B does not see or know Leg 2 exists.
+  - **Dealer-Initiated Skipping ("Pass Leg")**: The Corporate invited Bank B to Leg 2, but the Bank Dealer actively chooses not to quote that currency pair at runtime.
+- **The Architectural Bridge**: Both actions feed into the unified per-leg counterparty configuration model (`QuotationBankLegConfig`). Rather than managing disconnected exceptions, the engine evaluates each `(Bank, Leg)` pair through an explicit **Participation Status**:
+  - `EXCLUDED_BY_CORPORATE`: Leg was hidden/invisible to this bank at creation.
+  - `PASSED_BY_DEALER`: Dealer explicitly opted out using `[ Pass Leg ]`.
+  - `DECLINED_BY_BANK`: Bank internal approver declined the entire tender.
+  - `TIMED_OUT_NO_QUOTE`: Bank was invited and approved, but the window expired with no quote submitted.
+
+#### 2. Status Taxonomy & Strict Integrity (Zero Duplication / Zero Conflict)
+To prevent confusion across dealers, corporate admins, and audit logs, the system maintains strict status naming integrity without altering existing database enums:
+
+| Scenario | Trigger / Actor | Corporate View Status Badge | Quoting Console State | Timestamp Column | Internal Representation |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Normal Quote** | Dealer entered valid rate | `🏆 Awarded` / `Competitive` | Active rate card | Exact time (e.g. `10:14:22 AM`) | `QuotationOffer.price > 0` |
+| **Explicit Pass** | Dealer clicked `[ Pass Leg ]` | `Passed on this leg` *(Slate neutral)* | `Passed (Declined to Quote)` | `Passed by Dealer` | `QuotationBankLegConfig.is_passed = True` |
+| **Passive Non-Response** | Trader did not submit | `No Quote Submitted` *(Muted gray)* | `⏳ Awaiting Quote` | `No Submission` | `offer.price IS NULL` and `is_passed = False` |
+| **Corporate Excluded** | Hidden in wizard (Phase 3) | `Excluded / Not Invited` *(Subtle tag)* | Leg card hidden from DOM | `Excluded` | `QuotationBankLegConfig.is_invited = False` |
+| **Approver Declined** | Bank approver declined RFQ | `Participation Declined` *(Rose badge)* | Terminal locked / declined | `Declined by Bank` | `QuotationBankAssignment.approval_status = 'DECLINED'` |
+
+#### 3. Institutional Legal Principle: Administrative Execution Delegation vs. Commercial Decision
+- **The Core Distinction**: Enabling `AUTO_ACCEPT` or `AUTO_ACCEPT_SINGLE_QUOTE` is strictly a **procedural delegation of executing the acceptance action upon timeout** under pre-configured parameters.
+- **Decision Ownership**: It is **NOT** a delegation of the financial, commercial, or trading decision. 
+- **Platform Boundary**: The Grow platform acts strictly as an automated execution assistant. The corporate organization and its authorized officers retain 100% sole legal, commercial, and financial responsibility for counterparty selection, accepted rates, and market spread exposure.
+- **Enforcement Mechanism**: The settings can never be changed via a casual checkbox or toggle click. Enabling requires completing a **High-Importance Dual-Confirmation Consent Modal** with a mandatory, non-prechecked legal acknowledgment checkbox, recorded immutably in the `AuditLog` with user ID, email, IP, and full consent text.
+
+#### 4. Live Market Thermometer vs. CBE Benchmark
+- **The Reality of Central Bank Rates**: Official CBE benchmarks publish once daily **after market close** (~4:00 PM CLT). Intraday spot bidding sessions cannot be fairly measured against yesterday's closing reference.
+- **Live Interbank Mid Transition**: The system introduces a live interbank spot mid reference feed (via FXStreet, XE, or dedicated financial market data APIs).
+- **Commercial Markup Awareness**: Retail/aggregator mid-market feeds reflect zero-margin interbank mid. Bank commercial execution rates will naturally reflect the bank's operational markup. The platform therefore displays:
+  - **Live Interbank Mid**: The unbiased real-time market thermometer.
+  - **Spread / Pip Delta**: The transparent difference between the bank's firm quote and live mid (e.g. `Quote: 48.6500 | Live Mid: 48.5800 | Spread: +14.4 pips (+0.14%)`).
+
+#### 5. Symmetrical Single-Leg & Multi-Leg Architecture
+All controls operate identically whether an RFQ has 1 leg or 10 legs:
+- **Single-Leg Quotation**: Clicking `[ Pass Leg ]` allows a dealer to formally decline quoting the single pair without abandoning the session. If only 1 bank quotes, the leg is flagged as an Uncontested Single Quote.
+- **Multi-Leg Quotation**: Dealers can selectively quote Leg 1 and pass Leg 2. Uncontested quote detection and auto-accept governance evaluate independently **per leg**.
+
+---
+
+### 7.3 Phased Implementation & Verification Plan
+
+```
+  Phase 6.1: Dealer Quoting Terminal
+  [Pass Leg] Button & Batch Submit Validation
+                    │
+                    ▼
+  Phase 6.2: Corporate Results View
+  "Skipped Bank" Matrix (Passed vs. No Quote vs. Excluded)
+                    │
+                    ▼
+  Phase 6.3: Uncontested / Single-Quote Detection
+  Per-Leg Monopoly Warning in Corporate Evaluation UI
+                    │
+                    ▼
+  Phase 6.4: Governance & Consent Modal
+  Auto-Accept & Single-Quote Policy with Legal Delegation Consent
+                    │
+                    ▼
+  Phase 6.5: Live Market Benchmark
+  Interbank Mid Reference (FXStreet / XE Feed) & Spread Tracker
+```
+
+---
+
+#### 📌 Phase 6.1: Dealer Quoting Terminal — Explicit `[ Pass Leg ]` Interaction
+*Scope: Public bank portal quoting console & batch submission payload.*
+
+- **Frontend Interactions (`QuotationBankOfferPage.js`)**:
+  - Add an explicit `[ Pass Leg ✕ ]` toggle button on each currency pair card.
+  - When clicked: the price input is disabled, cleared, and styled with a clean `Passed (Declined to Quote)` banner.
+  - Reversible prior to submission: dealer can click `[ ↩ Quote this Leg ]` to re-enter pricing.
+  - **Validation Guardrail**: Dealer must quote at least 1 leg in multi-leg portfolios to submit. Passing all legs instructs the dealer to use the main *"Decline Tender"* button.
+  - Submit button dynamically updates: e.g., `Submit Quotes (2 of 3 Legs Quoted)`.
+- **Backend Schema & Endpoint (`POST /offers-batch`)**:
+  - Update `FXSpotMultiOfferCreate` to accept `passed_legs: List[str] = []`.
+  - For quoted legs: create `QuotationOffer` records.
+  - For passed legs: persist `is_passed = True` on `QuotationBankLegConfig`.
+- **Verification & Testing Criteria**:
+  - Create a 2-leg RFQ (USD/EGP and EUR/EGP).
+  - As dealer: enter rate on Leg 1; click `[ Pass Leg ]` on Leg 2.
+  - Submit quote. Confirm zero validation errors.
+  - Verify database: Leg 1 has `QuotationOffer`; Leg 2 has `is_passed = True` on `QuotationBankLegConfig`.
+
+---
+
+#### 📌 Phase 6.2: Corporate Results View — "Skipped Bank" Audit Matrix
+*Scope: Corporate evaluation dashboard, leg comparison tables, and audit logs.*
+
+- **Backend Aggregation (`compute_rfq_standings` in `quotations_endpoints.py`)**:
+  - Expose `is_passed: bool` in each bank's leg result payload.
+- **Frontend Presentation (`ResultsView.js` & `QuotationRequestDashboard.js`)**:
+  - In each leg's counterparty table, render the exact audit reason for any unquoted bank:
+    - `res.is_passed === true` $\rightarrow$ **`Passed on this leg`** (Slate neutral badge; timestamp: `Passed by Dealer`).
+    - `res.submitted_at === null` $\rightarrow$ **`No Quote Submitted`** (Muted gray badge; timestamp: `No Submission`).
+    - `res.approval_status === 'DECLINED'` $\rightarrow$ **`Participation Declined`** (Rose badge).
+    - `res.is_invited === false` (Phase 3 Invisible) $\rightarrow$ **`Excluded / Not Invited`** (Subtle outline badge).
+- **Verification & Testing Criteria**:
+  - Open corporate dashboard for the Phase 6.1 test tender.
+  - Verify Leg 1 displays the bank's active competitive rate.
+  - Verify Leg 2 displays the bank with `Passed on this leg` and rate `—`.
+  - Verify uninvited or timed-out banks display their respective badges cleanly without layout shifting.
+
+---
+
+#### 📌 Phase 6.3: Uncontested / Single-Quote Monopoly Detection & UI Warning
+*Scope: Algorithmic detection of sole-counterparty legs and visual risk advisories.*
+
+- **Per-Leg Uncontested Detection**:
+  - Triggered whenever `valid_execution_quotes.length === 1` on any specific leg (whether caused by dealer passes, approver declines, or only 1 invited bank).
+- **Corporate UI Warning**:
+  - On the leg card and inside the Deal Acceptance modal:
+    - Display prominent warning banner: ⚠️ **Uncontested Rate (Single Quote)**
+    - Advisory Text: *"Only 1 bank counterparty provided a quote on this leg. No competing offers were received to establish market spread."*
+- **Verification & Testing Criteria**:
+  - Run an RFQ where 2 banks are invited; Bank B passes Leg 2.
+  - Leg 1 displays standard competitive multi-bank comparison.
+  - Leg 2 displays Bank A's rate accompanied by the ⚠️ Uncontested Single Quote warning banner.
+
+---
+
+#### 📌 Phase 6.4: Corporate Governance & Legal Delegation Consent Modal
+*Scope: Configuration engine, high-importance consent dialog, and auto-accept execution engine.*
+
+- **Configuration Settings (Customer Configuration)**:
+  - `QUOTATION_ACCEPTANCE_DEFAULT_ACTION`: `AUTO_ACCEPT` vs `AUTO_REJECT`.
+  - `AUTO_ACCEPT_SINGLE_QUOTE`: `True` vs `False` (Sub-configuration).
+- **High-Importance Dual-Confirmation Consent Modal**:
+  - Triggers when enabling either setting in Corporate Admin Settings.
+  - Displays the mandatory legal responsibility text:
+    > *"Notice of Administrative Delegation & Sole Responsibility:*  
+    > *Enabling automated execution constitutes an administrative delegation of executing the acceptance action upon timeout according to your pre-configured parameters. This is NOT a delegation of commercial, financial, or trading decision-making.*  
+    > *The user and [Company] acknowledge that the Grow platform acts solely as an automated processing assistant, and that all trading decisions, counterparty selections, pricing acceptance, and financial risks remain solely the responsibility of the corporate organization."*
+  - Requires explicit checkbox acknowledgment before saving.
+  - Logs full details to `AuditLog` (admin ID, email, timestamp, IP, consent text).
+- **Timeout Execution Engine (`quotations_endpoints.py`)**:
+  - If `AUTO_ACCEPT = True` and quotes $\ge 2$: auto-accepts normally.
+  - If `AUTO_ACCEPT = True` but quotes $== 1$ and `AUTO_ACCEPT_SINGLE_QUOTE = False`:
+    - The engine **halts automated execution** for that leg.
+    - Leaves the leg in `PENDING_ACCEPTANCE` and logs: *"Uncontested quote requires manual corporate sign-off."*
+  - If `AUTO_ACCEPT_SINGLE_QUOTE = True` (with recorded consent): proceeds to auto-accept.
+- **Verification & Testing Criteria**:
+  - Attempt toggling `AUTO_ACCEPT` without checkbox $\rightarrow$ confirm save button is disabled.
+  - Enable with checkbox $\rightarrow$ verify audit log entry with legal text.
+  - Allow window to expire on an uncontested leg with `AUTO_ACCEPT_SINGLE_QUOTE = False` $\rightarrow$ confirm system halts auto-accept and marks leg as requiring manual corporate approval.
+
+---
+
+#### 📌 Phase 6.5: Live Market Benchmark Integration (Interbank Mid Reference)
+*Scope: Replacing static CBE post-close benchmark with live intraday reference rates.*
+
+- **Live Data Feed Integration**:
+  - Connect live interbank mid rates (via FXStreet, XE, or institutional market API).
+- **UI Integration**:
+  - Display **`Live Interbank Mid`** alongside bank firm quotes.
+  - Display real-time **Spread / Pip Delta** relative to live mid.
+- **Verification & Testing Criteria**:
+  - Verify live mid rates update in real-time during market hours.
+  - Verify pip/spread calculation against submitted bank quotes is mathematically accurate.
+
