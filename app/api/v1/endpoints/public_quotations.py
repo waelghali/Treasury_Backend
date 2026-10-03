@@ -604,7 +604,7 @@ async def request_quotation_otp(
     """
 
     bank_display = q_bank.bank.name if q_bank and q_bank.bank else "Treasury Portal"
-    subject = f"RFQ {rfq.ref_no} - Portal Verification Code {otp_code} - {bank_display}"
+    subject = f"RFQ {rfq.ref_no} - Portal Verification Code - {bank_display}"
     body = f"""
     <!DOCTYPE html>
     <html>
