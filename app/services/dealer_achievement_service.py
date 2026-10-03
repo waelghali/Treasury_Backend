@@ -652,13 +652,13 @@ class DealerAchievementService:
                 title="The Active Desk",
                 icon="Shield",
                 category="Participation",
-                description="Consistent market liquidity provider across invited corporate tenders.",
+                description="Actively quote and provide liquidity across invited corporate RFQ tenders.",
                 current_value=total_tenders_participated,
                 unit="tenders",
                 milestones={"BRONZE": 5, "SILVER": 20, "GOLD": 50, "PLATINUM": 100},
                 tier_titles={
                     "NONE": "The Active Desk",
-                    "BRONZE": "Verified Counterparty",
+                    "BRONZE": "Active Participant",
                     "SILVER": "Core Liquidity Partner",
                     "GOLD": "Prime Relationship Desk",
                     "PLATINUM": "Sovereign Liquidity Anchor"
