@@ -289,12 +289,41 @@ class DealerAchievementService:
                     if is_rfq_won:
                         total_volume_won_egp += rfq_volume_egp
                         total_volume_won_usd += rfq_volume_usd
-                        current_streak += 1
-                        if current_streak > longest_streak:
-                            longest_streak = current_streak
-                    else:
-                        if rfq.status in ('COMPLETED', 'CLOSED'):
+
+                    # Streak Evaluation across RFQs (Clean Sweep standard with Wash on aborted/rejected tenders)
+                    exec_legs = [l for l in getattr(rfq, 'legs', []) if (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution']
+                    if rfq.type == 'TBILL':
+                        qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
+                        asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
+                        is_tbill_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                        is_tbill_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                        if is_tbill_won:
+                            current_streak += 1
+                            if current_streak > longest_streak:
+                                longest_streak = current_streak
+                        elif is_tbill_lost or (rfq.status in ('COMPLETED', 'CLOSED') and not is_tbill_won):
                             current_streak = 0
+                    else:
+                        if exec_legs:
+                            dealer_won_all_legs = all(
+                                l.winner_bank_id == bank_id_val and l.status not in ('REJECTED', 'CANCELLED', 'DECLINED') and
+                                any(o.leg_id == l.id and abs(float(o.price or 0.0) - float(l.winner_rate or 0.0)) < 1e-4 for o in fx_offers)
+                                for l in exec_legs
+                            ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
+
+                            competitor_won_any = any(
+                                l.winner_bank_id and l.winner_bank_id != bank_id_val
+                                for l in exec_legs
+                            )
+                            deal_concluded = rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED')
+
+                            if dealer_won_all_legs:
+                                current_streak += 1
+                                if current_streak > longest_streak:
+                                    longest_streak = current_streak
+                            elif competitor_won_any or (deal_concluded and not dealer_won_all_legs):
+                                current_streak = 0
+                            # Note: If RFQ was cancelled/rejected with no winner awarded, it is a wash (preserves current_streak)
 
                 display_email = clean_email
                 target_bank_name = bank_name
@@ -408,34 +437,38 @@ class DealerAchievementService:
                 current_streak = 0
                 longest_streak = 0
                 for rfq in rfqs_sorted:
-                    is_won = False
+                    exec_legs = [l for l in getattr(rfq, 'legs', []) if (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution']
                     if rfq.type == 'TBILL':
                         qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
                         asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
-                        if qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank:
-                            is_won = (qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
-                    else:
-                        legs = getattr(rfq, 'legs', [])
-                        if legs:
-                            is_won = any(
-                                getattr(l, 'winner_bank_id', None) == bank_id and
-                                (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution' and
-                                getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED')
-                                for l in legs
-                            )
-                        else:
-                            if (rfq.quotation_base or 'Execution').lower() == 'execution':
-                                qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-                                asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
-                                if qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank:
-                                    is_won = (qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
-                    if is_won:
-                        current_streak += 1
-                        if current_streak > longest_streak:
-                            longest_streak = current_streak
-                    else:
-                        if rfq.status in ('COMPLETED', 'CLOSED'):
+                        is_tbill_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                        is_tbill_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                        if is_tbill_won:
+                            current_streak += 1
+                            if current_streak > longest_streak:
+                                longest_streak = current_streak
+                        elif is_tbill_lost or (rfq.status in ('COMPLETED', 'CLOSED') and not is_tbill_won):
                             current_streak = 0
+                    else:
+                        if exec_legs:
+                            bank_won_all_legs = all(
+                                getattr(l, 'winner_bank_id', None) == bank_id and getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED')
+                                for l in exec_legs
+                            ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
+
+                            competitor_won_any = any(
+                                getattr(l, 'winner_bank_id', None) and getattr(l, 'winner_bank_id', None) != bank_id
+                                for l in exec_legs
+                            )
+                            deal_concluded = rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED')
+
+                            if bank_won_all_legs:
+                                current_streak += 1
+                                if current_streak > longest_streak:
+                                    longest_streak = current_streak
+                            elif competitor_won_any or (deal_concluded and not bank_won_all_legs):
+                                current_streak = 0
+                            # Note: If RFQ was cancelled/rejected with no winner awarded, it is a wash (preserves current_streak)
 
             # Construct Multi-Metal Badges with Calibrated Institutional Milestones
             trophies = cls._build_trophies_set(
@@ -545,20 +578,22 @@ class DealerAchievementService:
             ),
             cls._build_trophy(
                 trophy_id="TRIPLE_CROWN",
-                title="Triple Crown Cup",
+                title="Unbroken Victor",
                 icon="Crown",
                 category="Consistency",
-                description="Consecutive winning firm execution tenders across the interbank market.",
-                current_value=best_streak,
+                description="Consecutive clean-sweep tender executions won across the interbank market.",
+                current_value=current_streak,
                 unit="streak",
-                milestones={"BRONZE": 3, "SILVER": 5, "GOLD": 8, "PLATINUM": 12},
+                milestones={"BRONZE": 3, "SILVER": 5, "GOLD": 10, "PLATINUM": 15},
                 tier_titles={
-                    "NONE": "Triple Crown Cup",
-                    "BRONZE": "Triple Crown Cup",
+                    "NONE": "Unbroken Victor",
+                    "BRONZE": "Unbroken Victor",
                     "SILVER": "Sustained Victor",
                     "GOLD": "Market Dominance",
-                    "PLATINUM": "Grand Slam Master"
-                }
+                    "PLATINUM": "Invincible Desk"
+                },
+                active_value=current_streak,
+                best_record=longest_streak
             ),
             cls._build_trophy(
                 trophy_id="VOLUME_TITAN",
@@ -677,44 +712,43 @@ class DealerAchievementService:
         unit: str,
         milestones: Dict[str, float],
         tier_titles: Optional[Dict[str, str]] = None,
-        is_currency: bool = False
+        is_currency: bool = False,
+        active_value: Optional[float] = None,
+        best_record: Optional[float] = None
     ) -> Dict[str, Any]:
         """Calculates multi-metal status (BRONZE, SILVER, GOLD, PLATINUM) and progress bar."""
-        tier = "NONE"
-        next_tier = "BRONZE"
-        target_val = milestones["BRONZE"]
-        prev_val = 0.0
+        # Tier unlocked is based on best record ever achieved (earned badges are kept)
+        eval_tier_val = best_record if best_record is not None else current_value
 
-        if current_value >= milestones["PLATINUM"]:
+        if eval_tier_val >= milestones["PLATINUM"]:
             tier = "PLATINUM"
             next_tier = "MAX"
             target_val = milestones["PLATINUM"]
-            progress_pct = 100.0
-        elif current_value >= milestones["GOLD"]:
+        elif eval_tier_val >= milestones["GOLD"]:
             tier = "GOLD"
             next_tier = "PLATINUM"
             target_val = milestones["PLATINUM"]
-            progress_pct = min(100.0, (current_value / target_val) * 100.0) if target_val > 0 else 0.0
-        elif current_value >= milestones["SILVER"]:
+        elif eval_tier_val >= milestones["SILVER"]:
             tier = "SILVER"
             next_tier = "GOLD"
             target_val = milestones["GOLD"]
-            progress_pct = min(100.0, (current_value / target_val) * 100.0) if target_val > 0 else 0.0
-        elif current_value >= milestones["BRONZE"]:
+        elif eval_tier_val >= milestones["BRONZE"]:
             tier = "BRONZE"
             next_tier = "SILVER"
             target_val = milestones["SILVER"]
-            progress_pct = min(100.0, (current_value / target_val) * 100.0) if target_val > 0 else 0.0
         else:
             tier = "NONE"
             next_tier = "BRONZE"
             target_val = milestones["BRONZE"]
-            progress_pct = min(100.0, (current_value / target_val) * 100.0) if target_val > 0 else 0.0
+
+        # Progress percentage strictly reflects ACTIVE streak progress towards target_val!
+        active_val = current_value
+        progress_pct = min(100.0, (active_val / target_val) * 100.0) if target_val > 0 else 0.0
 
 
         display_title = tier_titles.get(tier, title) if tier_titles else title
 
-        return {
+        res = {
             "id": trophy_id,
             "title": display_title,
             "base_title": title,
@@ -730,6 +764,11 @@ class DealerAchievementService:
             "is_currency": is_currency,
             "milestones": milestones
         }
+        if active_value is not None:
+            res["active_value"] = active_value
+        if best_record is not None:
+            res["best_record"] = best_record
+        return res
 
     @classmethod
     def _evaluate_active_seasons(cls) -> List[Dict[str, Any]]:
