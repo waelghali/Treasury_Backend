@@ -69,6 +69,27 @@ async def upload_quotation_documents(
         
     return {"documents": uploaded_files}
 
+
+def _resolve_entities_for_invitation(db: Session, customer_id: int, qb = None, fallback_entity_ids: list = None):
+    """Resolves active legal entities for email notifications and handshake pages."""
+    from app.models.models import CustomerEntity
+    all_ents = db.query(CustomerEntity).filter(
+        CustomerEntity.customer_id == customer_id,
+        CustomerEntity.is_active == True,
+        CustomerEntity.is_deleted == False
+    ).order_by(CustomerEntity.entity_name.asc()).all()
+
+    scope = getattr(qb, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
+    if scope == "ALL_ENTITIES" or not qb:
+        return [{"id": e.id, "name": e.entity_name, "code": e.code} for e in all_ents], "ALL_ENTITIES"
+
+    assigned_ids = [assoc.entity_id for assoc in qb.entity_associations] if getattr(qb, "entity_associations", None) else (fallback_entity_ids or [])
+    ents = [{"id": e.id, "name": e.entity_name, "code": e.code} for e in all_ents if e.id in assigned_ids]
+    if not ents:
+        return [{"id": e.id, "name": e.entity_name, "code": e.code} for e in all_ents], "ALL_ENTITIES"
+    return ents, "SPECIFIC_ENTITIES"
+
+
 @router.post("/banks", response_model=QuotationBankOut)
 def create_quotation_bank(
     bank_in: QuotationBankCreate,
@@ -86,11 +107,21 @@ def create_quotation_bank(
         )
 
     # Capture previous state for structured role audit
-    existing_bank = db.query(QuotationBank).filter(
-        QuotationBank.customer_id == current_user.customer_id,
-        QuotationBank.bank_id == bank_in.bank_id,
-        QuotationBank.trade_type == (bank_in.trade_type or "BOTH")
-    ).first()
+    existing_bank = None
+    target_id = getattr(bank_in, 'id', None)
+    if target_id:
+        existing_bank = db.query(QuotationBank).filter(
+            QuotationBank.id == target_id,
+            QuotationBank.customer_id == current_user.customer_id
+        ).first()
+    elif (bank_in.entity_scope or "ALL_ENTITIES") == "ALL_ENTITIES":
+        existing_bank = db.query(QuotationBank).filter(
+            QuotationBank.customer_id == current_user.customer_id,
+            QuotationBank.bank_id == bank_in.bank_id,
+            QuotationBank.entity_scope == "ALL_ENTITIES",
+            QuotationBank.trade_type == (bank_in.trade_type or "BOTH")
+        ).first()
+
     old_contacts = list(existing_bank.contacts) if (existing_bank and existing_bank.contacts) else []
     old_auth_email = getattr(existing_bank, 'authorized_contact_email', None) if existing_bank else None
 
@@ -144,6 +175,78 @@ def create_quotation_bank(
         },
         customer_id=current_user.customer_id
     )
+
+    # Dispatch dealer invitation handshake email for all newly added contacts (first onboarding or roster additions)
+    if added_contacts:
+        import secrets
+        from datetime import datetime, timezone, timedelta
+        from app.core.email_service import send_email, get_customer_email_settings
+        from app.services.unified_email_builder import build_dealer_invitation_email
+        from app.core.routing import get_frontend_base_url
+        from app.models.models import Customer, Bank
+
+        cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+        bank_obj = bank.bank if bank.bank else db.query(Bank).filter(Bank.id == bank_in.bank_id).first()
+        bank_name_str = bank_obj.name if bank_obj else f"Bank {bank_in.bank_id}"
+
+        for contact in added_contacts:
+            c_email = (contact.get("email") or "").strip().lower()
+            if not c_email:
+                continue
+
+            existing_inv = db.query(QuotationBankContactInvitation).filter(
+                QuotationBankContactInvitation.customer_id == current_user.customer_id,
+                QuotationBankContactInvitation.bank_id == bank_in.bank_id,
+                QuotationBankContactInvitation.email == c_email,
+                QuotationBankContactInvitation.status.in_(["PENDING", "ACCEPTED"])
+            ).first()
+
+            if not existing_inv:
+                inv_token = secrets.token_urlsafe(32)
+                inv_expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+
+                invitation = QuotationBankContactInvitation(
+                    customer_id=current_user.customer_id,
+                    bank_id=bank_in.bank_id,
+                    quotation_bank_id=bank.id,
+                    email=c_email,
+                    title=contact.get("name") or None,
+                    role=(contact.get("role") or "EXECUTION").upper(),
+                    token=inv_token,
+                    status="PENDING",
+                    invited_by_user_id=current_user.user_id,
+                    expires_at=inv_expires_at
+                )
+                db.add(invitation)
+                db.commit()
+                db.refresh(invitation)
+
+                try:
+                    frontend_base = get_frontend_base_url(request)
+                    handshake_link = f"{frontend_base}/public/dealer-handshake/{inv_token}"
+                    ents_for_email, scope_str = _resolve_entities_for_invitation(db, current_user.customer_id, bank, bank_in.entity_ids)
+                    subj, email_html = build_dealer_invitation_email(
+                        customer_branding=cust.name if cust else "Corporate Treasury",
+                        bank_name=bank_name_str,
+                        dealer_email=invitation.email,
+                        dealer_title=invitation.title,
+                        role=invitation.role,
+                        handshake_link=handshake_link,
+                        entities=ents_for_email,
+                        entity_scope=scope_str
+                    )
+                    email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+                    background_tasks.add_task(
+                        send_email,
+                        db,
+                        [invitation.email],
+                        subj,
+                        email_html,
+                        {},
+                        email_settings
+                    )
+                except Exception as email_err:
+                    logger.warning(f"Could not dispatch dealer handshake invitation email on onboarding: {email_err}")
 
     return bank
 
@@ -311,13 +414,20 @@ def invite_bank_contact(
     try:
         frontend_base = get_frontend_base_url(request)
         handshake_link = f"{frontend_base}/public/dealer-handshake/{token}"
+        qb = db.query(QuotationBank).filter(
+            QuotationBank.customer_id == current_user.customer_id,
+            QuotationBank.bank_id == bank_id
+        ).first()
+        ents_for_email, scope_str = _resolve_entities_for_invitation(db, current_user.customer_id, qb)
         subj, email_html = build_dealer_invitation_email(
             customer_branding=cust.name if cust else "Corporate Treasury",
             bank_name=bank.name,
             dealer_email=invitation.email,
             dealer_title=invitation.title,
             role=invitation.role,
-            handshake_link=handshake_link
+            handshake_link=handshake_link,
+            entities=ents_for_email,
+            entity_scope=scope_str
         )
         email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
         background_tasks.add_task(
@@ -385,13 +495,28 @@ def resend_contact_invitation(
     frontend_base = get_frontend_base_url(request)
     handshake_link = f"{frontend_base}/public/dealer-handshake/{inv.token}"
 
+    qb = None
+    if inv.quotation_bank_id:
+        from app.models.models_quotation import QuotationBank
+        qb = db.query(QuotationBank).filter(QuotationBank.id == inv.quotation_bank_id).first()
+    if not qb:
+        from app.models.models_quotation import QuotationBank
+        qb = db.query(QuotationBank).filter(
+            QuotationBank.customer_id == current_user.customer_id,
+            QuotationBank.bank_id == inv.bank_id
+        ).first()
+
+    ents_for_email, scope_str = _resolve_entities_for_invitation(db, current_user.customer_id, qb)
+
     subj, email_html = build_dealer_invitation_email(
         customer_branding=cust.name if cust else "Corporate Treasury",
         bank_name=bank.name if bank else f"Bank {inv.bank_id}",
         dealer_email=inv.email,
         dealer_title=inv.title,
         role=inv.role,
-        handshake_link=handshake_link
+        handshake_link=handshake_link,
+        entities=ents_for_email,
+        entity_scope=scope_str
     )
     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
     background_tasks.add_task(
@@ -521,11 +646,16 @@ def get_user_accessible_quotation_entities(
 def get_quotation_banks(
     trade_type: str = None,
     entity_id: int = None,
+    exclude_all_pending: bool = False,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
     return crud_quotation.get_quotation_banks(
-        db, customer_id=current_user.customer_id, trade_type=trade_type, entity_id=entity_id
+        db,
+        customer_id=current_user.customer_id,
+        trade_type=trade_type,
+        entity_id=entity_id,
+        exclude_all_pending=exclude_all_pending
     )
 
 @router.get("/banks/latest-costs")
@@ -623,7 +753,25 @@ def get_bank_recommendations(
     )
     if trade_type and trade_type != 'BOTH':
         q = q.filter(QuotationBank.trade_type.in_([trade_type, 'BOTH']))
-    customer_banks = q.all()
+    all_customer_banks = q.all()
+
+    # Exclude banks where all registered contacts are pending dealer handshake
+    from app.models.models_quotation import QuotationBankContactInvitation
+    pending_invs = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.customer_id == current_user.customer_id,
+        QuotationBankContactInvitation.status == "PENDING"
+    ).all()
+    pending_by_bank = {}
+    for pinv in pending_invs:
+        pending_by_bank.setdefault(pinv.bank_id, set()).add((pinv.email or "").strip().lower())
+
+    customer_banks = []
+    for qb in all_customer_banks:
+        q_contacts = list(qb.contacts) if qb.contacts else []
+        pending_set = pending_by_bank.get(qb.bank_id, set())
+        has_active = any((c.get("email") or "").strip().lower() not in pending_set for c in q_contacts)
+        if q_contacts and has_active:
+            customer_banks.append(qb)
 
     if not customer_banks:
         return {"recommended_bank_ids": [], "recommendations": [], "all_bank_analytics": {}}

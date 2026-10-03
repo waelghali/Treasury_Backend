@@ -3120,24 +3120,37 @@ async def approve_trial_registration(
         requested = registration.requested_modules or ["custody"]
         wants_custody = "custody" in requested
         wants_issuance = "issuance" in requested
+        wants_quotations = "quotations" in requested or "quotation" in requested
+        wants_reconciliation = "reconciliation" in requested
 
         # Query all active plans and find the best match
         from app.models import SubscriptionPlan
-        all_plans = db.query(SubscriptionPlan).filter(
+        query = db.query(SubscriptionPlan).filter(
             SubscriptionPlan.is_deleted == False,
             SubscriptionPlan.has_custody_module == wants_custody,
             SubscriptionPlan.has_issuance_module == wants_issuance,
-        ).all()
+        )
+        if hasattr(SubscriptionPlan, "has_quotation_module"):
+            query = query.filter(SubscriptionPlan.has_quotation_module == wants_quotations)
+        if hasattr(SubscriptionPlan, "has_reconciliation_module"):
+            query = query.filter(SubscriptionPlan.has_reconciliation_module == wants_reconciliation)
+        all_plans = query.all()
 
         if not all_plans:
             # Fallback: try the legacy "Free Trial Plan" for backward compatibility
             subscription_plan = crud_subscription_plan.get_by_name(db, name="Free Trial Plan")
             if not subscription_plan:
-                module_desc = " & ".join(m.replace("custody", "LG Custody").replace("issuance", "LG Issuance") for m in requested)
+                module_desc = " & ".join(
+                    m.replace("custody", "LG Custody")
+                     .replace("issuance", "LG Issuance")
+                     .replace("quotations", "FX & T-Bill Quotations")
+                     .replace("reconciliation", "Bank Auto-Reconciliation")
+                    for m in requested
+                )
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"No subscription plan found matching the requested modules ({module_desc}). "
-                           f"Please create a plan with has_custody_module={wants_custody} and has_issuance_module={wants_issuance} first."
+                           f"Please create a plan with matching module toggles first."
                 )
         else:
             # Pick the cheapest plan (lowest monthly_price) — free trial plans would be 0

@@ -48,7 +48,7 @@ class QuotationBankBase(BaseModel):
     handshake_confirmed_at: Optional[datetime] = None
 
 class QuotationBankCreate(QuotationBankBase):
-    pass
+    id: Optional[int] = None
 
 class BankSimpleOut(BaseModel):
     id: int
@@ -70,6 +70,8 @@ class QuotationBankOut(QuotationBankBase):
     authorized_contact_email: Optional[str] = None
     authorized_contact_name: Optional[str] = None
     handshake_confirmed_at: Optional[datetime] = None
+    all_contacts_pending: Optional[bool] = False
+    has_active_contacts: Optional[bool] = True
     
     class Config:
         from_attributes = True

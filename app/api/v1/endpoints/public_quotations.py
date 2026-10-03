@@ -425,6 +425,9 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "entity_cr_number": None if assignment.is_cross_entity else (rfq.entity.commercial_register_number if rfq.entity else None),
         "entity_code": None if assignment.is_cross_entity else (rfq.entity.code if rfq.entity else None),
         "serverTime": now.isoformat(),
+        "created_at": rfq.created_at.isoformat() if rfq.created_at else None,
+        "created_by_email": rfq.creator.email if rfq.creator else None,
+        "created_by_name": (getattr(rfq.creator, "full_name", None) or getattr(rfq.creator, "name", None) or (rfq.creator.email.split("@")[0].replace(".", " ").title() if rfq.creator and rfq.creator.email else None)),
         "isWindowOpen": is_open,
         "offers": offers,
         "legs": portal_legs,
@@ -1727,6 +1730,37 @@ def get_live_rank(token: str, leg_id: Optional[str] = None, db: Session = Depend
         "isWindowOpen": is_open
     }
 
+@router.get("/{token}/dealer-achievements")
+def get_dealer_achievements_endpoint(
+    token: str,
+    email: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Returns verified cross-corporate trophies, multi-metal tiers, and seasonal status for the dealer.
+    Strictly read-only and decoupled.
+    """
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    bank = assignment.quotation_bank.bank if assignment.quotation_bank else None
+    bank_id = bank.id if bank else None
+    bank_name = bank.name if bank else (assignment.quotation_bank.name if assignment.quotation_bank else "Bank Desk")
+
+    target_email = None
+    if email and email.strip():
+        target_email = email.strip().lower()
+
+    from app.services.dealer_achievement_service import dealer_achievement_service
+    return dealer_achievement_service.get_dealer_achievements(
+        db,
+        dealer_email=target_email,
+        bank_id=bank_id,
+        bank_name=bank_name,
+        current_rfq_id=str(assignment.rfq_id) if assignment.rfq_id else None
+    )
+
 @router.post("/{token}/approve")
 async def approve_rfq_for_bank(
     token: str,
@@ -2467,9 +2501,49 @@ def get_dealer_handshake_details(token: str, db: Session = Depends(get_db)):
     if not inv:
         raise HTTPException(status_code=404, detail="The invitation link is invalid or has expired.")
 
-    from app.models.models import Customer, Bank
+    from app.models.models import Customer, Bank, CustomerEntity
+    from app.models.models_quotation import QuotationBank
+
     cust = db.query(Customer).filter(Customer.id == inv.customer_id).first()
     bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
+
+    # Resolve quotation bank configuration and authorized legal entities
+    qb = None
+    if inv.quotation_bank_id:
+        qb = db.query(QuotationBank).filter(QuotationBank.id == inv.quotation_bank_id).first()
+    if not qb:
+        qb = db.query(QuotationBank).filter(
+            QuotationBank.customer_id == inv.customer_id,
+            QuotationBank.bank_id == inv.bank_id
+        ).first()
+
+    all_customer_entities = db.query(CustomerEntity).filter(
+        CustomerEntity.customer_id == inv.customer_id,
+        CustomerEntity.is_active == True,
+        CustomerEntity.is_deleted == False
+    ).order_by(CustomerEntity.entity_name.asc()).all()
+
+    entity_scope = qb.entity_scope if qb else "ALL_ENTITIES"
+    if entity_scope == "ALL_ENTITIES" or not qb:
+        entities_list = [
+            {"id": e.id, "name": e.entity_name, "code": e.code}
+            for e in all_customer_entities
+        ]
+        scope_display = "All Group Entities"
+    else:
+        assigned_ids = [assoc.entity_id for assoc in qb.entity_associations] if qb.entity_associations else []
+        entities_list = [
+            {"id": e.id, "name": e.entity_name, "code": e.code}
+            for e in all_customer_entities if e.id in assigned_ids
+        ]
+        if not entities_list:
+            entities_list = [
+                {"id": e.id, "name": e.entity_name, "code": e.code}
+                for e in all_customer_entities
+            ]
+            scope_display = "All Group Entities"
+        else:
+            scope_display = f"{len(entities_list)} Specific Entit{'ies' if len(entities_list) > 1 else 'y'}"
 
     now_utc = datetime.now(timezone.utc)
     is_expired = inv.expires_at < now_utc if inv.expires_at else False
@@ -2482,6 +2556,10 @@ def get_dealer_handshake_details(token: str, db: Session = Depends(get_db)):
         "role": inv.role,
         "bank_name": bank.name if bank else f"Bank {inv.bank_id}",
         "customer_name": cust.name if cust else "Corporate Treasury",
+        "entity_scope": entity_scope,
+        "entity_scope_display": scope_display,
+        "entities": entities_list,
+        "trade_type": qb.trade_type if qb else "BOTH",
         "created_at": inv.created_at.isoformat() if inv.created_at else None,
         "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None,
         "already_accepted": (inv.status == "ACCEPTED")

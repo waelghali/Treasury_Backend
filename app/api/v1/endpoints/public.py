@@ -169,7 +169,7 @@ async def register_free_trial(
     client_ip = request.client.host if request.client else None
     
     # Parse and validate requested modules
-    valid_modules = {"custody", "issuance"}
+    valid_modules = {"custody", "issuance", "quotations", "reconciliation"}
     parsed_modules = [m.strip().lower() for m in requested_modules.split(",") if m.strip()]
     parsed_modules = [m for m in parsed_modules if m in valid_modules]
     if not parsed_modules:
@@ -199,7 +199,11 @@ async def register_free_trial(
         module_names.append("LG Custody")
     if "issuance" in parsed_modules:
         module_names.append("LG Issuance")
-    modules_text = " & ".join(module_names)
+    if "quotations" in parsed_modules:
+        module_names.append("FX & T-Bill Quotations")
+    if "reconciliation" in parsed_modules:
+        module_names.append("Bank Auto-Reconciliation")
+    modules_text = " & ".join(module_names) if module_names else "Treasury Platform"
 
     email_settings = get_global_email_settings()
     subject = f"{modules_text} Free Trial Registration Confirmation"

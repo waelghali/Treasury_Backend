@@ -1174,10 +1174,13 @@ def build_dealer_invitation_email(
     dealer_title: Optional[str],
     role: str,
     handshake_link: str,
+    entities: Optional[List[Dict[str, Any]]] = None,
+    entity_scope: Optional[str] = "ALL_ENTITIES",
     platform_name: str = "Grow Treasury Platform"
 ) -> Tuple[str, str]:
     """
     Builds the individual invitation & handshake email sent directly to a newly added bank dealer.
+    Includes customer corporate group header and explicit legal entities in scope listed one by one.
     """
     now = datetime.now()
     current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
@@ -1193,6 +1196,45 @@ def build_dealer_invitation_email(
     else:
         role_badge = '<span style="background: #f1f5f9; color: #475569; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #cbd5e1;">👁️ View Only</span>'
         role_desc = "View live RFQs and transaction telemetry without quoting authority."
+
+    # Format legal entities list
+    entities_list = entities or []
+    is_all_entities = (entity_scope == "ALL_ENTITIES") or (len(entities_list) == 0)
+    
+    if entities_list:
+        entity_rows = ""
+        for ent in entities_list:
+            e_name = ent.get("name") or ent.get("entity_name") or "Corporate Entity"
+            e_code = ent.get("code")
+            code_html = f' <span style="color: #64748b; font-size: 11px; font-family: monospace;">({e_code})</span>' if e_code else ''
+            entity_rows += f'<li style="margin-bottom: 4px; color: #1e293b;"><strong>{e_name}</strong>{code_html}</li>'
+        
+        entities_card_html = f"""
+        <tr>
+            <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; vertical-align: top;">Entities in Scope:</td>
+            <td style="padding-bottom: 8px;">
+                <div style="margin-bottom: 6px;">
+                    <span style="background: #e0f2fe; color: #0369a1; font-weight: 700; padding: 2px 8px; border-radius: 4px; font-size: 11px; border: 1px solid #bae6fd;">
+                        {'🌐 All Group Entities (' + str(len(entities_list)) + ' Entities)' if is_all_entities else '🏢 ' + str(len(entities_list)) + ' Specific Legal Entit' + ('ies' if len(entities_list) > 1 else 'y')}
+                    </span>
+                </div>
+                <ul style="margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.5;">
+                    {entity_rows}
+                </ul>
+            </td>
+        </tr>
+        """
+    else:
+        entities_card_html = f"""
+        <tr>
+            <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; vertical-align: top;">Entities in Scope:</td>
+            <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a;">
+                <span style="background: #e0f2fe; color: #0369a1; font-weight: 700; padding: 2px 8px; border-radius: 4px; font-size: 11px;">
+                    🌐 All Group Entities
+                </span>
+            </td>
+        </tr>
+        """
 
     subject = f"Invitation: Join {bank_name} Trading Desk for {customer_branding}"
 
@@ -1216,7 +1258,7 @@ def build_dealer_invitation_email(
                     </td>
                     <td style="text-align: right; vertical-align: middle;">
                         <span style="background-color: rgba(16, 185, 129, 0.15); color: #10b981; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid #10b981;">
-                            {customer_branding}
+                            {customer_branding} (Group)
                         </span>
                     </td>
                 </tr>
@@ -1229,14 +1271,18 @@ def build_dealer_invitation_email(
                 {greeting}
             </p>
             <p style="margin-top: 0; margin-bottom: 20px; font-size: 13.5px; color: #334155; line-height: 1.6;">
-                You have been invited by <strong>{customer_branding}</strong> to join the treasury counterparty roster for <strong>{bank_name}</strong> on the {platform_name}.
+                You have been invited by corporate group <strong>{customer_branding}</strong> to join the treasury counterparty roster for <strong>{bank_name}</strong> on the {platform_name}.
             </p>
 
-            <!-- ROLE CARD -->
+            <!-- ROLE & ENTITIES CARD -->
             <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 20px; margin-bottom: 24px;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <tr>
-                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; width: 140px;">Counterparty Bank:</td>
+                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; width: 140px;">Corporate Client:</td>
+                        <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{customer_branding} (Group)</td>
+                    </tr>
+                    <tr>
+                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Counterparty Bank:</td>
                         <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{bank_name}</td>
                     </tr>
                     <tr>
@@ -1247,8 +1293,9 @@ def build_dealer_invitation_email(
                         <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Assigned Role:</td>
                         <td style="padding-bottom: 8px;">{role_badge}</td>
                     </tr>
+                    {entities_card_html}
                     <tr>
-                        <td style="font-size: 12px; color: #64748b; font-weight: 600;">Authority Scope:</td>
+                        <td style="font-size: 12px; color: #64748b; font-weight: 600; vertical-align: top;">Authority Scope:</td>
                         <td style="font-size: 12px; color: #475569;">{role_desc}</td>
                     </tr>
                 </table>

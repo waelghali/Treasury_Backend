@@ -92,12 +92,22 @@ class CRUDQuotation:
                 if not is_valid:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
 
-        # Check if already exists for this customer and trade_type
-        existing = db.query(QuotationBank).filter(
-            QuotationBank.customer_id == customer_id,
-            QuotationBank.bank_id == obj_in.bank_id,
-            QuotationBank.trade_type == (obj_in.trade_type or "BOTH")
-        ).first()
+        # Check if updating an existing counterparty profile or creating a new one
+        existing = None
+        target_id = getattr(obj_in, 'id', None)
+        if target_id:
+            existing = db.query(QuotationBank).filter(
+                QuotationBank.id == target_id,
+                QuotationBank.customer_id == customer_id
+            ).first()
+        elif getattr(obj_in, "entity_scope", "ALL_ENTITIES") == "ALL_ENTITIES":
+            # If creating without explicit ID with ALL_ENTITIES, check if an ALL_ENTITIES profile already exists
+            existing = db.query(QuotationBank).filter(
+                QuotationBank.customer_id == customer_id,
+                QuotationBank.bank_id == obj_in.bank_id,
+                QuotationBank.entity_scope == "ALL_ENTITIES",
+                QuotationBank.trade_type == (obj_in.trade_type or "BOTH")
+            ).first()
         
         entity_scope = getattr(obj_in, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
         entity_ids = getattr(obj_in, "entity_ids", []) or []
@@ -161,10 +171,59 @@ class CRUDQuotation:
             return True
         return False
 
-    def get_quotation_banks(self, db: Session, customer_id: int, trade_type: str = None, entity_id: int = None):
-        from app.models.models_quotation import QuotationBankEntity
+    def get_quotation_banks(self, db: Session, customer_id: int, trade_type: str = None, entity_id: int = None, exclude_all_pending: bool = False):
+        from app.models.models_quotation import QuotationBankEntity, QuotationBankContactInvitation
         from app.crud.crud_config import crud_customer_configuration
         from app.constants import GlobalConfigKey
+
+        # Query all staged invitations for this customer to determine contact handshake status
+        invitations = db.query(QuotationBankContactInvitation).filter(
+            QuotationBankContactInvitation.customer_id == customer_id,
+            QuotationBankContactInvitation.status.in_(["PENDING", "ACCEPTED"])
+        ).all()
+        inv_map = {}
+        for inv in invitations:
+            key = (inv.bank_id, (inv.email or "").strip().lower())
+            if key not in inv_map or inv.status == "ACCEPTED":
+                inv_map[key] = inv.status
+
+        def enrich_bank(b):
+            assoc_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
+            b.entity_ids = assoc_ids
+            raw_contacts = list(b.contacts) if b.contacts else []
+            if not raw_contacts and b.emails:
+                emails_list = [e.strip() for e in b.emails.split(",") if e.strip()]
+                raw_contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+
+            enriched_contacts = []
+            pending_count = 0
+            accepted_count = 0
+
+            for c in raw_contacts:
+                c_item = dict(c)
+                c_email = (c_item.get("email") or "").strip().lower()
+                inv_status = inv_map.get((b.bank_id, c_email))
+                if inv_status == "PENDING":
+                    c_item["invitation_status"] = "PENDING"
+                    c_item["is_pending"] = True
+                    pending_count += 1
+                elif inv_status == "ACCEPTED":
+                    c_item["invitation_status"] = "ACCEPTED"
+                    c_item["is_pending"] = False
+                    accepted_count += 1
+                else:
+                    # Legacy contacts without explicit invitation record are considered active
+                    c_item["invitation_status"] = "ACCEPTED"
+                    c_item["is_pending"] = False
+                    accepted_count += 1
+                enriched_contacts.append(c_item)
+
+            b.contacts = enriched_contacts
+            total_contacts = len(enriched_contacts)
+            # All contacts pending if there are contacts and all are pending, or if there are no contacts at all
+            b.all_contacts_pending = (total_contacts == 0) or (pending_count == total_contacts)
+            b.has_active_contacts = (accepted_count > 0)
+            return b
 
         query = db.query(QuotationBank).filter(QuotationBank.customer_id == customer_id)
         if trade_type:
@@ -194,13 +253,14 @@ class CRUDQuotation:
                 )
 
             banks = query.all()
+            result_banks = []
             for b in banks:
-                if not b.contacts:
-                    emails_list = [e.strip() for e in (b.emails or "").split(",") if e.strip()]
-                    b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
-                b.entity_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
+                enrich_bank(b)
                 b.is_cross_entity = False
-            return banks
+                if exclude_all_pending and b.all_contacts_pending:
+                    continue
+                result_banks.append(b)
+            return result_banks
 
         # When entity_id and allow_cross are active:
         all_banks = query.all()
@@ -209,19 +269,19 @@ class CRUDQuotation:
         direct_bank_ids = set()
 
         for b in all_banks:
-            assoc_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
-            b.entity_ids = assoc_ids
-            if not b.contacts:
-                emails_list = [e.strip() for e in (b.emails or "").split(",") if e.strip()]
-                b.contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+            enrich_bank(b)
+            if exclude_all_pending and b.all_contacts_pending:
+                continue
 
-            is_direct = (b.entity_scope == 'ALL_ENTITIES') or (entity_id in assoc_ids)
+            is_direct = (b.entity_scope == 'ALL_ENTITIES') or (entity_id in (b.entity_ids or []))
             if is_direct:
                 b.is_cross_entity = False
                 direct_banks.append(b)
                 direct_bank_ids.add(b.bank_id)
 
         for b in all_banks:
+            if exclude_all_pending and b.all_contacts_pending:
+                continue
             if b.bank_id not in direct_bank_ids:
                 b.is_cross_entity = True
                 cross_banks.append(b)
@@ -518,6 +578,27 @@ class CRUDQuotation:
 
                 if not q_bank:
                     continue
+
+                # Ensure bank has at least one active (accepted) contact to quote
+                from app.models.models_quotation import QuotationBankContactInvitation
+                pending_invs = db.query(QuotationBankContactInvitation).filter(
+                    QuotationBankContactInvitation.customer_id == customer_id,
+                    QuotationBankContactInvitation.bank_id == raw_bank_id,
+                    QuotationBankContactInvitation.status == "PENDING"
+                ).all()
+                pending_emails = {(inv.email or "").strip().lower() for inv in pending_invs}
+                bank_contacts = list(q_bank.contacts) if q_bank.contacts else []
+                active_contacts = [
+                    c for c in bank_contacts
+                    if (c.get("email") or "").strip().lower() not in pending_emails
+                ]
+                if bank_contacts and len(active_contacts) == 0:
+                    db.rollback()
+                    b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Bank '{b_name}' cannot be selected: all dealer contacts are currently pending dealer invitation handshake."
+                    )
 
                 # Ensure single QuotationBankAssignment per bank per RFQ session
                 if raw_bank_id not in assignment_by_bank_id:
