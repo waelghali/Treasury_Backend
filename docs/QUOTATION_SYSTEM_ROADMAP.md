@@ -355,4 +355,95 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 - **Verification & Testing Criteria**:
   - Verify live mid rates update in real-time during market hours.
   - Verify pip/spread calculation against submitted bank quotes is mathematically accurate.
+---
 
+### 7. Phase 7: Platform Owner Diagnostics Console & Dealer Voice System
+
+---
+
+#### 📌 Phase 7.1: Internal Trophy & Liquidity Diagnostics Console (Super Admin Portal)
+*Scope: Internal platform diagnostics, mathematical verification, counterparty oversight, and trophy calculation audit.*
+
+- **Context & Operational Rationale**:
+  - The Platform Owner / Super Admin requires central visibility into how bank desks and individual dealers perform, which trophies have been unlocked, and whether gamification algorithms are calculating accurately.
+  - **Zero Public Disclaimer Requirement**: Because this is strictly internal administrative telemetry and QA diagnostics for the platform creator—and is never exposed to competing banks or corporate clients—no external legal disclaimers or public terms-of-use changes are required.
+- **Access Control & Security Isolation**:
+  - Strictly restricted to `SYSTEM_ADMIN` / `SUPER_ADMIN` roles.
+  - Completely invisible to corporate admins, branch users, and participating bank dealers.
+  - Zero interbank data leakage: Bank A can never access Bank B's metrics.
+- **Console Features & UI Architecture**:
+  - **Bank Desk Selector**: Dropdown to inspect any onboarded institution (Banque Misr, CIB, AlexBank, NBE, QNB, HSBC, etc.).
+  - **Dealer Roster & Activity**: Drill down by specific dealer email/name or view aggregate bank desk achievements.
+  - **Live 8-Trophy Mathematical Audit Showcase**:
+    1. **Deal Closer (`DEAL_CLOSER`)**: Total firm deals won; click to view list of awarded RFQs and execution legs.
+    2. **Unbroken Victor (`TRIPLE_CROWN`)**: 
+       - Active Streak vs. Personal Best Record.
+       - **Streak Audit Trail**: Chronological timeline of evaluated RFQs showing exact state transitions:
+         - Clean Sweep ($\ge 1$ legs won, 100% of awarded legs won) $\rightarrow +1$ streak.
+         - Competitor Win ($\ge 1$ leg won by rival bank) $\rightarrow$ streak reset to 0 with explanation.
+         - Wash / Neutral (client-rejected, auto-rejected, or aborted RFQ with 0 awards) $\rightarrow$ streak preserved.
+    3. **Liquidity Titan (`VOLUME_TITAN`)**: Total volume awarded converted to USD ($M/B), showing currency breakdown (USD, EUR, GBP, EGP converted at 50.0).
+    4. **Swift Quoting (`PRECISION_SPEED`)**: Total firm quotation submissions.
+    5. **Market Intelligence (`MARKET_INTELLIGENCE`)**: Total indicative pricing quotes submitted.
+    6. **The Active Desk (`THE_RELIABLE_DESK`)**: Total corporate tenders entered and quoted; verification of the **"Active Participant"** tier at 5 tenders.
+    7. **Market Versatility (`CURRENCY_EXPLORER`)**: Distinct interbank currency pairs traded (e.g., USD/EGP, EUR/EGP, EUR/USD).
+    8. **Ready at the Bell (`READY_AT_THE_BELL`)**: Punctual logins authenticated within 15 minutes before the opening bell.
+  - **Instant Calculation Verification**:
+    - Re-run calculation button to instantly verify and trace live database state against cached achievement payloads.
+- **Verification & Testing Criteria**:
+  - Open console as Super Admin $\rightarrow$ select Banque Misr.
+  - Confirm all 8 trophies reflect authentic database records.
+  - Verify that clicking on `Unbroken Victor` shows the streak audit history explaining why the streak is at its current number.
+  - Verify unauthorized roles (dealers, corporate clients) receive HTTP 403 Forbidden.
+
+---
+
+#### 📌 Phase 7.2: Dealer Voice & Feedback Mechanism (Quotation Terminal)
+*Scope: Institutional feedback widget, trader experience rating, and non-blocking toast prompt on the public quotation interface.*
+
+- **Context & Operational Rationale**:
+  - Giving bank dealers a direct channel to provide feedback, report system issues, or rate the terminal builds relationship goodwill and provides early warning for latency or usability bugs.
+- **Critical Trading Desk Design Constraints**:
+  - **Non-Interference with Live Trading**: FX and Treasury dealers operate under high stress during active quotation windows. The feedback mechanism must **never** block, modal-lock, or delay the quotation submission flow or countdown timers.
+  - **100% Optional & Low Friction**: Must take under 5 seconds to complete.
+- **Frontend Components (`QuotationBankOfferPage.js`)**:
+  - **1. Discreet Header Button**:
+    - A subtle, sleek button placed alongside the trophy showcase and session badge:
+      `[ 💬 Feedback ]`
+    - Clicking opens a compact, floating feedback modal.
+  - **2. Optional Post-Quote Experience Toast**:
+    - Triggers only *after* quotes are successfully submitted or when the quotation window has closed.
+    - Displays a lightweight, elegant toast in the lower corner:
+      > *"How was your quotation experience today? [ ★ ★ ★ ★ ★ ] (Optional)"*
+    - Automatically dismisses after 8 seconds if ignored, without modal backdrop or interaction lock.
+  - **3. Compact Feedback Modal**:
+    - **Star Rating**: 1 to 5 stars.
+    - **Category Pills**: `Execution Speed & Latency`, `Rate Triangulation / Calculations`, `Terminal UI & Usability`, `Feature Request`, `Other`.
+    - **Short Comment**: Multi-line textarea (max 300 characters, optional).
+    - **Privacy Toggle**: `Include my name & bank` vs. `Submit Anonymously`.
+- **Backend API (`public_quotations.py` / `dealer_feedback.py`)**:
+  - `POST /api/v1/public-quotation/feedback`
+    - Validates quotation token / OTP assignment.
+    - Records bank ID, dealer email (if not anonymous), star rating, category, message, tender ID, and timestamp.
+    - Rate-limited to prevent spam (max 2 submissions per tender session).
+
+---
+
+#### 📌 Phase 7.3: Admin Feedback Inbox & Satisfaction Stream (Super Admin Portal)
+*Scope: Platform owner feedback feed, sentiment tracking, and issue triaging.*
+
+- **Console Features**:
+  - **Feedback Stream**: Reverse-chronological table of all received dealer submissions:
+    - Timestamp, Bank Name, Dealer Email (or "Anonymous Dealer"), Star Rating, Category, and Comment.
+  - **Filter & Search**:
+    - Filter by Bank, Star Rating (e.g. show 1-2 star alerts first), Category, or Date Range.
+  - **Status Triaging**:
+    - Status badges: `New` $\rightarrow$ `Under Review` $\rightarrow$ `Resolved / Addressed`.
+    - Internal admin notes (e.g. *"Discussed with AlexBank Head of FX on Oct 4"*).
+  - **CSAT / NPS Summary Card**:
+    - Average quotation satisfaction score (e.g. 4.8 / 5.0).
+    - Breakdown by category (speed, UI, rate triangulation).
+- **Verification & Testing Criteria**:
+  - Submit a feedback test from the dealer quotation page with 5 stars and category `Rate Triangulation`.
+  - Verify the entry appears instantly in the Super Admin Feedback Inbox.
+  - Test the anonymous toggle and confirm the dealer email is masked while retaining the bank association.
