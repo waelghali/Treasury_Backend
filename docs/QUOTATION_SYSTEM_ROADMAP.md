@@ -49,6 +49,20 @@ Before writing code for any sub-phase, perform a systematic 5-point inspection:
 ### Rule 4: Git Push Exclusivity
 - **NEVER execute `git push` without explicit, unambiguous user confirmation**. Local commits are made continuously to protect progress, but pushing to remote `origin/main` remains strictly under the user's manual command.
 
+### Rule 5: Sub-Phase Pre-Flight Briefing
+- **Before touching any code**: Present a structured Pre-Flight Brief to the user:
+  1. What is going to happen in this sub-phase.
+  2. Which exact files, database columns, endpoints, and UI components will change.
+  3. Ground-truth code findings confirming variable/status alignment.
+  4. Explicit verification criteria.
+
+### Rule 6: Sub-Phase Post-Flight Living Roadmap Update
+- **Immediately upon completing each sub-phase**: Update `QUOTATION_SYSTEM_ROADMAP.md` with:
+  1. **Work Actually Done**: Concrete list of files modified and logic implemented.
+  2. **Technical Findings & Gotchas**: Uncovered realities or system nuances discovered during implementation.
+  3. **Plan Deviations**: Any divergence from the original conceptual design with explicit architectural justification.
+  4. **Verification Proof**: Exact test steps and database/UI checks confirming success.
+
 ---
 
 ## 2. Phase 1: Counterparty Integrity & Security Controls (Completed)
