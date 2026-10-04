@@ -26,6 +26,31 @@ This roadmap consolidates all architectural designs, threat models, and feature 
 
 ---
 
+## 🔒 Engineering Discipline & Cross-Session Continuity Protocol
+
+To prevent context loss across chat sessions, avoid hallucinated assumptions, and eliminate regression bugs, all development on this platform strictly adheres to the following four rules:
+
+### Rule 1: Ground Truth in Existing Code (Zero Assumptions)
+- **Never guess or assume**: Variable names, database models, status enums, API request/response keys, and UI state properties must be inspected in the codebase using file viewers/ripgrep before writing any logic.
+- Verify both backend and frontend counterparts (e.g. if checking `is_passed`, inspect both `QuotationBankLegConfig` in Python and the offer iteration loop in React).
+
+### Rule 2: Deep Pre-Flight Analysis Before Every Sub-Phase
+Before writing code for any sub-phase, perform a systematic 5-point inspection:
+1. **Existing Touchpoints**: Which exact files, endpoints, and components are affected?
+2. **Data Flow & Types**: What exact types are sent, received, and stored?
+3. **Edge Cases & Failure Modes**: What happens on network drops, timeouts, partial submissions, or single quotes?
+4. **Impact on Related Roles**: How does a dealer change affect corporate admin, approver, and audit views?
+5. **No Visual or Performance Regressions**: Ensure styling adheres strictly to platform light corporate palette and adds zero latency.
+
+### Rule 3: Session Resumption & Context Preservation
+- At the end of every active milestone, code must be verified and committed locally with clear semantic Git messages.
+- The roadmap file (`QUOTATION_SYSTEM_ROADMAP.md`) serves as the single source of truth (SSOT). Any new chat session starts by reading this file and checking `git status` / `git log` to resume immediately without missing a beat.
+
+### Rule 4: Git Push Exclusivity
+- **NEVER execute `git push` without explicit, unambiguous user confirmation**. Local commits are made continuously to protect progress, but pushing to remote `origin/main` remains strictly under the user's manual command.
+
+---
+
 ## 2. Phase 1: Counterparty Integrity & Security Controls (Completed)
 
 | Feature | Description | Implementation Status |
