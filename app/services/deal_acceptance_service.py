@@ -348,18 +348,31 @@ def get_active_deal_awaiting_acceptance(
         winner_rate = rfq.winner_rate or (savings_summary.get("winner_rate") if savings_summary else None)
         saved_vs_avg = rfq.saved_vs_avg or (savings_summary.get("saved_vs_avg") if savings_summary else None)
 
+        total_quotes = savings_summary.get("total_quotes") or (len(standings.get("valid_results", [])) if standings.get("valid_results") else None)
+        avg_rate = savings_summary.get("avg_rate")
+        worst_rate = savings_summary.get("worst_rate")
+        value_date_str = str(rfq.value_date) if getattr(rfq, 'value_date', None) else None
+
         legs_summary = []
         if is_multi_leg:
             for l in standings.get("legs", []):
+                l_res = l.get("results", [])
+                valid_q = [r for r in l_res if r.get("price") is not None or r.get("best_score") is not None]
+                l_savings = l.get("savings_summary") or {}
                 legs_summary.append({
                     "leg_id": str(l.get("leg_id")),
                     "leg_index": l.get("leg_index"),
                     "currency_pair": l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}",
                     "direction": l.get("direction"),
                     "amount": float(l.get("amount") or 0.0),
+                    "buy_currency": l.get("buy_currency"),
+                    "sell_currency": l.get("sell_currency"),
                     "winner_bank_name": l.get("winner_bank_name"),
                     "winner_rate": l.get("winner_rate"),
+                    "avg_rate": l_savings.get("avg_rate"),
                     "saved_vs_avg": l.get("saved_vs_avg"),
+                    "value_date": str(l.get("value_date") or ""),
+                    "total_quotes": len(valid_q),
                     "is_inconclusive": l.get("is_inconclusive", False),
                     "is_uncontested": l.get("is_uncontested", False),
                     "uncontested_reason": l.get("uncontested_reason")
@@ -388,9 +401,13 @@ def get_active_deal_awaiting_acceptance(
             "buy_currency": rfq.buy_currency,
             "sell_currency": rfq.sell_currency,
             "amount": float(rfq.amount or 0.0),
+            "value_date": value_date_str,
             "is_multi_leg": is_multi_leg,
             "winner_bank_name": winner_name,
             "winner_rate": winner_rate,
+            "avg_rate": avg_rate,
+            "worst_rate": worst_rate,
+            "total_quotes": total_quotes,
             "saved_vs_avg": saved_vs_avg,
             "is_uncontested": is_uncontested_deal,
             "uncontested_reason": standings.get("uncontested_reason"),
