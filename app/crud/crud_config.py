@@ -139,6 +139,29 @@ class CRUDGlobalConfiguration(CRUDBase):
         eff_key = data.get('key', db_obj.key)
         self._validate_bounds(value_min=eff_min, value_max=eff_max, value_default=eff_def, key=eff_key)
 
+        # Cross-key invariant: AUTO_ACCEPT_SINGLE_QUOTE vs QUOTATION_ACCEPTANCE_DEFAULT_ACTION
+        if eff_key == GlobalConfigKey.AUTO_ACCEPT_SINGLE_QUOTE:
+            val_clean = str(eff_def or '').strip().lower()
+            if val_clean in ['true', '1']:
+                def_act_gc = self.get_by_key(db, GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION)
+                def_act = (def_act_gc.value_default if def_act_gc else 'AUTO_REJECT') or 'AUTO_REJECT'
+                if str(def_act).strip().upper() in ('AUTO_REJECT', 'REJECT', 'FALSE', '0'):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="AUTO_ACCEPT_SINGLE_QUOTE cannot be set to true when QUOTATION_ACCEPTANCE_DEFAULT_ACTION is set to AUTO_REJECT."
+                    )
+        elif eff_key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+            val_clean = str(eff_def or '').strip().upper()
+            if val_clean in ('AUTO_REJECT', 'REJECT', 'FALSE', '0'):
+                try:
+                    single_q_gc = self.get_by_key(db, GlobalConfigKey.AUTO_ACCEPT_SINGLE_QUOTE)
+                    if single_q_gc and str(single_q_gc.value_default).strip().lower() in ['true', '1']:
+                        single_q_gc.value_default = 'false'
+                        db.add(single_q_gc)
+                        db.commit()
+                except Exception as ex:
+                    logger.warning(f"Could not cascade reset global default AUTO_ACCEPT_SINGLE_QUOTE: {ex}")
+
         # Save old values to check for narrowing ranges
         old_value_min = db_obj.value_min
         old_value_max = db_obj.value_max
