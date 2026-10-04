@@ -11,7 +11,7 @@ from app.crud.base import log_action
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
     QuotationTBillOffer, QuotationBank, QuotationBankContactInvitation, QuotationAccessOTP, QuotationAnalytics,
-    QuotationNotification
+    QuotationNotification, QuotationBankLegConfig
 )
 from app.schemas.schemas_quotation import (
     FXSpotOfferCreate, FXSpotMultiOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate,
