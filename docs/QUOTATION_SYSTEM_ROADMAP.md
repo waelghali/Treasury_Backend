@@ -573,3 +573,18 @@ To ensure development proceeds in strict logical order without circular dependen
       ▼
 [ Phase 5 ] Institutional Cyber Security, WORM Auditing & Bank Compliance Attestation
 ```
+
+---
+
+### 9.6 The 6-Dimension Zero-Knowledge Systemic Audit & Safety Checklist
+
+To eliminate the risk of blind spots, missing historical reports, or broken workflows, Phase 8 is governed by a strict **6-Dimension Operational Checklist**. No code is considered complete until all 6 dimensions pass verification:
+
+| Dimension | System Touchpoints | Architectural Mitigation & Safety Rule | Verification Check |
+| :--- | :--- | :--- | :--- |
+| **1. Authentication & Session Lifecycles** | `POST /login`, `POST /refresh`, JWT tokens | - Session tokens embed unsealed session key in memory-only context.<br>- Zero key writing to localStorage or browser cookies.<br>- Sliding token expiration handles active session renewals cleanly. | Verify login works seamlessly with 0 added user clicks or friction. |
+| **2. Role-Based Access Control (RBAC)** | `corporate_admin`, `approver`, `execution`, `view_only` | - Permission trees are maintained independently of data encryption.<br>- Envelope access mirrors existing company organization tree.<br>- Revoking a user's role instantly revokes their envelope access. | Verify `view_only` users cannot decrypt deal execution approval actions. |
+| **3. Database Queries & Historical Data** | PostgreSQL tables: `quotations`, `quotation_offers`, `quotation_legs` | - **Dual-Read Compatibility Layer**: Application reads both unencrypted legacy rows and newly encrypted rows without error.<br>- **Idempotent Background Worker**: Backfills and encrypts historical data in 50-row chunks during live operations with zero downtime.<br>- Legacy plaintext columns are dropped only after 100% verification. | Run query comparing legacy rows vs newly encrypted rows; outputs must match to 6 decimal places. |
+| **4. Aggregations, Reports & Dashboards** | PDF export, Excel summaries, monthly savings reports | - **Compute-on-Decryption Pattern**: Treasury reports fetch encrypted rows, decrypt in application memory using the tenant session key, and generate reports on-the-fly.<br>- The database never needs to run plaintext math over confidential fields. | Export a 6-month historical Treasury report; confirm exact totals and currency conversions match. |
+| **5. Frontend UI/UX & Live Quotation Flows** | `ResultsView.js`, `QuotationRequestDashboard.js`, `QuotationBankOfferPage.js` | - Zero visual changes: screens continue rendering identical typography, currency cards, and charts.<br>- Bank dealers continue using single-use OTP links without needing customer keys.<br>- Instant auto-transition upon deal resolution preserved. | Execute a live 2-minute competitive tender; verify zero UI lag or layout shift. |
+| **6. Disaster Recovery & Self-Contained Maintenance** | Password resets, account recovery, DB backups | - Rate-limited self-service email recovery links (with cooldown timers).<br>- Automated envelope re-sealing without data loss.<br>- Encrypted DB backups are completely useless if stolen, protecting customer confidentiality. | Perform an end-to-end "Forgot Password" flow; verify user logs in with new password and historical deals remain 100% accessible. |
