@@ -1460,11 +1460,18 @@ def submit_fx_offers_batch(
     # Notify Creator
     from app.models.models_quotation import QuotationNotification
     by_text = f" by {submitted_by}" if submitted_by else ""
+    if len(submitted_offers) > 0:
+        notif_title = f"New Quotes: {rfq.ref_no}"
+        notif_msg = f"{len(submitted_offers)} quote(s) were submitted{by_text} for your {rfq.type} request."
+    else:
+        notif_title = f"Bank Passed: {rfq.ref_no}"
+        notif_msg = f"Bank submitted an explicit pass on all {len(payload.passed_legs or [])} leg(s){by_text} for your {rfq.type} request."
+
     db.add(QuotationNotification(
         user_id=rfq.created_by_user_id,
         type="NEW_OFFER",
-        title=f"New Quotes: {rfq.ref_no}",
-        message=f"{len(submitted_offers)} quote(s) were submitted{by_text} for your {rfq.type} request.",
+        title=notif_title,
+        message=notif_msg,
         link=f"/end-user/quotations/history?rfq_id={rfq.id}",
         is_read=False
     ))
@@ -1489,6 +1496,11 @@ def submit_fx_offers_batch(
     # Clean non-sensitive audit log (Zero-Knowledge: strictly NO prices or bid numbers)
     bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
     client_ip = request.client.host if request and request.client else None
+    action_desc = (
+        f"Bank submitted multi-leg quotation package ({len(submitted_offers)} leg(s)) for {rfq.ref_no}."
+        if len(submitted_offers) > 0
+        else f"Bank submitted an explicit pass on all {len(payload.passed_legs or [])} leg(s) for {rfq.ref_no}."
+    )
     log_action(
         db=db,
         user_id=None,
@@ -1499,10 +1511,11 @@ def submit_fx_offers_batch(
             "rfq_id": str(rfq.id),
             "bank_name": bank_name,
             "dealer_email": submitted_by or "Authorized Bank Dealer",
-            "action_description": f"Bank submitted multi-leg quotation package ({len(submitted_offers)} leg(s)) for {rfq.ref_no}.",
+            "action_description": action_desc,
             "ref_no": rfq.ref_no,
             "trade_type": rfq.type,
             "legs_quoted_count": len(submitted_offers),
+            "legs_passed_count": len(payload.passed_legs or []),
             "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         },
         customer_id=rfq.customer_id,

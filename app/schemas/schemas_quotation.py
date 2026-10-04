@@ -340,7 +340,7 @@ class FXSpotOfferItem(BaseModel):
 
 class FXSpotMultiOfferCreate(BaseModel):
     token: str
-    quotes: List[FXSpotOfferItem]
+    quotes: List[FXSpotOfferItem] = []
     passed_legs: Optional[List[str]] = []
     session_token: Optional[str] = None
     email: Optional[str] = None
