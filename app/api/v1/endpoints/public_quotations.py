@@ -1147,14 +1147,14 @@ def submit_fx_offer(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # Strict bidding window check (with 3 seconds network latency buffer)
+    # Strict bidding window check (with 2 seconds network latency buffer)
     now = datetime.now(timezone.utc)
     w_start = rfq.window_start if (rfq.window_start and rfq.window_start.tzinfo) else (rfq.window_start.replace(tzinfo=timezone.utc) if rfq.window_start else None)
     w_end = rfq.window_end if (rfq.window_end and rfq.window_end.tzinfo) else (rfq.window_end.replace(tzinfo=timezone.utc) if rfq.window_end else None)
 
-    if w_start and now < (w_start - timedelta(seconds=3)):
+    if w_start and now < (w_start - timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window has not opened yet.")
-    if w_end and now > (w_end + timedelta(seconds=3)):
+    if w_end and now > (w_end + timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window is closed.")
 
     # Verify submitter authorization & role if session provided
@@ -1349,14 +1349,14 @@ def submit_fx_offers_batch(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # Strict bidding window check (with 3 seconds network latency buffer)
+    # Strict bidding window check (with 2 seconds network latency buffer)
     now = datetime.now(timezone.utc)
     w_start = rfq.window_start if (rfq.window_start and rfq.window_start.tzinfo) else (rfq.window_start.replace(tzinfo=timezone.utc) if rfq.window_start else None)
     w_end = rfq.window_end if (rfq.window_end and rfq.window_end.tzinfo) else (rfq.window_end.replace(tzinfo=timezone.utc) if rfq.window_end else None)
 
-    if w_start and now < (w_start - timedelta(seconds=3)):
+    if w_start and now < (w_start - timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window has not opened yet.")
-    if w_end and now > (w_end + timedelta(seconds=3)):
+    if w_end and now > (w_end + timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window is closed.")
 
     # Authorize submitter
@@ -1570,14 +1570,14 @@ def submit_tbill_offer(
     if assignment.approval_status in ('DECLINED', 'EXPIRED'):
         raise HTTPException(status_code=403, detail="Your bank is not participating in this quotation.")
 
-    # Strict bidding window check (with 3 seconds network latency buffer)
+    # Strict bidding window check (with 2 seconds network latency buffer)
     now = datetime.now(timezone.utc)
     w_start = rfq.window_start if (rfq.window_start and rfq.window_start.tzinfo) else (rfq.window_start.replace(tzinfo=timezone.utc) if rfq.window_start else None)
     w_end = rfq.window_end if (rfq.window_end and rfq.window_end.tzinfo) else (rfq.window_end.replace(tzinfo=timezone.utc) if rfq.window_end else None)
 
-    if w_start and now < (w_start - timedelta(seconds=3)):
+    if w_start and now < (w_start - timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window has not opened yet.")
-    if w_end and now > (w_end + timedelta(seconds=3)):
+    if w_end and now > (w_end + timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window is closed.")
     
     # Verify submitter authorization & role if session provided
@@ -2185,8 +2185,8 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     if w_start and now < w_start:
         return {"status": "SCHEDULED"}
 
-    # Align with 3-second network latency buffer
-    is_closed = bool(w_end and now > (w_end + timedelta(seconds=3)))
+    # Align with 2-second network latency buffer
+    is_closed = bool(w_end and now > (w_end + timedelta(seconds=2)))
 
     if not is_closed and rfq.status not in ('COMPLETED', 'CANCELLED', 'REJECTED'):
         return {"status": "OPEN" if (w_start and now >= w_start) else "PENDING"}

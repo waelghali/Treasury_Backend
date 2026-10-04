@@ -1429,8 +1429,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     w_end = _to_utc_dt(rfq.window_end)
 
     is_scheduled = bool(w_start and now < w_start)
-    # Align evaluation with 3s submission buffer: quotation only closes when buffer elapses
-    is_closed = bool(w_end and now > (w_end + timedelta(seconds=3))) and not is_scheduled
+    # Align evaluation with 2s submission buffer: quotation only closes when buffer elapses
+    is_closed = bool(w_end and now > (w_end + timedelta(seconds=2))) and not is_scheduled
 
     # Resolve Acceptance Timeout and Default Action from Customer Configuration
     try:
@@ -2221,7 +2221,7 @@ def get_rfq_history(
             w_end_val = r.window_end
             if w_end_val and w_end_val.tzinfo is None:
                 w_end_val = w_end_val.replace(tzinfo=timezone.utc)
-            is_closed = bool(w_end_val and now > (w_end_val + timedelta(seconds=3)))
+            is_closed = bool(w_end_val and now > (w_end_val + timedelta(seconds=2)))
         except Exception:
             is_closed = False
             
