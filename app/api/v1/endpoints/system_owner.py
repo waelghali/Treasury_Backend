@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import select, func
 from typing import List, Optional, Any, Dict
+from pydantic import BaseModel
 
 import uuid
 from app.core.ai_integration import _upload_to_gcs, generate_signed_gcs_url, GCS_BUCKET_NAME
