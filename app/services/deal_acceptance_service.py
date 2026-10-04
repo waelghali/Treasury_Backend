@@ -360,7 +360,9 @@ def get_active_deal_awaiting_acceptance(
                     "winner_bank_name": l.get("winner_bank_name"),
                     "winner_rate": l.get("winner_rate"),
                     "saved_vs_avg": l.get("saved_vs_avg"),
-                    "is_inconclusive": l.get("is_inconclusive", False)
+                    "is_inconclusive": l.get("is_inconclusive", False),
+                    "is_uncontested": l.get("is_uncontested", False),
+                    "uncontested_reason": l.get("uncontested_reason")
                 })
 
         urgent_deals.append({
@@ -376,6 +378,8 @@ def get_active_deal_awaiting_acceptance(
             "winner_bank_name": winner_name,
             "winner_rate": winner_rate,
             "saved_vs_avg": saved_vs_avg,
+            "is_uncontested": standings.get("is_uncontested", False),
+            "uncontested_reason": standings.get("uncontested_reason"),
             "acceptance_deadline": acc_deadline_utc.isoformat(),
             "seconds_remaining": diff_seconds,
             "timeout_action": rfq.acceptance_timeout_action or "AUTO_REJECT",

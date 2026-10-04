@@ -1536,6 +1536,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     best_execution_rate = None
     deviation_percent = None
     has_execution_banks = False
+    is_uncontested = False
+    uncontested_reason = None
     
     if rfq.type == 'TBILL':
         all_tbill_offers = []
@@ -1671,6 +1673,10 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
 
         results.sort(key=lambda x: (x['best_score'] is None, x['best_score']))
         exec_results = [r for r in results if (r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity')]
+        valid_exec_tbills = [r for r in exec_results if r.get('best_score') is not None]
+        if len(valid_exec_tbills) == 1:
+            is_uncontested = True
+            uncontested_reason = "Only 1 bank counterparty provided a quote on this tender. No competing offers were received to establish market spread."
         if exec_results and exec_results[0].get('best_score') is not None:
             winner_bank_id = exec_results[0]['bank_id']
 
@@ -1857,6 +1863,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             leg_best_indicative = None
             leg_best_execution = None
             leg_deviation_pct = None
+            execution_bids = []
+            indicative_bids = []
 
             if not valid_leg_results:
                 if is_closed and not is_scheduled:
@@ -1951,6 +1959,12 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
                     leg.status = 'COMPLETED'
 
+            leg_is_uncontested = bool(len(execution_bids) == 1)
+            leg_uncontested_reason = (
+                "Only 1 bank counterparty provided a quote on this currency pair. No competing offers were received to establish market spread."
+                if leg_is_uncontested else None
+            )
+
             legs_data.append({
                 "leg_id": leg.id,
                 "leg_index": leg.leg_index,
@@ -1975,6 +1989,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 "savings_percent": round((leg_savings_summary.get("saved_vs_avg", 0.0) / (leg.amount * leg_savings_summary.get("avg_rate", 1.0))) * 100, 2) if (leg_savings_summary and leg.amount and leg_savings_summary.get("avg_rate")) else 0.0,
                 "is_inconclusive": leg_is_inconclusive,
                 "inconclusive_reason": leg_inconclusive_reason,
+                "is_uncontested": leg_is_uncontested,
+                "uncontested_reason": leg_uncontested_reason,
                 "best_indicative_rate": leg_best_indicative,
                 "best_execution_rate": leg_best_execution,
                 "deviation_percent": leg_deviation_pct,
@@ -2073,6 +2089,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         deviation_percent = primary_leg["deviation_percent"]
         has_execution_banks = any(l["has_execution_banks"] for l in legs_data)
         savings_summary = primary_leg["savings_summary"]
+        is_uncontested = any(l.get("is_uncontested", False) for l in legs_data)
+        uncontested_reason = primary_leg.get("uncontested_reason")
 
     # Attach winner and rate attributes to RFQ object
     if savings_summary and not is_inconclusive:
@@ -2102,6 +2120,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         "best_execution_rate": best_execution_rate,
         "deviation_percent": deviation_percent,
         "has_execution_banks": has_execution_banks,
+        "is_uncontested": is_uncontested,
+        "uncontested_reason": uncontested_reason,
         "live_telemetry": live_telemetry,
         "savings_summary": savings_summary
     }
