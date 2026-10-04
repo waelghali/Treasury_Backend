@@ -405,30 +405,51 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 
 ---
 
-#### 📌 Phase 6.4: Corporate Governance & Legal Delegation Consent Modal
-*Scope: Configuration engine, high-importance consent dialog, and auto-accept execution engine.*
+#### 📌 Phase 6.4: Corporate Governance & Legal Delegation Consent Modal (Completed & Verified ✅)
+*Scope: Customer configuration governance, high-importance legal consent dialog, invariant business rules, cascade resets, and auto-accept execution engine.*
 
-- **Configuration Settings (Customer Configuration)**:
-  - `QUOTATION_ACCEPTANCE_DEFAULT_ACTION`: `AUTO_ACCEPT` vs `AUTO_REJECT`.
-  - `AUTO_ACCEPT_SINGLE_QUOTE`: `True` vs `False` (Sub-configuration).
-- **High-Importance Dual-Confirmation Consent Modal**:
-  - Triggers when enabling either setting in Corporate Admin Settings.
-  - Displays the mandatory legal responsibility text:
-    > *"Notice of Administrative Delegation & Sole Responsibility:*  
-    > *Enabling automated execution constitutes an administrative delegation of executing the acceptance action upon timeout according to your pre-configured parameters. This is NOT a delegation of commercial, financial, or trading decision-making.*  
-    > *The user and [Company] acknowledge that the Grow platform acts solely as an automated processing assistant, and that all trading decisions, counterparty selections, pricing acceptance, and financial risks remain solely the responsibility of the corporate organization."*
-  - Requires explicit checkbox acknowledgment before saving.
-  - Logs full details to `AuditLog` (admin ID, email, timestamp, IP, consent text).
-- **Timeout Execution Engine (`quotations_endpoints.py`)**:
-  - If `AUTO_ACCEPT = True` and quotes $\ge 2$: auto-accepts normally.
-  - If `AUTO_ACCEPT = True` but quotes $== 1$ and `AUTO_ACCEPT_SINGLE_QUOTE = False`:
-    - The engine **halts automated execution** for that leg.
-    - Leaves the leg in `PENDING_ACCEPTANCE` and logs: *"Uncontested quote requires manual corporate sign-off."*
-  - If `AUTO_ACCEPT_SINGLE_QUOTE = True` (with recorded consent): proceeds to auto-accept.
-- **Verification & Testing Criteria**:
-  - Attempt toggling `AUTO_ACCEPT` without checkbox $\rightarrow$ confirm save button is disabled.
-  - Enable with checkbox $\rightarrow$ verify audit log entry with legal text.
-  - Allow window to expire on an uncontested leg with `AUTO_ACCEPT_SINGLE_QUOTE = False` $\rightarrow$ confirm system halts auto-accept and marks leg as requiring manual corporate approval.
+- **Work Actually Done**:
+  - **Database & Enum Schema**:
+    - Added `AUTO_ACCEPT_SINGLE_QUOTE` to PostgreSQL `globalconfigkey` enum via `ALTER TYPE globalconfigkey ADD VALUE 'AUTO_ACCEPT_SINGLE_QUOTE'`.
+    - Seeded `GlobalConfiguration` record (id: 112, key: `AUTO_ACCEPT_SINGLE_QUOTE`, default: `'false'`, unit: `'boolean'`, module_tags: `['quotation', 'quotations']`).
+    - Added `AUTO_ACCEPT_SINGLE_QUOTE = "AUTO_ACCEPT_SINGLE_QUOTE"` to `GlobalConfigKey` in [`app/constants.py`](file:///c:/Grow/app/constants.py).
+  - **Strict Business Rule Invariant (`crud_config.py` & `corporate_admin.py`)**:
+    - **Invariant Enforced**: `if QUOTATION_ACCEPTANCE_DEFAULT_ACTION = AUTO_REJECT then AUTO_ACCEPT_SINGLE_QUOTE cannot be set to true ever`.
+    - Attempting to set `AUTO_ACCEPT_SINGLE_QUOTE = true` when default action is `AUTO_REJECT` raises an immediate `HTTPException(400, "AUTO_ACCEPT_SINGLE_QUOTE cannot be set to true when QUOTATION_ACCEPTANCE_DEFAULT_ACTION is set to AUTO_REJECT.")`.
+    - **Cascade Reset**: When `QUOTATION_ACCEPTANCE_DEFAULT_ACTION` is switched to `AUTO_REJECT`, `AUTO_ACCEPT_SINGLE_QUOTE` is automatically reset to `'false'` in both backend database and frontend client state, accompanied by an immutable audit log entry.
+  - **Quotation Window Expiry Execution Engine (`quotations_endpoints.py`)**:
+    - Placed timeout evaluation after full standings computation so uncontested monopoly status is known with 100% precision.
+    - If `acceptance_timeout_action == "AUTO_ACCEPT"`:
+      - Checks `AUTO_ACCEPT_SINGLE_QUOTE` configuration.
+      - If uncontested single quote AND `AUTO_ACCEPT_SINGLE_QUOTE == False`:
+        - **Halts automated execution!** Leaves deal pending corporate review, sets revision note: *"Automated execution halted: sole-source uncontested quote received. Corporate treasury manual approval required by governance policy."*
+        - Logs audit trail: `QUOTATION_AUTO_ACCEPT_HALTED_SINGLE_QUOTE`.
+      - If competitive $\ge 2$ quotes OR `AUTO_ACCEPT_SINGLE_QUOTE == True`:
+        - Executes `AUTO_ACCEPTED` normally.
+    - If `acceptance_timeout_action == "AUTO_REJECT"`:
+      - Auto-rejects on timeout as configured.
+  - **Deal Acceptance Alert Polling (`deal_acceptance_service.py` & `GlobalDealAcceptanceModal.js`)**:
+    - Identifies halted deals and passes `is_auto_accept_halted = True`.
+    - In `GlobalDealAcceptanceModal.js`, displays distinct amber badge: `Auto-Accept Halted (Manual Sign-Off Required)`.
+  - **High-Importance Dual-Confirmation Consent Modal ([`QuotationAutoAcceptConsentModal.js`](file:///c:/Grow/frontend/src/components/Modals/QuotationAutoAcceptConsentModal.js))**:
+    - Prompts whenever turning ON `AUTO_ACCEPT` or `AUTO_ACCEPT_SINGLE_QUOTE`.
+    - Displays institutional legal notice: administrative execution delegation vs. commercial decision. Organization retains 100% sole responsibility for price risk and counterparty selection.
+    - Mandates non-prechecked confirmation checkbox before enabling action button.
+    - Records immutable `QUOTATION_LEGAL_CONSENT_ACKNOWLEDGED` entry in `AuditLog` capturing user ID, corporate email, IP address, and legal text.
+  - **Corporate Admin Settings UI ([`CustomerConfigurationManagementPage.js`](file:///c:/Grow/frontend/src/pages/CorporateAdmin/CustomerConfigurationManagementPage.js))**:
+    - Dynamically evaluates `QUOTATION_ACCEPTANCE_DEFAULT_ACTION`.
+    - When default action is `AUTO_REJECT`, the `AUTO_ACCEPT_SINGLE_QUOTE` switch is visually locked and disabled with tooltip: *"Locked: Cannot be enabled when Quotation Acceptance Default Action is set to Auto-Reject"*.
+    - Value column displays `Disabled (Auto-Reject Active)`.
+    - Switching to `AUTO_ACCEPT` unlocks the toggle for configuration via the Legal Consent Modal.
+
+- **Verification Proof**:
+  - `python -m py_compile` passed on all modified backend files with zero errors.
+  - Dedicated Python invariant test suite executed cleanly:
+    - `AUTO_REJECT` $\rightarrow$ setting `AUTO_ACCEPT_SINGLE_QUOTE = true` threw 400 Bad Request ✅.
+    - `AUTO_ACCEPT` $\rightarrow$ setting `AUTO_ACCEPT_SINGLE_QUOTE = true` succeeded ✅.
+    - Switching back to `AUTO_REJECT` $\rightarrow$ cascade reset `AUTO_ACCEPT_SINGLE_QUOTE` to `false` ✅.
+  - Frontend production build (`craco build`) compiled cleanly (`main.d5777097.js`, code 0).
+  - Local commits: Backend `14d240d`; Frontend `7b9072a`. Live API and UI verified.
 
 ---
 
