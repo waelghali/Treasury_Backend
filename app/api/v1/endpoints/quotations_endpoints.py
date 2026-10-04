@@ -3431,6 +3431,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                 seen_doc_paths = set()
                 from app.core.ai_integration import generate_signed_gcs_url
                 for leg in won_legs:
+                    l_idx = leg.get("leg_index")
+                    l_id = str(leg.get("id") or leg.get("leg_id") or "")
                     l_pair = leg.get("currency_pair") or f"{leg.get('buy_currency')}/{leg.get('sell_currency')}"
                     l_docs = rfq.get_documents_for_leg(leg_index=l_idx, leg_id=l_id, pair=l_pair)
                     for d in l_docs:

@@ -195,8 +195,8 @@ async def execute_shared_deal_acceptance(
     )
 
     try:
-        from app.api.v1.endpoints.quotations_endpoints import dispatch_rfq_result_emails
-        await dispatch_rfq_result_emails(rfq.id, db, force=False)
+        from app.api.v1.endpoints.quotations_endpoints import trigger_auto_dispatch_results
+        trigger_auto_dispatch_results(rfq.id)
     except Exception as email_err:
         logger.warning(f"Result emails auto-dispatch encountered an issue for RFQ {rfq.id}: {email_err}")
 
@@ -258,8 +258,8 @@ async def execute_shared_deal_decline(
     )
 
     try:
-        from app.api.v1.endpoints.quotations_endpoints import dispatch_rfq_result_emails
-        await dispatch_rfq_result_emails(rfq.id, db, force=False)
+        from app.api.v1.endpoints.quotations_endpoints import trigger_auto_dispatch_results
+        trigger_auto_dispatch_results(rfq.id)
     except Exception as email_err:
         logger.warning(f"Rejection result emails auto-dispatch encountered an issue for RFQ {rfq.id}: {email_err}")
 
