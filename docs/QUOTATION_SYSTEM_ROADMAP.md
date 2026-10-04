@@ -372,19 +372,36 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 
 ---
 
-#### 📌 Phase 6.3: Uncontested / Single-Quote Monopoly Detection & UI Warning
-*Scope: Algorithmic detection of sole-counterparty legs and visual risk advisories.*
+#### 📌 Phase 6.3: Uncontested / Single-Quote Monopoly Detection & UI Warning (Completed & Verified ✅)
+*Scope: Algorithmic detection of sole-counterparty legs across single-leg, multi-leg, and T-Bill tenders, and visual risk advisories.*
 
-- **Per-Leg Uncontested Detection**:
-  - Triggered whenever `valid_execution_quotes.length === 1` on any specific leg (whether caused by dealer passes, approver declines, or only 1 invited bank).
-- **Corporate UI Warning**:
-  - On the leg card and inside the Deal Acceptance modal:
-    - Display prominent warning banner: ⚠️ **Uncontested Rate (Single Quote)**
-    - Advisory Text: *"Only 1 bank counterparty provided a quote on this leg. No competing offers were received to establish market spread."*
-- **Verification & Testing Criteria**:
-  - Run an RFQ where 2 banks are invited; Bank B passes Leg 2.
-  - Leg 1 displays standard competitive multi-bank comparison.
-  - Leg 2 displays Bank A's rate accompanied by the ⚠️ Uncontested Single Quote warning banner.
+- **Work Actually Done**:
+  - **Backend Detection Engine (`compute_rfq_standings` in [`quotations_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py))**:
+    - **Single-Leg & Multi-Leg FX Baskets**: Evaluates active execution bids per leg (`len(execution_bids) == 1`). If exactly one bank provided a valid execution quote, sets `leg_is_uncontested = True` and populates `leg_uncontested_reason` explaining sole-source status and absence of competing market spread.
+    - **T-Bill Auctions**: Evaluates valid execution offers (`len(valid_exec_tbills) == 1`), setting `is_uncontested = True` and detailed reason.
+    - **Root Standings Response**: Exposes `is_uncontested` and `uncontested_reason` at both the tender root level and inside each individual leg object in `legs_data`.
+  - **Deal Acceptance Engine (`poll_pending_deal_acceptance` in [`deal_acceptance_service.py`](file:///c:/Grow/app/services/deal_acceptance_service.py))**:
+    - Propagates `is_uncontested` and `uncontested_reason` into each leg summary and the top-level deal dictionary of `urgent_deals`.
+  - **Frontend Corporate Evaluation View ([`ResultsView.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/ResultsView.js))**:
+    - State hydration: Stores `isUncontested` and `uncontestedReason` in `resultsMeta`.
+    - **Deal Acceptance Banner**: Displays an amber Sole-Source Advisory callout if any awarded leg received only a single quote, warning treasury before execution.
+    - **Deal Acceptance Leg Checklist**: Renders a dedicated `⚠️ Single Quote` warning badge alongside the awarded rate and winner name on uncontested legs.
+    - **Multi-Leg "ALL" View**: Renders prominent `Sole-Source Advisory (Single Quote Received)` warning callout banner between the leg header and counterparty rows.
+    - **Multi-Leg Tabbed View**: Renders `Sole-Source Advisory` banner for the currently selected leg.
+    - **Single-Leg Tender View**: Renders `Sole-Source Advisory` banner across the counterparty list when uncontested.
+  - **Global Deal Acceptance Modal ([`GlobalDealAcceptanceModal.js`](file:///c:/Grow/frontend/src/components/Quotations/GlobalDealAcceptanceModal.js))**:
+    - Top-Level Advisory Banner: Renders sole-source advisory warning if the deal or any leg is uncontested.
+    - Single-Leg Rate Card: Displays `⚠️ Single Quote Received` badge.
+    - Multi-Leg Basket Checklist: Renders `⚠️ Single Quote` badge beside currency pair info on uncontested legs.
+
+- **Technical Findings & Gotchas**:
+  - Uncontested monopoly detection operates comprehensively regardless of the underlying cause: whether due to dealer explicit pass, competitor timeout, approver decline, or initial single-bank invitation.
+  - Filtering strictly by `(quotation_base or 'Execution').lower() == 'execution'` ensures that indicative or market-intelligence benchmarks do not falsely mask sole-source firm execution monopolies.
+
+- **Verification Proof**:
+  - `python -m py_compile` passed on `quotations_endpoints.py` and `deal_acceptance_service.py` with zero errors.
+  - Frontend production build (`craco build`) compiled cleanly (`main.9b9adf15.js`, code 0).
+  - Local commits: Backend `79de5aa`; Frontend `d3ee69f`. Live API and UI verified.
 
 ---
 
