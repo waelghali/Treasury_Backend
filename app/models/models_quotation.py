@@ -393,6 +393,7 @@ class QuotationBankLegConfig(BaseModel):
     leg_id = Column(String, ForeignKey("quotation_legs.id", ondelete="CASCADE"), nullable=False, index=True)
     
     is_invited = Column(Boolean, default=True, nullable=False)
+    is_passed = Column(Boolean, default=False, nullable=False, comment="True if dealer explicitly passed/declined to quote this leg")
     cost_min = Column(Float, default=0.0)
     cost_percent = Column(Float, default=0.0)
     cost_max = Column(Float, default=0.0)

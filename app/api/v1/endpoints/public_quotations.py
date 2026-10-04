@@ -359,6 +359,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             "cost_flat": cfg_cost_flat,
             "cost_min": cfg_cost_min,
             "cost_max": cfg_cost_max,
+            "is_passed": getattr(leg_cfg, 'is_passed', False) if leg_cfg else False,
             "offers": leg_offers_list,
             "cbe_benchmark_rate": leg_bm,
             "live_rank": leg_rank_info
@@ -1432,6 +1433,27 @@ def submit_fx_offers_batch(
         )
         db.add(offer)
         submitted_offers.append(offer)
+
+    # Process and record any explicitly passed legs by the dealer
+    if payload.passed_legs:
+        import uuid
+        for passed_leg_id in payload.passed_legs:
+            # Check if leg config already exists
+            leg_cfg = db.query(QuotationBankLegConfig).filter(
+                QuotationBankLegConfig.assignment_id == assignment.id,
+                QuotationBankLegConfig.leg_id == passed_leg_id
+            ).first()
+            if leg_cfg:
+                leg_cfg.is_passed = True
+            else:
+                new_leg_cfg = QuotationBankLegConfig(
+                    id=str(uuid.uuid4()),
+                    assignment_id=assignment.id,
+                    leg_id=passed_leg_id,
+                    is_invited=True,
+                    is_passed=True
+                )
+                db.add(new_leg_cfg)
 
     db.commit()
 
