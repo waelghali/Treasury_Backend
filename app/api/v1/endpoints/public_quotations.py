@@ -341,6 +341,22 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             except Exception:
                 pass
 
+        # Phase 6.5: Live Market Benchmark for leg
+        leg_market_bm = None
+        if (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
+            try:
+                from app.services.live_market_service import live_market_service
+                leg_market_bm = live_market_service.get_empirical_reference(
+                    db,
+                    customer_id=rfq.customer_id,
+                    from_code=leg.buy_currency,
+                    to_code=leg.sell_currency,
+                    direction=leg.direction or rfq.direction or 'BUY',
+                    amount=leg.amount
+                )
+            except Exception:
+                pass
+
         portal_legs.append({
             "id": leg.id,
             "pair_order": leg.pair_order,
@@ -363,6 +379,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             "is_passed": getattr(leg_cfg, 'is_passed', False) if leg_cfg else False,
             "offers": leg_offers_list,
             "cbe_benchmark_rate": leg_bm,
+            "market_benchmark": leg_market_bm,
             "live_rank": leg_rank_info
         })
 
@@ -398,6 +415,22 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         rfq_approved_by_email = rfq.creator.email
         rfq_approved_by_name = (getattr(rfq.creator, "full_name", None) or getattr(rfq.creator, "name", None) or rfq.creator.email)
         rfq_approved_at = rfq.created_at.isoformat() if rfq.created_at else None
+
+    # Phase 6.5: Live Market Benchmark for root RFQ
+    root_market_bm = portal_legs[0].get("market_benchmark") if portal_legs else None
+    if not root_market_bm and rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
+        try:
+            from app.services.live_market_service import live_market_service
+            root_market_bm = live_market_service.get_empirical_reference(
+                db,
+                customer_id=rfq.customer_id,
+                from_code=rfq.buy_currency,
+                to_code=rfq.sell_currency,
+                direction=rfq.direction or 'BUY',
+                amount=rfq.amount
+            )
+        except Exception:
+            pass
 
     return {
         "id": rfq.id,
@@ -453,6 +486,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "total_execution_dealers": sum(1 for c in (_get_bank_contacts_list(q_bank) if q_bank else []) if c.get("role") == "EXECUTION"),
         "requires_bank_approval": requires_bank_approval,
         "cbe_benchmark_rate": cbe_benchmark_rate,
+        "market_benchmark": root_market_bm,
         "is_live_ranking_enabled": is_live_ranking_enabled,
         "live_rank": live_rank,
         "total_quotes": total_quotes,

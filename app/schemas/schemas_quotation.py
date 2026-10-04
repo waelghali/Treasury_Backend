@@ -402,6 +402,7 @@ class QuotationResultsOut(BaseModel):
     has_execution_banks: bool = True
     savings_summary: Optional[dict] = None
     live_telemetry: Optional[dict] = None
+    market_benchmark: Optional[dict] = None
 
 # --- Bank Live Ranking Schemas ---
 class BankLiveRankingConfigCreate(BaseModel):

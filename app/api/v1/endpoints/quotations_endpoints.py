@@ -1959,6 +1959,29 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 if leg_is_uncontested else None
             )
 
+            # Phase 6.5: Live Market Benchmark & Empirical Historical Spread
+            leg_market_bm = None
+            if (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
+                try:
+                    from app.services.live_market_service import live_market_service
+                    leg_market_bm = live_market_service.get_empirical_reference(
+                        db,
+                        customer_id=rfq.customer_id,
+                        from_code=leg.buy_currency,
+                        to_code=leg.sell_currency,
+                        direction=leg.direction or rfq.direction or 'Buy',
+                        amount=leg.amount
+                    )
+                    win_rate_val = leg_savings_summary.get("winner_rate") if leg_savings_summary else None
+                    if win_rate_val and leg_market_bm:
+                        leg_market_bm["quote_evaluation"] = live_market_service.evaluate_quote_spread(
+                            float(win_rate_val),
+                            leg_market_bm,
+                            direction=leg.direction or rfq.direction or 'Buy'
+                        )
+                except Exception as bm_err:
+                    logger.warning(f"Error computing live market benchmark for leg {leg.id}: {bm_err}")
+
             legs_data.append({
                 "leg_id": leg.id,
                 "leg_index": leg.leg_index,
@@ -1989,7 +2012,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 "best_execution_rate": leg_best_execution,
                 "deviation_percent": leg_deviation_pct,
                 "has_execution_banks": leg_has_execution,
-                "savings_summary": leg_savings_summary
+                "savings_summary": leg_savings_summary,
+                "market_benchmark": leg_market_bm
             })
 
     # --- Live Trading Floor Presence Telemetry ---
@@ -2194,6 +2218,28 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
 
     db.commit()
 
+    # Phase 6.5: Derive Root Market Benchmark for Single-Pair / Overall RFQ
+    root_market_bm = primary_leg.get("market_benchmark") if primary_leg else None
+    if not root_market_bm and rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
+        try:
+            from app.services.live_market_service import live_market_service
+            root_market_bm = live_market_service.get_empirical_reference(
+                db,
+                customer_id=rfq.customer_id,
+                from_code=rfq.buy_currency,
+                to_code=rfq.sell_currency,
+                direction=rfq.direction or 'Buy',
+                amount=rfq.amount
+            )
+            if savings_summary and savings_summary.get("winner_rate") and root_market_bm:
+                root_market_bm["quote_evaluation"] = live_market_service.evaluate_quote_spread(
+                    float(savings_summary["winner_rate"]),
+                    root_market_bm,
+                    direction=rfq.direction or 'Buy'
+                )
+        except Exception as root_bm_err:
+            logger.warning(f"Error computing root market benchmark: {root_bm_err}")
+
     return {
         "rfq": rfq,
         "legs": legs_data,
@@ -2208,7 +2254,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         "is_uncontested": is_uncontested,
         "uncontested_reason": uncontested_reason,
         "live_telemetry": live_telemetry,
-        "savings_summary": savings_summary
+        "savings_summary": savings_summary,
+        "market_benchmark": root_market_bm
     }
 
 @router.get("/", response_model=List[QuotationRequestOut])

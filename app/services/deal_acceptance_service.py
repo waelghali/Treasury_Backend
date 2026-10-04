@@ -425,7 +425,8 @@ def get_active_deal_awaiting_acceptance(
                     "is_inconclusive": l.get("is_inconclusive", False),
                     "is_uncontested": l.get("is_uncontested", False),
                     "uncontested_reason": l.get("uncontested_reason"),
-                    "counterparty_offers": _sanitize_offers_ladder(l_res, l.get("winner_bank_id"), is_sell=((l.get("direction") or "Buy").lower() == "sell"))
+                    "counterparty_offers": _sanitize_offers_ladder(l_res, l.get("winner_bank_id"), is_sell=((l.get("direction") or "Buy").lower() == "sell")),
+                    "market_benchmark": l.get("market_benchmark")
                 })
 
         is_uncontested_deal = standings.get("is_uncontested", False)
@@ -472,7 +473,8 @@ def get_active_deal_awaiting_acceptance(
             "timeout_action": rfq.acceptance_timeout_action or "AUTO_REJECT",
             "is_auto_accept_halted": is_auto_accept_halted,
             "legs": legs_summary,
-            "counterparty_offers": root_offers
+            "counterparty_offers": root_offers,
+            "market_benchmark": standings.get("market_benchmark")
         })
 
     if not urgent_deals:
