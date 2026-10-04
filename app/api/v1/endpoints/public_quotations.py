@@ -2800,19 +2800,34 @@ def submit_dealer_feedback(
         if dealer_email and not dealer_name:
             dealer_name = dealer_email.split("@")[0]
 
-    feedback = QuotationDealerFeedback(
-        rfq_id=assignment.rfq_id,
-        quotation_bank_id=assignment.quotation_bank_id,
-        bank_id=bank_id,
-        bank_name=bank_name,
-        dealer_email=dealer_email if not req_body.is_anonymous else None,
-        dealer_name=dealer_name if not req_body.is_anonymous else None,
-        is_anonymous=req_body.is_anonymous,
-        star_rating=req_body.star_rating,
-        category=req_body.category,
-        comment=req_body.comment.strip() if req_body.comment else None,
-        status="NEW"
-    )
+    if req_body.is_anonymous:
+        feedback = QuotationDealerFeedback(
+            rfq_id=None,
+            quotation_bank_id=None,
+            bank_id=None,
+            bank_name="Verified Bank Partner",
+            dealer_email=None,
+            dealer_name="Anonymous Trader",
+            is_anonymous=True,
+            star_rating=req_body.star_rating,
+            category=req_body.category,
+            comment=req_body.comment.strip() if req_body.comment else None,
+            status="NEW"
+        )
+    else:
+        feedback = QuotationDealerFeedback(
+            rfq_id=assignment.rfq_id,
+            quotation_bank_id=assignment.quotation_bank_id,
+            bank_id=bank_id,
+            bank_name=bank_name,
+            dealer_email=dealer_email,
+            dealer_name=dealer_name,
+            is_anonymous=False,
+            star_rating=req_body.star_rating,
+            category=req_body.category,
+            comment=req_body.comment.strip() if req_body.comment else None,
+            status="NEW"
+        )
     db.add(feedback)
     db.commit()
     db.refresh(feedback)

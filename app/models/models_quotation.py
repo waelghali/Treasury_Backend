@@ -591,16 +591,17 @@ class QuotationDealerFeedback(Base):
     bank = relationship("Bank")
 
     def to_dict(self):
+        is_anon = bool(self.is_anonymous)
         return {
             "id": self.id,
-            "rfq_id": self.rfq_id,
-            "rfq_ref_no": getattr(self.rfq, 'ref_no', None) if self.rfq else None,
-            "quotation_bank_id": self.quotation_bank_id,
-            "bank_id": self.bank_id,
-            "bank_name": self.bank_name or (self.bank.name if self.bank else "Unknown Bank"),
-            "dealer_email": "Anonymous Dealer" if self.is_anonymous else self.dealer_email,
-            "dealer_name": "Anonymous" if self.is_anonymous else (self.dealer_name or (self.dealer_email.split('@')[0] if self.dealer_email else "Trader")),
-            "is_anonymous": self.is_anonymous,
+            "rfq_id": None if is_anon else self.rfq_id,
+            "rfq_ref_no": None if is_anon else (getattr(self.rfq, 'ref_no', None) if self.rfq else None),
+            "quotation_bank_id": None if is_anon else self.quotation_bank_id,
+            "bank_id": None if is_anon else self.bank_id,
+            "bank_name": "Verified Bank Partner" if is_anon else (self.bank_name or (self.bank.name if self.bank else "Unknown Bank")),
+            "dealer_email": "Anonymous Dealer" if is_anon else self.dealer_email,
+            "dealer_name": "Anonymous Trader" if is_anon else (self.dealer_name or (self.dealer_email.split('@')[0] if self.dealer_email else "Trader")),
+            "is_anonymous": is_anon,
             "star_rating": self.star_rating,
             "category": self.category,
             "comment": self.comment,
