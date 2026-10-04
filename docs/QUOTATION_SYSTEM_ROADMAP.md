@@ -331,15 +331,17 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
     - Updated `executeBatchSubmit` to transmit `passed_legs: passedLegIds` to the backend.
     - Dynamic quoting counter in console header: displays both `X Passed` and `Y / Z Quoted`.
     - Dynamic submit button label: `Submit Quotes (X of Y Pairs)` and disabled guardrail when all legs are passed.
+    - **Dealer Full Pass (Option 1 Adopted)**: Allowed dealers to pass on all legs and transmit a complete pass. Dynamic button styles to slate `✕ Submit Pass on All Legs` (or `✕ Update Pass on All Legs`), prompts with safety confirmation modal before transmitting, and dispatches backend audit trail and notifications with zero rates.
 
 - **Technical Findings & Gotchas**:
   - **Database Column Prerequisite**: SQLAlchemy ORM lazy loading immediately raises `UndefinedColumn: column quotation_bank_leg_configs.is_passed does not exist` when accessing relationships if the database column is missing. Executed clean direct `ALTER TABLE` without throwaway migration files.
   - **Fat-Finger Guard Nuance**: The cross-leg synthetic cross-rate swap detection and individual 10x deviation checks in `handleBatchSubmit` must evaluate only active quoted legs (`quotesToSubmit`), ignoring passed legs so dealers can pass legs without triggering false anomaly modals.
+  - **Dealer Decline Scope**: The "Decline Participation" button is strictly scoped to internal bank `APPROVER` roles during pre-trade reviews. Permitting execution dealers to submit a full pass via `[ Submit Pass on All Legs ]` provides a unified, intuitive UX without requiring separate decline workflows.
 
 - **Verification Proof**:
   - `python -m py_compile` passed on all backend models and schemas with zero errors.
-  - Frontend production build (`craco build`) passed cleanly (`main.44c4e966.js`, code 0).
-  - Live API verification: `GET /api/v1/public-quotation/9ecd319f-2f81-4c6d-8f08-25afa39b4733` returned `HTTP 200 OK` with `is_passed` exposed on all legs.
+  - Frontend production build (`craco build`) passed cleanly (`main.01500639.js`, code 0).
+  - Local commits: Backend `4d32ad9`, `dd4ce11`, `ffa6271`; Frontend `09d194c`, `81366fe`. Live API and public portal verified.
 
 ---
 
