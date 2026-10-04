@@ -13,6 +13,8 @@
 5. [Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine](#5-phase-4-smart-counterparty-intelligence--dynamic-recommendation-engine)
 6. [Phase 5: Institutional Banking Cyber Security & Compliance Readiness](#6-phase-5-institutional-banking-cyber-security--compliance-readiness-enterprise-onboarding-track)
 7. [Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture](#7-phase-6-selective-leg-quoting-uncontested-deal-governance--unified-skipped-bank-architecture)
+8. [Phase 7: Platform Owner Diagnostics Console & Dealer Voice System](#8-phase-7-platform-owner-diagnostics-console--dealer-voice-system)
+9. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
 
 ---
 
@@ -355,9 +357,7 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 - **Verification & Testing Criteria**:
   - Verify live mid rates update in real-time during market hours.
   - Verify pip/spread calculation against submitted bank quotes is mathematically accurate.
----
-
-### 7. Phase 7: Platform Owner Diagnostics Console & Dealer Voice System
+## 8. Phase 7: Platform Owner Diagnostics Console & Dealer Voice System
 
 ---
 
@@ -447,3 +447,129 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
   - Submit a feedback test from the dealer quotation page with 5 stars and category `Rate Triangulation`.
   - Verify the entry appears instantly in the Super Admin Feedback Inbox.
   - Test the anonymous toggle and confirm the dealer email is masked while retaining the bank association.
+
+---
+
+## 9. Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics
+
+### 9.1 Strategic Vision & Executive Objective
+To build an institutional-grade security perimeter where **the database contains zero plaintext confidential financial terms** (bank quotes, profit margins, deal spreads, pricing models), isolating the System Owner, database hosting providers, and compromised backups from customer data.
+
+Concurrently, the platform must preserve:
+1. **Uninterrupted UX**: Zero key-management friction for non-technical corporate treasurers.
+2. **Self-Contained Maintenance**: 100% automated user onboarding and self-service email password recovery with rate-limiting cooldown timers, requiring **zero manual intervention from the System Owner**.
+3. **Collaborative Intelligence**: Platform-wide market benchmarks (interbank spread averages, percentile rankings, liquidity depth, and dealer gamification trophies) computed securely without ever decrypting or exposing individual corporate deal specifics.
+
+---
+
+### 9.2 The Phased Cryptographic Model: Seamless $0.00 to Cloud KMS Evolution
+
+To balance operational cost during early growth with Tier-1 bank procurement readiness, the system employs **Envelope Encryption with an Abstracted Key Management Provider**:
+
+```
+                       ┌──────────────────────────────────────────────┐
+                       │           Sensitive Quotation Data           │
+                       │    (Quotes, Spreads, Margins, Volume)        │
+                       └──────────────────────┬───────────────────────┘
+                                              │
+                              Encrypted via AES-256-GCM
+                                              │
+                                              ▼
+                       ┌──────────────────────────────────────────────┐
+                       │     Tenant Data Encryption Key (DEK)         │
+                       │          (Unique Per Customer)               │
+                       └──────────────────────┬───────────────────────┘
+                                              │
+                               Sealed via Master KEK
+                                              │
+                      ┌───────────────────────┴───────────────────────┐
+                      ▼                                               ▼
+         [ Stage 1: $0.00 / Month ]                      [ Stage 2: $5–$15 / Month ]
+       Self-Contained Server Isolation                    Cloud KMS Hardware Security
+   (Local Master KEK + Tenant Envelopes)             (AWS KMS / GCP Cloud KMS HSM Provider)
+   - Zero infrastructure cost                        - FIPS 140-2 Level 2/3 hardware isolation
+   - Ideal for pilot customers & dev                 - Hardware-enforced separation of duties
+   - Code swap: exactly 1 file / 20 lines            - Meets institutional CISO bank checklists
+```
+
+#### Why Upgrading Requires Zero Rewriting:
+* **The Database Schema NEVER Changes**: In both Stage 1 and Stage 2, ciphertext columns in PostgreSQL (`encrypted_offer_price`, `encrypted_spread`, `dek_envelope`) remain 100% identical.
+* **Zero Data Re-Encryption Needed**: The customer's Tenant DEK encrypts the deals. Upgrading from $0 to Cloud KMS only wraps the DEK with a Cloud KEK instead of a local Server KEK. No historical deal rows ever need to be decrypted or re-encrypted.
+* **Unified Code Interface**:
+  ```python
+  # app/core/security_crypto.py
+  class KeyProvider(ABC):
+      @abstractmethod
+      def unwrap_dek(self, encrypted_dek: bytes, tenant_id: str) -> bytes: pass
+
+  class LocalServerKeyProvider(KeyProvider):  # Stage 1: $0.00
+      ...
+  class CloudKmsKeyProvider(KeyProvider):     # Stage 2: $5-$15 (Plug-and-play)
+      ...
+  ```
+
+---
+
+### 9.3 Self-Contained Lifecycle & Zero System Owner Maintenance
+
+#### 1. Zero-Touch Onboarding
+1. System Owner invites Customer and creates the first Corporate Admin with their email address.
+2. The platform automatically dispatches an encrypted, single-use activation link to the user's email.
+3. The Corporate Admin opens the link in their browser and sets their own private password.
+4. The backend initializes a cryptographically random Tenant DEK (256-bit AES), encrypts it inside the user's envelope, and commits it.
+5. **System Owner Visibility**: Zero knowledge of the password, zero plaintext exposure.
+
+#### 2. Self-Contained Password Recovery (Forgot Password)
+1. **Initiation**: User clicks "Forgot Password" on the login screen.
+2. **Abuse Prevention**: Platform enforces a **Cooldown Timer & Rate Limiter** (e.g., max 3 recovery attempts per 1 hour; 15-minute token TTL).
+3. **Signed Token**: An HMAC-SHA256 time-bounded recovery token is dispatched directly to the user's registered corporate email.
+4. **Automated Re-Enveloping**: 
+   - Upon clicking the verified email link, the user enters their new password.
+   - The platform unseals the tenant recovery envelope and re-encrypts the Tenant DEK with the user's new password derivative.
+5. **Operational Result**: Zero data loss, zero customer lockout, and **zero support tickets or manual tasks for the System Owner**.
+
+---
+
+### 9.4 Privacy-Preserving Collaborative Analytics & Trophies
+
+The platform achieves a mathematical dual-state: **Absolute Private Isolation vs. Collective Market Analytics**:
+
+| System Domain | Privacy Mechanism | System Owner Visibility | Counterparty Visibility |
+| :--- | :--- | :--- | :--- |
+| **Corporate Deal Terms** | Envelope AES-256-GCM | ❌ Scrambled Ciphertext | Only authorized invited banks on that specific leg |
+| **Bank Relative Ranking** | Zero-Knowledge Blinded Percentiles | ❌ No raw spreads revealed | Bank sees relative rank (`#1 of 4`, `Top Quartile`) without seeing competitor rates |
+| **Market Spread Trend** | Aggregate Differential Privacy ($\epsilon$-Noise) | ✅ Trend & median curve | Corporate views market spread vs. interbank mid |
+| **Dealer Achievements** | One-Way Tokenized Telemetry (Win counts, speed ms, streaks) | ✅ Trophies & gamification metrics calculated accurately | Dealer sees unlocked personal trophies; rivals see zero deal data |
+
+---
+
+### 9.5 Harmonized Execution Sequence Across All Roadmap Phases
+
+To ensure development proceeds in strict logical order without circular dependencies, the implementation roadmap is harmonized into the following unified milestones:
+
+```
+[ Phase 1 & 2 ] Counterparty Security, Domain Integrity & OTP Hardening (Completed ✅)
+      │
+      ▼
+[ Phase 6.1 - 6.4 ] Selective Leg Quoting, Pass Leg & Uncontested Deal Governance (In Progress)
+      │
+      ▼
+[ Phase 3 ] Multi-Leg "Invisible" Legs (Selective Counterparty Exclusion)
+      │
+      ▼
+[ Phase 7 ] Platform Owner Diagnostics Console & Dealer Voice System
+      │
+      ▼
+[ Phase 4 ] Smart Counterparty Intelligence & Dynamic Recommendation Engine
+      │
+      ▼
+[ Phase 6.5 ] Live Market Benchmark (FXStreet / XE Interbank Mid Feed)
+      │
+      ▼
+[ Phase 8 ] Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics
+      │   ├─ Stage 1: $0.00 Self-Contained Envelope Encryption & Automated Email Recovery
+      │   └─ Stage 2: Seamless Multi-Tenant Cloud KMS Plug-in ($5–$15/mo)
+      │
+      ▼
+[ Phase 5 ] Institutional Cyber Security, WORM Auditing & Bank Compliance Attestation
+```
