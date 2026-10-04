@@ -7,14 +7,15 @@
 
 ## 📌 Table of Contents
 1. [Executive Summary & Vision](#1-executive-summary--vision)
-2. [Phase 1: Counterparty Integrity & Security Controls (Completed)](#2-phase-1-counterparty-integrity--security-controls-completed)
-3. [Phase 2: Bank Protection & Cryptographic Security Hardening (Completed)](#3-phase-2-bank-protection--cryptographic-security-hardening-completed--verified-)
-4. [Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion](#4-phase-3-multi-leg-invisible-legs--selective-counterparty-exclusion)
-5. [Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine](#5-phase-4-smart-counterparty-intelligence--dynamic-recommendation-engine)
-6. [Phase 5: Institutional Banking Cyber Security & Compliance Readiness](#6-phase-5-institutional-banking-cyber-security--compliance-readiness-enterprise-onboarding-track)
-7. [Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture](#7-phase-6-selective-leg-quoting-uncontested-deal-governance--unified-skipped-bank-architecture)
-8. [Phase 7: Platform Owner Diagnostics Console & Dealer Voice System](#8-phase-7-platform-owner-diagnostics-console--dealer-voice-system)
-9. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
+2. [Production Database Migration Ledger (Manual Production DDL)](#-production-database-migration-ledger-manual-production-ddl)
+3. [Phase 1: Counterparty Integrity & Security Controls (Completed)](#2-phase-1-counterparty-integrity--security-controls-completed)
+4. [Phase 2: Bank Protection & Cryptographic Security Hardening (Completed)](#3-phase-2-bank-protection--cryptographic-security-hardening-completed--verified-)
+5. [Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion](#4-phase-3-multi-leg-invisible-legs--selective-counterparty-exclusion)
+6. [Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine](#5-phase-4-smart-counterparty-intelligence--dynamic-recommendation-engine)
+7. [Phase 5: Institutional Banking Cyber Security & Compliance Readiness](#6-phase-5-institutional-banking-cyber-security--compliance-readiness-enterprise-onboarding-track)
+8. [Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture](#7-phase-6-selective-leg-quoting-uncontested-deal-governance--unified-skipped-bank-architecture)
+9. [Phase 7: Platform Owner Diagnostics Console & Dealer Voice System](#8-phase-7-platform-owner-diagnostics-console--dealer-voice-system)
+10. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
 
 ---
 
@@ -62,6 +63,18 @@ Before writing code for any sub-phase, perform a systematic 5-point inspection:
   2. **Technical Findings & Gotchas**: Uncovered realities or system nuances discovered during implementation.
   3. **Plan Deviations**: Any divergence from the original conceptual design with explicit architectural justification.
   4. **Verification Proof**: Exact test steps and database/UI checks confirming success.
+
+---
+
+## 🗄️ Production Database Migration Ledger (Manual Production DDL)
+
+To maintain a clean codebase without single-use migration scripts, all manual DDL modifications applied to local development databases are logged in this centralized ledger with exact SQL statements, target tables, and verification queries. 
+
+**Run these exact statements when deploying updates to Production PostgreSQL:**
+
+| Phase | Target Table | Action | Production SQL Statement | Verification Query |
+| :--- | :--- | :--- | :--- | :--- |
+| **Phase 6.1** | `quotation_bank_leg_configs` | Add column `is_passed` | ```sql<br>ALTER TABLE quotation_bank_leg_configs<br>ADD COLUMN IF NOT EXISTS is_passed BOOLEAN NOT NULL DEFAULT FALSE;<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_bank_leg_configs' AND column_name = 'is_passed';<br>``` |
 
 ---
 
