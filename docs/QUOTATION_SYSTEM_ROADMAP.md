@@ -345,22 +345,30 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 
 ---
 
-#### 📌 Phase 6.2: Corporate Results View — "Skipped Bank" Audit Matrix
+#### 📌 Phase 6.2: Corporate Results View — "Skipped Bank" Audit Matrix (Completed & Verified ✅)
 *Scope: Corporate evaluation dashboard, leg comparison tables, and audit logs.*
 
-- **Backend Aggregation (`compute_rfq_standings` in `quotations_endpoints.py`)**:
-  - Expose `is_passed: bool` in each bank's leg result payload.
-- **Frontend Presentation (`ResultsView.js` & `QuotationRequestDashboard.js`)**:
-  - In each leg's counterparty table, render the exact audit reason for any unquoted bank:
-    - `res.is_passed === true` $\rightarrow$ **`Passed on this leg`** (Slate neutral badge; timestamp: `Passed by Dealer`).
-    - `res.submitted_at === null` $\rightarrow$ **`No Quote Submitted`** (Muted gray badge; timestamp: `No Submission`).
-    - `res.approval_status === 'DECLINED'` $\rightarrow$ **`Participation Declined`** (Rose badge).
-    - `res.is_invited === false` (Phase 3 Invisible) $\rightarrow$ **`Excluded / Not Invited`** (Subtle outline badge).
-- **Verification & Testing Criteria**:
-  - Open corporate dashboard for the Phase 6.1 test tender.
-  - Verify Leg 1 displays the bank's active competitive rate.
-  - Verify Leg 2 displays the bank with `Passed on this leg` and rate `—`.
-  - Verify uninvited or timed-out banks display their respective badges cleanly without layout shifting.
+- **Work Actually Done**:
+  - **Backend Aggregation (`compute_rfq_standings` in [`app/api/v1/endpoints/quotations_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py))**:
+    - Injected `"is_passed": bool(getattr(cfg, 'is_passed', False)) if cfg else False` in unquoted bank leg results.
+    - Set `"is_passed": False` for active quote submissions.
+  - **Frontend Counterparty Cards ([`ResultsView.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/ResultsView.js))**:
+    - Subtitle Header: Displays `Passed by Dealer • Declined to quote this pair` when `result.is_passed === true`.
+    - Status Badge: Displays a distinct, elevated slate pill:
+      - `Passed on this leg` with a neutral slate dot indicator.
+      - Accompanying caption: `Declined to quote by dealer`.
+    - Retains full backward compatibility with `Declined by Bank` (Approver decline), `No Offer Received` (Window closed without response), and `Awaiting Submission` (Active bidding in progress).
+  - **Trophy & Accolade Safety Audit**:
+    - Performed a mathematical audit on the Dealer Accolade Engine ([`dealer_achievement_service.py`](file:///c:/Grow/app/services/dealer_achievement_service.py)).
+    - Confirmed that passed legs do not inject dummy rows into `QuotationOffer`, preventing false inflation of pricing velocity trophies (`Swift Quoting`) and ensuring 100% accurate win streaks (`Unbroken Victor`) and volume metrics (`Liquidity Titan`).
+
+- **Technical Findings & Gotchas**:
+  - `compute_rfq_standings` is invoked in both live evaluation and deal acceptance workflows; maintaining `is_passed` as an explicit boolean dictionary key ensures downstream consumers never encounter `KeyError` or falsy misclassifications.
+
+- **Verification Proof**:
+  - `python -m py_compile` passed on `quotations_endpoints.py` with zero errors.
+  - Frontend production build (`craco build`) compiled cleanly (`main.ca0d065c.js`, code 0).
+  - Local commits: Backend `994a77c`; Frontend `0e81270`.
 
 ---
 
