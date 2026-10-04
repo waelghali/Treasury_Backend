@@ -998,7 +998,7 @@ def desk_heartbeat(
     w_end = _to_utc_dt(rfq.window_end) if rfq else None
     
     # Retrieve customer-configured corporate acceptance timeout (default: 120s for TBILL, 30s for FX_SPOT)
-    acceptance_timeout_seconds = 120 if (rfq and rfq.type == "TBILL") else 30
+    acceptance_timeout_seconds = getattr(rfq, 'acceptance_timeout_seconds', None) or (120 if (rfq and rfq.type == "TBILL") else 30)
     if rfq and rfq.customer_id:
         try:
             from app.crud.crud_config import crud_customer_configuration
@@ -1011,10 +1011,10 @@ def desk_heartbeat(
             pass
 
     # Desk session coordination allowed from 10 minutes before window_start
-    # until (Corporate Acceptance Timeout + 1 minute buffer) after window_end,
+    # until (Corporate Acceptance Timeout + 30s buffer) after window_end,
     # as counterparties must remain connected at their desk during the corporate acceptance period.
     from datetime import timedelta
-    post_buffer = timedelta(seconds=acceptance_timeout_seconds + 60)
+    post_buffer = timedelta(seconds=acceptance_timeout_seconds + 30)
     is_session_active = bool(
         w_start and w_end and 
         (w_start - timedelta(minutes=10)) <= now <= (w_end + post_buffer) and 
