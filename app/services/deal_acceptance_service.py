@@ -365,6 +365,20 @@ def get_active_deal_awaiting_acceptance(
                     "uncontested_reason": l.get("uncontested_reason")
                 })
 
+        is_uncontested_deal = standings.get("is_uncontested", False)
+        allow_single_auto_accept = False
+        try:
+            from app.crud.crud_config import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg_single = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, rfq.customer_id, GlobalConfigKey.AUTO_ACCEPT_SINGLE_QUOTE
+            )
+            allow_single_auto_accept = str(cfg_single.get("effective_value") if cfg_single else "false").strip().lower() in ("true", "1")
+        except Exception:
+            allow_single_auto_accept = False
+
+        is_auto_accept_halted = bool(is_uncontested_deal and (rfq.acceptance_timeout_action == "AUTO_ACCEPT") and not allow_single_auto_accept)
+
         urgent_deals.append({
             "rfq_id": str(rfq.id),
             "ref_no": rfq.ref_no,
@@ -378,11 +392,12 @@ def get_active_deal_awaiting_acceptance(
             "winner_bank_name": winner_name,
             "winner_rate": winner_rate,
             "saved_vs_avg": saved_vs_avg,
-            "is_uncontested": standings.get("is_uncontested", False),
+            "is_uncontested": is_uncontested_deal,
             "uncontested_reason": standings.get("uncontested_reason"),
             "acceptance_deadline": acc_deadline_utc.isoformat(),
             "seconds_remaining": diff_seconds,
             "timeout_action": rfq.acceptance_timeout_action or "AUTO_REJECT",
+            "is_auto_accept_halted": is_auto_accept_halted,
             "legs": legs_summary
         })
 

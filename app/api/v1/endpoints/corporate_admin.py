@@ -1017,6 +1017,45 @@ def update_customer_configuration(
                 )
         # ---------------------------------------
 
+        # 3b. --- VALIDATION: Quotation Acceptance Governance Invariants ---
+        if key_for_db == "AUTO_ACCEPT_SINGLE_QUOTE" and str(config_in.configured_value).strip().lower() in ("true", "1"):
+            def_act_cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id, GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION
+            )
+            def_act = (def_act_cfg.get("effective_value") if def_act_cfg else "AUTO_REJECT") or "AUTO_REJECT"
+            if str(def_act).strip().upper() in ("AUTO_REJECT", "REJECT", "FALSE", "0"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="AUTO_ACCEPT_SINGLE_QUOTE cannot be set to true when QUOTATION_ACCEPTANCE_DEFAULT_ACTION is set to AUTO_REJECT."
+                )
+
+        # 3c. --- AUDIT: Record Legal Consent Acknowledgment ---
+        if (
+            (key_for_db == "QUOTATION_ACCEPTANCE_DEFAULT_ACTION" and str(config_in.configured_value).strip().upper() in ("AUTO_ACCEPT", "TRUE", "ACCEPT")) or
+            (key_for_db == "AUTO_ACCEPT_SINGLE_QUOTE" and str(config_in.configured_value).strip().lower() in ("true", "1"))
+        ):
+            log_action(
+                db,
+                user_id=corporate_admin_context.user_id,
+                action_type="QUOTATION_LEGAL_CONSENT_ACKNOWLEDGED",
+                entity_type="CustomerConfiguration",
+                entity_id=None,
+                details={
+                    "config_key": key_for_db,
+                    "configured_value": config_in.configured_value,
+                    "consent_notice": (
+                        "Notice of Administrative Delegation: Enabling automated execution is strictly a procedural delegation "
+                        "of executing the acceptance action upon countdown expiry. The corporate organization retains full and sole "
+                        "commercial, financial, and legal responsibility for all trade executions, counterparty selections, and price exposure."
+                    ),
+                    "user_id": corporate_admin_context.user_id,
+                    "user_email": getattr(corporate_admin_context, "email", None),
+                    "ip_address": client_host
+                },
+                customer_id=customer_id,
+                ip_address=client_host
+            )
+
         # 4. Capture old value for audit
         existing_customer_config = crud_customer_configuration.get_by_customer_and_global_config_id(
             db, customer_id=customer_id, global_config_id=global_config.id

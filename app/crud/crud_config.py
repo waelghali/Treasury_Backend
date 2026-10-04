@@ -446,6 +446,48 @@ class CRUDCustomerConfiguration(CRUDBase):
                             )
                 except (ValueError, TypeError):
                     pass  # Non-numeric — skip cross validation
+
+        # Cross-key rule: AUTO_ACCEPT_SINGLE_QUOTE vs QUOTATION_ACCEPTANCE_DEFAULT_ACTION
+        if global_config.key == GlobalConfigKey.AUTO_ACCEPT_SINGLE_QUOTE:
+            val_clean = configured_value.strip().lower()
+            if val_clean in ['true', '1']:
+                def_act_cfg = self.get_customer_config_or_global_fallback(
+                    db, customer_id, GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION
+                )
+                def_act = (def_act_cfg.get('effective_value') if def_act_cfg else 'AUTO_REJECT') or 'AUTO_REJECT'
+                if str(def_act).strip().upper() in ('AUTO_REJECT', 'REJECT', 'FALSE', '0'):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="AUTO_ACCEPT_SINGLE_QUOTE cannot be set to true when QUOTATION_ACCEPTANCE_DEFAULT_ACTION is set to AUTO_REJECT."
+                    )
+        elif global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+            val_clean = configured_value.strip().upper()
+            if val_clean in ('AUTO_REJECT', 'REJECT', 'FALSE', '0'):
+                # Invariant: If default action is AUTO_REJECT, AUTO_ACCEPT_SINGLE_QUOTE cannot be true ever
+                try:
+                    single_q_gc = self.global_config_crud.get_by_key(db, GlobalConfigKey.AUTO_ACCEPT_SINGLE_QUOTE)
+                    if single_q_gc:
+                        cust_single_q = self.get_by_customer_and_global_config_id(db, customer_id, single_q_gc.id)
+                        if cust_single_q and str(cust_single_q.configured_value).strip().lower() in ['true', '1']:
+                            cust_single_q.configured_value = 'false'
+                            db.add(cust_single_q)
+                            db.commit()
+                            log_action(
+                                db,
+                                user_id=user_id,
+                                action_type="UPDATE",
+                                entity_type="CustomerConfiguration",
+                                entity_id=cust_single_q.id,
+                                details={
+                                    "global_config_key": "AUTO_ACCEPT_SINGLE_QUOTE",
+                                    "old_value": "true",
+                                    "new_value": "false",
+                                    "reason": "Cascaded reset: QUOTATION_ACCEPTANCE_DEFAULT_ACTION set to AUTO_REJECT"
+                                },
+                                customer_id=customer_id
+                            )
+                except Exception as ex:
+                    logger.warning(f"Could not cascade reset AUTO_ACCEPT_SINGLE_QUOTE: {ex}")
         
         customer_config = self.get_by_customer_and_global_config_id(
             db, customer_id, global_config_id

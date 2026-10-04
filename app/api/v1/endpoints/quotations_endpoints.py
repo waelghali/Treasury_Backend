@@ -1477,54 +1477,12 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 rfq.acceptance_status = 'REJECTED'
             db.commit()
         else:
-            # Acceptance decision is still pending. Check if acceptance window has expired!
-            if acc_deadline and now > acc_deadline:
-                from app.crud.crud import log_action
-                if rfq.acceptance_timeout_action == "AUTO_ACCEPT":
-                    rfq.status = 'COMPLETED'
-                    rfq.acceptance_status = 'AUTO_ACCEPTED'
-                    rfq.acceptance_resolved_at = now
-                    for leg in (rfq.legs or []):
-                        if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
-                            leg.status = 'ACCEPTED'
-                        elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
-                            leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
-                    db.commit()
-                    log_action(
-                        db=db,
-                        user_id=None,
-                        action_type="QUOTATION_DEAL_AUTO_ACCEPTED",
-                        entity_type="QuotationRequest",
-                        entity_id=None,
-                        details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "reason": "Acceptance window expired with policy AUTO_ACCEPT"},
-                        customer_id=rfq.customer_id
-                    )
-                else:
-                    # Policy is AUTO_REJECT (user's configuration!)
-                    rfq.status = 'REJECTED'
-                    rfq.acceptance_status = 'AUTO_REJECTED'
-                    rfq.admin_revision_notes = "Quotation auto-rejected: corporate acceptance window expired with default action AUTO_REJECT."
-                    rfq.acceptance_resolved_at = now
-                    for leg in (rfq.legs or []):
-                        leg.status = 'REJECTED'
-                        leg.rejection_reason = "Auto-rejected on acceptance timeout"
-                    db.commit()
-                    log_action(
-                        db=db,
-                        user_id=None,
-                        action_type="QUOTATION_DEAL_AUTO_REJECTED",
-                        entity_type="QuotationRequest",
-                        entity_id=None,
-                        details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "reason": "Acceptance window expired with policy AUTO_REJECT"},
-                        customer_id=rfq.customer_id
-                    )
-                    trigger_auto_dispatch_results(rfq.id)
-            else:
-                # Acceptance window is still active! Awaiting Corporate Admin manual decision
+            # Acceptance decision pending — will be evaluated after computing standings & uncontested status
+            if rfq.status not in ('REJECTED', 'CANCELLED', 'COMPLETED'):
+                rfq.status = 'EVALUATING'
+            if not rfq.acceptance_status:
                 rfq.acceptance_status = 'PENDING'
-                if rfq.status not in ('REJECTED', 'CANCELLED'):
-                    rfq.status = 'EVALUATING'
-                db.commit()
+            db.commit()
         
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
     
@@ -2101,6 +2059,97 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         rfq.winner_bank_name = None
         rfq.winner_rate = None
         rfq.saved_vs_avg = None
+
+    # Phase 6.4: Acceptance Window Expiration & Governance Engine
+    if is_closed and not is_indicative_only:
+        if rfq.acceptance_status in ('ACCEPTED', 'AUTO_ACCEPTED'):
+            rfq.status = 'COMPLETED'
+        elif rfq.acceptance_status in ('REJECTED', 'AUTO_REJECTED') or rfq.status == 'REJECTED':
+            rfq.status = 'REJECTED'
+            if not rfq.acceptance_status:
+                rfq.acceptance_status = 'REJECTED'
+        elif not is_inconclusive:
+            # Acceptance decision is still pending. Check if acceptance window has expired!
+            if acc_deadline and now > acc_deadline:
+                from app.crud.crud import log_action
+                if rfq.acceptance_timeout_action == "AUTO_ACCEPT":
+                    # Check AUTO_ACCEPT_SINGLE_QUOTE governance guardrail!
+                    cfg_single = crud_customer_configuration.get_customer_config_or_global_fallback(
+                        db, rfq.customer_id, GlobalConfigKey.AUTO_ACCEPT_SINGLE_QUOTE
+                    )
+                    allow_single_auto_accept = (
+                        str(cfg_single.get("effective_value") if cfg_single else "false").strip().lower() in ("true", "1")
+                    )
+
+                    if is_uncontested and not allow_single_auto_accept:
+                        # HALT automated execution for uncontested single quote!
+                        # Governance policy requires manual corporate treasury approval
+                        rfq.acceptance_status = 'PENDING'
+                        rfq.admin_revision_notes = (
+                            "Automated execution halted: sole-source uncontested quote received. "
+                            "Corporate treasury manual approval required by governance policy."
+                        )
+                        log_action(
+                            db=db,
+                            user_id=None,
+                            action_type="QUOTATION_AUTO_ACCEPT_HALTED_SINGLE_QUOTE",
+                            entity_type="QuotationRequest",
+                            entity_id=rfq.id,
+                            details={
+                                "rfq_id": rfq.id,
+                                "ref_no": rfq.ref_no,
+                                "reason": "Automated execution halted for uncontested single quote. Corporate treasury manual approval required."
+                            },
+                            customer_id=rfq.customer_id
+                        )
+                    else:
+                        # Competitive quotes OR customer has explicitly consented to auto-accepting single quote!
+                        rfq.status = 'COMPLETED'
+                        rfq.acceptance_status = 'AUTO_ACCEPTED'
+                        rfq.acceptance_resolved_at = now
+                        for leg in (rfq.legs or []):
+                            if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
+                                leg.status = 'ACCEPTED'
+                            elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
+                                leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+                        log_action(
+                            db=db,
+                            user_id=None,
+                            action_type="QUOTATION_DEAL_AUTO_ACCEPTED",
+                            entity_type="QuotationRequest",
+                            entity_id=rfq.id,
+                            details={
+                                "rfq_id": rfq.id,
+                                "ref_no": rfq.ref_no,
+                                "is_uncontested": is_uncontested,
+                                "reason": "Acceptance window expired with policy AUTO_ACCEPT"
+                            },
+                            customer_id=rfq.customer_id
+                        )
+                else:
+                    # Policy is AUTO_REJECT (user's configuration)
+                    rfq.status = 'REJECTED'
+                    rfq.acceptance_status = 'AUTO_REJECTED'
+                    rfq.admin_revision_notes = "Quotation auto-rejected: corporate acceptance window expired with default action AUTO_REJECT."
+                    rfq.acceptance_resolved_at = now
+                    for leg in (rfq.legs or []):
+                        leg.status = 'REJECTED'
+                        leg.rejection_reason = "Auto-rejected on acceptance timeout"
+                    log_action(
+                        db=db,
+                        user_id=None,
+                        action_type="QUOTATION_DEAL_AUTO_REJECTED",
+                        entity_type="QuotationRequest",
+                        entity_id=rfq.id,
+                        details={"rfq_id": rfq.id, "ref_no": rfq.ref_no, "reason": "Acceptance window expired with policy AUTO_REJECT"},
+                        customer_id=rfq.customer_id
+                    )
+                    trigger_auto_dispatch_results(rfq.id)
+            else:
+                # Acceptance window is still active! Awaiting Corporate Admin manual decision
+                rfq.acceptance_status = 'PENDING'
+                if rfq.status not in ('REJECTED', 'CANCELLED'):
+                    rfq.status = 'EVALUATING'
 
     # Auto-dispatch result emails for automated deal confirmations OR auto-rejections
     is_auto_deal_concluded = (rfq.acceptance_status in ('AUTO_ACCEPTED', 'AUTO_REJECTED')) or (rfq.status == 'COMPLETED' and is_indicative_only)
