@@ -272,6 +272,55 @@ async def execute_shared_deal_decline(
     }
 
 
+def _sanitize_offers_ladder(results_list, winner_id=None, is_sell=False):
+    if not results_list:
+        return []
+    offers = []
+    best_rate = None
+    rank = 1
+    for r in results_list:
+        if r.get("is_cross_entity"):
+            continue
+        bank_id = r.get("bank_id")
+        bank_name = r.get("bank_name") or "Bank"
+        is_passed = bool(r.get("is_passed"))
+        rate = r.get("finalPrice") if r.get("finalPrice") is not None else r.get("price")
+        if rate is None and r.get("best_score") is not None:
+            rate = r.get("best_score")
+        
+        has_quote = (rate is not None) and not is_passed
+        is_winner = bool(winner_id and bank_id == winner_id)
+        
+        item_rank = None
+        spread_bps = None
+        delta_rate = None
+        
+        if has_quote:
+            item_rank = rank
+            rank += 1
+            if best_rate is None:
+                best_rate = float(rate)
+            else:
+                diff = abs(float(rate) - best_rate)
+                delta_rate = round(diff, 4)
+                if best_rate > 0:
+                    spread_bps = round((diff / best_rate) * 10000, 1)
+
+        offers.append({
+            "bank_id": bank_id,
+            "bank_name": bank_name,
+            "rate": round(float(rate), 4) if rate is not None else None,
+            "has_quote": has_quote,
+            "is_passed": is_passed,
+            "is_winner": is_winner,
+            "rank": item_rank,
+            "spread_bps": spread_bps,
+            "delta_rate": delta_rate,
+            "quotation_base": r.get("quotation_base") or "Execution"
+        })
+    return offers
+
+
 def get_active_deal_awaiting_acceptance(
     user_id: int,
     customer_id: int,
@@ -375,7 +424,8 @@ def get_active_deal_awaiting_acceptance(
                     "total_quotes": len(valid_q),
                     "is_inconclusive": l.get("is_inconclusive", False),
                     "is_uncontested": l.get("is_uncontested", False),
-                    "uncontested_reason": l.get("uncontested_reason")
+                    "uncontested_reason": l.get("uncontested_reason"),
+                    "counterparty_offers": _sanitize_offers_ladder(l_res, l.get("winner_bank_id"), is_sell=((l.get("direction") or "Buy").lower() == "sell"))
                 })
 
         is_uncontested_deal = standings.get("is_uncontested", False)
@@ -391,6 +441,12 @@ def get_active_deal_awaiting_acceptance(
             allow_single_auto_accept = False
 
         is_auto_accept_halted = bool(is_uncontested_deal and (rfq.acceptance_timeout_action == "AUTO_ACCEPT") and not allow_single_auto_accept)
+
+        root_offers = _sanitize_offers_ladder(
+            standings.get("results", []),
+            standings.get("winner_bank_id") or rfq.winner_bank_id,
+            is_sell=((rfq.direction or "Buy").lower() == "sell")
+        )
 
         urgent_deals.append({
             "rfq_id": str(rfq.id),
@@ -415,7 +471,8 @@ def get_active_deal_awaiting_acceptance(
             "seconds_remaining": diff_seconds,
             "timeout_action": rfq.acceptance_timeout_action or "AUTO_REJECT",
             "is_auto_accept_halted": is_auto_accept_halted,
-            "legs": legs_summary
+            "legs": legs_summary,
+            "counterparty_offers": root_offers
         })
 
     if not urgent_deals:
