@@ -3948,3 +3948,23 @@ async def decline_quotation_deal_enduser(
         db=db
     )
 
+
+@router.get("/active-acceptance-alert")
+def get_active_acceptance_alert_enduser(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Polls for active RFQ deals currently awaiting binding corporate acceptance
+    for the authenticated end user (Maker or designated Delegate).
+    """
+    from app.services.deal_acceptance_service import get_active_deal_awaiting_acceptance
+    user_role = current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role)
+    return get_active_deal_awaiting_acceptance(
+        user_id=current_user.user_id,
+        customer_id=current_user.customer_id,
+        user_role=user_role,
+        db=db
+    )
+
+

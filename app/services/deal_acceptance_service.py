@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -270,3 +270,127 @@ async def execute_shared_deal_decline(
         "rfq_status": rfq.status,
         "acceptance_status": rfq.acceptance_status
     }
+
+
+def get_active_deal_awaiting_acceptance(
+    user_id: int,
+    customer_id: int,
+    user_role: str,
+    db: Session
+) -> dict:
+    """
+    Checks if there is an active quotation deal currently awaiting binding corporate acceptance
+    for the authorized user (Corporate Admin, Super Admin, Maker, or Delegate).
+    Returns the most urgent pending deal details or has_pending_deal: False.
+    """
+    now_utc = datetime.now(timezone.utc)
+    recent_cutoff = now_utc - timedelta(hours=2)
+
+    query = db.query(QuotationRequest).filter(
+        QuotationRequest.status.notin_(['CANCELLED', 'DRAFT']),
+        (QuotationRequest.acceptance_status.notin_(['ACCEPTED', 'AUTO_ACCEPTED', 'REJECTED', 'AUTO_REJECTED', 'INDICATIVE_COMPLETED'])) | (QuotationRequest.acceptance_status.is_(None))
+    )
+
+    if user_role != "super_admin":
+        query = query.filter(QuotationRequest.customer_id == customer_id)
+
+    # Filter to recent window end or active scheduled
+    query = query.filter(
+        (QuotationRequest.window_end >= recent_cutoff) | (QuotationRequest.window_end.is_(None))
+    )
+
+    candidate_rfqs = query.all()
+    if not candidate_rfqs:
+        return {"has_pending_deal": False, "deal": None, "total_pending": 0}
+
+    is_admin = user_role in ["corporate_admin", "super_admin"]
+    from app.api.v1.endpoints.quotations_endpoints import compute_rfq_standings
+
+    urgent_deals = []
+
+    for rfq in candidate_rfqs:
+        # Check authority
+        is_maker = (rfq.created_by_user_id == user_id)
+        is_delegate = (rfq.delegated_to_user_id is not None and rfq.delegated_to_user_id == user_id)
+        if not (is_admin or is_maker or is_delegate):
+            continue
+
+        # Check indicative-only
+        if (rfq.quotation_base or "").lower() == "indicative" and not getattr(rfq, "legs", []):
+            continue
+
+        # Compute standings and evaluate state
+        standings = compute_rfq_standings(rfq, db, dispatch_emails=False)
+
+        # Check if awaiting acceptance
+        is_inconclusive = standings.get("is_inconclusive", False)
+        if is_inconclusive:
+            continue
+
+        # Ensure acceptance window is active
+        if rfq.acceptance_status != "PENDING" and rfq.status != "EVALUATING":
+            continue
+
+        acc_deadline = rfq.acceptance_deadline
+        if not acc_deadline:
+            continue
+
+        acc_deadline_utc = acc_deadline.replace(tzinfo=timezone.utc) if acc_deadline.tzinfo is None else acc_deadline.astimezone(timezone.utc)
+        diff_seconds = int((acc_deadline_utc - now_utc).total_seconds())
+
+        if diff_seconds <= 0:
+            continue
+
+        # Valid deal awaiting acceptance!
+        is_multi_leg = bool(rfq.legs and len(rfq.legs) > 1)
+        savings_summary = standings.get("savings_summary") or {}
+        winner_name = rfq.winner_bank_name or (savings_summary.get("winner_bank_name") if savings_summary else None) or "Winning Counterparty"
+        winner_rate = rfq.winner_rate or (savings_summary.get("winner_rate") if savings_summary else None)
+        saved_vs_avg = rfq.saved_vs_avg or (savings_summary.get("saved_vs_avg") if savings_summary else None)
+
+        legs_summary = []
+        if is_multi_leg:
+            for l in standings.get("legs", []):
+                legs_summary.append({
+                    "leg_id": str(l.get("leg_id")),
+                    "leg_index": l.get("leg_index"),
+                    "currency_pair": l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}",
+                    "direction": l.get("direction"),
+                    "amount": float(l.get("amount") or 0.0),
+                    "winner_bank_name": l.get("winner_bank_name"),
+                    "winner_rate": l.get("winner_rate"),
+                    "saved_vs_avg": l.get("saved_vs_avg"),
+                    "is_inconclusive": l.get("is_inconclusive", False)
+                })
+
+        urgent_deals.append({
+            "rfq_id": str(rfq.id),
+            "ref_no": rfq.ref_no,
+            "type": rfq.type or "FX_SPOT",
+            "direction": rfq.direction or "BUY",
+            "currency_pair": f"{rfq.buy_currency}/{rfq.sell_currency}" if rfq.buy_currency and rfq.sell_currency else ("T-Bill Portfolio" if rfq.type == 'TBILL' else "FX Basket"),
+            "buy_currency": rfq.buy_currency,
+            "sell_currency": rfq.sell_currency,
+            "amount": float(rfq.amount or 0.0),
+            "is_multi_leg": is_multi_leg,
+            "winner_bank_name": winner_name,
+            "winner_rate": winner_rate,
+            "saved_vs_avg": saved_vs_avg,
+            "acceptance_deadline": acc_deadline_utc.isoformat(),
+            "seconds_remaining": diff_seconds,
+            "timeout_action": rfq.acceptance_timeout_action or "AUTO_REJECT",
+            "legs": legs_summary
+        })
+
+    if not urgent_deals:
+        return {"has_pending_deal": False, "deal": None, "total_pending": 0}
+
+    urgent_deals.sort(key=lambda d: d["seconds_remaining"])
+
+    return {
+        "has_pending_deal": True,
+        "deal": urgent_deals[0],
+        "total_pending": len(urgent_deals),
+        "all_pending_deals": urgent_deals
+    }
+

@@ -2839,6 +2839,26 @@ async def decline_quotation_deal(
     )
 
 
+@router.get("/quotations/active-acceptance-alert")
+def get_active_acceptance_alert_corporate_admin(
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+):
+    """
+    Polls for active RFQ deals currently awaiting binding corporate acceptance
+    for the authenticated corporate admin.
+    """
+    from app.services.deal_acceptance_service import get_active_deal_awaiting_acceptance
+    user_role = corporate_admin_context.role.value if hasattr(corporate_admin_context.role, 'value') else str(corporate_admin_context.role)
+    return get_active_deal_awaiting_acceptance(
+        user_id=corporate_admin_context.user_id,
+        customer_id=corporate_admin_context.customer_id,
+        user_role=user_role,
+        db=db
+    )
+
+
+
 # ==============================================================================
 # ORGANIZATION & TEAMS (Departments & Approval Groups)
 # ==============================================================================
