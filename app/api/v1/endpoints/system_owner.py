@@ -3438,16 +3438,52 @@ def get_system_owner_bank_trophies(
                             "name": c.get("name") or c["email"].split("@")[0],
                             "role": c.get("role") or "DEALER"
                         })
+
+        # Calculate high-level summary achievements for comparative leaderboard
+        ach_summary = dealer_achievement_service.get_dealer_achievements(
+            db=db,
+            bank_id=b.id,
+            bank_name=b.name
+        )
+        t_map = {t['id']: t for t in ach_summary.get('trophies', [])}
+        deals = t_map.get('DEAL_CLOSER', {}).get('current_value', 0)
+        vol_usd = t_map.get('VOLUME_TITAN', {}).get('current_value', 0.0)
+        quotes = t_map.get('PRECISION_SPEED', {}).get('current_value', 0)
+        streak = t_map.get('TRIPLE_CROWN', {}).get('current_value', 0)
+        tenders = t_map.get('THE_RELIABLE_DESK', {}).get('current_value', 0)
+        pairs = t_map.get('CURRENCY_EXPLORER', {}).get('current_value', 0)
+        unlocked = ach_summary.get('earned_trophy_count', 0)
+        tier_display = str(ach_summary.get('dealer_tier') or 'Active Desk')
+        has_exec = bool(deals > 0 or vol_usd > 0 or quotes > 0)
+
         banks_list.append({
             "id": b.id,
             "name": b.name,
-            "dealers": dealers
+            "dealers": dealers,
+            "deals": deals,
+            "vol_usd": vol_usd,
+            "quotes": quotes,
+            "streak": streak,
+            "tenders": tenders,
+            "pairs": pairs,
+            "unlocked": unlocked,
+            "tier": tier_display,
+            "has_execution": has_exec
         })
+
+    # Sort banks: Active first by volume descending, then by deals descending
+    banks_list.sort(key=lambda x: (x["has_execution"], x["vol_usd"], x["deals"]), reverse=True)
+
+    total_active_desks = sum(1 for b in banks_list if b["has_execution"])
+    total_market_volume_usd = sum(b["vol_usd"] for b in banks_list)
+    total_market_deals = sum(b["deals"] for b in banks_list)
+    total_market_quotes = sum(b["quotes"] for b in banks_list)
 
     selected_bank_id = bank_id
     if not selected_bank_id and banks_list:
-        cib = next((b for b in banks_list if b["id"] == 3), None)
-        selected_bank_id = cib["id"] if cib else banks_list[0]["id"]
+        # Default to leading active bank
+        active_leader = next((b for b in banks_list if b["has_execution"]), None)
+        selected_bank_id = active_leader["id"] if active_leader else banks_list[0]["id"]
 
     target_bank = next((b for b in all_banks if b.id == selected_bank_id), None)
     bank_name = target_bank.name if target_bank else "Selected Bank"
@@ -3471,7 +3507,14 @@ def get_system_owner_bank_trophies(
         "selected_bank_id": selected_bank_id,
         "selected_dealer_email": dealer_email,
         "achievements": achievements,
-        "streak_audit": streak_audit
+        "streak_audit": streak_audit,
+        "macro_summary": {
+            "total_active_desks": total_active_desks,
+            "total_onboarded_banks": len(banks_list),
+            "total_market_volume_usd": total_market_volume_usd,
+            "total_market_deals": total_market_deals,
+            "total_market_quotes": total_market_quotes
+        }
     }
 
 
