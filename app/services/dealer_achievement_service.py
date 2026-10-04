@@ -915,5 +915,105 @@ class DealerAchievementService:
             "as_of": datetime.now(timezone.utc).isoformat()
         }
 
+    @classmethod
+    def get_streak_audit_trail(
+        cls,
+        db: Session,
+        bank_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Phase 7.1: Returns chronological audit trail explaining every streak transition
+        (+1 Clean Sweep, Reset to 0 Competitor Win, or Wash/Neutral) across authentic RFQs.
+        """
+        assignments = db.query(QuotationBankAssignment).join(
+            QuotationBank, QuotationBankAssignment.quotation_bank_id == QuotationBank.id
+        ).filter(
+            QuotationBank.bank_id == bank_id
+        ).all()
+        if not assignments:
+            return []
+
+        rfq_ids = list(set([a.rfq_id for a in assignments]))
+        rfqs = db.query(QuotationRequest).filter(
+            QuotationRequest.id.in_(rfq_ids),
+            QuotationRequest.ref_no.like('RFQ-202%'),
+            QuotationRequest.status.notin_(['DRAFT'])
+        ).all()
+
+        rfqs_sorted = sorted(
+            rfqs,
+            key=lambda r: (r.window_end.replace(tzinfo=timezone.utc) if r.window_end and r.window_end.tzinfo is None else (r.window_end or datetime.min.replace(tzinfo=timezone.utc)))
+        )
+
+        audit_trail = []
+        running_streak = 0
+
+        for rfq in rfqs_sorted:
+            dt_str = str(rfq.window_end or rfq.created_at).split('.')[0]
+            if rfq.type == 'TBILL':
+                qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
+                asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
+                is_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                is_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+
+                if is_won:
+                    running_streak += 1
+                    transition = "+1 (Won)"
+                    reason = "T-Bill tender awarded to this bank"
+                    badge = "CLEAN_SWEEP"
+                elif is_lost:
+                    running_streak = 0
+                    transition = "Reset to 0"
+                    reason = "T-Bill tender awarded to competitor"
+                    badge = "COMPETITOR_WIN"
+                else:
+                    transition = "Preserved"
+                    reason = f"Tender {rfq.status} with no award (Neutral)"
+                    badge = "WASH"
+            else:
+                exec_legs = [l for l in getattr(rfq, 'legs', []) if (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution']
+                if not exec_legs:
+                    continue
+
+                bank_won_all = all(
+                    getattr(l, 'winner_bank_id', None) == bank_id and getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED')
+                    for l in exec_legs
+                ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
+
+                competitor_won_any = any(
+                    getattr(l, 'winner_bank_id', None) and getattr(l, 'winner_bank_id', None) != bank_id
+                    for l in exec_legs
+                )
+                deal_concluded = rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED')
+
+                if bank_won_all:
+                    running_streak += 1
+                    transition = "+1 (Won)"
+                    reason = f"Clean Sweep: Won all {len(exec_legs)} execution leg(s)"
+                    badge = "CLEAN_SWEEP"
+                elif competitor_won_any or (deal_concluded and not bank_won_all):
+                    running_streak = 0
+                    transition = "Reset to 0"
+                    reason = "Competitor bank awarded one or more execution legs"
+                    badge = "COMPETITOR_WIN"
+                else:
+                    transition = "Preserved"
+                    reason = f"Tender {rfq.status} with no executed trade (Neutral Wash)"
+                    badge = "WASH"
+
+            audit_trail.append({
+                "rfq_id": rfq.id,
+                "ref_no": rfq.ref_no,
+                "date": dt_str,
+                "type": rfq.type,
+                "status": rfq.status,
+                "transition": transition,
+                "badge": badge,
+                "running_streak": running_streak,
+                "reason": reason
+            })
+
+        return list(reversed(audit_trail))
+
 
 dealer_achievement_service = DealerAchievementService()

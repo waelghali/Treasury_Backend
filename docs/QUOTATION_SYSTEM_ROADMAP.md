@@ -546,10 +546,20 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
   - **Instant Calculation Verification**:
     - Re-run calculation button to instantly verify and trace live database state against cached achievement payloads.
 - **Verification & Testing Criteria**:
-  - Open console as Super Admin $\rightarrow$ select Banque Misr.
+  - Open console as Super Admin $\rightarrow$ select Banque Misr or CIB.
   - Confirm all 8 trophies reflect authentic database records.
   - Verify that clicking on `Unbroken Victor` shows the streak audit history explaining why the streak is at its current number.
   - Verify unauthorized roles (dealers, corporate clients) receive HTTP 403 Forbidden.
+- **Implementation Status (Completed & Verified ✅)**:
+  - **Backend**:
+    - [`dealer_achievement_service.py`](file:///c:/Grow/app/services/dealer_achievement_service.py): Implemented `get_streak_audit_trail(db, bank_id)` providing chronological RFQ breakdown with state transitions (`+1 Clean Sweep`, `Reset to 0 Competitor Win`, or `Preserved Wash`).
+    - [`system_owner.py`](file:///c:/Grow/app/api/v1/endpoints/system_owner.py): Added `GET /api/v1/system-owner/quotation-diagnostics/bank-trophies` returning full bank roster with registered dealer contacts, selected bank 8-trophy achievements payload, and chronological streak audit trail.
+  - **Frontend**:
+    - [`QuotationTelemetryDashboard.js`](file:///c:/Grow/frontend/src/pages/SystemOwner/QuotationTelemetryDashboard.js): Added top tab switcher (`Network Telemetry & SLA Matrix` vs. `Bank Desk & Dealer 8-Trophy Diagnostics`), bank institution selector dropdown, dealer roster scope dropdown, desk status banner, 8-trophy showcase cards with progress bars and tier badges, and an interactive **Streak Audit Modal** displaying the chronological tender timeline.
+  - **Verification Proof**:
+    - Tested CIB (Bank ID 3): Tier 2 Silver Desk (5/8 trophies unlocked, 9 deals, 111 quotes, 49 tenders, 3 pairs, 31 bell logins, $1.32M volume).
+    - Verified streak audit trail over 47 evaluated tenders.
+    - Clean production build: `main.e7c68d98.js`.
 
 ---
 

@@ -3404,6 +3404,77 @@ def get_quotations_macro_telemetry(
     return get_system_owner_telemetry(db)
 
 
+@router.get("/quotation-diagnostics/bank-trophies")
+def get_system_owner_bank_trophies(
+    bank_id: Optional[int] = None,
+    dealer_email: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """
+    Phase 7.1: Internal Trophy & Liquidity Diagnostics Console.
+    Allows Super Admin to audit counterparty 8-trophy progression, desk volumes,
+    and granular tender-by-tender streak history.
+    """
+    from app.models.models import Bank
+    from app.models.models_quotation import QuotationBank
+    from app.services.dealer_achievement_service import dealer_achievement_service
+
+    all_banks = db.query(Bank).order_by(Bank.name.asc()).all()
+    banks_list = []
+
+    for b in all_banks:
+        q_banks = db.query(QuotationBank).filter(QuotationBank.bank_id == b.id).all()
+        dealers = []
+        seen_emails = set()
+        for qb in q_banks:
+            contacts = qb.contacts or []
+            if isinstance(contacts, list):
+                for c in contacts:
+                    if isinstance(c, dict) and c.get("email") and c["email"].lower() not in seen_emails:
+                        seen_emails.add(c["email"].lower())
+                        dealers.append({
+                            "email": c["email"],
+                            "name": c.get("name") or c["email"].split("@")[0],
+                            "role": c.get("role") or "DEALER"
+                        })
+        banks_list.append({
+            "id": b.id,
+            "name": b.name,
+            "dealers": dealers
+        })
+
+    selected_bank_id = bank_id
+    if not selected_bank_id and banks_list:
+        cib = next((b for b in banks_list if b["id"] == 3), None)
+        selected_bank_id = cib["id"] if cib else banks_list[0]["id"]
+
+    target_bank = next((b for b in all_banks if b.id == selected_bank_id), None)
+    bank_name = target_bank.name if target_bank else "Selected Bank"
+
+    achievements = dealer_achievement_service.get_dealer_achievements(
+        db=db,
+        dealer_email=dealer_email if dealer_email else None,
+        bank_id=selected_bank_id,
+        bank_name=bank_name
+    )
+
+    streak_audit = []
+    if selected_bank_id:
+        streak_audit = dealer_achievement_service.get_streak_audit_trail(
+            db=db,
+            bank_id=selected_bank_id
+        )
+
+    return {
+        "banks": banks_list,
+        "selected_bank_id": selected_bank_id,
+        "selected_dealer_email": dealer_email,
+        "achievements": achievements,
+        "streak_audit": streak_audit
+    }
+
+
 # =====================================================================
 # Bank Live Ranking Configuration Endpoints (System Owner)
 # =====================================================================
