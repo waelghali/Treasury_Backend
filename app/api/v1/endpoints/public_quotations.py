@@ -341,21 +341,8 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             except Exception:
                 pass
 
-        # Phase 6.5: Live Market Benchmark for leg
+        # Phase 6.6: Bank Desks quote blind & independent (confidential internal reference is not leaked to banks)
         leg_market_bm = None
-        if (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
-            try:
-                from app.services.live_market_service import live_market_service
-                leg_market_bm = live_market_service.get_empirical_reference(
-                    db,
-                    customer_id=rfq.customer_id,
-                    from_code=leg.buy_currency,
-                    to_code=leg.sell_currency,
-                    direction=leg.direction or rfq.direction or 'BUY',
-                    amount=leg.amount
-                )
-            except Exception:
-                pass
 
         portal_legs.append({
             "id": leg.id,
@@ -416,21 +403,8 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         rfq_approved_by_name = (getattr(rfq.creator, "full_name", None) or getattr(rfq.creator, "name", None) or rfq.creator.email)
         rfq_approved_at = rfq.created_at.isoformat() if rfq.created_at else None
 
-    # Phase 6.5: Live Market Benchmark for root RFQ
-    root_market_bm = portal_legs[0].get("market_benchmark") if portal_legs else None
-    if not root_market_bm and rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
-        try:
-            from app.services.live_market_service import live_market_service
-            root_market_bm = live_market_service.get_empirical_reference(
-                db,
-                customer_id=rfq.customer_id,
-                from_code=rfq.buy_currency,
-                to_code=rfq.sell_currency,
-                direction=rfq.direction or 'BUY',
-                amount=rfq.amount
-            )
-        except Exception:
-            pass
+    # Phase 6.6: Bank Desks quote blind & independent (confidential internal reference is not leaked to banks)
+    root_market_bm = None
 
     return {
         "id": rfq.id,

@@ -1959,9 +1959,9 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 if leg_is_uncontested else None
             )
 
-            # Phase 6.5: Live Market Benchmark & Empirical Historical Spread
-            leg_market_bm = None
-            if (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
+            # Phase 6.6: Use Frozen Snapshot if deal accepted, else live benchmark
+            leg_market_bm = leg.market_benchmark_snapshot if getattr(leg, 'market_benchmark_snapshot', None) else None
+            if not leg_market_bm and (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
                 try:
                     from app.services.live_market_service import live_market_service
                     leg_market_bm = live_market_service.get_empirical_reference(
@@ -2218,8 +2218,10 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
 
     db.commit()
 
-    # Phase 6.5: Derive Root Market Benchmark for Single-Pair / Overall RFQ
-    root_market_bm = primary_leg.get("market_benchmark") if primary_leg else None
+    # Phase 6.6: Derive Root Market Benchmark for Single-Pair / Overall RFQ (Frozen Snapshot or Live)
+    root_market_bm = rfq.market_benchmark_snapshot if getattr(rfq, 'market_benchmark_snapshot', None) else None
+    if not root_market_bm:
+        root_market_bm = primary_leg.get("market_benchmark") if primary_leg else None
     if not root_market_bm and rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
         try:
             from app.services.live_market_service import live_market_service

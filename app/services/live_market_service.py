@@ -176,6 +176,31 @@ class LiveMarketService:
             cbe_gap_bps = round(((live_mid - cbe_mid) / cbe_mid) * 10000.0, 2)
             cbe_gap_pips = round((live_mid - cbe_mid) * 10000.0, 1)
 
+        # Phase 6.6: Time-Series Market Spot Rate Archive (builds proprietary dataset)
+        if live_mid and db:
+            try:
+                from app.models.models_quotation import QuotationMarketRateHistory
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+                recent_entry = db.query(QuotationMarketRateHistory).filter(
+                    QuotationMarketRateHistory.currency_pair == pair_str,
+                    QuotationMarketRateHistory.created_at >= cutoff
+                ).first()
+                if not recent_entry:
+                    hist_record = QuotationMarketRateHistory(
+                        currency_pair=pair_str,
+                        base_currency=from_code,
+                        quote_currency=to_code,
+                        rate=live_mid,
+                        source=source,
+                        cbe_official_mid=cbe_mid,
+                        cbe_gap_bps=cbe_gap_bps
+                    )
+                    db.add(hist_record)
+                    db.commit()
+            except Exception as archive_err:
+                logger.debug(f"Spot rate archive skip or error: {archive_err}")
+                db.rollback()
+
         return {
             "currency_pair": pair_str,
             "live_mid": live_mid,

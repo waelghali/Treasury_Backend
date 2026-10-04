@@ -178,6 +178,59 @@ async def execute_shared_deal_acceptance(
     rfq.acceptance_resolved_at = datetime.now(timezone.utc)
     rfq.acceptance_resolved_by_user_id = user.id
 
+    # Phase 6.6: Freeze Market Benchmark Snapshot at Trade Acceptance
+    try:
+        from app.services.live_market_service import live_market_service
+        root_from = rfq.buy_currency or "USD"
+        root_to = rfq.sell_currency or "EGP"
+        root_bm = live_market_service.get_empirical_reference(
+            db=db,
+            customer_id=rfq.customer_id,
+            from_code=root_from,
+            to_code=root_to,
+            direction=rfq.direction or "BUY",
+            amount=rfq.amount
+        )
+        best_price = None
+        for leg in (rfq.legs or []):
+            if leg.winner_rate:
+                best_price = leg.winner_rate
+                break
+        if best_price and root_bm:
+            root_bm["quote_evaluation"] = live_market_service.evaluate_quote_spread(
+                quote_rate=float(best_price),
+                benchmark=root_bm,
+                direction=rfq.direction or "BUY"
+            )
+        root_bm["frozen_at"] = datetime.now(timezone.utc).isoformat()
+        root_bm["frozen_by_user_id"] = user.id
+        root_bm["is_frozen_snapshot"] = True
+        rfq.market_benchmark_snapshot = root_bm
+
+        for leg in (rfq.legs or []):
+            leg_from = leg.buy_currency or root_from
+            leg_to = leg.sell_currency or root_to
+            leg_bm = live_market_service.get_empirical_reference(
+                db=db,
+                customer_id=rfq.customer_id,
+                from_code=leg_from,
+                to_code=leg_to,
+                direction=leg.direction or rfq.direction or "BUY",
+                amount=leg.amount or rfq.amount
+            )
+            if leg.winner_rate and leg_bm:
+                leg_bm["quote_evaluation"] = live_market_service.evaluate_quote_spread(
+                    quote_rate=float(leg.winner_rate),
+                    benchmark=leg_bm,
+                    direction=leg.direction or rfq.direction or "BUY"
+                )
+            leg_bm["frozen_at"] = datetime.now(timezone.utc).isoformat()
+            leg_bm["frozen_by_user_id"] = user.id
+            leg_bm["is_frozen_snapshot"] = True
+            leg.market_benchmark_snapshot = leg_bm
+    except Exception as snap_err:
+        logger.warning(f"Error freezing market benchmark snapshot for RFQ {rfq.id}: {snap_err}")
+
     db.commit()
 
     log_action(

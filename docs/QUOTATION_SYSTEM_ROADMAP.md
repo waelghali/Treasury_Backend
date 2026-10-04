@@ -75,6 +75,8 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
 | Phase | Target Table | Action | Production SQL Statement | Verification Query |
 | :--- | :--- | :--- | :--- | :--- |
 | **Phase 6.1** | `quotation_bank_leg_configs` | Add column `is_passed` | ```sql<br>ALTER TABLE quotation_bank_leg_configs<br>ADD COLUMN IF NOT EXISTS is_passed BOOLEAN NOT NULL DEFAULT FALSE;<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_bank_leg_configs' AND column_name = 'is_passed';<br>``` |
+| **Phase 6.6** | `quotation_rfqs`, `quotation_legs` | Add `market_benchmark_snapshot` JSONB | ```sql<br>ALTER TABLE quotation_rfqs<br>ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;<br>ALTER TABLE quotation_legs<br>ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;<br>``` | ```sql<br>SELECT column_name, data_type<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_rfqs' AND column_name = 'market_benchmark_snapshot';<br>``` |
+| **Phase 6.6** | `quotation_market_rate_history` | Create Time-Series Archive Table | ```sql<br>CREATE TABLE IF NOT EXISTS quotation_market_rate_history (<br>&nbsp;&nbsp;id SERIAL PRIMARY KEY,<br>&nbsp;&nbsp;currency_pair VARCHAR(10) NOT NULL,<br>&nbsp;&nbsp;base_currency VARCHAR(5) NOT NULL,<br>&nbsp;&nbsp;quote_currency VARCHAR(5) NOT NULL,<br>&nbsp;&nbsp;rate DOUBLE PRECISION NOT NULL,<br>&nbsp;&nbsp;source VARCHAR(50) NOT NULL,<br>&nbsp;&nbsp;cbe_official_mid DOUBLE PRECISION,<br>&nbsp;&nbsp;cbe_gap_bps DOUBLE PRECISION,<br>&nbsp;&nbsp;created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL<br>);<br>CREATE INDEX IF NOT EXISTS idx_quotation_mkt_rate_pair_created<br>ON quotation_market_rate_history (currency_pair, created_at DESC);<br>``` | ```sql<br>SELECT count(*)<br>FROM quotation_market_rate_history;<br>``` |
 
 ---
 
@@ -478,6 +480,38 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
   - Verified Intraday CBE drift calculation (`-12.37 bps`).
   - Verified historical sample aggregation across 14+ customer tenders yielding accurate empirical suggested reference rates (`50.9186`).
   - Verified frontend build passes with zero errors (`main.8b1b1f11.js`).
+
+---
+
+#### 📌 Phase 6.6: Market Benchmark Governance Hardening, Dealer Blind Quoting & Trade Execution Freeze (Completed & Verified ✅)
+*Scope: Remove internal customer expectations and suggested reference rates from bank dealer portals, preserve universal benchmark on corporate side, permanently freeze market benchmarks on deal acceptance, and archive live spot rates into a dedicated historical database.*
+
+- **Context & Operational Rationale**:
+  - Exposing the customer's Suggested Reference Rate or spread delta calculations to bank counterparties creates an anti-competitive leak ("showing cards" to the bidding bank). Bank desks must quote blindly and independently without seeing internal customer benchmarks.
+  - Comparing a sealed deal to moving market rates weeks or months after acceptance invalidates historical audit trails. The exact market mid, CBE drift, and spread must be snapshotted and frozen at the second of trade execution.
+  - Archiving every fetched spot rate builds a proprietary time-series market database for the platform owner to power future analytical and AI models.
+- **Architectural & Security Controls**:
+  - **Dealer Blind Quoting**: Bank portals (`QuotationBankOfferPage.js`) only show the official CBE Mid benchmark if available. The Suggested Reference Rate, Delta Tracker, and customer expectation indicators were removed entirely.
+  - **Public API Sanitization**: `GET /api/v1/public-quotation/{token}` explicitly returns `market_benchmark: null` to prevent any backend leak of customer reference models to quoting desks.
+  - **Universal Corporate Benchmark**: Corporate acceptance modals and results views maintain the Live Interbank Mid, CBE Drift, and Historical Spread across **ALL deals** (both competitive multi-bank and sole-source single-bank tenders).
+  - **Trade Execution Snapshot Freeze**:
+    - Added `market_benchmark_snapshot` (`JSONB`) to `quotation_rfqs` and `quotation_legs`.
+    - When `execute_shared_deal_acceptance` is triggered, the exact live mid, suggested reference, and winning quote spread are snapshotted into `market_benchmark_snapshot` before database commit.
+    - Subsequent inquiries in `compute_rfq_standings` and the acceptance modal load the frozen snapshot with a `🔒 Locked at Acceptance` indicator, preventing post-trade drift.
+  - **Proprietary Spot Rate Archive**:
+    - Created `quotation_market_rate_history` table (`QuotationMarketRateHistory` model) recording `currency_pair`, `base_currency`, `quote_currency`, `rate`, `source`, `cbe_official_mid`, and `cbe_gap_bps`.
+    - Continuous archiving in `live_market_service.py` safely throttled to 60-second intervals per currency pair.
+- **Database Ledger (Production DDL)**:
+  - `ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;`
+  - `ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;`
+  - `CREATE TABLE IF NOT EXISTS quotation_market_rate_history (...);`
+- **Verification Proof**:
+  - `verify_live_api.py` confirmed `market_benchmark: null` across public bank portal API.
+  - `verify_archive.py` verified live spot rate insertion into `quotation_market_rate_history`.
+  - Frontend production build clean (`main.516825b7.js`).
+
+---
+
 ## 8. Phase 7: Platform Owner Diagnostics Console & Dealer Voice System
 
 ---

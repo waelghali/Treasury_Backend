@@ -108,6 +108,7 @@ class QuotationRequest(BaseModel):
     acceptance_status = Column(String(50), nullable=True, comment="'PENDING', 'ACCEPTED', 'REJECTED', 'AUTO_ACCEPTED', 'AUTO_REJECTED', 'INDICATIVE_COMPLETED'")
     acceptance_resolved_at = Column(DateTime(timezone=True), nullable=True)
     acceptance_resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    market_benchmark_snapshot = Column(JSONB, nullable=True, comment="Frozen market benchmark snapshot at trade acceptance")
 
     # Acceptance Delegation
     delegated_to_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, comment="Corporate colleague authorized to accept/reject deal on behalf of maker")
@@ -302,6 +303,7 @@ class QuotationLeg(BaseModel):
     rejection_reason = Column(Text, nullable=True)
     document_path = Column(Text, nullable=True)
     entity_id = Column(Integer, ForeignKey("customer_entities.id", ondelete="SET NULL"), nullable=True)
+    market_benchmark_snapshot = Column(JSONB, nullable=True, comment="Frozen market benchmark snapshot at leg acceptance")
 
     rfq = relationship("QuotationRequest", back_populates="legs")
     offers = relationship("QuotationOffer", back_populates="leg", cascade="all, delete-orphan")
@@ -533,3 +535,23 @@ class BankLiveRankingConfig(BaseModel):
     bank = relationship("Bank")
     customer = relationship("Customer")
     entity = relationship("CustomerEntity")
+
+
+class QuotationMarketRateHistory(Base):
+    """
+    Time-Series Market Spot Rate Archive.
+    Stores historical live spot rates fetched from interbank feeds to build
+    a proprietary time-series market database for rate modeling and audit reconstruction.
+    """
+    __tablename__ = "quotation_market_rate_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    currency_pair = Column(String(10), nullable=False, index=True, comment="e.g. 'USD/EGP', 'EUR/EGP'")
+    base_currency = Column(String(5), nullable=False)
+    quote_currency = Column(String(5), nullable=False)
+    rate = Column(Float, nullable=False)
+    source = Column(String(50), nullable=False)
+    cbe_official_mid = Column(Float, nullable=True)
+    cbe_gap_bps = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
