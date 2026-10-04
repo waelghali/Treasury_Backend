@@ -498,6 +498,7 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
     - Added `market_benchmark_snapshot` (`JSONB`) to `quotation_rfqs` and `quotation_legs`.
     - When `execute_shared_deal_acceptance` is triggered, the exact live mid, suggested reference, and winning quote spread are snapshotted into `market_benchmark_snapshot` before database commit.
     - Subsequent inquiries in `compute_rfq_standings` and the acceptance modal load the frozen snapshot with a `🔒 Locked at Acceptance` indicator, preventing post-trade drift.
+    - **Permanent Historical Rate Audit in RFQ Details Modal**: Embedded a dedicated **"Market Reference & Regulatory Rate Audit"** 4-pillar card in [`ResultsView.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/ResultsView.js), allowing corporate treasurers, makers, and auditors to inspect the frozen Central Bank of Egypt (CBE) fixing, live market mid at execution, calculated reference expectation, and executed quoted rate with green/red status anytime they refer back to past tenders.
   - **Proprietary Spot Rate Archive**:
     - Created `quotation_market_rate_history` table (`QuotationMarketRateHistory` model) recording `currency_pair`, `base_currency`, `quote_currency`, `rate`, `source`, `cbe_official_mid`, and `cbe_gap_bps`.
     - Continuous archiving in `live_market_service.py` safely throttled to 60-second intervals per currency pair.
@@ -508,7 +509,7 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 - **Verification Proof**:
   - `verify_live_api.py` confirmed `market_benchmark: null` across public bank portal API.
   - `verify_archive.py` verified live spot rate insertion into `quotation_market_rate_history`.
-  - Frontend production build clean (`main.516825b7.js`).
+  - Frontend production build clean (`main.2b6ad714.js`).
 
 ---
 
