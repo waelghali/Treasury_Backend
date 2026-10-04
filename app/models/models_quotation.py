@@ -594,7 +594,7 @@ class QuotationDealerFeedback(Base):
         return {
             "id": self.id,
             "rfq_id": self.rfq_id,
-            "rfq_ref_no": self.rfq.rfq_number if self.rfq else None,
+            "rfq_ref_no": getattr(self.rfq, 'ref_no', None) if self.rfq else None,
             "quotation_bank_id": self.quotation_bank_id,
             "bank_id": self.bank_id,
             "bank_name": self.bank_name or (self.bank.name if self.bank else "Unknown Bank"),
