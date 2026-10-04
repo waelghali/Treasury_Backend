@@ -554,13 +554,19 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 - **Implementation Status (Completed & Verified ✅)**:
   - **Backend**:
     - [`dealer_achievement_service.py`](file:///c:/Grow/app/services/dealer_achievement_service.py): Implemented `get_streak_audit_trail(db, bank_id)` providing chronological RFQ breakdown with state transitions (`+1 Clean Sweep`, `Reset to 0 Competitor Win`, or `Preserved Wash`).
-    - [`system_owner.py`](file:///c:/Grow/app/api/v1/endpoints/system_owner.py): Added `GET /api/v1/system-owner/quotation-diagnostics/bank-trophies` returning full bank roster with registered dealer contacts, selected bank 8-trophy achievements payload, and chronological streak audit trail.
+    - [`system_owner.py`](file:///c:/Grow/app/api/v1/endpoints/system_owner.py): Enhanced `GET /api/v1/system-owner/quotation-diagnostics/bank-trophies` to aggregate and return comparative metrics for all 37 onboarded banks (`deals`, `vol_usd`, `quotes`, `streak`, `tenders`, `pairs`, `unlocked`, `tier`, `has_execution`), sort active desks by volume, compute `macro_summary` (7 active desks, $6.45M USD volume, 49 deals, 467 quotes), and default selection to market liquidity leader (Bank of Alexandria).
   - **Frontend**:
-    - [`QuotationTelemetryDashboard.js`](file:///c:/Grow/frontend/src/pages/SystemOwner/QuotationTelemetryDashboard.js): Added top tab switcher (`Network Telemetry & SLA Matrix` vs. `Bank Desk & Dealer 8-Trophy Diagnostics`), bank institution selector dropdown, dealer roster scope dropdown, desk status banner, 8-trophy showcase cards with progress bars and tier badges, and an interactive **Streak Audit Modal** displaying the chronological tender timeline.
+    - [`QuotationTelemetryDashboard.js`](file:///c:/Grow/frontend/src/pages/SystemOwner/QuotationTelemetryDashboard.js): 
+      - Added dual-mode sub-navigation: **Counterparty Comparison Matrix** vs. **Single Desk 8-Trophies Deep Dive**.
+      - Implemented **Macro Network Diagnostics Banner**: 4 KPI cards for Active Desks (7/37), Executed Volume ($6.45M USD), Deals Won (49), and Live Quotes Logged (467).
+      - Added **Zero-Execution Counterparty Filtering**: Default `[✓] Hide 0-Execution Desks` filter automatically isolating the 7 active institutions with a toggle to inspect all 37 banks, plus live text search and multi-column sorting (Volume, Deals, Quotes, Trophies).
+      - Built high-density **Comparative Leaderboard Table**: Side-by-side ranks (#1-#3 podium badges), bank names, dealer count, status pills, desk tiers, 8-trophy progress bars, awarded USD volume with market share %, deals won with win rate %, quotes, tenders, streaks, and 1-click `Inspect ➔` buttons.
+      - Seamless deep-dive drilldown: Clicking any bank in the comparison matrix navigates directly to that institution's 8-trophy breakdown, with a prominent `‹ Return to Comparison Matrix` button and cleaned dropdowns grouping active vs. zero-execution desks.
   - **Verification Proof**:
-    - Tested CIB (Bank ID 3): Tier 2 Silver Desk (5/8 trophies unlocked, 9 deals, 111 quotes, 49 tenders, 3 pairs, 31 bell logins, $1.32M volume).
-    - Verified streak audit trail over 47 evaluated tenders.
-    - Clean production build: `main.e7c68d98.js`.
+    - Python API test verified macro summary and instant multi-bank metrics calculation in 0.83s across all 37 institutions.
+    - Verified filtering: correctly isolates 7 active banks (Bank of Alexandria, CIB, HSBC, Banque Misr, The United Bank, NBE, SAIB) with $6.45M total volume, while cleanly hiding the 30 zero-execution institutions.
+    - Frontend production build (`craco build`) compiled cleanly (`main.4494659f.js`, exit code 0).
+    - Local commits: Backend `51de5aa`; Frontend `ffd231e`. Live UI and API verified.
 
 ---
 
