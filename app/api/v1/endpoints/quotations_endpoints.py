@@ -1687,6 +1687,42 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 assigned_val_str = str(assigned_val_date).split('T')[0] if assigned_val_date is not None else None
                 is_custom_date = bool(cfg.value_date and str(cfg.value_date).split('T')[0] != (str(leg_target_val_date).split('T')[0] if leg_target_val_date else ''))
 
+                is_leg_passed = bool(getattr(cfg, 'is_passed', False)) if cfg else False
+                if is_leg_passed:
+                    leg_results.append({
+                        "bank_id": q_bank.bank_id if q_bank else 0,
+                        "quotation_bank_id": a.quotation_bank_id,
+                        "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                        "bank_emails": q_bank.emails if q_bank else "",
+                        "price": None,
+                        "finalPrice": None,
+                        "normalized_price": None,
+                        "assigned_value_date": assigned_val_str,
+                        "offered_value_date": None,
+                        "allow_alternative_value_date": allow_alt_val,
+                        "is_alternative_value_date": False,
+                        "is_custom_value_date": is_custom_date,
+                        "time_value_adjustment": 0.0,
+                        "notes": None,
+                        "submitted_at": None,
+                        "submitted_by_email": None,
+                        "token": a.token,
+                        "quotation_base": assigned_base,
+                        "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
+                        "is_passed": True,
+                        "is_document_visible": cfg.is_document_visible if hasattr(cfg, 'is_document_visible') else True,
+                        "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                        "approval_status": a.approval_status,
+                        "approved_by_email": a.approved_by_email,
+                        "approved_at": a.approved_at,
+                        "approval_notes": a.approval_notes,
+                        "cost_min": cfg.cost_min or 0.0,
+                        "cost_percent": cfg.cost_percent or 0.0,
+                        "cost_max": cfg.cost_max or 0.0,
+                        "cost_flat": cfg.cost_flat or 0.0
+                    })
+                    continue
+
                 offer_db = db.query(QuotationOffer).filter(
                     QuotationOffer.assignment_id == a.id,
                     (QuotationOffer.leg_id == leg.id) | (QuotationOffer.leg_id.is_(None) if len(rfq_legs) == 1 else False)
@@ -1713,7 +1749,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "token": a.token,
                         "quotation_base": assigned_base,
                         "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
-                        "is_passed": bool(getattr(cfg, 'is_passed', False)) if cfg else False,
+                        "is_passed": False,
                         "is_document_visible": cfg.is_document_visible if hasattr(cfg, 'is_document_visible') else True,
                         "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                         "approval_status": a.approval_status,

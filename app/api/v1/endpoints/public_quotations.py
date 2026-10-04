@@ -310,8 +310,9 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
                 QuotationOffer.assignment_id == assignment.id
             ).order_by(QuotationOffer.submitted_at.desc()).first()
 
+        is_leg_passed = bool(getattr(leg_cfg, 'is_passed', False)) if leg_cfg else False
         leg_offers_list = []
-        if leg_offer:
+        if leg_offer and not is_leg_passed:
             leg_offers_list.append({
                 "price": leg_offer.price,
                 "offered_value_date": str(leg_offer.offered_value_date).split('T')[0] if leg_offer.offered_value_date else None,
@@ -1423,6 +1424,20 @@ def submit_fx_offers_batch(
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid proposed value date format. Expected YYYY-MM-DD.")
 
+        # Reset any prior pass flag on this leg since dealer is submitting a valid quote
+        leg_cfg_item = db.query(QuotationBankLegConfig).filter(
+            QuotationBankLegConfig.assignment_id == assignment.id,
+            QuotationBankLegConfig.leg_id == item.leg_id
+        ).first()
+        if leg_cfg_item:
+            leg_cfg_item.is_passed = False
+
+        # Clear any prior offers for this leg from this bank assignment so the new offer is authoritative
+        db.query(QuotationOffer).filter(
+            QuotationOffer.assignment_id == assignment.id,
+            QuotationOffer.leg_id == item.leg_id
+        ).delete()
+
         offer = QuotationOffer(
             assignment_id=assignment.id,
             price=item.price,
@@ -1438,6 +1453,12 @@ def submit_fx_offers_batch(
     if payload.passed_legs:
         import uuid
         for passed_leg_id in payload.passed_legs:
+            # Clear any previously submitted quote for this leg since dealer has explicitly passed
+            db.query(QuotationOffer).filter(
+                QuotationOffer.assignment_id == assignment.id,
+                QuotationOffer.leg_id == passed_leg_id
+            ).delete()
+
             # Check if leg config already exists
             leg_cfg = db.query(QuotationBankLegConfig).filter(
                 QuotationBankLegConfig.assignment_id == assignment.id,
