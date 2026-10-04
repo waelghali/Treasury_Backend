@@ -3724,6 +3724,103 @@ def get_customer_entities_for_system_owner(
     return [{"id": e.id, "name": e.entity_name, "entity_name": e.entity_name, "country": getattr(e, "country", None)} for e in entities]
 
 
+class DealerFeedbackUpdateIn(BaseModel):
+    status: Optional[str] = None
+    admin_notes: Optional[str] = None
+
+
+@router.get("/dealer-feedback")
+def get_dealer_feedbacks_for_system_owner(
+    bank_id: Optional[int] = None,
+    star_rating: Optional[int] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """
+    Phase 7.3: Admin Feedback Inbox & Satisfaction Stream.
+    Retrieves reverse-chronological stream of interbank dealer feedback submissions,
+    ratings, category distributions, and CSAT metrics.
+    """
+    from app.models.models_quotation import QuotationDealerFeedback
+
+    query = db.query(QuotationDealerFeedback)
+
+    if bank_id:
+        query = query.filter(QuotationDealerFeedback.bank_id == bank_id)
+    if star_rating:
+        query = query.filter(QuotationDealerFeedback.star_rating == star_rating)
+    if category and category != "ALL":
+        query = query.filter(QuotationDealerFeedback.category == category)
+    if status and status != "ALL":
+        query = query.filter(QuotationDealerFeedback.status == status)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            (QuotationDealerFeedback.bank_name.ilike(s)) |
+            (QuotationDealerFeedback.dealer_email.ilike(s)) |
+            (QuotationDealerFeedback.comment.ilike(s))
+        )
+
+    all_feedbacks = query.order_by(QuotationDealerFeedback.created_at.desc()).all()
+
+    # Macro CSAT Metrics across all records (or filtered)
+    total_count = len(all_feedbacks)
+    avg_rating = round(sum(f.star_rating for f in all_feedbacks) / total_count, 2) if total_count > 0 else 5.0
+
+    rating_dist = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    category_counts = {}
+    status_counts = {"NEW": 0, "IN_REVIEW": 0, "RESOLVED": 0, "ARCHIVED": 0}
+
+    for f in all_feedbacks:
+        if f.star_rating in rating_dist:
+            rating_dist[f.star_rating] += 1
+        category_counts[f.category] = category_counts.get(f.category, 0) + 1
+        status_counts[f.status] = status_counts.get(f.status, 0) + 1
+
+    return {
+        "feedbacks": [f.to_dict() for f in all_feedbacks],
+        "macro_csat": {
+            "total_count": total_count,
+            "avg_rating": avg_rating,
+            "rating_distribution": rating_dist,
+            "category_breakdown": category_counts,
+            "status_counts": status_counts
+        }
+    }
+
+
+@router.patch("/dealer-feedback/{feedback_id}")
+def update_dealer_feedback_status(
+    feedback_id: int,
+    payload: DealerFeedbackUpdateIn,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """
+    Phase 7.3: Triage and update dealer feedback status and administrative review notes.
+    """
+    from app.models.models_quotation import QuotationDealerFeedback
+
+    fb = db.query(QuotationDealerFeedback).filter(QuotationDealerFeedback.id == feedback_id).first()
+    if not fb:
+        raise HTTPException(status_code=404, detail="Dealer feedback record not found")
+
+    if payload.status:
+        fb.status = payload.status
+        if payload.status == "RESOLVED":
+            fb.resolved_at = datetime.utcnow()
+            fb.resolved_by = current_user.email if hasattr(current_user, 'email') else "Super Admin"
+
+    if payload.admin_notes is not None:
+        fb.admin_notes = payload.admin_notes
+
+    db.commit()
+    db.refresh(fb)
+    return fb.to_dict()
+
 
 # Make sure the router inclusion remains at the bottom
 router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])

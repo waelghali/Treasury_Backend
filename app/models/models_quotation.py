@@ -555,3 +555,61 @@ class QuotationMarketRateHistory(Base):
     cbe_gap_bps = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
+
+class QuotationDealerFeedback(Base):
+    """
+    Phase 7.2 & 7.3: Institutional Dealer Voice & Feedback Mechanism.
+    Stores direct feedback, ratings, usability issues, and feature requests
+    submitted by bank dealers quoting via public terminal links.
+    """
+    __tablename__ = "quotation_dealer_feedbacks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rfq_id = Column(String, ForeignKey("quotation_rfqs.id", ondelete="SET NULL"), nullable=True, index=True)
+    quotation_bank_id = Column(Integer, ForeignKey("quotation_banks.id", ondelete="SET NULL"), nullable=True, index=True)
+    bank_id = Column(Integer, ForeignKey("banks.id", ondelete="SET NULL"), nullable=True, index=True)
+    bank_name = Column(String(255), nullable=True)
+    
+    dealer_email = Column(String(255), nullable=True, index=True)
+    dealer_name = Column(String(255), nullable=True)
+    is_anonymous = Column(Boolean, default=False, nullable=False)
+    
+    star_rating = Column(Integer, nullable=False, default=5)
+    category = Column(String(100), nullable=False, default="GENERAL_FEEDBACK")
+    comment = Column(Text, nullable=True)
+    
+    status = Column(String(50), default="NEW", nullable=False, index=True)
+    admin_notes = Column(Text, nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_by = Column(String(255), nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    rfq = relationship("QuotationRequest")
+    quotation_bank = relationship("QuotationBank")
+    bank = relationship("Bank")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "rfq_id": self.rfq_id,
+            "rfq_ref_no": self.rfq.rfq_number if self.rfq else None,
+            "quotation_bank_id": self.quotation_bank_id,
+            "bank_id": self.bank_id,
+            "bank_name": self.bank_name or (self.bank.name if self.bank else "Unknown Bank"),
+            "dealer_email": "Anonymous Dealer" if self.is_anonymous else self.dealer_email,
+            "dealer_name": "Anonymous" if self.is_anonymous else (self.dealer_name or (self.dealer_email.split('@')[0] if self.dealer_email else "Trader")),
+            "is_anonymous": self.is_anonymous,
+            "star_rating": self.star_rating,
+            "category": self.category,
+            "comment": self.comment,
+            "status": self.status,
+            "admin_notes": self.admin_notes,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "resolved_by": self.resolved_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+

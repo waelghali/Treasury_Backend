@@ -2735,3 +2735,91 @@ def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(
         "bank_name": bank.name if bank else "",
         "customer_name": cust.name if cust else ""
     }
+
+
+from pydantic import BaseModel, Field
+
+class DealerFeedbackCreateRequest(BaseModel):
+    token: str
+    star_rating: int = Field(..., ge=1, le=5)
+    category: str = Field(..., max_length=100)
+    comment: Optional[str] = Field(None, max_length=500)
+    is_anonymous: bool = False
+    dealer_email: Optional[str] = None
+
+
+@router.post("/feedback")
+def submit_dealer_feedback(
+    req_body: DealerFeedbackCreateRequest,
+    db: Session = Depends(get_db),
+    request: Request = None
+):
+    """
+    Phase 7.2: Institutional Dealer Voice & Feedback Mechanism.
+    Allows bank dealers to submit fast, non-blocking ratings and usability comments
+    directly from their quotation terminal.
+    """
+    from app.models.models_quotation import QuotationBankAssignment, QuotationDealerFeedback, QuotationBank
+    from app.models.models import Bank
+
+    assignment = db.query(QuotationBankAssignment).filter(
+        QuotationBankAssignment.token == req_body.token
+    ).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Quotation session token not found or invalid.")
+
+    # Rate limiting: max 3 feedbacks per assignment token
+    existing_count = db.query(QuotationDealerFeedback).filter(
+        QuotationDealerFeedback.quotation_bank_id == assignment.quotation_bank_id,
+        QuotationDealerFeedback.rfq_id == assignment.rfq_id
+    ).count()
+    if existing_count >= 3:
+        raise HTTPException(
+            status_code=429,
+            detail="Feedback limit reached for this quotation session. Thank you for your input!"
+        )
+
+    quotation_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    bank_id = quotation_bank.bank_id if quotation_bank else None
+    bank_name = "Unknown Bank"
+    if bank_id:
+        b = db.query(Bank).filter(Bank.id == bank_id).first()
+        if b:
+            bank_name = b.name
+
+    dealer_email = None
+    dealer_name = None
+    if not req_body.is_anonymous:
+        dealer_email = req_body.dealer_email
+        if not dealer_email and quotation_bank and quotation_bank.contacts:
+            if isinstance(quotation_bank.contacts, list) and len(quotation_bank.contacts) > 0:
+                first_c = quotation_bank.contacts[0]
+                if isinstance(first_c, dict):
+                    dealer_email = first_c.get("email")
+                    dealer_name = first_c.get("name")
+        if dealer_email and not dealer_name:
+            dealer_name = dealer_email.split("@")[0]
+
+    feedback = QuotationDealerFeedback(
+        rfq_id=assignment.rfq_id,
+        quotation_bank_id=assignment.quotation_bank_id,
+        bank_id=bank_id,
+        bank_name=bank_name,
+        dealer_email=dealer_email if not req_body.is_anonymous else None,
+        dealer_name=dealer_name if not req_body.is_anonymous else None,
+        is_anonymous=req_body.is_anonymous,
+        star_rating=req_body.star_rating,
+        category=req_body.category,
+        comment=req_body.comment.strip() if req_body.comment else None,
+        status="NEW"
+    )
+    db.add(feedback)
+    db.commit()
+    db.refresh(feedback)
+
+    return {
+        "status": "success",
+        "message": "Thank you! Your feedback has been received by the platform operations desk.",
+        "id": feedback.id
+    }
+
