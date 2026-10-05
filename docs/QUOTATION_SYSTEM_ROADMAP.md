@@ -10,12 +10,13 @@
 2. [Production Database Migration Ledger (Manual Production DDL)](#-production-database-migration-ledger-manual-production-ddl)
 3. [Phase 1: Counterparty Integrity & Security Controls (Completed)](#2-phase-1-counterparty-integrity--security-controls-completed)
 4. [Phase 2: Bank Protection & Cryptographic Security Hardening (Completed)](#3-phase-2-bank-protection--cryptographic-security-hardening-completed--verified-)
-5. [Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion](#4-phase-3-multi-leg-invisible-legs--selective-counterparty-exclusion)
-6. [Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine](#5-phase-4-smart-counterparty-intelligence--dynamic-recommendation-engine)
+5. [Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion (Completed)](#4-phase-3-multi-leg-invisible-legs--selective-counterparty-exclusion-completed--verified-)
+6. [Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine (Completed)](#5-phase-4-smart-counterparty-intelligence--dynamic-recommendation-engine-completed--verified-)
 7. [Phase 5: Institutional Banking Cyber Security & Compliance Readiness](#6-phase-5-institutional-banking-cyber-security--compliance-readiness-enterprise-onboarding-track)
-8. [Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture](#7-phase-6-selective-leg-quoting-uncontested-deal-governance--unified-skipped-bank-architecture)
-9. [Phase 7: Platform Owner Diagnostics Console & Dealer Voice System](#8-phase-7-platform-owner-diagnostics-console--dealer-voice-system)
-10. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
+8. [Phase 6: Selective Leg Quoting, Uncontested Deal Governance & Unified "Skipped Bank" Architecture (Completed)](#7-phase-6-selective-leg-quoting-uncontested-deal-governance--unified-skipped-bank-architecture)
+9. [Phase 7: Platform Owner Diagnostics Console & Dealer Voice System (Completed)](#8-phase-7-platform-owner-diagnostics-console--dealer-voice-system)
+10. [Workflow Governance, Dual Notifications & Performance Hardening (Completed)](#8-workflow-governance-maker-checker-dual-channel-notifications--real-time-performance-hardening-completed--verified-)
+11. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics (Current Core Focus)](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
 
 ---
 
@@ -616,6 +617,54 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 
 ---
 
+## 8. Workflow Governance, Maker-Checker Dual-Channel Notifications & Real-Time Performance Hardening (Completed & Verified ✅)
+
+### 8.1 Dual-Channel Approval Workflow Notification Engine
+To guarantee institutional compliance and eliminate operational delays between corporate makers (treasury analysts) and checkers (corporate admins), the platform implements an automated dual-channel notification service (`app/services/quotation_approval_notifications.py`):
+
+1. **Maker Submits Quotation for Approval (`QUOTATION_RFQ_PENDING_APPROVAL`)**:
+   - Corporate Admins receive an in-app system notification **and** an immediate high-priority email alerting them to review and approve the deal, containing deal details and a direct 1-click review link.
+2. **Admin Approves Quotation (`QUOTATION_RFQ_APPROVED`)**:
+   - The creator/maker receives an in-app notification **and** a green success email with live or scheduled release confirmation and direct deal link.
+3. **Admin Requests Revision (`QUOTATION_RFQ_NEEDS_REVISION`)**:
+   - The maker receives an in-app notification **and** an amber alert email containing the administrator's exact feedback/notes and a direct link to edit and resubmit.
+4. **Admin Rejects Quotation (`QUOTATION_RFQ_REJECTED`)**:
+   - Mandates or records the admin's **Rejection Reason** in database records (`rejection_reason` / `admin_notes`) and audit trails.
+   - The maker receives an in-app notification **and** an alert email detailing the exact Rejection Reason.
+5. **Maker Resubmits Revised Quotation (`QUOTATION_RFQ_RESUBMITTED`)**:
+   - Corporate Admins receive an in-app notification **and** an email showing the maker's updated package for re-review.
+
+### 8.2 Maker Pre-Approval RFQ Editing & In-Place Resubmission
+- **Pre-Approval In-Place Editing**: Makers are empowered to modify and update quotations that are in `PENDING_APPROVAL` status prior to admin review (previously restricted to `NEEDS_REVISION`).
+- Resubmitting updates parameters in place, preserves reference numbers, and dispatches a fresh re-review alert to Corporate Admins.
+- **Frontend Action Buttons**: Added direct **Edit Quotation** buttons in both [`QuotationHistoryDashboard.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/QuotationHistoryDashboard.js) and [`ResultsView.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/ResultsView.js).
+
+### 8.3 Quotation Cloning & Parameter Unlocking Overhaul
+- **100% Unlocked Parameter Editing**: Clicking "⚡ Clone as New Quotation" previously locked parameters like Direction, Amount, Legal Entity, Currencies, and Leg additions. Cloned templates are now 100% unlocked, allowing users to modify:
+  - Trade Type (FX Spot vs T-Bills)
+  - Requesting Legal Entity
+  - Direction, Currencies, and Ticket Amounts
+  - Settlement / Value Dates
+  - Adding or removing multi-currency legs freely
+- **Streamlined Results UX**: Eliminated duplicate header buttons when quotations conclude, standardize labeling to `⚡ Clone as New Quotation`.
+
+### 8.4 Live Market Benchmark Performance Gating & Instant History Loading
+- **Strict Benchmark Gating**:
+  - Defined `can_fetch_live_market = bool(is_live_bidding or is_acceptance_open)` in `quotations_endpoints.py`.
+  - Both leg-level and root-level market benchmark calculations now **only run** if the deal is currently live (`PENDING`, `OPEN`, `EVALUATING`) or the customer acceptance window is open.
+  - Concluded, rejected, cancelled, and past deals **never trigger live rate fetches or empirical models** (they only display their preserved frozen snapshot if one exists).
+- **In-Memory Cache & Network Resilience**:
+  - Increased in-memory cache TTL in `live_market_service.py` from 60 seconds to **300 seconds (5 minutes)**.
+  - Lowered external request timeout from 4s to 2s to guarantee worker threads are never held up.
+- **Instant History Table Rendering**:
+  - In `QuotationHistoryDashboard.js`, decoupled primary history loading from secondary statistics (`setLoading(false)` as soon as RFQ list returns). Table renders in milliseconds.
+  - Restricted `MarketSpreadTicker` on the history page: only mounts when active live tenders are running.
+- **Optimized Terminal State Polling**:
+  - In `ResultsView.js`, background polling immediately idles once deals reach terminal states (`COMPLETED`, `CANCELLED`, `REJECTED`, `INCONCLUSIVE`, `EXPIRED`, or finalized deal acceptance).
+  - Polling interval during active bidding or open acceptance relaxed from 1.5s to **3.0s**.
+
+---
+
 ## 9. Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics
 
 ### 9.1 Strategic Vision & Executive Objective
@@ -729,12 +778,15 @@ To ensure development proceeds in strict logical order without circular dependen
 [ Phase 3 ] Multi-Leg "Invisible" Legs (Selective Counterparty Exclusion) (Completed & Verified ✅)
       │
       ▼
-[ Phase 8 ] Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics
+[ Workflow & Performance Hardening ] Dual Approval Notifications, Unlocked Clone & Live Market Gating (Completed & Verified ✅)
+      │
+      ▼
+[ Phase 8 ] Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics ◄── (CURRENT UPCOMING CORE PHASE)
       │   ├─ Stage 1: $0.00 Self-Contained Envelope Encryption & Automated Email Recovery
       │   └─ Stage 2: Seamless Multi-Tenant Cloud KMS Plug-in ($5–$15/mo)
       │
       ▼
-[ Phase 5 ] Institutional Cyber Security, WORM Auditing & Bank Compliance Attestation
+[ Phase 5 ] Institutional Cyber Security, WORM Auditing & Bank Compliance Attestation (Enterprise Onboarding Track)
 ```
 
 ---
