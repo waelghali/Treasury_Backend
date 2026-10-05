@@ -1674,10 +1674,41 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             leg_results = []
             for a in assignments:
                 cfg = a.get_config_for_leg(leg.id)
+                q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
                 if getattr(cfg, 'is_invited', True) is False:
+                    leg_results.append({
+                        "bank_id": q_bank.bank_id if q_bank else 0,
+                        "quotation_bank_id": a.quotation_bank_id,
+                        "bank_name": q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank",
+                        "bank_emails": q_bank.emails if q_bank else "",
+                        "price": None,
+                        "finalPrice": None,
+                        "normalized_price": None,
+                        "assigned_value_date": None,
+                        "offered_value_date": None,
+                        "allow_alternative_value_date": False,
+                        "is_alternative_value_date": False,
+                        "is_custom_value_date": False,
+                        "time_value_adjustment": 0.0,
+                        "notes": None,
+                        "submitted_at": None,
+                        "submitted_by_email": None,
+                        "token": a.token,
+                        "quotation_base": a.quotation_base or rfq.quotation_base or "Execution",
+                        "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
+                        "is_excluded": True,
+                        "is_invited": False,
+                        "is_passed": False,
+                        "is_document_visible": False,
+                        "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
+                        "approval_status": a.approval_status,
+                        "cost_min": 0.0,
+                        "cost_percent": 0.0,
+                        "cost_max": 0.0,
+                        "cost_flat": 0.0
+                    })
                     continue
 
-                q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
                 assigned_val_date = cfg.value_date or a.value_date or leg_target_val_date
                 assigned_base = cfg.quotation_base or a.quotation_base or leg.quotation_base or rfq.quotation_base or "Execution"
                 allow_alt_val = cfg.allow_alternative_value_date if cfg.allow_alternative_value_date is not None else (
@@ -3184,7 +3215,7 @@ def resubmit_quotation(
                             id=cfg_id,
                             assignment_id=db_assignment.id,
                             leg_id=leg_obj.id,
-                            is_invited=True,
+                            is_invited=b_data.get('isInvited', b_data.get('is_invited', True)) is not False,
                             cost_min=b_data.get('costMin', 0.0),
                             cost_percent=b_data.get('costPercent', 0.0),
                             cost_max=b_data.get('costMax', 0.0),

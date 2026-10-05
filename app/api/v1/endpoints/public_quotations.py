@@ -286,6 +286,8 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
 
     for leg in rfq_legs:
         leg_cfg = assignment.get_config_for_leg(leg.id)
+        if leg_cfg and getattr(leg_cfg, 'is_invited', True) is False:
+            continue
         cfg_val_date = leg_cfg.value_date if leg_cfg and leg_cfg.value_date else (assignment.value_date or rfq.value_date)
         cfg_allow_alt = (leg_cfg.allow_alternative_value_date if leg_cfg and leg_cfg.allow_alternative_value_date is not None 
                          else (assignment.allow_alternative_value_date if assignment.allow_alternative_value_date is not None 
@@ -406,17 +408,36 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     # Phase 6.6: Bank Desks quote blind & independent (confidential internal reference is not leaked to banks)
     root_market_bm = None
 
+    # Phase 3: Align root RFQ attributes with single visible leg if only 1 leg is accessible to this bank
+    ret_direction = rfq.direction
+    ret_val_date = effective_value_date_str
+    ret_allow_alt = effective_allow_alt
+    ret_amount = rfq.amount
+    ret_min_ticket = rfq.min_ticket_amount
+    ret_buy_curr = rfq.buy_currency
+    ret_sell_curr = rfq.sell_currency
+
+    if len(portal_legs) == 1:
+        s_leg = portal_legs[0]
+        ret_direction = s_leg.get("direction") or ret_direction
+        ret_val_date = s_leg.get("value_date") or ret_val_date
+        ret_allow_alt = s_leg.get("allow_alternative_value_date") if s_leg.get("allow_alternative_value_date") is not None else ret_allow_alt
+        ret_amount = s_leg.get("amount") or ret_amount
+        ret_min_ticket = s_leg.get("min_ticket_amount") or ret_min_ticket
+        ret_buy_curr = s_leg.get("buy_currency") or ret_buy_curr
+        ret_sell_curr = s_leg.get("sell_currency") or ret_sell_curr
+
     return {
         "id": rfq.id,
         "ref_no": rfq.ref_no,
         "type": rfq.type,
-        "direction": rfq.direction,
-        "value_date": effective_value_date_str,
-        "allow_alternative_value_date": effective_allow_alt,
-        "amount": rfq.amount,
-        "min_ticket_amount": rfq.min_ticket_amount,
-        "buy_currency": rfq.buy_currency,
-        "sell_currency": rfq.sell_currency,
+        "direction": ret_direction,
+        "value_date": ret_val_date,
+        "allow_alternative_value_date": ret_allow_alt,
+        "amount": ret_amount,
+        "min_ticket_amount": ret_min_ticket,
+        "buy_currency": ret_buy_curr,
+        "sell_currency": ret_sell_curr,
         "settlement_date_start": rfq.settlement_date_start,
         "settlement_date_end": rfq.settlement_date_end,
         "maturity_date_start": rfq.maturity_date_start,
@@ -1202,6 +1223,11 @@ def submit_fx_offer(
 
     # Retrieve leg-specific or assignment config for value date
     leg_cfg = assignment.get_config_for_leg(target_leg_id) if target_leg_id else None
+    if leg_cfg and getattr(leg_cfg, 'is_invited', True) is False:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your institution is not invited to participate in this currency leg.")
+    if leg_cfg and getattr(leg_cfg, 'is_passed', False):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot submit quote on a passed leg.")
+
     if leg_cfg and leg_cfg.value_date:
         effective_target_value_date = leg_cfg.value_date
     else:
@@ -1403,6 +1429,10 @@ def submit_fx_offers_batch(
     submitted_offers = []
     for item in payload.quotes:
         leg_cfg = assignment.get_config_for_leg(item.leg_id) if item.leg_id else None
+        if leg_cfg and getattr(leg_cfg, 'is_invited', True) is False:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your institution is not invited to participate in one or more selected legs.")
+        if leg_cfg and getattr(leg_cfg, 'is_passed', False):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot submit quote on a passed leg.")
         eff_target_val_date = (leg_cfg.value_date if leg_cfg and leg_cfg.value_date 
                                else (assignment.value_date or rfq.value_date))
         is_alt_allowed = (leg_cfg.allow_alternative_value_date if leg_cfg and leg_cfg.allow_alternative_value_date is not None
@@ -2266,9 +2296,15 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
             }
 
         bank_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
-        legs_data = res_data.get("legs", [])
+        raw_legs_data = res_data.get("legs", [])
+        legs_data = []
+        for l in raw_legs_data:
+            cfg = assignment.get_config_for_leg(l.get("leg_id"))
+            if cfg and getattr(cfg, 'is_invited', True) is False:
+                continue
+            legs_data.append(l)
 
-        if legs_data and len(legs_data) > 1:
+        if legs_data and (len(legs_data) > 1 or len(raw_legs_data) > 1):
             won_legs = []
             lost_legs = []
             inconclusive_legs = []

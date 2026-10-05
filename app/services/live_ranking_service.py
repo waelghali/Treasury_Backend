@@ -232,25 +232,35 @@ class LiveRankingService:
         ).all()
         all_assignment_ids = [a.id for a in all_assignments]
 
+        target_assignment = next((a for a in all_assignments if a.id == assignment_id), None)
         results = {}
         legs = rfq.legs or []
         if legs:
             for idx, leg in enumerate(legs):
+                if target_assignment:
+                    cfg = target_assignment.get_config_for_leg(leg.id)
+                    if cfg and getattr(cfg, 'is_invited', True) is False:
+                        continue
+
                 rank = LiveRankingService.calculate_bank_live_rank(
                     db=db, rfq_id=rfq_id, assignment_id=assignment_id, leg_id=leg.id
                 )
                 
-                # Count total quotes for this specific leg
+                # Count total quotes for this specific leg among invited counterparties
+                invited_assignment_ids = [
+                    a.id for a in all_assignments
+                    if getattr(a.get_config_for_leg(leg.id), 'is_invited', True) is not False
+                ]
                 if rfq.type == 'TBILL':
                     leg_submitted_ids = set(
                         o.assignment_id for o in db.query(QuotationTBillOffer).filter(
-                            QuotationTBillOffer.assignment_id.in_(all_assignment_ids)
+                            QuotationTBillOffer.assignment_id.in_(invited_assignment_ids)
                         ).all()
                     )
                 else:
                     leg_submitted_ids = set(
                         o.assignment_id for o in db.query(QuotationOffer).filter(
-                            QuotationOffer.assignment_id.in_(all_assignment_ids),
+                            QuotationOffer.assignment_id.in_(invited_assignment_ids),
                             (QuotationOffer.leg_id == leg.id) | (QuotationOffer.leg_id.is_(None))
                         ).all()
                     )

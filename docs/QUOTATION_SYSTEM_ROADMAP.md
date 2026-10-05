@@ -132,7 +132,7 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
 
 ---
 
-## 4. Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion
+## 4. Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion (Completed & Verified ✅)
 
 ### 4.1 Business Need
 In multi-leg transactions (e.g. FX Swaps, multi-currency portfolios, concurrent Spot and Forward legs), a Corporate Treasury frequently needs to **hide specific legs from specific banks** to:
@@ -720,13 +720,13 @@ To ensure development proceeds in strict logical order without circular dependen
 [ Phase 6.1 - 6.5 ] Multi-Pair FX Tender Advanced Quoting, Governance & Live Market Benchmark (Completed ✅)
       │
       ▼
-[ Phase 3 ] Multi-Leg "Invisible" Legs (Selective Counterparty Exclusion)
+[ Phase 4 ] Smart Counterparty Intelligence & Dynamic Recommendation Engine (Completed ✅)
       │
       ▼
-[ Phase 7 ] Platform Owner Diagnostics Console & Dealer Voice System
+[ Phase 7 ] Platform Owner Diagnostics Console & Dealer Voice System (Completed ✅)
       │
       ▼
-[ Phase 4 ] Smart Counterparty Intelligence & Dynamic Recommendation Engine
+[ Phase 3 ] Multi-Leg "Invisible" Legs (Selective Counterparty Exclusion) (Completed & Verified ✅)
       │
       ▼
 [ Phase 8 ] Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics
@@ -755,4 +755,17 @@ To guarantee that **nothing** is overlooked across the entire platform ecosystem
 | **8. Search, Filtering, Sorting & Pagination** | Search by Currency, Bank, Status, Date, Deal ID | - **Blind Indexing**: Searchable non-confidential metadata (`currency_pair`, `status`, `created_at`, `counterparty_id`) remains indexed in plaintext/hashes for ultra-fast SQL sorting.<br>- Numeric price range filtering is executed in-memory after tenant retrieval. | Search past deals by "EUR/EGP" and filter by "Awarded"; verify sub-50ms query response. |
 | **9. Audit Trails & Forensic Compliance** | `AuditLog` table, WORM forwarding, Super Admin views | - Audit logs record *who* performed *what action* (e.g. `ACCEPTED_OFFER`, `MODIFIED_BANK_DESK`) without logging raw confidential price spreads.<br>- State transitions are fully auditable while maintaining zero-knowledge data isolation. | Review audit trail for executed deal; confirm complete forensic traceability with zero rate exposure. |
 | **10. Disaster Recovery & Self-Contained Maintenance** | Password resets, account recovery, DB backups | - Rate-limited self-service email recovery links (with cooldown timers).<br>- Automated envelope re-sealing without data loss.<br>- Encrypted DB backups are completely useless if stolen, protecting customer confidentiality. | Perform an end-to-end "Forgot Password" flow; verify user logs in with new password and historical deals remain 100% accessible. |
+
+---
+
+## 10. Production Database Migration Ledger (Audit & Compliance Log)
+
+This ledger tracks all production database schema states, DDL operations, and migration audits across the roadmap implementation:
+
+| Timestamp (UTC) | Phase | Target Table(s) | Column(s) / Constraints | Migration Type | Status & Operational Impact |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **2026-10-05** | **Phase 3** | `quotation_bank_leg_configs` | `is_invited` (`BOOLEAN NOT NULL DEFAULT True`) | **Schema Audit / Verification** | **Verified Pre-Existing ✅**<br>Audited live PostgreSQL schema. `is_invited` was already present from initial model creation. **Zero DDL alterations / Zero migration scripts required.** |
+| **2026-10-04** | **Phase 7** | `dealer_feedbacks` | `id`, `rfq_id`, `assignment_id`, `rating`, `comment`, `created_at` | DDL Migration | Active ✅ |
+| **2026-10-03** | **Phase 2** | `quotation_access_otps` | `failed_attempts` (`INTEGER DEFAULT 0`), `hashed_otp` (`VARCHAR(64)`) | DDL Migration | Active ✅ |
+| **2026-10-02** | **Phase 6** | `quotation_bank_leg_configs` | Multi-leg tariff overrides (`cost_min`, `cost_percent`, `cost_max`, `cost_flat`, `value_date`, `quotation_base`, `allow_alternative_value_date`) | DDL Migration | Active ✅ |
 

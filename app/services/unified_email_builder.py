@@ -413,7 +413,43 @@ def build_quotation_rfq_bank_email(
     sell_curr = getattr(rfq, "sell_currency", None) or ""
     direction = getattr(rfq, "direction", None) or "Buy"
     legs = getattr(rfq, "legs", []) or []
+
+    # Phase 3: Filter legs to only visible legs invited for this bank counterparty
+    if assignment and legs:
+        visible_legs = []
+        for l in legs:
+            cfg = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == l.id), None)
+            if cfg and getattr(cfg, 'is_invited', True) is False:
+                continue
+            visible_legs.append(l)
+        legs = visible_legs
+
     is_multi_pair = len(legs) > 1 and rfq_type == "FX_SPOT"
+
+    # If reduced to a single visible leg, align single-pair values with that leg
+    if len(legs) == 1 and rfq_type == "FX_SPOT":
+        s_leg = legs[0]
+        buy_curr = getattr(s_leg, "buy_currency", None) or buy_curr
+        sell_curr = getattr(s_leg, "sell_currency", None) or sell_curr
+        direction = getattr(s_leg, "direction", None) or direction
+        if getattr(s_leg, "amount", None) is not None:
+            try:
+                amount_str = f"{float(s_leg.amount):,.2f}"
+            except Exception:
+                pass
+        cfg_s = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == s_leg.id), None) if assignment else None
+        s_val_date = (cfg_s.value_date if cfg_s and getattr(cfg_s, "value_date", None) else getattr(s_leg, "value_date", None))
+        if s_val_date:
+            clean_vd = str(s_val_date).strip().split("T")[0]
+            try:
+                d_obj = datetime.strptime(clean_vd, "%Y-%m-%d")
+                value_date_display = f"{d_obj.strftime('%A, %d %b %Y')} ({clean_vd})"
+            except Exception:
+                value_date_display = clean_vd
+        if cfg_s and getattr(cfg_s, "allow_alternative_value_date", None) is not None:
+            is_alt_allowed = bool(cfg_s.allow_alternative_value_date)
+        elif getattr(s_leg, "allow_alternative_value_date", None) is not None:
+            is_alt_allowed = bool(s_leg.allow_alternative_value_date)
 
     # Quotation Base & Multi-Leg Mixed Package Detection
     q_base = (assignment.quotation_base if assignment and getattr(assignment, "quotation_base", None) else getattr(rfq, "quotation_base", None)) or "Indicative"
@@ -926,6 +962,7 @@ def build_quotation_rfq_bank_email(
 
 def build_quotation_withdrawn_bank_email(
     rfq: Any,
+    assignment: Any = None,
     bank_name: str = "Bank Partner",
     customer_branding: str = "Corporate Treasury",
     platform_name: str = "Grow Treasury Platform"
@@ -939,9 +976,26 @@ def build_quotation_withdrawn_bank_email(
     rfq_type = getattr(rfq, "type", "FX_SPOT")
     buy_curr = getattr(rfq, "buy_currency", None) or ""
     sell_curr = getattr(rfq, "sell_currency", None) or ""
-    pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or rfq_type)
-
     raw_amount = getattr(rfq, "amount", None)
+
+    legs = getattr(rfq, "legs", []) or []
+    if assignment and legs:
+        visible_legs = []
+        for l in legs:
+            cfg = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == l.id), None)
+            if cfg and getattr(cfg, 'is_invited', True) is False:
+                continue
+            visible_legs.append(l)
+        if len(visible_legs) == 1:
+            s_leg = visible_legs[0]
+            buy_curr = getattr(s_leg, "buy_currency", None) or buy_curr
+            sell_curr = getattr(s_leg, "sell_currency", None) or sell_curr
+            raw_amount = getattr(s_leg, "amount", None) or raw_amount
+        elif len(visible_legs) > 1:
+            buy_curr = "Multi"
+            sell_curr = "Currency"
+
+    pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or rfq_type)
     amount_str = f"{float(raw_amount):,.2f}" if raw_amount is not None else "N/A"
 
     subject = f"NOTICE OF WITHDRAWAL: RFQ {ref_no} Cancelled - {customer_branding}"

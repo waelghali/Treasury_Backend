@@ -727,7 +727,7 @@ class CRUDQuotation:
                     id=cfg_id,
                     assignment_id=db_assign.id,
                     leg_id=leg_obj.id,
-                    is_invited=True,
+                    is_invited=b_data.get('isInvited', b_data.get('is_invited', True)) is not False,
                     cost_min=b_data.get('costMin', 0.0),
                     cost_percent=b_data.get('costPercent', 0.0),
                     cost_max=b_data.get('costMax', 0.0),
