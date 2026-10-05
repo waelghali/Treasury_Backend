@@ -776,6 +776,29 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
   - Test suite executed: **3 of 3 tests passed with 100% success**.
   - Python compilation passed cleanly (`python -m py_compile`).
 
+#### 📌 Sub-Phase 8.3: Live Quoting & Results Zero-Knowledge Pipeline (Completed & Verified ✅)
+*Scope: End-to-end integration across bank submission, PostgreSQL ciphertext persistence, and corporate evaluation in-memory decryption.*
+
+- **Work Actually Done**:
+  - **Public Bank Submission Pipeline ([`public_quotations.py`](file:///c:/Grow/app/api/v1/endpoints/public_quotations.py))**:
+    - `submit_fx_offer`: Unseals target customer's Tenant DEK in memory and encrypts quote into `encrypted_price` using AES-256-GCM before database commit.
+    - `submit_fx_offers_batch`: Automatically encrypts all multi-leg portfolio quote lines with Tenant DEK.
+    - `submit_tbill_offer`: Encrypts `encrypted_discount_rate` and `encrypted_max_amount` with Tenant DEK.
+    - `get_public_rfq_result`: Securely decrypts only the bank's own historical offers for authorized trade confirmations without leaking customer DEK to external clients.
+  - **Corporate Standings & Evaluation Engine ([`quotations_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py))**:
+    - In `compute_rfq_standings`: Resolves bank quote prices and T-Bill discount rates in memory via `tenant_key_service.resolve_offer_price` and `resolve_tbill_discount_rate`.
+    - Normalization, TVM adjustments, fee clamping, and best-price ladder sorting execute seamlessly in memory over decrypted rates while physical rows on disk remain scrambled ciphertext.
+    - In `get_counterparty_recommendations`: Multi-dimensional recommendations engine decrypts historical quotes with customer DEK to maintain 100% accurate win rate, competitive proximity, and ticket size analytics.
+  - **Comprehensive E2E Integration Test ([`tests/test_zero_knowledge_e2e.py`](file:///c:/Grow/tests/test_zero_knowledge_e2e.py))**:
+    - Tested full end-to-end quoting and evaluation pipeline.
+    - Direct PostgreSQL DB audit: verified raw database row contains `enc:v1:{nonce}:{ct}` and verified raw numbers (e.g. `48.875`) are completely absent from plaintext storage.
+    - Verified cross-tenant isolation: attempting to decrypt customer's ciphertext with a foreign tenant's DEK raises `TamperDetectedError`.
+    - Verified corporate standings computation: cleanly decrypts quotes in memory and correctly evaluates ranking, winner, and spreads.
+- **Verification Proof**:
+  - All 3 test suites executed concurrently: **12 of 12 tests passed with 100% success** (Sub-Phase 8.1: 8/8, Sub-Phase 8.2: 3/3, Sub-Phase 8.3: 1/1).
+  - Python compilation passed cleanly (`python -m py_compile`).
+  - Local commit: `73372d8` (`feat(crypto): Sub-Phase 8.3 live quoting encryption and standings zero-knowledge pipeline`).
+
 ---
 
 ### 9.3 Self-Contained Lifecycle & Zero System Owner Maintenance
