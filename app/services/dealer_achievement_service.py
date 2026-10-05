@@ -206,6 +206,9 @@ class DealerAchievementService:
                     if not asgn:
                         continue
 
+                    from app.services.tenant_key_service import tenant_key_service
+                    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
                     bank_id_val = asgn.quotation_bank.bank_id if asgn.quotation_bank else None
                     if not bank_id_val:
                         continue
@@ -233,7 +236,7 @@ class DealerAchievementService:
 
                                 if leg.winner_bank_id == bank_id_val and leg.status not in ('REJECTED', 'CANCELLED', 'DECLINED'):
                                     dealer_submitted_winning_rate = any(
-                                        o.leg_id == leg.id and abs(float(o.price or 0.0) - float(leg.winner_rate or 0.0)) < 1e-4
+                                        o.leg_id == leg.id and abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(leg.winner_rate or 0.0)) < 1e-4
                                         for o in fx_offers
                                     )
                                     if dealer_submitted_winning_rate:
@@ -264,7 +267,7 @@ class DealerAchievementService:
                                 if qa and qa.winner_quotation_bank_id and asgn.quotation_bank:
                                     if qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status == 'COMPLETED':
                                         dealer_submitted_winning_rate = any(
-                                            o.assignment_id == asgn.id and abs(float(o.price or 0.0) - float(rfq.eval_rate or 0.0)) < 1e-4
+                                            o.assignment_id == asgn.id and abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(rfq.eval_rate or 0.0)) < 1e-4
                                             for o in fx_offers
                                         )
                                         if dealer_submitted_winning_rate:
@@ -307,7 +310,7 @@ class DealerAchievementService:
                         if exec_legs:
                             dealer_won_all_legs = all(
                                 l.winner_bank_id == bank_id_val and l.status not in ('REJECTED', 'CANCELLED', 'DECLINED') and
-                                any(o.leg_id == l.id and abs(float(o.price or 0.0) - float(l.winner_rate or 0.0)) < 1e-4 for o in fx_offers)
+                                any(o.leg_id == l.id and abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(l.winner_rate or 0.0)) < 1e-4 for o in fx_offers)
                                 for l in exec_legs
                             ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
 

@@ -253,12 +253,17 @@ class LiveMarketService:
                 if not assignments:
                     continue
                 offers = db.query(QuotationOffer).filter(
-                    QuotationOffer.assignment_id.in_([a.id for a in assignments]),
-                    QuotationOffer.price.isnot(None)
+                    QuotationOffer.assignment_id.in_([a.id for a in assignments])
                 ).all()
                 if not offers:
                     continue
-                prices = [o.price for o in offers if o.price and o.price > 0]
+                from app.services.tenant_key_service import tenant_key_service
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, r.customer_id)
+                prices = [
+                    tenant_key_service.resolve_offer_price(o, tenant_dek)
+                    for o in offers
+                ]
+                prices = [p for p in prices if p and p > 0]
                 if not prices:
                     continue
 
