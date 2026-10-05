@@ -388,17 +388,18 @@ def get_active_deal_awaiting_acceptance(
     now_utc = datetime.now(timezone.utc)
     recent_cutoff = now_utc - timedelta(hours=2)
 
+    # Only look for RFQs that are actually in an active evaluation/pending acceptance state
     query = db.query(QuotationRequest).filter(
-        QuotationRequest.status.notin_(['CANCELLED', 'DRAFT']),
-        (QuotationRequest.acceptance_status.notin_(['ACCEPTED', 'AUTO_ACCEPTED', 'REJECTED', 'AUTO_REJECTED', 'INDICATIVE_COMPLETED'])) | (QuotationRequest.acceptance_status.is_(None))
+        QuotationRequest.status.notin_(['CANCELLED', 'DRAFT', 'REJECTED']),
+        QuotationRequest.acceptance_status == 'PENDING'
     )
 
     if user_role != "super_admin":
         query = query.filter(QuotationRequest.customer_id == customer_id)
 
-    # Filter to recent window end or active scheduled
+    # Filter to active acceptance deadline
     query = query.filter(
-        (QuotationRequest.window_end >= recent_cutoff) | (QuotationRequest.window_end.is_(None))
+        QuotationRequest.acceptance_deadline > now_utc
     )
 
     candidate_rfqs = query.all()
@@ -421,18 +422,6 @@ def get_active_deal_awaiting_acceptance(
         if (rfq.quotation_base or "").lower() == "indicative" and not getattr(rfq, "legs", []):
             continue
 
-        # Compute standings and evaluate state
-        standings = compute_rfq_standings(rfq, db, dispatch_emails=False)
-
-        # Check if awaiting acceptance
-        is_inconclusive = standings.get("is_inconclusive", False)
-        if is_inconclusive:
-            continue
-
-        # Ensure acceptance window is active
-        if rfq.acceptance_status != "PENDING" and rfq.status != "EVALUATING":
-            continue
-
         acc_deadline = rfq.acceptance_deadline
         if not acc_deadline:
             continue
@@ -441,6 +430,14 @@ def get_active_deal_awaiting_acceptance(
         diff_seconds = int((acc_deadline_utc - now_utc).total_seconds())
 
         if diff_seconds <= 0:
+            continue
+
+        # Compute standings only for genuine active candidate
+        standings = compute_rfq_standings(rfq, db, dispatch_emails=False)
+
+        # Check if awaiting acceptance
+        is_inconclusive = standings.get("is_inconclusive", False)
+        if is_inconclusive:
             continue
 
         # Valid deal awaiting acceptance!

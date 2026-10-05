@@ -2403,8 +2403,10 @@ def get_rfq_history(
                 r.saved_vs_avg = first_leg.saved_vs_avg
         elif is_closed and r.status in ('PENDING', 'OPEN', 'EVALUATING'):
             compute_rfq_standings(r, db, dispatch_emails=False)
-        elif r.status in ['COMPLETED', 'TRADED']:
-            compute_rfq_standings(r, db, dispatch_emails=False)
+        else:
+            r.winner_bank_name = getattr(r, 'winner_bank_name', None)
+            r.winner_rate = getattr(r, 'winner_rate', None)
+            r.saved_vs_avg = getattr(r, 'saved_vs_avg', None)
             
         r.parent_rfq_ref = parent_map.get(r.parent_rfq_id)
         r.re_tender_count = retender_counts.get(r.id, 0)

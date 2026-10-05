@@ -752,7 +752,7 @@ class CRUDQuotation:
         query = db.query(QuotationRequest).options(
             selectinload(QuotationRequest.creator),
             selectinload(QuotationRequest.entity),
-            selectinload(QuotationRequest.legs)
+            selectinload(QuotationRequest.legs).selectinload(QuotationLeg.bank_configs)
         )
         if customer_id is not None:
             query = query.filter(QuotationRequest.customer_id == customer_id)
