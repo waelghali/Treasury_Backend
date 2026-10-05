@@ -799,6 +799,26 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
   - Python compilation passed cleanly (`python -m py_compile`).
   - Local commit: `73372d8` (`feat(crypto): Sub-Phase 8.3 live quoting encryption and standings zero-knowledge pipeline`).
 
+#### 📌 Sub-Phase 8.4: Privacy-Preserving Collaborative Analytics & Trophies (Completed & Verified ✅)
+*Scope: Cross-organization market spread averages, dealer gamification, and system owner telemetry with zero plaintext financial leakage.*
+
+- **Work Actually Done**:
+  - **Dealer Accolade Engine ([`dealer_achievement_service.py`](file:///c:/Grow/app/services/dealer_achievement_service.py))**:
+    - Updated individual dealer win-rate and streak verification routines to resolve quote prices via `tenant_key_service.resolve_offer_price` in memory using that deal's customer context.
+    - Verified that trophies (e.g. `Swift Quoting`, `Liquidity Titan`, `Unbroken Victor`) calculate from tokenized metadata (timestamp speed in ms, streak counters, volume tiers) without ever exposing competitor rates.
+  - **Empirical Live Market Benchmark ([`live_market_service.py`](file:///c:/Grow/app/services/live_market_service.py))**:
+    - In `_aggregate_market_spreads_from_completed_rfqs`: Decrypts winning quotes across completed historical tenders using respective customer DEKs in memory.
+    - Applies differential privacy aggregation and outputs strictly anonymized spread deviations in basis points (`spread_bps`, `sample_size`, `pair`). No corporate names, deals, or quotes leak into benchmark outputs.
+  - **System Owner Diagnostics Integrity ([`system_owner.py`](file:///c:/Grow/app/api/v1/endpoints/system_owner.py))**:
+    - Verified that Super Admin diagnostic and telemetry endpoints operate strictly over aggregate operational telemetry (CSAT scores, submission counts, feedback comments, latency metrics) with zero access to private deal quotes or spreads.
+  - **Verification Test Suite ([`tests/test_privacy_preserving_analytics.py`](file:///c:/Grow/tests/test_privacy_preserving_analytics.py))**:
+    - Test 1: Verified dealer desk dashboard and trophy calculations execute cleanly with zero errors.
+    - Test 2: Verified empirical market reference generates valid spread predictions while isolating all private competitor quotes.
+- **Verification Proof**:
+  - Test suite executed: **2 of 2 tests passed with 100% success**.
+  - Python compilation passed cleanly (`python -m py_compile`).
+  - Local commit: `6ffd619` (`feat(crypto): Sub-Phase 8.4 privacy-preserving collaborative analytics and dealer accolades`).
+
 ---
 
 ### 9.3 Self-Contained Lifecycle & Zero System Owner Maintenance
