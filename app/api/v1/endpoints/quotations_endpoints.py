@@ -2944,10 +2944,12 @@ def retender_quotation(
 def resubmit_quotation(
     rfq_id: str,
     payload: QuotationResubmitRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_active_user)
+    current_user: TokenData = Depends(get_current_active_user),
+    request: Request = None
 ):
-    """Allows the maker to update an RFQ that was returned with status NEEDS_REVISION and resubmit for approval."""
+    """Allows the maker to update an RFQ that was returned with status NEEDS_REVISION or is still PENDING_APPROVAL and resubmit for approval."""
     rfq = db.query(QuotationRequest).filter(
         QuotationRequest.id == rfq_id,
         QuotationRequest.customer_id == current_user.customer_id
@@ -2955,8 +2957,8 @@ def resubmit_quotation(
     if not rfq:
         raise HTTPException(status_code=404, detail="Quotation not found.")
 
-    if rfq.status != 'NEEDS_REVISION':
-        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be resubmitted.")
+    if rfq.status not in ('NEEDS_REVISION', 'PENDING_APPROVAL'):
+        raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and cannot be edited or resubmitted.")
 
     # Validate date consistency: settlement/value date cannot precede quotation trade date
     eff_w_start = payload.window_start or rfq.window_start
@@ -3260,6 +3262,17 @@ def resubmit_quotation(
             is_read=False
         ))
     db.commit()
+
+    # Step 3: Dispatch Email to Corporate Admins
+    from app.services.quotation_approval_notifications import dispatch_rfq_resubmitted_email
+    dispatch_rfq_resubmitted_email(
+        db=db,
+        background_tasks=background_tasks,
+        rfq=rfq,
+        user_notes=getattr(payload, 'user_notes', None),
+        submitter_email=current_user.email or f"User #{current_user.user_id}",
+        request=request
+    )
 
     log_action(
         db,

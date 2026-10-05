@@ -2295,6 +2295,16 @@ def approve_quotation(
             ))
             db.commit()
 
+        from app.services.quotation_approval_notifications import dispatch_rfq_approved_email
+        dispatch_rfq_approved_email(
+            db=db,
+            background_tasks=background_tasks,
+            rfq=rfq,
+            admin_email=corporate_admin_context.email,
+            scheduled_time=scheduled_time,
+            request=request
+        )
+
         return {
             "message": f"Quotation approved and scheduled for bank release at {scheduled_time.strftime('%Y-%m-%d %H:%M UTC')}.",
             "rfq_id": rfq.id,
@@ -2336,6 +2346,16 @@ def approve_quotation(
         ip_address=client_ip
     )
     db.commit()
+
+    from app.services.quotation_approval_notifications import dispatch_rfq_approved_email
+    dispatch_rfq_approved_email(
+        db=db,
+        background_tasks=background_tasks,
+        rfq=rfq,
+        admin_email=corporate_admin_context.email,
+        scheduled_time=None,
+        request=request
+    )
 
     from app.core.routing import get_frontend_base_url
     base_url = get_frontend_base_url(request=request)
@@ -2487,8 +2507,10 @@ class QuotationRevisionRequest(BaseModel):
 def request_quotation_revision(
     rfq_id: str,
     payload: QuotationRevisionRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    request: Request = None
 ):
     """Returns a quotation to the maker for revision with administrator notes."""
     rfq = db.query(QuotationRequest).filter(
@@ -2511,7 +2533,7 @@ def request_quotation_revision(
     rfq.admin_reviewed_at = func.now()
     db.commit()
 
-    # Notify End User Maker
+    # Notify End User Maker (In-App)
     from app.models.models_quotation import QuotationNotification
     db.add(QuotationNotification(
         user_id=rfq.created_by_user_id,
@@ -2522,6 +2544,17 @@ def request_quotation_revision(
         is_read=False
     ))
     db.commit()
+
+    # Dispatch Email to End User Maker
+    from app.services.quotation_approval_notifications import dispatch_rfq_revision_requested_email
+    dispatch_rfq_revision_requested_email(
+        db=db,
+        background_tasks=background_tasks,
+        rfq=rfq,
+        admin_notes=notes,
+        admin_email=corporate_admin_context.email,
+        request=request
+    )
 
     return {"message": "Quotation returned to maker for revision.", "rfq_id": rfq.id, "status": "NEEDS_REVISION"}
 
