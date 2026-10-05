@@ -1487,6 +1487,11 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
     
+    # Gate live market benchmark evaluation: only run when live tender bidding or acceptance window is open
+    is_live_bidding = bool(not is_closed and not is_scheduled and rfq.status in ('PENDING', 'OPEN', 'EVALUATING'))
+    is_acceptance_open = bool(rfq.acceptance_status == 'PENDING' and acc_deadline and now < acc_deadline)
+    can_fetch_live_market = bool(is_live_bidding or is_acceptance_open)
+    
     results = []
     winner_bank_id = None
     is_inconclusive = False
@@ -1993,7 +1998,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
 
             # Phase 6.6: Use Frozen Snapshot if deal accepted, else live benchmark
             leg_market_bm = leg.market_benchmark_snapshot if getattr(leg, 'market_benchmark_snapshot', None) else None
-            if not leg_market_bm and (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
+            if not leg_market_bm and can_fetch_live_market and (getattr(leg, 'type', None) or rfq.type) == 'FX_SPOT' and leg.buy_currency and leg.sell_currency:
                 try:
                     from app.services.live_market_service import live_market_service
                     leg_market_bm = live_market_service.get_empirical_reference(
@@ -2254,7 +2259,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     root_market_bm = rfq.market_benchmark_snapshot if getattr(rfq, 'market_benchmark_snapshot', None) else None
     if not root_market_bm:
         root_market_bm = primary_leg.get("market_benchmark") if primary_leg else None
-    if not root_market_bm and rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
+    if not root_market_bm and can_fetch_live_market and rfq.type == 'FX_SPOT' and rfq.buy_currency and rfq.sell_currency:
         try:
             from app.services.live_market_service import live_market_service
             root_market_bm = live_market_service.get_empirical_reference(

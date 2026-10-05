@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory TTL Cache: { "USD_EGP": { "rate": 52.22, "timestamp": datetime } }
 _LIVE_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL_SECONDS = 60
+CACHE_TTL_SECONDS = 300
 
 DISCLAIMER_TEXT = (
     "⚠️ Historical Empirical Model: Reference rate and spread are derived mathematically from "
@@ -106,7 +106,7 @@ class LiveMarketService:
                 "https://open.er-api.com/v6/latest/USD",
                 headers={"User-Agent": "GrowTreasury/2.0 (Platform Benchmark Engine)"}
             )
-            with urllib.request.urlopen(req, timeout=4) as response:
+            with urllib.request.urlopen(req, timeout=2) as response:
                 if response.status == 200:
                     payload = json.loads(response.read().decode('utf-8'))
                     rates = payload.get("rates", {})
