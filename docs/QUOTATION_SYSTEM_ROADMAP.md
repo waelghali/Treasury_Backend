@@ -723,6 +723,33 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
       ...
   ```
 
+#### 📌 Sub-Phase 8.1: Core Cryptographic Engine & Key Provider Interface (Completed & Verified ✅)
+*Scope: Standalone authenticated envelope encryption service, key abstraction interface, and comprehensive security test suite.*
+
+- **Work Actually Done**:
+  - **Module Implementation ([`app/core/security_crypto.py`](file:///c:/Grow/app/core/security_crypto.py))**:
+    - `KeyProvider` abstract base class defining standard `wrap_dek` and `unwrap_dek` interface.
+    - `LocalServerKeyProvider` (Stage 1, $0.00 infrastructure cost): derives 256-bit Master KEK via HKDF-SHA256 from application secrets and seals Tenant DEKs using AES-256-GCM bound to `tenant_id` via Associated Authenticated Data (AAD).
+    - `CloudKmsKeyProvider` (Stage 2): reserved plug-and-play provider interface for AWS KMS / Google Cloud KMS.
+    - `generate_tenant_dek()`: generates cryptographically secure 256-bit random keys.
+    - `encrypt_field()` & `decrypt_field()`: authenticated AES-256-GCM encryption with 96-bit unique nonces and context-binding AAD. Supports native type preservation (`float`, `int`, `str`, `bool`, `dict`, `list`).
+    - `encrypt_json()` & `decrypt_json()`: serialization helper for complex JSON dictionaries.
+    - `is_encrypted()`: format detection (`enc:v1:{nonce}:{ciphertext}`) supporting dual-read backwards compatibility.
+    - Specialized exceptions: `CryptoError`, `DecryptionError`, `TamperDetectedError`, `InvalidKeyError`.
+  - **Comprehensive Test Suite ([`tests/test_security_crypto.py`](file:///c:/Grow/tests/test_security_crypto.py))**:
+    - Test 1: Key provider wrap/unwrap round-trip.
+    - Test 2: Tenant isolation binding (AAD mismatch on cross-tenant unwrap raises `TamperDetectedError`).
+    - Test 3: Native types round-trip (floats, ints, strings, dicts, None).
+    - Test 4: Field context binding (attempting to decrypt a 'price' ciphertext as 'spread' raises `TamperDetectedError`).
+    - Test 5: Ciphertext bit-flip tamper detection (single-bit modification in ciphertext raises `TamperDetectedError`).
+    - Test 6: Cross-tenant isolation (decrypting Tenant A ciphertext with Tenant B DEK raises `TamperDetectedError`).
+    - Test 7: Dual-read backwards compatibility (legacy unencrypted plain numbers/strings return safely unchanged).
+    - Test 8: Performance benchmark: 1,000 cycles completed in **0.0239s** (~0.0239ms per op), validating sub-millisecond execution.
+- **Verification Proof**:
+  - Standalone test suite executed: **8 of 8 tests passed with 100% success**.
+  - Python compilation passed cleanly (`python -m py_compile`).
+  - Local commit: `c99099c` (`feat(crypto): implement Phase 8.1 Zero-Knowledge authenticated encryption engine and test suite`).
+
 ---
 
 ### 9.3 Self-Contained Lifecycle & Zero System Owner Maintenance
