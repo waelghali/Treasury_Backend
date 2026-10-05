@@ -176,38 +176,22 @@ In multi-leg transactions (e.g. FX Swaps, multi-currency portfolios, concurrent 
 
 ---
 
-## 5. Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine
+## 5. Phase 4: Smart Counterparty Intelligence & Dynamic Recommendation Engine (Completed & Verified ✅)
 
 ### 5.1 Objective
-Enhance `@router.get("/recommendations")` from a simple volume counter into a **predictive, multi-dimensional Counterparty Recommendation Engine** that guides the corporate user to invite the highest-probability, best-pricing banks for every specific deal.
+Enhanced `@router.get("/recommendations")` from a simple volume counter into a **predictive, multi-dimensional Counterparty Recommendation Engine** that guides the corporate user to invite the highest-probability, best-pricing banks for every specific deal.
 
-### 5.2 Key Evaluation Dimensions
-
-#### 1. Indicative vs. Firm Execution Divergence ("Bait-and-Switch" Detection)
-- **The Problem**: Some bank desks quote aggressive, tight spreads on Indicative benchmarks (to look good on market intelligence dashboards), but widen their spreads significantly or decline to quote when invited to binding Firm Execution RFQs.
-- **The Intelligence Metric**:
-  $$\text{Execution Degradation Spread} = \text{Spread}_{\text{Execution}} - \text{Spread}_{\text{Indicative}}$$
-- **Behavior**:
-  - Banks that maintain tight pricing on firm execution receive an **Execution Consistency Premium**.
-  - Banks with chronic spread widening on firm execution are flagged and penalized in execution recommendations.
-
-#### 2. Currency Pair Affinity & Desk Specialization
-- **The Problem**: A bank with a modest 25% overall win rate across all currencies might actually win **75% of EUR/EGP** transactions because they manage large corporate export flows in Euros.
-- **The Intelligence Metric**:
-  - Calculate pair-specific win rates and spread competitive percentiles:
-    $$\text{Pair Affinity Score} = \text{Win Rate}_{\text{Pair}} \times 0.6 + \text{Response Rate}_{\text{Pair}} \times 0.4$$
-- **Behavior**:
-  - When the user selects `EUR / EGP` in the wizard, the recommendation engine elevates the "EUR Specialist" bank with an explicit badge: `⭐ EUR/EGP Specialist (75% Win Rate in EUR)`.
-
-#### 3. Response Reliability & Price Freshness (Window Completion vs. Ghosting)
-- **Market Reality (The Trader's Advantage)**: In institutional FX, quoting in the final seconds before window close is **an indicator of high efficiency and sophistication**. Desks that wait until the final seconds do so to price against the live interbank order book without needing wide defensive buffers, delivering the freshest, most aggressive rates to the corporate.
-- **The Intelligent Metric**:
-  - **Window Completion Rate**: Measures whether the bank delivered a valid quote before the cutoff (penalizes true ghosting / non-response, without penalizing strategic late-window quoting).
-  - **Price Freshness Index**: Recognizes active desks that refresh quotes close to the deadline.
-  - **Quote Refinement Rate**: Tracks whether a desk actively tightens its quote during live market movement.
-
-#### 4. Ticket Size & Volume Sweet Spots
-- Recognizes bank balance sheet appetite (e.g. Bank X is #1 for tickets > $5M, while Bank Y is most competitive for tickets < $500k).
+### 5.2 Implemented Evaluation Dimensions & Features
+- **Direct Currency Pair Win Rate & Affinity**: Evaluates historical wins per currency pair; dynamically awards `⭐ {Pair} Specialist ({X} of {Y} won)` or `⭐ Proven in {Pair}`.
+- **Competitive Proximity & Runner-Up Index (Metric A)**: Computes when a bank finished in the Top 2 or quoted within tight spread tolerances, awarding `🎯 Tight Competitor (Top 2 in {X}% of quotes)`.
+- **Ticket Size Appetite & Volume Sweet Spots (Metric B)**: Analyzes institutional balance sheet performance on tickets $\ge \$1\text{M}$, awarding `🏛️ Mega-Ticket Dominance` or `🏛️ Large-Ticket Proven`.
+- **Multi-Leg Basket Coverage**: Recognizes counterparties capable of pricing entire multi-pair portfolios (`📦 Full Basket Quoter`).
+- **Pure Participation Rate**: Tracks commitments delivered without penalizing strategic late-window quoting (`⚡ Highly Active ({X}% participation)` vs `⚠️ Low Response Rate`).
+- **Dynamic 100-Point Scoring Model**: Automatically factors pair affinity (40%), top-2 rate (35%), participation (25%), mega-ticket bonus (+10), and non-response penalty (-15).
+- **Frontend Wizard Integration ([`QuotationRequestDashboard.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/QuotationRequestDashboard.js))**:
+  - Dynamically recalculates recommendations as pairs, amounts, and settlement dates change.
+  - Highlights `Top Pick` with spark icons (`Sparkles`).
+  - Renders color-coded badges for Specialist (`⭐`, emerald), Competitor (`🎯`, indigo), Mega-Ticket (`🏛️`, purple), and Low Response (`⚠️`, amber).
 
 ---
 
