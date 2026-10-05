@@ -1271,6 +1271,9 @@ def submit_fx_offer(
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid proposed value date format. Expected YYYY-MM-DD.")
 
+    from app.services.tenant_key_service import tenant_key_service
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
     offer = QuotationOffer(
         assignment_id=assignment.id,
         price=offer_in.price,
@@ -1279,6 +1282,7 @@ def submit_fx_offer(
         submitted_by_email=submitted_by,
         leg_id=target_leg_id
     )
+    tenant_key_service.apply_encrypted_offer_price(offer, offer_in.price, tenant_dek)
     db.add(offer)
     db.commit()
 
@@ -1476,6 +1480,9 @@ def submit_fx_offers_batch(
             QuotationOffer.leg_id == item.leg_id
         ).delete()
 
+        from app.services.tenant_key_service import tenant_key_service
+        tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
         offer = QuotationOffer(
             assignment_id=assignment.id,
             price=item.price,
@@ -1484,6 +1491,7 @@ def submit_fx_offers_batch(
             submitted_by_email=submitted_by,
             leg_id=item.leg_id
         )
+        tenant_key_service.apply_encrypted_offer_price(offer, item.price, tenant_dek)
         db.add(offer)
         submitted_offers.append(offer)
 
@@ -1683,6 +1691,9 @@ def submit_tbill_offer(
     # Delete existing lines for this exact assignment entirely before repopulating
     db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == assignment.id).delete()
     
+    from app.services.tenant_key_service import tenant_key_service
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
     for line in offer_in.lines:
         o = QuotationTBillOffer(
             assignment_id=assignment.id,
@@ -1693,6 +1704,7 @@ def submit_tbill_offer(
             notes=line.notes or offer_in.notes,
             submitted_by_email=submitted_by
         )
+        tenant_key_service.apply_encrypted_tbill_offer(o, line.discountRate, line.maxAmount, tenant_dek)
         db.add(o)
     
     db.commit()
@@ -2077,24 +2089,27 @@ def get_bank_quotation_history(
         notes = None
         offers_info = []
 
+        from app.services.tenant_key_service import tenant_key_service
+        tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
         if rfq.type == "TBILL":
             tb_offers = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
             if tb_offers:
-                best_price = min(o.discount_rate for o in tb_offers)
+                best_price = min(tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek) for o in tb_offers)
                 submitted_by = tb_offers[0].submitted_by_email
                 submitted_at = tb_offers[0].submitted_at
                 notes = tb_offers[0].notes
                 offers_info = [{
                     "settlement_date": o.settlement_date,
                     "maturity_date": o.maturity_date,
-                    "discount_rate": o.discount_rate,
+                    "discount_rate": tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek),
                     "max_amount": o.max_amount,
                     "notes": o.notes
                 } for o in tb_offers]
         else:
             fx_offer = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
             if fx_offer:
-                best_price = fx_offer.price
+                best_price = tenant_key_service.resolve_offer_price(fx_offer, tenant_dek)
                 submitted_by = fx_offer.submitted_by_email
                 submitted_at = fx_offer.submitted_at
                 notes = fx_offer.notes
@@ -2120,7 +2135,7 @@ def get_bank_quotation_history(
                     l_outcome = "REJECTED"
                 elif l.status == 'INCONCLUSIVE':
                     l_outcome = "INCONCLUSIVE"
-                elif l_offer and l_offer.price is not None:
+                elif l_offer and (l_offer.price is not None or l_offer.encrypted_price is not None):
                     l_outcome = "NOT_SELECTED" if rfq.status == "COMPLETED" else "SUBMITTED"
                 else:
                     l_outcome = "NO_QUOTE"
@@ -2134,7 +2149,7 @@ def get_bank_quotation_history(
                     "buy_currency": l.buy_currency,
                     "sell_currency": l.sell_currency,
                     "value_date": l.value_date,
-                    "submitted_price": l_offer.price if l_offer else None,
+                    "submitted_price": tenant_key_service.resolve_offer_price(l_offer, tenant_dek) if l_offer else None,
                     "outcome": l_outcome,
                     "is_winner": is_l_won
                 })

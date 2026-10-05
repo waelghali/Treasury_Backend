@@ -873,10 +873,12 @@ def get_bank_recommendations(
 
                 # Competitive Proximity (Top 2 Rank in this leg - Metric A)
                 all_comp_quotes = []
+                from app.services.tenant_key_service import tenant_key_service
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
                 for other_a in rfq.assignments:
                     o_offers = [o for o in other_a.offers if (o.leg_id == leg.id or (not o.leg_id and len(rfq_legs) == 1))]
                     if o_offers:
-                        best_p = min(o.price for o in o_offers) if (leg.direction or 'Buy').lower() == 'buy' else max(o.price for o in o_offers)
+                        best_p = min(tenant_key_service.resolve_offer_price(o, tenant_dek) for o in o_offers) if (leg.direction or 'Buy').lower() == 'buy' else max(tenant_key_service.resolve_offer_price(o, tenant_dek) for o in o_offers)
                         all_comp_quotes.append({
                             "bank_id": other_a.quotation_bank.bank_id,
                             "price": best_p
@@ -1503,6 +1505,9 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     is_uncontested = False
     uncontested_reason = None
     
+    from app.services.tenant_key_service import tenant_key_service
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
     if rfq.type == 'TBILL':
         all_tbill_offers = []
         for a in assignments:
@@ -1515,7 +1520,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "bank_emails": q_bank.emails if q_bank else "",
                     "settlement_date": o.settlement_date,
                     "maturity_date": o.maturity_date,
-                    "discount_rate": o.discount_rate,
+                    "discount_rate": tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek),
                     "max_amount": o.max_amount,
                     "submitted_at": o.submitted_at
                 })
@@ -1800,7 +1805,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     })
                     continue
 
-                price = offer_db.price
+                price = tenant_key_service.resolve_offer_price(offer_db, tenant_dek)
                 base_deal_volume = leg_amount * price
                 raw_fee = (base_deal_volume * (float(cfg.cost_percent or 0) / 100.0)) + float(cfg.cost_flat or 0)
                 clamped_fee = raw_fee
