@@ -78,6 +78,8 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
 | **Phase 6.1** | `quotation_bank_leg_configs` | Add column `is_passed` | ```sql<br>ALTER TABLE quotation_bank_leg_configs<br>ADD COLUMN IF NOT EXISTS is_passed BOOLEAN NOT NULL DEFAULT FALSE;<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_bank_leg_configs' AND column_name = 'is_passed';<br>``` |
 | **Phase 6.6** | `quotation_rfqs`, `quotation_legs` | Add `market_benchmark_snapshot` JSONB | ```sql<br>ALTER TABLE quotation_rfqs<br>ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;<br>ALTER TABLE quotation_legs<br>ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;<br>``` | ```sql<br>SELECT column_name, data_type<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_rfqs' AND column_name = 'market_benchmark_snapshot';<br>``` |
 | **Phase 6.6** | `quotation_market_rate_history` | Create Time-Series Archive Table | ```sql<br>CREATE TABLE IF NOT EXISTS quotation_market_rate_history (<br>&nbsp;&nbsp;id SERIAL PRIMARY KEY,<br>&nbsp;&nbsp;currency_pair VARCHAR(10) NOT NULL,<br>&nbsp;&nbsp;base_currency VARCHAR(5) NOT NULL,<br>&nbsp;&nbsp;quote_currency VARCHAR(5) NOT NULL,<br>&nbsp;&nbsp;rate DOUBLE PRECISION NOT NULL,<br>&nbsp;&nbsp;source VARCHAR(50) NOT NULL,<br>&nbsp;&nbsp;cbe_official_mid DOUBLE PRECISION,<br>&nbsp;&nbsp;cbe_gap_bps DOUBLE PRECISION,<br>&nbsp;&nbsp;created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL<br>);<br>CREATE INDEX IF NOT EXISTS idx_quotation_mkt_rate_pair_created<br>ON quotation_market_rate_history (currency_pair, created_at DESC);<br>``` | ```sql<br>SELECT count(*)<br>FROM quotation_market_rate_history;<br>``` |
+| **Phase 8.2** | `quotation_tenant_keys` | Create Tenant Envelope Key Store | ```sql<br>CREATE TABLE IF NOT EXISTS quotation_tenant_keys (<br>&nbsp;&nbsp;id SERIAL PRIMARY KEY,<br>&nbsp;&nbsp;customer_id INTEGER NOT NULL UNIQUE REFERENCES customers(id) ON DELETE CASCADE,<br>&nbsp;&nbsp;key_id VARCHAR(64) NOT NULL UNIQUE,<br>&nbsp;&nbsp;wrapped_dek TEXT NOT NULL,<br>&nbsp;&nbsp;key_version INTEGER NOT NULL DEFAULT 1,<br>&nbsp;&nbsp;status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',<br>&nbsp;&nbsp;created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,<br>&nbsp;&nbsp;updated_at TIMESTAMP WITH TIME ZONE,<br>&nbsp;&nbsp;is_deleted BOOLEAN NOT NULL DEFAULT FALSE,<br>&nbsp;&nbsp;deleted_at TIMESTAMP WITH TIME ZONE,<br>&nbsp;&nbsp;rotated_at TIMESTAMP WITH TIME ZONE<br>);<br>CREATE INDEX IF NOT EXISTS idx_quotation_tenant_keys_cust ON quotation_tenant_keys(customer_id);<br>``` | ```sql<br>SELECT count(*)<br>FROM quotation_tenant_keys;<br>``` |
+| **Phase 8.2** | `quotation_offers`, `quotation_tbill_offers` | Add Ciphertext Columns | ```sql<br>ALTER TABLE quotation_offers<br>ADD COLUMN IF NOT EXISTS encrypted_price VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_spread VARCHAR(255);<br>ALTER TABLE quotation_tbill_offers<br>ADD COLUMN IF NOT EXISTS encrypted_discount_rate VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_max_amount VARCHAR(255);<br>``` | ```sql<br>SELECT column_name, data_type<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_offers' AND column_name = 'encrypted_price';<br>``` |
 
 ---
 
@@ -749,6 +751,30 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
   - Standalone test suite executed: **8 of 8 tests passed with 100% success**.
   - Python compilation passed cleanly (`python -m py_compile`).
   - Local commit: `c99099c` (`feat(crypto): implement Phase 8.1 Zero-Knowledge authenticated encryption engine and test suite`).
+
+#### 📌 Sub-Phase 8.2: Tenant Key Store & Dual-Read Database Layer (Completed & Verified ✅)
+*Scope: Database schema preparation, customer key envelopes, ORM model properties, and backwards-compatible resolvers.*
+
+- **Work Actually Done**:
+  - **Database Migration & Schema**:
+    - Executed DDL creating `quotation_tenant_keys` table with indexes, CASCADE deletion, and `BaseModel` audit columns (`created_at`, `updated_at`, `is_deleted`, `deleted_at`, `rotated_at`).
+    - Added ciphertext storage columns to `quotation_offers` (`encrypted_price`, `encrypted_spread`) and `quotation_tbill_offers` (`encrypted_discount_rate`, `encrypted_max_amount`).
+    - Logged exact SQL statements in the centralized **Production Database Migration Ledger**.
+  - **ORM Models ([`app/models/models_quotation.py`](file:///c:/Grow/app/models/models_quotation.py))**:
+    - Created `QuotationTenantKey` model linking to `Customer`.
+    - Added encrypted ciphertext columns to `QuotationOffer` and `QuotationTBillOffer`.
+  - **Tenant Key Service ([`app/services/tenant_key_service.py`](file:///c:/Grow/app/services/tenant_key_service.py))**:
+    - `get_or_create_tenant_dek`: On-demand provisioning of cryptographically random 256-bit Tenant DEKs sealed via Master KEK and bound to `customer_id` via AAD.
+    - In-memory thread-safe TTL cache (10-minute expiry) to eliminate redundant Master KEK unwrapping on hot queries.
+    - Dual-read resolvers: `resolve_offer_price` and `resolve_tbill_discount_rate` resolve prices from ciphertext when available, falling back safely to legacy plaintext columns for existing historical deals.
+  - **Verification Test Suite ([`tests/test_tenant_key_service.py`](file:///c:/Grow/tests/test_tenant_key_service.py))**:
+    - Test 1: On-demand provisioning, persistence in PostgreSQL, and cache hit/unseal verification.
+    - Test 2: Dual-write and dual-read verification for `QuotationOffer` (FX Spot).
+    - Test 3: Dual-write and dual-read verification for `QuotationTBillOffer` (T-Bills).
+- **Verification Proof**:
+  - Database table and columns verified live on PostgreSQL (`grow` database).
+  - Test suite executed: **3 of 3 tests passed with 100% success**.
+  - Python compilation passed cleanly (`python -m py_compile`).
 
 ---
 

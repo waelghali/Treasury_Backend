@@ -414,6 +414,8 @@ class QuotationOffer(BaseModel):
     assignment_id = Column(String, ForeignKey("quotation_bank_assignments.id", ondelete="CASCADE"), nullable=False)
     leg_id = Column(String, ForeignKey("quotation_legs.id", ondelete="CASCADE"), nullable=True, index=True)
     price = Column(Float, nullable=False)
+    encrypted_price = Column(String(255), nullable=True, comment="Phase 8 Zero-Knowledge AES-256-GCM encrypted quote")
+    encrypted_spread = Column(String(255), nullable=True, comment="Phase 8 Zero-Knowledge AES-256-GCM encrypted spread")
     offered_value_date = Column(Date, nullable=True, comment="Alternative settlement date proposed by counterparty")
     notes = Column(Text, nullable=True, comment="Optional notes or comments from the submitting trader")
     submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
@@ -431,12 +433,29 @@ class QuotationTBillOffer(BaseModel):
     maturity_date = Column(String, nullable=False)
     discount_rate = Column(Float, nullable=False)
     max_amount = Column(Float, nullable=False)
+    encrypted_discount_rate = Column(String(255), nullable=True, comment="Phase 8 Zero-Knowledge AES-256-GCM encrypted discount rate")
+    encrypted_max_amount = Column(String(255), nullable=True, comment="Phase 8 Zero-Knowledge AES-256-GCM encrypted max amount")
     notes = Column(Text, nullable=True, comment="Optional notes or comments from the submitting trader")
     submitted_by_email = Column(String, nullable=True, comment="Email of the authenticated trader who submitted this quote")
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assignment = relationship("QuotationBankAssignment", back_populates="tbill_offers")
     leg = relationship("QuotationLeg", back_populates="tbill_offers")
+
+class QuotationTenantKey(BaseModel):
+    """Phase 8: Stores wrapped Tenant Data Encryption Keys (DEKs) per Corporate Customer."""
+    __tablename__ = "quotation_tenant_keys"
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    key_id = Column(String(64), nullable=False, unique=True)
+    wrapped_dek = Column(Text, nullable=False, comment="AES-256-GCM wrapped DEK sealed by Master KEK")
+    key_version = Column(Integer, default=1, nullable=False)
+    status = Column(String(20), default="ACTIVE", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    rotated_at = Column(DateTime(timezone=True), nullable=True)
+
+    customer = relationship("Customer")
+
 
 class QuotationAccessOTP(BaseModel):
     """Stores OTPs and magic access tokens for bank desk authentication."""
