@@ -21,6 +21,7 @@ import json
 import base64
 import secrets
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple, Dict, Union
 
@@ -264,3 +265,88 @@ def decrypt_json(cipher_str: Optional[str], dek: bytes, context: str = "") -> Op
         except Exception:
             return None
     return None
+
+
+# --- Sub-Phase 8.5: Self-Contained Password Recovery & Cooldown Rate Limiting ---
+import hmac
+import hashlib
+from collections import defaultdict
+
+_RECOVERY_ATTEMPTS: Dict[str, list] = defaultdict(list)
+
+def check_recovery_rate_limit(email: str, max_attempts: int = 3, window_seconds: int = 3600) -> Tuple[bool, int]:
+    """
+    Enforces a strict cooldown rate limiter for self-service password recovery.
+    Allows up to max_attempts within window_seconds (default: max 3 requests per 1 hour).
+    Returns (is_allowed, seconds_remaining_until_cooldown).
+    """
+    clean_email = email.strip().lower()
+    now = time.time()
+    
+    # Prune attempts older than the window
+    attempts = [ts for ts in _RECOVERY_ATTEMPTS[clean_email] if (now - ts) < window_seconds]
+    _RECOVERY_ATTEMPTS[clean_email] = attempts
+
+    if len(attempts) >= max_attempts:
+        oldest_in_window = min(attempts)
+        seconds_remaining = int(window_seconds - (now - oldest_in_window))
+        return False, max(1, seconds_remaining)
+
+    # Record this attempt
+    _RECOVERY_ATTEMPTS[clean_email].append(now)
+    return True, 0
+
+def clear_recovery_rate_limit(email: str) -> None:
+    """Resets recovery attempt history for testing or upon successful password reset."""
+    _RECOVERY_ATTEMPTS.pop(email.strip().lower(), None)
+
+def generate_recovery_token(email: str, secret_salt: str, expiry_minutes: int = 15) -> str:
+    """
+    Generates a secure, time-bounded HMAC-SHA256 recovery token.
+    Encodes email, expiry timestamp, and a cryptographic MAC signature.
+    """
+    clean_email = email.strip().lower()
+    expires_at = int(time.time()) + (expiry_minutes * 60)
+    data = f"{clean_email}:{expires_at}"
+    
+    mac = hmac.new(
+        key=secret_salt.encode("utf-8"),
+        msg=data.encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    payload = f"{data}:{mac}"
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+def verify_recovery_token(token: str, secret_salt: str) -> Optional[str]:
+    """
+    Validates an HMAC-SHA256 recovery token.
+    Returns the associated email if valid, or None if the token is tampered, malformed, or expired.
+    """
+    try:
+        raw_payload = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        parts = raw_payload.split(":")
+        if len(parts) != 3:
+            return None
+        
+        email, expires_at_str, signature = parts
+        expires_at = int(expires_at_str)
+        
+        # Check expiration (15-minute TTL)
+        if time.time() > expires_at:
+            return None
+        
+        # Verify HMAC
+        data = f"{email}:{expires_at}"
+        expected_mac = hmac.new(
+            key=secret_salt.encode("utf-8"),
+            msg=data.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        if hmac.compare_digest(signature, expected_mac):
+            return email
+        return None
+    except Exception:
+        return None
+

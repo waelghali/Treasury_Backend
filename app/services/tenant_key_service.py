@@ -136,5 +136,109 @@ class TenantKeyService:
         tbill_offer.discount_rate = float(discount_rate)
         tbill_offer.max_amount = float(max_amount)
 
+    def re_envelope_tenant_dek(self, db: Session, customer_id: int) -> dict:
+        """
+        Unseals the current DEK and re-wraps it with the Master KEK.
+        Called during credentials rotation or security upgrades.
+        Guarantees zero data loss: the underlying DEK remains identical so existing ciphertext remains valid.
+        """
+        from sqlalchemy.sql import func
+        record = db.query(QuotationTenantKey).filter(
+            QuotationTenantKey.customer_id == customer_id,
+            QuotationTenantKey.status == "ACTIVE"
+        ).first()
+
+        if not record:
+            raise ValueError(f"No active tenant key found for customer {customer_id}")
+
+        provider = get_key_provider()
+        tenant_context = str(customer_id)
+
+        # 1. Unseal existing DEK
+        current_dek = provider.unwrap_dek(record.wrapped_dek, tenant_context)
+
+        # 2. Re-seal DEK under Master KEK
+        new_wrapped = provider.wrap_dek(current_dek, tenant_context)
+
+        record.wrapped_dek = new_wrapped
+        record.key_version += 1
+        record.rotated_at = func.now()
+        db.commit()
+
+        # Invalidate cache
+        self.clear_cache(customer_id)
+        logger.info(f"Re-enveloped Tenant DEK for Customer {customer_id} (Version: {record.key_version})")
+
+        return {
+            "customer_id": customer_id,
+            "key_id": record.key_id,
+            "key_version": record.key_version,
+            "status": "RE_ENVELOPED_HEALTHY"
+        }
+
+    def verify_tenant_keys_health(self, db: Session) -> dict:
+        """
+        Disaster Recovery & Integrity Diagnostic Tool:
+        Audits all tenant key records in the database, verifying Master KEK unwrap ability,
+        AES-GCM MAC tag integrity, and roundtrip canary encryption.
+        """
+        records = db.query(QuotationTenantKey).filter(
+            QuotationTenantKey.status == "ACTIVE"
+        ).all()
+
+        provider = get_key_provider()
+        total_keys = len(records)
+        healthy = 0
+        corrupted = 0
+        details = []
+
+        start_t = time.perf_counter()
+
+        for rec in records:
+            tenant_context = str(rec.customer_id)
+            try:
+                # 1. Test unwrap
+                dek = provider.unwrap_dek(rec.wrapped_dek, tenant_context)
+                if len(dek) != 32:
+                    raise ValueError("DEK length is invalid")
+
+                # 2. Test synthetic canary roundtrip
+                canary_test = 49.9999
+                enc = encrypt_field(canary_test, dek, field_context="canary")
+                dec = decrypt_field(enc, dek, field_context="canary")
+                if abs(dec - canary_test) > 1e-5:
+                    raise ValueError("Canary roundtrip assertion failed")
+
+                healthy += 1
+                details.append({
+                    "customer_id": rec.customer_id,
+                    "key_id": rec.key_id,
+                    "key_version": rec.key_version,
+                    "status": "HEALTHY"
+                })
+            except Exception as e:
+                corrupted += 1
+                details.append({
+                    "customer_id": rec.customer_id,
+                    "key_id": rec.key_id,
+                    "key_version": rec.key_version,
+                    "status": "CORRUPTED",
+                    "error": str(e)
+                })
+
+        duration = time.perf_counter() - start_t
+        avg_ms = (duration / max(1, total_keys)) * 1000.0
+
+        return {
+            "status": "HEALTHY" if corrupted == 0 else "WARNING",
+            "total_keys_audited": total_keys,
+            "healthy_keys": healthy,
+            "corrupted_keys": corrupted,
+            "audit_duration_seconds": round(duration, 4),
+            "avg_unseal_latency_ms": round(avg_ms, 4),
+            "keys_audit": details
+        }
+
 
 tenant_key_service = TenantKeyService()
+
