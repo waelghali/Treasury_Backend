@@ -3194,8 +3194,12 @@ def resubmit_quotation(
                         cfg_id = str(uuid.uuid4())
                         leg_cfg_val_d = _parse_d(b_data.get('valueDate') or leg_obj.value_date)
                         leg_q_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or leg_obj.quotation_base or 'Execution')
+                        is_leg_invited = b_data.get('isInvited', b_data.get('is_invited', True)) is not False
+                        if str(leg_q_base).strip().lower() in ['invisible', 'skipped', 'excluded']:
+                            is_leg_invited = False
+                            leg_q_base = "Invisible"
 
-                        if (rfq.type == 'FX_SPOT' or not rfq.type):
+                        if (rfq.type == 'FX_SPOT' or not rfq.type) and is_leg_invited:
                             sig = get_bank_leg_signature(
                                 leg_obj.buy_currency,
                                 leg_obj.sell_currency,
@@ -3215,7 +3219,7 @@ def resubmit_quotation(
                             id=cfg_id,
                             assignment_id=db_assignment.id,
                             leg_id=leg_obj.id,
-                            is_invited=b_data.get('isInvited', b_data.get('is_invited', True)) is not False,
+                            is_invited=is_leg_invited,
                             cost_min=b_data.get('costMin', 0.0),
                             cost_percent=b_data.get('costPercent', 0.0),
                             cost_max=b_data.get('costMax', 0.0),

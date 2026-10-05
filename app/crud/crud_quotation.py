@@ -703,8 +703,13 @@ class CRUDQuotation:
                 leg_cfg_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
                 leg_quotation_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or leg_obj.quotation_base or db_assign.quotation_base or 'Execution')
 
-                # Bank-level leg uniqueness check
-                if p_type == 'FX_SPOT':
+                is_leg_invited = b_data.get('isInvited', b_data.get('is_invited', True)) is not False
+                if str(leg_quotation_base).strip().lower() in ['invisible', 'skipped', 'excluded']:
+                    is_leg_invited = False
+                    leg_quotation_base = "Invisible"
+
+                # Bank-level leg uniqueness check (only for active invited legs)
+                if p_type == 'FX_SPOT' and is_leg_invited:
                     sig = get_bank_leg_signature(
                         leg_obj.buy_currency,
                         leg_obj.sell_currency,
@@ -727,7 +732,7 @@ class CRUDQuotation:
                     id=cfg_id,
                     assignment_id=db_assign.id,
                     leg_id=leg_obj.id,
-                    is_invited=b_data.get('isInvited', b_data.get('is_invited', True)) is not False,
+                    is_invited=is_leg_invited,
                     cost_min=b_data.get('costMin', 0.0),
                     cost_percent=b_data.get('costPercent', 0.0),
                     cost_max=b_data.get('costMax', 0.0),
