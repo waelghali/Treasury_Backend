@@ -1428,7 +1428,7 @@ def create_customer_entity(
     return db_entity
 
 @router.post("/customers/{customer_id}/users/", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def create_customer_user_by_system_owner(
+async def create_customer_user_by_system_owner(
     customer_id: int,
     user_in: UserCreate,
     db: Session = Depends(get_db),
@@ -1437,7 +1437,7 @@ def create_customer_user_by_system_owner(
 ):
     """
     Allows a System Owner to create a new user for a specific customer.
-    This can be used to add additional Corporate Admins after the initial onboarding.
+    Automatically dispatches a private single-use 24-hour activation link with save_copy=False (SendOnly).
     """
     client_host = get_client_ip(request) if request else None
 
@@ -1462,6 +1462,14 @@ def create_customer_user_by_system_owner(
     try:
         # Use the existing CRUD method which handles all business logic like user limit checks
         db_user = crud_user.create_user(db, user_in, user_id_caller=current_user.user_id)
+        
+        # Dispatch private SendOnly activation email to the newly created user
+        from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+        try:
+            await send_corporate_admin_activation_email(db, db_user, customer_check.name, request=request)
+        except Exception as email_err:
+            logger.error(f"Failed to dispatch activation email to user {db_user.email}: {email_err}", exc_info=True)
+
         return db_user
     except HTTPException as e:
         log_action(db, user_id=current_user.user_id, action_type="CREATE_FAILED", entity_type="User", entity_id=None, details={"email": user_in.email, "customer_id": customer_id, "reason": str(e.detail)}, customer_id=customer_id, ip_address=client_host)
