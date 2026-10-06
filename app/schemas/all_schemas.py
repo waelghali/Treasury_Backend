@@ -186,7 +186,7 @@ class UserBase(BaseModel):
     role: UserRole = Field(UserRole.END_USER, description="Role of the user within the system")
 
 class UserCreate(UserBase):
-    password: str = Field(..., description="User's password, complexity enforced by business logic.")
+    password: Optional[str] = Field(None, description="User's password, complexity enforced by business logic. If omitted, a high-entropy random password is set and an activation invite is sent.")
     customer_id: Optional[int] = Field(None, description="Customer ID for the user (required for non-SYSTEM_OWNER)")
     has_all_entity_access: bool = Field(True, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this user has access to (if has_all_entity_access is False)")
@@ -219,7 +219,7 @@ class UserUpdate(UserBase):
         return self
 
 class UserCreateCorporateAdmin(UserBase):
-    password: str = Field(..., description="User's password, complexity enforced by business logic.")
+    password: Optional[str] = Field(None, description="User's password, complexity enforced by business logic. If omitted, an activation invite is sent.")
     role: UserRole = Field(..., description="Role of the user within the system (cannot be SYSTEM_OWNER)")
     has_all_entity_access: bool = Field(True, description="True if user has access to all entities under their customer, False if restricted to specific entities")
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this user has access to (if has_all_entity_access is False)")

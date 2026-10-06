@@ -880,7 +880,7 @@ def restore_subscription_plan(
 
 
 @router.post("/customers/onboard", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
-def onboard_customer(
+async def onboard_customer(
     customer_in: CustomerCreate,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("customer:create")),
@@ -888,6 +888,7 @@ def onboard_customer(
 ):
     """
     Onboard a new customer, including their initial entities and a Corporate Admin user.
+    Automatically dispatches a private single-use 24-hour activation link with save_copy=False (SendOnly).
     """
     client_host = get_client_ip(request) if request else None
 
@@ -902,6 +903,15 @@ def onboard_customer(
     # Call the actual onboarding logic in the CRUD layer
     db_customer = crud_customer.onboard_customer(db, customer_in, user_id_caller=current_user.user_id)
     
+    # Dispatch Zero-Touch Activation Email to the Corporate Admin
+    admin_user = next((u for u in db_customer.users if u.role == UserRole.CORPORATE_ADMIN), None)
+    if admin_user:
+        from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+        try:
+            await send_corporate_admin_activation_email(db, admin_user, db_customer.name, request=request)
+        except Exception as email_err:
+            logger.error(f"Failed to dispatch activation email to Corporate Admin {admin_user.email}: {email_err}", exc_info=True)
+
     # Return the created customer object. FastAPI will automatically serialize it to JSON
     return db_customer
 
@@ -1557,6 +1567,42 @@ def update_user_by_system_owner(
     log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="User", entity_id=updated_user.id, details={"email": updated_user.email, "ip_address": client_host, "updated_fields": user_in.model_dump(exclude_unset=True)})
     
     return updated_user
+
+@router.post("/users/{user_id}/resend-invitation")
+async def resend_user_invitation(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("user:edit")),
+    request: Request = None
+):
+    """
+    Resends a private single-use 24-hour activation invitation to a user.
+    Dispatches with SendOnly (save_copy=False) so credentials remain 100% private to the user.
+    """
+    db_user = crud_user.get(db, id=user_id)
+    if not db_user or db_user.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found or is deleted.")
+
+    customer = crud_customer.get(db, db_user.customer_id) if db_user.customer_id else None
+    customer_name = customer.name if customer else "Grow Treasury"
+
+    from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+    success, err = await send_corporate_admin_activation_email(db, db_user, customer_name, request=request)
+
+    if not success:
+        logger.warning(f"Failed to resend invitation email to {db_user.email}: {err}")
+        return {
+            "success": False,
+            "message": f"Activation token generated, but email dispatch failed: {err}. Please verify email settings.",
+            "email": db_user.email
+        }
+
+    return {
+        "success": True,
+        "message": f"Private activation invitation resent to {db_user.email} successfully.",
+        "email": db_user.email
+    }
+
            
 @router.post("/global-configurations/", response_model=GlobalConfigurationOut, status_code=status.HTTP_201_CREATED)
 def create_global_configuration(

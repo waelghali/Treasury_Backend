@@ -118,9 +118,14 @@ class CRUDCustomer(CRUDBase):
                 self.crud_customer_entity_instance.create(db, entity_in, db_customer.id, user_id_caller)
 
         # Create initial Corporate Admin user
+        admin_password = customer_in.initial_corporate_admin.password
+        if not admin_password or not str(admin_password).strip():
+            import secrets
+            admin_password = secrets.token_urlsafe(32)
+
         initial_admin_user_data = UserCreateCorporateAdmin(
             email=customer_in.initial_corporate_admin.email,
-            password=customer_in.initial_corporate_admin.password,
+            password=admin_password,
             role=UserRole.CORPORATE_ADMIN,
             has_all_entity_access=customer_in.initial_corporate_admin.has_all_entity_access,
             entity_ids=customer_in.initial_corporate_admin.entity_ids,
@@ -131,7 +136,14 @@ class CRUDCustomer(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"User limit ({subscription_plan.max_users}) exceeded for this plan. Cannot create initial Corporate Admin."
             )
-        self.crud_user_instance.create_user_by_corporate_admin(db, initial_admin_user_data, db_customer.id, user_id_caller)
+        admin_user = self.crud_user_instance.create_user_by_corporate_admin(db, initial_admin_user_data, db_customer.id, user_id_caller)
+
+        # Initialize isolated Tenant DEK envelope for zero-knowledge data protection
+        try:
+            from app.services.tenant_key_service import tenant_key_service
+            tenant_key_service.get_or_create_tenant_dek(db, db_customer.id)
+        except Exception as key_err:
+            logger.warning(f"Tenant DEK envelope eager initialization notice: {key_err}")
 
         # Log onboarding action
         log_action(

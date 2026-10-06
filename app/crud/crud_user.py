@@ -82,7 +82,11 @@ class CRUDUser(CRUDBase):
             customer.active_user_count += 1
 
         user_data = user_in.model_dump(exclude_unset=True)
-        password = user_data.pop("password")
+        password = user_data.pop("password", None)
+        if not password or not str(password).strip():
+            import secrets
+            password = secrets.token_urlsafe(32)
+            user_data["must_change_password"] = True
         entity_ids = user_data.pop("entity_ids", [])
 
         db_user = self.model(**user_data)
@@ -209,7 +213,11 @@ class CRUDUser(CRUDBase):
             )
 
         user_data = user_in.model_dump(exclude_unset=True)
-        password = user_data.pop("password")
+        password = user_data.pop("password", None)
+        if not password or not str(password).strip():
+            import secrets
+            password = secrets.token_urlsafe(32)
+            user_data["must_change_password"] = True
         entity_ids = user_data.pop("entity_ids", [])
 
         user_data.pop("must_change_password", None)
