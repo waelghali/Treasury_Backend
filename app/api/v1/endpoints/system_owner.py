@@ -1569,6 +1569,13 @@ def update_user_by_system_owner(
                 detail=f"User with email '{user_in.email}' already exists."
             )
             
+    # Zero-Touch / Host-Blind Protection: System Owner cannot set or overwrite customer user passwords
+    if user_in.password and db_user.customer_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="In Zero-Touch / Host-Blind security mode, System Owners cannot directly set or modify customer user passwords. Please use the private 'Resend Invitation / Reset Link' feature instead."
+        )
+
     # FIX: Change 'db_obj' to 'db_user' to match the function signature in crud_user.py
     updated_user = crud_user.update_user(db, db_user=db_user, user_in=user_in, user_id_caller=current_user.user_id)
     

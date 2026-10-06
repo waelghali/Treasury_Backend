@@ -745,8 +745,12 @@ class AuthService:
         # --- Role Hierarchy Enforcement ---
         # 1. System Owner can manage Corporate Admins (and implicitly, End Users/Checkers too)
         if admin_user.role == UserRole.SYSTEM_OWNER:
-            # System Owner can set/reset password for any user
-            pass # No additional role checks needed for SO here
+            # Zero-Touch / Host-Blind Protection: System Owner cannot set passwords for customer tenant accounts
+            if db_target_user.customer_id is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="In Zero-Touch / Host-Blind security mode, System Owners cannot directly set customer user passwords. The customer must use self-service reset or receive a private activation link."
+                )
         # 2. Corporate Admin can manage End Users and Checkers within their customer scope
         elif admin_user.role == UserRole.CORPORATE_ADMIN:
             if admin_user.customer_id is None:
