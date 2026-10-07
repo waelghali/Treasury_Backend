@@ -678,6 +678,10 @@ class AuditLog(Base):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, comment="ID of the customer this audit log belongs to (for filtering)")
     lg_record_id = Column(Integer, ForeignKey("lg_records.id"), nullable=True, comment="ID of the LG record associated with the action (for LG lifecycle tracking)")
 
+    # Phase 5: Cryptographic Hash-Chained WORM Audit Trail
+    previous_hash = Column(String(64), nullable=True, comment="Cryptographic SHA-256 hash of previous audit log record")
+    entry_hash = Column(String(64), nullable=True, index=True, comment="Cryptographic SHA-256 hash of current audit log record and previous hash")
+
     user = relationship("User")
     customer = relationship("Customer")
     lg_record = relationship("LGRecord")

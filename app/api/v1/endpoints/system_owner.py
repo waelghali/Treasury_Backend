@@ -2823,6 +2823,22 @@ def restore_template(
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Template", entity_id=restored_template.id, details={"name": restored_template.name, "ip_address": client_host})
     return restored_template
 
+@router.get("/audit-logs/verify-chain")
+def verify_audit_chain(
+    start_id: Optional[int] = Query(None, description="Optional starting AuditLog ID for partial verification"),
+    limit: Optional[int] = Query(10000, description="Maximum number of chained records to verify"),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("audit_log:view"))
+):
+    """
+    Phase 5: Validates the cryptographic WORM integrity of the audit log hash chain.
+    Walks through all chained audit records in sequence and verifies:
+    1. The entry's 'previous_hash' matches the preceding entry's 'entry_hash'.
+    2. The entry's 'entry_hash' matches the recomputed SHA-256 digest of its payload.
+    """
+    from app.core.audit_crypto import verify_audit_log_chain
+    return verify_audit_log_chain(db, start_id=start_id, limit=limit)
+
 @router.get("/audit-logs/", response_model=List[AuditLogOut])
 def read_audit_logs(
     skip: int = 0, 

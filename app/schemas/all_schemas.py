@@ -745,6 +745,8 @@ class AuditLogOut(BaseModel):
     customer_id: Optional[int] = None
     customer_name: Optional[str] = None
     lg_record_id: Optional[int] = None
+    previous_hash: Optional[str] = Field(None, description="Cryptographic SHA-256 hash of previous audit log record")
+    entry_hash: Optional[str] = Field(None, description="Cryptographic SHA-256 hash of current audit log record and previous hash")
 
     class Config:
         from_attributes = True

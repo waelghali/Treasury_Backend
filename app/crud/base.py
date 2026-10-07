@@ -188,6 +188,33 @@ def log_action(
                 if isinstance(sanitized_details, dict) and "entity_id" not in sanitized_details:
                     sanitized_details["entity_id"] = str(entity_id)
 
+        # Phase 5: Cryptographic Hash-Chained WORM Linking
+        from app.core.audit_crypto import compute_audit_hash, GENESIS_HASH
+        from datetime import datetime, timezone
+        
+        last_log = (
+            db.query(AuditLog.entry_hash)
+            .filter(AuditLog.entry_hash.isnot(None))
+            .order_by(AuditLog.id.desc())
+            .first()
+        )
+        prev_hash = last_log[0] if (last_log and last_log[0]) else GENESIS_HASH
+
+        now_utc = datetime.now(timezone.utc)
+
+        curr_hash = compute_audit_hash(
+            previous_hash=prev_hash,
+            timestamp=now_utc,
+            user_id=user_id,
+            action_type=action_type,
+            entity_type=entity_type,
+            entity_id=safe_entity_id,
+            customer_id=customer_id,
+            lg_record_id=lg_record_id,
+            details=sanitized_details,
+            ip_address=ip_address
+        )
+
         audit_log_entry = AuditLog(
             user_id=user_id,
             action_type=action_type,
@@ -197,7 +224,9 @@ def log_action(
             customer_id=customer_id,
             lg_record_id=lg_record_id,
             ip_address=ip_address,
-            timestamp=func.now(),
+            timestamp=now_utc,
+            previous_hash=prev_hash,
+            entry_hash=curr_hash,
         )
         db.add(audit_log_entry)
         db.flush()
