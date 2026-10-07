@@ -144,30 +144,46 @@ Available from LG Details page -> Actions Menu:
 - **Record Bank Reply**: Logs bank's formal confirmation, acceptance, or debit advice.
 - **Send Bank Reminder**: Generates formal reminder letter (1st, 2nd, final) for pending bank execution within the reminder time window.
 
-5. FX & T-BILLS QUOTATION MODULE WORKFLOWS & CONTROLS
-The Quotation Module provides enterprise multi-bank rate discovery, digital RFQ (Request for Quote) broadcasting, real-time dealer offer comparison, and trade execution for FX Spot, FX Forward, and Treasury Bills:
-- **Core End-to-End Workflow**:
-  1. **RFQ Creation (Requestor / End User)**:
-     - Open **Sidebar ➔ Quotations ➔ Quotation Requests & History** (`/end-user/quotations`).
-     - Click **New RFQ / Request Quotation**.
-     - Choose Instrument Type: **Foreign Exchange (Spot / Forward)** or **Treasury Bills (T-Bills)**.
-     - Specify Currency Pair, Buy/Sell Amount, Settlement/Value Date, Tenor/Maturity Date (for T-Bills), and optional target execution rate.
-     - Select participating banking partners to invite to the competitive quoting round.
-  2. **Corporate Governance & Pre-Broadcast Approval**:
-     - Controlled by setting **`QUOTATION_APPROVAL_REQUIRED`** in **Settings ➔ Group 4** (`/corporate-admin/module-configs`).
-     - If `true`, the RFQ is placed in pending review for Corporate Admin approval before dealers are notified.
-     - If `false`, the RFQ is broadcast instantly upon submission.
-  3. **Dealer Public Quoting Portal**:
-     - Invited bank dealers receive an automated, secure, tokenized invitation link (`/public/quotations/:token`).
-     - Bank dealers open the digital bidding portal on desktop/mobile without needing Grow accounts.
-     - Dealers submit live executable rates, bid/ask spreads, and quotation expiry timestamps in real-time.
-  4. **Quotation Control Center & Deal Awarding (Corporate Admin)**:
-     - Open **Sidebar ➔ Quotations ➔ Quotation Control Center** (`/corporate-admin/quotations`).
-     - Real-time comparison matrix displaying all competing bank quotes ranked by best rate, yield, and spread.
-     - Corporate Admin reviews bids, selects the winning rate, and clicks **Award Deal / Accept Quote**.
-     - Automated confirmation notices and trade settlement confirmations are dispatched to both the winning bank dealer and internal treasury stakeholders.
-  5. **Audit Trail & Rate Analytics**:
-     - All RFQ rounds, dealer quote timestamps, spreads, winning margins, and rejection reasons are permanently archived in the Quotation Audit Log for compliance and banking relationship reviews.
+5. FX & T-BILLS QUOTATION MODULE WORKFLOWS, GOVERNANCE & EXECUTION
+The Quotation Module provides institutional multi-bank rate discovery, digital RFQ (Request for Quote) broadcasting, real-time dealer offer comparison, and trade execution for Foreign Exchange (FX Spot / FX Forward) and Treasury Bills (T-Bills):
+
+--- A. ROLE-SPECIFIC WORKFLOWS & NAVIGATION ---
+* **Corporate Admin (`corporate_admin`)**:
+  - **Quotation Control Center** (`/corporate-admin/quotations`): Master command center. Monitors live incoming quotes across all organization entities, compares competing bids in real time, evaluates Final Adjusted Prices (net of bank fees and spreads), manages the Acceptance Window countdown, awards trades, and downloads dual-branded Deal Confirmation Receipts.
+  - **Pre-Broadcast Governance**: Can toggle `QUOTATION_APPROVAL_REQUIRED` under **Settings ➔ Group 4** (`/corporate-admin/module-configs`). If enabled, RFQs created by End Users must be approved by Corporate Admin before being broadcast to bank dealers.
+  - **Bank Counterparty Management**: Configures participating bank desks, invited dealer email rosters, and additional fee schedules.
+* **End User / Treasury Specialist (`end_user`)**:
+  - **Quotation Requests & History** (`/end-user/quotations`): Initiates new RFQs via the structured creation wizard, bundles Multi-Leg currency baskets, selects invited relationship banks, and tracks live quoting progress on the Results View.
+* **Checker (`checker`)**:
+  - Reviews and approves/rejects pending RFQ requests in the Approval Center before they are dispatched to banking partners.
+* **Bank Counterparty / Desk Dealer (`dealer`)**:
+  - Accesses secure, tokenized bidding portals (`/public/quotations/:token`) to enter executable rates, spreads, and proposed value dates. Supports `APPROVER`, `EXECUTION`, and `VIEW_ONLY` dealer roles with automated Trader Takeover.
+
+--- B. SUPPORTED INSTRUMENTS & PRICING MECHANICS ---
+* **FX Spot & FX Forward**:
+  - Buy/Sell currency pairs (e.g. USD/EGP, EUR/USD, GBP/EGP), contract amounts, target value dates, and tolerance thresholds.
+  - Supports dealer invisible synthetic hedging legs (cross-currency synthetic quotes) behind the scenes without complicating corporate settlement.
+* **Treasury Bills (T-Bills)**:
+  - Tenors (91, 182, 273, 364 days), settlement date, and maturity date.
+  - Automatically computes gross discount rates and net effective annualized yields after statutory 20% withholding tax (WHT).
+
+--- C. MULTI-LEG BASKETS & ADDITIONAL COST MATRIX ---
+* **Multi-Leg Baskets**: Bundles multiple currency pairs or tenors into a single unified RFQ session. Counterparties quote all legs concurrently. Treasury can award individual legs to different banks or award the entire package.
+* **Additional Cost Matrix**: Bank-specific fee structures (Percentage %, Flat fee, Min/Max caps). The engine computes:
+  `Final Adjusted Price = Quoted Price + Additional Bank Fees`
+  Ensures awards are determined based on true net economic cost rather than raw nominal rates.
+
+--- D. ACCEPTANCE WINDOW & TIMEOUT POLICIES ---
+* Upon bidding closure, a synchronized countdown window (e.g. 30s to 120s) activates on both the Corporate Admin cockpit and dealer portals.
+* **Timeout Actions**:
+  - `AUTO_ACCEPT`: Automatically awards the deal to the best valid compliant quote when the timer reaches zero, immediately dispatching trade confirmations.
+  - `AUTO_REJECT`: Declines trade execution when the timer hits zero while preserving all quotes for audit and re-tender.
+* **Tolerance Limits**: If the winning quote deviates from the Central Bank (CBE) benchmark by more than `max_tolerance_percent`, the trade is flagged `INCONCLUSIVE` to safeguard against off-market execution.
+
+--- E. DEAL EXECUTION RECEIPTS & AUDIT EVIDENCE ---
+* Upon trade acceptance, the system automatically generates an official **Deal Confirmation Receipt (PDF)**.
+* **Receipt Contents**: Master RFQ reference, execution reference (e.g. `DEAL-20260408-001`), trade timestamp, currency pair, buy/sell amounts, executed rate, value date, Corporate Admin & winning Bank Dealer identity, digital signature stamp, and SHA-256 cryptographic seal.
+* **Cryptographic WORM Audit Trail**: Every RFQ creation, quote submission, modification, acceptance, and cancellation is permanently chained into the sequential SHA-256 WORM audit log for immutable regulatory compliance and non-repudiation.
 """
 
 

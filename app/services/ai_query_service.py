@@ -26,6 +26,10 @@ from app.models import (
     InternalOwnerContact, Currency, LGInstruction
 )
 from app.models.models_issuance import IssuanceRequest, IssuanceFacility
+from app.models.models_quotation import (
+    QuotationRequest, QuotationLeg, QuotationBankAssignment,
+    QuotationOffer, QuotationTBillOffer, QuotationBank
+)
 from app.models.models import AuditLog
 from app.services.ai_policy_guardrail import policy_guardrail
 from app.services.ai_privacy_tokenizer import privacy_tokenizer
@@ -94,8 +98,9 @@ class AIQueryAssistantService:
                 "parameters": {"query": q_raw}
             }
 
-        # Non-treasury rejection
-        if any(kw in q_lower for kw in ["capital of", "weather in", "recipe", "who won", "president of", "football", "tell me a joke"]):
+        # Non-treasury rejection (guard against sports/weather/trivia, but permit treasury questions like "who won the rfq/deal")
+        is_treasury_query = any(w in q_lower for w in ["rfq", "rfqs", "deal", "trade", "bank", "quote", "quotation", "lg", "guarantee", "facility", "treasury"])
+        if not is_treasury_query and any(kw in q_lower for kw in ["capital of", "weather in", "recipe", "who won", "president of", "football", "tell me a joke"]):
             return {
                 "suggested_level": 3,
                 "topic": "non_treasury",
@@ -225,6 +230,67 @@ class AIQueryAssistantService:
                 }
             }
 
+        # Quotation Data: Direct Deal or RFQ Reference Lookup
+        deal_ref_match = re.search(r'\b((?:DEAL|RFQ|EXEC)-[A-Za-z0-9_-]+)\b', q_raw, re.IGNORECASE)
+        if deal_ref_match:
+            return {
+                "suggested_level": 1,
+                "topic": "quotation",
+                "intent": "lookup_deal_reference",
+                "parameters": {"ref": deal_ref_match.group(1).strip()}
+            }
+        
+        extracted_deal_word = re.search(r'(?:deal\s*(?:ref|reference|#)?|rfq\s*(?:ref|reference|#)?|execution\s*(?:ref|reference)?)\s*[:#]?\s*([A-Za-z0-9_-]{3,})', q_raw, re.IGNORECASE)
+        if extracted_deal_word and extracted_deal_word.group(1).lower() not in ["ref", "rate", "details", "summary", "stats", "history"]:
+            return {
+                "suggested_level": 1,
+                "topic": "quotation",
+                "intent": "lookup_deal_reference",
+                "parameters": {"ref": extracted_deal_word.group(1).strip()}
+            }
+
+        # Quotation Data: Participating Banks in Last / Specific RFQ
+        if any(w in q_lower for w in [
+            "participating banks", "who participated", "invited banks", "banks in the last rfq",
+            "banks in last rfq", "who quoted on the last rfq", "last rfq banks", "banks in our last rfq",
+            "who was in our last rfq", "participating banks in our last rfq", "who quoted on our last rfq",
+            "invited banks in last rfq", "which banks participated"
+        ]):
+            rfq_match = re.search(r'\b(RFQ-[A-Za-z0-9_-]+)\b', q_raw, re.IGNORECASE)
+            return {
+                "suggested_level": 1,
+                "topic": "quotation",
+                "intent": "get_last_rfq_participants",
+                "parameters": {"rfq_ref": rfq_match.group(1) if rfq_match else None}
+            }
+
+        # Quotation Data: Top Winning Relationship Banks
+        if any(w in q_lower for w in [
+            "maximum number of rfqs", "most rfqs", "most deals", "who won the most",
+            "which bank won the most", "top winning banks", "highest winning bank",
+            "bank with most deals", "winning relationship banks", "bank rankings",
+            "who won most rfqs", "who wins the most deals", "top quoting banks"
+        ]):
+            return {
+                "suggested_level": 1,
+                "topic": "quotation",
+                "intent": "get_top_winning_banks",
+                "parameters": {"limit": 5}
+            }
+
+        # Quotation Data: RFQ Portfolio / Execution History Summary
+        if any(w in q_lower for w in [
+            "how many rfqs did we execute", "how many deals executed", "quotation history summary",
+            "rfq summary", "total quotation volume", "show quotation stats", "rfq statistics",
+            "executed quotation volume", "how many rfqs", "executed deals summary"
+        ]):
+            return {
+                "suggested_level": 1,
+                "topic": "quotation",
+                "intent": "get_quotation_summary",
+                "parameters": {}
+            }
+
         # 2. Level 4 System Guides & Navigation (using word boundaries to prevent 'show top' colliding with 'how to')
         is_greeting = q_lower in ["hi", "hello", "hey", "start", "help", "who are you", "what can you do", "restart", "reset"]
         guide_patterns = [
@@ -238,7 +304,7 @@ class AIQueryAssistantService:
             r"\bhow\s+does\b", r"\bhow\s+do\b", r"\bhow\s+is\b", r"\bhow\s+are\b",
             r"\bhow\s+works?\b", r"\bexplain\b", r"\btell\s+me\s+about\b",
             r"\bwhat\s+is\s+the\s+quotation\b", r"\bwhat\s+is\s+quotation\b",
-            r"\bquotation\s+module\b", r"\bquotations\s+module\b", r"\brfq\b", r"\brfqs\b",
+            r"\bquotation\s+module\b", r"\bquotations\s+module\b",
             r"\bacceptance\s+window\b", r"\bacceptance\s+timeout\b", r"\bauto[-_]?accept\b", r"\bauto[-_]?reject\b",
             r"\btolerance\s+limit\b", r"\btolerance\s+percent\b", r"\bcbe\s+benchmark\b",
             r"\bdealer\s+roles?\b", r"\btrader\s+takeover\b", r"\bmulti[- ]leg\b",
@@ -544,6 +610,135 @@ class AIQueryAssistantService:
                 joinedload(IssuanceFacility.bank),
                 joinedload(IssuanceFacility.currency)
             ).all()
+
+        if intent == "get_last_rfq_participants":
+            rfq_ref = params.get("rfq_ref")
+            q = db.query(QuotationRequest).filter(
+                QuotationRequest.customer_id == customer_id,
+                QuotationRequest.is_deleted == False
+            )
+            if rfq_ref:
+                rfq = q.filter(QuotationRequest.ref_no.ilike(f"%{rfq_ref}%")).first()
+            else:
+                rfq = q.order_by(desc(QuotationRequest.created_at)).first()
+
+            if not rfq:
+                return None
+
+            assignments = db.query(QuotationBankAssignment).filter(
+                QuotationBankAssignment.rfq_id == rfq.id
+            ).all()
+
+            legs = db.query(QuotationLeg).filter(
+                QuotationLeg.rfq_id == rfq.id
+            ).order_by(QuotationLeg.leg_index.asc()).all()
+
+            bank_data = []
+            for a in assignments:
+                bank_name = a.quotation_bank.bank.name if a.quotation_bank and a.quotation_bank.bank else "Bank"
+                offers = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).all()
+                tbill_offers = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
+
+                quoted = len(offers) > 0 or len(tbill_offers) > 0
+                best_price = min([o.price for o in offers]) if offers else None
+                best_discount = min([t.discount_rate for t in tbill_offers]) if tbill_offers else None
+                is_winner = any(l.winner_bank_id == a.quotation_bank.bank_id for l in legs if l.winner_bank_id and a.quotation_bank)
+
+                bank_data.append({
+                    "bank_name": bank_name,
+                    "quoted": quoted,
+                    "quotes_count": len(offers) + len(tbill_offers),
+                    "best_price": best_price,
+                    "best_discount": best_discount,
+                    "is_winner": is_winner,
+                    "approval_status": a.approval_status
+                })
+
+            return {
+                "rfq": rfq,
+                "legs": legs,
+                "banks": bank_data
+            }
+
+        if intent == "get_top_winning_banks":
+            limit = params.get("limit", 5)
+            legs = db.query(QuotationLeg).join(QuotationRequest).filter(
+                QuotationRequest.customer_id == customer_id,
+                QuotationRequest.is_deleted == False,
+                QuotationLeg.winner_bank_name.isnot(None),
+                QuotationLeg.status.in_(["COMPLETED", "ACCEPTED"])
+            ).all()
+
+            bank_stats = {}
+            for l in legs:
+                b_name = l.winner_bank_name or "Unknown Bank"
+                if b_name not in bank_stats:
+                    bank_stats[b_name] = {
+                        "bank_name": b_name,
+                        "deals_won": 0,
+                        "currencies": set(),
+                        "total_volume": 0.0,
+                        "currency_volumes": {},
+                        "latest_deal_ref": l.execution_reference or (l.rfq.ref_no if l.rfq else None),
+                        "latest_date": l.updated_at or l.created_at
+                    }
+                s = bank_stats[b_name]
+                s["deals_won"] += 1
+                c_pair = l.currency_pair or (f"{l.buy_currency}/{l.sell_currency}" if l.buy_currency else "FX")
+                s["currencies"].add(c_pair)
+                amt = float(l.amount or 0.0)
+                s["total_volume"] += amt
+                curr = l.buy_currency or "USD"
+                s["currency_volumes"][curr] = s["currency_volumes"].get(curr, 0.0) + amt
+
+            sorted_banks = sorted(bank_stats.values(), key=lambda x: x["deals_won"], reverse=True)
+            return {
+                "total_completed_deals": len(legs),
+                "ranked_banks": sorted_banks[:limit]
+            }
+
+        if intent == "lookup_deal_reference":
+            ref = str(params.get("ref") or "").strip()
+            leg = db.query(QuotationLeg).join(QuotationRequest).filter(
+                QuotationRequest.customer_id == customer_id,
+                QuotationRequest.is_deleted == False,
+                or_(
+                    QuotationLeg.execution_reference.ilike(f"%{ref}%"),
+                    QuotationRequest.ref_no.ilike(f"%{ref}%")
+                )
+            ).order_by(desc(QuotationLeg.created_at)).first()
+
+            rfq = None
+            if not leg:
+                rfq = db.query(QuotationRequest).filter(
+                    QuotationRequest.customer_id == customer_id,
+                    QuotationRequest.is_deleted == False,
+                    QuotationRequest.ref_no.ilike(f"%{ref}%")
+                ).first()
+                if rfq and rfq.legs:
+                    leg = rfq.legs[0]
+
+            return {
+                "ref_searched": ref,
+                "leg": leg,
+                "rfq": leg.rfq if leg else rfq
+            }
+
+        if intent == "get_quotation_summary":
+            rfqs = db.query(QuotationRequest).filter(
+                QuotationRequest.customer_id == customer_id,
+                QuotationRequest.is_deleted == False
+            ).order_by(desc(QuotationRequest.created_at)).all()
+
+            legs = db.query(QuotationLeg).join(QuotationRequest).filter(
+                QuotationRequest.customer_id == customer_id,
+                QuotationRequest.is_deleted == False
+            ).all()
+
+            return {
+                "rfqs": rfqs,
+                "legs": legs
+            }
 
         if intent == "get_daily_pulse":
             now_dt = datetime.utcnow()
@@ -954,6 +1149,187 @@ class AIQueryAssistantService:
                 {"label": "📤 Issuance Pipeline", "query": "show issuance pipeline"},
                 {"label": "🏦 Bank Exposure", "query": "show bank exposure"},
                 {"label": "📊 Unified Portfolio Overview", "query": "show portfolio overview"}
+            ]
+            return "\n".join(lines), references, suggested_chips
+
+        if intent == "get_last_rfq_participants":
+            data = query_result or {}
+            rfq = data.get("rfq")
+            if not rfq:
+                return (
+                    "No quotation RFQs have been created yet for your organization.\n\n"
+                    f"👉 [Create New Quotation Request]({nav_base}/quotations)"
+                ), [], [{"label": "✍️ Create New RFQ", "query": "how to create an rfq"}]
+
+            banks = data.get("banks") or []
+            legs = data.get("legs") or []
+
+            inst_type = rfq.type or "FX_SPOT"
+            dir_str = f"{rfq.direction} " if rfq.direction else ""
+            pair_str = f"{rfq.buy_currency}/{rfq.sell_currency}" if rfq.buy_currency else ""
+            amt_str = f"{float(rfq.amount or 0.0):,.2f} {rfq.buy_currency or ''}".strip()
+            status_badge = str(rfq.status or "OPEN").upper()
+
+            lines = [
+                f"📋 **Participating Banks in Latest RFQ ({rfq.ref_no})**:\n",
+                f"- **Instrument**: **{inst_type}** ({dir_str}{pair_str} — {amt_str})",
+                f"- **Current Status**: **{status_badge}**",
+                f"- **Quotation Window**: {rfq.window_start.strftime('%Y-%m-%d %H:%M') if rfq.window_start else 'N/A'} to {rfq.window_end.strftime('%H:%M UTC') if rfq.window_end else 'N/A'}\n",
+                f"🏛️ **Invited Banking Partners ({len(banks)} Banks)**:"
+            ]
+
+            if not banks:
+                lines.append("- *No banks have been assigned to this RFQ yet.*")
+            else:
+                for b in banks:
+                    b_name = b["bank_name"]
+                    if b["quoted"]:
+                        rate_info = f"Quoted (Best Rate: **{b['best_price']}**)" if b["best_price"] is not None else (
+                            f"Quoted (Discount: **{b['best_discount']}%**)" if b["best_discount"] is not None else "Quote Submitted"
+                        )
+                        winner_tag = " 🏆 **WINNER / AWARDED**" if b["is_winner"] else ""
+                        lines.append(f"- ✓ **{b_name}**: {rate_info}{winner_tag}")
+                    else:
+                        lines.append(f"- ○ **{b_name}**: Invited (*Pending rate submission*)")
+
+            lines.append(f"\n👉 [Open Quotation in Workspace]({nav_base}/quotations)")
+
+            references.append({
+                "rfq_id": str(rfq.id),
+                "ref_no": rfq.ref_no,
+                "amount": float(rfq.amount or 0.0),
+                "status": rfq.status
+            })
+
+            suggested_chips = [
+                {"label": "🏆 Who won the most RFQs?", "query": "who won the maximum number of rfqs"},
+                {"label": "📊 Quotation Stats", "query": "how many rfqs did we execute"},
+                {"label": "✍️ Create New RFQ", "query": "how to create an rfq"}
+            ]
+            return "\n".join(lines), references, suggested_chips
+
+        if intent == "get_top_winning_banks":
+            data = query_result or {}
+            total_deals = data.get("total_completed_deals", 0)
+            ranked = data.get("ranked_banks") or []
+
+            if not ranked:
+                return (
+                    "Your organization has not yet awarded or executed any RFQ deals with relationship banks.\n\n"
+                    f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
+                ), [], [{"label": "✍️ Create New RFQ", "query": "how to create an rfq"}]
+
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+            lines = [
+                f"🏆 **Relationship Bank Quotation Rankings & Win Leaderboard**:\n",
+                f"Across **{total_deals} Completed Deal(s)**, here are your top executing banks:\n"
+            ]
+
+            for idx, b in enumerate(ranked):
+                m = medals[idx] if idx < len(medals) else "🔹"
+                win_pct = round((b["deals_won"] / max(total_deals, 1)) * 100, 1)
+                curr_vol_str = ", ".join([f"{amt:,.0f} {curr}" for curr, amt in b["currency_volumes"].items()])
+                lines.append(
+                    f"{m} **{b['bank_name']}**: **{b['deals_won']} Deals Won** ({win_pct}% win share)\n"
+                    f"   - Volume: {curr_vol_str or 'N/A'} | Pairs: {', '.join(list(b['currencies'])[:3])}"
+                )
+
+            lines.append(f"\n👉 [View Historical Analytics in Quotation Center]({nav_base}/quotations)")
+
+            suggested_chips = [
+                {"label": "📋 Participating banks in last RFQ", "query": "who was the participating banks in the last rfq"},
+                {"label": "📊 Total RFQ volume", "query": "how many rfqs did we execute"},
+                {"label": "✍️ Create New RFQ", "query": "how to create an rfq"}
+            ]
+            return "\n".join(lines), references, suggested_chips
+
+        if intent == "lookup_deal_reference":
+            data = query_result or {}
+            ref = data.get("ref_searched", "")
+            leg = data.get("leg")
+            rfq = data.get("rfq")
+
+            if not leg and not rfq:
+                return (
+                    f"No executed deal or RFQ matching **'{ref}'** was found under your organization.\n\n"
+                    f"👉 [Search All Deals in Quotation Control Center]({nav_base}/quotations)"
+                ), [], [{"label": "📋 Last RFQ details", "query": "who was the participating banks in the last rfq"}]
+
+            target_ref = leg.execution_reference if (leg and leg.execution_reference) else (rfq.ref_no if rfq else ref)
+            winner_bank = leg.winner_bank_name if (leg and leg.winner_bank_name) else "Pending / Multiple"
+            rate_val = f"**{leg.winner_rate}**" if (leg and leg.winner_rate is not None) else "Evaluating"
+            pair_val = leg.currency_pair if (leg and leg.currency_pair) else (f"{rfq.buy_currency}/{rfq.sell_currency}" if rfq and rfq.buy_currency else "FX")
+            amt_val = f"{float(leg.amount or rfq.amount or 0.0):,.2f} {leg.buy_currency or (rfq.buy_currency if rfq else '')}".strip()
+            val_date = leg.value_date or (rfq.value_date if rfq else "Standard")
+
+            lines = [
+                f"🔖 **Trade Execution Details: {target_ref}**\n",
+                f"- **Master RFQ**: **{rfq.ref_no if rfq else 'N/A'}**",
+                f"- **Awarded Bank**: **{winner_bank}** 🏆",
+                f"- **Execution Rate**: {rate_val} {pair_val}",
+                f"- **Trade Volume**: **{amt_val}**",
+                f"- **Settlement / Value Date**: **{val_date}**",
+                f"- **Status**: **{leg.status if leg else rfq.status}**",
+                f"- **Deal Receipt**: ✓ Dual-Branded Trade Confirmation (PDF) generated with SHA-256 integrity seal\n",
+                f"👉 [Open Trade Confirmation in Quotation Center]({nav_base}/quotations)"
+            ]
+
+            if leg and leg.execution_reference:
+                references.append({
+                    "deal_ref": leg.execution_reference,
+                    "winner_bank": leg.winner_bank_name,
+                    "rate": leg.winner_rate,
+                    "status": leg.status
+                })
+
+            suggested_chips = [
+                {"label": "🏆 Top winning banks", "query": "who won the maximum number of rfqs"},
+                {"label": "📋 Last RFQ participants", "query": "who was the participating banks in the last rfq"}
+            ]
+            return "\n".join(lines), references, suggested_chips
+
+        if intent == "get_quotation_summary":
+            data = query_result or {}
+            rfqs = data.get("rfqs") or []
+            legs = data.get("legs") or []
+
+            if not rfqs:
+                return (
+                    "No quotation RFQs have been created yet for your organization.\n\n"
+                    f"👉 [Create Your First RFQ]({nav_base}/quotations)"
+                ), [], [{"label": "✍️ Create New RFQ", "query": "how to create an rfq"}]
+
+            status_counts = {}
+            for r in rfqs:
+                st = str(r.status or "DRAFT").upper()
+                status_counts[st] = status_counts.get(st, 0) + 1
+
+            completed_legs = [l for l in legs if str(l.status).upper() in ["COMPLETED", "ACCEPTED"]]
+            vol_by_curr = {}
+            for l in completed_legs:
+                c = l.buy_currency or "USD"
+                vol_by_curr[c] = vol_by_curr.get(c, 0.0) + float(l.amount or 0.0)
+
+            curr_lines = [f"- **{c}**: {amt:,.2f}" for c, amt in vol_by_curr.items()]
+
+            lines = [
+                f"📊 **Quotation & RFQ Portfolio Summary ({len(rfqs)} Total RFQs)**:\n",
+                f"- **Active / In Bidding**: {status_counts.get('OPEN', 0)} round(s)",
+                f"- **Evaluating / Acceptance Window**: {status_counts.get('EVALUATING', 0)} round(s)",
+                f"- **Executed & Completed**: {status_counts.get('COMPLETED', 0) + status_counts.get('ACCEPTED', 0)} round(s) ({len(completed_legs)} executed trade legs)",
+                f"- **Pending Internal Approval**: {status_counts.get('PENDING_APPROVAL', 0)} round(s)",
+                f"- **Rejected / Cancelled**: {status_counts.get('REJECTED', 0) + status_counts.get('CANCELLED', 0)} round(s)\n"
+            ]
+
+            if curr_lines:
+                lines.append("💰 **Total Executed Volume**:\n" + "\n".join(curr_lines) + "\n")
+
+            lines.append(f"👉 [Open Quotation Control Center]({nav_base}/quotations)")
+
+            suggested_chips = [
+                {"label": "🏆 Top winning banks", "query": "who won the maximum number of rfqs"},
+                {"label": "📋 Participating banks in last RFQ", "query": "who was the participating banks in the last rfq"},
+                {"label": "✍️ Create New RFQ", "query": "how to create an rfq"}
             ]
             return "\n".join(lines), references, suggested_chips
 
@@ -1432,6 +1808,31 @@ class AIQueryAssistantService:
                 f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
             )
 
+        # Specific: How to Create an RFQ / Request a Quote
+        if any(w in q_lower for w in [
+            "how to create an rfq", "how do i create an rfq", "how can i create an rfq",
+            "create an rfq", "new rfq", "request a quote", "how to request a quote",
+            "how do i request a quote", "how to submit an rfq", "create rfq"
+        ]):
+            return (
+                f"**Step-by-Step: Creating a Quotation Request (RFQ) as {role_label}**:\n\n"
+                f"1. **Navigate to the Quotation Center**:\n"
+                f"   - Go to **Sidebar ➔ Quotations ➔ Quotation Requests & History** (`{nav_base}/quotations`).\n\n"
+                f"2. **Initiate the Request**:\n"
+                f"   - Click the **`+ New Quotation Request`** button at the top of the dashboard.\n\n"
+                f"3. **Select Instrument & Specify Terms**:\n"
+                f"   - **FX Spot**: Choose Currency Pair (e.g. `USD/EGP`), Direction (`Buy` or `Sell`), Amount, and Settlement Date.\n"
+                f"   - **FX Forward**: Set future value date, tenor, and indicative evaluation rate.\n"
+                f"   - **Treasury Bills (T-Bills)**: Specify issue amount, tenor (91/182/273/364 days), and settlement window.\n"
+                f"   - *Multi-Leg Option*: Click **Add Currency Leg** to bundle multiple pairs into a single RFQ basket.\n\n"
+                f"4. **Configure Quoting Window & Counterparties**:\n"
+                f"   - Set the bidding window start and end times (e.g., 30-minute bidding round).\n"
+                f"   - Select which relationship banks to invite from your approved counterparty roster.\n\n"
+                f"5. **Submit & Broadcast**:\n"
+                f"   - Click **Submit RFQ**. If `QUOTATION_APPROVAL_REQUIRED` is active, it routes to Corporate Admin first; otherwise, invited bank dealers immediately receive secure quoting invitations.\n\n"
+                f"👉 [Open Quotation Workspace]({nav_base}/quotations)"
+            )
+
         # 0.5 FX & T-Bills Quotation Module Guidance
         if any(w in q_lower for w in [
             "quotation", "quotations", "rfq", "rfqs", "fx quote", "fx quotation",
@@ -1444,19 +1845,20 @@ class AIQueryAssistantService:
                     f"The Quotation Module provides end-to-end competitive rate discovery, multi-bank digital RFQs (Request for Quote), and automated trade execution for **Foreign Exchange (Spot / Forward)** and **Treasury Bills (T-Bills)**:\n\n"
                     f"1. **Centralized Quotation Control Center** (`{nav_base}/quotations`):\n"
                     f"   - View all active, pending, awarded, and expired RFQ rounds across all internal entities.\n"
-                    f"   - Monitor live bank dealer submissions in a real-time side-by-side comparison matrix with **Final Adjusted Prices**.\n"
+                    f"   - Monitor live bank dealer submissions in a real-time side-by-side comparison matrix with **Final Adjusted Prices** (accounting for bank spreads and additional fees).\n"
                     f"   - Compare competitive rates, bid/ask spreads, and T-Bill yield curves after 20% withholding tax.\n\n"
                     f"2. **Pre-Broadcast Governance & Approval** (`QUOTATION_APPROVAL_REQUIRED`):\n"
                     f"   - Located under **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs` Group 4).\n"
                     f"   - When enabled (`true`), RFQs submitted by End Users are routed to Corporate Admin for verification before being broadcast to bank dealers.\n\n"
                     f"3. **Acceptance Window & Execution Policies**:\n"
-                    f"   - A synchronized decision window (e.g. 30s) activates immediately upon bidding closure.\n"
+                    f"   - A synchronized decision window (e.g. 30s to 120s) activates immediately upon bidding closure.\n"
                     f"   - Supports **AUTO_ACCEPT** (auto-awards best quote upon timeout) or **AUTO_REJECT** (auto-declines trade on timeout while preserving quotes for audit).\n\n"
                     f"4. **Awarding Deals & Trade Settlement**:\n"
                     f"   - Select winning counterparties per currency pair or award multi-leg packages.\n"
-                    f"   - Automatically dispatches official trade execution tickets to winners and neutral outcome notifications to unselected counterparties.\n\n"
-                    f"5. **Audit Trail & Bank Performance Analytics**:\n"
-                    f"   - Complete audit trail tracking portal access, IP addresses, quoting timestamps, and pricing competitiveness across all banking partners.\n\n"
+                    f"   - Automatically generates an official **Dual-Branded Deal Confirmation Receipt (PDF)** with execution reference, digital signature stamp, and SHA-256 seal.\n"
+                    f"   - Dispatches execution tickets to winners and neutral outcome notifications to unselected counterparties.\n\n"
+                    f"5. **Cryptographic WORM Audit Trail**:\n"
+                    f"   - Complete audit trail tracking portal access, IP addresses, quoting timestamps, and trade executions, all permanently sealed in the sequential SHA-256 WORM audit chain.\n\n"
                     f"👉 [Open Quotation Control Center]({nav_base}/quotations)"
                 )
             else:
@@ -1473,8 +1875,9 @@ class AIQueryAssistantService:
                     f"2. **Bank Dealer Quoting**:\n"
                     f"   - Invited bank dealers receive a secure, tokenized public portal link (`/public/quotations/:token`) to submit live executable rates without needing system passwords.\n\n"
                     f"3. **Real-Time Rate Tracking & Awarding**:\n"
-                    f"   - Watch incoming bank bids in real-time as dealers submit live rates and spreads.\n"
-                    f"   - Review competing quotes and route the best offer for awarding or corporate acceptance.\n\n"
+                    f"   - Watch incoming bank bids in real-time as dealers submit live rates and spreads on the Results View.\n"
+                    f"   - Review competing quotes and route the best offer for awarding or corporate acceptance.\n"
+                    f"   - Once awarded, official **Deal Confirmation Receipts (PDF)** are generated immediately.\n\n"
                     f"👉 [Open Quotations Workspace]({nav_base}/quotations)"
                 )
 
