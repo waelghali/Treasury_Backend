@@ -848,58 +848,150 @@ async def get_historical_trades_blotter(
         customer_name = rfq.customer.name if rfq.customer else "Corporate Client"
         bank_name = current_dealer.bank.name if current_dealer.bank else "Partner Bank"
 
-        # Check won status
+        # Multi-leg vs Single-leg
         is_multi_leg = bool(getattr(rfq, 'legs', None) and len(rfq.legs) > 0)
+        
+        # Summary trading attributes
+        if is_multi_leg:
+            valid_legs = [l for l in rfq.legs if not l.is_deleted]
+            summary_pair = ", ".join(l.currency_pair or f"{l.buy_currency}/{l.sell_currency}" for l in valid_legs[:2])
+            if len(valid_legs) > 2:
+                summary_pair += f" (+{len(valid_legs) - 2} more)"
+            summary_direction = valid_legs[0].direction or "BUY" if len(valid_legs) == 1 else "PACKAGE"
+            summary_amount = sum(float(l.amount or 0) for l in valid_legs)
+            summary_currency = valid_legs[0].buy_currency or "USD"
+            summary_value_date = valid_legs[0].value_date or "Spot (T+2)"
+        else:
+            summary_pair = f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")
+            summary_direction = rfq.direction or "BUY"
+            summary_amount = float(rfq.amount or 0)
+            summary_currency = rfq.buy_currency or "USD"
+            summary_value_date = rfq.value_date or "Spot (T+2)"
+
+        # Check Dealer's own submitted quote on this RFQ
+        dealer_offers = [o for o in asgn.offers if not o.is_deleted]
+        dealer_tbills = [o for o in asgn.tbill_offers if not o.is_deleted]
+        has_quoted = len(dealer_offers) > 0 or len(dealer_tbills) > 0
+
+        dealer_rate = None
+        dealer_submitted_at = None
+        dealer_submitted_by = None
+        dealer_notes = None
+
+        if dealer_offers:
+            latest_offer = sorted(dealer_offers, key=lambda x: x.submitted_at or datetime.min, reverse=True)[0]
+            dealer_rate = float(latest_offer.price) if latest_offer.price is not None else None
+            dealer_submitted_at = latest_offer.submitted_at.isoformat() if latest_offer.submitted_at else None
+            dealer_submitted_by = latest_offer.submitted_by_email
+            dealer_notes = latest_offer.notes
+        elif dealer_tbills:
+            latest_tbill = sorted(dealer_tbills, key=lambda x: x.submitted_at or datetime.min, reverse=True)[0]
+            dealer_rate = float(latest_tbill.discount_rate) if latest_tbill.discount_rate is not None else None
+            dealer_submitted_at = latest_tbill.submitted_at.isoformat() if latest_tbill.submitted_at else None
+            dealer_submitted_by = latest_tbill.submitted_by_email
+            dealer_notes = latest_tbill.notes
+
+        # Determine winning status & details
         won_legs = []
-        lost_legs = []
+        all_legs_detail = []
+        is_won = False
+        winning_rate = None
+        winning_bank_name = None
 
         if is_multi_leg:
             for leg in rfq.legs:
-                winner_id = getattr(leg, 'winner_quotation_bank_id', None)
-                if winner_id == asgn.quotation_bank_id:
-                    # Leg won by this bank!
-                    pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                if leg.is_deleted:
+                    continue
+                pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                leg_offer = next((o for o in dealer_offers if str(o.leg_id or '') == str(leg.id)), None)
+                my_leg_rate = float(leg_offer.price) if (leg_offer and leg_offer.price is not None) else None
+                
+                leg_is_won = (leg.winner_bank_id == current_dealer.bank_id)
+                leg_win_rate = float(leg.winner_rate or leg.eval_rate or 0) if (leg.winner_rate or leg.eval_rate) else None
+                
+                leg_data = {
+                    "leg_id": str(leg.id),
+                    "pair": pair_str,
+                    "direction": leg.direction or "BUY",
+                    "amount": float(leg.amount or 0),
+                    "currency": leg.buy_currency or "USD",
+                    "value_date": leg.value_date or "Spot (T+2)",
+                    "my_rate": my_leg_rate,
+                    "winning_rate": leg_win_rate,
+                    "is_won": leg_is_won
+                }
+                all_legs_detail.append(leg_data)
+                
+                if leg_is_won:
                     won_legs.append({
                         "leg_id": str(leg.id),
                         "pair": pair_str,
                         "direction": leg.direction or "BUY",
                         "amount": float(leg.amount or 0),
-                        "currency": leg.buy_currency,
-                        "rate": float(getattr(leg, 'winner_price', 0) or 0.0),
-                        "value_date": getattr(leg, 'value_date', 'Standard Spot') or 'Standard Spot'
+                        "currency": leg.buy_currency or "USD",
+                        "rate": leg_win_rate or my_leg_rate or 0.0,
+                        "value_date": leg.value_date or "Spot (T+2)"
                     })
-                else:
-                    lost_legs.append(str(leg.id))
 
             is_won = len(won_legs) > 0
-            is_clean_sweep = is_won and (len(lost_legs) == 0)
-            outcome_badge = "WON_CLEAN_SWEEP" if is_clean_sweep else ("WON_PARTIAL" if is_won else "LOST")
+            is_clean_sweep = is_won and (len(won_legs) == len(all_legs_detail))
+            outcome_badge = "WON_CLEAN_SWEEP" if is_clean_sweep else ("WON_PARTIAL" if is_won else ("CANCELLED" if rfq.status in ["CANCELLED", "INCONCLUSIVE"] else ("EXPIRED" if rfq.status == "EXPIRED" else ("UNQUOTED" if not has_quoted else "LOST"))))
+            winning_rate = won_legs[0]["rate"] if won_legs else (all_legs_detail[0]["winning_rate"] if all_legs_detail else None)
         else:
-            # Single-leg RFQ: check rfq analytics or winner
-            analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-            is_winner = (analytics and analytics.winner_quotation_bank_id == asgn.quotation_bank_id)
-            if not is_winner and getattr(rfq, 'winner_quotation_bank_id', None) == asgn.quotation_bank_id:
-                is_winner = True
+            # Single-leg RFQ
+            primary_leg = rfq.legs[0] if (rfq.legs and len(rfq.legs) > 0) else None
+            if primary_leg and primary_leg.winner_bank_id:
+                is_won = bool(primary_leg.winner_bank_id == current_dealer.bank_id and rfq.status == "COMPLETED")
+                winning_rate = float(primary_leg.winner_rate or primary_leg.eval_rate or 0) if (primary_leg.winner_rate or primary_leg.eval_rate) else None
+                winning_bank_name = primary_leg.winner_bank_name
+            elif rfq.eval_rate:
+                winning_rate = float(rfq.eval_rate)
+                if dealer_rate and abs(dealer_rate - winning_rate) < 0.00001 and rfq.status == "COMPLETED":
+                    is_won = True
 
-            is_won = bool(is_winner and rfq.status == "COMPLETED")
-            is_clean_sweep = is_won
-            outcome_badge = "WON" if is_won else ("CANCELLED" if rfq.status in ["CANCELLED", "INCONCLUSIVE"] else "LOST")
+            outcome_badge = "WON" if is_won else ("CANCELLED" if rfq.status in ["CANCELLED", "INCONCLUSIVE"] else ("EXPIRED" if rfq.status == "EXPIRED" else ("UNQUOTED" if not has_quoted else "LOST")))
 
             if is_won:
-                pair_str = f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")
                 won_legs.append({
                     "leg_id": str(rfq.id),
-                    "pair": pair_str,
-                    "direction": rfq.direction or "BUY",
-                    "amount": float(rfq.amount or 0),
-                    "currency": rfq.buy_currency or "",
-                    "rate": float(analytics.winner_price if analytics and analytics.winner_price else (rfq.eval_rate or 0)),
-                    "value_date": rfq.value_date or "Spot (T+2)"
+                    "pair": summary_pair,
+                    "direction": summary_direction,
+                    "amount": summary_amount,
+                    "currency": summary_currency,
+                    "rate": winning_rate or dealer_rate or 0.0,
+                    "value_date": summary_value_date
                 })
+
+        # Calculate Market Rank and Pricing Delta
+        all_rfq_offers = db.query(QuotationOffer).join(
+            QuotationBankAssignment, QuotationOffer.assignment_id == QuotationBankAssignment.id
+        ).filter(
+            QuotationBankAssignment.rfq_id == rfq.id,
+            QuotationOffer.is_deleted == False
+        ).all()
+
+        all_prices = [float(o.price) for o in all_rfq_offers if o.price is not None]
+        total_bidders = len(set(o.assignment_id for o in all_rfq_offers))
+        dealer_rank = None
+        spread_delta = None
+
+        if dealer_rate is not None and len(all_prices) > 0:
+            is_buy = (summary_direction or "BUY").upper() == "BUY"
+            sorted_unique = sorted(list(set(all_prices)), reverse=(not is_buy))
+            best_rate = sorted_unique[0]
+            if winning_rate is None:
+                winning_rate = best_rate
+            try:
+                dealer_rank = sorted_unique.index(dealer_rate) + 1
+            except ValueError:
+                dealer_rank = None
+
+            if winning_rate is not None:
+                spread_delta = round(dealer_rate - winning_rate, 4)
 
         # Generate Cryptographic Scoped Receipt if won
         receipt_data = None
-        if is_won:
+        if is_won and won_legs:
             exec_time = rfq.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC") if rfq.updated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             try:
                 receipt_data = generate_scoped_deal_receipt(
@@ -924,18 +1016,44 @@ async def get_historical_trades_blotter(
             "quotation_base": rfq.quotation_base or "Execution",
             "outcome": outcome_badge,
             "is_won": is_won,
+            "has_quoted": has_quoted,
+            "summary_pair": summary_pair,
+            "summary_direction": summary_direction,
+            "summary_amount": summary_amount,
+            "summary_currency": summary_currency,
+            "summary_value_date": summary_value_date,
+            "dealer_rate": dealer_rate,
+            "dealer_submitted_at": dealer_submitted_at,
+            "dealer_submitted_by": dealer_submitted_by,
+            "dealer_notes": dealer_notes,
+            "winning_rate": winning_rate,
+            "winning_bank_name": winning_bank_name,
+            "dealer_rank": dealer_rank,
+            "total_bidders": total_bidders,
+            "spread_delta": spread_delta,
             "won_legs_count": len(won_legs),
-            "total_legs_count": len(won_legs) + len(lost_legs) if is_multi_leg else 1,
+            "total_legs_count": len(rfq.legs) if is_multi_leg else 1,
             "executed_legs": won_legs,
+            "all_legs_detail": all_legs_detail if is_multi_leg else [],
             "receipt": receipt_data,
             "concluded_at": rfq.updated_at.isoformat() if rfq.updated_at else rfq.created_at.isoformat()
         })
+
+    won_records = [h for h in history_records if h["is_won"]]
+    quoted_records = [h for h in history_records if h["dealer_rate"] is not None]
+    total_volume_won = sum(h["summary_amount"] for h in won_records)
+    win_rate = round((len(won_records) / len(quoted_records) * 100), 1) if quoted_records else 0.0
+    ranks = [h["dealer_rank"] for h in quoted_records if h["dealer_rank"] is not None]
+    avg_rank = round(sum(ranks) / len(ranks), 1) if ranks else None
 
     return {
         "success": True,
         "bank_name": current_dealer.bank.name if current_dealer.bank else "Partner Bank",
         "total_deals": len(history_records),
-        "won_deals_count": sum(1 for h in history_records if h["is_won"]),
+        "won_deals_count": len(won_records),
+        "total_volume_won": total_volume_won,
+        "win_rate_percent": win_rate,
+        "avg_dealer_rank": avg_rank,
         "records": history_records
     }
 
