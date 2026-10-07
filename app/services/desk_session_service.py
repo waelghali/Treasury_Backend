@@ -30,6 +30,7 @@ class DeskState:
         # Latest quote mirrored state
         self.last_quote_price: Optional[float] = None
         self.last_quote_legs: Optional[Dict[str, Any]] = None
+        self.last_passed_legs: Optional[List[str]] = None
         self.last_quote_by: Optional[str] = None
         self.last_quote_at: Optional[datetime] = None
 
@@ -266,13 +267,16 @@ class DeskSessionService:
         assignment_id: str, 
         email: str, 
         price: Optional[float] = None,
-        legs_quotes: Optional[Dict[str, Any]] = None
+        legs_quotes: Optional[Dict[str, Any]] = None,
+        passed_legs: Optional[List[str]] = None
     ):
-        """Mirrors latest submitted quote to all desk observers."""
+        """Mirrors latest submitted quote and passed legs to all desk observers."""
         with self._lock:
             desk = self._get_or_create(assignment_id)
             desk.last_quote_price = price
             desk.last_quote_legs = legs_quotes
+            if passed_legs is not None:
+                desk.last_passed_legs = [str(p) for p in passed_legs]
             desk.last_quote_by = email.strip().lower()
             desk.last_quote_at = datetime.now(timezone.utc)
 
@@ -321,6 +325,7 @@ class DeskSessionService:
             "mirrored_quote": {
                 "price": desk.last_quote_price,
                 "legs_quotes": desk.last_quote_legs,
+                "passed_legs": [str(p) for p in (desk.last_passed_legs or [])],
                 "by": desk.last_quote_by,
                 "at": desk.last_quote_at.isoformat() if desk.last_quote_at else None
             }

@@ -738,11 +738,30 @@ class CRUDQuotation:
                     cost_max=b_data.get('costMax', 0.0),
                     cost_flat=b_data.get('costFlat', 0.0),
                     quotation_base=leg_quotation_base,
-                    is_document_visible=b_data.get('isDocumentVisible', True),
+                    is_document_visible=b_data.get('isDocumentVisible', True) if (not is_cross_bank and is_leg_invited) else False,
                     value_date=leg_cfg_val_d,
-                    allow_alternative_value_date=b_data.get('allowAlternativeValueDate')
+                    allow_alternative_value_date=bool(b_data.get('allowAlternativeValueDate')) if b_data.get('allowAlternativeValueDate') is not None else bool(leg_obj.allow_alternative_value_date)
                 )
                 db.add(leg_bank_cfg)
+
+        # Ensure RFQ-level quotation_base reflects active counterparty invitations (Mixed, Execution, Indicative)
+        all_invited_leg_bases = [
+            c.quotation_base.lower()
+            for c in db.query(QuotationBankLegConfig).join(QuotationBankAssignment).filter(
+                QuotationBankAssignment.rfq_id == db_rfq.id,
+                QuotationBankLegConfig.is_invited == True
+            ).all()
+            if c.quotation_base and c.quotation_base.lower() != 'invisible'
+        ]
+        if all_invited_leg_bases:
+            has_rfq_exec = any(b == 'execution' for b in all_invited_leg_bases)
+            has_rfq_indic = any(b == 'indicative' for b in all_invited_leg_bases)
+            if has_rfq_exec and has_rfq_indic:
+                db_rfq.quotation_base = "Mixed"
+            elif has_rfq_indic:
+                db_rfq.quotation_base = "Indicative"
+            else:
+                db_rfq.quotation_base = "Execution"
 
         db.commit()
         db.refresh(db_rfq)

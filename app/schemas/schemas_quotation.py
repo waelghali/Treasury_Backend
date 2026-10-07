@@ -213,6 +213,7 @@ class QuotationRequestOut(BaseModel):
     parent_rfq_id: Optional[str] = None
     parent_rfq_ref: Optional[str] = None
     admin_revision_notes: Optional[str] = None
+    user_revision_notes: Optional[str] = None
     admin_reviewed_at: Optional[datetime] = None
     winner_bank_name: Optional[str] = None
     winner_rate: Optional[float] = None

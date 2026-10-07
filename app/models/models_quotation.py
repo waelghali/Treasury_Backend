@@ -90,6 +90,7 @@ class QuotationRequest(BaseModel):
     parent_rfq_id = Column(String, ForeignKey("quotation_rfqs.id", ondelete="SET NULL"), nullable=True, index=True, comment="Original RFQ if this is a re-tender")
     entity_id = Column(Integer, ForeignKey("customer_entities.id", ondelete="SET NULL"), nullable=True, index=True, comment="Customer entity/subsidiary requesting the RFQ")
     admin_revision_notes = Column(Text, nullable=True, comment="Notes from Corporate Admin when returned for revision")
+    user_revision_notes = Column(Text, nullable=True, comment="Notes from requestor when revising RFQ")
     admin_reviewed_at = Column(DateTime(timezone=True), nullable=True)
     cancellation_reason = Column(String(255), nullable=True, comment="Internal reason selected by end user for cancellation")
     cancellation_notes = Column(Text, nullable=True, comment="Additional context notes provided by requestor")
@@ -248,6 +249,11 @@ class QuotationRequest(BaseModel):
                 filtered.append(d)
                 continue
 
+            # Critical Safeguard: If a document has an explicit pair and clean_pair is provided,
+            # it must NEVER be assigned to a different currency pair!
+            if d_pair and clean_pair and d_pair != clean_pair:
+                continue
+
             # Exact leg_id match
             if clean_leg_id and d_id and d_id == clean_leg_id:
                 filtered.append(d)
@@ -258,10 +264,8 @@ class QuotationRequest(BaseModel):
                 filtered.append(d)
                 continue
 
-            # Accurate index matching:
-            # If doc set contains index 0, then 0-based mapping applies (Leg 1 is index 0, Leg 2 is index 1...)
-            # Never use ambiguous 'OR' that matches both index 0 and 1 for Leg 1!
-            if leg_index is not None and d_idx is not None:
+            # Accurate index matching (ONLY if the document does not specify a conflicting pair)
+            if leg_index is not None and d_idx is not None and not d_pair:
                 expected_idx = (leg_index - 1) if (has_zero_indexed and leg_index >= 1) else leg_index
                 if d_idx == expected_idx:
                     filtered.append(d)

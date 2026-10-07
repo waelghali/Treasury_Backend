@@ -10,7 +10,7 @@ from app.models.models import User, UserRole
 from app.core.routing import get_frontend_base_url
 from app.core.email_service import get_customer_email_settings, send_email
 from app.services.unified_email_builder import build_transaction_email_html
-from app.crud.crud_common_communication import get_common_communication_emails
+from app.services.issuance_notifications import get_common_communication_emails
 
 logger = logging.getLogger(__name__)
 

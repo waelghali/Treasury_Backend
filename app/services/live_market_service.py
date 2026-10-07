@@ -32,9 +32,14 @@ from app.models.models import CurrencyExchangeRate, Currency
 
 logger = logging.getLogger(__name__)
 
-# In-memory TTL Cache: { "USD_EGP": { "rate": 52.22, "timestamp": datetime } }
+# In-memory TTL Cache: { "USD_BASE": { "rates": {...}, "timestamp": datetime } }
 _LIVE_CACHE: Dict[str, Dict[str, Any]] = {}
+_LAST_FETCH_ATTEMPT: Optional[datetime] = None
+_ARCHIVE_THROTTLE: Dict[str, datetime] = {}
+_EMPIRICAL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 300
+RETRY_BACKOFF_SECONDS = 60
+EMPIRICAL_CACHE_TTL_SECONDS = 30
 
 DISCLAIMER_TEXT = (
     "⚠️ Historical Empirical Model: Reference rate and spread are derived mathematically from "
@@ -96,17 +101,23 @@ class LiveMarketService:
 
     def fetch_live_rates(self) -> Dict[str, float]:
         """Fetches live USD-based spot rates from free open market API with memory cache."""
+        global _LAST_FETCH_ATTEMPT
         now = datetime.now(timezone.utc)
         cache_entry = _LIVE_CACHE.get("USD_BASE")
         if cache_entry and (now - cache_entry["timestamp"]).total_seconds() < CACHE_TTL_SECONDS:
             return cache_entry["rates"]
 
+        # Prevent hammering external network API on failure or timeouts
+        if _LAST_FETCH_ATTEMPT and (now - _LAST_FETCH_ATTEMPT).total_seconds() < RETRY_BACKOFF_SECONDS:
+            return cache_entry["rates"] if cache_entry else {}
+
+        _LAST_FETCH_ATTEMPT = now
         try:
             req = urllib.request.Request(
                 "https://open.er-api.com/v6/latest/USD",
                 headers={"User-Agent": "GrowTreasury/2.0 (Platform Benchmark Engine)"}
             )
-            with urllib.request.urlopen(req, timeout=2) as response:
+            with urllib.request.urlopen(req, timeout=1.5) as response:
                 if response.status == 200:
                     payload = json.loads(response.read().decode('utf-8'))
                     rates = payload.get("rates", {})
@@ -176,30 +187,26 @@ class LiveMarketService:
             cbe_gap_bps = round(((live_mid - cbe_mid) / cbe_mid) * 10000.0, 2)
             cbe_gap_pips = round((live_mid - cbe_mid) * 10000.0, 1)
 
-        # Phase 6.6: Time-Series Market Spot Rate Archive (builds proprietary dataset)
-        if live_mid and db:
+        # Phase 6.6: Time-Series Market Spot Rate Archive (non-intrusive rate capture)
+        # Note: Must NEVER execute db.commit() or db.rollback() or db.flush() in read query path to protect caller transaction
+        now_dt = datetime.now(timezone.utc)
+        last_archived = _ARCHIVE_THROTTLE.get(pair_str)
+        if live_mid and db and (not last_archived or (now_dt - last_archived).total_seconds() > 300):
             try:
                 from app.models.models_quotation import QuotationMarketRateHistory
-                cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
-                recent_entry = db.query(QuotationMarketRateHistory).filter(
-                    QuotationMarketRateHistory.currency_pair == pair_str,
-                    QuotationMarketRateHistory.created_at >= cutoff
-                ).first()
-                if not recent_entry:
-                    hist_record = QuotationMarketRateHistory(
-                        currency_pair=pair_str,
-                        base_currency=from_code,
-                        quote_currency=to_code,
-                        rate=live_mid,
-                        source=source,
-                        cbe_official_mid=cbe_mid,
-                        cbe_gap_bps=cbe_gap_bps
-                    )
-                    db.add(hist_record)
-                    db.commit()
+                hist_record = QuotationMarketRateHistory(
+                    currency_pair=pair_str,
+                    base_currency=from_code,
+                    quote_currency=to_code,
+                    rate=live_mid,
+                    source=source,
+                    cbe_official_mid=cbe_mid,
+                    cbe_gap_bps=cbe_gap_bps
+                )
+                db.add(hist_record)
+                _ARCHIVE_THROTTLE[pair_str] = now_dt
             except Exception as archive_err:
-                logger.debug(f"Spot rate archive skip or error: {archive_err}")
-                db.rollback()
+                logger.debug(f"Spot rate archive non-fatal skip: {archive_err}")
 
         return {
             "currency_pair": pair_str,
@@ -235,13 +242,21 @@ class LiveMarketService:
         volume_tier = self.categorize_volume_tier(amount, currency=from_code)
         pair_str = f"{from_code}/{to_code}"
 
+        # Fast In-Memory Cache Lookup (30s TTL): Prevents massive DB query storms during active bidding/acceptance
+        cache_key = f"{customer_id}:{from_code}:{to_code}:{direction_upper}:{volume_tier}"
+        now_utc = datetime.now(timezone.utc)
+        cached_entry = _EMPIRICAL_CACHE.get(cache_key)
+        if cached_entry and (now_utc - cached_entry["timestamp"]).total_seconds() < EMPIRICAL_CACHE_TTL_SECONDS:
+            return dict(cached_entry["data"])
+
         # 1. Obtain Live Interbank Mid & CBE Drift
         live_data = self.get_live_interbank_mid(db, from_code, to_code)
         live_mid = live_data["live_mid"]
 
         # Helper to extract past winning spread over historical benchmark
         def _get_spreads_from_rfqs(query):
-            completed_rfqs = query.all()
+            # Limit historical scan to top 10 most recent completed tenders for agility and performance
+            completed_rfqs = query.order_by(desc(QuotationRequest.created_at)).limit(10).all()
             spreads = []
             curr_rec = db.query(Currency).filter(func.upper(Currency.iso_code) == from_code).first()
 
@@ -257,13 +272,17 @@ class LiveMarketService:
                 ).all()
                 if not offers:
                     continue
-                from app.services.tenant_key_service import tenant_key_service
-                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, r.customer_id)
-                prices = [
-                    tenant_key_service.resolve_offer_price(o, tenant_dek)
-                    for o in offers
-                ]
-                prices = [p for p in prices if p and p > 0]
+                try:
+                    from app.services.tenant_key_service import tenant_key_service
+                    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, r.customer_id)
+                    prices = [
+                        tenant_key_service.resolve_offer_price(o, tenant_dek)
+                        for o in offers
+                    ]
+                    prices = [p for p in prices if p and p > 0]
+                except Exception as ex:
+                    logger.debug(f"Non-fatal error resolving prices for historical RFQ {r.id}: {ex}")
+                    continue
                 if not prices:
                     continue
 
@@ -312,12 +331,14 @@ class LiveMarketService:
                 func.upper(QuotationRequest.direction) == direction_upper
             )
             # Filter volume tier
-            all_cust_rfqs = q_lvl1.all()
+            all_cust_rfqs = q_lvl1.order_by(desc(QuotationRequest.created_at)).limit(20).all()
             matching_tier = [r for r in all_cust_rfqs if self.categorize_volume_tier(r.amount, from_code) == volume_tier]
             if len(matching_tier) >= 3:
                 # Use matching tier directly
                 class DummyQuery:
-                    def all(self): return matching_tier
+                    def order_by(self, *args): return self
+                    def limit(self, *args): return self
+                    def all(self): return matching_tier[:10]
                 spreads_lvl1 = _get_spreads_from_rfqs(DummyQuery())
 
         # Level 2: Customer + Pair (All Volumes)
@@ -391,7 +412,7 @@ class LiveMarketService:
                 "Displaying raw Live Interbank Mid."
             )
 
-        return {
+        result_payload = {
             "currency_pair": pair_str,
             "direction": direction_upper,
             "volume_tier": volume_tier,
@@ -414,6 +435,14 @@ class LiveMarketService:
             "governance_disclaimer": DISCLAIMER_TEXT,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+
+        # Cache payload to eliminate redundant DB processing for 30s
+        _EMPIRICAL_CACHE[cache_key] = {
+            "data": result_payload,
+            "timestamp": now_utc
+        }
+
+        return result_payload
 
     def evaluate_quote_spread(
         self,

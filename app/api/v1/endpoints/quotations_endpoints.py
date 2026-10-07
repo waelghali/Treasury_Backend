@@ -3056,6 +3056,8 @@ def resubmit_quotation(
         rfq.comments_to_banks = payload.comments_to_banks
     elif getattr(payload, 'commentsToBanks', None) is not None:
         rfq.comments_to_banks = payload.commentsToBanks
+    if getattr(payload, 'user_notes', None) is not None:
+        rfq.user_revision_notes = payload.user_notes.strip() if payload.user_notes else None
 
     # Handle multi-pair legs re-creation if provided
     resubmit_pairs = getattr(payload, 'pairs', None) or getattr(payload, 'legs', None)
@@ -3082,6 +3084,7 @@ def resubmit_quotation(
             seen_pair_keys.add(pair_key)
 
         db.query(QuotationLeg).filter(QuotationLeg.rfq_id == rfq.id).delete()
+        created_legs_with_source = []
         for idx, p_item in enumerate(resubmit_pairs, start=1):
             leg_id = f"{rfq.id}-leg-{idx}"
             leg_val_d = getattr(p_item, 'valueDate', None)
@@ -3104,147 +3107,212 @@ def resubmit_quotation(
                 entity_id=rfq.entity_id
             )
             db.add(leg_obj)
+            created_legs_with_source.append((leg_obj, p_item))
         db.flush()
 
     # If new selected banks provided from the builder, re-sync bank assignments
     if payload.selected_banks:
         try:
-            banks_data = json.loads(payload.selected_banks) if isinstance(payload.selected_banks, str) else payload.selected_banks
+            banks_data = json.loads(payload.selected_banks) if isinstance(payload.selected_banks, str) else (payload.selected_banks or [])
+            # Preserve existing assignment tokens so counterparty tabs/links do not get decommissioned on revision
+            existing_tokens = {
+                a.quotation_bank_id: a.token
+                for a in db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+                if a.quotation_bank_id and a.token
+            }
             # Remove previous unsubmitted assignments
             db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).delete()
             current_legs = db.query(QuotationLeg).filter(QuotationLeg.rfq_id == rfq.id).order_by(QuotationLeg.leg_index.asc()).all()
 
+            # Pre-scan legs per bank to determine order-independent assignment parameters and per-leg bank data
+            bank_legs_catalog = {} # raw_bank_id -> list of dicts: {'leg_obj': leg_obj, 'b_data': b_data}
+            legs_to_process = created_legs_with_source if 'created_legs_with_source' in locals() and created_legs_with_source else [(l, None) for l in current_legs]
+
+            for leg_obj, p_source in legs_to_process:
+                p_banks_raw = (getattr(p_source, 'selectedBanks', None) or getattr(p_source, 'selected_banks', None)) if p_source else None
+                if p_banks_raw:
+                    leg_banks = json.loads(p_banks_raw) if isinstance(p_banks_raw, str) else p_banks_raw
+                    if isinstance(leg_banks, list):
+                        leg_banks = [b.dict() if hasattr(b, 'dict') else b for b in leg_banks]
+                    else:
+                        leg_banks = banks_data
+                else:
+                    leg_banks = banks_data
+
+                for b_data in leg_banks:
+                    bid = b_data.get('id')
+                    if not bid:
+                        continue
+                    if bid not in bank_legs_catalog:
+                        bank_legs_catalog[bid] = []
+                    bank_legs_catalog[bid].append({'leg_obj': leg_obj, 'b_data': b_data})
+
+            # Also ensure all banks in root banks_data are cataloged
             for b_data in banks_data:
-                assignment_id = str(uuid.uuid4())
-                token = str(uuid.uuid4())
+                bid = b_data.get('id')
+                if bid and bid not in bank_legs_catalog:
+                    bank_legs_catalog[bid] = [{'leg_obj': l, 'b_data': b_data} for l in current_legs]
+
+            all_created_leg_cfgs = []
+            for raw_bank_id, leg_items in bank_legs_catalog.items():
+                root_bank_info = next((rb for rb in banks_data if str(rb.get('id')) == str(raw_bank_id)), leg_items[0]['b_data'])
                 q_bank = db.query(QuotationBank).filter(
                     QuotationBank.customer_id == current_user.customer_id,
-                    QuotationBank.bank_id == b_data.get('id'),
+                    QuotationBank.bank_id == raw_bank_id,
                     QuotationBank.trade_type.in_([rfq.type, "BOTH"])
                 ).first()
-                if q_bank:
-                    # Check if bank is cross-entity for this RFQ's entity
-                    is_cross_bank = False
-                    if rfq.entity_id and q_bank.entity_scope != 'ALL_ENTITIES':
-                        assoc_eids = [assoc.entity_id for assoc in q_bank.entity_associations] if q_bank.entity_associations else []
-                        if rfq.entity_id not in assoc_eids:
-                            is_cross_bank = True
+                if not q_bank:
+                    continue
 
-                    if is_cross_bank:
-                        from app.crud.crud_config import crud_customer_configuration
-                        from app.constants import GlobalConfigKey
-                        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
-                            db, customer_id=current_user.customer_id, config_key=GlobalConfigKey.ALLOW_CROSS_ENTITY_INDICATIVE_QUOTES
+                token = existing_tokens.get(q_bank.id) or str(uuid.uuid4())
+                assignment_id = str(uuid.uuid4())
+
+                # Check if bank is cross-entity for this RFQ's entity
+                is_cross_bank = False
+                if rfq.entity_id and q_bank.entity_scope != 'ALL_ENTITIES':
+                    assoc_eids = [assoc.entity_id for assoc in q_bank.entity_associations] if q_bank.entity_associations else []
+                    if rfq.entity_id not in assoc_eids:
+                        is_cross_bank = True
+
+                if is_cross_bank:
+                    from app.crud.crud_config import crud_customer_configuration
+                    from app.constants import GlobalConfigKey
+                    cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                        db, customer_id=current_user.customer_id, config_key=GlobalConfigKey.ALLOW_CROSS_ENTITY_INDICATIVE_QUOTES
+                    )
+                    allow_cross_cfg = False
+                    if cfg and cfg.get("effective_value"):
+                        allow_cross_cfg = str(cfg["effective_value"]).strip().lower() in ("true", "1", "yes")
+                    if not allow_cross_cfg:
+                        b_name = root_bank_info.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
                         )
-                        allow_cross_cfg = False
-                        if cfg and cfg.get("effective_value"):
-                            allow_cross_cfg = str(cfg["effective_value"]).strip().lower() in ("true", "1", "yes")
-                        if not allow_cross_cfg:
-                            b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{b_data.get('id')}")
-                            raise HTTPException(
-                                status_code=status.HTTP_403_FORBIDDEN,
-                                detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
-                            )
-                    if is_cross_bank:
-                        q_base_override = "Indicative"
-                        has_any_exec_leg = False
+
+                # Compute order-independent quotation base across ALL active legs for this bank
+                if is_cross_bank:
+                    bank_overall_base = "Indicative"
+                    has_any_exec_leg = False
+                else:
+                    leg_bases = []
+                    for item in leg_items:
+                        l_b_data = item['b_data']
+                        l_leg_obj = item['leg_obj']
+                        l_q_base = l_b_data.get('quotationBase') or root_bank_info.get('quotationBase') or l_leg_obj.quotation_base or rfq.quotation_base or 'Execution'
+                        is_l_invited = l_b_data.get('isInvited', l_b_data.get('is_invited', True)) is not False
+                        if str(l_q_base).strip().lower() not in ['invisible', 'skipped', 'excluded'] and is_l_invited:
+                            leg_bases.append((l_q_base or 'Execution').strip().capitalize())
+
+                    if not leg_bases:
+                        leg_bases = [(root_bank_info.get('quotationBase') or rfq.quotation_base or 'Execution').strip().capitalize()]
+
+                    has_exec = any(b.lower() == 'execution' for b in leg_bases)
+                    has_indic = any(b.lower() == 'indicative' for b in leg_bases)
+                    has_any_exec_leg = has_exec
+                    if has_exec and has_indic:
+                        bank_overall_base = "Mixed"
+                    elif has_indic:
+                        bank_overall_base = "Indicative"
                     else:
-                        leg_bases = []
-                        for leg_obj in (current_legs or []):
-                            l_b = b_data.get('quotationBase') or leg_obj.quotation_base or rfq.quotation_base or 'Execution'
-                            leg_bases.append((l_b or 'Execution').strip().capitalize())
-                        if not leg_bases:
-                            leg_bases = [(b_data.get('quotationBase') or rfq.quotation_base or 'Execution').strip().capitalize()]
+                        bank_overall_base = "Execution"
 
-                        has_exec = any(b.lower() == 'execution' for b in leg_bases)
-                        has_indic = any(b.lower() == 'indicative' for b in leg_bases)
-                        has_any_exec_leg = has_exec
-                        if has_exec and has_indic:
-                            q_base_override = "Mixed"
-                        elif has_indic:
-                            q_base_override = "Indicative"
-                        else:
-                            q_base_override = "Execution"
+                contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
+                has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
+                has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
+                bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec_leg and not is_cross_bank) else None
 
-                    is_doc_vis = b_data.get('isDocumentVisible', True)
-                    if is_doc_vis is None:
-                        is_doc_vis = True
-                    contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
-                    has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
-                    has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                    bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec_leg and not is_cross_bank) else None
+                bank_value_date = root_bank_info.get('valueDate') or rfq.value_date
+                if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
+                    b_val_d = _parse_d(bank_value_date)
+                    if b_val_d and b_val_d < w_date:
+                        bank_label = q_bank.bank.name if (q_bank and q_bank.bank) else f"Bank #{raw_bank_id}"
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Value Date ({b_val_d}) for {bank_label} cannot be earlier than quotation window date ({w_date}). Value date must be on or after the quotation trade date."
+                        )
 
-                    bank_value_date = b_data.get('valueDate') or rfq.value_date
-                    if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
-                        b_val_d = _parse_d(bank_value_date)
-                        if b_val_d and b_val_d < w_date:
-                            bank_label = q_bank.bank.name if (q_bank and q_bank.bank) else f"Bank #{b_data.get('id')}"
+                bank_allow_alt = root_bank_info.get('allowAlternativeValueDate')
+
+                db_assignment = QuotationBankAssignment(
+                    id=assignment_id,
+                    rfq_id=rfq.id,
+                    quotation_bank_id=q_bank.id,
+                    token=token,
+                    cost_min=root_bank_info.get('costMin', 0.0),
+                    cost_percent=root_bank_info.get('costPercent', 0.0),
+                    cost_max=root_bank_info.get('costMax', 0.0),
+                    cost_flat=root_bank_info.get('costFlat', 0.0),
+                    quotation_base=bank_overall_base,
+                    is_document_visible=root_bank_info.get('isDocumentVisible', True) if not is_cross_bank else False,
+                    value_date=bank_value_date,
+                    allow_alternative_value_date=bank_allow_alt,
+                    approval_status=bank_approval_status
+                )
+                db.add(db_assignment)
+                db.flush()
+
+                bank_seen_signatures = set()
+                for item in leg_items:
+                    leg_obj = item['leg_obj']
+                    b_data = item['b_data']
+                    cfg_id = str(uuid.uuid4())
+                    leg_cfg_val_d = _parse_d(b_data.get('valueDate') or leg_obj.value_date)
+                    leg_q_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or leg_obj.quotation_base or 'Execution')
+                    is_leg_invited = b_data.get('isInvited', b_data.get('is_invited', True)) is not False
+                    if str(leg_q_base).strip().lower() in ['invisible', 'skipped', 'excluded']:
+                        is_leg_invited = False
+                        leg_q_base = "Invisible"
+
+                    if (rfq.type == 'FX_SPOT' or not rfq.type) and is_leg_invited:
+                        sig = get_bank_leg_signature(
+                            leg_obj.buy_currency,
+                            leg_obj.sell_currency,
+                            leg_obj.direction,
+                            leg_cfg_val_d,
+                            leg_q_base
+                        )
+                        if sig in bank_seen_signatures:
+                            b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
                             raise HTTPException(
-                                status_code=400,
-                                detail=f"Value Date ({b_val_d}) for {bank_label} cannot be earlier than quotation window date ({w_date}). Value date must be on or after the quotation trade date."
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Counterparty conflict for {b_name}: Multiple legs requested for {leg_obj.buy_currency}/{leg_obj.sell_currency} with matching effective settlement date ({leg_cfg_val_d}) and quotation base ({str(leg_q_base).capitalize()}). A bank cannot receive identical quote requests."
                             )
+                        bank_seen_signatures.add(sig)
 
-                    bank_allow_alt = b_data.get('allowAlternativeValueDate')
+                    leg_allow_alt = bool(b_data.get('allowAlternativeValueDate')) if b_data.get('allowAlternativeValueDate') is not None else bool(leg_obj.allow_alternative_value_date)
 
-                    db_assignment = QuotationBankAssignment(
-                        id=assignment_id,
-                        rfq_id=rfq.id,
-                        quotation_bank_id=q_bank.id,
-                        token=token,
+                    leg_bank_cfg = QuotationBankLegConfig(
+                        id=cfg_id,
+                        assignment_id=db_assignment.id,
+                        leg_id=leg_obj.id,
+                        is_invited=is_leg_invited,
                         cost_min=b_data.get('costMin', 0.0),
                         cost_percent=b_data.get('costPercent', 0.0),
                         cost_max=b_data.get('costMax', 0.0),
                         cost_flat=b_data.get('costFlat', 0.0),
-                        quotation_base=q_base_override or rfq.quotation_base,
-                        is_document_visible=is_doc_vis,
-                        value_date=bank_value_date,
-                        allow_alternative_value_date=bank_allow_alt,
-                        approval_status=bank_approval_status
+                        quotation_base=leg_q_base,
+                        is_document_visible=b_data.get('isDocumentVisible', True) if not is_cross_bank else False,
+                        value_date=leg_cfg_val_d,
+                        allow_alternative_value_date=leg_allow_alt
                     )
-                    db.add(db_assignment)
-                    db.flush()
+                    db.add(leg_bank_cfg)
+                    all_created_leg_cfgs.append(leg_bank_cfg)
 
-                    bank_seen_signatures = set()
-                    for leg_obj in current_legs:
-                        cfg_id = str(uuid.uuid4())
-                        leg_cfg_val_d = _parse_d(b_data.get('valueDate') or leg_obj.value_date)
-                        leg_q_base = "Indicative" if is_cross_bank else (b_data.get('quotationBase') or leg_obj.quotation_base or 'Execution')
-                        is_leg_invited = b_data.get('isInvited', b_data.get('is_invited', True)) is not False
-                        if str(leg_q_base).strip().lower() in ['invisible', 'skipped', 'excluded']:
-                            is_leg_invited = False
-                            leg_q_base = "Invisible"
-
-                        if (rfq.type == 'FX_SPOT' or not rfq.type) and is_leg_invited:
-                            sig = get_bank_leg_signature(
-                                leg_obj.buy_currency,
-                                leg_obj.sell_currency,
-                                leg_obj.direction,
-                                leg_cfg_val_d,
-                                leg_q_base
-                            )
-                            if sig in bank_seen_signatures:
-                                b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{b_data.get('id')}")
-                                raise HTTPException(
-                                    status_code=status.HTTP_400_BAD_REQUEST,
-                                    detail=f"Counterparty conflict for {b_name}: Multiple legs requested for {leg_obj.buy_currency}/{leg_obj.sell_currency} with matching effective settlement date ({leg_cfg_val_d}) and quotation base ({str(leg_q_base).capitalize()}). A bank cannot receive identical quote requests."
-                                )
-                            bank_seen_signatures.add(sig)
-
-                        leg_bank_cfg = QuotationBankLegConfig(
-                            id=cfg_id,
-                            assignment_id=db_assignment.id,
-                            leg_id=leg_obj.id,
-                            is_invited=is_leg_invited,
-                            cost_min=b_data.get('costMin', 0.0),
-                            cost_percent=b_data.get('costPercent', 0.0),
-                            cost_max=b_data.get('costMax', 0.0),
-                            cost_flat=b_data.get('costFlat', 0.0),
-                            quotation_base=leg_q_base,
-                            is_document_visible=is_doc_vis,
-                            value_date=leg_cfg_val_d,
-                            allow_alternative_value_date=bank_allow_alt
-                        )
-                        db.add(leg_bank_cfg)
+            # Re-evaluate RFQ-level quotation_base based on active invited counterparties
+            active_bases = [
+                c.quotation_base.lower() for c in all_created_leg_cfgs
+                if c.is_invited and c.quotation_base and c.quotation_base.lower() != 'invisible'
+            ]
+            if active_bases:
+                has_rfq_exec = any(b == 'execution' for b in active_bases)
+                has_rfq_indic = any(b == 'indicative' for b in active_bases)
+                if has_rfq_exec and has_rfq_indic:
+                    rfq.quotation_base = "Mixed"
+                elif has_rfq_indic:
+                    rfq.quotation_base = "Indicative"
+                else:
+                    rfq.quotation_base = "Execution"
         except HTTPException:
             raise
         except Exception as e:

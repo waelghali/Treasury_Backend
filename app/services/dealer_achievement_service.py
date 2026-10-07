@@ -294,39 +294,69 @@ class DealerAchievementService:
                         total_volume_won_usd += rfq_volume_usd
 
                     # Streak Evaluation across RFQs (Clean Sweep standard with Wash on aborted/rejected tenders)
-                    exec_legs = [l for l in getattr(rfq, 'legs', []) if (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution']
+                    # Unbroken Victory strictly evaluates legs where this bank was invited on an Execution basis.
                     if rfq.type == 'TBILL':
-                        qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-                        asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
-                        is_tbill_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
-                        is_tbill_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
-                        if is_tbill_won:
-                            current_streak += 1
-                            if current_streak > longest_streak:
-                                longest_streak = current_streak
-                        elif is_tbill_lost or (rfq.status in ('COMPLETED', 'CLOSED') and not is_tbill_won):
-                            current_streak = 0
-                    else:
-                        if exec_legs:
-                            dealer_won_all_legs = all(
-                                l.winner_bank_id == bank_id_val and l.status not in ('REJECTED', 'CANCELLED', 'DECLINED') and
-                                any(o.leg_id == l.id and abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(l.winner_rate or 0.0)) < 1e-4 for o in fx_offers)
-                                for l in exec_legs
-                            ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
-
-                            competitor_won_any = any(
-                                l.winner_bank_id and l.winner_bank_id != bank_id_val
-                                for l in exec_legs
-                            )
-                            deal_concluded = rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED')
-
-                            if dealer_won_all_legs:
+                        tbill_base = (getattr(asgn, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                        if tbill_base == 'execution':
+                            qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
+                            asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
+                            is_tbill_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                            is_tbill_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                            if is_tbill_won:
                                 current_streak += 1
                                 if current_streak > longest_streak:
                                     longest_streak = current_streak
-                            elif competitor_won_any or (deal_concluded and not dealer_won_all_legs):
+                            elif is_tbill_lost:
                                 current_streak = 0
-                            # Note: If RFQ was cancelled/rejected with no winner awarded, it is a wash (preserves current_streak)
+                            # Note: If RFQ was cancelled/rejected with no award, it is a wash (preserves current_streak)
+                    else:
+                        legs = getattr(rfq, 'legs', [])
+                        # Filter strictly for legs where this bank was invited on an Execution basis (exclude Indicative & Invisible)
+                        eligible_exec_legs = []
+                        if legs:
+                            for l in legs:
+                                leg_cfg = asgn.get_config_for_leg(l.id) if hasattr(asgn, 'get_config_for_leg') else None
+                                is_invited = getattr(leg_cfg, 'is_invited', True) if leg_cfg else True
+                                leg_base = (getattr(leg_cfg, 'quotation_base', None) or getattr(asgn, 'quotation_base', None) or getattr(l, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                                if is_invited and leg_base == 'execution':
+                                    eligible_exec_legs.append(l)
+                        else:
+                            rfq_base = (getattr(asgn, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                            if rfq_base == 'execution':
+                                eligible_exec_legs.append(rfq)
+
+                        if eligible_exec_legs:
+                            # Awarded business: legs concluded with a winner and not rejected/cancelled/declined by client
+                            awarded_legs = [
+                                l for l in eligible_exec_legs
+                                if (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) and
+                                getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED', 'INCONCLUSIVE', 'EXPIRED')
+                            ]
+
+                            competitor_won_any = any(
+                                (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) != bank_id_val
+                                for l in awarded_legs
+                            )
+
+                            if competitor_won_any:
+                                current_streak = 0
+                            elif awarded_legs and rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED'):
+                                dealer_won_all_awarded = all(
+                                    (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) == bank_id_val and
+                                    any(
+                                        (o.leg_id == l.id if hasattr(l, 'id') and l != rfq else o.assignment_id == asgn.id) and
+                                        abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(getattr(l, 'winner_rate', None) or getattr(rfq, 'eval_rate', None) or 0.0)) < 1e-4
+                                        for o in fx_offers
+                                    )
+                                    for l in awarded_legs
+                                )
+                                if dealer_won_all_awarded:
+                                    current_streak += 1
+                                    if current_streak > longest_streak:
+                                        longest_streak = current_streak
+                                elif rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED'):
+                                    current_streak = 0
+                            # Note: If no legs awarded (e.g. client rejected all legs or cancelled tender), it is a wash (preserves current_streak)
 
                 display_email = clean_email
                 target_bank_name = bank_name
@@ -440,38 +470,66 @@ class DealerAchievementService:
                 current_streak = 0
                 longest_streak = 0
                 for rfq in rfqs_sorted:
-                    exec_legs = [l for l in getattr(rfq, 'legs', []) if (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution']
+                    asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
+                    if not asgn:
+                        continue
+
                     if rfq.type == 'TBILL':
-                        qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-                        asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
-                        is_tbill_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
-                        is_tbill_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
-                        if is_tbill_won:
-                            current_streak += 1
-                            if current_streak > longest_streak:
-                                longest_streak = current_streak
-                        elif is_tbill_lost or (rfq.status in ('COMPLETED', 'CLOSED') and not is_tbill_won):
-                            current_streak = 0
-                    else:
-                        if exec_legs:
-                            bank_won_all_legs = all(
-                                getattr(l, 'winner_bank_id', None) == bank_id and getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED')
-                                for l in exec_legs
-                            ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
-
-                            competitor_won_any = any(
-                                getattr(l, 'winner_bank_id', None) and getattr(l, 'winner_bank_id', None) != bank_id
-                                for l in exec_legs
-                            )
-                            deal_concluded = rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED')
-
-                            if bank_won_all_legs:
+                        tbill_base = (getattr(asgn, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                        if tbill_base == 'execution':
+                            qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
+                            is_tbill_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                            is_tbill_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
+                            if is_tbill_won:
                                 current_streak += 1
                                 if current_streak > longest_streak:
                                     longest_streak = current_streak
-                            elif competitor_won_any or (deal_concluded and not bank_won_all_legs):
+                            elif is_tbill_lost:
                                 current_streak = 0
-                            # Note: If RFQ was cancelled/rejected with no winner awarded, it is a wash (preserves current_streak)
+                            # Note: If RFQ was cancelled/rejected with no award, it is a wash (preserves current_streak)
+                    else:
+                        legs = getattr(rfq, 'legs', [])
+                        # Filter strictly for legs where this bank was invited on an Execution basis (exclude Indicative & Invisible)
+                        eligible_exec_legs = []
+                        if legs:
+                            for l in legs:
+                                leg_cfg = asgn.get_config_for_leg(l.id) if hasattr(asgn, 'get_config_for_leg') else None
+                                is_invited = getattr(leg_cfg, 'is_invited', True) if leg_cfg else True
+                                leg_base = (getattr(leg_cfg, 'quotation_base', None) or getattr(asgn, 'quotation_base', None) or getattr(l, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                                if is_invited and leg_base == 'execution':
+                                    eligible_exec_legs.append(l)
+                        else:
+                            rfq_base = (getattr(asgn, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                            if rfq_base == 'execution':
+                                eligible_exec_legs.append(rfq)
+
+                        if eligible_exec_legs:
+                            # Awarded business: legs concluded with a winner and not rejected/cancelled/declined by client
+                            awarded_legs = [
+                                l for l in eligible_exec_legs
+                                if (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) and
+                                getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED', 'INCONCLUSIVE', 'EXPIRED')
+                            ]
+
+                            competitor_won_any = any(
+                                (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) != bank_id
+                                for l in awarded_legs
+                            )
+
+                            if competitor_won_any:
+                                current_streak = 0
+                            elif awarded_legs and rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED'):
+                                bank_won_all_awarded = all(
+                                    (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) == bank_id
+                                    for l in awarded_legs
+                                )
+                                if bank_won_all_awarded:
+                                    current_streak += 1
+                                    if current_streak > longest_streak:
+                                        longest_streak = current_streak
+                                elif rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED'):
+                                    current_streak = 0
+                            # Note: If no legs awarded (wash), current_streak is preserved
 
             # Construct Multi-Metal Badges with Calibrated Institutional Milestones
             trophies = cls._build_trophies_set(
@@ -952,10 +1010,17 @@ class DealerAchievementService:
         running_streak = 0
 
         for rfq in rfqs_sorted:
+            asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
+            if not asgn:
+                continue
+
             dt_str = str(rfq.window_end or rfq.created_at).split('.')[0]
             if rfq.type == 'TBILL':
+                tbill_base = (getattr(asgn, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                if tbill_base != 'execution':
+                    continue
+
                 qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
-                asgn = next((a for a in assignments if a.rfq_id == rfq.id), None)
                 is_won = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
                 is_lost = bool(qa and qa.winner_quotation_bank_id and asgn and asgn.quotation_bank and qa.winner_quotation_bank_id != asgn.quotation_bank.id and rfq.status in ('COMPLETED', 'CLOSED'))
 
@@ -971,34 +1036,65 @@ class DealerAchievementService:
                     badge = "COMPETITOR_WIN"
                 else:
                     transition = "Preserved"
-                    reason = f"Tender {rfq.status} with no award (Neutral)"
+                    reason = f"Tender {rfq.status} with no award (Neutral Wash)"
                     badge = "WASH"
             else:
-                exec_legs = [l for l in getattr(rfq, 'legs', []) if (getattr(l, 'quotation_base', None) or 'Execution').lower() == 'execution']
-                if not exec_legs:
+                legs = getattr(rfq, 'legs', [])
+                eligible_exec_legs = []
+                if legs:
+                    for l in legs:
+                        leg_cfg = asgn.get_config_for_leg(l.id) if hasattr(asgn, 'get_config_for_leg') else None
+                        is_invited = getattr(leg_cfg, 'is_invited', True) if leg_cfg else True
+                        leg_base = (getattr(leg_cfg, 'quotation_base', None) or getattr(asgn, 'quotation_base', None) or getattr(l, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                        if is_invited and leg_base == 'execution':
+                            eligible_exec_legs.append(l)
+                else:
+                    rfq_base = (getattr(asgn, 'quotation_base', None) or getattr(rfq, 'quotation_base', None) or 'Execution').strip().lower()
+                    if rfq_base == 'execution':
+                        eligible_exec_legs.append(rfq)
+
+                if not eligible_exec_legs:
+                    # Bank was not invited to any execution legs in this tender (e.g. Indicative or Invisible only)
                     continue
 
-                bank_won_all = all(
-                    getattr(l, 'winner_bank_id', None) == bank_id and getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED')
-                    for l in exec_legs
-                ) and len(exec_legs) > 0 and rfq.status in ('COMPLETED', 'ACCEPTED')
+                awarded_legs = [
+                    l for l in eligible_exec_legs
+                    if (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) and
+                    getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED', 'INCONCLUSIVE', 'EXPIRED')
+                ]
 
                 competitor_won_any = any(
-                    getattr(l, 'winner_bank_id', None) and getattr(l, 'winner_bank_id', None) != bank_id
-                    for l in exec_legs
+                    (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) != bank_id
+                    for l in awarded_legs
                 )
-                deal_concluded = rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED')
 
-                if bank_won_all:
-                    running_streak += 1
-                    transition = "+1 (Won)"
-                    reason = f"Clean Sweep: Won all {len(exec_legs)} execution leg(s)"
-                    badge = "CLEAN_SWEEP"
-                elif competitor_won_any or (deal_concluded and not bank_won_all):
+                if competitor_won_any:
                     running_streak = 0
                     transition = "Reset to 0"
                     reason = "Competitor bank awarded one or more execution legs"
                     badge = "COMPETITOR_WIN"
+                elif awarded_legs and rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED'):
+                    bank_won_all_awarded = all(
+                        (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) == bank_id
+                        for l in awarded_legs
+                    )
+                    if bank_won_all_awarded:
+                        running_streak += 1
+                        transition = "+1 (Won)"
+                        if len(awarded_legs) == len(eligible_exec_legs):
+                            reason = f"Clean Sweep: Won all {len(awarded_legs)} execution leg(s)"
+                        else:
+                            reason = f"Won all {len(awarded_legs)} awarded execution leg(s) ({len(eligible_exec_legs) - len(awarded_legs)} non-awarded/rejected by client)"
+                        badge = "CLEAN_SWEEP"
+                    elif rfq.status in ('COMPLETED', 'ACCEPTED', 'CLOSED'):
+                        running_streak = 0
+                        transition = "Reset to 0"
+                        reason = "Awarded execution leg not won by this bank"
+                        badge = "COMPETITOR_WIN"
+                    else:
+                        transition = "Preserved"
+                        reason = f"Tender {rfq.status} (Neutral Wash)"
+                        badge = "WASH"
                 else:
                     transition = "Preserved"
                     reason = f"Tender {rfq.status} with no executed trade (Neutral Wash)"

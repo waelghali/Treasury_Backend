@@ -388,7 +388,26 @@ def get_active_deal_awaiting_acceptance(
     now_utc = datetime.now(timezone.utc)
     recent_cutoff = now_utc - timedelta(hours=2)
 
-    # Only look for RFQs that are actually in an active evaluation/pending acceptance state
+    from app.api.v1.endpoints.quotations_endpoints import compute_rfq_standings
+
+    # Proactively evaluate newly closed RFQs whose quotation window ended within the last 5 minutes
+    # so the corporate acceptance modal triggers immediately with 0 latency
+    uncomputed_query = db.query(QuotationRequest).filter(
+        QuotationRequest.status.in_(['OPEN', 'PENDING', 'EVALUATING']),
+        QuotationRequest.acceptance_status.is_(None),
+        QuotationRequest.window_end <= now_utc,
+        QuotationRequest.window_end >= now_utc - timedelta(minutes=5)
+    )
+    if user_role != "super_admin":
+        uncomputed_query = uncomputed_query.filter(QuotationRequest.customer_id == customer_id)
+
+    for unc in uncomputed_query.all():
+        try:
+            compute_rfq_standings(unc, db)
+        except Exception as e:
+            logger.warning(f"Error proactively computing standings for closed RFQ {unc.id}: {e}")
+
+    # Query for RFQs currently in active acceptance period
     query = db.query(QuotationRequest).filter(
         QuotationRequest.status.notin_(['CANCELLED', 'DRAFT', 'REJECTED']),
         QuotationRequest.acceptance_status == 'PENDING'
@@ -407,7 +426,6 @@ def get_active_deal_awaiting_acceptance(
         return {"has_pending_deal": False, "deal": None, "total_pending": 0}
 
     is_admin = user_role in ["corporate_admin", "super_admin"]
-    from app.api.v1.endpoints.quotations_endpoints import compute_rfq_standings
 
     urgent_deals = []
 
@@ -495,7 +513,7 @@ def get_active_deal_awaiting_acceptance(
 
         root_offers = _sanitize_offers_ladder(
             standings.get("results", []),
-            standings.get("winner_bank_id") or rfq.winner_bank_id,
+            standings.get("winner_bank_id") or getattr(rfq, 'winner_bank_id', None),
             is_sell=((rfq.direction or "Buy").lower() == "sell")
         )
 

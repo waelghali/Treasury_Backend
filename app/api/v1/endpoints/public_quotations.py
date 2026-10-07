@@ -193,40 +193,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
 
     effective_base = (assignment.quotation_base or rfq.quotation_base or 'Execution').lower()
 
-    parsed_docs = []
-    # Indicative RFQs never share documents, and document visibility flag is respected.
-    # If release_docs_to_winner_only is active, documents are strictly withheld during the bidding window.
-    if (
-        effective_base != 'indicative' 
-        and (assignment.is_document_visible is not False) 
-        and rfq.document_path 
-        and not getattr(rfq, 'release_docs_to_winner_only', False)
-    ):
-        raw_docs = []
-        try:
-            import json
-            loaded = json.loads(rfq.document_path)
-            if isinstance(loaded, dict):
-                raw_docs = loaded.get("documents", [])
-            elif isinstance(loaded, list):
-                raw_docs = loaded
-            elif isinstance(loaded, str):
-                raw_docs = [{"name": os.path.basename(loaded), "path": loaded}]
-        except Exception:
-            raw_paths = [p.strip() for p in rfq.document_path.split(',') if p.strip()]
-            raw_docs = [{"name": os.path.basename(p), "path": p} for p in raw_paths]
-
-        from app.core.ai_integration import generate_signed_gcs_url
-        for d in raw_docs:
-            p_str = d.get("path", "")
-            if p_str.startswith("gs://"):
-                try:
-                    signed_url = await generate_signed_gcs_url(p_str, expiration=604800)
-                    p_str = signed_url or p_str
-                except Exception:
-                    pass
-            parsed_docs.append({"name": d.get("name") or "Document", "path": p_str})
-
+    # Document resolution is evaluated after portal_legs are constructed to guarantee strict leg-level data isolation
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
 
     cbe_benchmark_rate = None
@@ -294,6 +261,8 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
                                else (rfq.allow_alternative_value_date or False)))
         cfg_base = (leg_cfg.quotation_base if leg_cfg and leg_cfg.quotation_base 
                     else (assignment.quotation_base or rfq.quotation_base or 'Execution'))
+        if str(cfg_base).strip().lower() in ('invisible', 'excluded', 'skipped'):
+            continue
         cfg_doc_vis = (leg_cfg.is_document_visible if leg_cfg and leg_cfg.is_document_visible is not None 
                        else (assignment.is_document_visible is not False))
         cfg_cost_pct = leg_cfg.cost_percent if leg_cfg else (assignment.cost_percent or 0.0)
@@ -369,8 +338,132 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             "offers": leg_offers_list,
             "cbe_benchmark_rate": leg_bm,
             "market_benchmark": leg_market_bm,
-            "live_rank": leg_rank_info
+            "live_rank": leg_rank_info,
+            "documents": []
         })
+
+    # Phase 9: Secure Leg-Scoped Document Filtering Engine
+    # Documents associated with invisible legs, uninvited legs, or legs with is_document_visible=False are strictly excluded.
+    # Indicative legs default to hidden, but intentional user override (is_document_visible=True) is honored.
+    # If release_docs_to_winner_only is active, all documents are withheld during the bidding window.
+    parsed_docs = []
+    is_winner_only = bool(getattr(rfq, 'release_docs_to_winner_only', False))
+    is_cross = bool(getattr(assignment, 'is_cross_entity', False))
+
+    if not is_winner_only and not is_cross and rfq.document_path and (assignment.is_document_visible is not False):
+        raw_docs = rfq.get_parsed_documents() if hasattr(rfq, 'get_parsed_documents') else []
+        if not raw_docs and rfq.document_path:
+            try:
+                import json
+                loaded = json.loads(rfq.document_path)
+                if isinstance(loaded, dict):
+                    raw_docs = loaded.get("documents", [])
+                elif isinstance(loaded, list):
+                    raw_docs = loaded
+                elif isinstance(loaded, str):
+                    raw_docs = [{"name": os.path.basename(loaded), "path": loaded}]
+            except Exception:
+                raw_paths = [p.strip() for p in rfq.document_path.split(',') if p.strip()]
+                raw_docs = [{"name": os.path.basename(p), "path": p} for p in raw_paths]
+
+        # Check if 0-based indexing was used in uploaded documents (frontend pIdx 0, 1...)
+        has_zero_indexed = any(d.get("leg_index") == 0 for d in raw_docs if d.get("leg_index") is not None)
+
+        visible_portal_legs_by_id = {}
+        visible_portal_legs_by_pair = {}
+        visible_portal_legs_by_idx = {}
+        any_leg_doc_visible = False
+
+        if portal_legs:
+            for pl in portal_legs:
+                pl_id = str(pl.get("id") or "").strip()
+                pl_pair = str(pl.get("currency_pair") or f"{pl.get('buy_currency')}/{pl.get('sell_currency')}").strip().upper()
+                pl_idx = pl.get("pair_order")  # 1-based index
+                visible_portal_legs_by_id[pl_id] = pl
+                visible_portal_legs_by_pair[pl_pair] = pl
+                if pl_idx is not None:
+                    visible_portal_legs_by_idx[pl_idx] = pl
+                if pl.get("is_document_visible") is True:
+                    any_leg_doc_visible = True
+        else:
+            any_leg_doc_visible = bool(assignment.is_document_visible is not False)
+
+        from app.core.ai_integration import generate_signed_gcs_url
+
+        for d in raw_docs:
+            d_idx = d.get("leg_index")
+            d_id = str(d.get("leg_id") or "").strip()
+            d_pair = str(d.get("pair") or "").strip().upper()
+
+            matched_portal_leg = None
+            is_leg_specific = False
+
+            if portal_legs:
+                # 1. Match by leg_id
+                if d_id and d_id in visible_portal_legs_by_id:
+                    matched_portal_leg = visible_portal_legs_by_id[d_id]
+                    is_leg_specific = True
+                elif d_id:
+                    is_leg_specific = True
+
+                # 2. Match by pair
+                if not matched_portal_leg and d_pair:
+                    is_leg_specific = True
+                    if d_pair in visible_portal_legs_by_pair:
+                        matched_portal_leg = visible_portal_legs_by_pair[d_pair]
+
+                # 3. Match by index
+                if not matched_portal_leg and d_idx is not None and not d_pair and not d_id:
+                    is_leg_specific = True
+                    target_idx = (d_idx + 1) if (has_zero_indexed and d_idx >= 0) else d_idx
+                    if target_idx in visible_portal_legs_by_idx:
+                        matched_portal_leg = visible_portal_legs_by_idx[target_idx]
+
+                if is_leg_specific:
+                    # Leg-specific: MUST be invited AND have document visibility enabled on this leg
+                    if not matched_portal_leg:
+                        # Leg is invisible or uninvited for this bank -> STRICT REDACTION
+                        continue
+                    if matched_portal_leg.get("is_document_visible") is not True:
+                        # User opted out or indicative default left unchecked -> STRICT REDACTION
+                        continue
+                else:
+                    # Global document: only visible if bank has at least one active invited leg with docs visible
+                    if not any_leg_doc_visible:
+                        continue
+            else:
+                if not any_leg_doc_visible:
+                    continue
+
+            p_str = d.get("path", "")
+            if p_str and str(p_str).startswith("gs://"):
+                try:
+                    signed_url = await generate_signed_gcs_url(p_str, expiration=604800)
+                    p_str = signed_url or p_str
+                except Exception:
+                    pass
+
+            doc_pair_label = (
+                matched_portal_leg.get("currency_pair")
+                if matched_portal_leg
+                else (d_pair or ("All Pairs" if portal_legs else (rfq.currency_pair if hasattr(rfq, 'currency_pair') else "Trade Document")))
+            )
+
+            parsed_docs.append({
+                "name": d.get("name") or "Document",
+                "path": p_str,
+                "pair": doc_pair_label,
+                "leg_id": matched_portal_leg.get("id") if matched_portal_leg else d_id,
+                "leg_index": d_idx
+            })
+
+        # Inject leg-scoped documents directly into each portal_leg
+        for pl in portal_legs:
+            pl_pair = pl.get("currency_pair")
+            pl["documents"] = [
+                doc for doc in parsed_docs
+                if doc.get("pair") == pl_pair or doc.get("pair") == "All Pairs"
+            ]
 
     # Acceptance timeout countdown configured by Corporate Admin (default: 120s for TBILL, 30s for FX_SPOT)
     acceptance_timeout_seconds = 120 if rfq.type == "TBILL" else 30
@@ -451,7 +544,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "has_execution_legs": has_exec_leg,
         "is_all_indicative": not has_exec_leg,
         "has_execution_dealers": any(c.get("role") == "EXECUTION" for c in (_get_bank_contacts_list(q_bank) if q_bank else [])),
-        "document_path": rfq.document_path if (has_exec_leg and assignment.is_document_visible is not False and not getattr(rfq, 'release_docs_to_winner_only', False)) else None,
+        "document_path": rfq.document_path if (parsed_docs and len(parsed_docs) > 0) else None,
         "documents": parsed_docs,
         "status": rfq.status,
         "comments_to_banks": rfq.comments_to_banks,
@@ -1219,14 +1312,20 @@ def submit_fx_offer(
     # Determine target leg
     target_leg_id = offer_in.leg_id
     if not target_leg_id and rfq.legs:
-        target_leg_id = rfq.legs[0].id
+        # Find the leg the counterparty was invited to if excluded from other legs
+        invited_legs = [
+            l for l in rfq.legs
+            if getattr(assignment.get_config_for_leg(l.id), 'is_invited', True) is not False
+        ]
+        target_leg_id = invited_legs[0].id if invited_legs else rfq.legs[0].id
 
     # Retrieve leg-specific or assignment config for value date
     leg_cfg = assignment.get_config_for_leg(target_leg_id) if target_leg_id else None
     if leg_cfg and getattr(leg_cfg, 'is_invited', True) is False:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your institution is not invited to participate in this currency leg.")
     if leg_cfg and getattr(leg_cfg, 'is_passed', False):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot submit quote on a passed leg.")
+        # Reset pass flag since dealer is now actively submitting a firm price quote for this leg
+        leg_cfg.is_passed = False
 
     if leg_cfg and leg_cfg.value_date:
         effective_target_value_date = leg_cfg.value_date
@@ -1435,8 +1534,11 @@ def submit_fx_offers_batch(
         leg_cfg = assignment.get_config_for_leg(item.leg_id) if item.leg_id else None
         if leg_cfg and getattr(leg_cfg, 'is_invited', True) is False:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your institution is not invited to participate in one or more selected legs.")
+        if payload.passed_legs and item.leg_id in payload.passed_legs:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot submit a quote and pass on the same currency leg simultaneously.")
         if leg_cfg and getattr(leg_cfg, 'is_passed', False):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot submit quote on a passed leg.")
+            # Reset pass flag since dealer is actively submitting a firm price quote for this leg
+            leg_cfg.is_passed = False
         eff_target_val_date = (leg_cfg.value_date if leg_cfg and leg_cfg.value_date 
                                else (assignment.value_date or rfq.value_date))
         is_alt_allowed = (leg_cfg.allow_alternative_value_date if leg_cfg and leg_cfg.allow_alternative_value_date is not None
@@ -1590,6 +1692,7 @@ def submit_fx_offers_batch(
     )
     db.commit()
 
+    passed_leg_ids = [str(x) for x in (payload.passed_legs or [])]
     if submitted_offers:
         best_price = submitted_offers[0].price
         legs_payload = {
@@ -1604,7 +1707,16 @@ def submit_fx_offers_batch(
             assignment.id,
             submitted_by or "Dealer",
             best_price,
-            legs_quotes=legs_payload
+            legs_quotes=legs_payload,
+            passed_legs=passed_leg_ids
+        )
+    elif passed_leg_ids:
+        desk_session_service.record_quote_submission(
+            assignment.id,
+            submitted_by or "Dealer",
+            None,
+            legs_quotes={},
+            passed_legs=passed_leg_ids
         )
 
     return {
@@ -2322,6 +2434,7 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
         if legs_data and (len(legs_data) > 1 or len(raw_legs_data) > 1):
             won_legs = []
             lost_legs = []
+            passed_legs = []
             inconclusive_legs = []
             indicative_legs = []
             legs_breakdown = {}
@@ -2334,7 +2447,15 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 l_inconclusive = l.get("is_inconclusive", False)
                 l_status = (l.get("status") or "").upper()
 
-                if leg_base == "indicative":
+                # Check if this bank passed/declined quoting on this specific leg
+                cfg = assignment.get_config_for_leg(leg_id)
+                is_bank_passed = bool(cfg and getattr(cfg, 'is_passed', False))
+
+                if is_bank_passed:
+                    passed_legs.append(l)
+                    leg_status = "PASSED"
+                    is_leg_win = False
+                elif leg_base == "indicative":
                     indicative_legs.append(l)
                     leg_status = "INDICATIVE"
                     is_leg_win = False
@@ -2363,7 +2484,8 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                     "quotation_base": l.get("quotation_base", "Execution"),
                     "is_winner": is_leg_win,
                     "won": is_leg_win,
-                    "status": "WINNER" if is_leg_win else ("NOT_SELECTED" if leg_status in ("LOST", "NOT_SELECTED") else leg_status),
+                    "is_passed": is_bank_passed,
+                    "status": "PASSED" if is_bank_passed else ("WINNER" if is_leg_win else ("NOT_SELECTED" if leg_status in ("LOST", "NOT_SELECTED") else leg_status)),
                     "raw_status": leg_status,
                     "winner_rate": l.get("winner_rate") if is_leg_win else None
                 }
@@ -2379,7 +2501,7 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 overall_status = "WINNER"
             elif len(won_legs) > 0:
                 overall_status = "PARTIALLY_WON"
-            elif len(won_legs) == 0 and len(lost_legs) > 0:
+            elif len(won_legs) == 0 and (len(lost_legs) > 0 or len(passed_legs) > 0):
                 overall_status = "NOT_SELECTED"
             elif len(indicative_legs) == len(legs_data):
                 overall_status = "INDICATIVE_ONLY"
@@ -2421,11 +2543,25 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 seen_paths = set()
                 from app.core.ai_integration import generate_signed_gcs_url
                 for wl in won_legs:
+                    wl_base = str(wl.get("quotation_base") or "").lower()
+                    # Security safeguard: documents are ONLY unsealed for executed, binding legs
+                    if wl_base == "indicative":
+                        continue
                     wl_idx = wl.get("leg_index")
                     wl_id = str(wl.get("leg_id") or "")
                     wl_pair = wl.get("currency_pair") or f"{wl.get('buy_currency')}/{wl.get('sell_currency')}"
+                    
+                    leg_cfg = assignment.get_config_for_leg(wl_id) if hasattr(assignment, 'get_config_for_leg') else None
+                    leg_doc_vis = leg_cfg.is_document_visible if (leg_cfg and leg_cfg.is_document_visible is not None) else (assignment.is_document_visible is not False)
+                    # If not winner-only release and document visibility was explicitly disabled by user, do not release
+                    if not getattr(rfq, 'release_docs_to_winner_only', False) and not leg_doc_vis:
+                        continue
                     leg_docs = rfq.get_documents_for_leg(leg_index=wl_idx, leg_id=wl_id, pair=wl_pair)
                     for d in leg_docs:
+                        d_pair = d.get("pair")
+                        # Strict check: If doc has a pair, it MUST match the won leg's pair!
+                        if d_pair and d_pair.strip().upper() != wl_pair.strip().upper():
+                            continue
                         p_val = d.get("path")
                         if p_val and p_val not in seen_paths:
                             seen_paths.add(p_val)
@@ -2446,10 +2582,12 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 "status": overall_status,
                 "won_legs_count": len(won_legs),
                 "lost_legs_count": len(lost_legs),
+                "passed_legs_count": len(passed_legs),
                 "inconclusive_legs_count": len(inconclusive_legs),
                 "total_legs_count": len(legs_data),
                 "won_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in won_legs],
                 "lost_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in lost_legs],
+                "passed_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in passed_legs],
                 "inconclusive_pairs": [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in inconclusive_legs],
                 "legs_breakdown": legs_breakdown,
                 "receipt": receipt,
