@@ -854,15 +854,16 @@ async def get_historical_trades_blotter(
         # Summary trading attributes
         if is_multi_leg:
             valid_legs = [l for l in rfq.legs if not l.is_deleted]
-            summary_pair = ", ".join(l.currency_pair or f"{l.buy_currency}/{l.sell_currency}" for l in valid_legs[:2])
-            if len(valid_legs) > 2:
-                summary_pair += f" (+{len(valid_legs) - 2} more)"
-            summary_direction = valid_legs[0].direction or "BUY" if len(valid_legs) == 1 else "PACKAGE"
+            distinct_pairs = list(dict.fromkeys(l.currency_pair or f"{l.buy_currency}/{l.sell_currency}" for l in valid_legs if (l.currency_pair or (l.buy_currency and l.sell_currency))))
+            summary_pair = " & ".join(distinct_pairs) if distinct_pairs else "Multi-Leg"
+            summary_direction = "PACKAGE"
             summary_amount = sum(float(l.amount or 0) for l in valid_legs)
-            summary_currency = valid_legs[0].buy_currency or "USD"
+            distinct_currencies = list(dict.fromkeys(l.buy_currency for l in valid_legs if l.buy_currency))
+            summary_currency = "/".join(distinct_currencies) if distinct_currencies else "USD"
             summary_value_date = valid_legs[0].value_date or "Spot (T+2)"
         else:
-            summary_pair = f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")
+            distinct_pairs = [f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")]
+            summary_pair = distinct_pairs[0]
             summary_direction = rfq.direction or "BUY"
             summary_amount = float(rfq.amount or 0)
             summary_currency = rfq.buy_currency or "USD"
@@ -899,7 +900,7 @@ async def get_historical_trades_blotter(
         winning_bank_name = None
 
         if is_multi_leg:
-            for leg in rfq.legs:
+            for idx, leg in enumerate(rfq.legs, 1):
                 if leg.is_deleted:
                     continue
                 pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
@@ -910,6 +911,7 @@ async def get_historical_trades_blotter(
                 leg_win_rate = float(leg.winner_rate or leg.eval_rate or 0) if (leg.winner_rate or leg.eval_rate) else None
                 
                 leg_data = {
+                    "leg_index": idx,
                     "leg_id": str(leg.id),
                     "pair": pair_str,
                     "direction": leg.direction or "BUY",
@@ -918,12 +920,15 @@ async def get_historical_trades_blotter(
                     "value_date": leg.value_date or "Spot (T+2)",
                     "my_rate": my_leg_rate,
                     "winning_rate": leg_win_rate,
-                    "is_won": leg_is_won
+                    "winning_bank_name": (current_dealer.bank.name if current_dealer.bank else "This Bank") if leg_is_won else leg.winner_bank_name,
+                    "is_won": leg_is_won,
+                    "status": "WON" if leg_is_won else ("LOST" if leg.winner_bank_id else "UNAWARDED")
                 }
                 all_legs_detail.append(leg_data)
                 
                 if leg_is_won:
                     won_legs.append({
+                        "leg_index": idx,
                         "leg_id": str(leg.id),
                         "pair": pair_str,
                         "direction": leg.direction or "BUY",
@@ -935,7 +940,7 @@ async def get_historical_trades_blotter(
 
             is_won = len(won_legs) > 0
             is_clean_sweep = is_won and (len(won_legs) == len(all_legs_detail))
-            outcome_badge = "WON_CLEAN_SWEEP" if is_clean_sweep else ("WON_PARTIAL" if is_won else ("CANCELLED" if rfq.status in ["CANCELLED", "INCONCLUSIVE"] else ("EXPIRED" if rfq.status == "EXPIRED" else ("UNQUOTED" if not has_quoted else "LOST"))))
+            outcome_badge = "WON_CLEAN_SWEEP" if is_clean_sweep else (f"WON_{len(won_legs)}_OF_{len(all_legs_detail)}" if is_won else ("CANCELLED" if rfq.status in ["CANCELLED", "INCONCLUSIVE"] else ("EXPIRED" if rfq.status == "EXPIRED" else ("UNQUOTED" if not has_quoted else "LOST"))))
             winning_rate = won_legs[0]["rate"] if won_legs else (all_legs_detail[0]["winning_rate"] if all_legs_detail else None)
         else:
             # Single-leg RFQ
@@ -1081,3 +1086,32 @@ async def claim_rfq_desk_lock(
         "success": True,
         "desk_status": status_data
     }
+
+
+@router.get("/achievements")
+async def get_dealer_desk_achievements(
+    current_dealer: QuotationBankDealer = Depends(get_current_dealer),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns authentic institutional trophies, streaks, and gamification tiers
+    for the authenticated bank trader and their institution's trading desk.
+    """
+    from app.services.dealer_achievement_service import dealer_achievement_service
+
+    bank_id = current_dealer.bank_id
+    bank_name = current_dealer.bank.name if current_dealer.bank else "Partner Bank"
+
+    achievements = dealer_achievement_service.get_dealer_achievements(
+        db,
+        dealer_email=current_dealer.email,
+        bank_id=bank_id,
+        bank_name=bank_name,
+        include_bank_desk=True
+    )
+
+    return {
+        "success": True,
+        "achievements": achievements
+    }
+
