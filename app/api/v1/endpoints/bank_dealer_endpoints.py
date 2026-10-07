@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, cast, Text, String
 
 from app.database import get_db
 from app.models.models import Bank
@@ -175,7 +175,7 @@ async def initiate_dealer_enrollment(
             q_bank = db.query(QuotationBank).filter(
                 or_(
                     func.lower(QuotationBank.emails).like(f"%{clean_email}%"),
-                    func.cast(QuotationBank.contacts, func.Text).like(f"%{clean_email}%")
+                    cast(QuotationBank.contacts, Text).like(f"%{clean_email}%")
                 ),
                 QuotationBank.is_deleted == False
             ).first()
