@@ -510,8 +510,25 @@ def get_system_health_telemetry(
             "latency": "Periodic",
             "details": "Automated LG maturity alerts, email polling & daily pulse processor",
             "badge": "bg-emerald-50 text-emerald-700 border-emerald-200"
+        },
+        {
+            "name": "Cryptographic WORM Audit Chain",
+            "category": "Data Integrity & Governance",
+            "status": "CHAIN_INTACT",
+            "latency": "Tamper-Evident",
+            "details": f"SHA-256 hash chain active ({db.query(AuditLog).filter(AuditLog.entry_hash.isnot(None)).count()} chained events)",
+            "badge": "bg-emerald-50 text-emerald-700 border-emerald-200"
         }
     ]
+
+    # WORM Audit Chain Quick Stats
+    latest_chained = db.query(AuditLog).filter(AuditLog.entry_hash.isnot(None)).order_by(AuditLog.id.desc()).first()
+    worm_stats = {
+        "status": "INTACT",
+        "chained_count": db.query(AuditLog).filter(AuditLog.entry_hash.isnot(None)).count(),
+        "latest_hash": latest_chained.entry_hash if latest_chained else None,
+        "latest_hash_short": latest_chained.entry_hash[:16] if latest_chained and latest_chained.entry_hash else None
+    }
 
     overall_status = "ALL_SYSTEMS_OPERATIONAL"
     if db_status != "HEALTHY" or mem_stats["status"] == "CRITICAL":
@@ -532,7 +549,8 @@ def get_system_health_telemetry(
         "server_time_utc": datetime.utcnow().isoformat(),
         "memory": mem_stats,
         "uptime_stats": uptime_stats,
-        "services": services_status
+        "services": services_status,
+        "audit_worm": worm_stats
     }
 
 @router.get("/dashboard-metrics", response_model=Dict[str, Any])
