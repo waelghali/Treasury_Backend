@@ -18,13 +18,14 @@
 10. [Workflow Governance, Dual Notifications & Performance Hardening (Completed)](#8-workflow-governance-maker-checker-dual-channel-notifications--real-time-performance-hardening-completed--verified-)
 11. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics (Completed & Verified)](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
 12. [The 3-Tier Progressive Zero-Knowledge Confidentiality Architecture](#10-the-3-tier-progressive-zero-knowledge-confidentiality-architecture)
+    - [10.4 Permanent Bank Dealer Access & Unified Multi-Customer Trading Desk](#104-permanent-bank-dealer-access--unified-multi-customer-trading-desk)
 13. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#11-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
 
 ---
 
 ## 1. Executive Summary & Vision
 
-The Grow Quotation Module is built to give Corporate Treasuries institutional-grade control, confidentiality, and data-driven counterparty allocation during FX Spot, Multi-Leg Portfolios, and T-Bill competitive tenders.
+The Grow Quotation Module is built to give Corporate Treasuries institutional-grade control, confidentialit and data-driven counterparty allocation during FX Spot, Multi-Leg Portfolios, and T-Bill competitive tenders.
 
 This roadmap consolidates all architectural designs, threat models, and feature specifications agreed upon to ensure continuity across development cycles.
 
@@ -1013,6 +1014,61 @@ Grow Treasury's architecture ensures that **parties can choose different tiers w
 
 ---
 
+### 10.4 Permanent Bank Dealer Access & Unified Multi-Customer Trading Desk
+
+To eliminate the operational friction of 24-hour expiring quote links and slow email OTP roundtrips for institutional bank traders, Grow Treasury introduces the **Permanent Bank Dealer Trading Desk**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    UNIFIED MULTI-CUSTOMER BANK DEALER PORTAL                    │
+│                                                                                 │
+│   Active Trader: Karim Fathy (@cibeg.com)   Bank: Commercial International Bank  │
+│   Auth: Enrolled via Microsoft Authenticator (RFC 6238 TOTP)   Session: Active   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ 📥 LIVE RFQ FEED (Across ALL Corporate Clients)                                  │
+│ ┌─────────────────┬──────────────────┬─────────────┬───────────┬──────────────┐ │
+│ │ Corporate Client│ Request Details  │ Value Date  │ Time Left │ Desk Action  │ │
+│ ├─────────────────┼──────────────────┼─────────────┼───────────┼──────────────┤ │
+│ │ Acme Corp       │ BUY 1.5M USD/EGP │ Spot (T+2)  │ 04m 12s   │ [Quote Now]  │ │
+│ │ Global Foods    │ BUY 500K EUR/USD │ Spot (T+2)  │ 11m 45s   │ [In Progress]│ │
+│ │ Delta Logistics │ SELL 2.0M SAR/EGP│ Tom (T+1)   │ 01m 20s   │ [Review]     │ │
+│ └─────────────────┴──────────────────┴─────────────┴───────────┴──────────────┘ │
+│                                                                                 │
+│ 📊 TRADING BLOTTER & WON EXECUTION ARCHIVE                                      │
+│ • Real-Time Desk Lock (Powered by desk_session_service.py)                      │
+│ • Instant Cryptographic Deal Execution Receipts (HMAC-SHA256)                   │
+│ • Dealer Achievement Metrics & Counterparty Volume Analytics                    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1. Lightweight Desk Identity (Zero Bank Matrix Overhead)
+- **No Complex Enterprise Trees**: Avoids heavy organizational hierarchies, subsidiary trees, or multi-department bureaucracy.
+- **Data Model**: A Bank Dealer is modeled simply as `(corporate_email, bank_id, full_name, totp_secret, is_active)`.
+- Counterparties map directly to the existing `QuotationBank` entities.
+
+#### 2. The 2-Factor Enrolment Handshake (Proof-of-Possession Ceremony)
+1. **Initial Access**: The dealer receives an invitation or accesses an active quotation link.
+2. **Gate 1 (Corporate Domain Proof)**: A single-use verification code is dispatched to their official `@bank.com` corporate email using `save_copy=False` (SendOnly).
+3. **Gate 2 (Authenticator App Binding)**:
+   - Upon entering the email code, the portal generates a cryptographically random TOTP secret (RFC 6238) and presents a one-time QR code.
+   - The dealer scans the QR code using **Microsoft Authenticator** or Google Authenticator on their physical corporate smartphone.
+4. **Cryptographic Handshake Proof**:
+   - The dealer must read and enter the active 6-digit rolling code displayed on their phone.
+   - The server validates the code against the generated secret before permanently activating the account (`is_totp_enrolled = True`).
+   - This proves the physical corporate phone is directly tethered to the verified bank email address.
+
+#### 3. Day 1+ Instant Login Experience
+- Dealer navigates directly to `treasury.grow.com/dealer`.
+- Authenticates in **3 seconds** using their password and 6-digit Microsoft Authenticator code.
+- **Zero dependency on bank email servers, junk filters, or link expirations.**
+
+#### 4. Unified Multi-Customer Trading Blotter
+- **Cross-Customer Quoting**: All RFQs dispatched to that bank across all corporate customers appear in a single, real-time feed.
+- **Real-Time Concurrency Lock**: Integrates with [desk_session_service.py](file:///c:/Grow/app/services/desk_session_service.py) to prevent desk colleagues from colliding or overwriting quotes.
+- **Institutional Archival**: Full history of won, lost, and passed quotes with instant cryptographic deal receipts and analytics.
+
+---
+
 ## 11. Master Implementation Status: What We Have vs. What Still Needs to Be Done
 
 This matrix serves as the authoritative ground truth comparing active production code against upcoming deliverables:
@@ -1029,8 +1085,9 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Zero-Knowledge (Tier 1)** | 256-bit AES-GCM Envelope Encryption (DEK/KEK) | ✅ **Completed & Verified** | `security_crypto.py`, `tenant_key_service.py`, `quotation_tenant_keys` table | 18 of 18 backend tests passing with 100% success. |
 | **Zero-Knowledge (Tier 1)** | Dual-Read Resolver for FX Spot & T-Bills | ✅ **Completed & Verified** | `tenant_key_service.py:resolve_offer_price` | Resolves ciphertext; backwards compatible with legacy deals. |
 | **Zero-Knowledge (Tier 1)** | Cryptographic Salted OTPs (HMAC-SHA256) | ✅ **Completed & Verified** | `otp_security.py:hash_otp_code`, `quotation_access_otps` table | Zero plaintext OTP codes stored in database. |
-| **Zero-Knowledge (Tier 1)** | Non-Repudiation Scoped Deal Receipts | ✅ **Completed & Verified** | `otp_security.py:generate_scoped_deal_receipt`, `QuotationBankOfferPage.js` | Digital signature verification badge active. |
-| **Zero-Knowledge (Tier 1)** | **Zero-Touch Onboarding & Private Activation UI** | ✅ **Completed & Verified** | Backend: `customer_onboarding_service.py`, `system_owner.py`<br>Frontend: `CustomerOnboardingForm.js`, `CustomerDetailsPage.js`, `ResetPasswordPage.js`<br>Tests: `test_zero_touch_onboarding.py` | Fully operational. Passwords omitted by default; single-use 24h tokens dispatched with SendOnly (`save_copy=False`). Includes UI toggle for manual testing fallback and 1-click Resend Invitation button. |
+| **Zero-Knowledge (Tier 1)** | Non-Repudiation Scoped Deal Receipts | ✅ **Completed & Verified** | `otp_security.py:generate_scoped_deal_receipt`, `QuotationBankOfferPage.js` | Digital signature verification badge active on-screen & in deal award emails. |
+| **Zero-Knowledge (Tier 1)** | **Zero-Touch Onboarding & Activation Link UI** | ✅ **Completed & Verified** | `customer_onboarding_service.py`, `CustomerOnboardingForm.js`, `CustomerDetailsPage.js`, `ResetPasswordPage.js` | **Fully Verified & Operational**: System Owner is 100% blind to passwords at creation & edit. Private activation links dispatched with `save_copy=False` (SendOnly). 1-click resend active. |
+| **Dealer Experience** | **Permanent Bank Dealer Access & Multi-Customer Portal** | 🔵 **Architected & Queued** | `QUOTATION_SYSTEM_ROADMAP.md` (Sec 10.4), `desk_session_service.py` | Add TOTP enrolment endpoints, dealer login route, and multi-customer live blotter UI. |
 | **Enterprise BYOK (Tier 3)** | Cloud KMS Hardware Security Plug-in | 🟡 **Interface Ready, Provider Pending** | `security_crypto.py:CloudKmsKeyProvider` (Abstract interface) | Connect Google Cloud KMS / AWS KMS client library and add IAM configuration modal in Corporate Admin settings. |
 | **Host-Blind Vault (Tier 2)** | Client-Side WebCrypto Bidding Engine | 🔵 **Architected, Implementation Queued** | `QUOTATION_SYSTEM_ROADMAP.md` (Design specifications) | Implement browser WebCrypto keypair generation hook and dealer-side public-key encryption in `QuotationBankOfferPage.js`. |
 | **Enterprise Governance** | 4-Eyes Dual Approval for Counterparties (Phase 5) | 🔵 **Queued (Phase 5)** | Design specifications in Phase 2.5 & Phase 5 | Corporate Officer requires secondary approver before activating newly added bank trading desks. |
