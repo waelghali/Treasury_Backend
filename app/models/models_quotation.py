@@ -637,3 +637,59 @@ class QuotationDealerFeedback(Base):
         }
 
 
+class QuotationBankDealer(BaseModel):
+    """
+    Permanent Bank Dealer user entity for institutional multi-customer quotation desk access.
+    Enables unified multi-customer RFQ participation without expiring link dependency, secured by
+    RFC 6238 TOTP dual-factor authentication (Microsoft Authenticator / Google Authenticator).
+    """
+    __tablename__ = "quotation_bank_dealers"
+
+    bank_id = Column(Integer, ForeignKey("banks.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False, comment="Official corporate bank email (@bank.com)")
+    full_name = Column(String(255), nullable=False)
+    phone_number = Column(String(50), nullable=True)
+    title = Column(String(100), nullable=True, comment="e.g. Senior FX Dealer, Head of Treasury Sales")
+    role = Column(String(50), default="EXECUTION", nullable=False, comment="'EXECUTION', 'APPROVER', or 'VIEW_ONLY'")
+
+    hashed_password = Column(String(255), nullable=True)
+    totp_secret = Column(String(128), nullable=True, comment="Base32 RFC 6238 secret key for Microsoft/Google Authenticator")
+    is_totp_enrolled = Column(Boolean, default=False, nullable=False)
+
+    is_active = Column(Boolean, default=True, nullable=False)
+    email_verified_at = Column(DateTime(timezone=True), nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    failed_login_attempts = Column(Integer, default=0, nullable=False)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
+
+    # Staging fields for 2-Factor Enrolment Handshake
+    pending_email_otp = Column(String(64), nullable=True, comment="HMAC-SHA256 hashed 6-digit email verification code")
+    pending_email_otp_expires_at = Column(DateTime(timezone=True), nullable=True)
+    pending_otp_failed_attempts = Column(Integer, default=0, nullable=False)
+    enrollment_token = Column(String(255), unique=True, nullable=True, index=True, comment="Gate 1 to Gate 2 cryptographic handover token")
+    enrollment_token_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    bank = relationship("Bank")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "bank_id": self.bank_id,
+            "bank_name": self.bank.name if self.bank else None,
+            "bank_short_name": getattr(self.bank, 'short_name', None) if self.bank else None,
+            "email": self.email,
+            "full_name": self.full_name,
+            "phone_number": self.phone_number,
+            "title": self.title,
+            "role": self.role,
+            "is_totp_enrolled": bool(self.is_totp_enrolled),
+            "is_active": bool(self.is_active),
+            "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# Aliases for convenience
+BankDealerUser = QuotationBankDealer
+
+

@@ -140,7 +140,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     from app.api.v1.endpoints import (
         system_owner, corporate_admin, end_user, migration, 
         public, public_issuance, reports, facility_endpoints,
-        quotations_endpoints, public_quotations, reconciliation_endpoints,
+        quotations_endpoints, public_quotations, bank_dealer_endpoints, reconciliation_endpoints,
         notification_endpoints, ai_query_assistant, user_feedback,
         inbox_endpoints, system_holidays_endpoints, campaign_endpoints
     )
@@ -290,6 +290,11 @@ def configure_app_instance(fastapi_app: FastAPI):
         prefix="/api/v1/public-quotation", 
         tags=["Public Quotation Webhooks"]
         # Intentionally leaving out the dependency here so bank callbacks still function in background for existing records
+    )
+    fastapi_app.include_router(
+        bank_dealer_endpoints.router,
+        prefix="/api/v1/bank-dealer",
+        tags=["Bank Dealer Permanent Portal"]
     )
     fastapi_app.include_router(
         reconciliation_endpoints.router, 
