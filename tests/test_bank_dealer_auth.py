@@ -229,6 +229,32 @@ def test_dealer_enrollment_full_handshake_flow():
         assert me_data["dealer"]["bank_name"] == cib.name
         assert me_data["dealer"]["is_totp_enrolled"] is True
 
+        # -------------------------------------------------------------
+        # 8. Unified Live RFQ Blotter Feed
+        # -------------------------------------------------------------
+        blotter_res = client.get(
+            "/api/v1/bank-dealer/blotter/live-rfqs",
+            headers={"Authorization": f"Bearer {session_token}"}
+        )
+        assert blotter_res.status_code == 200, blotter_res.text
+        b_data = blotter_res.json()
+        assert b_data["success"] is True
+        assert "tickets" in b_data
+        assert "total_active_rfqs" in b_data
+
+        # -------------------------------------------------------------
+        # 9. Historical Won Trades Blotter & Cryptographic Receipts
+        # -------------------------------------------------------------
+        history_res = client.get(
+            "/api/v1/bank-dealer/blotter/history",
+            headers={"Authorization": f"Bearer {session_token}"}
+        )
+        assert history_res.status_code == 200, history_res.text
+        h_data = history_res.json()
+        assert h_data["success"] is True
+        assert "records" in h_data
+        assert "total_deals" in h_data
+
     finally:
         # Cleanup
         db.query(QuotationBankDealer).filter(QuotationBankDealer.email == test_email).delete()

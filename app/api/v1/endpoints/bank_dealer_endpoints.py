@@ -612,3 +612,354 @@ async def get_dealer_profile(
         "success": True,
         "dealer": current_dealer.to_dict()
     }
+
+
+# ==============================================================================
+# UNIFIED MULTI-CUSTOMER TRADING BLOTTER ENDPOINTS
+# ==============================================================================
+
+class ClaimDeskRequest(BaseModel):
+    assignment_id: str = Field(..., description="Assignment UUID of the target RFQ desk")
+
+
+@router.get("/blotter/live-rfqs")
+async def get_live_rfq_blotter(
+    current_dealer: QuotationBankDealer = Depends(get_current_dealer),
+    db: Session = Depends(get_db)
+):
+    """
+    Unified Multi-Customer Live RFQ Blotter:
+    Returns all live, open, and upcoming tenders dispatched to the dealer's bank
+    across ALL corporate clients on the platform.
+    Features:
+    - Real-time countdowns & urgency sorting
+    - Desk concurrency lock awareness (desk_session_service)
+    - Multi-leg privacy filtering (invisible legs cleanly hidden)
+    - Quoted / Passed state tracking
+    """
+    from app.models.models_quotation import (
+        QuotationBankAssignment, QuotationRequest, QuotationLeg,
+        QuotationOffer, QuotationTBillOffer, QuotationBankLegConfig
+    )
+    from app.services.desk_session_service import desk_session_service
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Query all active assignments for the dealer's bank
+    assignments = db.query(QuotationBankAssignment).join(
+        QuotationBank, QuotationBankAssignment.quotation_bank_id == QuotationBank.id
+    ).join(
+        QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
+    ).filter(
+        QuotationBank.bank_id == current_dealer.bank_id,
+        QuotationRequest.is_deleted == False,
+        QuotationRequest.status.in_(["OPEN", "EVALUATING", "PENDING"])
+    ).all()
+
+    live_tickets = []
+
+    for asgn in assignments:
+        rfq = asgn.rfq
+        if not rfq:
+            continue
+
+        w_start = rfq.window_start.replace(tzinfo=timezone.utc) if (rfq.window_start and rfq.window_start.tzinfo is None) else rfq.window_start
+        w_end = rfq.window_end.replace(tzinfo=timezone.utc) if (rfq.window_end and rfq.window_end.tzinfo is None) else rfq.window_end
+
+        # Token validity cutoff
+        validity_hours = getattr(rfq, 'token_validity_hours', 24) or 24
+        cutoff = w_end + timedelta(hours=validity_hours) if w_end else None
+        if cutoff and now_utc > cutoff:
+            continue
+
+        # Status categorization
+        if w_start and now_utc < w_start:
+            timing_status = "SCHEDULED"
+            sec_remaining = max(0, int((w_start - now_utc).total_seconds()))
+        elif w_end and now_utc <= w_end:
+            timing_status = "LIVE_OPEN"
+            sec_remaining = max(0, int((w_end - now_utc).total_seconds()))
+        else:
+            timing_status = "EVALUATING"
+            sec_remaining = 0
+
+        # Multi-leg vs Single-leg inspection
+        is_multi_leg = bool(getattr(rfq, 'legs', None) and len(rfq.legs) > 0)
+        visible_legs = []
+
+        if is_multi_leg:
+            for leg in rfq.legs:
+                l_id = str(leg.id)
+                cfg = asgn.get_config_for_leg(l_id) if hasattr(asgn, 'get_config_for_leg') else None
+                # Privacy Shield: do not leak invisible legs to this bank
+                if cfg and cfg.is_invited is False:
+                    continue
+
+                # Check if this leg has been quoted or passed
+                leg_offer = next((o for o in asgn.offers if str(o.leg_id or '') == l_id and not o.is_deleted), None)
+                is_passed = bool(cfg and cfg.is_passed)
+
+                pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                visible_legs.append({
+                    "leg_id": l_id,
+                    "currency_pair": pair_str,
+                    "direction": leg.direction or "BUY",
+                    "amount": float(leg.amount or 0),
+                    "currency": leg.buy_currency,
+                    "value_date": getattr(cfg, 'value_date', None) or leg.value_date or "Spot (T+2)",
+                    "has_quote": leg_offer is not None,
+                    "is_passed": is_passed
+                })
+
+            if len(visible_legs) == 0:
+                # Bank was hidden from all legs
+                continue
+
+            summary_pair = f"Multi-Currency ({len(visible_legs)} Pairs)" if len(visible_legs) > 1 else visible_legs[0]["currency_pair"]
+            summary_amount = visible_legs[0]["amount"] if len(visible_legs) == 1 else sum(l["amount"] for l in visible_legs)
+            summary_direction = visible_legs[0]["direction"] if len(visible_legs) == 1 else "PACKAGE"
+            summary_value_date = visible_legs[0]["value_date"] if len(visible_legs) == 1 else "Mixed Value Dates"
+            all_quoted = all(l["has_quote"] or l["is_passed"] for l in visible_legs) and any(l["has_quote"] for l in visible_legs)
+            all_passed = all(l["is_passed"] for l in visible_legs)
+        else:
+            # Single-leg RFQ
+            is_tbill = (rfq.type or "FX_SPOT").upper() == "TBILL"
+            has_offer = False
+            if is_tbill:
+                has_offer = any(not o.is_deleted for o in asgn.tbill_offers)
+            else:
+                has_offer = any(not o.is_deleted for o in asgn.offers)
+
+            summary_pair = f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")
+            summary_amount = float(rfq.amount or 0)
+            summary_direction = rfq.direction or "BUY"
+            summary_value_date = rfq.value_date or "Spot (T+2)"
+            all_quoted = has_offer
+            all_passed = False
+
+        # Desk Concurrency Lock from desk_session_service
+        desk = desk_session_service._desks.get(asgn.id)
+        if desk and desk.active_trader_email:
+            now_check = datetime.now(timezone.utc)
+            desk.check_and_release_expired_lock(now_check)
+
+        if desk and desk.active_trader_email:
+            is_you = (desk.active_trader_email.strip().lower() == current_dealer.email.strip().lower())
+            desk_lock = {
+                "is_locked": True,
+                "locked_by_email": desk.active_trader_email,
+                "locked_by_name": desk.active_trader_name or desk.active_trader_email.split("@")[0],
+                "is_you": is_you,
+                "spectators_count": len(desk.spectators)
+            }
+        else:
+            desk_lock = {
+                "is_locked": False,
+                "locked_by_email": None,
+                "locked_by_name": None,
+                "is_you": False,
+                "spectators_count": 0
+            }
+
+        customer_name = rfq.customer.name if rfq.customer else "Corporate Client"
+        entity_name = rfq.entity.name if getattr(rfq, 'entity', None) else None
+
+        live_tickets.append({
+            "assignment_id": asgn.id,
+            "token": asgn.token,
+            "rfq_id": str(rfq.id),
+            "ref_no": rfq.ref_no,
+            "type": rfq.type or "FX_SPOT",
+            "quotation_base": rfq.quotation_base or "Execution",
+            "customer_name": customer_name,
+            "entity_name": entity_name,
+            "status": timing_status,
+            "window_start": w_start.isoformat() if w_start else None,
+            "window_end": w_end.isoformat() if w_end else None,
+            "seconds_remaining": sec_remaining,
+            "is_multi_leg": is_multi_leg,
+            "visible_legs_count": len(visible_legs) if is_multi_leg else 1,
+            "visible_legs": visible_legs,
+            "summary_pair": summary_pair,
+            "summary_amount": summary_amount,
+            "summary_direction": summary_direction,
+            "summary_value_date": summary_value_date,
+            "has_quoted": all_quoted,
+            "has_passed": all_passed,
+            "desk_lock": desk_lock,
+            "created_at": rfq.created_at.isoformat() if rfq.created_at else None
+        })
+
+    # Sort tickets: LIVE_OPEN first (by seconds_remaining asc), then SCHEDULED, then EVALUATING
+    def sort_key(t):
+        order = {"LIVE_OPEN": 0, "SCHEDULED": 1, "EVALUATING": 2}
+        return (order.get(t["status"], 3), t["seconds_remaining"] if t["status"] == "LIVE_OPEN" else -t["seconds_remaining"])
+
+    live_tickets.sort(key=sort_key)
+
+    return {
+        "success": True,
+        "bank_name": current_dealer.bank.name if current_dealer.bank else "Partner Bank",
+        "total_active_rfqs": len(live_tickets),
+        "live_open_count": sum(1 for t in live_tickets if t["status"] == "LIVE_OPEN"),
+        "scheduled_count": sum(1 for t in live_tickets if t["status"] == "SCHEDULED"),
+        "evaluating_count": sum(1 for t in live_tickets if t["status"] == "EVALUATING"),
+        "tickets": live_tickets
+    }
+
+
+@router.get("/blotter/history")
+async def get_historical_trades_blotter(
+    current_dealer: QuotationBankDealer = Depends(get_current_dealer),
+    db: Session = Depends(get_db)
+):
+    """
+    Historical Trades Blotter & Won Execution Archive:
+    Returns full history of concluded trades for the dealer's bank.
+    Includes:
+    - Won firm trades with HMAC-SHA256 Cryptographic Deal Execution Receipts
+    - Concluded rates, ticket amounts, and value dates
+    - Clean Sweep vs Partial execution breakdown
+    - Lost and passed historical records
+    """
+    from app.models.models_quotation import (
+        QuotationBankAssignment, QuotationRequest, QuotationLeg,
+        QuotationOffer, QuotationTBillOffer, QuotationAnalytics
+    )
+    from app.core.otp_security import generate_scoped_deal_receipt
+
+    assignments = db.query(QuotationBankAssignment).join(
+        QuotationBank, QuotationBankAssignment.quotation_bank_id == QuotationBank.id
+    ).join(
+        QuotationRequest, QuotationBankAssignment.rfq_id == QuotationRequest.id
+    ).filter(
+        QuotationBank.bank_id == current_dealer.bank_id,
+        QuotationRequest.is_deleted == False,
+        QuotationRequest.status.in_(["COMPLETED", "REJECTED", "CANCELLED", "EXPIRED", "INCONCLUSIVE"])
+    ).order_by(QuotationRequest.updated_at.desc()).limit(100).all()
+
+    history_records = []
+
+    for asgn in assignments:
+        rfq = asgn.rfq
+        if not rfq:
+            continue
+
+        customer_name = rfq.customer.name if rfq.customer else "Corporate Client"
+        bank_name = current_dealer.bank.name if current_dealer.bank else "Partner Bank"
+
+        # Check won status
+        is_multi_leg = bool(getattr(rfq, 'legs', None) and len(rfq.legs) > 0)
+        won_legs = []
+        lost_legs = []
+
+        if is_multi_leg:
+            for leg in rfq.legs:
+                winner_id = getattr(leg, 'winner_quotation_bank_id', None)
+                if winner_id == asgn.quotation_bank_id:
+                    # Leg won by this bank!
+                    pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                    won_legs.append({
+                        "leg_id": str(leg.id),
+                        "pair": pair_str,
+                        "direction": leg.direction or "BUY",
+                        "amount": float(leg.amount or 0),
+                        "currency": leg.buy_currency,
+                        "rate": float(getattr(leg, 'winner_price', 0) or 0.0),
+                        "value_date": getattr(leg, 'value_date', 'Standard Spot') or 'Standard Spot'
+                    })
+                else:
+                    lost_legs.append(str(leg.id))
+
+            is_won = len(won_legs) > 0
+            is_clean_sweep = is_won and (len(lost_legs) == 0)
+            outcome_badge = "WON_CLEAN_SWEEP" if is_clean_sweep else ("WON_PARTIAL" if is_won else "LOST")
+        else:
+            # Single-leg RFQ: check rfq analytics or winner
+            analytics = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
+            is_winner = (analytics and analytics.winner_quotation_bank_id == asgn.quotation_bank_id)
+            if not is_winner and getattr(rfq, 'winner_quotation_bank_id', None) == asgn.quotation_bank_id:
+                is_winner = True
+
+            is_won = bool(is_winner and rfq.status == "COMPLETED")
+            is_clean_sweep = is_won
+            outcome_badge = "WON" if is_won else ("CANCELLED" if rfq.status in ["CANCELLED", "INCONCLUSIVE"] else "LOST")
+
+            if is_won:
+                pair_str = f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")
+                won_legs.append({
+                    "leg_id": str(rfq.id),
+                    "pair": pair_str,
+                    "direction": rfq.direction or "BUY",
+                    "amount": float(rfq.amount or 0),
+                    "currency": rfq.buy_currency or "",
+                    "rate": float(analytics.winner_price if analytics and analytics.winner_price else (rfq.eval_rate or 0)),
+                    "value_date": rfq.value_date or "Spot (T+2)"
+                })
+
+        # Generate Cryptographic Scoped Receipt if won
+        receipt_data = None
+        if is_won:
+            exec_time = rfq.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC") if rfq.updated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            try:
+                receipt_data = generate_scoped_deal_receipt(
+                    rfq_id=str(rfq.id),
+                    ref_no=rfq.ref_no,
+                    customer_name=customer_name,
+                    bank_id=current_dealer.bank_id,
+                    bank_name=bank_name,
+                    executed_legs=won_legs,
+                    executed_at=exec_time
+                )
+            except Exception as e:
+                logger.warning(f"Could not generate deal receipt: {e}")
+
+        history_records.append({
+            "assignment_id": asgn.id,
+            "token": asgn.token,
+            "rfq_id": str(rfq.id),
+            "ref_no": rfq.ref_no,
+            "customer_name": customer_name,
+            "type": rfq.type or "FX_SPOT",
+            "quotation_base": rfq.quotation_base or "Execution",
+            "outcome": outcome_badge,
+            "is_won": is_won,
+            "won_legs_count": len(won_legs),
+            "total_legs_count": len(won_legs) + len(lost_legs) if is_multi_leg else 1,
+            "executed_legs": won_legs,
+            "receipt": receipt_data,
+            "concluded_at": rfq.updated_at.isoformat() if rfq.updated_at else rfq.created_at.isoformat()
+        })
+
+    return {
+        "success": True,
+        "bank_name": current_dealer.bank.name if current_dealer.bank else "Partner Bank",
+        "total_deals": len(history_records),
+        "won_deals_count": sum(1 for h in history_records if h["is_won"]),
+        "records": history_records
+    }
+
+
+@router.post("/blotter/claim-desk")
+async def claim_rfq_desk_lock(
+    req: ClaimDeskRequest,
+    current_dealer: QuotationBankDealer = Depends(get_current_dealer),
+    db: Session = Depends(get_db)
+):
+    """
+    Claims active exclusive trader control of an RFQ quotation desk ticket.
+    Integrates directly with desk_session_service concurrency manager.
+    """
+    from app.services.desk_session_service import desk_session_service
+
+    status_data = desk_session_service.get_or_claim_desk(
+        assignment_id=req.assignment_id,
+        email=current_dealer.email,
+        name=current_dealer.full_name,
+        role=current_dealer.role
+    )
+
+    return {
+        "success": True,
+        "desk_status": status_data
+    }
