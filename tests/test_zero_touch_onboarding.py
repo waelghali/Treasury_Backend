@@ -95,12 +95,14 @@ def test_zero_touch_activation_and_reset_roundtrip():
         dek = tenant_key_service.get_or_create_tenant_dek(db, cust.id)
         assert len(dek) == 32
 
-        # 2. Dispatch activation email (mock/dry run in test)
+        # 2. Dispatch activation email with mocked SMTP dispatch to prevent external bounces
+        from unittest.mock import patch
+
         async def run_activation():
-            return await send_corporate_admin_activation_email(db, user, cust.name)
+            with patch("app.services.customer_onboarding_service.send_email", return_value=(True, None)):
+                return await send_corporate_admin_activation_email(db, user, cust.name)
 
         success, err = asyncio.run(run_activation())
-        # Note: in test env with dummy SMTP, send_email may suppress or return True
         print(f"[Pass] Activation email dispatched: success={success}, err={err}")
 
         # 3. Verify token was created in DB
