@@ -1966,13 +1966,16 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             if hasattr(leg, 'id') and leg_savings_summary and not leg_is_inconclusive and not is_leg_declined:
                 leg.winner_bank_name = leg_savings_summary.get("winner_bank_name")
                 leg.winner_bank_id = leg_winner_bank_id
-                leg.winner_rate = leg_savings_summary.get("winner_rate")
-                leg.saved_vs_avg = leg_savings_summary.get("saved_vs_avg")
+                tenant_key_service.apply_encrypted_leg_winner(
+                    leg,
+                    win_rate=leg_savings_summary.get("winner_rate"),
+                    saved_vs_avg=leg_savings_summary.get("saved_vs_avg"),
+                    dek=tenant_dek
+                )
             elif hasattr(leg, 'id'):
                 leg.winner_bank_name = None
                 leg.winner_bank_id = None
-                leg.winner_rate = None
-                leg.saved_vs_avg = None
+                tenant_key_service.apply_encrypted_leg_winner(leg, None, None, tenant_dek)
 
             if is_closed and hasattr(leg, 'id'):
                 if leg_is_inconclusive:
@@ -2141,12 +2144,15 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     # Attach winner and rate attributes to RFQ object
     if savings_summary and not is_inconclusive:
         rfq.winner_bank_name = savings_summary.get("winner_bank_name")
-        rfq.winner_rate = savings_summary.get("winner_rate")
-        rfq.saved_vs_avg = savings_summary.get("saved_vs_avg")
+        tenant_key_service.apply_encrypted_rfq_winner(
+            rfq,
+            win_rate=savings_summary.get("winner_rate"),
+            saved_vs_avg=savings_summary.get("saved_vs_avg"),
+            dek=tenant_dek
+        )
     else:
         rfq.winner_bank_name = None
-        rfq.winner_rate = None
-        rfq.saved_vs_avg = None
+        tenant_key_service.apply_encrypted_rfq_winner(rfq, None, None, tenant_dek)
 
     # Phase 6.4: Acceptance Window Expiration & Governance Engine
     if is_closed and not is_indicative_only:

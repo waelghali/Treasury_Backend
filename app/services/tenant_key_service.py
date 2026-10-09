@@ -136,6 +136,50 @@ class TenantKeyService:
         tbill_offer.discount_rate = None
         tbill_offer.max_amount = None
 
+    # --- Dual-Read Resolvers & Enveloping for Winning Deal Terms ---
+
+    def apply_encrypted_leg_winner(self, leg: Any, win_rate: Optional[float], saved_vs_avg: Optional[float], dek: bytes) -> None:
+        """Encrypts winner rate and saved_vs_avg on QuotationLeg, ensuring plaintext columns are strictly NULL."""
+        if win_rate is not None:
+            leg.encrypted_winner_rate = encrypt_field(float(win_rate), dek, field_context="winner_rate")
+        else:
+            leg.encrypted_winner_rate = None
+
+        if saved_vs_avg is not None:
+            leg.encrypted_saved_vs_avg = encrypt_field(float(saved_vs_avg), dek, field_context="saved_vs_avg")
+        else:
+            leg.encrypted_saved_vs_avg = None
+
+        if hasattr(leg, "_db_winner_rate"):
+            leg._db_winner_rate = None
+        if hasattr(leg, "_db_saved_vs_avg"):
+            leg._db_saved_vs_avg = None
+        if hasattr(leg, "_resolved_winner_rate"):
+            leg._resolved_winner_rate = float(win_rate) if win_rate is not None else None
+        if hasattr(leg, "_resolved_saved_vs_avg"):
+            leg._resolved_saved_vs_avg = float(saved_vs_avg) if saved_vs_avg is not None else None
+
+    def apply_encrypted_rfq_winner(self, rfq: Any, win_rate: Optional[float], saved_vs_avg: Optional[float], dek: bytes) -> None:
+        """Encrypts root winner rate and savings on QuotationRequest, ensuring plaintext columns are strictly NULL."""
+        if win_rate is not None:
+            rfq.encrypted_winner_rate = encrypt_field(float(win_rate), dek, field_context="winner_rate")
+        else:
+            rfq.encrypted_winner_rate = None
+
+        if saved_vs_avg is not None:
+            rfq.encrypted_saved_vs_avg = encrypt_field(float(saved_vs_avg), dek, field_context="saved_vs_avg")
+        else:
+            rfq.encrypted_saved_vs_avg = None
+
+        if hasattr(rfq, "_db_winner_rate"):
+            rfq._db_winner_rate = None
+        if hasattr(rfq, "_db_saved_vs_avg"):
+            rfq._db_saved_vs_avg = None
+        if hasattr(rfq, "_resolved_winner_rate"):
+            rfq._resolved_winner_rate = float(win_rate) if win_rate is not None else None
+        if hasattr(rfq, "_resolved_saved_vs_avg"):
+            rfq._resolved_saved_vs_avg = float(saved_vs_avg) if saved_vs_avg is not None else None
+
     def re_envelope_tenant_dek(self, db: Session, customer_id: int) -> dict:
         """
         Unseals the current DEK and re-wraps it with the Master KEK.

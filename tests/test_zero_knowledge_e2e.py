@@ -173,6 +173,20 @@ def test_zero_knowledge_live_quoting_e2e():
         assert abs(resolved_price - raw_quote_price) < 0.0001
         assert comp_bank["finalPrice"] is not None
 
+        # 7. WINNER RATE PURE CIPHERTEXT DISK AUDIT:
+        # Inspect raw row in quotation_legs to verify winner_rate is physically NULL on disk
+        raw_leg_row = db.execute(text("SELECT winner_rate, encrypted_winner_rate, saved_vs_avg, encrypted_saved_vs_avg FROM quotation_legs WHERE id = :lid"), {"lid": leg.id}).fetchone()
+        assert raw_leg_row is not None
+        print(f"[Raw PostgreSQL Disk Check - Leg] winner_rate: {raw_leg_row[0]} (physically NULL)")
+        print(f"[Raw PostgreSQL Disk Check - Leg] encrypted_winner_rate: {raw_leg_row[1]}")
+        assert raw_leg_row[0] is None, f"Expected leg.winner_rate in DB to be NULL, found {raw_leg_row[0]}"
+        assert is_encrypted(raw_leg_row[1]), "Expected leg.encrypted_winner_rate to be valid ciphertext"
+
+        # Verify that accessing leg.winner_rate in memory transparently unseals the rate
+        db.refresh(leg)
+        print(f"[In-Memory Resolution - Leg] leg.winner_rate: {leg.winner_rate}")
+        assert abs(leg.winner_rate - raw_quote_price) < 0.0001
+
         print("[Pass] Corporate Results View standings computed and decrypted cleanly in memory!")
 
     finally:

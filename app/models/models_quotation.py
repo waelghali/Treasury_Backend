@@ -116,6 +116,14 @@ class QuotationRequest(BaseModel):
     delegated_at = Column(DateTime(timezone=True), nullable=True)
     delegated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
+    # Winning terms & Zero-Knowledge encryption
+    winner_bank_id = Column(Integer, nullable=True)
+    winner_bank_name = Column(String(255), nullable=True)
+    _db_winner_rate = Column("winner_rate", Float, nullable=True)
+    encrypted_winner_rate = Column(String(255), nullable=True)
+    _db_saved_vs_avg = Column("saved_vs_avg", Float, nullable=True)
+    encrypted_saved_vs_avg = Column(String(255), nullable=True)
+
     customer = relationship("Customer")
     entity = relationship("CustomerEntity")
     creator = relationship("User", foreign_keys=[created_by_user_id])
@@ -126,6 +134,68 @@ class QuotationRequest(BaseModel):
     assignments = relationship("QuotationBankAssignment", back_populates="rfq", cascade="all, delete-orphan")
     legs = relationship("QuotationLeg", back_populates="rfq", cascade="all, delete-orphan", order_by="QuotationLeg.leg_index")
     parent_rfq = relationship("QuotationRequest", remote_side=[id], backref="re_tenders")
+
+    @property
+    def winner_rate(self):
+        if hasattr(self, '_resolved_winner_rate') and self._resolved_winner_rate is not None:
+            return self._resolved_winner_rate
+        if self._db_winner_rate is not None:
+            return self._db_winner_rate
+        if not self.encrypted_winner_rate:
+            return None
+        try:
+            from sqlalchemy.orm import object_session
+            session = object_session(self)
+            cust_id = self.customer_id
+            if session and cust_id:
+                from app.services.tenant_key_service import tenant_key_service
+                dek = tenant_key_service.get_or_create_tenant_dek(session, cust_id)
+                from app.core.security_crypto import decrypt_field
+                val = decrypt_field(self.encrypted_winner_rate, dek, field_context="winner_rate")
+                if val is not None:
+                    self._resolved_winner_rate = float(val)
+                    return self._resolved_winner_rate
+        except Exception:
+            pass
+        return None
+
+    @winner_rate.setter
+    def winner_rate(self, value):
+        self._resolved_winner_rate = float(value) if value is not None else None
+        if value is None:
+            self._db_winner_rate = None
+            self.encrypted_winner_rate = None
+
+    @property
+    def saved_vs_avg(self):
+        if hasattr(self, '_resolved_saved_vs_avg') and self._resolved_saved_vs_avg is not None:
+            return self._resolved_saved_vs_avg
+        if self._db_saved_vs_avg is not None:
+            return self._db_saved_vs_avg
+        if not self.encrypted_saved_vs_avg:
+            return None
+        try:
+            from sqlalchemy.orm import object_session
+            session = object_session(self)
+            cust_id = self.customer_id
+            if session and cust_id:
+                from app.services.tenant_key_service import tenant_key_service
+                dek = tenant_key_service.get_or_create_tenant_dek(session, cust_id)
+                from app.core.security_crypto import decrypt_field
+                val = decrypt_field(self.encrypted_saved_vs_avg, dek, field_context="saved_vs_avg")
+                if val is not None:
+                    self._resolved_saved_vs_avg = float(val)
+                    return self._resolved_saved_vs_avg
+        except Exception:
+            pass
+        return None
+
+    @saved_vs_avg.setter
+    def saved_vs_avg(self, value):
+        self._resolved_saved_vs_avg = float(value) if value is not None else None
+        if value is None:
+            self._db_saved_vs_avg = None
+            self.encrypted_saved_vs_avg = None
 
     @property
     def delegated_to_name(self):
@@ -312,8 +382,10 @@ class QuotationLeg(BaseModel):
     status = Column(String, default="PENDING", comment="'PENDING', 'OPEN', 'EVALUATING', 'COMPLETED', 'ACCEPTED', 'REJECTED', 'INCONCLUSIVE', 'EXPIRED'")
     winner_bank_id = Column(Integer, nullable=True)
     winner_bank_name = Column(String(255), nullable=True)
-    winner_rate = Column(Float, nullable=True)
-    saved_vs_avg = Column(Float, nullable=True)
+    _db_winner_rate = Column("winner_rate", Float, nullable=True)
+    encrypted_winner_rate = Column(String(255), nullable=True)
+    _db_saved_vs_avg = Column("saved_vs_avg", Float, nullable=True)
+    encrypted_saved_vs_avg = Column(String(255), nullable=True)
     execution_reference = Column(String(50), nullable=True)
     deal_slip_pdf_path = Column(String(500), nullable=True)
     rejection_reason = Column(Text, nullable=True)
@@ -322,6 +394,68 @@ class QuotationLeg(BaseModel):
     market_benchmark_snapshot = Column(JSONB, nullable=True, comment="Frozen market benchmark snapshot at leg acceptance")
 
     rfq = relationship("QuotationRequest", back_populates="legs")
+
+    @property
+    def winner_rate(self):
+        if hasattr(self, '_resolved_winner_rate') and self._resolved_winner_rate is not None:
+            return self._resolved_winner_rate
+        if self._db_winner_rate is not None:
+            return self._db_winner_rate
+        if not self.encrypted_winner_rate:
+            return None
+        try:
+            from sqlalchemy.orm import object_session
+            session = object_session(self)
+            cust_id = self.rfq.customer_id if (self.rfq and getattr(self.rfq, 'customer_id', None)) else None
+            if session and cust_id:
+                from app.services.tenant_key_service import tenant_key_service
+                dek = tenant_key_service.get_or_create_tenant_dek(session, cust_id)
+                from app.core.security_crypto import decrypt_field
+                val = decrypt_field(self.encrypted_winner_rate, dek, field_context="winner_rate")
+                if val is not None:
+                    self._resolved_winner_rate = float(val)
+                    return self._resolved_winner_rate
+        except Exception:
+            pass
+        return None
+
+    @winner_rate.setter
+    def winner_rate(self, value):
+        self._resolved_winner_rate = float(value) if value is not None else None
+        if value is None:
+            self._db_winner_rate = None
+            self.encrypted_winner_rate = None
+
+    @property
+    def saved_vs_avg(self):
+        if hasattr(self, '_resolved_saved_vs_avg') and self._resolved_saved_vs_avg is not None:
+            return self._resolved_saved_vs_avg
+        if self._db_saved_vs_avg is not None:
+            return self._db_saved_vs_avg
+        if not self.encrypted_saved_vs_avg:
+            return None
+        try:
+            from sqlalchemy.orm import object_session
+            session = object_session(self)
+            cust_id = self.rfq.customer_id if (self.rfq and getattr(self.rfq, 'customer_id', None)) else None
+            if session and cust_id:
+                from app.services.tenant_key_service import tenant_key_service
+                dek = tenant_key_service.get_or_create_tenant_dek(session, cust_id)
+                from app.core.security_crypto import decrypt_field
+                val = decrypt_field(self.encrypted_saved_vs_avg, dek, field_context="saved_vs_avg")
+                if val is not None:
+                    self._resolved_saved_vs_avg = float(val)
+                    return self._resolved_saved_vs_avg
+        except Exception:
+            pass
+        return None
+
+    @saved_vs_avg.setter
+    def saved_vs_avg(self, value):
+        self._resolved_saved_vs_avg = float(value) if value is not None else None
+        if value is None:
+            self._db_saved_vs_avg = None
+            self.encrypted_saved_vs_avg = None
     offers = relationship("QuotationOffer", back_populates="leg", cascade="all, delete-orphan")
     tbill_offers = relationship("QuotationTBillOffer", back_populates="leg", cascade="all, delete-orphan")
     bank_configs = relationship("QuotationBankLegConfig", back_populates="leg", cascade="all, delete-orphan")
