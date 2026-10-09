@@ -46,29 +46,32 @@ async def upload_quotation_documents(
     files: List[UploadFile] = File(...),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Uploads supporting documents for a quotation request to GCS bucket (or local storage fallback)."""
+    """Uploads supporting documents for a quotation request to GCS bucket (or local storage fallback) in parallel."""
+    import asyncio
     from app.core.ai_integration import _upload_to_gcs, generate_signed_gcs_url, GCS_BUCKET_NAME
+    from app.core.storage_service import build_customer_blob_path
     
-    uploaded_files = []
-    for file in files:
+    async def _process_single_file(file: UploadFile):
         file_bytes = await file.read()
         safe_filename = f"{uuid.uuid4().hex[:8]}_{file.filename.replace(' ', '_')}"
-        from app.core.storage_service import build_customer_blob_path
         blob_path = build_customer_blob_path(current_user.customer_id, "quotations", f"rfq_docs/{safe_filename}")
         
         gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, file_bytes, file.content_type or "application/octet-stream")
         if not gcs_uri:
             raise HTTPException(status_code=500, detail=f"Failed to upload document {file.filename} to cloud storage")
         
-        signed = await generate_signed_gcs_url(gcs_uri, expiration=604800)
+        # Fresh upload is guaranteed to exist: skip remote existence check for sub-millisecond HMAC signing
+        signed = await generate_signed_gcs_url(gcs_uri, expiration=604800, skip_existence_check=True)
         doc_url = signed or gcs_uri
 
-        uploaded_files.append({
+        return {
             "name": file.filename,
             "path": doc_url
-        })
-        
-    return {"documents": uploaded_files}
+        }
+
+    # Parallelize file reading, uploading, and signing
+    uploaded_files = await asyncio.gather(*[_process_single_file(f) for f in files])
+    return {"documents": list(uploaded_files)}
 
 
 def _resolve_entities_for_invitation(db: Session, customer_id: int, qb = None, fallback_entity_ids: list = None):
@@ -2394,7 +2397,8 @@ def get_rfq_history(
                 r.winner_bank_name = first_leg.winner_bank_name
                 r.winner_rate = first_leg.winner_rate
                 r.saved_vs_avg = first_leg.saved_vs_avg
-        elif is_closed and r.status in ('PENDING', 'OPEN', 'EVALUATING'):
+        elif is_closed and r.status in ('PENDING', 'OPEN') and r.acceptance_status is None:
+            # Deal tender window closed within the last few seconds: finalize standings
             compute_rfq_standings(r, db, dispatch_emails=False)
         else:
             r.winner_bank_name = getattr(r, 'winner_bank_name', None)

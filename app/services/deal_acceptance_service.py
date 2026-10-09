@@ -450,7 +450,7 @@ def get_active_deal_awaiting_acceptance(
         if diff_seconds <= 0:
             continue
 
-        # Compute standings only for genuine active candidate
+        # Compute standings for genuine active candidate
         standings = compute_rfq_standings(rfq, db, dispatch_emails=False)
 
         # Check if awaiting acceptance

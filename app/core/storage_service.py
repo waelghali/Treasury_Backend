@@ -242,14 +242,22 @@ def download_bytes_from_gcs_sync(gcs_uri: str) -> Tuple[bytes, str]:
     return data, content_type
 
 
-async def generate_signed_url(gcs_uri: str, expiration_seconds: int = 3600) -> Optional[str]:
+async def generate_signed_url(gcs_uri: str, expiration_seconds: int = 3600, skip_existence_check: bool = False) -> Optional[str]:
     """
     Generates a secure, temporary V4 signed URL for browser viewing or download.
-    Includes dual-read fallback resolution.
+    Includes dual-read fallback resolution. When skip_existence_check is True (e.g. fresh uploads),
+    bypasses remote .exists() roundtrips and calculates signature in-memory instantly.
     """
     try:
         bucket_name, blob_name = parse_gcs_uri(gcs_uri)
-        blob, resolved_name = resolve_gcs_blob(bucket_name, blob_name)
+        if skip_existence_check:
+            client = _get_gcs_client()
+            if not client:
+                raise RuntimeError("GCS client is not initialized.")
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+        else:
+            blob, resolved_name = resolve_gcs_blob(bucket_name, blob_name)
 
         def _sign():
             return blob.generate_signed_url(
