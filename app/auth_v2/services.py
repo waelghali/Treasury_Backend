@@ -751,33 +751,12 @@ class AuthService:
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="In Zero-Touch / Host-Blind security mode, System Owners cannot directly set customer user passwords. The customer must use self-service reset or receive a private activation link."
                 )
-        # 2. Corporate Admin can manage End Users and Checkers within their customer scope
+        # 2. Corporate Admin cannot directly set passwords in Zero-Touch / Host-Blind security mode
         elif admin_user.role == UserRole.CORPORATE_ADMIN:
-            if admin_user.customer_id is None:
-                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Admin user is not associated with a customer."
-                )
-            if db_target_user.customer_id != admin_user.customer_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You can only manage users within your organization."
-                )
-            if db_target_user.role == UserRole.SYSTEM_OWNER:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Corporate Admins cannot manage System Owner accounts."
-                )
-            if db_target_user.role == UserRole.CORPORATE_ADMIN and db_target_user.id != admin_user.user_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Corporate Admins cannot manage other Corporate Admin accounts."
-                )
-            if db_target_user.id == admin_user.user_id:
-                # If CA tries to reset their own password via admin panel, it implies a self-service type action
-                # But typically this path is for "admin resetting others"
-                # If they reset their own, it should be fine, but often self-service is preferred route
-                pass # Allow CA to reset their own password, but not via the "admin of others" path
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="In Zero-Touch / Host-Blind security mode, Corporate Admins cannot directly set user passwords. The user must use self-service reset or receive a private activation link."
+            )
         else:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

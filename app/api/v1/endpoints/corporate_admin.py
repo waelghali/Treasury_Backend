@@ -478,22 +478,19 @@ def restore_customer_entity(
 
 # --- User Management (within Corporate Admin's customer scope) ---
 @router.post("/users/", response_model=UserOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(check_for_read_only_mode)])
-def create_user(
+async def create_user(
     user_in: UserCreateCorporateAdmin,
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(HasPermission("user:create")),
-    request: Request = None,
-    background_tasks: BackgroundTasks = None
+    request: Request = None
 ):
     """
     Allows a Corporate Admin to create a new user under their customer organization.
     Enforces subscription plan limits and prevents assignment of the SYSTEM_OWNER role.
-    Sends a welcome email upon successful creation.
+    Dispatches a private single-use 24-hour activation link with save_copy=False (SendOnly).
     """
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
-    
-    new_user_password = user_in.password
 
     log_details = {"email": user_in.email, "customer_id": customer_id}
 
@@ -507,46 +504,18 @@ def create_user(
         if user_in.role == UserRole.SYSTEM_OWNER:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Corporate Admins cannot create users with 'SYSTEM_OWNER' role.")
 
+        # In Zero-Touch mode, password setting is prohibited from corporate admin side
+        user_in.password = None
+
         db_user = crud_user.create_user_by_corporate_admin(db, user_in, customer_id, corporate_admin_context.user_id)
         
-        # Use customer-specific email settings (falls back to global if not configured)
-        from app.core.email_service import get_customer_email_settings as _get_cust_email
-        email_settings, _email_source = _get_cust_email(db, customer_id)
-        
-        from app.core.routing import get_frontend_base_url
-        base_url = get_frontend_base_url(request=request)
-        login_url = f"{base_url}/login"
+        # Dispatch private SendOnly activation email to the newly created user
+        from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+        try:
+            await send_corporate_admin_activation_email(db, db_user, customer_check.name, request=request)
+        except Exception as email_err:
+            logger.error(f"Failed to dispatch activation email to user {db_user.email}: {email_err}", exc_info=True)
 
-        welcome_subject = f"Welcome to the Platform, {db_user.email}!"
-        user_name = db_user.email
-
-        welcome_body = f"""
-            <html><body>
-                <p>Hello {user_name},</p>
-                <p>A new account has been created for you on the platform with the role: <strong>{db_user.role.value}</strong>.</p>
-                <p><strong>Your login details are:</strong></p>
-                <ul>
-                    <li><strong>Email:</strong> {db_user.email}</li>
-                    <li><strong>Temporary Password:</strong> {new_user_password}</li>
-                </ul>
-                <p>Since this is your first login, you will be prompted to change your password immediately upon signing in for security purposes.</p>
-                <p>Please click here to log in: <a href="{login_url}">{login_url}</a></p>
-                <p>If you did not authorize this, please contact your Corporate Admin immediately.</p>
-                <p>Best regards,</p>
-                <p>Your Corporate Admin</p>
-            </body></html>
-        """
-        
-        background_tasks.add_task(
-            send_email,
-            db,
-            [db_user.email],
-            welcome_subject,
-            welcome_body,
-            {}, # template_data
-            email_settings,
-        )
-        
         return db_user
     except HTTPException as e:
         db.rollback()
@@ -700,6 +669,47 @@ def restore_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}"
         )
+
+
+@router.post("/users/{user_id}/resend-invitation", dependencies=[Depends(check_for_read_only_mode)])
+async def resend_user_invitation(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(HasPermission("user:edit")),
+    request: Request = None
+):
+    """
+    Resends a private single-use 24-hour activation invitation to a user within the corporate admin's customer organization.
+    Dispatches with SendOnly (save_copy=False) so credentials remain 100% private to the user.
+    """
+    customer_id = corporate_admin_context.customer_id
+    db_user = db.query(User).filter(
+        User.id == user_id,
+        User.customer_id == customer_id,
+        User.is_deleted == False
+    ).first()
+    if not db_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found or does not belong to your organization.")
+
+    customer = crud_customer.get(db, customer_id)
+    customer_name = customer.name if customer else "Grow Treasury"
+
+    from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+    success, err = await send_corporate_admin_activation_email(db, db_user, customer_name, request=request)
+
+    if not success:
+        logger.warning(f"Failed to resend invitation email to {db_user.email}: {err}")
+        return {
+            "success": False,
+            "message": f"Activation token generated, but email dispatch failed: {err}. Please verify email settings.",
+            "email": db_user.email
+        }
+
+    return {
+        "success": True,
+        "message": f"Private activation invitation resent to {db_user.email} successfully.",
+        "email": db_user.email
+    }
 
 
 # --- LG Category Management (within Corporate Admin's customer scope) ---
@@ -2283,17 +2293,7 @@ def approve_quotation(
         )
         db.commit()
 
-        if rfq.created_by_user_id:
-            from app.models.models_quotation import QuotationNotification
-            db.add(QuotationNotification(
-                user_id=rfq.created_by_user_id,
-                type="RFQ_APPROVED_SCHEDULED",
-                title=f"RFQ {rfq.ref_no} Approved & Scheduled",
-                message=f"Your RFQ {rfq.ref_no} has been approved and scheduled for bank release at {scheduled_time.strftime('%Y-%m-%d %H:%M UTC')}.",
-                link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-                is_read=False
-            ))
-            db.commit()
+
 
         from app.services.quotation_approval_notifications import dispatch_rfq_approved_email
         dispatch_rfq_approved_email(
@@ -2486,17 +2486,7 @@ def reject_quotation(
             leg.status = 'REJECTED'
     db.commit()
     
-    # Notify End User
-    from app.models.models_quotation import QuotationNotification
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="RFQ_REJECTED",
-        title=f"RFQ {rfq.ref_no} Rejected",
-        message=f"Your {rfq.type} quotation request has been rejected by the administrator.",
-        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-        is_read=False
-    ))
-    db.commit()
+
     
     return {"message": "Quotation rejected.", "rfq_id": rfq.id}
 
@@ -2533,17 +2523,7 @@ def request_quotation_revision(
     rfq.admin_reviewed_at = func.now()
     db.commit()
 
-    # Notify End User Maker (In-App)
-    from app.models.models_quotation import QuotationNotification
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="RFQ_NEEDS_REVISION",
-        title=f"Action Required: RFQ {rfq.ref_no} Returned for Revision",
-        message=f"Administrator feedback: {notes}",
-        link=f"/end-user/quotations/active?revision_rfq_id={rfq.id}",
-        is_read=False
-    ))
-    db.commit()
+
 
     # Dispatch Email to End User Maker
     from app.services.quotation_approval_notifications import dispatch_rfq_revision_requested_email
@@ -2601,18 +2581,7 @@ def approve_quotation_request(
         customer_id=corporate_admin_context.customer_id
     )
 
-    # Notify End User
-    from app.models.models_quotation import QuotationNotification
-    status_msg = "APPROVED and released to banks" if approval_in.status == "PENDING" else "REJECTED"
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="RFQ_APPROVED" if approval_in.status == "PENDING" else "RFQ_REJECTED",
-        title=f"RFQ {rfq.ref_no} Update",
-        message=f"Your {rfq.type} quotation request has been {status_msg}.",
-        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-        is_read=False
-    ))
-    db.commit()
+
 
     # Schedule or cancel 15-minute prior reminder
     try:
@@ -2766,18 +2735,7 @@ def approve_quotation_cancellation(
                 email_settings
             )
 
-    # Notify maker
-    from app.models.models_quotation import QuotationNotification
-    if rfq.created_by_user_id:
-        db.add(QuotationNotification(
-            user_id=rfq.created_by_user_id,
-            type="RFQ_CANCELLATION_APPROVED",
-            title=f"Cancellation Approved: {rfq.ref_no}",
-            message=f"Your cancellation request for RFQ {rfq.ref_no} ({rfq.type}) has been approved by Corporate Admin. Counterparty links have been deactivated.",
-            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-            is_read=False
-        ))
-        db.commit()
+
 
     from app.crud.crud import log_action
     log_action(
@@ -2823,17 +2781,7 @@ def reject_quotation_cancellation(
 
     # Notify maker
     rejection_notes = payload.rejection_notes if payload and payload.rejection_notes else "No specific notes provided."
-    from app.models.models_quotation import QuotationNotification
-    if rfq.created_by_user_id:
-        db.add(QuotationNotification(
-            user_id=rfq.created_by_user_id,
-            type="RFQ_CANCELLATION_REJECTED",
-            title=f"Cancellation Rejected: {rfq.ref_no}",
-            message=f"Your cancellation request for RFQ {rfq.ref_no} was rejected by Corporate Admin. The RFQ remains scheduled. Notes: {rejection_notes}",
-            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-            is_read=False
-        ))
-        db.commit()
+
 
     from app.crud.crud import log_action
     log_action(

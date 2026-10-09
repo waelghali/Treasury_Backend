@@ -94,10 +94,17 @@ for handler in logging.root.handlers:
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
+# In production (e.g. Render), hide public API docs from automated scanners unless explicitly enabled via ENABLE_DOCS=true
+_is_prod = (os.getenv("ENVIRONMENT", "").lower() == "production") or (os.getenv("RENDER") is not None)
+_enable_docs = os.getenv("ENABLE_DOCS", "").lower() in ("true", "1") or not _is_prod
+
 app = FastAPI(
     title="Treasury Management Platform API",
     description="API for managing financial instruments, primarily Letters of Guarantee.",
     version="1.0.0",
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
 )
 
 def configure_app_instance(fastapi_app: FastAPI):
@@ -162,6 +169,13 @@ def configure_app_instance(fastapi_app: FastAPI):
         if Base.metadata.tables:
             Base.metadata.create_all(bind=engine)
             logger.info("Database tables verified/created.")
+            try:
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE banks ADD COLUMN IF NOT EXISTS portal_access_enabled BOOLEAN NOT NULL DEFAULT TRUE;"))
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"Column migration check for banks.portal_access_enabled: {e}")
 
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:

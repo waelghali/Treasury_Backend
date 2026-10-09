@@ -450,13 +450,14 @@ async def generate_issuance_letter(
     additional_text: str = Query("", description="Extra free text instructions to include in the letter"),
     use_special_wording: bool = Query(False, description="Override to use special wording instead of bank standard"),
     field_overrides: str = Query("", description="JSON dict of placeholder overrides from missing fields panel"),
+    is_companion: bool = Query(False, description="Whether this is a Companion Bank Instruction Letter attached to an official bank form"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context),
 ):
     """
     Generates a signed company letter PDF for an issuance request using the template system.
+    Supports both primary issuance request letters and Companion Bank Instruction Letters (LG_BANK_COMPANION_LETTER).
     Uses customer-specific template if available, otherwise falls back to the global default.
-    Available placeholders are defined under action_type 'LG_ISSUANCE_REQUEST'.
     """
     import json
     overrides = {}
@@ -472,6 +473,7 @@ async def generate_issuance_letter(
         additional_text=additional_text,
         use_special_wording=use_special_wording,
         field_overrides=overrides,
+        is_companion=is_companion,
     )
     headers = {
         'Content-Disposition': f'inline; filename="{result["filename"]}"'

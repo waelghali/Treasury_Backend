@@ -4,6 +4,7 @@ Cross-verifies raw database records with the DealerAchievementService engine.
 """
 import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import text
 from app.database import SessionLocal
 from app.services.dealer_achievement_service import DealerAchievementService

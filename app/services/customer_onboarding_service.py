@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.models.models import User, PasswordResetToken
+from app.constants import UserRole
 from app.core.hashing import get_password_hash
 from app.core.email_service import send_email, get_customer_email_settings, get_global_email_settings
 from app.services.unified_email_builder import build_security_email_html
@@ -29,12 +30,13 @@ async def send_corporate_admin_activation_email(
     db: Session,
     user: User,
     customer_name: str,
-    request: Optional[object] = None
+    request: Optional[object] = None,
+    custom_role_label: Optional[str] = None
 ) -> Tuple[bool, Optional[str]]:
     """
-    Issues a single-use 24-hour activation token for a Corporate Admin
+    Issues a single-use 24-hour activation token for a Corporate Admin or Customer User
     and dispatches a private 'SendOnly' email (save_copy=False) with the activation link.
-    Guarantees that the System Owner has zero knowledge of the link or credentials.
+    Guarantees that administrators (System Owner and Corporate Admins) have zero knowledge of the link or credentials.
     """
     try:
         # 1. Invalidate any existing active tokens for this user
@@ -70,16 +72,29 @@ async def send_corporate_admin_activation_email(
             email_settings, _ = get_global_email_settings()
 
         # 5. Build high-aesthetic security email
+        role_label = custom_role_label
+        if not role_label:
+            if user.role == UserRole.CORPORATE_ADMIN:
+                role_label = "Corporate Administrator"
+            elif user.role == UserRole.CHECKER:
+                role_label = "Checker / Approver"
+            elif user.role == UserRole.VIEWER:
+                role_label = "Viewer"
+            elif user.role == UserRole.END_USER:
+                role_label = "User / Maker"
+            else:
+                role_label = str(user.role.value).replace('_', ' ').title()
+
         subject = f"Welcome to Grow Treasury — Activate Your Account ({customer_name})"
         body = build_security_email_html(
             title="Welcome to Grow Treasury",
             user_email=user.email,
             message=(
-                f"Your organization <strong>{customer_name}</strong> has been onboarded to Grow Treasury. "
-                f"You have been designated as the primary <strong>Corporate Administrator</strong>.<br><br>"
+                f"Your account has been configured under organization <strong>{customer_name}</strong> in Grow Treasury "
+                f"with the role of <strong>{role_label}</strong>.<br><br>"
                 f"Please click below to activate your account and establish your private, confidential password. "
-                f"For institutional privacy, this activation link is strictly confidential and neither the System Owner "
-                f"nor Grow platform administrators have access to your credentials.<br><br>"
+                f"For institutional privacy, this activation link is strictly confidential and neither platform administrators "
+                f"nor your organization's administrators have access to your credentials.<br><br>"
                 f"<em>This link is valid for 24 hours.</em>"
             ),
             action_url=activation_link,
@@ -118,3 +133,7 @@ async def send_corporate_admin_activation_email(
     except Exception as e:
         logger.error(f"Error dispatching activation email to {user.email}: {e}", exc_info=True)
         return False, str(e)
+
+
+# Alias for generalized user activation
+send_user_activation_email = send_corporate_admin_activation_email

@@ -17,7 +17,7 @@ from app.core.encryption import encrypt_data
 
 # Models
 from app.models.models import Bank, Currency 
-from app.models.models_issuance import IssuedLGRecord, IssuanceRequest, IssuanceFacilitySubLimit, IssuanceFacility, IssuanceWorkflowPolicy, CustomerFormConfiguration, IssuanceRequestSnapshot, IssuanceRequestVersion, AdminChangeRequest, BankFormIssueReport, BankFormTemplate
+from app.models.models_issuance import IssuedLGRecord, IssuanceRequest, IssuanceFacilitySubLimit, IssuanceFacility, IssuanceWorkflowPolicy, CustomerFormConfiguration, IssuanceRequestSnapshot, IssuanceRequestVersion, AdminChangeRequest, BankFormIssueReport, BankFormTemplate, IssuanceExposureEntry
 # NOTE: Ensure you created app/models/models_reconciliation.py first!
 from app.models.models_reconciliation import BankPositionBatch, BankPositionRow 
 # Schemas
@@ -198,12 +198,14 @@ def get_bank_form_page_image(
     form_id: int,
     page_num: int = Query(0, ge=0, description="0-indexed page number"),
     dpi: int = Query(150, ge=72, le=300, description="Render resolution in DPI"),
+    show_overlay: bool = Query(False, description="If true, renders with actual filled overlay text from PDF engine"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(check_subscription_status),
 ):
     """
     Renders a specific page of a bank form template as a high-resolution PNG image
     for the interactive Visual Drag-and-Drop Designer.
+    When show_overlay=True, renders the actual output of the PDF filler engine.
     """
     import fitz  # PyMuPDF
     from app.constants import UserRole
@@ -220,6 +222,44 @@ def get_bank_form_page_image(
     pdf_bytes = _read_bank_form_pdf_bytes(form_template)
     if not pdf_bytes:
         raise HTTPException(404, "Form PDF content not found.")
+
+    if show_overlay and form_template.field_mapping:
+        try:
+            from datetime import date as d, timedelta
+            today = d.today()
+            dummy_data = {
+                "bank_branch": "New Cairo Branch",
+                "current_date": today,
+                "lg_type_is_bid_bond": True,
+                "lg_type_is_performance": True,
+                "lg_type_is_advance_payment": True,
+                "operational_status": "Operative",
+                "margin_percentage": "10%",
+                "has_facility_at_bank": True,
+                "amount": 250000.00,
+                "amount_in_words": "Two Hundred Fifty Thousand Egyptian Pounds Only",
+                "reference_amount": 2500000.00,
+                "contract_percentage": "10%",
+                "contract_percentage_num": "10",
+                "lg_percentage_of_contract": "10%",
+                "reference_amount_percentage": "10%",
+                "reference_number": "CON-2026-A100",
+                "requested_expiry_date": today + timedelta(days=365),
+                "lg_purpose": "Supply and installation of HVAC systems - Phase 2",
+                "additional_conditions": "As per attached special wording / Cross-border Letter of Guarantee",
+                "beneficiary_name": "ACME Construction Co. LLC",
+                "beneficiary_address": "12 Nile Avenue, Giza, Egypt",
+                "entity_name": "Pilot Test Corp Main Entity",
+                "entity_address": "45 Smart Village, 6th October City, Giza, Egypt",
+                "customer_cif_number": "CIF-98765",
+                "customer_phone": "+20 2 3456 7890",
+                "bank_account_number": "1234567890123"
+            }
+            from app.core.pdf_form_filler import generate_scanned_fill_pdf
+            pdf_bytes = generate_scanned_fill_pdf(pdf_bytes, form_template.field_mapping, dummy_data)
+        except Exception as overlay_err:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to generate overlay for page image: {overlay_err}")
 
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -406,6 +446,11 @@ def preview_bank_form(
         "reference_number": "CON-2026-A100",
         "reference_date": today - timedelta(days=60),
         "reference_amount": 2500000.00,
+        "contract_percentage": "10%",
+        "contract_percentage_num": "10",
+        "lg_percentage_of_contract": "10%",
+        "reference_amount_percentage": "10%",
+        "margin_percentage": "10%",
         "tender_number": "TNR-2026-555",
         # ── Customer / Entity ──
         "entity_name": "Pilot Test Corp Main Entity",
@@ -718,7 +763,9 @@ def update_bank_form_mapping(
     if not form_template:
         raise HTTPException(404, "Bank form template not found.")
     
+    from sqlalchemy.orm.attributes import flag_modified
     form_template.field_mapping = mapping
+    flag_modified(form_template, "field_mapping")
     db.commit()
     
     return {"message": "Field mapping updated", "id": form_template.id}
@@ -1164,8 +1211,8 @@ async def auto_fill_bank_form(
             f"Complete the issuance with the current bank or cancel first."
         )
     
-    # Lock to this bank on first form generation
-    if not locked_bank_id:
+    # Lock to this bank on actual form generation (Phase 2), not dry-run pre-check
+    if not locked_bank_id and user_values is not None:
         meta["locked_bank_id"] = bank_id
         request.metadata_json = meta
         request.locked_for_issuance = True
@@ -1451,10 +1498,11 @@ async def auto_fill_bank_form(
                     'X-Form-Role': str(getattr(form_template, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER'),
                     'X-Has-Third-Party-Form': 'true' if tp_template else 'false',
                     'X-Third-Party-Form-Id': str(tp_template.id) if tp_template else '',
+                    'X-Has-Companion-Letter': 'true' if bool(getattr(request, 'is_cross_border', False) or getattr(request, 'requires_special_wording', False) or getattr(request, 'other_conditions', False)) else 'false',
                     'X-Special-Wording-Doc-Id': str(special_wording_doc_id) if special_wording_doc_id else '',
                     'X-Calculated-Expiry-Applied': 'true' if request_data.get("calculated_expiry_applied") else 'false',
                     'X-Projected-Expiry-Date': str(request_data.get("projected_expiry_date") or ''),
-                    'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id, X-Calculated-Expiry-Applied, X-Projected-Expiry-Date',
+                    'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Has-Companion-Letter, X-Special-Wording-Doc-Id, X-Calculated-Expiry-Applied, X-Projected-Expiry-Date',
                 }
             )
         
@@ -1470,6 +1518,7 @@ async def auto_fill_bank_form(
             "auto_filled_fields": len(form_template.field_mapping) - len(missing_fields),
             "has_third_party_form": bool(tp_template),
             "third_party_form_info": third_party_form_info,
+            "has_companion_letter": bool(getattr(request, 'is_cross_border', False) or getattr(request, 'requires_special_wording', False) or getattr(request, 'other_conditions', False)),
             "special_wording_doc_id": special_wording_doc_id,
             "calculated_expiry_applied": bool(request_data.get("calculated_expiry_applied")),
             "projected_expiry_date": str(request_data.get("projected_expiry_date") or ""),
@@ -1568,10 +1617,11 @@ async def auto_fill_bank_form(
             'X-Form-Role': str(getattr(form_template, 'form_role', 'PRIMARY_ISSUER') or 'PRIMARY_ISSUER'),
             'X-Has-Third-Party-Form': 'true' if tp_template else 'false',
             'X-Third-Party-Form-Id': str(tp_template.id) if tp_template else '',
+            'X-Has-Companion-Letter': 'true' if bool(getattr(request, 'is_cross_border', False) or getattr(request, 'requires_special_wording', False) or getattr(request, 'other_conditions', False)) else 'false',
             'X-Special-Wording-Doc-Id': str(special_wording_doc_id) if special_wording_doc_id else '',
             'X-Calculated-Expiry-Applied': 'true' if request_data.get("calculated_expiry_applied") else 'false',
             'X-Projected-Expiry-Date': str(request_data.get("projected_expiry_date") or ''),
-            'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Special-Wording-Doc-Id, X-Calculated-Expiry-Applied, X-Projected-Expiry-Date',
+            'Access-Control-Expose-Headers': 'X-Form-Type, X-Form-Role, X-Has-Third-Party-Form, X-Third-Party-Form-Id, X-Has-Companion-Letter, X-Special-Wording-Doc-Id, X-Calculated-Expiry-Applied, X-Projected-Expiry-Date',
         }
     )
 

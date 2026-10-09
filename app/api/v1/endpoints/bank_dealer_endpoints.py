@@ -72,6 +72,15 @@ class DealerLoginRequest(BaseModel):
     totp_code: str = Field(..., min_length=6, max_length=6, description="6-digit rolling code from Microsoft/Google Authenticator")
 
 
+class DealerRecoveryInitiateRequest(BaseModel):
+    email: EmailStr = Field(..., description="Official corporate bank email (@bank.com)")
+
+
+class DealerRecoveryVerifyEmailRequest(BaseModel):
+    email: EmailStr = Field(..., description="Corporate email address")
+    otp_code: str = Field(..., min_length=6, max_length=6, description="6-digit recovery code from email")
+
+
 # ==============================================================================
 # AUTH DEPENDENCY
 # ==============================================================================
@@ -126,7 +135,13 @@ async def get_current_dealer(
     if not dealer.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Bank dealer account has been deactivated."
+            detail="Bank dealer account has been deactivated by administrator."
+        )
+
+    if dealer.bank and not dealer.bank.portal_access_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Trading portal access for this bank has been disabled by platform administration."
         )
 
     return dealer
@@ -188,11 +203,23 @@ async def initiate_dealer_enrollment(
                 detail=f"The email domain '@{domain}' is not registered with any partner bank. Please select your bank or contact platform support."
             )
 
+    if not bank.portal_access_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Trading portal access for {bank.name} has been disabled by platform administration."
+        )
+
     # Check existing dealer record
     dealer = db.query(QuotationBankDealer).filter(
         QuotationBankDealer.email == clean_email,
         QuotationBankDealer.is_deleted == False
     ).first()
+
+    if dealer and not dealer.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your bank trading desk account has been deactivated. Please contact platform administration."
+        )
 
     if dealer and dealer.is_totp_enrolled and dealer.hashed_password:
         return {
@@ -433,6 +460,18 @@ async def confirm_dealer_totp_and_activate(
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer account not found.")
 
+    if not dealer.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your bank trading desk account has been deactivated. Contact your administrator."
+        )
+
+    if dealer.bank and not dealer.bank.portal_access_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Trading portal access for {dealer.bank.name} has been disabled by platform administration."
+        )
+
     if not dealer.totp_secret:
         raise HTTPException(status_code=400, detail="No pending TOTP secret found. Please restart enrolment.")
 
@@ -489,6 +528,226 @@ async def confirm_dealer_totp_and_activate(
 
 
 # ==============================================================================
+# DAY 1+ ACCOUNT RECOVERY / CHANGED DEVICE / PASSWORD RESET
+# ==============================================================================
+
+@router.post("/auth/recovery/initiate")
+async def initiate_dealer_recovery(
+    req: DealerRecoveryInitiateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Day 1+ Account Recovery & 2FA Device Migration:
+    Dispatches a single-use 6-digit cryptographic security code to the dealer's
+    registered corporate bank email to allow password reset and Authenticator re-binding
+    (e.g., when the trader gets a new phone or forgot their password).
+    """
+    clean_email = req.email.strip().lower()
+    dealer = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.email == clean_email,
+        QuotationBankDealer.is_deleted == False
+    ).first()
+
+    if not dealer:
+        # Standard security response to prevent user enumeration
+        return {
+            "success": True,
+            "message": "If an account exists for this corporate email, a recovery verification code has been dispatched."
+        }
+
+    if not dealer.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your bank trading desk account has been deactivated. Please contact platform administration."
+        )
+
+    if dealer.bank and not dealer.bank.portal_access_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Trading portal access for {dealer.bank.name} has been disabled by platform administration."
+        )
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Generate 6-digit email OTP
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    hashed_otp = hash_otp_code(otp_code)
+    expires_at = now_utc + timedelta(minutes=EMAIL_OTP_TTL_MINUTES)
+
+    dealer.pending_email_otp = hashed_otp
+    dealer.pending_email_otp_expires_at = expires_at
+    dealer.pending_otp_failed_attempts = 0
+    dealer.enrollment_token = None
+    dealer.enrollment_token_expires_at = None
+
+    db.commit()
+    db.refresh(dealer)
+
+    bank_name = dealer.bank.name if dealer.bank else "Partner Bank"
+
+    # Dispatch Recovery Verification Email
+    subject = f"Grow Treasury - Trading Desk Account Recovery & 2FA Reset ({bank_name})"
+    body = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0f172a; margin: 0; padding: 24px; color: #f8fafc;">
+        <div style="max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 16px; border: 1px solid #334155; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.4);">
+            <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 28px 32px; border-bottom: 1px solid #334155; text-align: center;">
+                <div style="display: inline-block; background: #0284c7; color: #ffffff; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; padding: 4px 12px; border-radius: 20px; margin-bottom: 12px;">
+                    Desk Account Recovery
+                </div>
+                <h1 style="color: #ffffff; font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.025em;">Password & 2FA Reset Code</h1>
+                <p style="color: #94a3b8; font-size: 13px; margin: 6px 0 0 0;">{bank_name}</p>
+            </div>
+            
+            <div style="padding: 32px;">
+                <p style="margin: 0 0 16px 0; font-size: 15px; line-height: 1.5; color: #e2e8f0;">Dear <strong>{dealer.full_name}</strong>,</p>
+                <p style="margin: 0 0 20px 0; font-size: 13px; line-height: 1.6; color: #94a3b8;">
+                    We received a request to reset your password or re-bind Microsoft Authenticator on a new phone for your <strong>Grow Treasury Trading Desk</strong> account.
+                </p>
+
+                <div style="background: #0f172a; border: 1px solid #334155; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
+                    <span style="display: block; font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.05em; margin-bottom: 8px;">Security Recovery Code</span>
+                    <span style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 38px; font-weight: 800; letter-spacing: 0.25em; color: #38bdf8; margin-left: 0.25em;">{otp_code}</span>
+                    <span style="display: block; font-size: 11px; color: #64748b; margin-top: 10px;">Expires in {EMAIL_OTP_TTL_MINUTES} minutes &bull; Single Use</span>
+                </div>
+
+                <div style="background: #1e293b; border-left: 3px solid #0284c7; padding: 12px 16px; border-radius: 6px; margin-bottom: 20px;">
+                    <p style="margin: 0; font-size: 12px; color: #cbd5e1; line-height: 1.4;">
+                        <strong>Next Step:</strong> After entering this code on the trading desk portal, you will be prompted to scan a new QR code with <strong>Microsoft Authenticator</strong> on your phone and choose a new password.
+                    </p>
+                </div>
+
+                <div style="border-top: 1px solid #334155; padding-top: 16px; font-size: 11px; color: #64748b;">
+                    If you did not request this recovery, please notify your bank's Treasury Desk Head immediately.
+                </div>
+            </div>
+            
+            <div style="background: #0f172a; padding: 14px 32px; border-top: 1px solid #334155; font-size: 11px; color: #64748b; text-align: center;">
+                Grow Treasury Platform &bull; Institutional Trading Desk Security
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    email_settings, source = get_customer_email_settings(db, None)
+    background_tasks.add_task(
+        send_email,
+        db=db,
+        to_emails=[clean_email],
+        subject_template=subject,
+        body_template=body,
+        template_data={},
+        email_settings=email_settings,
+        sender_name="Grow Treasury Trading Desk",
+        save_copy=False
+    )
+
+    return {
+        "success": True,
+        "message": f"Security recovery code dispatched to {clean_email}.",
+        "email": clean_email,
+        "bank_name": bank_name
+    }
+
+
+@router.post("/auth/recovery/verify-email")
+async def verify_dealer_recovery_otp(
+    req: DealerRecoveryVerifyEmailRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Verifies the 6-digit recovery OTP, unlocks any temporary lockout,
+    and generates a fresh RFC 6238 TOTP secret and QR code so the dealer can
+    bind their new phone / Authenticator and set a new password.
+    """
+    clean_email = req.email.strip().lower()
+    dealer = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.email == clean_email,
+        QuotationBankDealer.is_deleted == False
+    ).first()
+
+    if not dealer:
+        raise HTTPException(status_code=404, detail="No registered account found for this email.")
+
+    if not dealer.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your bank trading desk account has been deactivated. Contact your administrator."
+        )
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Check OTP expiration
+    if not dealer.pending_email_otp or not dealer.pending_email_otp_expires_at or now_utc > dealer.pending_email_otp_expires_at:
+        raise HTTPException(
+            status_code=400,
+            detail="The verification code has expired. Please request a new recovery code."
+        )
+
+    # Brute-force rate limiting
+    if dealer.pending_otp_failed_attempts >= 3:
+        dealer.pending_email_otp = None
+        dealer.pending_email_otp_expires_at = None
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail="Too many incorrect attempts. For security, this code has been invalidated. Please request a fresh code."
+        )
+
+    # Verify OTP constant time
+    if not verify_otp_code(req.otp_code, dealer.pending_email_otp):
+        dealer.pending_otp_failed_attempts += 1
+        db.commit()
+        rem = 3 - dealer.pending_otp_failed_attempts
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid recovery code. {rem} attempt(s) remaining."
+        )
+
+    # Recovery Code Verified! Clear pending email OTP and reset lockout
+    dealer.pending_email_otp = None
+    dealer.pending_email_otp_expires_at = None
+    dealer.pending_otp_failed_attempts = 0
+    dealer.email_verified_at = now_utc
+    dealer.locked_until = None
+    dealer.failed_login_attempts = 0
+
+    # Generate fresh RFC 6238 TOTP secret
+    totp_secret = generate_totp_secret()
+    dealer.totp_secret = totp_secret
+
+    bank_name = dealer.bank.name if dealer.bank else "Partner Bank"
+    otpauth_uri = generate_totp_uri(totp_secret, dealer.email, bank_name)
+    qr_code_base64 = generate_qr_code_base64(otpauth_uri)
+
+    # Issue Gate 1 -> Gate 2 Handover Token
+    handover_token = create_enrollment_handover_token(dealer.id, dealer.email, dealer.bank_id)
+    dealer.enrollment_token = handover_token
+    dealer.enrollment_token_expires_at = now_utc + timedelta(minutes=15)
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Recovery verified. Scan the new QR code on your phone and choose a new password.",
+        "enrollment_token": handover_token,
+        "totp_secret": totp_secret,
+        "otpauth_uri": otpauth_uri,
+        "qr_code_base64": qr_code_base64,
+        "email": dealer.email,
+        "bank_name": bank_name,
+        "full_name": dealer.full_name
+    }
+
+
+# ==============================================================================
 # DAY 1+ INSTANT LOGIN & DESK SESSION
 # ==============================================================================
 
@@ -519,6 +778,12 @@ async def dealer_login(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your bank trading desk account has been deactivated. Contact your administrator."
+        )
+
+    if dealer.bank and not dealer.bank.portal_access_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Trading portal access for {dealer.bank.name} has been disabled by platform administration."
         )
 
     now_utc = datetime.now(timezone.utc)
@@ -707,6 +972,7 @@ async def get_live_rfq_blotter(
                     "amount": float(leg.amount or 0),
                     "currency": leg.buy_currency,
                     "value_date": getattr(cfg, 'value_date', None) or leg.value_date or "Spot (T+2)",
+                    "allow_alternative_value_date": bool(getattr(cfg, 'allow_alternative_value_date', None) if (cfg and getattr(cfg, 'allow_alternative_value_date', None) is not None) else leg.allow_alternative_value_date),
                     "has_quote": leg_offer is not None,
                     "is_passed": is_passed
                 })
@@ -715,10 +981,17 @@ async def get_live_rfq_blotter(
                 # Bank was hidden from all legs
                 continue
 
-            summary_pair = f"Multi-Currency ({len(visible_legs)} Pairs)" if len(visible_legs) > 1 else visible_legs[0]["currency_pair"]
-            summary_amount = visible_legs[0]["amount"] if len(visible_legs) == 1 else sum(l["amount"] for l in visible_legs)
+            summary_pair = f"{len(visible_legs)} Legs Package" if len(visible_legs) > 1 else visible_legs[0]["currency_pair"]
+            distinct_currencies = list(dict.fromkeys(l["currency"] for l in visible_legs if l.get("currency")))
+            if len(distinct_currencies) == 1 and len(visible_legs) > 0:
+                summary_amount = sum(l["amount"] for l in visible_legs)
+                summary_currency = distinct_currencies[0]
+            else:
+                summary_amount = None
+                summary_currency = None
+
             summary_direction = visible_legs[0]["direction"] if len(visible_legs) == 1 else "PACKAGE"
-            summary_value_date = visible_legs[0]["value_date"] if len(visible_legs) == 1 else "Mixed Value Dates"
+            summary_value_date = visible_legs[0]["value_date"] if len(visible_legs) == 1 else "Multiple Dates"
             all_quoted = all(l["has_quote"] or l["is_passed"] for l in visible_legs) and any(l["has_quote"] for l in visible_legs)
             all_passed = all(l["is_passed"] for l in visible_legs)
         else:
@@ -762,7 +1035,7 @@ async def get_live_rfq_blotter(
             }
 
         customer_name = rfq.customer.name if rfq.customer else "Corporate Client"
-        entity_name = rfq.entity.name if getattr(rfq, 'entity', None) else None
+        entity_name = getattr(rfq.entity, 'entity_name', getattr(rfq.entity, 'name', None)) if getattr(rfq, 'entity', None) else None
 
         live_tickets.append({
             "assignment_id": asgn.id,
@@ -784,6 +1057,7 @@ async def get_live_rfq_blotter(
             "summary_amount": summary_amount,
             "summary_direction": summary_direction,
             "summary_value_date": summary_value_date,
+            "allow_alternative_value_date": bool(rfq.allow_alternative_value_date),
             "has_quoted": all_quoted,
             "has_passed": all_passed,
             "desk_lock": desk_lock,
@@ -854,13 +1128,16 @@ async def get_historical_trades_blotter(
         # Summary trading attributes
         if is_multi_leg:
             valid_legs = [l for l in rfq.legs if not l.is_deleted]
-            distinct_pairs = list(dict.fromkeys(l.currency_pair or f"{l.buy_currency}/{l.sell_currency}" for l in valid_legs if (l.currency_pair or (l.buy_currency and l.sell_currency))))
-            summary_pair = " & ".join(distinct_pairs) if distinct_pairs else "Multi-Leg"
+            summary_pair = f"{len(valid_legs)} Legs Package" if len(valid_legs) > 1 else (valid_legs[0].currency_pair or "FX Package")
             summary_direction = "PACKAGE"
-            summary_amount = sum(float(l.amount or 0) for l in valid_legs)
             distinct_currencies = list(dict.fromkeys(l.buy_currency for l in valid_legs if l.buy_currency))
-            summary_currency = "/".join(distinct_currencies) if distinct_currencies else "USD"
-            summary_value_date = valid_legs[0].value_date or "Spot (T+2)"
+            if len(distinct_currencies) == 1 and valid_legs:
+                summary_amount = sum(float(l.amount or 0) for l in valid_legs)
+                summary_currency = distinct_currencies[0]
+            else:
+                summary_amount = None
+                summary_currency = None
+            summary_value_date = "Multiple Dates" if len(set(l.value_date for l in valid_legs if l.value_date)) > 1 else (valid_legs[0].value_date or "Spot (T+2)")
         else:
             distinct_pairs = [f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")]
             summary_pair = distinct_pairs[0]
@@ -874,6 +1151,19 @@ async def get_historical_trades_blotter(
         dealer_tbills = [o for o in asgn.tbill_offers if not o.is_deleted]
         has_quoted = len(dealer_offers) > 0 or len(dealer_tbills) > 0
 
+        clean_my_email = (current_dealer.email or "").strip().lower()
+        my_offers = [o for o in dealer_offers if (o.submitted_by_email or "").strip().lower() == clean_my_email]
+        my_tbills = [o for o in dealer_tbills if (o.submitted_by_email or "").strip().lower() == clean_my_email]
+        quoted_by_me = len(my_offers) > 0 or len(my_tbills) > 0
+
+        from app.services.tenant_key_service import tenant_key_service
+        tenant_dek = None
+        if getattr(rfq, 'customer_id', None):
+            try:
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+            except Exception:
+                tenant_dek = None
+
         dealer_rate = None
         dealer_submitted_at = None
         dealer_submitted_by = None
@@ -881,13 +1171,13 @@ async def get_historical_trades_blotter(
 
         if dealer_offers:
             latest_offer = sorted(dealer_offers, key=lambda x: x.submitted_at or datetime.min, reverse=True)[0]
-            dealer_rate = float(latest_offer.price) if latest_offer.price is not None else None
+            dealer_rate = tenant_key_service.resolve_offer_price(latest_offer, tenant_dek) if latest_offer else None
             dealer_submitted_at = latest_offer.submitted_at.isoformat() if latest_offer.submitted_at else None
             dealer_submitted_by = latest_offer.submitted_by_email
             dealer_notes = latest_offer.notes
         elif dealer_tbills:
             latest_tbill = sorted(dealer_tbills, key=lambda x: x.submitted_at or datetime.min, reverse=True)[0]
-            dealer_rate = float(latest_tbill.discount_rate) if latest_tbill.discount_rate is not None else None
+            dealer_rate = tenant_key_service.resolve_tbill_discount_rate(latest_tbill, tenant_dek) if latest_tbill else None
             dealer_submitted_at = latest_tbill.submitted_at.isoformat() if latest_tbill.submitted_at else None
             dealer_submitted_by = latest_tbill.submitted_by_email
             dealer_notes = latest_tbill.notes
@@ -905,7 +1195,7 @@ async def get_historical_trades_blotter(
                     continue
                 pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
                 leg_offer = next((o for o in dealer_offers if str(o.leg_id or '') == str(leg.id)), None)
-                my_leg_rate = float(leg_offer.price) if (leg_offer and leg_offer.price is not None) else None
+                my_leg_rate = tenant_key_service.resolve_offer_price(leg_offer, tenant_dek) if leg_offer else None
                 
                 leg_is_won = (leg.winner_bank_id == current_dealer.bank_id)
                 leg_win_rate = float(leg.winner_rate or leg.eval_rate or 0) if (leg.winner_rate or leg.eval_rate) else None
@@ -967,6 +1257,20 @@ async def get_historical_trades_blotter(
                     "value_date": summary_value_date
                 })
 
+        # Determine if this won deal was won by the authenticated dealer specifically
+        is_won_by_me = False
+        if is_won:
+            if is_multi_leg:
+                for leg in rfq.legs:
+                    if leg.is_deleted or leg.winner_bank_id != current_dealer.bank_id:
+                        continue
+                    leg_my_offer = next((o for o in my_offers if str(o.leg_id or '') == str(leg.id)), None)
+                    if leg_my_offer:
+                        is_won_by_me = True
+                        break
+            else:
+                is_won_by_me = quoted_by_me
+
         # Calculate Market Rank and Pricing Delta
         all_rfq_offers = db.query(QuotationOffer).join(
             QuotationBankAssignment, QuotationOffer.assignment_id == QuotationBankAssignment.id
@@ -975,7 +1279,11 @@ async def get_historical_trades_blotter(
             QuotationOffer.is_deleted == False
         ).all()
 
-        all_prices = [float(o.price) for o in all_rfq_offers if o.price is not None]
+        all_prices = []
+        for o in all_rfq_offers:
+            p = tenant_key_service.resolve_offer_price(o, tenant_dek)
+            if p and p > 0:
+                all_prices.append(p)
         total_bidders = len(set(o.assignment_id for o in all_rfq_offers))
         dealer_rank = None
         spread_delta = None
@@ -1021,6 +1329,8 @@ async def get_historical_trades_blotter(
             "quotation_base": rfq.quotation_base or "Execution",
             "outcome": outcome_badge,
             "is_won": is_won,
+            "is_won_by_me": is_won_by_me,
+            "quoted_by_me": quoted_by_me,
             "has_quoted": has_quoted,
             "summary_pair": summary_pair,
             "summary_direction": summary_direction,
@@ -1046,8 +1356,23 @@ async def get_historical_trades_blotter(
 
     won_records = [h for h in history_records if h["is_won"]]
     quoted_records = [h for h in history_records if h["dealer_rate"] is not None]
-    total_volume_won = sum(h["summary_amount"] for h in won_records)
+    my_won_records = [h for h in won_records if h.get("is_won_by_me")]
+    my_quoted_records = [h for h in quoted_records if h.get("quoted_by_me")]
+    
+    # Calculate won volume broken down by currency without ever mixing currencies
+    won_volume_by_currency = {}
+    for h in won_records:
+        if h.get("all_legs_detail"):
+            for leg in h["all_legs_detail"]:
+                if leg.get("is_won"):
+                    c = leg.get("currency") or "USD"
+                    won_volume_by_currency[c] = won_volume_by_currency.get(c, 0.0) + float(leg.get("amount") or 0.0)
+        elif h.get("summary_amount") and h.get("summary_currency"):
+            c = h["summary_currency"]
+            won_volume_by_currency[c] = won_volume_by_currency.get(c, 0.0) + float(h["summary_amount"] or 0.0)
+
     win_rate = round((len(won_records) / len(quoted_records) * 100), 1) if quoted_records else 0.0
+    my_win_rate = round((len(my_won_records) / len(my_quoted_records) * 100), 1) if my_quoted_records else 0.0
     ranks = [h["dealer_rank"] for h in quoted_records if h["dealer_rank"] is not None]
     avg_rank = round(sum(ranks) / len(ranks), 1) if ranks else None
 
@@ -1056,7 +1381,12 @@ async def get_historical_trades_blotter(
         "bank_name": current_dealer.bank.name if current_dealer.bank else "Partner Bank",
         "total_deals": len(history_records),
         "won_deals_count": len(won_records),
-        "total_volume_won": total_volume_won,
+        "my_won_deals_count": len(my_won_records),
+        "quoted_deals_count": len(quoted_records),
+        "my_quoted_deals_count": len(my_quoted_records),
+        "my_win_rate_percent": my_win_rate,
+        "won_volume_by_currency": won_volume_by_currency,
+        "total_volume_won": won_volume_by_currency.get("USD", 0.0),
         "win_rate_percent": win_rate,
         "avg_dealer_rank": avg_rank,
         "records": history_records

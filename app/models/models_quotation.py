@@ -684,6 +684,8 @@ class QuotationBankDealer(BaseModel):
             "role": self.role,
             "is_totp_enrolled": bool(self.is_totp_enrolled),
             "is_active": bool(self.is_active),
+            "locked_until": self.locked_until.isoformat() if self.locked_until else None,
+            "failed_login_attempts": self.failed_login_attempts,
             "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }

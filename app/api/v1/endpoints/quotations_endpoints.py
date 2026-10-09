@@ -1379,24 +1379,7 @@ def create_rfq(
                             {},
                             email_settings,
                         )
-        else:
-            # Notify Corporate Admins
-            from app.models import User, UserRole
-            from app.models.models_quotation import QuotationNotification
-            admins = db.query(User).filter(
-                User.customer_id == current_user.customer_id,
-                User.role == UserRole.CORPORATE_ADMIN
-            ).all()
-            for admin in admins:
-                db.add(QuotationNotification(
-                    user_id=admin.id,
-                    type="RFQ_PENDING_APPROVAL",
-                    title="Action Required: New RFQ Pending Approval",
-                    message=f"A new {rfq.type} RFQ ({rfq.ref_no}) has been created by {current_user.user_id} and requires your approval.",
-                    link=f"/corporate-admin/quotations/history?rfq_id={rfq.id}",
-                    is_read=False
-                ))
-            db.commit()
+
         
         # Dispatch submission email to Corporate Admins and Common Communication List
         _dispatch_quotation_submission_email(
@@ -1432,8 +1415,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     w_end = _to_utc_dt(rfq.window_end)
 
     is_scheduled = bool(w_start and now < w_start)
-    # Align evaluation with 2s submission buffer: quotation only closes when buffer elapses
-    is_closed = bool(w_end and now > (w_end + timedelta(seconds=2))) and not is_scheduled
+    # The moment window_end is reached, the tender window is closed for execution evaluation
+    is_closed = bool(w_end and now >= w_end) and not is_scheduled
 
     # Resolve Acceptance Timeout and Default Action from Customer Configuration
     try:
@@ -2555,24 +2538,6 @@ def request_rfq_cancellation(
         rfq.cancellation_requested_at = now
         db.commit()
 
-        # Notify Corporate Admin
-        from app.models.models_quotation import QuotationNotification
-        from app.models import User, UserRole
-        admin_users = db.query(User).filter(
-            User.customer_id == current_user.customer_id,
-            User.role == UserRole.CORPORATE_ADMIN,
-            User.is_deleted == False
-        ).all()
-        for admin in admin_users:
-            db.add(QuotationNotification(
-                user_id=admin.id,
-                type="RFQ_CANCELLATION_REQUESTED",
-                title=f"Cancellation Requested: {rfq.ref_no}",
-                message=f"A cancellation request for RFQ {rfq.ref_no} ({rfq.type}) was submitted by maker. Reason: {payload.reason}",
-                link=f"/corporate-admin/quotations?rfq_id={rfq.id}",
-                is_read=False
-            ))
-        db.commit()
 
         log_action(
             db=db,
@@ -2912,24 +2877,7 @@ def retender_quotation(
                         {},
                         email_settings,
                     )
-    else:
-        # Notify Corporate Admins
-        from app.models import User, UserRole
-        from app.models.models_quotation import QuotationNotification
-        admins = db.query(User).filter(
-            User.customer_id == current_user.customer_id,
-            User.role == UserRole.CORPORATE_ADMIN
-        ).all()
-        for admin in admins:
-            db.add(QuotationNotification(
-                user_id=admin.id,
-                type="RFQ_PENDING_APPROVAL",
-                title=f"Action Required: Re-Tender RFQ {new_rfq.ref_no} Pending Approval",
-                message=f"Re-tender {new_rfq.ref_no} (of {parent.ref_no}) has been created and requires your approval.",
-                link=f"/corporate-admin/quotations/history?rfq_id={new_rfq.id}",
-                is_read=False
-            ))
-        db.commit()
+
 
     # Dispatch submission email to Corporate Admins and Common Communication List
     _dispatch_quotation_submission_email(
@@ -3321,25 +3269,6 @@ def resubmit_quotation(
     rfq.status = 'PENDING_APPROVAL'
     db.commit()
 
-    # Notify Corporate Admins
-    from app.models import User, UserRole
-    from app.models.models_quotation import QuotationNotification
-    admins = db.query(User).filter(
-        User.customer_id == current_user.customer_id,
-        User.role == UserRole.CORPORATE_ADMIN,
-        User.is_deleted == False
-    ).all()
-    user_note_text = f" Note: {payload.user_notes.strip()}" if payload.user_notes and payload.user_notes.strip() else ""
-    for admin in admins:
-        db.add(QuotationNotification(
-            user_id=admin.id,
-            type="RFQ_RESUBMITTED",
-            title=f"Revised RFQ {rfq.ref_no} Resubmitted for Approval",
-            message=f"Maker has addressed your notes and resubmitted RFQ {rfq.ref_no}.{user_note_text}",
-            link=f"/corporate-admin/quotations/history?rfq_id={rfq.id}",
-            is_read=False
-        ))
-    db.commit()
 
     # Step 3: Dispatch Email to Corporate Admins
     from app.services.quotation_approval_notifications import dispatch_rfq_resubmitted_email
@@ -3996,11 +3925,8 @@ def get_my_notifications(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Fetches the 20 most recent notifications for the logged-in user."""
-    from app.models.models_quotation import QuotationNotification
-    return db.query(QuotationNotification).filter(
-        QuotationNotification.user_id == current_user.user_id
-    ).order_by(QuotationNotification.created_at.desc()).limit(20).all()
+    """Fetches the 20 most recent notifications for the logged-in user (decommissioned)."""
+    return []
 
 @router.patch("/notifications/{notification_id}/read")
 def mark_notification_as_read(
@@ -4008,16 +3934,7 @@ def mark_notification_as_read(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Marks a specific notification as read."""
-    from app.models.models_quotation import QuotationNotification
-    notif = db.query(QuotationNotification).filter(
-        QuotationNotification.id == notification_id,
-        QuotationNotification.user_id == current_user.user_id
-    ).first()
-    if not notif:
-        raise HTTPException(status_code=404, detail="Notification not found")
-    notif.is_read = True
-    db.commit()
+    """Marks a specific notification as read (decommissioned)."""
     return {"message": "Notification marked as read"}
 
 @router.get("/export-csv")

@@ -11,7 +11,7 @@ from app.crud.base import log_action
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
     QuotationTBillOffer, QuotationBank, QuotationBankContactInvitation, QuotationAccessOTP, QuotationAnalytics,
-    QuotationNotification, QuotationBankLegConfig
+    QuotationBankLegConfig
 )
 from app.schemas.schemas_quotation import (
     FXSpotOfferCreate, FXSpotMultiOfferCreate, TBillOfferCreate, OTPRequestCreate, OTPVerifyCreate,
@@ -167,13 +167,21 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             detail="The validity of this quotation link has expired."
         )
 
+    from app.services.tenant_key_service import tenant_key_service
+    tenant_dek = None
+    if getattr(rfq, 'customer_id', None):
+        try:
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+        except Exception:
+            tenant_dek = None
+
     offers = []
     if rfq.type == 'TBILL':
         tbill_records = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == assignment.id).all()
         offers = [{
             "settlement_date": o.settlement_date,
             "maturity_date": o.maturity_date,
-            "discount_rate": o.discount_rate,
+            "discount_rate": tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek),
             "max_amount": o.max_amount,
             "notes": o.notes,
             "submitted_by_email": o.submitted_by_email,
@@ -184,7 +192,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         offer = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == assignment.id).order_by(QuotationOffer.submitted_at.desc()).first()
         if offer:
             offers = [{
-                "price": offer.price, 
+                "price": tenant_key_service.resolve_offer_price(offer, tenant_dek), 
                 "offered_value_date": offer.offered_value_date,
                 "notes": offer.notes,
                 "submitted_by_email": offer.submitted_by_email,
@@ -285,7 +293,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         leg_offers_list = []
         if leg_offer and not is_leg_passed:
             leg_offers_list.append({
-                "price": leg_offer.price,
+                "price": tenant_key_service.resolve_offer_price(leg_offer, tenant_dek),
                 "offered_value_date": str(leg_offer.offered_value_date).split('T')[0] if leg_offer.offered_value_date else None,
                 "notes": leg_offer.notes,
                 "submitted_by_email": leg_offer.submitted_by_email,
@@ -1385,18 +1393,6 @@ def submit_fx_offer(
     db.add(offer)
     db.commit()
 
-    # Notify Creator
-    from app.models.models_quotation import QuotationNotification
-    by_text = f" by {submitted_by}" if submitted_by else ""
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="NEW_OFFER",
-        title=f"New Quote: {rfq.ref_no}",
-        message=f"A quote of {offer_in.price:.4f} was submitted{by_text} for your {rfq.type} request.",
-        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-        is_read=False
-    ))
-    db.commit()
 
     # Calculate live rank if enabled
     live_rank_data = None
@@ -1626,25 +1622,6 @@ def submit_fx_offers_batch(
 
     db.commit()
 
-    # Notify Creator
-    from app.models.models_quotation import QuotationNotification
-    by_text = f" by {submitted_by}" if submitted_by else ""
-    if len(submitted_offers) > 0:
-        notif_title = f"New Quotes: {rfq.ref_no}"
-        notif_msg = f"{len(submitted_offers)} quote(s) were submitted{by_text} for your {rfq.type} request."
-    else:
-        notif_title = f"Bank Passed: {rfq.ref_no}"
-        notif_msg = f"Bank submitted an explicit pass on all {len(payload.passed_legs or [])} leg(s){by_text} for your {rfq.type} request."
-
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="NEW_OFFER",
-        title=notif_title,
-        message=notif_msg,
-        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-        is_read=False
-    ))
-    db.commit()
 
     # Calculate live ranks per leg only if bank is eligible in system-owner live ranking
     ranks_by_leg = {}
@@ -1821,18 +1798,6 @@ def submit_tbill_offer(
     
     db.commit()
 
-    # Notify Creator
-    from app.models.models_quotation import QuotationNotification
-    by_text = f" by {submitted_by}" if submitted_by else ""
-    db.add(QuotationNotification(
-        user_id=rfq.created_by_user_id,
-        type="NEW_OFFER",
-        title=f"New T-Bill Quote: {rfq.ref_no}",
-        message=f"A multi-line T-Bill quote was submitted{by_text} for your request {rfq.ref_no}.",
-        link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-        is_read=False
-    ))
-    db.commit()
 
     # Calculate live rank if enabled
     live_rank_data = None
@@ -2086,20 +2051,6 @@ async def approve_rfq_for_bank(
             )
             background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
 
-        # Notify Corporate Admin / Creator
-        db.add(QuotationNotification(
-            user_id=rfq.created_by_user_id,
-            type="BANK_APPROVED",
-            title=f"Bank Approved: {bank_name}",
-            message=f"{bank_name} approver ({approver_email}) approved participation for {rfq.ref_no} ({customer_name}).",
-            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-            is_read=False
-        ))
-
-    else:
-        # DECLINE
-        assignment.approval_status = "DECLINED"
-        
         # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
         if non_approver_emails:
             from app.services.unified_email_builder import build_alert_email_html
@@ -2119,16 +2070,6 @@ async def approve_rfq_for_bank(
                 platform_name="Grow Treasury Platform"
             )
             background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
-
-        # Notify Corporate Admin / Creator
-        db.add(QuotationNotification(
-            user_id=rfq.created_by_user_id,
-            type="BANK_DECLINED",
-            title=f"Bank Declined: {bank_name}",
-            message=f"{bank_name} approver ({approver_email}) declined participation for {rfq.ref_no}." + (f" Notes: {action_in.notes}" if action_in.notes else ""),
-            link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-            is_read=False
-        ))
 
     db.commit()
 

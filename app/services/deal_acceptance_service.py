@@ -395,7 +395,7 @@ def get_active_deal_awaiting_acceptance(
     uncomputed_query = db.query(QuotationRequest).filter(
         QuotationRequest.status.in_(['OPEN', 'PENDING', 'EVALUATING']),
         QuotationRequest.acceptance_status.is_(None),
-        QuotationRequest.window_end <= now_utc,
+        QuotationRequest.window_end <= (now_utc + timedelta(seconds=1)),
         QuotationRequest.window_end >= now_utc - timedelta(minutes=5)
     )
     if user_role != "super_admin":

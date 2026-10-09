@@ -1098,9 +1098,11 @@ class IssuanceService:
         
         candidates = []
         
+        ccy_code = request.currency.iso_code if getattr(request, 'currency', None) else f"ID:{request.currency_id}"
+        lg_name = request.lg_type.name if getattr(request, 'lg_type', None) else f"ID:{request.lg_type_id}"
         logger.info(
-            f"[FACILITY MATCH] Request {request_id}: lg_type_id={request.lg_type_id}, "
-            f"currency_id={request.currency_id}, amount={request.amount}, "
+            f"[FACILITY MATCH] Request {request_id}: lg_type='{lg_name}' (id={request.lg_type_id}), "
+            f"currency='{ccy_code}' (id={request.currency_id}), amount={request.amount:,.2f}, "
             f"is_cross_border={request.is_cross_border}, is_third_party={request.is_third_party}, "
             f"total facilities to evaluate={len(facilities)}"
         )
@@ -2545,9 +2547,12 @@ class IssuanceService:
         additional_text: str = "",
         use_special_wording: bool = False,
         field_overrides: dict = None,
+        is_companion: bool = False,
+        action_type: str = None,
     ) -> Dict[str, Any]:
         """
         Generates a signed letter PDF for an issuance request.
+        Supports both Standard Company Letters and Companion Bank Instruction Letters / Annexes.
         Uses the custody template system: customer-specific template → global fallback.
         
         Returns: { "pdf_bytes": bytes, "filename": str, "template_name": str }
@@ -2576,15 +2581,26 @@ class IssuanceService:
 
         # 2. Resolve template: customer-specific first, then global (language-aware)
         lg_lang = getattr(request, 'lg_language', 'EN') or 'EN'
+        target_action = "LG_BANK_COMPANION_LETTER" if is_companion else (action_type or "LG_ISSUANCE_REQUEST")
+        
         template = crud_template.get_single_template(
             db,
-            action_type="LG_ISSUANCE_REQUEST",
+            action_type=target_action,
             is_global=False,
             customer_id=customer_id,
             is_notification_template=False,
             language=lg_lang,
         )
         if not template:
+            template = crud_template.get_single_template(
+                db,
+                action_type=target_action,
+                is_global=True,
+                is_notification_template=False,
+                language=lg_lang,
+            )
+        # Fallback to standard request letter if companion template not found
+        if not template and is_companion:
             template = crud_template.get_single_template(
                 db,
                 action_type="LG_ISSUANCE_REQUEST",
@@ -2595,7 +2611,7 @@ class IssuanceService:
         if not template:
             raise HTTPException(
                 status_code=404,
-                detail="No template found for LG_ISSUANCE_REQUEST. Please create one in System Owner → Templates."
+                detail=f"No template found for {target_action}. Please create one in System Owner → Templates."
             )
 
         # 3. Resolve the bank name and bank account from the selected facility
@@ -2732,6 +2748,24 @@ class IssuanceService:
             "custom_field_1_value": request.custom_field_1_value or "",
             "custom_field_2_label": custom_field_2_label,
             "custom_field_2_value": request.custom_field_2_value or "",
+
+            # Cross-Border & Companion Letter Enriched Placeholders
+            "is_cross_border": "true" if getattr(request, 'is_cross_border', False) else "",
+            "requires_special_wording": "true" if getattr(request, 'requires_special_wording', False) else "",
+            "facility_reference": (facility.reference_number or "") if facility else "",
+            "advising_bank_name": ((request.cross_border_details or {}).get("advising_bank_name", "")),
+            "advising_bank_swift": ((request.cross_border_details or {}).get("advising_bank_swift", "")),
+            "advising_bank_country": ((request.cross_border_details or {}).get("advising_bank_country", "")),
+            "governing_law_country": ((request.cross_border_details or {}).get("governing_law_country", "")),
+            "applicable_rules": {
+                "URDG_758": "URDG 758 (ICC Uniform Rules for Demand Guarantees)",
+                "ISP_98": "ISP98 (International Standby Practices)",
+                "LOCAL_LAW": "Local Governing Law",
+            }.get(getattr(request, 'applicable_rules', '') or '', getattr(request, 'applicable_rules', '') or "URDG 758 (ICC Uniform Rules for Demand Guarantees)"),
+            "counter_guarantee_expiry_date": (
+                (request.requested_expiry_date + __import__('datetime').timedelta(days=14)).strftime("%d-%b-%Y")
+                if request.requested_expiry_date else "N/A"
+            ),
         }
 
         # 5b. Apply user overrides from missing fields panel

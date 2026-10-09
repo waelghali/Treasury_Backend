@@ -10,9 +10,10 @@ Uses pypdf for reading/writing PDF forms.
 """
 
 import io
+import re
 import logging
 from typing import Dict, Any, Optional, List
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from app.core.date_utils import calculate_projected_expiry, format_period_sentence
 
@@ -27,6 +28,8 @@ DATE_FORMAT_MAP = {
     "DD-MM-YYYY": "%d-%m-%Y",
     "MM/DD/YYYY": "%m/%d/%Y",
     "YYYY-MM-DD": "%Y-%m-%d",
+    "YYYY MM DD": "%Y %m %d",
+    "DD MM YYYY": "%d %m %Y",
     "YYYYMMDD": "%Y%m%d",
     "DD-MMM-YYYY": "%d-%b-%Y",
     "DD.MM.YYYY": "%d.%m.%Y",
@@ -38,6 +41,7 @@ DATE_FORMAT_MAP = {
     "DDMMYY": "%d%m%y",
     "DDMMYYYY": "%d%m%Y",
     "YY/MM/DD": "%y/%m/%d",
+    "YY MM DD": "%y %m %d",
     # Single component variants for split-box forms
     "DD": "%d",
     "MM": "%m",
@@ -45,16 +49,52 @@ DATE_FORMAT_MAP = {
     "YY": "%y",
 }
 
+def _parse_date_flexible(val) -> Optional[date]:
+    """Parses various date representations (date, datetime, ISO strings, slash strings, dot strings)."""
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    if not val or not isinstance(val, str):
+        return None
+    val_clean = val.strip()[:10]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d.%m.%Y", "%Y%m%d", "%Y %m %d", "%d %m %Y"):
+        try:
+            return datetime.strptime(val_clean, fmt).date()
+        except ValueError:
+            pass
+    return None
+
 def _format_date(value, date_format: str = None) -> str:
-    """Format a date value according to the specified format string."""
-    if not isinstance(value, date):
+    """Format a date or date-string according to the specified format string."""
+    parsed_date = _parse_date_flexible(value)
+    if not parsed_date:
         return str(value) if value else ""
     
-    if date_format and date_format.upper() in DATE_FORMAT_MAP:
-        return value.strftime(DATE_FORMAT_MAP[date_format.upper()])
+    if not date_format:
+        return parsed_date.strftime("%d/%m/%Y")
     
-    # Default format
-    return value.strftime("%d/%m/%Y")
+    clean_fmt = date_format.strip().upper()
+    if clean_fmt in DATE_FORMAT_MAP:
+        return parsed_date.strftime(DATE_FORMAT_MAP[clean_fmt])
+    
+    # Dynamic token replacement for custom formats (e.g. 'YYYY MM DD', 'YYYY  MM  DD', 'DD / MM / YYYY')
+    py_fmt = date_format
+    token_pairs = [
+        ('YYYY', '%Y'),
+        ('YY', '%y'),
+        ('MMMM', '%B'),
+        ('MMM', '%b'),
+        ('MM', '%m'),
+        ('DD', '%d'),
+    ]
+    for token, py_tok in token_pairs:
+        py_fmt = re.sub(re.escape(token), py_tok, py_fmt, flags=re.IGNORECASE)
+    
+    try:
+        return parsed_date.strftime(py_fmt)
+    except Exception:
+        return parsed_date.strftime("%d/%m/%Y")
 
 
 # ---------------------------------------------------------------------------
@@ -499,10 +539,13 @@ def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PR
     
     # --- Compute additional_conditions ---
     conditions_parts = []
-    if bool(getattr(request, 'requires_special_wording', False)):
-        conditions_parts.append("As per attached special wording")
+    ref_label = getattr(request, 'serial_number', None) or f"REQ-{request.id}"
+    if bool(getattr(request, 'is_cross_border', False)) or bool(getattr(request, 'requires_special_wording', False)):
+        conditions_parts.append(f"As per attached Bank Instruction Letter & Annex (Ref: {ref_label})")
+    elif bool(getattr(request, 'requires_special_wording', False)):
+        conditions_parts.append(f"As per attached special wording (Ref: {ref_label})")
     if bool(getattr(request, 'is_cross_border', False)):
-        conditions_parts.append("Cross-border Letter of Guarantee")
+        conditions_parts.append("Cross-border SWIFT MT760")
     if data.get("applicable_rules_text"):
         conditions_parts.append(data["applicable_rules_text"])
     data["additional_conditions"] = " / ".join(conditions_parts)
@@ -541,6 +584,21 @@ def build_request_data_dict(request, db=None, bank_id=None, form_role: str = "PR
     data["amount_in_words"] = (
         f"{currency_code} {amount_val:,.2f} \u2014 {_words_only}" if currency_code else _words_only
     )
+    
+    # Contract Percentage (% of LG from total contract/reference amount)
+    ref_amount_val = float(request.reference_amount) if getattr(request, 'reference_amount', None) else 0
+    if ref_amount_val > 0 and amount_val > 0:
+        calc_pct = (amount_val / ref_amount_val) * 100.0
+        pct_formatted = f"{calc_pct:.1f}%" if calc_pct % 1 else f"{int(calc_pct)}%"
+        pct_num = f"{calc_pct:.1f}" if calc_pct % 1 else f"{int(calc_pct)}"
+    else:
+        pct_formatted = ""
+        pct_num = ""
+    data["contract_percentage"] = pct_formatted
+    data["contract_percentage_num"] = pct_num
+    data["lg_percentage_of_contract"] = pct_formatted
+    data["reference_amount_percentage"] = pct_formatted
+    data["margin_percentage"] = getattr(request, 'margin_percentage', '') or pct_formatted
     
     # LG Type — text AND boolean flags for checkbox matching
     lg_type_name = ""
@@ -807,20 +865,36 @@ def generate_overlay_pdf(
             if field_type == "checkbox":
                 is_checked = bool(value) and str(value).lower() not in ("", "0", "false", "no", "none")
                 if is_checked:
-                    c.setFont("Helvetica-Bold", max(8, font_size))
-                    c.drawString(x, y, "X")
+                    cb_font_size = max(8, min(10, font_size if font_size else 9))
+                    string_width = c.stringWidth("X", "Helvetica-Bold", cb_font_size)
+                    cap_height = cb_font_size * 0.718
+                    
+                    # Target checkbox box dimension in PDF points.
+                    # Frontend renders checkboxes as a fixed 14px x 14px square box at (x_pct, y_pct).
+                    # On the 850px-wide canvas, 14px corresponds to 14.0 * (pw / 850.0) PDF points (~10.08 pt for Letter, 9.8 pt for A4).
+                    # Checkbox bounding boxes are always square; never let leftover or wide width_pct distort the placement.
+                    box_w = 14.0 * (pw / 850.0)
+                    box_h = box_w
+                    
+                    if x_pct is not None and y_pct is not None:
+                        # Center 'X' horizontally inside the 14px box
+                        cb_x = x + (box_w - string_width) / 2.0
+                        # Center 'X' vertically inside the 14px box
+                        y_top = (1.0 - float(y_pct) / 100.0) * ph
+                        cb_y = y_top - (box_h / 2.0) - (cap_height / 2.0)
+                    else:
+                        cb_x = x
+                        cb_y = y
+                    
+                    t = c.beginText(cb_x, cb_y)
+                    t.setFont("Helvetica-Bold", cb_font_size)
+                    t.setCharSpace(0)
+                    t.textOut("X")
+                    c.drawText(t)
                     filled_count += 1
                 continue
-            elif field_type == "date" or isinstance(value, date):
-                if isinstance(value, str) and value:
-                    try:
-                        from datetime import datetime as dt
-                        parsed = dt.strptime(value.strip()[:10], "%Y-%m-%d").date()
-                        value = _format_date(parsed, date_format)
-                    except (ValueError, TypeError):
-                        pass
-                elif isinstance(value, date):
-                    value = _format_date(value, date_format)
+            elif field_type == "date" or isinstance(value, (date, datetime)):
+                value = _format_date(value, date_format)
             elif isinstance(value, (int, float, Decimal)):
                 value = f"{float(value):,.2f}" if isinstance(value, (float, Decimal)) else str(value)
             
@@ -828,17 +902,16 @@ def generate_overlay_pdf(
             if not value:
                 continue
             
-            # Draw text at the specified position with character spacing support
+            # Draw text at the specified position with explicit character spacing control
+            # Note: in PDF/ReportLab, setCharSpace sets the persistent 'Tc' text state.
+            # We MUST explicitly pass char_spacing (or 0) on every text object to prevent
+            # state leakage between fields.
             char_spacing = float(entry.get("char_spacing", 0))
-            if char_spacing > 0:
-                t = c.beginText(x, y)
-                t.setFont("Helvetica", font_size)
-                t.setCharSpace(char_spacing)
-                t.textOut(value)
-                c.drawText(t)
-            else:
-                c.setFont("Helvetica", font_size)
-                c.drawString(x, y, value)
+            t = c.beginText(x, y)
+            t.setFont("Helvetica", font_size)
+            t.setCharSpace(char_spacing if char_spacing > 0 else 0)
+            t.textOut(value)
+            c.drawText(t)
             filled_count += 1
             logger.debug(
                 f"Overlay: p{page_num} '{mapped_to}' → '{value[:30]}' | "

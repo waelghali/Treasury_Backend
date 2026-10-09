@@ -9,7 +9,7 @@ from apscheduler.triggers.date import DateTrigger
 from app.database import SessionLocal, get_db
 from app.models.models import AuditLog
 from app.models.models_quotation import (
-    QuotationRequest, QuotationBank, QuotationBankAssignment, QuotationNotification
+    QuotationRequest, QuotationBank, QuotationBankAssignment
 )
 from app.core.email_service import get_customer_email_settings, send_email
 from app.services.unified_email_builder import build_quotation_rfq_bank_email
@@ -192,17 +192,7 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
                     await send_email(db, all_bank_emails, subject, body, {}, email_settings)
                     emails_sent += len(all_bank_emails)
 
-        # Notify End User Maker
-        if rfq.created_by_user_id:
-            db.add(QuotationNotification(
-                user_id=rfq.created_by_user_id,
-                type="RFQ_DISPATCHED",
-                title=f"RFQ {rfq.ref_no} Released to Banks",
-                message=f"Your {rfq.type} quotation request has been released and invitations dispatched to banks.",
-                link=f"/end-user/quotations/history?rfq_id={rfq.id}",
-                is_read=False
-            ))
-            db.commit()
+
 
         # Schedule 15m reminder before bidding window starts if lead time >= 60m
         try:

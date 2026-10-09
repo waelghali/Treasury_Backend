@@ -333,6 +333,17 @@ class DealerAchievementService:
                                 getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED', 'INCONCLUSIVE', 'EXPIRED')
                             ]
 
+                            # Check if this dealer submitted offers for this RFQ
+                            dealer_submitted_any_offer = any(
+                                (o.leg_id == l.id if hasattr(l, 'id') and l != rfq else o.assignment_id == asgn.id)
+                                for l in eligible_exec_legs
+                                for o in fx_offers
+                            ) or any(o.assignment_id == asgn.id for o in fx_offers)
+
+                            # If dealer did not submit an offer on this tender, it is a Neutral Wash (streak is preserved)
+                            if not dealer_submitted_any_offer:
+                                continue
+
                             competitor_won_any = any(
                                 (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) != bank_id_val
                                 for l in awarded_legs
@@ -510,6 +521,14 @@ class DealerAchievementService:
                                 if (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) and
                                 getattr(l, 'status', None) not in ('REJECTED', 'CANCELLED', 'DECLINED', 'INCONCLUSIVE', 'EXPIRED')
                             ]
+
+                            # Check if the bank desk submitted offers for this RFQ
+                            desk_submitted_any_offer = any(
+                                o.assignment_id == asgn.id for o in fx_offers
+                            )
+                            # If desk did not quote on this tender, it is a Neutral Wash (streak is preserved)
+                            if not desk_submitted_any_offer:
+                                continue
 
                             competitor_won_any = any(
                                 (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) != bank_id
@@ -811,16 +830,20 @@ class DealerAchievementService:
 
         res = {
             "id": trophy_id,
+            "trophy_id": trophy_id,
             "title": display_title,
             "base_title": title,
+            "current_tier_title": display_title if tier != "NONE" else None,
             "icon": icon,
             "category": category,
             "description": description,
             "current_value": current_value,
             "target_value": target_val,
+            "next_milestone": target_val if next_tier != "MAX" else None,
             "current_tier": tier,
             "next_tier": next_tier,
             "progress_percent": round(progress_pct, 1),
+            "progress_pct": round(progress_pct, 1),
             "unit": unit,
             "is_currency": is_currency,
             "milestones": milestones
@@ -1055,6 +1078,22 @@ class DealerAchievementService:
 
                 if not eligible_exec_legs:
                     # Bank was not invited to any execution legs in this tender (e.g. Indicative or Invisible only)
+                    continue
+
+                # Check if the bank desk submitted offers for this RFQ
+                desk_offers = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == asgn.id).all()
+                if not desk_offers:
+                    audit_trail.append({
+                        "rfq_id": rfq.id,
+                        "ref_no": rfq.ref_no,
+                        "date": dt_str,
+                        "type": rfq.type,
+                        "status": rfq.status,
+                        "transition": "Preserved",
+                        "badge": "WASH",
+                        "running_streak": running_streak,
+                        "reason": "No quotes submitted by bank desk (Abstained / Neutral Wash)"
+                    })
                     continue
 
                 awarded_legs = [

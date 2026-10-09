@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    @page {
+        size: A4 portrait;
+        margin: 20mm 15mm 20mm 15mm;
+        @bottom-right {
+            content: "Page " counter(page) " of " counter(pages);
+            font-size: 8pt;
+            color: #777;
+        }
+    }
+    body {
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        font-size: 10pt;
+        line-height: 1.5;
+        color: #1e293b;
+        margin: 0;
+        padding: 0;
+    }
+    .header-table {
+        width: 100%;
+        border-bottom: 2px solid #0f172a;
+        padding-bottom: 12px;
+        margin-bottom: 20px;
+    }
+    .company-title {
+        font-size: 16pt;
+        font-weight: bold;
+        color: #0f172a;
+        letter-spacing: 0.5px;
+    }
+    .company-sub {
+        font-size: 9pt;
+        color: #64748b;
+        margin-top: 2px;
+    }
+    .doc-badge {
+        text-align: right;
+        font-size: 9pt;
+        color: #475569;
+    }
+    .doc-badge strong {
+        color: #0f172a;
+        font-size: 10pt;
+    }
+    .recipient-box {
+        margin-bottom: 16px;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        padding: 10px 14px;
+    }
+    .recipient-box table {
+        width: 100%;
+    }
+    .recipient-box td {
+        vertical-align: top;
+        font-size: 9.5pt;
+    }
+    .subject-banner {
+        background: #0f172a;
+        color: #ffffff;
+        padding: 8px 14px;
+        font-size: 11pt;
+        font-weight: bold;
+        border-radius: 4px;
+        margin-bottom: 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .legal-binding-box {
+        background: #f1f5f9;
+        border-left: 4px solid #0284c7;
+        padding: 10px 14px;
+        margin-bottom: 16px;
+        font-size: 8.5pt;
+        line-height: 1.45;
+        color: #334155;
+        text-align: justify;
+    }
+    .legal-binding-box strong {
+        color: #0f172a;
+    }
+    .section-title {
+        font-size: 10pt;
+        font-weight: bold;
+        color: #0f172a;
+        border-bottom: 1.5px solid #cbd5e1;
+        padding-bottom: 4px;
+        margin-top: 14px;
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+    }
+    .details-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 14px;
+    }
+    .details-table th {
+        background: #f1f5f9;
+        color: #334155;
+        text-align: left;
+        padding: 6px 10px;
+        font-size: 8.5pt;
+        border: 1px solid #cbd5e1;
+    }
+    .details-table td {
+        padding: 6px 10px;
+        border: 1px solid #e2e8f0;
+        font-size: 9pt;
+        vertical-align: top;
+    }
+    .details-table tr:nth-child(even) td {
+        background: #fafafa;
+    }
+    .label-col {
+        font-weight: bold;
+        color: #475569;
+        width: 30%;
+    }
+    .cross-border-box {
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 14px;
+    }
+    .cross-border-box .section-title {
+        color: #1e40af;
+        border-bottom: 1.5px solid #93c5fd;
+        margin-top: 0;
+    }
+    .special-wording-box {
+        background: #fefce8;
+        border-left: 4px solid #eab308;
+        padding: 8px 12px;
+        margin-bottom: 12px;
+        font-size: 8.5pt;
+        color: #713f12;
+    }
+    .instructions-box {
+        background: #f8fafc;
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        padding: 8px 12px;
+        margin-bottom: 14px;
+        font-size: 8.5pt;
+        color: #334155;
+    }
+    .signature-section {
+        margin-top: 25px;
+        width: 100%;
+        page-break-inside: avoid;
+    }
+    .signature-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    .signature-box {
+        width: 48%;
+        border: 1px dashed #94a3b8;
+        border-radius: 6px;
+        padding: 12px;
+        height: 75px;
+        vertical-align: top;
+        font-size: 8.5pt;
+        color: #64748b;
+    }
+</style>
+</head>
+<body>
+
+<!-- Corporate Header -->
+<table class="header-table">
+    <tr>
+        <td style="width: 65%;">
+            <div class="company-title">{{customer_name}}</div>
+            <div class="company-sub">{{entity_name}}{{#if customer_address}} &bull; {{customer_address}}{{/if}}</div>
+        </td>
+        <td class="doc-badge" style="width: 35%;">
+            <div>Date: <strong>{{current_date}}</strong></div>
+            <div>Application Ref: <strong>{{serial_number}}</strong></div>
+            {{#if facility_reference}}<div>Facility Ref: <strong>{{facility_reference}}</strong></div>{{/if}}
+        </td>
+    </tr>
+</table>
+
+<!-- Recipient Bank -->
+<div class="recipient-box">
+    <table>
+        <tr>
+            <td style="width: 50%;">
+                <strong style="color: #0f172a;">To: {{bank_name}}</strong><br>
+                Trade Finance & Guarantee Operations<br>
+                Branch: {{branch_name}}
+            </td>
+            <td style="width: 50%; text-align: right;">
+                Debit Account: <strong>{{account_number}}</strong><br>
+                Account Name: {{account_name}}<br>
+                CIF Number: <strong>{{customer_number}}</strong>
+            </td>
+        </tr>
+    </table>
+</div>
+
+<!-- Subject Banner -->
+<div class="subject-banner">
+    Bank Instruction Letter & Annex &mdash; {{lg_type}}
+</div>
+
+<!-- Legal Binding Clause extending the official Bank Form -->
+<div class="legal-binding-box">
+    <strong>LEGAL STATUS & INTEGRAL RELATIONSHIP TO OFFICIAL APPLICATION FORM:</strong><br>
+    This Bank Instruction Letter and Annex constitutes an integral, complementary, and indivisible part of the official 
+    <strong>{{bank_name}}</strong> Application Form for Issuance of Letter of Guarantee (Application Reference: <strong>{{serial_number}}</strong>, Dated: <strong>{{issue_date}}</strong>). 
+    All representations, warranties, indemnities, obligations, and general banking terms and conditions contained in or applicable to the said official Application Form 
+    are hereby fully ratified, reaffirmed, and incorporated herein by reference, and shall apply mutatis mutandis to this Instruction Letter and to the Letter of Guarantee issued pursuant hereto.
+</div>
+
+<!-- Core Guarantee Specifications -->
+<div class="section-title">1. Guarantee Specifications</div>
+<table class="details-table">
+    <tr>
+        <td class="label-col">Guarantee Type</td>
+        <td><strong>{{lg_type}}</strong></td>
+        <td class="label-col">Effective Issue Date</td>
+        <td>{{issue_date}}</td>
+    </tr>
+    <tr>
+        <td class="label-col">Guarantee Amount</td>
+        <td><strong style="font-size: 10.5pt; color: #0f172a;">{{currency_code}} {{amount}}</strong></td>
+        <td class="label-col">Validity / Expiry Date</td>
+        <td><strong style="color: #0f172a;">{{expiry_date}}</strong></td>
+    </tr>
+    <tr>
+        <td class="label-col">Amount in Words</td>
+        <td colspan="3"><strong>{{amount_in_words}}</strong></td>
+    </tr>
+    <tr>
+        <td class="label-col">Beneficiary Name</td>
+        <td colspan="3"><strong style="color: #0f172a;">{{beneficiary_name}}</strong></td>
+    </tr>
+    {{#if beneficiary_address}}
+    <tr>
+        <td class="label-col">Beneficiary Address</td>
+        <td colspan="3">{{beneficiary_address}}</td>
+    </tr>
+    {{/if}}
+    <tr>
+        <td class="label-col">Tender / Contract Ref</td>
+        <td>{{reference_type}} &mdash; {{reference_number}}</td>
+        <td class="label-col">Project / Purpose</td>
+        <td>{{purpose}}</td>
+    </tr>
+</table>
+
+<!-- Cross-Border Correspondent Bank Section (Conditioned) -->
+{{#if is_cross_border}}
+<div class="cross-border-box">
+    <div class="section-title">2. Cross-Border & Correspondent Bank Routing (SWIFT MT760)</div>
+    <table class="details-table" style="margin-bottom: 0;">
+        <tr>
+            <td class="label-col">Transmission Channel</td>
+            <td><strong>SWIFT MT760 Counter-Guarantee</strong> (Instructing Foreign Correspondent Bank)</td>
+        </tr>
+        <tr>
+            <td class="label-col">Advising / Issuing Bank</td>
+            <td><strong style="font-size: 10pt; color: #1e3a8a;">{{advising_bank_name}}</strong></td>
+        </tr>
+        <tr>
+            <td class="label-col">Correspondent SWIFT BIC</td>
+            <td><strong style="font-family: monospace; font-size: 10.5pt; color: #1e3a8a;">{{advising_bank_swift}}</strong></td>
+        </tr>
+        <tr>
+            <td class="label-col">Host Country & City</td>
+            <td>{{advising_bank_country}}</td>
+        </tr>
+        <tr>
+            <td class="label-col">Applicable Standard Rules</td>
+            <td><strong>{{applicable_rules}}</strong></td>
+        </tr>
+        <tr>
+            <td class="label-col">Counter-Guarantee Expiry</td>
+            <td><strong>{{counter_guarantee_expiry_date}}</strong> <em>(Includes standard claim presentation window)</em></td>
+        </tr>
+        {{#if governing_law_country}}
+        <tr>
+            <td class="label-col">Governing Law</td>
+            <td>{{governing_law_country}}</td>
+        </tr>
+        {{/if}}
+    </table>
+</div>
+{{/if}}
+
+<!-- Special Wording / Text Annex Notification -->
+{{#if requires_special_wording}}
+<div class="special-wording-box">
+    <strong>PROJECT SPECIAL WORDING (ANNEX 1):</strong><br>
+    Please issue the guarantee strictly incorporating the project text set forth in <strong>Annex 1</strong> attached hereto. No standard text alterations or omissions may be introduced without prior written approval from the undersigned Applicant.
+</div>
+{{/if}}
+
+<!-- Special Conditions / Instructions -->
+{{#if other_instructions}}
+<div class="instructions-box">
+    <strong style="color: #0f172a;">ADDITIONAL OPERATIONAL INSTRUCTIONS:</strong><br>
+    {{other_instructions}}
+</div>
+{{/if}}
+
+<!-- Account Debit Authorization -->
+<div style="font-size: 8.5pt; color: #475569; margin: 12px 0; line-height: 1.4;">
+    We hereby confirm our authorization to debit our aforementioned account for all standard issuance commissions, correspondent bank transmission charges, and relevant out-of-pocket expenses in connection with this transaction.
+</div>
+
+<!-- Signatures -->
+<div class="signature-section">
+    <table class="signature-table">
+        <tr>
+            <td class="signature-box" style="margin-right: 4%;">
+                <strong>For and on behalf of:</strong><br>
+                <strong style="font-size: 9.5pt; color: #0f172a;">{{customer_name}}</strong><br>
+                <span style="font-size: 8pt; color: #64748b;">{{entity_name}}</span>
+                <div style="margin-top: 25px; border-top: 1px solid #94a3b8; padding-top: 4px; font-weight: bold;">
+                    Authorized Signatory &amp; Stamp
+                </div>
+            </td>
+            <td style="width: 4%;"></td>
+            <td class="signature-box">
+                <strong>Second Authorized Signatory (If Required):</strong><br>
+                <span style="font-size: 8pt; color: #64748b;">Per Corporate Mandate</span>
+                <div style="margin-top: 40px; border-top: 1px solid #94a3b8; padding-top: 4px; font-weight: bold;">
+                    Authorized Signatory
+                </div>
+            </td>
+        </tr>
+    </table>
+</div>
+
+</body>
+</html>

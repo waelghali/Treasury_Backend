@@ -73,18 +73,6 @@ def get_statements(
 ):
     return crud_bank_statement.get_by_customer(db, customer_id=current_user.customer_id)
 
-@router.get("/erp-records", response_model=List[InternalLedgerRecordOut])
-def get_erp_records(
-    status: Optional[str] = None,
-    limit: int = 200,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
-):
-    """
-    Returns simulated or integrated internal ERP ledger records (AP Bills, AR Invoices, LG Fees, Payroll).
-    """
-    return crud_internal_ledger.get_by_customer(db, customer_id=current_user.customer_id, status=status, limit=limit)
-
 
 @router.get("/statements/{statement_id}/transactions", response_model=List[BankTransactionOut])
 def get_statement_transactions(
@@ -924,6 +912,7 @@ def get_erp_records(
     limit: int = 500,
     skip: int = 0,
     is_reconciled: Optional[bool] = None,
+    status: Optional[str] = None,
     search: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_corporate_admin)
@@ -936,6 +925,8 @@ def get_erp_records(
     )
     if is_reconciled is not None:
         query = query.filter(InternalLedgerRecord.is_reconciled == is_reconciled)
+    if status:
+        query = query.filter(InternalLedgerRecord.status == status)
     if search:
         s = f"%{search}%"
         query = query.filter(

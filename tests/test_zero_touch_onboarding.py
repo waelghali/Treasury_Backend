@@ -123,6 +123,78 @@ def test_zero_touch_activation_and_reset_roundtrip():
         db.close()
 
 
+def test_corporate_admin_host_blind_protection():
+    from fastapi import HTTPException
+    from app.schemas.all_schemas import UserUpdateCorporateAdmin
+    from app.core.security import TokenData
+    from unittest.mock import patch
+
+    db = SessionLocal()
+    try:
+        cust = db.query(Customer).first()
+        assert cust is not None, "Customer required for test"
+
+        test_email = f"ca_target_{int(datetime.now().timestamp())}@testcorp.com"
+        target_user = User(
+            email=test_email,
+            password_hash="initial_hash_val",
+            role=UserRole.END_USER,
+            customer_id=cust.id,
+            must_change_password=True
+        )
+        db.add(target_user)
+        db.flush()
+
+        # 1. Direct password update via crud_user.update_user_by_corporate_admin must be rejected (400 Host-Blind)
+        update_in = UserUpdateCorporateAdmin(password="AttemptedManualPass123!")
+        try:
+            crud_user.update_user_by_corporate_admin(db, target_user, update_in, cust.id, user_id_caller=999)
+            assert False, "Should have raised HTTPException 400"
+        except HTTPException as exc:
+            assert exc.status_code == 400
+            assert "Host-Blind" in exc.detail
+            print("[Pass] Corporate Admin direct password update blocked by Host-Blind protection (HTTP 400)")
+
+        # 2. Admin set password via auth_service must be rejected for Corporate Admin (403 Host-Blind)
+        from app.schemas.all_schemas import AdminUserUpdate
+        admin_update = AdminUserUpdate(
+            new_password="NewSecretAdminPass123!",
+            confirm_new_password="NewSecretAdminPass123!",
+            force_change_on_next_login=True
+        )
+        ca_context = TokenData(user_id=888, email="corp_admin@testcorp.com", role=UserRole.CORPORATE_ADMIN, customer_id=cust.id)
+
+        async def test_admin_set():
+            return await auth_service.admin_set_user_password(db, target_user.id, admin_update, ca_context, "127.0.0.1")
+
+        try:
+            asyncio.run(test_admin_set())
+            assert False, "Should have raised HTTPException 403"
+        except HTTPException as exc:
+            assert exc.status_code == 403
+            assert "Host-Blind" in exc.detail
+            print("[Pass] Corporate Admin admin_set_user_password blocked by Host-Blind protection (HTTP 403)")
+
+        # 3. Role-aware activation link dispatch for End User / Checker
+        async def run_checker_activation():
+            target_user.role = UserRole.CHECKER
+            with patch("app.services.customer_onboarding_service.send_email", return_value=(True, None)):
+                return await send_corporate_admin_activation_email(db, target_user, cust.name)
+
+        success, err = asyncio.run(run_checker_activation())
+        assert success is True
+        print("[Pass] Role-aware activation email successfully dispatched for Checker")
+
+        # Cleanup
+        active_tokens = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == target_user.id).all()
+        for tok in active_tokens:
+            db.delete(tok)
+        target_user.is_deleted = True
+        db.commit()
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     print("=" * 65)
     print("Grow Treasury — Quick Win #1 Zero-Touch Onboarding Test Suite")
@@ -130,6 +202,7 @@ if __name__ == "__main__":
     test_schema_optional_password()
     test_crud_auto_random_password()
     test_zero_touch_activation_and_reset_roundtrip()
+    test_corporate_admin_host_blind_protection()
     print("-" * 65)
     print("ALL ZERO-TOUCH ONBOARDING TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 65)

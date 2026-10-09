@@ -431,25 +431,12 @@ class CRUDUser(CRUDBase):
         update_data = user_in.model_dump(exclude_unset=True)
         changed_fields = {} # To track changes for audit logging
 
-        # Handle password update if provided
+        # Zero-Touch / Host-Blind Protection: Corporate Admins cannot directly set or overwrite user passwords
         if "password" in update_data and update_data["password"]:
-            db_user.set_password(update_data.pop("password"))
-            changed_fields["password"] = {"old": "[HIDDEN]", "new": "[SET]"}
-            # If password is changed, must_change_password flag might be relevant (e.g., reset)
-            if user_in.must_change_password is not None:
-                if db_user.must_change_password != user_in.must_change_password:
-                    changed_fields["must_change_password"] = {
-                        "old": db_user.must_change_password,
-                        "new": user_in.must_change_password
-                    }
-                db_user.must_change_password = user_in.must_change_password
-            else: # If password is set but must_change_password is not explicitly provided, default to False
-                if db_user.must_change_password: # Only change if currently True
-                    changed_fields["must_change_password"] = {
-                        "old": db_user.must_change_password,
-                        "new": False
-                    }
-                db_user.must_change_password = False # Assume setting password means they don't have to change immediately
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="In Zero-Touch / Host-Blind security mode, Corporate Admins cannot directly set or modify user passwords. Please use the private 'Resend Invitation / Reset Link' feature instead."
+            )
 
 
         # Handle entity access

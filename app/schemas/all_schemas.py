@@ -401,6 +401,7 @@ class BankBase(BaseModel):
     swift_code: Optional[str] = Field(None, min_length=8, max_length=11, description="SWIFT/BIC code of the bank")
     short_name: Optional[str] = Field(None, max_length=50, description="Short name of the bank")
     email_domain: Optional[str] = Field(None, max_length=100, description="Email domain of the bank (e.g., 'cibeg.com')")
+    portal_access_enabled: Optional[bool] = Field(True, description="Whether trading portal / dealer desk access is enabled for this bank")
 
 class BankCreate(BankBase):
     pass
@@ -414,9 +415,10 @@ class BankUpdate(BankBase):
     swift_code: Optional[str] = Field(None, min_length=8, max_length=11)
     short_name: Optional[str] = None
     email_domain: Optional[str] = None
+    portal_access_enabled: Optional[bool] = None
 
 class BankOut(BankBase, BaseSchema):
-    pass
+    dealer_count: Optional[int] = Field(0, description="Total active enrolled dealers under this bank")
 
 class TemplateBase(BaseModel):
     name: str = Field(..., min_length=3, max_length=100, description="Name of the template")

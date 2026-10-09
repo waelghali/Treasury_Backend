@@ -2592,6 +2592,20 @@ def read_banks(
 ):
     """Retrieve a list of all active banks."""
     banks = crud_bank.get_all(db, skip=skip, limit=limit)
+    try:
+        from app.models.models_quotation import QuotationBankDealer
+        dealer_counts = dict(
+            db.query(
+                QuotationBankDealer.bank_id,
+                func.count(QuotationBankDealer.id)
+            ).filter(
+                QuotationBankDealer.is_deleted == False
+            ).group_by(QuotationBankDealer.bank_id).all()
+        )
+        for b in banks:
+            setattr(b, "dealer_count", dealer_counts.get(b.id, 0))
+    except Exception as e:
+        logger.warning(f"Failed to calculate dealer counts: {e}")
     return banks
 
 @router.get("/banks/{bank_id}", response_model=BankOut)
@@ -2603,6 +2617,15 @@ def read_bank(
     db_bank = crud_bank.get(db, id=bank_id)
     if db_bank is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    try:
+        from app.models.models_quotation import QuotationBankDealer
+        count = db.query(QuotationBankDealer).filter(
+            QuotationBankDealer.bank_id == bank_id,
+            QuotationBankDealer.is_deleted == False
+        ).count()
+        setattr(db_bank, "dealer_count", count)
+    except Exception:
+        setattr(db_bank, "dealer_count", 0)
     return db_bank
 
 @router.put("/banks/{bank_id}", response_model=BankOut)
@@ -2661,6 +2684,245 @@ def restore_bank(
     client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Bank", entity_id=db_bank.id, details={"name": db_bank.name, "ip_address": client_host})
     return db_bank
+
+class BankPortalAccessToggleRequest(BaseModel):
+    portal_access_enabled: bool
+
+class DealerPortalAccessToggleRequest(BaseModel):
+    is_active: bool
+
+@router.put("/banks/{bank_id}/portal-access")
+def toggle_bank_portal_access(
+    bank_id: int,
+    payload: BankPortalAccessToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """Toggle whether bank portal / dealer desk access is enabled for this bank institution."""
+    db_bank = crud_bank.get(db, id=bank_id)
+    if db_bank is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    
+    db_bank.portal_access_enabled = payload.portal_access_enabled
+    db.commit()
+    db.refresh(db_bank)
+    
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UPDATE",
+        entity_type="Bank",
+        entity_id=db_bank.id,
+        details={
+            "action": "toggle_portal_access",
+            "name": db_bank.name,
+            "portal_access_enabled": db_bank.portal_access_enabled,
+            "ip_address": client_host
+        }
+    )
+    return {
+        "success": True,
+        "bank_id": db_bank.id,
+        "name": db_bank.name,
+        "portal_access_enabled": db_bank.portal_access_enabled
+    }
+
+@router.get("/banks/{bank_id}/dealers")
+def get_bank_dealers(
+    bank_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:view"))
+):
+    """List all registered bank dealers under a specific bank."""
+    from app.models.models_quotation import QuotationBankDealer
+    db_bank = crud_bank.get(db, id=bank_id)
+    if db_bank is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    
+    dealers = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.bank_id == bank_id,
+        QuotationBankDealer.is_deleted == False
+    ).order_by(QuotationBankDealer.created_at.desc()).all()
+    
+    return [d.to_dict() for d in dealers]
+
+@router.put("/dealers/{dealer_id}/portal-access")
+def toggle_dealer_portal_access(
+    dealer_id: int,
+    payload: DealerPortalAccessToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """Enable or disable portal access for a specific individual bank dealer."""
+    from app.models.models_quotation import QuotationBankDealer
+    dealer = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.id == dealer_id,
+        QuotationBankDealer.is_deleted == False
+    ).first()
+    if not dealer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dealer account not found")
+    
+    dealer.is_active = payload.is_active
+    db.commit()
+    db.refresh(dealer)
+    
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UPDATE",
+        entity_type="QuotationBankDealer",
+        entity_id=dealer.id,
+        details={
+            "action": "toggle_dealer_access",
+            "is_active": dealer.is_active,
+            "dealer_email": dealer.email,
+            "bank_id": dealer.bank_id,
+            "ip_address": client_host
+        }
+    )
+    return {"success": True, "dealer": dealer.to_dict()}
+
+
+@router.post("/dealers/{dealer_id}/reset-credentials")
+def reset_dealer_credentials(
+    dealer_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """
+    Resets a bank dealer's 2FA (TOTP Authenticator) and password.
+    Useful when a trader gets a new phone, loses their authenticator app,
+    or forgets their password. Allows them to re-enrol their new phone.
+    """
+    from app.models.models_quotation import QuotationBankDealer
+    dealer = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.id == dealer_id,
+        QuotationBankDealer.is_deleted == False
+    ).first()
+    if not dealer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dealer account not found")
+
+    dealer.totp_secret = None
+    dealer.is_totp_enrolled = False
+    dealer.hashed_password = None
+    dealer.failed_login_attempts = 0
+    dealer.locked_until = None
+    dealer.pending_email_otp = None
+    dealer.pending_email_otp_expires_at = None
+    dealer.enrollment_token = None
+    dealer.enrollment_token_expires_at = None
+
+    db.commit()
+    db.refresh(dealer)
+
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="RESET_CREDENTIALS",
+        entity_type="QuotationBankDealer",
+        entity_id=dealer.id,
+        details={
+            "action": "reset_dealer_credentials_2fa",
+            "dealer_email": dealer.email,
+            "bank_id": dealer.bank_id,
+            "ip_address": client_host
+        }
+    )
+
+    # Dispatch notification email to trader
+    try:
+        from app.services.email_service import send_email
+        from app.services.customer_email_settings_service import get_customer_email_settings
+        bank_name = dealer.bank.name if dealer.bank else "Partner Bank"
+        subject = f"Grow Treasury - Trading Desk Credentials & 2FA Reset ({bank_name})"
+        body = f"""
+        <div style="font-family: sans-serif; background-color: #0f172a; padding: 24px; color: #f8fafc;">
+            <div style="max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 24px; border: 1px solid #334155;">
+                <h2 style="color: #38bdf8; margin-top: 0;">Trading Desk Credentials Reset</h2>
+                <p>Dear <strong>{dealer.full_name}</strong>,</p>
+                <p>Your 2-Factor Authenticator and login credentials for <strong>{bank_name}</strong> have been reset by platform administration.</p>
+                <p>You may now access the trading portal to link your new phone with Microsoft Authenticator and set your permanent password:</p>
+                <div style="margin: 20px 0;">
+                    <a href="https://app.growbusinessdevelopment.com/dealer/auth?mode=enroll" style="background: #059669; color: #ffffff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: bold; display: inline-block;">
+                        Set Up New Phone & Authenticator
+                    </a>
+                </div>
+                <p style="font-size: 12px; color: #94a3b8;">If you did not request this change, please contact your Treasury Desk Head immediately.</p>
+            </div>
+        </div>
+        """
+        email_settings, _ = get_customer_email_settings(db, None)
+        background_tasks.add_task(
+            send_email,
+            db=db,
+            to_emails=[dealer.email],
+            subject_template=subject,
+            body_template=body,
+            template_data={},
+            email_settings=email_settings,
+            sender_name="Grow Treasury Trading Desk",
+            save_copy=False
+        )
+    except Exception as e:
+        logger.warning(f"Could not dispatch dealer reset notification email: {e}")
+
+    return {
+        "success": True,
+        "message": f"2FA and credentials successfully reset for {dealer.full_name}. Trader can now re-enrol their new device.",
+        "dealer": dealer.to_dict()
+    }
+
+
+@router.post("/dealers/{dealer_id}/unlock")
+def unlock_dealer_account(
+    dealer_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """
+    Unlocks a temporarily locked bank dealer account after multiple failed password/TOTP attempts.
+    """
+    from app.models.models_quotation import QuotationBankDealer
+    dealer = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.id == dealer_id,
+        QuotationBankDealer.is_deleted == False
+    ).first()
+    if not dealer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dealer account not found")
+
+    dealer.locked_until = None
+    dealer.failed_login_attempts = 0
+    db.commit()
+    db.refresh(dealer)
+
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UNLOCK",
+        entity_type="QuotationBankDealer",
+        entity_id=dealer.id,
+        details={
+            "action": "unlock_dealer_account",
+            "dealer_email": dealer.email,
+            "bank_id": dealer.bank_id,
+            "ip_address": client_host
+        }
+    )
+
+    return {
+        "success": True,
+        "message": f"Dealer account for {dealer.full_name} has been unlocked successfully.",
+        "dealer": dealer.to_dict()
+    }
 
 @router.post("/templates/", response_model=TemplateOut, status_code=status.HTTP_201_CREATED)
 def create_template(
@@ -3365,7 +3627,6 @@ def reject_trial_registration(
     log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_REJECTED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name})
     return {"message": "Registration rejected successfully."}
 
-router.include_router(trial_router, prefix="/trial", tags=["Trial Registration"])
 
 @trial_router.get("/get-document-url/") # Renamed for clarity
 async def get_commercial_register_document_url(

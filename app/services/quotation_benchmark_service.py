@@ -63,24 +63,36 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
     num_participating_banks = len(assignments)
 
-    # Collect offers
+    # Collect offers using dual-read resolvers (supports both legacy plaintext and encrypted deals)
     quotes = []
     first_quote_time = None
     
+    from app.services.tenant_key_service import tenant_key_service
+    tenant_dek = None
+    if getattr(rfq, 'customer_id', None):
+        try:
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+        except Exception:
+            tenant_dek = None
+
     if rfq.type == 'FX_SPOT':
         for a in assignments:
             off = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
-            if off and off.price:
-                quotes.append(off.price)
-                if not first_quote_time or (off.submitted_at and off.submitted_at < first_quote_time):
-                    first_quote_time = off.submitted_at
+            if off:
+                price = tenant_key_service.resolve_offer_price(off, tenant_dek)
+                if price and price > 0:
+                    quotes.append(price)
+                    if not first_quote_time or (off.submitted_at and off.submitted_at < first_quote_time):
+                        first_quote_time = off.submitted_at
     else:
         for a in assignments:
             off = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).order_by(QuotationTBillOffer.discount_rate.asc()).first()
-            if off and off.discount_rate:
-                quotes.append(off.discount_rate)
-                if not first_quote_time or (off.submitted_at and off.submitted_at < first_quote_time):
-                    first_quote_time = off.submitted_at
+            if off:
+                rate = tenant_key_service.resolve_tbill_discount_rate(off, tenant_dek)
+                if rate and rate > 0:
+                    quotes.append(rate)
+                    if not first_quote_time or (off.submitted_at and off.submitted_at < first_quote_time):
+                        first_quote_time = off.submitted_at
 
     num_quotes = len(quotes)
     if num_quotes == 0:
