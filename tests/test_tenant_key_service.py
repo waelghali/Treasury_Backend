@@ -69,7 +69,7 @@ def test_offer_price_dual_read_and_dual_write():
         tenant_key_service.apply_encrypted_offer_price(offer, test_price, dek)
 
         assert is_encrypted(offer.encrypted_price)
-        assert offer.price == test_price
+        assert offer.price is None  # Pure ciphertext: legacy column is NULL
         resolved = tenant_key_service.resolve_offer_price(offer, dek)
         assert abs(resolved - test_price) < 0.00001
 
@@ -98,8 +98,8 @@ def test_tbill_offer_dual_read_and_dual_write():
             assignment_id="test-tbill-1",
             settlement_date="2026-10-10",
             maturity_date="2027-01-10",
-            discount_rate=0.0,
-            max_amount=0.0
+            discount_rate=None,
+            max_amount=None
         )
         test_rate = 26.50
         test_amt = 10000000.0
@@ -107,8 +107,8 @@ def test_tbill_offer_dual_read_and_dual_write():
 
         assert is_encrypted(tbill.encrypted_discount_rate)
         assert is_encrypted(tbill.encrypted_max_amount)
-        assert tbill.discount_rate == test_rate
-        assert tbill.max_amount == test_amt
+        assert tbill.discount_rate is None  # Pure ciphertext
+        assert tbill.max_amount is None  # Pure ciphertext
 
         resolved_rate = tenant_key_service.resolve_tbill_discount_rate(tbill, dek)
         assert abs(resolved_rate - test_rate) < 0.0001

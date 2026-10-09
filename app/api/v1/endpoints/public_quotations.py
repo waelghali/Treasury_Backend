@@ -1383,7 +1383,7 @@ def submit_fx_offer(
 
     offer = QuotationOffer(
         assignment_id=assignment.id,
-        price=offer_in.price,
+        price=None,
         offered_value_date=final_offered_value_date,
         notes=offer_in.notes,
         submitted_by_email=submitted_by,
@@ -1583,7 +1583,7 @@ def submit_fx_offers_batch(
 
         offer = QuotationOffer(
             assignment_id=assignment.id,
-            price=item.price,
+            price=None,
             offered_value_date=final_val_date,
             notes=item.notes,
             submitted_by_email=submitted_by,
@@ -1788,8 +1788,8 @@ def submit_tbill_offer(
             assignment_id=assignment.id,
             settlement_date=line.settlementDate,
             maturity_date=line.maturityDate,
-            discount_rate=line.discountRate,
-            max_amount=line.maxAmount,
+            discount_rate=None,
+            max_amount=None,
             notes=line.notes or offer_in.notes,
             submitted_by_email=submitted_by
         )

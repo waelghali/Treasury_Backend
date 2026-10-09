@@ -137,11 +137,15 @@ def test_zero_knowledge_live_quoting_e2e():
         raw_row = db.execute(text("SELECT encrypted_price, price FROM quotation_offers WHERE id = :oid"), {"oid": offer.id}).fetchone()
         assert raw_row is not None
         encrypted_price_val = raw_row[0]
+        raw_db_price = raw_row[1]
 
         print(f"\n[Raw PostgreSQL Row] encrypted_price: {encrypted_price_val}")
+        print(f"[Raw PostgreSQL Row] price column: {raw_db_price} (physically NULL)")
 
         # Assert ciphertext format: enc:v1:{nonce}:{ct}
         assert is_encrypted(encrypted_price_val)
+        # Assert legacy price column is strictly NULL (pure ciphertext storage)
+        assert raw_db_price is None, f"Expected price column to be NULL, found {raw_db_price}"
         # Assert raw numbers are NOT readable in plaintext ciphertext
         assert "48.875" not in encrypted_price_val
 

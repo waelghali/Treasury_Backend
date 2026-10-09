@@ -111,9 +111,9 @@ class TenantKeyService:
         return float(offer.price) if offer.price is not None else 0.0
 
     def apply_encrypted_offer_price(self, offer: QuotationOffer, raw_price: float, dek: bytes) -> None:
-        """Encrypts price into encrypted_price and populates dual-write legacy column."""
+        """Encrypts price into encrypted_price and ensures legacy plaintext column is NULL for pure ciphertext storage."""
         offer.encrypted_price = encrypt_field(float(raw_price), dek, field_context="price")
-        offer.price = float(raw_price)
+        offer.price = None
 
     # --- Dual-Read Resolvers for T-Bill Offers ---
 
@@ -130,11 +130,11 @@ class TenantKeyService:
         return float(tbill_offer.discount_rate) if tbill_offer.discount_rate is not None else 0.0
 
     def apply_encrypted_tbill_offer(self, tbill_offer: QuotationTBillOffer, discount_rate: float, max_amount: float, dek: bytes) -> None:
-        """Encrypts T-Bill terms and populates dual-write legacy columns."""
+        """Encrypts T-Bill terms and ensures legacy plaintext columns are NULL for pure ciphertext storage."""
         tbill_offer.encrypted_discount_rate = encrypt_field(float(discount_rate), dek, field_context="discount_rate")
         tbill_offer.encrypted_max_amount = encrypt_field(float(max_amount), dek, field_context="max_amount")
-        tbill_offer.discount_rate = float(discount_rate)
-        tbill_offer.max_amount = float(max_amount)
+        tbill_offer.discount_rate = None
+        tbill_offer.max_amount = None
 
     def re_envelope_tenant_dek(self, db: Session, customer_id: int) -> dict:
         """
