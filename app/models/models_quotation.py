@@ -153,6 +153,8 @@ class QuotationRequest(BaseModel):
 
     @property
     def approved_by_name(self):
+        if hasattr(self, '_approved_by_name'):
+            return self._approved_by_name
         from sqlalchemy.orm import object_session
         session = object_session(self)
         if not session or not self.admin_reviewed_at:
@@ -178,8 +180,14 @@ class QuotationRequest(BaseModel):
             pass
         return None
 
+    @approved_by_name.setter
+    def approved_by_name(self, value):
+        self._approved_by_name = value
+
     @property
     def approved_by_email(self):
+        if hasattr(self, '_approved_by_email'):
+            return self._approved_by_email
         from sqlalchemy.orm import object_session
         session = object_session(self)
         if not session or not self.admin_reviewed_at:
@@ -197,6 +205,10 @@ class QuotationRequest(BaseModel):
         except Exception:
             pass
         return None
+
+    @approved_by_email.setter
+    def approved_by_email(self, value):
+        self._approved_by_email = value
 
     @property
     def release_docs_to_winner_only(self) -> bool:

@@ -2329,6 +2329,28 @@ def get_rfq_history(
         ).group_by(QuotationRequest.parent_rfq_id).all()
         retender_counts = {row[0]: row[1] for row in retender_rows}
 
+    # 2. Batch fetch approval audit logs in 1 single query instead of 2 * N queries
+    approval_map = {}
+    if reqs and current_user.customer_id:
+        from app.models.models import AuditLog
+        from sqlalchemy.orm import joinedload
+        audit_logs = db.query(AuditLog).options(joinedload(AuditLog.user)).filter(
+            AuditLog.action_type.in_(["QUOTATION_RFQ_APPROVED", "QUOTATION_RFQ_APPROVED_SCHEDULED"]),
+            AuditLog.customer_id == current_user.customer_id
+        ).order_by(AuditLog.id.desc()).all()
+        for al in audit_logs:
+            det = al.details or {}
+            rfq_key = str(det.get("rfq_id"))
+            if rfq_key and rfq_key not in approval_map:
+                u = al.user
+                approver_name = None
+                if u:
+                    f_name = getattr(u, 'first_name', '') or ''
+                    l_name = getattr(u, 'last_name', '') or ''
+                    approver_name = f"{f_name} {l_name}".strip() or u.email
+                approver_email = det.get("approved_by_email") or (u.email if u else None)
+                approval_map[rfq_key] = (approver_name, approver_email)
+
     for r in reqs:
         try:
             w_end_val = r.window_end
@@ -2407,6 +2429,9 @@ def get_rfq_history(
             
         r.parent_rfq_ref = parent_map.get(r.parent_rfq_id)
         r.re_tender_count = retender_counts.get(r.id, 0)
+        app_name, app_email = approval_map.get(str(r.id), (None, None))
+        r.approved_by_name = app_name
+        r.approved_by_email = app_email
             
     if changed:
         db.commit()

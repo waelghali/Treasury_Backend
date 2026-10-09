@@ -771,6 +771,8 @@ class CRUDQuotation:
         query = db.query(QuotationRequest).options(
             selectinload(QuotationRequest.creator),
             selectinload(QuotationRequest.entity),
+            selectinload(QuotationRequest.delegate),
+            selectinload(QuotationRequest.acceptance_resolved_by),
             selectinload(QuotationRequest.legs).selectinload(QuotationLeg.bank_configs)
         )
         if customer_id is not None:
