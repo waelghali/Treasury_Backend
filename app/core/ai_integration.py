@@ -609,6 +609,11 @@ async def generate_signed_gcs_url(gcs_uri: str, expiration: int = 3600, skip_exi
     from app.core.storage_service import generate_signed_url
     return await generate_signed_url(gcs_uri, expiration_seconds=expiration, skip_existence_check=skip_existence_check)
 
+def generate_signed_gcs_url_sync(gcs_uri: str, expiration: int = 3600) -> Optional[str]:
+    """Synchronously generates a temporary signed URL."""
+    from app.core.storage_service import generate_signed_url_sync
+    return generate_signed_url_sync(gcs_uri, expiration_seconds=expiration)
+
 # --- Google Vision OCR Function ---
 async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> Optional[str]:
     vision_client = _get_vision_client()

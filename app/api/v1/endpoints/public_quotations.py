@@ -2008,10 +2008,16 @@ async def approve_rfq_for_bank(
         )
 
     if assignment.approval_status in ('APPROVED', 'DECLINED'):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Quotation participation has already been {assignment.approval_status.lower()} by {assignment.approved_by_email or 'another approver'}."
-        )
+        # Idempotent response: If already processed (e.g. rapid double-click or simultaneous tab),
+        # return existing finalized state gracefully without raising 400
+        return {
+            "success": True,
+            "approval_status": assignment.approval_status,
+            "approved_by_email": assignment.approved_by_email,
+            "approved_at": assignment.approved_at.isoformat() if assignment.approved_at else now.isoformat(),
+            "notes": assignment.approval_notes,
+            "message": f"Quotation participation was already {assignment.approval_status.lower()}."
+        }
 
     action = action_in.action.strip().upper()
     if action not in ("APPROVE", "DECLINE"):
@@ -2050,6 +2056,9 @@ async def approve_rfq_for_bank(
                 email_purpose="APPROVED_BY_BANK"
             )
             background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+
+    elif action == "DECLINE":
+        assignment.approval_status = "DECLINED"
 
         # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
         if non_approver_emails:
@@ -2595,9 +2604,22 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                     "pair": d.get("pair") or f"{rfq.buy_currency}/{rfq.sell_currency}"
                 })
 
-            return {"status": "WINNER", "receipt": receipt, "released_documents": released_docs}
+            return {
+                "status": "WINNER",
+                "won_legs_count": 1,
+                "total_legs_count": 1,
+                "won_pairs": [f"{rfq.buy_currency}/{rfq.sell_currency}"],
+                "receipt": receipt,
+                "released_documents": released_docs
+            }
         else:
-            return {"status": "NOT_SELECTED", "released_documents": []}
+            return {
+                "status": "NOT_SELECTED",
+                "won_legs_count": 0,
+                "total_legs_count": 1,
+                "lost_pairs": [f"{rfq.buy_currency}/{rfq.sell_currency}"],
+                "released_documents": []
+            }
     except Exception:
         return {"status": "COMPLETED", "released_documents": []}
 

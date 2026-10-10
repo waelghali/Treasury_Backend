@@ -155,6 +155,21 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
   - Edge bot mitigation shielding authentication and public quotation endpoints from credential stuffing.
   - Origin IP masking ensuring direct server infrastructure remains concealed from public internet scans.
 
+### 2.8 Zero-Friction Perimeter Anti-Bot Honeypot Suite (Planned 🚀)
+- **Objective**: Deploy zero-friction, invisible, and keyboard-isolated Honeypot traps across all external public interaction endpoints to automatically detect and silently sinkhole malicious bots, credential-stuffing crawlers, and automated spam engines with 0% impact on legitimate humans.
+- **Architectural Mechanics & Safeguards**:
+  - **Zero Accessibility Impact (`tabIndex={-1}`)**: Human users pressing `Tab` skip the honeypot field entirely. Screen readers ignore it via `aria-hidden="true"`.
+  - **Autofill Shielding (`autoComplete="off"`)**: Deploys neutral field names (`company_fax_number`, `website_url`, `secondary_phone`) configured to prevent browser extensions or mobile autofills from populating them by mistake.
+  - **Silent Tarpit & Sinkhole Defense**: When an automated bot fills the trapped field, the backend does not announce detection (preventing bot reconnaissance). It injects a synthetic 2-second rate-limiting delay and returns a generic rejection or silent sinkhole.
+- **Target Public Gateways**:
+  1. Corporate Treasury Login Portal (`/login`)
+  2. Permanent Bank Dealer Desk Login (`/dealer`)
+  3. Demo Request Sales Lead Form
+  4. Free Trial Self-Service Tenant Provisioning
+  5. Public Issuance Requestor Portal
+  6. Forgot Password & Account Recovery Request (`/forgot-password`)
+  7. Public Bank Handshake & Counterparty Token Access
+
 ---
 
 ## 4. Phase 3: Multi-Leg "Invisible" Legs — Selective Counterparty Exclusion (Completed & Verified ✅)
@@ -905,6 +920,48 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
   - Comprehensive suite of 10 test files executed and verified: **100% Pass** across all tests including `test_zero_knowledge_e2e.py`, `test_tenant_key_service.py`, `test_bank_dealer_auth.py`, and `test_quotation_phase2_security.py`.
   - Python compilation passed cleanly (`python -m py_compile`).
 
+#### 📌 Sub-Phase 8.7: Document Encryption at Rest & Authenticated Streaming Gateway (Upcoming Post-Freeze Track 🚀)
+*Scope: AES-256-GCM authenticated document encryption at rest on Google Cloud Storage, high-performance chunked in-memory streaming gateway, dual-read backwards compatibility, multi-pair leg isolation, and WORM decryption audit trail.*
+
+- **Architectural Mechanics & Specifications**:
+  - **Storage-at-Rest Encryption ([`security_crypto.py`](file:///c:/Grow/app/core/security_crypto.py))**:
+    - Raw document bytes (PDF, DOCX, XLSX, scans) are encrypted using AES-256-GCM with the customer's unique 256-bit Tenant DEK before upload to Google Cloud Storage.
+    - Encrypted binary structure: 12-byte Magic (`ENC_FILE_V1\x00`) + 12-byte Nonce + GCM Ciphertext + 16-byte Authentication Tag. Direct inspection of Cloud Storage reveals 100% ciphertext.
+  - **Chunked Decryption Streaming Gateway ([`quotations_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py))**:
+    - Dedicated authenticated streaming route: `GET /api/v1/quotations/documents/download?gcs_uri={uri}&token={bank_token}`.
+    - Uses non-buffering chunked response generators to stream decrypted PDF bytes with negligible server RAM consumption (~0 MB overhead), even during concurrent multi-megabyte bank downloads.
+  - **Zero-Downtime Dual-Read Compatibility**:
+    - Detection routine checks for `RAW_FILE_MAGIC`. Unencrypted legacy contracts and newly encrypted files stream seamlessly side-by-side with zero data migration or historical re-upload requirements.
+  - **Multi-Pair Leg Gating & Isolation**:
+    - Strict validation in split awards: a winning bank dealer on Leg 1 can unseal ONLY Leg 1's attached documents. Attempting to download Leg 2's documents yields HTTP 403 Forbidden.
+  - **Cryptographic WORM Audit Integration**:
+    - Every file unsealing action is stamped into the tamper-proof forward hash-chained audit ledger (`[TIMESTAMP] Dealer {email} unsealed Document {doc_id} SHA-256: {hash}`).
+
+#### 📌 Sub-Phase 8.8: Notional Volume & Ticket Size Zero-Knowledge Encryption (Upcoming Post-Freeze Track 🚀)
+*Scope: Sealing trade amounts and minimum ticket sizes on quotation requests and legs under Tenant DEK, combined with blind bucketing for search and zero-knowledge volume analytics.*
+
+- **Architectural Mechanics & Specifications**:
+  - **Ciphertext Persistence (`quotation_rfqs`, `quotation_legs`)**:
+    - Add `encrypted_amount` (`VARCHAR`) and `encrypted_min_ticket_amount` (`VARCHAR`) to both master RFQ and individual leg models.
+    - Transition physical numeric `amount` column to `NULL` (following the verified Phase 8.6 price blueprint) so database backups and disk snooping reveal zero cash flow or trade volume data.
+  - **Blind Range Bucketing for Fast Search**:
+    - Maintain encrypted blind hash buckets (`amount_tier`: `<100K`, `100K-1M`, `1M-10M`, `>10M`) to allow ultra-fast indexed filtering by corporate treasurers without exposing exact dollar amounts to the database engine.
+  - **Dynamic In-Memory Resolution**:
+    - Real-time computation of total deal notional, currency conversion, and rate weighting executed in-memory after tenant key unwrapping.
+
+#### 📌 Sub-Phase 8.9: Comprehensive Data Classification & Sensitive Metadata Zero-Knowledge Scan (Upcoming Post-Freeze Track 🚀)
+*Scope: Exhaustive audit across all application entities to classify confidential vs. operational metadata, establishing strict zero-knowledge protection for tariffs, trader contacts, internal notes, and accounting benchmarks.*
+
+- **Data Classification & Encryption Targets**:
+  - **Tier 1 (High Confidentiality - Immediate Zero-Knowledge Encryption Target)**:
+    - `amount` / `min_ticket_amount`: Corporate liquidity volume & FX cash flow sensitivity.
+    - `eval_rate`: Internal corporate target/benchmark rates.
+    - `internal_notes` / `comments_to_banks` / `rejection_reason` / `cancellation_notes`: Private treasury negotiation context and corporate strategy.
+    - `cost_min`, `cost_percent`, `cost_max`, `cost_flat` (Bank Tariffs in `QuotationBankLegConfig`): Private bilateral fee schedules negotiated between the corporate and each individual bank.
+    - `contacts` / `emails` on `QuotationBank`: Direct phone numbers and personal emails of bank treasury heads.
+  - **Tier 2 (Operational Metadata - Plaintext / Blind-Indexed for Search & Routing)**:
+    - `buy_currency`, `sell_currency`, `value_date`, `status`, `window_start`, `window_end`: Required by background daemons for scheduling, timeouts, and multi-tenant routing.
+
 ---
 
 ### 9.3 Self-Contained Lifecycle & Zero System Owner Maintenance
@@ -1160,7 +1217,11 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Dealer Experience** | **Permanent Bank Dealer Multi-Customer Desk UI & Blotter (Step 2)** | ✅ **Completed & Verified** | `BankDealerAuthPage.js`, `BankDealerDeskPage.js`, `bank_dealer_endpoints.py`, `App.js` | Unified multi-customer live RFQ blotter feed, urgency countdowns, desk lock indicators, historical won trades with HMAC-SHA256 receipts, and day 1+ instant trading login. Fully operational. |
 | **Counterparty Governance** | **Bank Admin / Authorized Terminal (Phase 2.5)** | 🚀 **Planned / Queued** | Design specs in Section 2.5 | Counterparties self-manage their contact rosters & trading desks with configurable multi-level Maker-Checker-Approver (1 & 2) governance. |
 | **Edge Infrastructure** | **Cloudflare Low-Restriction Perimeter Shield (Phase 2.7)** | 🚀 **Planned / Queued** | Design specs in Section 2.7 | Zero-cost edge layer ($0.00) providing DDoS mitigation, automated TLS termination, and bot filtering with zero trading workflow disruption. |
+| **Perimeter Security** | **Zero-Friction Anti-Bot Honeypot Suite (Phase 2.8)** | 🚀 **Planned / Queued** | Design specs in Section 2.8 | Invisible, keyboard-isolated, autofill-shielded trap fields (`tabIndex={-1}`) with silent 2-second tarpit sinkholes across login, demo, and registration portals. |
 | **Database Hardening** | **Pure Ciphertext Storage (Zero-Plaintext Price)** | ✅ **Completed & Verified** | `tenant_key_service.py`, `public_quotations.py`, `test_zero_knowledge_e2e.py` | All new incoming FX Spot and T-Bill quotes physically write `NULL` to legacy price columns. PostgreSQL stores strictly AES-256-GCM ciphertext on disk. 100% in-memory decryption. |
+| **Document Security** | **Document Encryption at Rest & Streaming Gateway (Phase 8.7)** | 🚀 **Planned / Queued** | `security_crypto.py:encrypt_file_bytes`, `/documents/download` | AES-256-GCM authenticated file encryption at rest, low-memory chunked streaming gateway, dual-read backwards compatibility, multi-pair leg isolation, and WORM audit logging. |
+| **Database Hardening** | **Trade Amount & Notional Zero-Knowledge (Phase 8.8)** | 🚀 **Planned / Queued** | `models_quotation.py`, `quotation_rfqs` | `encrypted_amount` and `encrypted_min_ticket_amount` with blind range bucketing for fast search and NULL legacy columns. |
+| **Data Governance** | **Systemic Confidential Data Classification & Scan (Phase 8.9)** | 🚀 **Planned / Queued** | Cross-platform audit & schema scan | End-to-end audit classifying and encrypting internal accounting notes, bilateral bank tariffs, and trader contact directories. |
 | **Counterparty Security** | Automated Domain DNS/MX Enrichment (Phase 2.6) | ⏸️ **Intentionally Deferred** | Design specs in Phase 2.6 | Whitelist and official domain matching already deliver 100% protection against personal webmail. |
 | **Host-Blind Vault (Tier 2)** | Client-Side WebCrypto Bidding Engine | ⏸️ **Intentionally Deferred** | Section 10.2 | Deferred in favor of Tier 1 Envelope Encryption. Client-only decryption breaks automated background execution (AUTO_ACCEPT timeouts) and offline PDF report generation. |
 | **Enterprise BYOK (Tier 3)** | Cloud KMS Hardware Security Plug-in | ⏸️ **Deferred for Enterprise Mandates** | `security_crypto.py:CloudKmsKeyProvider` | Architectural abstraction complete. Deferred until a corporate client signs an enterprise cloud contract requiring dedicated Google Cloud KMS / AWS KMS provisioning ($5–$15/mo). |

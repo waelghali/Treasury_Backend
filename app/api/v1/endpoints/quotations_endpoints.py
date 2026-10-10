@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Response, Request, Query
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from typing import List, Any, Optional, Dict, Tuple
@@ -72,6 +72,30 @@ async def upload_quotation_documents(
     # Parallelize file reading, uploading, and signing
     uploaded_files = await asyncio.gather(*[_process_single_file(f) for f in files])
     return {"documents": list(uploaded_files)}
+
+
+@router.get("/document-url")
+async def get_quotation_document_url(
+    gcs_uri: str = Query(..., description="GCS URI to generate signed link for"),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """Generates an authorized secure signed URL for viewing an RFQ document."""
+    if not gcs_uri or not str(gcs_uri).startswith("gs://"):
+        raise HTTPException(status_code=400, detail="Invalid GCS URI")
+    
+    # Customer tenant security check
+    expected_customer_segment = f"customer_{current_user.customer_id}/"
+    user_role = (getattr(current_user, 'role', '') or '').lower()
+    is_system_admin = user_role in ('system_owner', 'super_admin') or getattr(current_user, 'is_superuser', False)
+    if expected_customer_segment not in gcs_uri and not is_system_admin:
+        raise HTTPException(status_code=403, detail="Unauthorized access to document")
+    
+    from app.core.ai_integration import generate_signed_gcs_url
+    signed = await generate_signed_gcs_url(gcs_uri, expiration=3600)
+    if not signed:
+        raise HTTPException(status_code=500, detail="Could not generate signed URL")
+    
+    return {"url": signed}
 
 
 def _resolve_entities_for_invitation(db: Session, customer_id: int, qb = None, fallback_entity_ids: list = None):
@@ -3419,7 +3443,37 @@ def get_rfq_results(
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
         
-    return compute_rfq_standings(rfq, db, dispatch_emails=True)
+    standings = compute_rfq_standings(rfq, db, dispatch_emails=True)
+
+    # Pre-sign any GCS document paths for instantaneous client-side viewing
+    if rfq.document_path and "gs://" in rfq.document_path:
+        try:
+            import json
+            from app.core.ai_integration import generate_signed_gcs_url_sync
+            loaded = json.loads(rfq.document_path)
+            docs_to_sign = []
+            if isinstance(loaded, dict) and "documents" in loaded:
+                docs_to_sign = loaded.get("documents", [])
+            elif isinstance(loaded, list):
+                docs_to_sign = loaded
+
+            modified = False
+            for d in docs_to_sign:
+                p_val = d.get("path")
+                if p_val and str(p_val).startswith("gs://"):
+                    signed = generate_signed_gcs_url_sync(p_val, expiration=604800)
+                    if signed:
+                        d["path"] = signed
+                        modified = True
+
+            if modified:
+                rfq_out = QuotationRequestOut.model_validate(rfq)
+                rfq_out.document_path = json.dumps(loaded)
+                standings["rfq"] = rfq_out
+        except Exception as e:
+            logger.warning(f"Failed to pre-sign documents in get_rfq_results: {e}")
+
+    return standings
 
 _DISPATCHING_RFQS = set()
 _DISPATCH_LOCK = threading.Lock()

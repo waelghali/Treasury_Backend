@@ -272,6 +272,27 @@ async def generate_signed_url(gcs_uri: str, expiration_seconds: int = 3600, skip
         return None
 
 
+def generate_signed_url_sync(gcs_uri: str, expiration_seconds: int = 3600, skip_existence_check: bool = True) -> Optional[str]:
+    """
+    Synchronously generates a temporary V4 signed URL for browser viewing or download.
+    """
+    try:
+        bucket_name, blob_name = parse_gcs_uri(gcs_uri)
+        client = _get_gcs_client()
+        if not client:
+            return None
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=expiration_seconds),
+            method="GET"
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate sync signed URL for {gcs_uri}: {e}")
+        return None
+
+
 def delete_gcs_blob(gcs_uri: str) -> bool:
     """
     Deletes a blob from GCS.
