@@ -71,7 +71,7 @@ except ImportError:
     genai_types = None
 
 # Model name constant - configurable via GEMINI_MODEL_NAME environment variable
-DEFAULT_PRIMARY_MODEL = "gemini-3.5-flash"
+DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 
 # Global API Studio client fallback
@@ -93,10 +93,10 @@ def _get_api_genai_client():
 
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
-    Optimized Cascade: Quality First, Cost Second for Treasury Document Intelligence:
-    1. gemini-3.5-flash: Top quality document extraction & layout comprehension at lowest cost
-    2. gemini-3.8-flash: High-context vision backup for complex forms & contracts
-    3. gemini-2.5-flash: Enterprise Vertex AI active bridge (active through Oct 16, 2026)
+    Optimized Cascade: Instant Response First, High-Context Second:
+    1. gemini-2.5-flash: Enterprise Vertex AI active bridge (instant 200 OK)
+    2. gemini-3.5-flash: Generation 3 document intelligence
+    3. gemini-3.8-flash: High-context vision backup
     4. gemini-3.6-flash: Fast generation 3 alternative
     5. gemini-3.7-flash: Fast generation 3 alternative
     6. gemini-3.5-flash-lite: High-speed lightweight fallback
@@ -105,9 +105,9 @@ def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
     candidates = [
         primary,
+        "gemini-2.5-flash",
         "gemini-3.5-flash",
         "gemini-3.8-flash",
-        "gemini-2.5-flash",
         "gemini-3.6-flash",
         "gemini-3.7-flash",
         "gemini-3.5-flash-lite",
@@ -1312,42 +1312,96 @@ async def analyze_supporting_document(
         # --- Build the AI-driven comparison prompt ---
         sanitized_text = _sanitize_text_for_json(raw_text[:80000])
 
-        # Format request data for the prompt
+        # Format comprehensive request data for the prompt
         request_fields_text = json.dumps({
             "contract_value": request_data.get("contract_value"),
             "currency": request_data.get("currency"),
             "beneficiary_name": request_data.get("beneficiary_name"),
             "beneficiary_address": request_data.get("beneficiary_address"),
+            "beneficiary_country": request_data.get("beneficiary_country"),
             "lg_type": request_data.get("lg_type"),
             "lg_value": request_data.get("lg_value"),
             "lg_currency": request_data.get("lg_currency"),
             "lg_expiry_date": request_data.get("lg_expiry_date"),
             "lg_purpose": request_data.get("lg_purpose"),
+            "reference_number": request_data.get("reference_number"),
+            "is_cross_border": "Yes" if request_data.get("is_cross_border") else "No",
+            "issuance_country": request_data.get("issuance_country") or "Egypt",
+            "is_third_party": "Yes" if request_data.get("is_third_party") else "No",
+            "third_party_name": request_data.get("third_party_name"),
+            "requires_special_wording": "Yes" if request_data.get("requires_special_wording") else "No",
+            "is_auto_reducing": "Yes" if request_data.get("is_auto_reducing") else "No",
+            "applicable_rules": request_data.get("applicable_rules"),
         }, indent=2, ensure_ascii=False)
 
-        prompt = f"""You are a financial document verification specialist. You are given:
-1. A {doc_type.replace('_', ' ').title()} document (OCR-extracted text)
-2. Data entered by a user for a Letter of Guarantee (LG) issuance request
+        prompt = f"""You are a senior banking and trade finance guarantee verification specialist. You are given:
+1. A {doc_type.replace('_', ' ').title()} document (OCR-extracted text from the contract, tender, purchase order, or formal request).
+2. Data entered by a user requesting the issuance of a Letter of Guarantee (LG) / Bank Guarantee / Bond.
 
-Your task:
-A. Compare each user-entered field against the document. For each field, return one of three verdicts:
-- **MATCH**: The document clearly confirms this value (exact or semantically equivalent)
-- **MISMATCH**: The document contains a DIFFERENT value for this field
-- **COULD_NOT_VALIDATE**: The field is not mentioned in the document, or the document is too ambiguous to verify
+Your mission is to perform an exhaustive, high-precision cross-examination of the user's request against the document.
+
+A. Field Verification & Cross-Examination:
+Compare each relevant field against the document text. For each field, evaluate:
+- **MATCH**: The document confirms this value (exact or semantically equivalent).
+- **MISMATCH**: The document contradicts or contains a DIFFERENT requirement/value for this field.
+- **COULD_NOT_VALIDATE**: The document does not mention or specify this field.
+
+**CRITICAL SPECIALIST RULES:**
+
+1. **COUNTRY OF ISSUANCE & CROSS-BORDER DETECTION (TOP PRIORITY)**:
+   - Carefully scan the document for any requirement on WHERE the guarantee must be issued, the required issuing bank jurisdiction, or governing territory (e.g., "Bank guarantee issued by a first-class bank operating in Saudi Arabia / UAE / Oman / Kuwait / UK / Kenya / Germany", "Local guarantee in [Country]", "Through a correspondent bank in [Country]", "Governed by English Law / UAE Law / Saudi Law").
+   - If the document mandates or implies that the guarantee must be issued in a country other than Egypt:
+     * For `is_cross_border`: If user request is "No", flag as **MISMATCH**! Note: "Document requires issuance in [Detected Country], which is a cross-border guarantee outside Egypt."
+     * For `issuance_country`: If user request is "Egypt" or null or a country different from what the document mandates, flag as **MISMATCH**! Set `document_value` to the country required by the document (e.g. "Saudi Arabia", "United Arab Emirates", etc.).
+   - If the contract and beneficiary are strictly domestic within Egypt and specify Egyptian bank issuance:
+     * `issuance_country` is "Egypt", and `is_cross_border` is "No". If user matched this, verdict is **MATCH**.
+
+2. **THIRD-PARTY APPLICANT / ISSUANCE IN THIRD-PARTY NAME (TOP PRIORITY)**:
+   - Carefully analyze if the guarantee is required to be issued on behalf of or in the name of a third party, joint venture, consortium leader/member, subsidiary, foreign principal, or subcontractor (e.g. "The Performance Guarantee shall be issued in the name of ABC Consortium / XYZ Partner", "Guarantee issued on behalf of [Company Name]").
+   - If the document stipulates a specific third-party applicant:
+     * For `is_third_party`: If user request is "No", flag as **MISMATCH**! Set `document_value` to "Yes". Note: "Document requires the guarantee to be issued in the name of [Entity Name]."
+     * For `third_party_name`: Set `document_value` to the entity name stipulated in the document. If user entered a different name or left it empty, flag as **MISMATCH**!
+   - If no third-party applicant is required by the document (standard direct issuance for the contracting company) and user entered "No", verdict is **MATCH**.
+
+3. **MANDATORY SPECIAL WORDING & ANNEX GUARANTEE TEMPLATE (TOP PRIORITY)**:
+   - Check if the document contains a specific guarantee draft, text annex (e.g. "Form of Guarantee Annex B", "Format of Bid Bond", "Draft Letter of Guarantee attached"), or explicitly states that "The Guarantee must be in the exact form prescribed in the Tender Documents without alteration".
+   - For `requires_special_wording`:
+     * If document mandates specific wording/annex and user entered "No", flag as **MISMATCH**! Set `document_value` to "Yes (Mandatory Prescribed Form/Annex in Document)". Note: "The contract/tender mandates an exact guarantee text/annex format. Special Wording must be enabled."
+     * If document mandates specific wording and user entered "Yes", verdict is **MATCH**.
+     * If no special wording is mentioned and user entered "No", verdict is **MATCH**.
+
+4. **CONTRACT / TENDER / PO REFERENCE NUMBER**:
+   - For `reference_number`: Look for contract numbers, tender numbers, RFQ IDs, or PO numbers in headers, clauses, or recitals. If found and user entered a different number, flag as **MISMATCH**. If matches, flag as **MATCH**.
+
+5. **LG VALUE vs. CONTRACT VALUE**:
+   - `contract_value` is the total value of the contract/PO.
+   - `lg_value` is the LG amount, which is often a percentage (e.g., 5%, 10%, 15%, 20%) of the contract value. These are SEPARATE fields. Do NOT flag a mismatch just because lg_value != contract_value.
+   - If the document specifies "Bid Bond of EGP 500,000" or "Performance Bond of 10% of contract price (= EGP 1,000,000)", verify `lg_value` against that specific guarantee amount!
+
+6. **BENEFICIARY DETAILS & COUNTRY**:
+   - For `beneficiary_name`: Accept bilingual matches (Arabic ↔ English), legal suffixes (Ltd, LLC, SAE, Co.), and slight transliterations as MATCH.
+   - For `beneficiary_address`: Partial address (e.g., city, street, or governorate) counts as MATCH.
+   - For `beneficiary_country`: Compare the beneficiary's stated or registered country with `beneficiary_country`.
+
+7. **CURRENCIES**:
+   - For `currency` and `lg_currency`: Match standard ISO codes (EGP, USD, EUR, SAR, AED, GBP, etc.).
+
+8. **LG EXPIRY DATE**:
+   - If the document mentions an exact date or a duration (e.g., "valid for 90 days from bid closing" or "12 months after handover"), compare. Within 30 days = MATCH.
+
+9. **LG TYPE & PURPOSE**:
+   - For `lg_type`: Semantic match (e.g. "Final Guarantee" = "Performance Bond" = "نهائي" = MATCH; "Initial Guarantee" = "Bid Bond" = "ابتدائي" = MATCH; "Advance Payment" = "دفعة مقدمة" = MATCH).
+   - For `lg_purpose`: Semantic match. If the project title or scope aligns, it's a MATCH.
+
+10. **AUTO-REDUCTION OF GUARANTEE**:
+    - For `is_auto_reducing`: If the document states the guarantee amount reduces automatically upon interim deliveries or payment certificates, and user entered "No", flag as **MISMATCH**.
+
+11. **APPLICABLE RULES / GOVERNING LAW**:
+    - For `applicable_rules`: If document specifies URDG 758, ISP 98, Egyptian Law, etc., compare against user selection.
 
 B. AI Contract Clause & Expiry Harvester:
-Search the document for any tender validity period, completion timeline, or guarantee duration clauses (e.g., "Clause 4.2", "Validity of the tender shall be 90 days from the submission deadline", "Guarantee shall remain valid until 30 days after contract completion").
+Search the document for any validity period, completion timeline, or guarantee duration clauses.
 Extract the exact citation and compute/propose the expiry date in YYYY-MM-DD format if determinable.
-
-**CRITICAL RULES:**
-- `contract_value` is the CONTRACT/PO total value. The `lg_value` is the LG amount, which is often a PERCENTAGE of the contract value (e.g., 5-20%). These are DIFFERENT fields. Do NOT flag a mismatch just because lg_value != contract_value.
-- For `beneficiary_name`: Accept bilingual matches (Arabic ↔ English), abbreviations, and minor variations as MATCH.
-- For `beneficiary_address`: A partial address match (e.g., city matches) counts as MATCH.
-- For `currency` and `lg_currency`: Match ISO codes (EGP, USD, EUR, SAR, etc.)
-- For `lg_expiry_date`: If the document mentions a duration (e.g., "12 months"), calculate approximate date from today and compare. Within 30 days = MATCH.
-- For `lg_type`: Semantic match (e.g., "Performance Bond" = "Performance Guarantee" = "نهائي" = MATCH)
-- For `lg_purpose`: Semantic match. If the document's project scope aligns with the stated purpose, it's a MATCH.
-- If a user field is null/empty, skip it (do NOT include it in results).
 
 **USER-ENTERED REQUEST DATA:**
 {request_fields_text}
@@ -1358,19 +1412,19 @@ Extract the exact citation and compute/propose the expiry date in YYYY-MM-DD for
 ---
 
 Return a JSON object with exactly these fields:
-- "comparison": array of objects, each with:
-  - "field": the field name (e.g., "contract_value")
-  - "label": human-readable label (e.g., "Contract Value")
+- "comparison": array of objects for each evaluated field:
+  - "field": field key (e.g. "issuance_country", "is_cross_border", "is_third_party", "third_party_name", "requires_special_wording", "reference_number", "contract_value", "lg_value", "lg_currency", "currency", "beneficiary_name", "beneficiary_address", "beneficiary_country", "lg_type", "lg_expiry_date", "lg_purpose", "is_auto_reducing", "applicable_rules")
+  - "label": human-readable label (e.g. "Country of Issuance", "Cross-Border Guarantee", "Third-Party Issuance", "Third-Party Name", "Special Wording Required", "Contract / Reference No.", "LG Amount", "Contract Value", "LG Currency", "Beneficiary Name", "LG Type", "Expiry Date", etc.)
   - "request_value": what the user entered (as string)
-  - "document_value": what you found in the document (as string), or null if not found
+  - "document_value": what the document explicitly stipulates (as string, e.g. "Saudi Arabia", "Yes", "ABC Consortium Ltd", "1000000"), or null if not mentioned
   - "verdict": one of "MATCH", "MISMATCH", "COULD_NOT_VALIDATE"
-  - "note": brief explanation (e.g., "Contract mentions EGP 3,000,000 which matches", or "Beneficiary not found in document")
+  - "note": clear concise explanation (e.g., "Contract stipulates guarantee must be issued by a local bank in Saudi Arabia", "Document specifies issuance on behalf of partner XYZ Ltd", etc.)
 - "clause_harvest": object or null:
-  - "clause_citation": exact excerpt or clause reference mentioning validity/expiry (e.g. "Clause 4.2: Tender validity shall be 90 days after tender submission date")
+  - "clause_citation": exact excerpt mentioning validity/expiry
   - "recommended_expiry_date": suggested expiry in YYYY-MM-DD format if calculable, else null
-  - "clause_title": short title (e.g. "Tender Validity Clause" or "Contract Expiry Milestone")
-  - "calculation_basis": brief explanation (e.g. "90 days from deadline of Oct 31, 2026")
-- "summary": 1-2 sentence summary of the document
+  - "clause_title": short title
+  - "calculation_basis": brief explanation
+- "summary": 1-2 sentence executive summary of the document, noting any cross-border, third-party, or special wording requirements
 """
 
         config = genai_types.GenerateContentConfig(

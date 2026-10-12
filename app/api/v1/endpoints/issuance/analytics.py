@@ -48,222 +48,51 @@ router = APIRouter()
 from .base import *
 from .base import _read_bank_form_pdf_bytes, _send_edit_notifications, _detect_coverage_gaps, _make_doc_filename, _get_lg_copy_docs, _send_requestor_status_notification, _serialize_action, _serialize_recon_session, _serialize_recon_result, _apply_admin_change, _create_governed_change
 
+@router.get("/issued-lgs/export-fields")
+def get_export_fields(
+    current_user: TokenData = Depends(get_issuance_read_context),
+):
+    """Returns available columns and presets for the custom export builder."""
+    from app.services.issuance_export_service import IssuanceExportService, PRESET_SUMMARY_COLS, PRESET_FINANCIAL_COLS, PRESET_OPERATIONS_COLS, PRESET_DETAILED_COLS
+
+    fields = IssuanceExportService.get_available_columns()
+    presets = {
+        "summary": PRESET_SUMMARY_COLS,
+        "financial": PRESET_FINANCIAL_COLS,
+        "operations": PRESET_OPERATIONS_COLS,
+        "detailed": PRESET_DETAILED_COLS,
+    }
+    return {"fields": fields, "presets": presets}
+
+
 @router.get("/issued-lgs/export")
 def export_issued_lgs(
-    export_type: str = Query("summary", description="summary | detailed | full_audit"),
+    export_type: str = Query("summary", description="summary | detailed | full_audit | custom"),
     status_filter: Optional[str] = Query(None, description="Filter by status, e.g. ACTIVE"),
     search: Optional[str] = Query(None, description="Search LG ref or beneficiary"),
+    columns: Optional[str] = Query(None, description="Comma-separated column keys for custom export"),
+    include_event_log: bool = Query(False, description="Include dedicated Lifecycle Event Log tab"),
+    include_approvals: bool = Query(False, description="Include dedicated Approvals Audit tab"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context),
 ):
-    """Export Issued LGs to XLSX. Types: summary, detailed, full_audit."""
-    from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
-    from app.models import Bank, Currency, User
+    """Export Issued LGs to professional formatted XLSX with full lifecycle history. Supports custom column selection and arranging."""
+    from app.services.issuance_export_service import IssuanceExportService
     from fastapi.responses import StreamingResponse
-    import io
-    try:
-        import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    except ImportError:
-        raise HTTPException(500, "openpyxl is not installed. Run: pip install openpyxl")
 
-    query = db.query(IssuedLGRecord).filter(
-        IssuedLGRecord.customer_id == current_user.customer_id
+    custom_cols_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+
+    buf = IssuanceExportService.generate_excel_export(
+        db=db,
+        customer_id=current_user.customer_id,
+        user_email=getattr(current_user, "email", "Treasury User"),
+        export_type=export_type,
+        status_filter=status_filter,
+        search=search,
+        custom_columns=custom_cols_list,
+        include_event_log=include_event_log,
+        include_approvals=include_approvals,
     )
-    if status_filter:
-        query = query.filter(IssuedLGRecord.status == status_filter)
-    records = query.order_by(IssuedLGRecord.created_at.desc()).all()
-
-    # Optional search filter (in-memory for simplicity)
-    if search:
-        s = search.lower()
-        records = [r for r in records if
-                   (r.lg_ref_number and s in r.lg_ref_number.lower()) or
-                   (r.beneficiary_name and s in r.beneficiary_name.lower())]
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Issued LGs"
-
-    # Styling
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="1a56db", end_color="1a56db", fill_type="solid")
-    thin_border = Border(
-        left=Side(style='thin', color='cccccc'),
-        right=Side(style='thin', color='cccccc'),
-        top=Side(style='thin', color='cccccc'),
-        bottom=Side(style='thin', color='cccccc'),
-    )
-
-    # Define columns based on export type
-    # Status label mapping for export
-    status_labels = {
-        "INTERNAL_PROCESSING": "Processing",
-        "DELIVERED_TO_BANK": "At Bank",
-        "BANK_INQUIRY": "Bank Inquiry",
-        "BANK_REJECTED": "Rejected by Bank",
-        "LG_ISSUED": "LG Issued",
-        "ACTIVE": "Active",
-        "EXPIRED": "Expired",
-        "CANCELLED": "Cancelled",
-        "PENDING_CLOSE": "Closing",
-        "CLOSED": "Closed",
-        "LIQUIDATED": "Liquidated",
-        "SLA_EXCEEDED": "SLA Breach",
-    }
-
-    if export_type == "summary":
-        headers = ["Serial", "LG Ref", "Status", "Amount", "Currency", "Expiry Date", "Bank", "Beneficiary"]
-    elif export_type == "detailed":
-        headers = [
-            "Serial", "LG Ref", "Status", "Amount", "Currency",
-            "Issue Date", "Expiry Date", "Bank", "Beneficiary",
-            "Bank LG Number", "Facility", "Sub-Limit", "Method",
-            "Requestor", "Department", "LG Type", "LG Purpose",
-            "Reference Type", "Reference #", "Validity Flag",
-            "Delivery Date", "Delivery Method",
-            "Bank Reply Type", "Bank Reply Date",
-            "Verification Status", "Verified At",
-            "Handover Date", "Recipient",
-            "Custody Holder", "Issued By", "Created At",
-        ]
-    else:  # full_audit
-        headers = [
-            "Serial", "LG Ref", "Status", "Amount", "Currency",
-            "Issue Date", "Expiry Date", "Bank", "Beneficiary",
-            "Bank LG Number", "Facility", "Sub-Limit", "Method",
-            "Requestor", "Department", "LG Type", "LG Purpose",
-            "Reference Type", "Reference #", "Validity Flag",
-            "Delivery Date", "Delivery Method",
-            "Bank Reply Type", "Bank Reply Date",
-            "Verification Status", "Verified At",
-            "Handover Date", "Recipient",
-            "Custody Holder", "Issued By", "Created At",
-            "Action History", "Approval Chain",
-        ]
-
-    # Write headers
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.border = thin_border
-        cell.alignment = Alignment(horizontal='center')
-
-    # Write data
-    for row_idx, r in enumerate(records, 2):
-        bank_name = r.bank.name if r.bank else "N/A"
-        if not r.bank_id and r.sub_limit and r.sub_limit.facility and r.sub_limit.facility.bank:
-            bank_name = r.sub_limit.facility.bank.name
-        currency_code = r.currency.iso_code if r.currency else "N/A"
-        facility_name = r.sub_limit.facility.facility_name if r.sub_limit and r.sub_limit.facility else ""
-        sub_limit_name = r.sub_limit.limit_name if r.sub_limit else ""
-        owner_name = ""
-        if getattr(r, 'current_owner_user_id', None):
-            owner = db.query(User).filter(User.id == r.current_owner_user_id).first()
-            owner_name = owner.email if owner else ""
-
-        # Friendly status label
-        display_status = status_labels.get(r.status, r.status or "")
-
-        # Build row data from request
-        ref_type = ""
-        ref_number = ""
-        requestor_name = ""
-        department = ""
-        lg_type = ""
-        lg_purpose = ""
-        issued_by_name = ""
-        approval_chain_str = ""
-        if r.request_id:
-            req = db.query(IssuanceRequest).filter(IssuanceRequest.id == r.request_id).first()
-            if req:
-                ref_type = req.reference_type or ""
-                ref_number = req.reference_number or ""
-                lg_type = (req.lg_type.name if req.lg_type else "") or ""
-                lg_purpose = req.lg_purpose or ""
-                department = req.department or ""
-                # Requestor — use stored name, fall back to user email
-                requestor_name = req.requestor_name or ""
-                if not requestor_name and req.requestor_user_id:
-                    requestor = db.query(User).filter(User.id == req.requestor_user_id).first()
-                    requestor_name = requestor.email if requestor else ""
-                # Issued by
-                if req.issued_by_user_id:
-                    issuer = db.query(User).filter(User.id == req.issued_by_user_id).first()
-                    issued_by_name = issuer.email if issuer else ""
-                # Approval chain
-                if export_type == "full_audit" and req.approval_chain_audit:
-                    import json as json_mod
-                    approval_chain_str = json_mod.dumps(req.approval_chain_audit, default=str)
-
-        # Tracking fields
-        delivery_date = str(getattr(r, 'delivery_date', '') or '')
-        delivery_method = getattr(r, 'delivery_method', '') or ''
-        bank_reply_type = getattr(r, 'bank_reply_type', '') or ''
-        bank_reply_date = str(getattr(r, 'bank_reply_date', '') or '')
-        verification_status = getattr(r, 'verification_status', '') or ''
-        verified_at = str(getattr(r, 'verified_at', '') or '')
-        handover_date = str(getattr(r, 'handover_date', '') or '')
-        recipient_name = getattr(r, 'recipient_name', '') or ''
-        internal_serial = getattr(r, 'internal_serial', '') or ''
-        bank_lg_number = getattr(r, 'bank_lg_number', '') or ''
-
-        if export_type == "summary":
-            row_data = [
-                internal_serial, r.lg_ref_number, display_status,
-                float(r.current_amount), currency_code,
-                str(r.expiry_date) if r.expiry_date else "", bank_name, r.beneficiary_name,
-            ]
-        elif export_type == "detailed":
-            row_data = [
-                internal_serial, r.lg_ref_number, display_status,
-                float(r.current_amount), currency_code,
-                str(r.issue_date) if r.issue_date else "", str(r.expiry_date) if r.expiry_date else "",
-                bank_name, r.beneficiary_name, bank_lg_number,
-                facility_name, sub_limit_name, r.issuance_method or "",
-                requestor_name, department, lg_type, lg_purpose,
-                ref_type, ref_number, getattr(r, 'reference_validity_flag', "") or "",
-                delivery_date, delivery_method,
-                bank_reply_type, bank_reply_date,
-                verification_status, verified_at,
-                handover_date, recipient_name,
-                r.custody_holder or "", issued_by_name,
-                r.created_at.isoformat() if r.created_at else "",
-            ]
-        else:  # full_audit
-            import json
-            history = json.dumps(r.action_history or r.custody_transfer_log or [], default=str)
-            row_data = [
-                internal_serial, r.lg_ref_number, display_status,
-                float(r.current_amount), currency_code,
-                str(r.issue_date) if r.issue_date else "", str(r.expiry_date) if r.expiry_date else "",
-                bank_name, r.beneficiary_name, bank_lg_number,
-                facility_name, sub_limit_name, r.issuance_method or "",
-                requestor_name, department, lg_type, lg_purpose,
-                ref_type, ref_number, getattr(r, 'reference_validity_flag', "") or "",
-                delivery_date, delivery_method,
-                bank_reply_type, bank_reply_date,
-                verification_status, verified_at,
-                handover_date, recipient_name,
-                r.custody_holder or "", issued_by_name,
-                r.created_at.isoformat() if r.created_at else "",
-                history, approval_chain_str,
-            ]
-
-        for col, val in enumerate(row_data, 1):
-            cell = ws.cell(row=row_idx, column=col, value=val)
-            cell.border = thin_border
-
-    # Auto-size columns
-    for col in ws.columns:
-        max_length = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max_length + 4, 50)
-
-    # Write to buffer
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
 
     filename = f"issued_lgs_{export_type}.xlsx"
     return StreamingResponse(

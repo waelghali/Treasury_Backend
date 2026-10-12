@@ -1562,6 +1562,14 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             rfq.winner_bank_name = None
             rfq.winner_rate = None
             rfq.saved_vs_avg = None
+            if is_closed and not is_scheduled:
+                rfq.status = 'INCONCLUSIVE'
+                rfq.acceptance_status = 'NO_QUOTES'
+                rfq.acceptance_resolved_at = now
+                for leg in (rfq.legs or []):
+                    if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                        leg.status = 'INCONCLUSIVE'
+                db.commit()
             return {
                 "rfq": rfq,
                 "results": results,
@@ -2186,6 +2194,17 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             rfq.status = 'REJECTED'
             if not rfq.acceptance_status:
                 rfq.acceptance_status = 'REJECTED'
+        elif is_inconclusive:
+            rfq.status = 'INCONCLUSIVE'
+            has_any_quote = any(
+                l.get("results") and any(r.get("finalPrice") is not None for r in l["results"])
+                for l in legs_data
+            ) if legs_data else bool(valid_results if 'valid_results' in locals() else False)
+            rfq.acceptance_status = 'NO_QUOTES' if not has_any_quote else 'INCONCLUSIVE'
+            rfq.acceptance_resolved_at = now
+            for leg in (rfq.legs or []):
+                if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                    leg.status = 'INCONCLUSIVE'
         elif not is_inconclusive:
             # Acceptance decision is still pending. Check if acceptance window has expired!
             if acc_deadline and now > acc_deadline:
@@ -2392,10 +2411,23 @@ def get_rfq_history(
             
         status_changed = False
         if is_closed:
-            if r.status in ('PENDING', 'OPEN'):
-                r.status = 'COMPLETED'
-                changed = True
-                status_changed = True
+            if r.status in ('PENDING', 'OPEN', 'EVALUATING'):
+                has_winner = any(l.winner_bank_name is not None for l in (r.legs or [])) if r.legs else bool(r.winner_bank_name)
+                acc_deadline_val = r.acceptance_deadline
+                if acc_deadline_val and acc_deadline_val.tzinfo is None:
+                    acc_deadline_val = acc_deadline_val.replace(tzinfo=timezone.utc)
+                is_acc_open = bool(r.acceptance_status == 'PENDING' and acc_deadline_val and now < acc_deadline_val)
+
+                if has_winner and not is_acc_open:
+                    r.status = 'COMPLETED'
+                    changed = True
+                    status_changed = True
+                elif not has_winner and not is_acc_open:
+                    r.status = 'INCONCLUSIVE'
+                    if not r.acceptance_status or r.acceptance_status == 'PENDING':
+                        r.acceptance_status = 'NO_QUOTES'
+                    changed = True
+                    status_changed = True
                 for leg in (r.legs or []):
                     if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED', 'INCONCLUSIVE', 'COMPLETED'):
                         leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'

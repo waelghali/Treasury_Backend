@@ -320,8 +320,105 @@ def generate_invite_link(
     
     return {"invite_link": invite_link}
 
+
+async def _auto_verify_request_documents(db: Session, request_id: int, customer_id: int):
+    """Guarantees that attached documents are scanned and verified against the request prior to approval."""
+    from app.models.models_issuance import IssuanceRequest, IssuanceRequestDocument
+    from app.core.ai_integration import analyze_supporting_document, _get_gcs_client
+    from sqlalchemy.orm import joinedload
+    import os
+    import logging
+    _log = logging.getLogger(__name__)
+
+    # Look for any attached document that hasn't been verified yet
+    docs = db.query(IssuanceRequestDocument).filter(
+        IssuanceRequestDocument.request_id == request_id,
+        IssuanceRequestDocument.is_deleted == False,
+        IssuanceRequestDocument.ai_verification_result == None
+    ).order_by(IssuanceRequestDocument.id.desc()).all()
+
+    if not docs:
+        return
+
+    # Prioritize contract/PO/formal request
+    prio = {"CONTRACT": 1, "PURCHASE_ORDER": 2, "FORMAL_REQUEST": 3, "SPECIAL_WORDING": 4, "OTHER": 5, "THIRD_PARTY": 6}
+    docs.sort(key=lambda d: prio.get((d.document_type or '').upper(), 99))
+    target_doc = docs[0]
+
+    if not target_doc.file_path:
+        return
+
+    pdf_bytes = None
+    if target_doc.file_path.startswith("gs://"):
+        try:
+            path_parts = target_doc.file_path[5:].split('/', 1)
+            client = _get_gcs_client()
+            if client:
+                bucket = client.bucket(path_parts[0])
+                blob = bucket.blob(path_parts[1])
+                pdf_bytes = blob.download_as_bytes()
+        except Exception as e:
+            _log.warning(f"Could not download doc {target_doc.id} from GCS for auto-verification: {e}")
+    elif os.path.exists(target_doc.file_path):
+        try:
+            with open(target_doc.file_path, "rb") as f:
+                pdf_bytes = f.read()
+        except Exception as e:
+            _log.warning(f"Could not read doc {target_doc.id} from disk: {e}")
+
+    if not pdf_bytes:
+        return
+
+    request_obj = db.query(IssuanceRequest).options(
+        joinedload(IssuanceRequest.currency),
+        joinedload(IssuanceRequest.payable_currency),
+        joinedload(IssuanceRequest.lg_type),
+    ).filter(
+        IssuanceRequest.id == request_id,
+        IssuanceRequest.customer_id == customer_id,
+    ).first()
+
+    if not request_obj:
+        return
+
+    request_data = {
+        "contract_value": float(request_obj.reference_amount) if request_obj.reference_amount else None,
+        "currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
+        "beneficiary_name": request_obj.beneficiary_name,
+        "beneficiary_address": request_obj.beneficiary_address,
+        "beneficiary_country": request_obj.beneficiary_country,
+        "lg_type": getattr(request_obj.lg_type, 'name', None) if hasattr(request_obj, 'lg_type') and request_obj.lg_type else None,
+        "lg_value": float(request_obj.amount) if request_obj.amount else None,
+        "lg_currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
+        "lg_expiry_date": str(request_obj.requested_expiry_date) if request_obj.requested_expiry_date else None,
+        "lg_purpose": request_obj.lg_purpose,
+        "reference_number": request_obj.reference_number,
+        "is_cross_border": bool(request_obj.is_cross_border),
+        "issuance_country": request_obj.issuance_country or "Egypt",
+        "is_third_party": bool(request_obj.is_third_party),
+        "third_party_name": request_obj.third_party_name,
+        "requires_special_wording": bool(request_obj.requires_special_wording),
+        "is_auto_reducing": bool(request_obj.is_auto_reducing),
+        "applicable_rules": request_obj.applicable_rules,
+    }
+
+    try:
+        doc_type_str = target_doc.document_type or "CONTRACT"
+        filename_str = target_doc.file_name or "document.pdf"
+        result = await analyze_supporting_document(
+            pdf_bytes, doc_type_str.upper(), filename_str,
+            request_data=request_data,
+            db=db, customer_id=customer_id, user_id=None
+        )
+        target_doc.ai_verification_result = result
+        db.commit()
+        _log.info(f"Auto-verified document {target_doc.id} for request {request_id}: {result.get('status')}")
+    except Exception as e:
+        _log.warning(f"Auto-verification failed for request {request_id}: {e}")
+
+
 @router.post("/submit", response_model=IssuanceRequestOut)
-def public_submit_request(
+async def public_submit_request(
     request_in: IssuanceRequestCreate,
     token: str = Query(...),
     background_tasks: BackgroundTasks = None,
@@ -338,6 +435,9 @@ def public_submit_request(
     request_record = crud_issuance_request.create_request(
         db, obj_in=request_in, customer_id=customer_id, user_id=None
     )
+    
+    # Guarantee document verification if unverified documents exist
+    await _auto_verify_request_documents(db, request_record.id, customer_id)
     
     # Use unified submit flow: creates V1 snapshot + runs approval matrix
     from app.services.issuance_service import issuance_service
@@ -526,7 +626,7 @@ def public_update_draft(
 
 
 @router.post("/requests/{request_id}/submit")
-def public_submit_existing_draft(
+async def public_submit_existing_draft(
     request_id: int,
     token: str = Query(...),
     background_tasks: BackgroundTasks = None,
@@ -552,6 +652,9 @@ def public_submit_existing_draft(
         raise HTTPException(status_code=400, detail="Only DRAFT or REVISION_REQUIRED requests can be submitted")
     if email and request_rec.requestor_email and request_rec.requestor_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Not authorized to submit this request")
+
+    # Guarantee document verification if unverified documents exist
+    await _auto_verify_request_documents(db, request_rec.id, customer_id)
 
     # Use unified submit flow: creates V1 snapshot + runs approval matrix
     from app.services.issuance_service import issuance_service
@@ -1086,21 +1189,61 @@ async def public_upload_document(
     }
 
 
+@router.get("/requests/{request_id}/documents")
+def public_get_request_documents(
+    request_id: int,
+    token: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    """Retrieve documents attached to a public issuance request."""
+    from app.models.models_issuance import IssuanceRequest, IssuanceRequestDocument
+
+    access_data = verify_portal_token(token)
+    customer_id = access_data["customer_id"]
+
+    request = db.query(IssuanceRequest).filter(
+        IssuanceRequest.id == request_id,
+        IssuanceRequest.customer_id == customer_id,
+        IssuanceRequest.is_deleted == False
+    ).first()
+    if not request:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    docs = db.query(IssuanceRequestDocument).filter(
+        IssuanceRequestDocument.request_id == request_id,
+        IssuanceRequestDocument.is_deleted == False
+    ).order_by(IssuanceRequestDocument.id.desc()).all()
+
+    return [
+        {
+            "id": d.id,
+            "document_type": d.document_type,
+            "file_name": d.file_name,
+            "created_at": str(d.created_at) if d.created_at else None,
+            "ai_verification_result": d.ai_verification_result
+        }
+        for d in docs
+    ]
+
+
 @router.post("/requests/{request_id}/analyze-document")
 async def public_analyze_document(
     request_id: int,
     token: str = Query(...),
-    doc_type: str = Query(default="CONTRACT"),
-    file: UploadFile = File(...),
+    doc_type: Optional[str] = Query(default=None),
+    document_id: Optional[int] = Query(default=None),
+    file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db)
 ):
     """
     Public: AI-driven document verification against the issuance request.
+    Can analyze an uploaded file OR any document already attached to the request.
     Sends document text + request data to AI for per-field comparison.
     """
-    from app.models.models_issuance import IssuanceRequest
-    from app.core.ai_integration import analyze_supporting_document, AI_DOC_MAX_SIZE_BYTES
+    from app.models.models_issuance import IssuanceRequest, IssuanceRequestDocument
+    from app.core.ai_integration import analyze_supporting_document, AI_DOC_MAX_SIZE_BYTES, _get_gcs_client
     from sqlalchemy.orm import joinedload
+    import os
 
     access_data = verify_portal_token(token)
     customer_id = access_data["customer_id"]
@@ -1116,47 +1259,108 @@ async def public_analyze_document(
     if not request_obj:
         raise HTTPException(404, "Request not found")
 
-    pdf_bytes = await file.read()
+    pdf_bytes = None
+    filename = "document.pdf"
+    target_doc = None
+    target_doc_type = (doc_type or "CONTRACT").upper()
+
+    if file and getattr(file, "filename", None):
+        pdf_bytes = await file.read()
+        filename = file.filename
+        target_doc_type = (doc_type or "CONTRACT").upper()
+    else:
+        # Resolve document from request's attached documents
+        query = db.query(IssuanceRequestDocument).filter(
+            IssuanceRequestDocument.request_id == request_id,
+            IssuanceRequestDocument.is_deleted == False
+        )
+        if document_id:
+            target_doc = query.filter(IssuanceRequestDocument.id == document_id).first()
+        else:
+            all_docs = query.order_by(IssuanceRequestDocument.id.desc()).all()
+            if all_docs:
+                prio = {"CONTRACT": 1, "PURCHASE_ORDER": 2, "FORMAL_REQUEST": 3, "SPECIAL_WORDING": 4, "OTHER": 5, "THIRD_PARTY": 6}
+                all_docs.sort(key=lambda d: prio.get((d.document_type or '').upper(), 99))
+                target_doc = all_docs[0]
+
+        if target_doc:
+            filename = target_doc.file_name or "document.pdf"
+            target_doc_type = target_doc.document_type or target_doc_type
+            if target_doc.file_path and target_doc.file_path.startswith("gs://"):
+                try:
+                    path_parts = target_doc.file_path[5:].split('/', 1)
+                    client = _get_gcs_client()
+                    if client:
+                        bucket = client.bucket(path_parts[0])
+                        blob = bucket.blob(path_parts[1])
+                        pdf_bytes = blob.download_as_bytes()
+                except Exception as e:
+                    logger.warning(f"Failed to download attached doc from GCS: {e}")
+            elif target_doc.file_path and os.path.exists(target_doc.file_path):
+                try:
+                    with open(target_doc.file_path, "rb") as f:
+                        pdf_bytes = f.read()
+                except Exception as e:
+                    logger.warning(f"Failed to read attached doc from disk: {e}")
+
+    if not pdf_bytes:
+        return {
+            "status": "NO_DOCUMENT",
+            "message": "No attached document could be retrieved for AI verification.",
+            "comparison": [],
+            "mismatches": 0,
+        }
 
     if len(pdf_bytes) > AI_DOC_MAX_SIZE_BYTES:
         return {
             "status": "TOO_LARGE",
             "message": f"Document too large for AI analysis ({len(pdf_bytes) / (1024*1024):.1f} MB). Max {AI_DOC_MAX_SIZE_BYTES // (1024*1024)} MB.",
-            "comparison": None,
+            "comparison": [],
+            "mismatches": 0,
         }
 
-    # Build request_data dict with the 9 fields for AI-driven comparison
+    # Build request_data dict with all contract and issuance fields for AI-driven comparison
     request_data = {
         "contract_value": float(request_obj.reference_amount) if request_obj.reference_amount else None,
         "currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
         "beneficiary_name": request_obj.beneficiary_name,
         "beneficiary_address": request_obj.beneficiary_address,
+        "beneficiary_country": request_obj.beneficiary_country,
         "lg_type": getattr(request_obj.lg_type, 'name', None) if hasattr(request_obj, 'lg_type') and request_obj.lg_type else None,
         "lg_value": float(request_obj.amount) if request_obj.amount else None,
         "lg_currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
         "lg_expiry_date": str(request_obj.requested_expiry_date) if request_obj.requested_expiry_date else None,
         "lg_purpose": request_obj.lg_purpose,
+        "reference_number": request_obj.reference_number,
+        "is_cross_border": bool(request_obj.is_cross_border),
+        "issuance_country": request_obj.issuance_country or "Egypt",
+        "is_third_party": bool(request_obj.is_third_party),
+        "third_party_name": request_obj.third_party_name,
+        "requires_special_wording": bool(request_obj.requires_special_wording),
+        "is_auto_reducing": bool(request_obj.is_auto_reducing),
+        "applicable_rules": request_obj.applicable_rules,
     }
 
     # Run AI-driven verification
     result = await analyze_supporting_document(
-        pdf_bytes, doc_type.upper(), file.filename,
+        pdf_bytes, target_doc_type.upper(), filename,
         request_data=request_data,
         db=db, customer_id=customer_id, user_id=None,
     )
 
     # Store result on the document for later viewing
     try:
-        from app.models.models_issuance import IssuanceRequestDocument
-        doc = db.query(IssuanceRequestDocument).filter(
-            IssuanceRequestDocument.request_id == request_id,
-            IssuanceRequestDocument.document_type == doc_type.upper(),
-        ).order_by(IssuanceRequestDocument.id.desc()).first()
-        if doc:
-            doc.ai_verification_result = result
+        if not target_doc:
+            target_doc = db.query(IssuanceRequestDocument).filter(
+                IssuanceRequestDocument.request_id == request_id,
+                IssuanceRequestDocument.document_type == target_doc_type.upper(),
+                IssuanceRequestDocument.is_deleted == False
+            ).order_by(IssuanceRequestDocument.id.desc()).first()
+        if target_doc:
+            target_doc.ai_verification_result = result
             db.commit()
-    except Exception:
-        pass  # Non-critical
+    except Exception as e:
+        logger.warning(f"Could not persist ai_verification_result on document: {e}")
 
     return result
 

@@ -173,9 +173,29 @@ def configure_app_instance(fastapi_app: FastAPI):
                 from sqlalchemy import text
                 with engine.connect() as conn:
                     conn.execute(text("ALTER TABLE banks ADD COLUMN IF NOT EXISTS portal_access_enabled BOOLEAN NOT NULL DEFAULT TRUE;"))
+                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS leg_id VARCHAR;"))
+                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS encrypted_price VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS encrypted_spread VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR;"))
+                    conn.execute(text("ALTER TABLE quotation_offers ALTER COLUMN price DROP NOT NULL;"))
+
+                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS leg_id VARCHAR;"))
+                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS encrypted_discount_rate VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS encrypted_max_amount VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR;"))
+                    conn.execute(text("ALTER TABLE quotation_tbill_offers ALTER COLUMN discount_rate DROP NOT NULL;"))
+                    conn.execute(text("ALTER TABLE quotation_tbill_offers ALTER COLUMN max_amount DROP NOT NULL;"))
+
+                    conn.execute(text("ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;"))
+
+                    conn.execute(text("ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);"))
+                    conn.execute(text("ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;"))
                     conn.commit()
             except Exception as e:
-                logger.warning(f"Column migration check for banks.portal_access_enabled: {e}")
+                logger.warning(f"Startup schema migration check: {e}")
 
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:

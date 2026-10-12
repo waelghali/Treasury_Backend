@@ -19,7 +19,10 @@
 11. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics (Completed & Verified)](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
 12. [The 3-Tier Progressive Zero-Knowledge Confidentiality Architecture](#10-the-3-tier-progressive-zero-knowledge-confidentiality-architecture)
     - [10.4 Permanent Bank Dealer Access & Unified Multi-Customer Trading Desk](#104-permanent-bank-dealer-access--unified-multi-customer-trading-desk)
-13. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#11-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
+13. [Phase 9: Mobile PWA & Web Push Notification Infrastructure (Zero-Store Footprint)](#11-phase-9-mobile-pwa--web-push-alerting-infrastructure-zero-store-footprint)
+14. [Phase 10: Automated Notification & Lifecycle Event Engine](#12-phase-10-automated-notification--lifecycle-event-engine)
+15. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#13-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
+16. [Production Database Migration Ledger](#14-production-database-migration-ledger-audit--compliance-log)
 
 ---
 
@@ -82,7 +85,7 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
 | **Phase 6.6** | `quotation_rfqs`, `quotation_legs` | Add `market_benchmark_snapshot` JSONB | ```sql<br>ALTER TABLE quotation_rfqs<br>ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;<br>ALTER TABLE quotation_legs<br>ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;<br>``` | ```sql<br>SELECT column_name, data_type<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_rfqs' AND column_name = 'market_benchmark_snapshot';<br>``` |
 | **Phase 6.6** | `quotation_market_rate_history` | Create Time-Series Archive Table | ```sql<br>CREATE TABLE IF NOT EXISTS quotation_market_rate_history (<br>&nbsp;&nbsp;id SERIAL PRIMARY KEY,<br>&nbsp;&nbsp;currency_pair VARCHAR(10) NOT NULL,<br>&nbsp;&nbsp;base_currency VARCHAR(5) NOT NULL,<br>&nbsp;&nbsp;quote_currency VARCHAR(5) NOT NULL,<br>&nbsp;&nbsp;rate DOUBLE PRECISION NOT NULL,<br>&nbsp;&nbsp;source VARCHAR(50) NOT NULL,<br>&nbsp;&nbsp;cbe_official_mid DOUBLE PRECISION,<br>&nbsp;&nbsp;cbe_gap_bps DOUBLE PRECISION,<br>&nbsp;&nbsp;created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL<br>);<br>CREATE INDEX IF NOT EXISTS idx_quotation_mkt_rate_pair_created<br>ON quotation_market_rate_history (currency_pair, created_at DESC);<br>``` | ```sql<br>SELECT count(*)<br>FROM quotation_market_rate_history;<br>``` |
 | **Phase 8.2** | `quotation_tenant_keys` | Create Tenant Envelope Key Store | ```sql<br>CREATE TABLE IF NOT EXISTS quotation_tenant_keys (<br>&nbsp;&nbsp;id SERIAL PRIMARY KEY,<br>&nbsp;&nbsp;customer_id INTEGER NOT NULL UNIQUE REFERENCES customers(id) ON DELETE CASCADE,<br>&nbsp;&nbsp;key_id VARCHAR(64) NOT NULL UNIQUE,<br>&nbsp;&nbsp;wrapped_dek TEXT NOT NULL,<br>&nbsp;&nbsp;key_version INTEGER NOT NULL DEFAULT 1,<br>&nbsp;&nbsp;status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',<br>&nbsp;&nbsp;created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,<br>&nbsp;&nbsp;updated_at TIMESTAMP WITH TIME ZONE,<br>&nbsp;&nbsp;is_deleted BOOLEAN NOT NULL DEFAULT FALSE,<br>&nbsp;&nbsp;deleted_at TIMESTAMP WITH TIME ZONE,<br>&nbsp;&nbsp;rotated_at TIMESTAMP WITH TIME ZONE<br>);<br>CREATE INDEX IF NOT EXISTS idx_quotation_tenant_keys_cust ON quotation_tenant_keys(customer_id);<br>``` | ```sql<br>SELECT count(*)<br>FROM quotation_tenant_keys;<br>``` |
-| **Phase 8.2** | `quotation_offers`, `quotation_tbill_offers` | Add Ciphertext Columns | ```sql<br>ALTER TABLE quotation_offers<br>ADD COLUMN IF NOT EXISTS encrypted_price VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_spread VARCHAR(255);<br>ALTER TABLE quotation_tbill_offers<br>ADD COLUMN IF NOT EXISTS encrypted_discount_rate VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_max_amount VARCHAR(255);<br>``` | ```sql<br>SELECT column_name, data_type<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_offers' AND column_name = 'encrypted_price';<br>``` |
+| **Phase 8.2** | `quotation_offers`, `quotation_tbill_offers` | Ciphertext Columns & Drop Plaintext NOT NULL | ```sql<br>ALTER TABLE quotation_offers<br>ADD COLUMN IF NOT EXISTS leg_id VARCHAR,<br>ADD COLUMN IF NOT EXISTS encrypted_price VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_spread VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR,<br>ALTER COLUMN price DROP NOT NULL;<br>ALTER TABLE quotation_tbill_offers<br>ADD COLUMN IF NOT EXISTS leg_id VARCHAR,<br>ADD COLUMN IF NOT EXISTS encrypted_discount_rate VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_max_amount VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR,<br>ALTER COLUMN discount_rate DROP NOT NULL,<br>ALTER COLUMN max_amount DROP NOT NULL;<br>``` | ```sql<br>SELECT column_name, data_type, is_nullable<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_offers' AND column_name IN ('price', 'encrypted_price');<br>``` |
 | **Phase 8.6** | `quotation_legs`, `quotation_rfqs` | Add Winning Rate & Savings Ciphertext Columns | ```sql<br>ALTER TABLE quotation_legs<br>ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);<br>ALTER TABLE quotation_rfqs<br>ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);<br>``` | ```sql<br>SELECT column_name, data_type<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_legs' AND column_name = 'encrypted_winner_rate';<br>``` |
 
 ---
@@ -1189,7 +1192,141 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
 
 ---
 
-## 11. Master Implementation Status: What We Have vs. What Still Needs to Be Done
+## 11. Phase 9: Mobile PWA & Web Push Alerting Infrastructure (Zero-Store Footprint)
+
+Corporate treasury officers, CFOs, and approvers frequently miss time-critical milestones—such as urgent LG renewals, expiring RFQ quotation windows, and blocking approval requests—because they are away from their workstations.
+
+To provide instant sound and vibration alerting without the friction of Apple Developer ($99/year) and Google Play Console review delays, Grow Treasury introduces an installable **Progressive Web App (PWA) with Web Push (VAPID)**.
+
+```
+[User Phone (Safari / Chrome)]
+       │  (1) Add to Home Screen + Grant Permission
+       ▼
+[Service Worker: sw.js] ──(2) Subscribes via PushManager──► [Apple APNs / Google FCM]
+       │                                                               ▲
+       ▼ (3) Saves endpoint + keys                                     │
+[Backend API: /push-subscribe]                                         │
+       │                                                               │
+[notification_service.notify()] ──(4) pywebpush VAPID payload ─────────┘
+```
+
+### 11.1 Frontend Web App Manifest & App Shell
+* **Manifest (`frontend/public/manifest.json`)**:
+  * `name`: `"Grow Treasury Management"`
+  * `short_name`: `"Grow"`
+  * `display`: `"standalone"` (eliminates browser address and navigation bars for a 100% native app feel).
+  * `theme_color`: Platform corporate primary hue.
+  * `background_color`: Platform background hue.
+  * `icons`: High-resolution icons (192x192, 512x512) generated from `public/growlogo.png`.
+* **Mobile Viewport Optimization**: Responsive audit ensuring the Action Center, Approval Modals, and Request Details views adapt cleanly to iOS Safari and Android Chrome viewports.
+
+### 11.2 Background Service Worker & Push Receiver
+* **Worker Script (`frontend/public/sw.js`)**:
+  * Listens to incoming `'push'` events triggered by browser push gateways.
+  * Formats notification payload with:
+    * Title, body text, icon, and badge.
+    * Vibration pattern (`[200, 100, 200]`).
+    * Deep-link metadata payload (`data.url`).
+  * Handles `'notificationclick'` events: Focuses the existing window or opens a new tab navigating directly to the target LG or approval record.
+
+### 11.3 Backend VAPID Keypair & Subscription Data Layer
+* **VAPID Key Generation**: 
+  * Generate ECDSA P-256 keypair (`VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY`).
+  * `VAPID_PUBLIC_KEY` exposed safely to frontend; `VAPID_PRIVATE_KEY` stored in `.env`.
+* **Database Model (`PushSubscription`)**:
+  * Fields: `id`, `user_id` (FK), `endpoint` (Unique), `p256dh`, `auth`, `user_agent`, `device_type`, `is_active`, `created_at`.
+* **Endpoints**:
+  * `POST /api/v1/notifications/push-subscribe`: Registers/updates active push subscription.
+  * `POST /api/v1/notifications/push-unsubscribe`: Deactivates subscription on logout or permission revoke.
+
+### 11.4 Centralized Push Dispatcher in Notification Service
+* **Extension of `app/services/notification_service.py`**:
+  * When `notify(...)` is invoked:
+    1. Persist `UserNotification` records in PostgreSQL.
+    2. Query active `PushSubscription` records for target `user_ids`.
+    3. Dispatch async web push using `pywebpush` with VAPID authorization headers.
+    4. Handle expired/stale endpoints (`404` / `410 Gone`) by automatically marking them inactive.
+
+### 11.5 Mobile Onboarding & Permission Handshake UX
+* **"Enable Mobile Alerts" Banner / Bell Action**:
+  * An intuitive prompt displayed when accessing on a mobile browser or inside the user profile/settings.
+  * Step-by-step guidance for iOS users: *"Tap Share ➔ Add to Home Screen to receive instant sound alerts on your phone."*
+
+---
+
+## 12. Phase 10: Automated Notification & Lifecycle Event Engine
+
+Phase 10 transitions the platform from *reactive* alerts (alerts triggered only when an explicit user clicks an action) to an **autonomous, proactive alert engine** driven by background schedule evaluation rules.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│             Automated Notification Engine (Scheduler)       │
+├──────────────────────────────┬──────────────────────────────┤
+│ 1. LG Expiry Monitor         │ Scans upcoming renewals      │
+│ 2. SLA Escalation Engine     │ Monitors stalled approvals   │
+│ 3. Quotation Window Guard    │ Enforces RFQ closing limits  │
+│ 4. Facility Limit Watcher    │ Alerts on credit thresholds  │
+│ 5. Daily Morning Briefing    │ Aggregated executive summary │
+└──────────────────────────────┴──────────────────────────────┘
+                               │
+                               ▼
+                   [notification_service.notify()]
+                               │
+               ┌───────────────┼───────────────┐
+               ▼               ▼               ▼
+          [Web Push]       [In-App Bell]    [Email]
+```
+
+### 12.1 Lifecycle & Time-Based Automated Scans
+* **LG Expiry Cascade**:
+  * Automated periodic scanner checking all active Guarantees across customer portfolios.
+  * **Alert Schedule**:
+    * **T-30 Days**: First advisory notification to corporate treasury team.
+    * **T-15 Days**: Action required notification with direct link to initiate renewal or release.
+    * **T-7 Days**: High-priority alert requesting urgent confirmation.
+    * **T-3 & T-1 Days**: Urgent alert (lock-screen push + email) to approvers and treasury heads.
+    * **T-0**: Expiry confirmed notice or overdue alert if not settled.
+  * Prevents duplicate notifications by checking `AuditLog` / notification event history for the current calendar cycle.
+
+* **Daily Morning Briefing (8:30 AM Local Time)**:
+  * Personalized daily executive push:
+    *"Good morning. You have 2 pending approvals awaiting signature and 1 LG reaching expiry this week."*
+
+### 12.2 Workflow SLA & Approval Escalation Nudges
+* **Stagnant Request Detection**:
+  * Monitor active `IssuanceRequest` records in `PENDING_APPROVAL` status.
+  * **24-Hour SLA Reminder**: If an approver has not acted within 24 hours of assignment, send an automated push nudge:
+    *"Reminder: Issuance Request #1042 has been awaiting your approval for 24h."*
+  * **48-Hour Escalation**: If still pending after 48 hours, notify the Corporate Super Admin / Treasury Director to prevent operational bottlenecks.
+
+### 12.3 Real-Time Commercial & Quotation Events
+* **Instant Dealer Offer Alert**:
+  * The moment a bank dealer submits an FX or T-Bill quotation, immediately push an alert to the Corporate Admin:
+    *"National Bank has submitted a quote for Deal #208 ($5,000,000)."*
+* **RFQ Countdown Warning**:
+  * Automated push 15 minutes before tender window closes:
+    *"15 minutes remaining to select winning quote for RFQ #208."*
+* **Automatic Expiration Notice**:
+  * Alerts corporate admin if an RFQ closes with unselected bids.
+
+### 12.4 Credit Facility & Threshold Risk Alerts
+* **Sub-Limit Utilization Warning**:
+  * Triggers when issuance of an LG pushes a bank facility utilization above **85%**.
+* **Critical Cap Alert**:
+  * High-priority warning when facility reaches **95%** or more, advising treasury to reallocate to alternative banks or request limit increases.
+
+### 12.5 User Preference Matrix, Quiet Hours & Frequency Throttling
+* **User Settings Table (`user_notification_preferences`)**:
+  * Granular controls per module:
+    * `issuance_expiry`: Push + Email
+    * `issuance_approvals`: Push + In-App
+    * `quotation_bids`: Push only
+  * **Quiet Hours Support**: Option to suppress non-emergency notifications between configured hours (e.g. 9:00 PM – 7:00 AM) while allowing emergency escalation alerts to break through.
+  * **Frequency Throttling / Batching**: Bundles multiple alerts occurring within 5 minutes into a single consolidated notification.
+
+---
+
+## 13. Master Implementation Status: What We Have vs. What Still Needs to Be Done
 
 This matrix serves as the authoritative ground truth comparing active production code against upcoming deliverables:
 
@@ -1228,15 +1365,23 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Counterparty Security** | Automated Domain DNS/MX Enrichment (Phase 2.6) | ⏸️ **Intentionally Deferred** | Design specs in Phase 2.6 | Whitelist and official domain matching already deliver 100% protection against personal webmail. |
 | **Host-Blind Vault (Tier 2)** | Client-Side WebCrypto Bidding Engine | ⏸️ **Intentionally Deferred** | Section 10.2 | Deferred in favor of Tier 1 Envelope Encryption. Client-only decryption breaks automated background execution (AUTO_ACCEPT timeouts) and offline PDF report generation. |
 | **Enterprise BYOK (Tier 3)** | Cloud KMS Hardware Security Plug-in | ⏸️ **Deferred for Enterprise Mandates** | `security_crypto.py:CloudKmsKeyProvider` | Architectural abstraction complete. Deferred until a corporate client signs an enterprise cloud contract requiring dedicated Google Cloud KMS / AWS KMS provisioning ($5–$15/mo). |
+| **Mobile Experience** | **PWA Web App Shell & Standalone Manifest (Phase 9)** | 🚀 **Planned / Queued** | `manifest.json`, icon assets | Full-screen app shell with zero browser URL bar, home screen install on iOS Safari & Android Chrome. |
+| **Mobile Experience** | **Lock-Screen Web Push Dispatcher (Phase 9)** | 🚀 **Planned / Queued** | `sw.js`, `pywebpush`, `notification_service.py` | VAPID keypair generation, phone sound/vibration alerts, deep link direct navigation on notification click. |
+| **Automated Notifications** | **LG Expiry Cascade Background Scanner (Phase 10)** | 🚀 **Planned / Queued** | Periodic background scheduler, `notification_service.py` | Automated alerts at T-30, T-15, T-7, T-3, T-1, and T-0 days before guarantee expiration. |
+| **Automated Notifications** | **Approval SLA & Inactivity Escalation Nudge (Phase 10)** | 🚀 **Planned / Queued** | Background monitor, `notification_service.py` | 24-hour pending approval reminder to approvers; 48-hour escalation to Corporate Admin. |
+| **Automated Notifications** | **Quotation Dealer Offer & RFQ Countdown (Phase 10)** | 🚀 **Planned / Queued** | Quotation event triggers, `notification_service.py` | Real-time push on bank offer arrival; 15-minute warning before tender window expires. |
+| **Automated Notifications** | **Facility Limit 85%/95% Threshold Alert (Phase 10)** | 🚀 **Planned / Queued** | Issuance approval hook, `notification_service.py` | Automated warning when guarantee issuance pushes bank facility utilization over 85% or 95%. |
 
 ---
 
-## 12. Production Database Migration Ledger (Audit & Compliance Log)
+## 14. Production Database Migration Ledger (Audit & Compliance Log)
 
 This ledger tracks all production database schema states, DDL operations, and migration audits across the roadmap implementation:
 
 | Timestamp (UTC) | Phase | Target Table(s) | Column(s) / Constraints | Migration Type | Status & Operational Impact |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **2026-10-12** | **Phase 9 (Mobile PWA)** | `push_subscriptions` | `id`, `user_id` (FK), `endpoint` (Unique), `p256dh`, `auth`, `user_agent`, `device_type`, `is_active`, `created_at` | **New Table DDL** | 🚀 **Planned / Queued**<br>Stores user device WebPush endpoints and VAPID public encryption tokens. |
+| **2026-10-12** | **Phase 10 (Automated Engine)** | `user_notification_preferences` | `id`, `user_id` (FK Unique), `push_enabled`, `email_enabled`, `quiet_hours_start`, `quiet_hours_end`, `preferences_json` | **New Table DDL** | 🚀 **Planned / Queued**<br>Stores per-user notification channel preferences and quiet hours configuration. |
 | **2026-10-10** | **Phase 8 (Zero-Knowledge)** | `quotation_tenant_keys` | `id`, `customer_id` (FK Unique), `key_id` (Unique), `wrapped_dek`, `key_version`, `status`, `created_at`, `rotated_at` | **New Table DDL** | **Active & Verified ✅**<br>Stores AES-256-GCM wrapped Data Encryption Keys (DEKs) per Corporate Customer. Key isolation verified across tenants. |
 | **2026-10-10** | **Phase 8 (Zero-Knowledge)** | `quotation_offers` | `encrypted_price` (`VARCHAR(255)`), `encrypted_spread` (`VARCHAR(255)`), `encrypted_discount_rate` (`VARCHAR(255)`), `encrypted_max_amount` (`VARCHAR(255)`) | **DDL Column Addition** | **Active & Verified ✅**<br>Enables pure ciphertext storage for bids and spreads. Legacy `price` set to NULL on disk. |
 | **2026-10-10** | **Phase 8 (Zero-Knowledge)** | `quotation_rfqs`, `quotation_legs` | `encrypted_winner_rate` (`VARCHAR(255)`), `encrypted_saved_vs_avg` (`VARCHAR(255)`), `market_benchmark_snapshot` (`JSONB`), `winner_bank_id`, `winner_bank_name`, `winner_rate`, `saved_vs_avg` | **DDL Column Addition** | **Active & Verified ✅**<br>Dynamic in-memory decryption for winner metrics and frozen market benchmark snapshots at trade acceptance. |

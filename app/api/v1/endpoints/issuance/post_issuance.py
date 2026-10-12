@@ -2309,17 +2309,26 @@ async def analyze_supporting_document_endpoint(
             "comparison": None,
         }
 
-    # Build request_data dict with the fields for AI-driven comparison
+    # Build request_data dict with all contract and issuance fields for AI-driven comparison
     request_data = {
         "contract_value": float(request_obj.reference_amount) if request_obj.reference_amount else None,
         "currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
         "beneficiary_name": request_obj.beneficiary_name,
         "beneficiary_address": request_obj.beneficiary_address,
+        "beneficiary_country": request_obj.beneficiary_country,
         "lg_type": getattr(request_obj.lg_type, 'name', None) if hasattr(request_obj, 'lg_type') and request_obj.lg_type else None,
         "lg_value": float(request_obj.amount) if request_obj.amount else None,
         "lg_currency": getattr(request_obj.currency, 'iso_code', None) if request_obj.currency else None,
         "lg_expiry_date": str(request_obj.requested_expiry_date) if request_obj.requested_expiry_date else None,
         "lg_purpose": request_obj.lg_purpose,
+        "reference_number": request_obj.reference_number,
+        "is_cross_border": bool(request_obj.is_cross_border),
+        "issuance_country": request_obj.issuance_country or "Egypt",
+        "is_third_party": bool(request_obj.is_third_party),
+        "third_party_name": request_obj.third_party_name,
+        "requires_special_wording": bool(request_obj.requires_special_wording),
+        "is_auto_reducing": bool(request_obj.is_auto_reducing),
+        "applicable_rules": request_obj.applicable_rules,
     }
 
     # Run AI-driven verification

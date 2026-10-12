@@ -226,6 +226,13 @@ async def submit_request_for_approval(
     current_user: TokenData = Depends(get_current_treasury_context)
 ):
     """ User submits DRAFT -> PENDING_APPROVAL """
+    # Guarantee that any attached document is scanned and verified before final submission
+    try:
+        from app.api.v1.endpoints.public_issuance import _auto_verify_request_documents
+        await _auto_verify_request_documents(db, request_id, current_user.customer_id)
+    except Exception as e:
+        logger.warning(f"Internal submit auto-verify exception: {e}")
+
     result = issuance_service.submit_for_approval(db, request_id, current_user.user_id)
     
     print(f"[DEBUG EMAIL] internal_submit: status={result.status}, approvers={result.pending_approver_users}")
@@ -877,9 +884,11 @@ async def record_bank_reply(
             raise HTTPException(status_code=500, detail=f"Database error recording bank reply: {flush_err}")
 
         # Promotional Campaign & Cashback Claim Hook
+        # Wrapped in savepoint so failures don't poison the main transaction
         try:
-            from app.crud.crud_campaign import crud_campaign
-            crud_campaign.record_claim_for_issued_lg(db, lg)
+            with db.begin_nested():
+                from app.crud.crud_campaign import crud_campaign
+                crud_campaign.record_claim_for_issued_lg(db, lg)
         except Exception as camp_err:
             logger.warning(f"Could not evaluate promotional claim for issued LG #{lg.id}: {camp_err}")
 
