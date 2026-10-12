@@ -195,6 +195,9 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS attachment_column_signature VARCHAR;",
                     "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS confidence_score INTEGER;",
                     "ALTER TABLE email_classification_history ALTER COLUMN confidence DROP NOT NULL;",
+                    "UPDATE quotation_rfqs SET status = 'COMPLETED', acceptance_status = 'NO_QUOTES', acceptance_deadline = NULL, acceptance_resolved_at = NULL, acceptance_resolved_by_user_id = NULL WHERE status = 'EVALUATING' AND window_end < NOW() AND (winner_bank_name IS NULL OR winner_bank_name = '') AND (acceptance_status IS NULL OR acceptance_status = 'PENDING');",
+                    "UPDATE quotation_rfqs SET status = 'COMPLETED' WHERE status = 'INCONCLUSIVE';",
+                    "UPDATE quotation_legs SET status = 'COMPLETED' WHERE status = 'INCONCLUSIVE';",
                 ]
                 with engine.connect() as conn:
                     for stmt in migrations:

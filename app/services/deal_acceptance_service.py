@@ -145,7 +145,7 @@ async def execute_shared_deal_acceptance(
                 if leg.winner_bank_id:
                     leg.status = 'ACCEPTED'
                 else:
-                    leg.status = 'INCONCLUSIVE'
+                    leg.status = 'COMPLETED'
             elif leg_key in declined_set or (declined_leg_ids is not None and len(declined_set) > 0 and leg_key not in accepted_set):
                 leg.status = 'REJECTED'
                 leg.winner_bank_id = None
@@ -156,7 +156,7 @@ async def execute_shared_deal_acceptance(
             elif leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
                 leg.status = 'ACCEPTED'
             elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
-                leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+                leg.status = 'COMPLETED'
 
         any_accepted = any(l.status == 'ACCEPTED' for l in (rfq.legs or []))
         if any_accepted:
@@ -167,13 +167,19 @@ async def execute_shared_deal_acceptance(
             rfq.acceptance_status = 'REJECTED'
             rfq.admin_revision_notes = "All legs declined by authorized corporate user"
     else:
+        has_win = bool(rfq.winner_bank_id or rfq.winner_bank_name or any(l.winner_bank_id for l in (rfq.legs or [])))
+        if not has_win:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot accept deal: No winning quote was received for this tender."
+            )
         rfq.status = 'COMPLETED'
         rfq.acceptance_status = 'ACCEPTED'
         for leg in (rfq.legs or []):
             if leg.winner_bank_id and leg.status not in ('REJECTED', 'CANCELLED'):
                 leg.status = 'ACCEPTED'
             elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
-                leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+                leg.status = 'COMPLETED'
 
     rfq.acceptance_resolved_at = datetime.now(timezone.utc)
     rfq.acceptance_resolved_by_user_id = user.id

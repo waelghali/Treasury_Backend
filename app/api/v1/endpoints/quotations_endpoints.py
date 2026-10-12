@@ -1489,12 +1489,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             if not rfq.acceptance_status:
                 rfq.acceptance_status = 'REJECTED'
             db.commit()
-        else:
-            # Acceptance decision pending — will be evaluated after computing standings & uncontested status
-            if rfq.status not in ('REJECTED', 'CANCELLED', 'COMPLETED'):
-                rfq.status = 'EVALUATING'
-            if not rfq.acceptance_status:
-                rfq.acceptance_status = 'PENDING'
+        elif rfq.acceptance_status == 'NO_QUOTES':
+            rfq.status = 'COMPLETED'
             db.commit()
         
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
@@ -1563,12 +1559,14 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             rfq.winner_rate = None
             rfq.saved_vs_avg = None
             if is_closed and not is_scheduled:
-                rfq.status = 'INCONCLUSIVE'
+                rfq.status = 'COMPLETED'
                 rfq.acceptance_status = 'NO_QUOTES'
-                rfq.acceptance_resolved_at = now
+                rfq.acceptance_deadline = None
+                rfq.acceptance_resolved_at = None
+                rfq.acceptance_resolved_by_user_id = None
                 for leg in (rfq.legs or []):
                     if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                        leg.status = 'INCONCLUSIVE'
+                        leg.status = 'COMPLETED'
                 db.commit()
             return {
                 "rfq": rfq,
@@ -2012,7 +2010,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             if is_closed and hasattr(leg, 'id'):
                 if leg_is_inconclusive:
                     if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                        leg.status = 'INCONCLUSIVE'
+                        leg.status = 'COMPLETED'
                 elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
                     leg.status = 'COMPLETED'
 
@@ -2194,19 +2192,26 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             rfq.status = 'REJECTED'
             if not rfq.acceptance_status:
                 rfq.acceptance_status = 'REJECTED'
-        elif is_inconclusive:
-            rfq.status = 'INCONCLUSIVE'
-            has_any_quote = any(
-                l.get("results") and any(r.get("finalPrice") is not None for r in l["results"])
-                for l in legs_data
-            ) if legs_data else bool(valid_results if 'valid_results' in locals() else False)
-            rfq.acceptance_status = 'NO_QUOTES' if not has_any_quote else 'INCONCLUSIVE'
-            rfq.acceptance_resolved_at = now
+        elif is_inconclusive or not winner_bank_id:
+            # Tender window closed with NO winning executable quote!
+            # Conclude tender directly as COMPLETED without opening an acceptance window.
+            rfq.status = 'COMPLETED'
+            rfq.acceptance_status = 'NO_QUOTES'
+            rfq.acceptance_deadline = None
+            rfq.acceptance_resolved_at = None
+            rfq.acceptance_resolved_by_user_id = None
+            rfq.winner_bank_id = None
+            rfq.winner_bank_name = None
+            rfq.winner_rate = None
+            rfq.saved_vs_avg = None
             for leg in (rfq.legs or []):
                 if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                    leg.status = 'INCONCLUSIVE'
-        elif not is_inconclusive:
-            # Acceptance decision is still pending. Check if acceptance window has expired!
+                    leg.status = 'COMPLETED'
+                    leg.winner_bank_id = None
+                    leg.winner_bank_name = None
+        elif not is_inconclusive and winner_bank_id:
+            # Acceptance decision is still pending for a valid winning quote!
+            # Check if acceptance window has expired!
             if acc_deadline and now > acc_deadline:
                 from app.crud.crud import log_action
                 if rfq.acceptance_timeout_action == "AUTO_ACCEPT":
@@ -2423,14 +2428,18 @@ def get_rfq_history(
                     changed = True
                     status_changed = True
                 elif not has_winner and not is_acc_open:
-                    r.status = 'INCONCLUSIVE'
-                    if not r.acceptance_status or r.acceptance_status == 'PENDING':
-                        r.acceptance_status = 'NO_QUOTES'
+                    r.status = 'COMPLETED'
+                    r.acceptance_status = 'NO_QUOTES'
+                    r.acceptance_deadline = None
+                    r.acceptance_resolved_at = None
+                    r.acceptance_resolved_by_user_id = None
                     changed = True
                     status_changed = True
                 for leg in (r.legs or []):
-                    if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED', 'INCONCLUSIVE', 'COMPLETED'):
-                        leg.status = 'INCONCLUSIVE' if not leg.winner_bank_id else 'COMPLETED'
+                    if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                        leg.status = 'COMPLETED'
+                        leg.winner_bank_id = None
+                        leg.winner_bank_name = None
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED'
                 changed = True
