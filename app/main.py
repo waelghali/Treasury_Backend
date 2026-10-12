@@ -171,29 +171,39 @@ def configure_app_instance(fastapi_app: FastAPI):
             logger.info("Database tables verified/created.")
             try:
                 from sqlalchemy import text
+                migrations = [
+                    "ALTER TABLE banks ADD COLUMN IF NOT EXISTS portal_access_enabled BOOLEAN NOT NULL DEFAULT TRUE;",
+                    "ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS leg_id VARCHAR;",
+                    "ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS encrypted_price VARCHAR(255);",
+                    "ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS encrypted_spread VARCHAR(255);",
+                    "ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR;",
+                    "ALTER TABLE quotation_offers ALTER COLUMN price DROP NOT NULL;",
+                    "ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS leg_id VARCHAR;",
+                    "ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS encrypted_discount_rate VARCHAR(255);",
+                    "ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS encrypted_max_amount VARCHAR(255);",
+                    "ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR;",
+                    "ALTER TABLE quotation_tbill_offers ALTER COLUMN discount_rate DROP NOT NULL;",
+                    "ALTER TABLE quotation_tbill_offers ALTER COLUMN max_amount DROP NOT NULL;",
+                    "ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255);",
+                    "ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);",
+                    "ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;",
+                    "ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255);",
+                    "ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);",
+                    "ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;",
+                    "ALTER TABLE quotation_anonymous_benchmarks ALTER COLUMN cbe_benchmark_rate DROP NOT NULL;",
+                    "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS original_classification VARCHAR;",
+                    "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS attachment_column_signature VARCHAR;",
+                    "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS confidence_score INTEGER;",
+                    "ALTER TABLE email_classification_history ALTER COLUMN confidence DROP NOT NULL;",
+                ]
                 with engine.connect() as conn:
-                    conn.execute(text("ALTER TABLE banks ADD COLUMN IF NOT EXISTS portal_access_enabled BOOLEAN NOT NULL DEFAULT TRUE;"))
-                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS leg_id VARCHAR;"))
-                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS encrypted_price VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS encrypted_spread VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_offers ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR;"))
-                    conn.execute(text("ALTER TABLE quotation_offers ALTER COLUMN price DROP NOT NULL;"))
-
-                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS leg_id VARCHAR;"))
-                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS encrypted_discount_rate VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS encrypted_max_amount VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_tbill_offers ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR;"))
-                    conn.execute(text("ALTER TABLE quotation_tbill_offers ALTER COLUMN discount_rate DROP NOT NULL;"))
-                    conn.execute(text("ALTER TABLE quotation_tbill_offers ALTER COLUMN max_amount DROP NOT NULL;"))
-
-                    conn.execute(text("ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_legs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;"))
-
-                    conn.execute(text("ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS encrypted_winner_rate VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS encrypted_saved_vs_avg VARCHAR(255);"))
-                    conn.execute(text("ALTER TABLE quotation_rfqs ADD COLUMN IF NOT EXISTS market_benchmark_snapshot JSONB;"))
-                    conn.commit()
+                    for stmt in migrations:
+                        try:
+                            conn.execute(text(stmt))
+                            conn.commit()
+                        except Exception as stmt_err:
+                            conn.rollback()
+                            logger.debug(f"Schema migration statement ignored ({stmt[:40]}...): {stmt_err}")
             except Exception as e:
                 logger.warning(f"Startup schema migration check: {e}")
 

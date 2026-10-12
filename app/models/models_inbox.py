@@ -221,6 +221,7 @@ class EmailClassificationHistory(BaseModel):
     sender_domain = Column(String, nullable=True, index=True)
     
     classification = Column(String, nullable=False)
+    confidence = Column(String, nullable=True, comment="Confidence rating string e.g. HIGH, LOW")
     was_user_corrected = Column(Boolean, default=False,
                                 comment="True if user changed the system's initial classification")
     original_classification = Column(String, nullable=True,
