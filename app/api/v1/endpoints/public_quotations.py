@@ -1598,9 +1598,14 @@ def submit_fx_offers_batch(
         import uuid
         for passed_leg_id in payload.passed_legs:
             # Clear any previously submitted quote for this leg since dealer has explicitly passed
+            is_single = len(rfq.legs or []) <= 1
+            leg_filter = QuotationOffer.leg_id == passed_leg_id
+            if is_single:
+                from sqlalchemy import or_
+                leg_filter = or_(leg_filter, QuotationOffer.leg_id.is_(None))
             db.query(QuotationOffer).filter(
                 QuotationOffer.assignment_id == assignment.id,
-                QuotationOffer.leg_id == passed_leg_id
+                leg_filter
             ).delete()
 
             # Check if leg config already exists
@@ -1611,14 +1616,17 @@ def submit_fx_offers_batch(
             if leg_cfg:
                 leg_cfg.is_passed = True
             else:
-                new_leg_cfg = QuotationBankLegConfig(
-                    id=str(uuid.uuid4()),
-                    assignment_id=assignment.id,
-                    leg_id=passed_leg_id,
-                    is_invited=True,
-                    is_passed=True
-                )
-                db.add(new_leg_cfg)
+                from app.models.models_quotation import QuotationLeg
+                leg_exists = db.query(QuotationLeg).filter(QuotationLeg.id == passed_leg_id).first()
+                if leg_exists:
+                    new_leg_cfg = QuotationBankLegConfig(
+                        id=str(uuid.uuid4()),
+                        assignment_id=assignment.id,
+                        leg_id=passed_leg_id,
+                        is_invited=True,
+                        is_passed=True
+                    )
+                    db.add(new_leg_cfg)
 
     db.commit()
 

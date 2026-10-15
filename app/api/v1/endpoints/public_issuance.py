@@ -15,6 +15,9 @@ from datetime import datetime, timezone, timedelta
 import secrets
 import string
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Models
 from app.models import Customer, ExternalOTP, CustomerEntity, Currency, LgType, Department

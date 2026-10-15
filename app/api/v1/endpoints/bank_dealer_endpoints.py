@@ -1018,12 +1018,16 @@ async def get_live_rfq_blotter(
 
         if desk and desk.active_trader_email:
             is_you = (desk.active_trader_email.strip().lower() == current_dealer.email.strip().lower())
+            distinct_spectators = {
+                (s.get("email") or "").strip().lower() for s in desk.spectators.values()
+                if (s.get("email") or "").strip().lower() and (s.get("email") or "").strip().lower() != desk.active_trader_email.strip().lower()
+            }
             desk_lock = {
                 "is_locked": True,
                 "locked_by_email": desk.active_trader_email,
                 "locked_by_name": desk.active_trader_name or desk.active_trader_email.split("@")[0],
                 "is_you": is_you,
-                "spectators_count": len(desk.spectators)
+                "spectators_count": len(distinct_spectators)
             }
         else:
             desk_lock = {

@@ -139,6 +139,7 @@ class QuotationBankLegConfigOut(BaseModel):
     assignment_id: str
     leg_id: str
     is_invited: bool = True
+    is_passed: bool = False
     cost_min: float = 0.0
     cost_percent: float = 0.0
     cost_max: float = 0.0
@@ -363,6 +364,7 @@ class TBillOfferCreate(BaseModel):
 # --- Results Schemas ---
 class QuotationResultItem(BaseModel):
     bank_id: int
+    quotation_bank_id: Optional[int] = None
     bank_name: str
     bank_emails: str
     price: Optional[float] = None
@@ -387,8 +389,12 @@ class QuotationResultItem(BaseModel):
     offered_value_date: Optional[Union[str, date]] = None
     allow_alternative_value_date: Optional[bool] = False
     is_alternative_value_date: Optional[bool] = False
+    is_custom_value_date: Optional[bool] = False
     time_value_adjustment: Optional[float] = 0.0
     normalized_price: Optional[float] = None
+    is_passed: Optional[bool] = False
+    is_excluded: Optional[bool] = False
+    is_cross_entity: Optional[bool] = False
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

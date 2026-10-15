@@ -2435,11 +2435,11 @@ def get_rfq_history(
                     r.acceptance_resolved_by_user_id = None
                     changed = True
                     status_changed = True
-                for leg in (r.legs or []):
-                    if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                        leg.status = 'COMPLETED'
-                        leg.winner_bank_id = None
-                        leg.winner_bank_name = None
+                    for leg in (r.legs or []):
+                        if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                            leg.status = 'COMPLETED'
+                            leg.winner_bank_id = None
+                            leg.winner_bank_name = None
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED'
                 changed = True

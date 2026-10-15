@@ -2604,32 +2604,73 @@ def approve_quotation_request(
         for assignment in assignments:
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if bank_row:
-                bank_emails = []
-                if bank_row.contacts and isinstance(bank_row.contacts, list):
-                    bank_emails = [c.get("email", "").strip() for c in bank_row.contacts if c.get("email")]
-                if not bank_emails and bank_row.emails:
-                    bank_emails = [e.strip() for e in bank_row.emails.split(',') if e.strip()]
+                contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
+                if not contacts and bank_row.emails:
+                    contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
+                if not contacts:
+                    continue
 
-                if bank_emails:
+                all_bank_emails = list(dict.fromkeys(
+                    c.get("email", "").strip() for c in contacts if c.get("email")
+                ))
+                approver_emails = list(dict.fromkeys(
+                    c.get("email", "").strip() for c in contacts 
+                    if c.get("role") == "APPROVER" and c.get("email")
+                ))
+                approver_set = {e.lower() for e in approver_emails}
+                non_approver_emails = [e for e in all_bank_emails if e.lower() not in approver_set]
+
+                has_approver = len(approver_emails) > 0
+                has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
+
+                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+
+                if assignment.approval_status == "PENDING" and has_approver and has_execution:
+                    # Bank Approver authorization needed
+                    for app_email in approver_emails:
+                        approver_link = f"{base_url}/public-quotation/{assignment.token}?email={app_email}"
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=assignment,
+                            bank_name=bank_display_name,
+                            customer_branding=customer_branding,
+                            link=approver_link,
+                            email_purpose="BANK_APPROVAL_REQUIRED"
+                        )
+                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+
+                    if non_approver_emails:
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=assignment,
+                            bank_name=bank_display_name,
+                            customer_branding=customer_branding,
+                            link="",
+                            email_purpose="BANK_HEADS_UP"
+                        )
+                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+
+                else:
+                    # Standard Invitation - No bank approver required
                     link = f"{base_url}/public-quotation/{assignment.token}"
-                    bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
-                    subject, body = build_quotation_rfq_bank_email(
-                        rfq=rfq,
-                        assignment=assignment,
-                        bank_name=bank_display_name,
-                        customer_branding=customer_branding,
-                        link=link,
-                        email_purpose="INVITATION"
-                    )
-                    background_tasks.add_task(
-                        send_email,
-                        db,
-                        bank_emails,
-                        subject,
-                        body,
-                        {}, 
-                        email_settings,
-                    )
+                    if all_bank_emails:
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=assignment,
+                            bank_name=bank_display_name,
+                            customer_branding=customer_branding,
+                            link=link,
+                            email_purpose="INVITATION"
+                        )
+                        background_tasks.add_task(
+                            send_email,
+                            db,
+                            all_bank_emails,
+                            subject,
+                            body,
+                            {}, 
+                            email_settings,
+                        )
 
     return {"message": "Quotation status updated successfully.", "status": rfq.status}
 

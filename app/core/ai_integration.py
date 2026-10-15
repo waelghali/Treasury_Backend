@@ -777,6 +777,12 @@ def log_ai_usage_sync(
     call_type: str = "unknown",
 ):
     """Sync-compatible AI usage logger for non-async callers (reconciliation, etc)."""
+    # ai_usage_logs.user_id is a NOT NULL FK to users. Public portal requestors (token-based,
+    # no user account) have no valid user id, so writing 0 would violate the FK and poison the
+    # caller's DB session. Skip the row instead of breaking the business flow.
+    if not user_id:
+        logger.info(f"AI usage not logged for {call_type} (customer {customer_id}): no authenticated user.")
+        return
     try:
         from app.models import AIUsageLog
         model_name = GEMINI_MODEL_NAME
@@ -796,6 +802,10 @@ def log_ai_usage_sync(
         db.commit()
         logger.info(f"AI Usage Log (sync) saved: {call_type} for customer {customer_id}")
     except Exception as e:
+        try:
+            db.rollback()  # Never leave the caller's session in a failed state
+        except Exception:
+            pass
         logger.error(f"Failed to save sync AI usage log: {e}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), reraise=True)
@@ -1386,8 +1396,11 @@ Compare each relevant field against the document text. For each field, evaluate:
 7. **CURRENCIES**:
    - For `currency` and `lg_currency`: Match standard ISO codes (EGP, USD, EUR, SAR, AED, GBP, etc.).
 
-8. **LG EXPIRY DATE**:
-   - If the document mentions an exact date or a duration (e.g., "valid for 90 days from bid closing" or "12 months after handover"), compare. Within 30 days = MATCH.
+8. **LG EXPIRY DATE & DATE NORMALIZATION (CRITICAL)**:
+   - Understand and parse ANY textual or numerical date format in the document (e.g., `31 Dec 2026`, `31/12/2026`, `12/31/2026`, `2026-12-31`, `December 31, 2026`, `31 ديسمبر 2026`).
+   - If the document date represents the SAME calendar day as the user's entered date (e.g., document says "31 Dec 2026" or "31/12/2026" and user entered "2026-12-31" or "12/31/2026"), this is an EXACT **MATCH** — do NOT flag a mismatch just because of date formatting differences!
+   - If the document mentions a duration (e.g., "valid for 90 days from bid closing" or "12 months after handover"), compute the target date. If within 30 days of user's request date, verdict is **MATCH**.
+   - **CRITICAL OUTPUT FORMAT**: When returning `document_value` for any date field (`lg_expiry_date`) or in `clause_harvest.recommended_expiry_date`, ALWAYS normalize and format the date strictly as **YYYY-MM-DD** (e.g. "2026-12-31"). Never output raw textual dates like "31 Dec 2026" or "31/12/2026" in `document_value` so downstream form inputs and databases receive clean ISO dates.
 
 9. **LG TYPE & PURPOSE**:
    - For `lg_type`: Semantic match (e.g. "Final Guarantee" = "Performance Bond" = "نهائي" = MATCH; "Initial Guarantee" = "Bid Bond" = "ابتدائي" = MATCH; "Advance Payment" = "دفعة مقدمة" = MATCH).
@@ -1459,7 +1472,7 @@ Return a JSON object with exactly these fields:
         # Log usage
         if response.usage_metadata and db and customer_id:
             log_ai_usage_sync(
-                db, customer_id, user_id or 0,
+                db, customer_id, user_id,
                 f"[doc_verify] {file_name}",
                 prompt_tokens=response.usage_metadata.prompt_token_count,
                 completion_tokens=response.usage_metadata.candidates_token_count,

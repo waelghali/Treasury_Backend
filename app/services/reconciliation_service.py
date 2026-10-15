@@ -39,12 +39,13 @@ logger = logging.getLogger(__name__)
 # Keyword → internal field map (case-insensitive matching)
 COLUMN_KEYWORDS: Dict[str, List[str]] = {
     "bank_lg_number": [
+        "bank lg number", "bank lg ref", "bank lg#", "bank guarantee no", "bank guarantee number",
         "lg number", "lg no", "lg#", "guarantee no", "guarantee number",
         "ref", "reference", "lg ref", "reference no", "lg reference",
         "رقم خطاب الضمان", "رقم الضمان",
     ],
     "beneficiary_name": [
-        "beneficiary", "in favour of", "in favor of", "favour of",
+        "beneficiary name", "beneficiary", "in favour of", "in favor of", "favour of",
         "المستفيد", "اسم المستفيد",
     ],
     "amount": [
@@ -626,6 +627,10 @@ class ReconciliationService:
         for values in all_rows[header_row_idx + 1:]:
             if not values or all(v is None or str(v).strip() == "" for v in values):
                 continue
+            # Skip summary/total/footer rows
+            first_val = str(values[0] or "").strip().upper()
+            if any(first_val.startswith(p) for p in ("TOTAL", "SUM", "GRAND TOTAL", "SUBTOTAL")):
+                continue
             row_dict = {}
             raw = {}
             for i, val in enumerate(values):
@@ -739,10 +744,7 @@ class ReconciliationService:
                 col_map[header] = cached_map[h_lower]
                 mapped_fields.add(cached_map[h_lower])
 
-        if len(col_map) >= 3:
-            return col_map, "CACHED"
-
-        # 2) Keyword matching
+        # 2) Keyword matching for any unmapped headers
         for header in headers:
             if header in col_map:
                 continue
@@ -758,7 +760,7 @@ class ReconciliationService:
                 if header in col_map:
                     break
 
-        method = "AUTO" if len(col_map) >= 3 else "PARTIAL"
+        method = "CACHED" if (cached and len(col_map) >= 3 and not (set(col_map.values()) - set(cached_map.values()))) else ("AUTO" if len(col_map) >= 3 else "PARTIAL")
 
         # Save successful mappings for reuse
         if len(col_map) >= 3:

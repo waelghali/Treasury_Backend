@@ -20,71 +20,117 @@ def build_standard_email_html(
 ) -> str:
     """
     Generates a standard corporate SaaS HTML email with dark navy branding.
+    Fully compatible with Microsoft Outlook Desktop (Word engine), mobile clients, and webmail.
     """
     greeting = f"Dear <strong>{recipient_name}</strong>," if recipient_name else "Hello,"
     cta_html = ""
     if cta_text and cta_url:
         cta_html = f"""
-        <div style="text-align: center; margin: 32px 0 16px 0;">
-            <a href="{cta_url}" style="background-color: #1e40af; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(30, 64, 175, 0.2);">
-                {cta_text} &rarr;
-            </a>
-        </div>
+        <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 32px auto 16px auto;">
+            <tr>
+                <td align="center" bgcolor="#1e40af" style="border-radius: 8px; background-color: #1e40af;">
+                    <a href="{cta_url}" target="_blank" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; border: 1px solid #1e40af; display: inline-block;">
+                        {cta_text} &rarr;
+                    </a>
+                </td>
+            </tr>
+        </table>
         """
 
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
+    return f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{title}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 660px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+        }}
+    </style>
 </head>
-<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
-    <div style="max-width: 650px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025); border: 1px solid #e2e8f0;">
-        
-        <!-- HEADER -->
-        <div style="background-color: #0f172a; padding: 26px 32px; color: #ffffff;">
-            <table style="width: 100%; border-collapse: collapse;">
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="650" align="center" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                    <td>
-                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()}</span>
-                        <h1 style="margin: 0; font-size: 19px; font-weight: 700; color: #ffffff;">{title}</h1>
-                    </td>
-                    <td style="text-align: right; vertical-align: middle;">
-                        <span style="background-color: rgba(56, 189, 248, 0.15); color: #38bdf8; padding: 6px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; border: 1px solid rgba(56, 189, 248, 0.3);">
-                            {customer_name}
-                        </span>
-                    </td>
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 650px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+                    
+                    <!-- HEADER -->
+                    <tr>
+                        <td bgcolor="#0f172a" style="background-color: #0f172a; padding: 26px 32px; color: #ffffff;" class="mobile-padding">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td valign="middle" align="left">
+                                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()}</span>
+                                        <h1 style="margin: 0; font-size: 19px; font-weight: 700; color: #ffffff; line-height: 1.3;">{title}</h1>
+                                    </td>
+                                    <td valign="middle" align="right" style="text-align: right;">
+                                        <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="display: inline-block;">
+                                            <tr>
+                                                <td bgcolor="#1e293b" style="background-color: #1e293b; color: #38bdf8; padding: 6px 14px; border-radius: 20px; font-size: 11px; font-weight: 700; border: 1px solid #38bdf8;">
+                                                    {customer_name}
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <!-- BODY CONTENT -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 32px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 20px; font-size: 15px; line-height: 1.6; color: #334155;">
+                                {greeting}
+                            </p>
+                            
+                            <div style="font-size: 14px; line-height: 1.6; color: #334155;">
+                                {content_html}
+                            </div>
+
+                            {cta_html}
+                        </td>
+                    </tr>
+
+                    <!-- FOOTER -->
+                    <tr>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 500;">
+                                {platform_name} &bull; Automated System Notification
+                            </p>
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                Generated on {current_time_str} for {customer_name}. Confidential.
+                            </p>
+                        </td>
+                    </tr>
+
+                </table>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
                 </tr>
-            </table>
-        </div>
-
-        <!-- BODY CONTENT -->
-        <div style="padding: 32px;">
-            <p style="margin-top: 0; margin-bottom: 20px; font-size: 15px; line-height: 1.6; color: #334155;">
-                {greeting}
-            </p>
-            
-            <div style="font-size: 14px; line-height: 1.6; color: #334155;">
-                {content_html}
-            </div>
-
-            {cta_html}
-        </div>
-
-        <!-- FOOTER -->
-        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
-            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 500;">
-                {platform_name} &bull; Automated System Notification
-            </p>
-            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                Generated on {current_time_str} for {customer_name}. Confidential.
-            </p>
-        </div>
-
-    </div>
+                </table>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
@@ -128,23 +174,29 @@ def build_alert_email_html(
     table_block = ""
     if details_table_html:
         table_block = f"""
-        <div style="overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 8px; margin: 20px 0;">
-            {details_table_html}
-        </div>
+        <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; margin: 20px 0;">
+            <tr>
+                <td>{details_table_html}</td>
+            </tr>
+        </table>
         """
 
     content_html = f"""
-    <div style="background-color: {banner_bg}; border: 1px solid {banner_border}; border-radius: 8px; padding: 18px 20px; margin-bottom: 24px;">
-        <span style="font-size: 11px; font-weight: 800; color: {banner_color}; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 6px;">
-            {badge_text}
-        </span>
-        <h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: 700; color: {title_color};">
-            {title}
-        </h3>
-        <p style="margin: 0; font-size: 14px; line-height: 1.5; color: #334155;">
-            {message}
-        </p>
-    </div>
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom: 24px;">
+        <tr>
+            <td bgcolor="{banner_bg}" style="background-color: {banner_bg}; border: 1px solid {banner_border}; border-radius: 8px; padding: 18px 20px;">
+                <span style="font-size: 11px; font-weight: 800; color: {banner_color}; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 6px;">
+                    {badge_text}
+                </span>
+                <h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: 700; color: {title_color};">
+                    {title}
+                </h3>
+                <p style="margin: 0; font-size: 14px; line-height: 1.5; color: #334155;">
+                    {message}
+                </p>
+            </td>
+        </tr>
+    </table>
 
     {table_block}
     """
@@ -179,9 +231,9 @@ def build_transaction_email_html(
     for idx, (key, value) in enumerate(key_value_dict.items()):
         bg_color = "#ffffff" if idx % 2 == 0 else "#f8fafc"
         rows.append(f"""
-        <tr style="background-color: {bg_color}; border-bottom: 1px solid #e2e8f0;">
-            <td style="padding: 10px 14px; font-size: 13px; font-weight: 600; color: #475569; width: 35%;">{key}</td>
-            <td style="padding: 10px 14px; font-size: 13px; font-weight: 600; color: #0f172a;">{value}</td>
+        <tr bgcolor="{bg_color}" style="background-color: {bg_color}; border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 10px 14px; font-size: 13px; font-weight: 600; color: #475569; width: 35%; border-bottom: 1px solid #e2e8f0;">{key}</td>
+            <td style="padding: 10px 14px; font-size: 13px; font-weight: 600; color: #0f172a; border-bottom: 1px solid #e2e8f0;">{value}</td>
         </tr>
         """)
 
@@ -192,28 +244,34 @@ def build_transaction_email_html(
     content_html = f"""
     {summary_block}
     
-    <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-bottom: 20px;">
-        <table style="width: 100%; border-collapse: collapse;">
-            <tr>
-                <td style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase;">
-                    {transaction_type}
-                </td>
-                <td style="text-align: right;">
-                    <span style="background-color: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 700;">
-                        Ref: {transaction_ref}
-                    </span>
-                </td>
-            </tr>
-        </table>
-    </div>
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom: 20px;">
+        <tr>
+            <td bgcolor="#f8fafc" style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px;">
+                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                    <tr>
+                        <td valign="middle" align="left" style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase;">
+                            {transaction_type}
+                        </td>
+                        <td valign="middle" align="right" style="text-align: right;">
+                            <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="display: inline-block;">
+                                <tr>
+                                    <td bgcolor="#e0f2fe" style="background-color: #e0f2fe; color: #0369a1; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 700;">
+                                        Ref: {transaction_ref}
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
 
-    <div style="overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 24px;">
-        <table style="width: 100%; border-collapse: collapse; text-align: left;">
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
-    </div>
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; margin-bottom: 24px; text-align: left;">
+        <tbody>
+            {rows_html}
+        </tbody>
+    </table>
     """
 
     return build_standard_email_html(
@@ -238,73 +296,123 @@ def build_security_email_html(
 ) -> str:
     """
     Generates a secure email for authentication, password resets, and account security notifications.
+    Fully compatible with Microsoft Outlook Desktop, mobile clients, and webmail.
     """
     code_block = ""
     if otp_code:
         code_block = f"""
-        <div style="text-align: center; margin: 28px 0;">
-            <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 1px; display: block; margin-bottom: 8px;">Your Verification Code</span>
-            <div style="font-size: 30px; font-weight: 800; letter-spacing: 6px; color: #0284c7; background-color: #f8fafc; border: 2px dashed #0284c7; padding: 16px 28px; border-radius: 10px; display: inline-block;">
-                {otp_code}
-            </div>
-        </div>
+        <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 28px auto;">
+            <tr>
+                <td align="center">
+                    <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 1px; display: block; margin-bottom: 8px;">Your Verification Code</span>
+                    <div style="font-size: 30px; font-weight: 800; letter-spacing: 6px; color: #0284c7; background-color: #f8fafc; border: 2px dashed #0284c7; padding: 16px 28px; border-radius: 10px; display: inline-block;">
+                        {otp_code}
+                    </div>
+                </td>
+            </tr>
+        </table>
         """
 
     cta_block = ""
     if action_url and action_text:
         cta_block = f"""
-        <div style="text-align: center; margin: 28px 0;">
-            <a href="{action_url}" style="background-color: #0284c7; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(2, 132, 199, 0.2);">
-                {action_text} &rarr;
-            </a>
-        </div>
+        <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 28px auto;">
+            <tr>
+                <td align="center" bgcolor="#0284c7" style="border-radius: 8px; background-color: #0284c7;">
+                    <a href="{action_url}" target="_blank" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; border: 1px solid #0284c7; display: inline-block;">
+                        {action_text} &rarr;
+                    </a>
+                </td>
+            </tr>
+        </table>
         """
 
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
+    return f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{title}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 600px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+        }}
+    </style>
 </head>
-<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
-    <div style="max-width: 580px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025); border: 1px solid #e2e8f0;">
-        
-        <!-- HEADER -->
-        <div style="background-color: #0f172a; padding: 24px 30px; color: #ffffff; text-align: center;">
-            <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()}</span>
-            <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff;">🛡️ {title}</h1>
-        </div>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="580" align="center" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 580px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+                    
+                    <!-- HEADER -->
+                    <tr>
+                        <td bgcolor="#0f172a" style="background-color: #0f172a; padding: 24px 30px; color: #ffffff; text-align: center;" class="mobile-padding">
+                            <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()}</span>
+                            <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff; line-height: 1.3;">🛡️ {title}</h1>
+                        </td>
+                    </tr>
 
-        <!-- CONTENT -->
-        <div style="padding: 30px;">
-            <p style="margin-top: 0; margin-bottom: 16px; font-size: 14px; color: #334155; line-height: 1.6;">
-                Hello <strong>{user_email}</strong>,
-            </p>
-            <p style="font-size: 14px; color: #334155; line-height: 1.6; margin-bottom: 20px;">
-                {message}
-            </p>
+                    <!-- CONTENT -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 30px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 16px; font-size: 14px; color: #334155; line-height: 1.6;">
+                                Hello <strong>{user_email}</strong>,
+                            </p>
+                            <p style="font-size: 14px; color: #334155; line-height: 1.6; margin-bottom: 20px;">
+                                {message}
+                            </p>
 
-            {code_block}
-            {cta_block}
+                            {code_block}
+                            {cta_block}
 
-            <div style="background-color: #f8fafc; border-left: 4px solid #0284c7; padding: 12px 16px; border-radius: 4px; margin-top: 24px;">
-                <p style="margin: 0; font-size: 12px; color: #475569; line-height: 1.5;">
-                    🔒 <strong>Security Advisory:</strong> If you did not initiate this request, please disregard this email or contact your Treasury Administrator immediately.
-                </p>
-            </div>
-        </div>
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top: 24px;">
+                                <tr>
+                                    <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-left: 4px solid #0284c7; padding: 12px 16px; border-radius: 4px;">
+                                        <p style="margin: 0; font-size: 12px; color: #475569; line-height: 1.5;">
+                                            🔒 <strong>Security Advisory:</strong> If you did not initiate this request, please disregard this email or contact your Treasury Administrator immediately.
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
 
-        <!-- FOOTER -->
-        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 18px 30px; text-align: center;">
-            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                {platform_name} &bull; Generated on {current_time_str}
-            </p>
-        </div>
+                    <!-- FOOTER -->
+                    <tr>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 18px 30px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                {platform_name} &bull; Generated on {current_time_str}
+                            </p>
+                        </td>
+                    </tr>
 
-    </div>
+                </table>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
+                </tr>
+                </table>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
@@ -620,26 +728,34 @@ def build_quotation_rfq_bank_email(
     if email_purpose == "BANK_HEADS_UP":
         action_box_html = f"""
             <!-- PENDING APPROVAL INFORMATION BOX -->
-            <div style="background-color: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #f59e0b; border-radius: 8px; padding: 16px 20px; margin: 28px 0 20px 0; text-align: center;">
-                <span style="font-size: 11px; font-weight: 800; color: #b45309; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px;">
-                    &#9203; ACTION STATUS &bull; PENDING AUTHORIZATION
-                </span>
-                <div style="font-size: 15px; font-weight: 800; color: #92400e; line-height: 1.4;">
-                    Awaiting Bank Approver Authorization
-                </div>
-                <p style="margin: 6px 0 0 0; font-size: 12px; color: #78350f; line-height: 1.4;">
-                    Your bank's designated approver has been notified with a secure authorization link. Once approved, your execution desk will automatically receive an invitation email with the live quotation portal link.
-                </p>
-            </div>
+            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin: 28px 0 20px 0;">
+                <tr>
+                    <td bgcolor="#fffbeb" style="background-color: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #f59e0b; border-radius: 8px; padding: 16px 20px; text-align: center;">
+                        <span style="font-size: 11px; font-weight: 800; color: #b45309; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px;">
+                            &#9203; ACTION STATUS &bull; PENDING AUTHORIZATION
+                        </span>
+                        <div style="font-size: 15px; font-weight: 800; color: #92400e; line-height: 1.4;">
+                            Awaiting Bank Approver Authorization
+                        </div>
+                        <p style="margin: 6px 0 0 0; font-size: 12px; color: #78350f; line-height: 1.4;">
+                            Your bank's designated approver has been notified with a secure authorization link. Once approved, your execution desk will automatically receive an invitation email with the live quotation portal link.
+                        </p>
+                    </td>
+                </tr>
+            </table>
         """
     elif email_purpose in ("BANK_APPROVAL_REQUIRED", "WINDOW_START_REMINDER_APPROVER"):
         action_box_html = f"""
             <!-- PRIMARY CALL TO ACTION BUTTON (APPROVER) -->
-            <div style="text-align: center; margin: 36px 0 20px 0;">
-                <a href="{link}" style="background-color: #2563eb; color: #ffffff; padding: 15px 36px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 15px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.3); letter-spacing: 0.5px;">
-                    &#9889; Review &amp; Authorize RFQ Participation &rarr;
-                </a>
-            </div>
+            <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 36px auto 20px auto;">
+                <tr>
+                    <td align="center" bgcolor="#2563eb" style="border-radius: 8px; background-color: #2563eb;">
+                        <a href="{link}" target="_blank" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 800; color: #ffffff; text-decoration: none; padding: 15px 36px; border-radius: 8px; border: 1px solid #2563eb; display: inline-block; letter-spacing: 0.5px;">
+                            &#9889; Review &amp; Authorize RFQ Participation &rarr;
+                        </a>
+                    </td>
+                </tr>
+            </table>
 
             <!-- DIRECT LINK FALLBACK -->
             <p style="text-align: center; margin: 0 0 24px 0; font-size: 12px; color: #64748b; line-height: 1.5;">
@@ -650,11 +766,15 @@ def build_quotation_rfq_bank_email(
     else:
         action_box_html = f"""
             <!-- PRIMARY CALL TO ACTION BUTTON -->
-            <div style="text-align: center; margin: 36px 0 20px 0;">
-                <a href="{link}" style="background-color: #0f172a; color: #ffffff; padding: 15px 36px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 15px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.25); letter-spacing: 0.5px;">
-                    Access Quotation Portal &amp; Submit Quote &rarr;
-                </a>
-            </div>
+            <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 36px auto 20px auto;">
+                <tr>
+                    <td align="center" bgcolor="#0f172a" style="border-radius: 8px; background-color: #0f172a;">
+                        <a href="{link}" target="_blank" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 800; color: #ffffff; text-decoration: none; padding: 15px 36px; border-radius: 8px; border: 1px solid #0f172a; display: inline-block; letter-spacing: 0.5px;">
+                            Access Quotation Portal &amp; Submit Quote &rarr;
+                        </a>
+                    </td>
+                </tr>
+            </table>
 
             <!-- DIRECT LINK FALLBACK -->
             <p style="text-align: center; margin: 0 0 24px 0; font-size: 12px; color: #64748b; line-height: 1.5;">
@@ -814,146 +934,191 @@ def build_quotation_rfq_bank_email(
             </div>
         """
 
-    html_body = f"""<!DOCTYPE html>
-<html lang="en">
+    html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{subject}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 660px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+        }}
+    </style>
 </head>
 <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
-    <div style="max-width: 650px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025); border: 1px solid #e2e8f0;">
-        
-        <!-- HEADER -->
-        <div style="background-color: #0f172a; padding: 26px 32px; color: #ffffff;">
-            <table style="width: 100%; border-collapse: collapse;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="650" align="center" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                    <td>
-                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()} &bull; FX &amp; MONEY MARKET</span>
-                        <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff;">{banner_title}</h1>
-                    </td>
-                    <td style="text-align: right; vertical-align: middle;">
-                        <span style="background-color: rgba(56, 189, 248, 0.15); color: #38bdf8; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid rgba(56, 189, 248, 0.3); display: inline-block;">
-                            {customer_branding}
-                        </span>
-                    </td>
-                </tr>
-            </table>
-        </div>
-
-        <!-- BODY -->
-        <div style="padding: 32px;">
-            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
-                {salutation}
-            </p>
-            <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
-                {intro_text} {instruction_text}
-            </p>
-
-            <!-- SUBMISSION DEADLINE ALERT BOX -->
-            <div style="background-color: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #dc2626; border-radius: 8px; padding: 18px 22px; margin-bottom: 26px;">
-                <table style="width: 100%; border-collapse: collapse;">
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 650px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+                    
+                    <!-- HEADER -->
                     <tr>
-                        <td style="vertical-align: top; width: 34px; font-size: 24px; color: #dc2626; padding-top: 2px;">
-                            &#9200;
-                        </td>
-                        <td style="vertical-align: top;">
-                            <span style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1.5px; text-transform: uppercase; display: block; margin-bottom: 8px;">
-                                QUOTATION TIMELINE &bull; CAIRO LOCAL TIME
-                            </span>
-                            <table style="width: 100%; border-collapse: collapse; margin-bottom: 6px;">
+                        <td bgcolor="#0f172a" style="background-color: #0f172a; padding: 26px 32px; color: #ffffff;" class="mobile-padding">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
                                 <tr>
-                                    <td style="font-size: 13px; font-weight: 600; color: #7f1d1d; width: 190px; padding: 4px 0;">Window Opens:</td>
-                                    <td style="font-size: 14px; font-weight: 700; color: #1e293b; padding: 4px 0;">{window_start_cairo_str}</td>
+                                    <td valign="middle" align="left">
+                                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; display: block; margin-bottom: 4px;">{platform_name.upper()} &bull; FX &amp; MONEY MARKET</span>
+                                        <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff; line-height: 1.3;">{banner_title}</h1>
+                                    </td>
+                                    <td valign="middle" align="right" style="text-align: right;">
+                                        <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="display: inline-block;">
+                                            <tr>
+                                                <td bgcolor="#1e293b" style="background-color: #1e293b; color: #38bdf8; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid #38bdf8;">
+                                                    {customer_branding}
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
                                 </tr>
-                                <tr>
-                                    <td style="font-size: 13px; font-weight: 700; color: #991b1b; width: 190px; padding: 4px 0;">Submission Deadline:</td>
-                                    <td style="font-size: 15px; font-weight: 800; color: #991b1b; padding: 4px 0;">{deadline_cairo_str}</td>
-                                </tr>
-                                {timeline_results_row}
                             </table>
-                            <p style="margin: 8px 0 0 0; font-size: 12px; color: #7f1d1d; line-height: 1.4;">
-                                {timeline_warning_text}
+                        </td>
+                    </tr>
+
+                    <!-- BODY -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 32px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
+                                {salutation}
+                            </p>
+                            <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
+                                {intro_text} {instruction_text}
+                            </p>
+
+                            <!-- SUBMISSION DEADLINE ALERT BOX -->
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom: 26px;">
+                                <tr>
+                                    <td bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #dc2626; border-radius: 8px; padding: 18px 22px;">
+                                        <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                            <tr>
+                                                <td style="vertical-align: top; width: 34px; font-size: 24px; color: #dc2626; padding-top: 2px;">
+                                                    &#9200;
+                                                </td>
+                                                <td style="vertical-align: top;">
+                                                    <span style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1.5px; text-transform: uppercase; display: block; margin-bottom: 8px;">
+                                                        QUOTATION TIMELINE &bull; CAIRO LOCAL TIME
+                                                    </span>
+                                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom: 6px;">
+                                                        <tr>
+                                                            <td style="font-size: 13px; font-weight: 600; color: #7f1d1d; width: 190px; padding: 4px 0;">Window Opens:</td>
+                                                            <td style="font-size: 14px; font-weight: 700; color: #1e293b; padding: 4px 0;">{window_start_cairo_str}</td>
+                                                        </tr>
+                                                        <tr>
+                                                            <td style="font-size: 13px; font-weight: 700; color: #991b1b; width: 190px; padding: 4px 0;">Submission Deadline:</td>
+                                                            <td style="font-size: 15px; font-weight: 800; color: #991b1b; padding: 4px 0;">{deadline_cairo_str}</td>
+                                                        </tr>
+                                                        {timeline_results_row}
+                                                    </table>
+                                                    <p style="margin: 8px 0 0 0; font-size: 12px; color: #7f1d1d; line-height: 1.4;">
+                                                        {timeline_warning_text}
+                                                    </p>
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+
+                            <!-- CORE TRADE SPECIFICATIONS TABLE -->
+                            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
+                                <div style="background-color: #f8fafc; padding: 12px 18px; border-bottom: 1px solid #e2e8f0;">
+                                    <span style="font-size: 12px; font-weight: 800; color: #475569; letter-spacing: 0.5px; text-transform: uppercase;">
+                                        Trade Specifications &bull; {ref_no}
+                                    </span>
+                                </div>
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="text-align: left;">
+                                    <tbody>
+                                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; width: 35%; border-bottom: 1px solid #e2e8f0;">RFQ Reference</td>
+                                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a; font-family: monospace; border-bottom: 1px solid #e2e8f0;">{ref_no}</td>
+                                        </tr>
+                                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; border-bottom: 1px solid #e2e8f0;">Requesting Legal Entity</td>
+                                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0;">
+                                                {entity_name}
+                                                {entity_meta_html}
+                                            </td>
+                                        </tr>
+                                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; border-bottom: 1px solid #e2e8f0;">Product &amp; Quotation Base</td>
+                                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 600; color: #0f172a; border-bottom: 1px solid #e2e8f0;">
+                                                <span style="margin-right: 8px;"><strong>{rfq_type}</strong></span>
+                                                {base_badge}
+                                                <div style="font-size: 12px; color: #64748b; margin-top: 4px; font-weight: normal;">{base_note}</div>
+                                            </td>
+                                        </tr>
+                                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; border-bottom: 1px solid #e2e8f0;">Quotation Window Opens</td>
+                                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0;">{window_start_cairo_str}</td>
+                                        </tr>
+                                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; border-bottom: 1px solid #e2e8f0;">Submission Deadline</td>
+                                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 800; color: #b91c1c; border-bottom: 1px solid #e2e8f0;">{deadline_cairo_str}</td>
+                                        </tr>
+                                        {specs_results_window_html}
+                                        {trade_specs_rows}
+                                        {tbill_rows}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            {comments_box_html}
+
+                            {action_box_html}
+
+                            <!-- INSTITUTIONAL RESERVATION CLAUSE -->
+                            <div style="background-color: #f8fafc; border-left: 3px solid #94a3b8; padding: 10px 14px; margin-top: 14px; font-size: 11px; color: #64748b; line-height: 1.4;">
+                                <strong>Reservation of Rights:</strong> The corporate treasury desk reserves the right to amend, postpone, or withdraw this quotation request prior to the scheduled quotation window opening. Counterparties will be promptly notified of any schedule alterations.
+                            </div>
+
+                            <!-- SECURITY & AUTHENTICATION CALLOUT -->
+                            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-top: 14px;">
+                                <p style="margin: 0; font-size: 12px; color: #475569; line-height: 1.5;">
+                                    <strong>Institution-Specific Access:</strong> This secure access token is uniquely generated for <strong>{bank_name}</strong>. Access is protected by 2FA OTP verification delivered directly to registered traders. Please do not forward this message.
+                                </p>
+                            </div>
+                        </td>
+                    </tr>
+
+                    <!-- FOOTER -->
+                    <tr>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                                {platform_name} &bull; Institutional Financial Trading
+                            </p>
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                Generated on {current_time_str} for {customer_branding}. Strictly confidential and intended solely for the designated recipient.
+                            </p>
+                            <p style="margin: 8px auto 0 auto; font-size: 10px; color: #94a3b8; line-height: 1.4; max-width: 540px;">
+                                <strong>Legal Notice:</strong> {platform_name} operates solely as an independent communications and workflow technology platform (&ldquo;AS IS&rdquo;). Neither {platform_name} nor its affiliates are party to this transaction or assume credit, market, or settlement liability. All commercial commitments and settlement obligations exist exclusively between {entity_name} and {bank_name}.
                             </p>
                         </td>
                     </tr>
+
                 </table>
-            </div>
-
-            <!-- CORE TRADE SPECIFICATIONS TABLE -->
-            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
-                <div style="background-color: #f8fafc; padding: 12px 18px; border-bottom: 1px solid #e2e8f0;">
-                    <span style="font-size: 12px; font-weight: 800; color: #475569; letter-spacing: 0.5px; text-transform: uppercase;">
-                        Trade Specifications &bull; {ref_no}
-                    </span>
-                </div>
-                <table style="width: 100%; border-collapse: collapse; text-align: left;">
-                    <tbody>
-                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b; width: 35%;">RFQ Reference</td>
-                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a; font-family: monospace;">{ref_no}</td>
-                        </tr>
-                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Requesting Legal Entity</td>
-                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">
-                                {entity_name}
-                                {entity_meta_html}
-                            </td>
-                        </tr>
-                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Product &amp; Quotation Base</td>
-                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 600; color: #0f172a;">
-                                <span style="margin-right: 8px;"><strong>{rfq_type}</strong></span>
-                                {base_badge}
-                                <div style="font-size: 12px; color: #64748b; margin-top: 4px; font-weight: normal;">{base_note}</div>
-                            </td>
-                        </tr>
-                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Quotation Window Opens</td>
-                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 700; color: #0f172a;">{window_start_cairo_str}</td>
-                        </tr>
-                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 12px 16px; font-size: 13px; font-weight: 600; color: #64748b;">Submission Deadline</td>
-                            <td style="padding: 12px 16px; font-size: 14px; font-weight: 800; color: #b91c1c;">{deadline_cairo_str}</td>
-                        </tr>
-                        {specs_results_window_html}
-                        {trade_specs_rows}
-                        {tbill_rows}
-                    </tbody>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
+                </tr>
                 </table>
-            </div>
-
-            {comments_box_html}
-
-            {action_box_html}
-
-            <!-- INSTITUTIONAL RESERVATION CLAUSE -->
-            <div style="background-color: #f8fafc; border-left: 3px solid #94a3b8; padding: 10px 14px; margin-top: 14px; font-size: 11px; color: #64748b; line-height: 1.4;">
-                <strong>Reservation of Rights:</strong> The corporate treasury desk reserves the right to amend, postpone, or withdraw this quotation request prior to the scheduled quotation window opening. Counterparties will be promptly notified of any schedule alterations.
-            </div>
-
-            <!-- SECURITY & AUTHENTICATION CALLOUT -->
-            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-top: 14px;">
-                <p style="margin: 0; font-size: 12px; color: #475569; line-height: 1.5;">
-                    <strong>Institution-Specific Access:</strong> This secure access token is uniquely generated for <strong>{bank_name}</strong>. Access is protected by 2FA OTP verification delivered directly to registered traders. Please do not forward this message.
-                </p>
-            </div>
-        </div>
-
-        <!-- FOOTER -->
-        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
-            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
-                {platform_name} &bull; Institutional Financial Trading
-            </p>
-            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                Generated on {current_time_str} for {customer_branding}. Strictly confidential and intended solely for the designated recipient.
-            </p>
-            <p style="margin: 8px auto 0 auto; font-size: 10px; color: #94a3b8; line-height: 1.4; max-width: 540px;">
-                <strong>Legal Notice:</strong> {platform_name} operates solely as an independent communications and workflow technology platform (&ldquo;AS IS&rdquo;). Neither {platform_name} nor its affiliates are party to this transaction or assume credit, market, or settlement liability. All commercial commitments and settlement obligations exist exclusively between {entity_name} and {bank_name}.
-            </p>
-        </div>
-
-    </div>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
@@ -1001,88 +1166,133 @@ def build_quotation_withdrawn_bank_email(
     subject = f"NOTICE OF WITHDRAWAL: RFQ {ref_no} Cancelled - {customer_branding}"
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
 
-    html_body = f"""<!DOCTYPE html>
-<html lang="en">
+    html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{subject}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 660px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+        }}
+    </style>
 </head>
 <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
-    <div style="max-width: 650px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05); border: 1px solid #e2e8f0;">
-        
-        <!-- HEADER -->
-        <div style="background-color: #334155; padding: 26px 32px; color: #ffffff;">
-            <table style="width: 100%; border-collapse: collapse;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="650" align="center" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                    <td>
-                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; display: block; margin-bottom: 4px;">{platform_name.upper()} &bull; OFFICIAL NOTICE</span>
-                        <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff;">Quotation Request Withdrawn</h1>
-                    </td>
-                    <td style="text-align: right; vertical-align: middle;">
-                        <span style="background-color: rgba(255, 255, 255, 0.15); color: #ffffff; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; display: inline-block;">
-                            {customer_branding}
-                        </span>
-                    </td>
-                </tr>
-            </table>
-        </div>
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 650px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+                    
+                    <!-- HEADER -->
+                    <tr>
+                        <td bgcolor="#334155" style="background-color: #334155; padding: 26px 32px; color: #ffffff;" class="mobile-padding">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td valign="middle" align="left">
+                                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; display: block; margin-bottom: 4px;">{platform_name.upper()} &bull; OFFICIAL NOTICE</span>
+                                        <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #ffffff; line-height: 1.3;">Quotation Request Withdrawn</h1>
+                                    </td>
+                                    <td valign="middle" align="right" style="text-align: right;">
+                                        <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="display: inline-block;">
+                                            <tr>
+                                                <td bgcolor="#475569" style="background-color: #475569; color: #ffffff; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid #64748b;">
+                                                    {customer_branding}
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
 
-        <!-- BODY -->
-        <div style="padding: 32px;">
-            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
-                Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,
-            </p>
-            <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
-                Please be advised that Request for Quotation (RFQ) <strong>{ref_no}</strong> previously released on behalf of <strong>{customer_branding}</strong> has been officially <strong>withdrawn and cancelled</strong> prior to execution.
-            </p>
+                    <!-- BODY -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 32px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 16px; font-size: 15px; color: #334155; line-height: 1.6;">
+                                Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,
+                            </p>
+                            <p style="margin-top: 0; margin-bottom: 24px; font-size: 14px; color: #334155; line-height: 1.6;">
+                                Please be advised that Request for Quotation (RFQ) <strong>{ref_no}</strong> previously released on behalf of <strong>{customer_branding}</strong> has been officially <strong>withdrawn and cancelled</strong> prior to execution.
+                            </p>
 
-            <!-- WITHDRAWAL NOTICE BOX -->
-            <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-left: 5px solid #64748b; border-radius: 8px; padding: 18px 20px; margin-bottom: 26px;">
-                <p style="margin: 0 0 6px 0; font-size: 14px; font-weight: 700; color: #1e293b;">
-                    No Action or Quotation is Required
-                </p>
-                <p style="margin: 0; font-size: 13px; color: #475569; line-height: 1.5;">
-                    This quotation request was officially withdrawn by the corporate treasury desk. Counterparty portal submission links for this RFQ have been deactivated. We apologize for any inconvenience.
-                </p>
-            </div>
+                            <!-- WITHDRAWAL NOTICE BOX -->
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom: 26px;">
+                                <tr>
+                                    <td bgcolor="#f8fafc" style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-left: 5px solid #64748b; border-radius: 8px; padding: 18px 20px;">
+                                        <p style="margin: 0 0 6px 0; font-size: 14px; font-weight: 700; color: #1e293b;">
+                                            No Action or Quotation is Required
+                                        </p>
+                                        <p style="margin: 0; font-size: 13px; color: #475569; line-height: 1.5;">
+                                            This quotation request was officially withdrawn by the corporate treasury desk. Counterparty portal submission links for this RFQ have been deactivated. We apologize for any inconvenience.
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
 
-            <!-- RFQ REFERENCE SUMMARY -->
-            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
-                    <tbody>
-                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b; width: 35%;">RFQ Reference</td>
-                            <td style="padding: 10px 16px; font-weight: 700; color: #0f172a; font-family: monospace;">{ref_no}</td>
-                        </tr>
-                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
-                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b;">Instrument / Currency</td>
-                            <td style="padding: 10px 16px; font-weight: 600; color: #0f172a;">{rfq_type} &bull; {pair_str}</td>
-                        </tr>
-                        <tr style="background-color: #ffffff;">
-                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b;">Quotation Amount</td>
-                            <td style="padding: 10px 16px; font-weight: 700; color: #0f172a;">{amount_str} {buy_curr or ''}</td>
-                        </tr>
-                    </tbody>
+                            <!-- RFQ REFERENCE SUMMARY -->
+                            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 24px;">
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="text-align: left; font-size: 13px;">
+                                    <tbody>
+                                        <tr style="background-color: #ffffff; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b; width: 35%; border-bottom: 1px solid #e2e8f0;">RFQ Reference</td>
+                                            <td style="padding: 10px 16px; font-weight: 700; color: #0f172a; font-family: monospace; border-bottom: 1px solid #e2e8f0;">{ref_no}</td>
+                                        </tr>
+                                        <tr style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b; border-bottom: 1px solid #e2e8f0;">Instrument / Currency</td>
+                                            <td style="padding: 10px 16px; font-weight: 600; color: #0f172a; border-bottom: 1px solid #e2e8f0;">{rfq_type} &bull; {pair_str}</td>
+                                        </tr>
+                                        <tr style="background-color: #ffffff;">
+                                            <td style="padding: 10px 16px; font-weight: 600; color: #64748b;">Quotation Amount</td>
+                                            <td style="padding: 10px 16px; font-weight: 700; color: #0f172a;">{amount_str} {buy_curr or ''}</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <p style="margin: 0; font-size: 13px; color: #64748b; line-height: 1.5;">
+                                Should the client reschedule or issue a new request for quotation, your desk will receive a separate formal invitation.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <!-- FOOTER -->
+                    <tr>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                                {platform_name} &bull; Institutional Financial Trading
+                            </p>
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                Notice dispatched on {current_time_str} on behalf of {customer_branding}.
+                            </p>
+                        </td>
+                    </tr>
+
                 </table>
-            </div>
-
-            <p style="margin: 0; font-size: 13px; color: #64748b; line-height: 1.5;">
-                Should the client reschedule or issue a new request for quotation, your desk will receive a separate formal invitation.
-            </p>
-        </div>
-
-        <!-- FOOTER -->
-        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
-            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
-                {platform_name} &bull; Institutional Financial Trading
-            </p>
-            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                Notice dispatched on {current_time_str} on behalf of {customer_branding}.
-            </p>
-        </div>
-
-    </div>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
+                </tr>
+                </table>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
@@ -1110,7 +1320,7 @@ def build_bank_roster_governance_email(
     title = "📋 Trading Contacts Report"
     intro_badge = "ROSTER REPORT"
     badge_color = "#38bdf8"
-    badge_bg = "rgba(56, 189, 248, 0.15)"
+    badge_bg = "#1e293b"
     headline = "Current Active Trading Representatives & Roles"
     intro_text = f"""
     Below is the current list of authorized trading contacts registered for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform as of <strong>{current_time_str}</strong>.
@@ -1133,88 +1343,129 @@ def build_bank_roster_governance_email(
 
         rows_html.append(f"""
         <tr style="border-bottom: 1px solid #e2e8f0;">
-            <td style="padding: 12px 14px; font-family: monospace; font-size: 13px; font-weight: 700; color: #0f172a;">{c_email}</td>
-            <td style="padding: 12px 14px; font-size: 13px; color: #334155;">{c_name}</td>
-            <td style="padding: 12px 14px; font-size: 12px;">{role_badge}</td>
-            <td style="padding: 12px 14px; font-size: 12px; font-weight: 700; color: #10b981;">Active</td>
+            <td style="padding: 12px 14px; font-family: monospace; font-size: 13px; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0;">{c_email}</td>
+            <td style="padding: 12px 14px; font-size: 13px; color: #334155; border-bottom: 1px solid #e2e8f0;">{c_name}</td>
+            <td style="padding: 12px 14px; font-size: 12px; border-bottom: 1px solid #e2e8f0;">{role_badge}</td>
+            <td style="padding: 12px 14px; font-size: 12px; font-weight: 700; color: #10b981; border-bottom: 1px solid #e2e8f0;">Active</td>
         </tr>
         """)
 
     contacts_table_rows = "".join(rows_html) if rows_html else '<tr><td colspan="4" style="padding: 16px; text-align: center; color: #94a3b8; font-size: 13px;">No active desk contacts configured yet.</td></tr>'
 
-    html_body = f"""<!DOCTYPE html>
-<html lang="en">
+    html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{subject}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 680px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+        }}
+    </style>
 </head>
 <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
-    <div style="max-width: 680px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025); border: 1px solid #e2e8f0;">
-        
-        <!-- HEADER -->
-        <div style="background-color: #0f172a; padding: 24px 32px; color: #ffffff;">
-            <table style="width: 100%; border-collapse: collapse;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="680" align="center" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                    <td>
-                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: {badge_color}; display: block; margin-bottom: 4px;">{intro_badge}</span>
-                        <h1 style="margin: 0; font-size: 18px; font-weight: 700; color: #ffffff;">{title}</h1>
-                    </td>
-                    <td style="text-align: right; vertical-align: middle;">
-                        <span style="background-color: {badge_bg}; color: {badge_color}; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid {badge_color};">
-                            {customer_branding}
-                        </span>
-                    </td>
-                </tr>
-            </table>
-        </div>
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 680px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+                    
+                    <!-- HEADER -->
+                    <tr>
+                        <td bgcolor="#0f172a" style="background-color: #0f172a; padding: 24px 32px; color: #ffffff;" class="mobile-padding">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td valign="middle" align="left">
+                                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: {badge_color}; display: block; margin-bottom: 4px;">{intro_badge}</span>
+                                        <h1 style="margin: 0; font-size: 18px; font-weight: 700; color: #ffffff; line-height: 1.3;">{title}</h1>
+                                    </td>
+                                    <td valign="middle" align="right" style="text-align: right;">
+                                        <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="display: inline-block;">
+                                            <tr>
+                                                <td bgcolor="{badge_bg}" style="background-color: {badge_bg}; color: {badge_color}; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid {badge_color};">
+                                                    {customer_branding}
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
 
-        <!-- CONTENT BODY -->
-        <div style="padding: 30px 32px;">
-            <p style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #0f172a;">
-                {recipient_greeting}
-            </p>
-            <p style="margin-top: 0; margin-bottom: 18px; font-size: 13.5px; color: #334155; line-height: 1.6;">
-                {intro_text}
-            </p>
+                    <!-- CONTENT BODY -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 30px 32px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #0f172a;">
+                                {recipient_greeting}
+                            </p>
+                            <p style="margin-top: 0; margin-bottom: 18px; font-size: 13.5px; color: #334155; line-height: 1.6;">
+                                {intro_text}
+                            </p>
 
-            <!-- ROSTER TABLE -->
-            <h3 style="margin: 22px 0 12px 0; font-size: 13.5px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px;">
-                {headline}
-            </h3>
-            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 22px;">
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
-                    <thead>
-                        <tr style="background-color: #f8fafc; border-bottom: 2px solid #e2e8f0;">
-                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Representative Email</th>
-                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Name / Title</th>
-                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Quoting Role</th>
-                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {contacts_table_rows}
-                    </tbody>
+                            <!-- ROSTER TABLE -->
+                            <h3 style="margin: 22px 0 12px 0; font-size: 13.5px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px;">
+                                {headline}
+                            </h3>
+                            <div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; margin-bottom: 22px;">
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="text-align: left; font-size: 13px;">
+                                    <thead>
+                                        <tr style="background-color: #f8fafc; border-bottom: 2px solid #e2e8f0;">
+                                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Representative Email</th>
+                                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Name / Title</th>
+                                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Quoting Role</th>
+                                            <th style="padding: 10px 14px; font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Status</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {contacts_table_rows}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <!-- CHANGE INSTRUCTIONS -->
+                            <p style="margin: 0; font-size: 12.5px; color: #64748b; line-height: 1.5;">
+                                If you need to add, delete, or update any trading representatives, please reply directly to this email.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <!-- FOOTER -->
+                    <tr>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 18px 32px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                                {platform_name} &bull; Institutional Financial Trading
+                            </p>
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                Dispatched on {current_time_str} on behalf of {customer_branding} Treasury Desk.
+                            </p>
+                        </td>
+                    </tr>
+
                 </table>
-            </div>
-
-            <!-- CHANGE INSTRUCTIONS -->
-            <p style="margin: 0; font-size: 12.5px; color: #64748b; line-height: 1.5;">
-                If you need to add, delete, or update any trading representatives, please reply directly to this email.
-            </p>
-        </div>
-
-        <!-- FOOTER -->
-        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 18px 32px; text-align: center;">
-            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
-                {platform_name} &bull; Institutional Financial Trading
-            </p>
-            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                Dispatched on {current_time_str} on behalf of {customer_branding} Treasury Desk.
-            </p>
-        </div>
-
-    </div>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
+                </tr>
+                </table>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
@@ -1292,102 +1543,149 @@ def build_dealer_invitation_email(
 
     subject = f"Invitation: Join {bank_name} Trading Desk for {customer_branding}"
 
-    html_body = f"""<!DOCTYPE html>
-<html lang="en">
+    html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{subject}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 640px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+        }}
+    </style>
 </head>
 <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
-    <div style="max-width: 620px; margin: 30px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05); border: 1px solid #e2e8f0;">
-        
-        <!-- HEADER -->
-        <div style="background-color: #0f172a; padding: 24px 32px; color: #ffffff;">
-            <table style="width: 100%; border-collapse: collapse;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="620" align="center" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                    <td>
-                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #10b981; display: block; margin-bottom: 4px;">INVITATION</span>
-                        <h1 style="margin: 0; font-size: 18px; font-weight: 700; color: #ffffff;">Trading Desk Access Invitation</h1>
-                    </td>
-                    <td style="text-align: right; vertical-align: middle;">
-                        <span style="background-color: rgba(16, 185, 129, 0.15); color: #10b981; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid #10b981;">
-                            {customer_branding} (Group)
-                        </span>
-                    </td>
-                </tr>
-            </table>
-        </div>
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 620px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+                    
+                    <!-- HEADER -->
+                    <tr>
+                        <td bgcolor="#0f172a" style="background-color: #0f172a; padding: 24px 32px; color: #ffffff;" class="mobile-padding">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td valign="middle" align="left">
+                                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #10b981; display: block; margin-bottom: 4px;">INVITATION</span>
+                                        <h1 style="margin: 0; font-size: 18px; font-weight: 700; color: #ffffff; line-height: 1.3;">Trading Desk Access Invitation</h1>
+                                    </td>
+                                    <td valign="middle" align="right" style="text-align: right;">
+                                        <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="display: inline-block;">
+                                            <tr>
+                                                <td bgcolor="#064e3b" style="background-color: #064e3b; color: #10b981; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid #10b981;">
+                                                    {customer_branding} (Group)
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
 
-        <!-- CONTENT BODY -->
-        <div style="padding: 30px 32px;">
-            <p style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #0f172a;">
-                {greeting}
-            </p>
-            <p style="margin-top: 0; margin-bottom: 20px; font-size: 13.5px; color: #334155; line-height: 1.6;">
-                You have been invited by corporate group <strong>{customer_branding}</strong> to join the treasury counterparty roster for <strong>{bank_name}</strong> on the {platform_name}.
-            </p>
+                    <!-- CONTENT BODY -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 30px 32px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #0f172a;">
+                                {greeting}
+                            </p>
+                            <p style="margin-top: 0; margin-bottom: 20px; font-size: 13.5px; color: #334155; line-height: 1.6;">
+                                You have been invited by corporate group <strong>{customer_branding}</strong> to join the treasury counterparty roster for <strong>{bank_name}</strong> on the {platform_name}.
+                            </p>
 
-            <!-- ROLE & ENTITIES CARD -->
-            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 20px; margin-bottom: 24px;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; width: 140px;">Corporate Client:</td>
-                        <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{customer_branding} (Group)</td>
+                            <!-- ROLE & ENTITIES CARD -->
+                            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 20px; margin-bottom: 24px;">
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                    <tr>
+                                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600; width: 140px;">Corporate Client:</td>
+                                        <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{customer_branding} (Group)</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Counterparty Bank:</td>
+                                        <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{bank_name}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Registered Email:</td>
+                                        <td style="padding-bottom: 8px; font-size: 13px; font-family: monospace; color: #0f172a; font-weight: 700;">{dealer_email}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Assigned Role:</td>
+                                        <td style="padding-bottom: 8px;">{role_badge}</td>
+                                    </tr>
+                                    {entities_card_html}
+                                    <tr>
+                                        <td style="font-size: 12px; color: #64748b; font-weight: 600; vertical-align: top;">Authority Scope:</td>
+                                        <td style="font-size: 12px; color: #475569;">{role_desc}</td>
+                                    </tr>
+                                </table>
+                            </div>
+
+                            <p style="margin-top: 0; margin-bottom: 24px; font-size: 13px; color: #334155; line-height: 1.5;">
+                                Please click the button below to confirm your contact details and activate your quoting access:
+                            </p>
+
+                            <!-- ACTION BUTTON -->
+                            <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 26px auto 20px auto;">
+                                <tr>
+                                    <td align="center" bgcolor="#0f172a" style="border-radius: 8px; background-color: #0f172a;">
+                                        <a href="{handshake_link}" target="_blank" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; padding: 13px 32px; border-radius: 8px; border: 1px solid #0f172a; display: inline-block;">
+                                            🤝 Accept Invitation &amp; Activate Access &rarr;
+                                        </a>
+                                    </td>
+                                </tr>
+                            </table>
+
+                            <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: -10px; margin-bottom: 24px;">
+                                Or open: <a href="{handshake_link}" style="color: #0284c7; word-break: break-all;">{handshake_link}</a>
+                            </p>
+
+                            <p style="margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.5; border-top: 1px solid #f1f5f9; padding-top: 16px;">
+                                If you believe you received this invitation in error, you may disregard this email or reply to contact the treasury team.
+                            </p>
+                        </td>
                     </tr>
+
+                    <!-- FOOTER -->
                     <tr>
-                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Counterparty Bank:</td>
-                        <td style="padding-bottom: 8px; font-size: 13px; color: #0f172a; font-weight: 700;">{bank_name}</td>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 32px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
+                                {platform_name} &bull; Institutional Financial Trading
+                            </p>
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                Dispatched on {current_time_str} on behalf of {customer_branding} Treasury Desk.
+                            </p>
+                        </td>
                     </tr>
-                    <tr>
-                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Registered Email:</td>
-                        <td style="padding-bottom: 8px; font-size: 13px; font-family: monospace; color: #0f172a; font-weight: 700;">{dealer_email}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding-bottom: 8px; font-size: 12px; color: #64748b; font-weight: 600;">Assigned Role:</td>
-                        <td style="padding-bottom: 8px;">{role_badge}</td>
-                    </tr>
-                    {entities_card_html}
-                    <tr>
-                        <td style="font-size: 12px; color: #64748b; font-weight: 600; vertical-align: top;">Authority Scope:</td>
-                        <td style="font-size: 12px; color: #475569;">{role_desc}</td>
-                    </tr>
+
                 </table>
-            </div>
-
-            <p style="margin-top: 0; margin-bottom: 24px; font-size: 13px; color: #334155; line-height: 1.5;">
-                Please click the button below to confirm your contact details and activate your quoting access:
-            </p>
-
-            <!-- ACTION BUTTON -->
-            <div style="text-align: center; margin: 26px 0 20px 0;">
-                <a href="{handshake_link}" style="background-color: #0f172a; color: #ffffff; padding: 13px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.2);">
-                    🤝 Accept Invitation &amp; Activate Access &rarr;
-                </a>
-            </div>
-            <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: -10px; margin-bottom: 24px;">
-                Or open: <a href="{handshake_link}" style="color: #0284c7; word-break: break-all;">{handshake_link}</a>
-            </p>
-
-            <p style="margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.5; border-top: 1px solid #f1f5f9; padding-top: 16px;">
-                If you believe you received this invitation in error, you may disregard this email or reply to contact the treasury team.
-            </p>
-        </div>
-
-        <!-- FOOTER -->
-        <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 32px; text-align: center;">
-            <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 600;">
-                {platform_name} &bull; Institutional Financial Trading
-            </p>
-            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                Dispatched on {current_time_str} on behalf of {customer_branding} Treasury Desk.
-            </p>
-        </div>
-
-    </div>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
+                </tr>
+                </table>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
     return subject, html_body
+
 
 
