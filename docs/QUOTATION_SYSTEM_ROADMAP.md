@@ -1,12 +1,13 @@
 # Grow Treasury — Quotation Module Architectural Roadmap
 
-*Last Updated: October 10, 2026*  
-*Status: Production Freeze & Verified Release Candidate (`release/2026-10-10-production-freeze`)*
+*Last Updated: October 15, 2026*  
+*Status: Production = `main` @ `12efde2` (backend) / `7955b8e` (frontend). Next release candidate = local branch `safe/2026-10-15-reviewed-fixes` (not merged, not pushed). Notification/Push engine = prototype on local branch `wip/notification-engine-2026-10-15` — **ON HOLD** (see [Current Release State](#-current-release-state--branch-split-2026-10-15)).*
 
 ---
 
 ## 📌 Table of Contents
 1. [Executive Summary & Vision](#1-executive-summary--vision)
+    - [🧭 Current Release State & Branch Split (2026-10-15)](#-current-release-state--branch-split-2026-10-15)
 2. [Production Database Migration Ledger (Manual Production DDL)](#-production-database-migration-ledger-manual-production-ddl)
 3. [Phase 1: Counterparty Integrity & Security Controls (Completed)](#2-phase-1-counterparty-integrity--security-controls-completed)
 4. [Phase 2: Bank Protection & Cryptographic Security Hardening (Completed)](#3-phase-2-bank-protection--cryptographic-security-hardening-completed--verified-)
@@ -19,10 +20,12 @@
 11. [Phase 8: Zero-Knowledge Architecture & Privacy-Preserving Collaborative Analytics (Completed & Verified)](#9-phase-8-zero-knowledge-architecture--privacy-preserving-collaborative-analytics)
 12. [The 3-Tier Progressive Zero-Knowledge Confidentiality Architecture](#10-the-3-tier-progressive-zero-knowledge-confidentiality-architecture)
     - [10.4 Permanent Bank Dealer Access & Unified Multi-Customer Trading Desk](#104-permanent-bank-dealer-access--unified-multi-customer-trading-desk)
-13. [Phase 9: Mobile PWA & Web Push Notification Infrastructure (Zero-Store Footprint)](#11-phase-9-mobile-pwa--web-push-alerting-infrastructure-zero-store-footprint)
-14. [Phase 10: Automated Notification & Lifecycle Event Engine](#12-phase-10-automated-notification--lifecycle-event-engine)
-15. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#13-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
-16. [Production Database Migration Ledger](#14-production-database-migration-ledger-audit--compliance-log)
+13. [Phase 9: Mobile PWA & Web Push Notification Infrastructure (Zero-Store Footprint) — ⏸️ Prototype, On Hold](#11-phase-9-mobile-pwa--web-push-alerting-infrastructure-zero-store-footprint)
+14. [Phase 10: Automated Notification & Lifecycle Event Engine — ⏸️ Prototype, On Hold (redesign in §12.7)](#12-phase-10-automated-notification--lifecycle-event-engine)
+15. [Phase 11: Tender Window Governance, Dynamic Lead-Time Buffer & Granular Lifecycle Sub-statuses (Planned 🚀)](#13-phase-11-tender-window-governance-dynamic-lead-time-buffer--granular-lifecycle-sub-statuses-planned-)
+16. [Phase 12: RFQ Document Governance — Decoupled Leg Scoping, Strict Exclusion Firewall & Internal-Only Confidential Vault (Planned 🚀)](#14-phase-12-rfq-document-governance--decoupled-leg-scoping-strict-exclusion-firewall--internal-only-confidential-vault-planned-)
+17. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#15-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
+18. [Production Database Migration Ledger](#16-production-database-migration-ledger-audit--compliance-log)
 
 ---
 
@@ -31,6 +34,43 @@
 The Grow Quotation Module is built to give Corporate Treasuries institutional-grade control, confidentialit and data-driven counterparty allocation during FX Spot, Multi-Leg Portfolios, and T-Bill competitive tenders.
 
 This roadmap consolidates all architectural designs, threat models, and feature specifications agreed upon to ensure continuity across development cycles.
+
+---
+
+## 🧭 Current Release State & Branch Split (2026-10-15)
+
+A deep review of all uncommitted work since production (`main` @ `12efde2` / `7955b8e`) was performed on 2026-10-15. Verdict: the general fixes are sound and worth shipping; the Notification / Push engine (Phases 9.2, 9.3, 10) is **not production-safe** and was isolated. Full report: `brain/38ceedf4-…/change_review_report.md`.
+
+### Branch Layout (both repos: `c:\Grow` and `c:\Grow\frontend`)
+
+| Branch | Backend | Frontend | Contents | State |
+| :--- | :--- | :--- | :--- | :--- |
+| `main` | `12efde2` | `7955b8e` | Current production | Untouched |
+| `safe/2026-10-15-reviewed-fixes` | `0b00b46` | `f4c4c89` | Reviewed fixes only (table below) | 🟡 **Release candidate** — local only, not merged, not pushed |
+| `wip/notification-engine-2026-10-15` | `134b516` | `3bc02f3` | Everything, incl. notification/push engine | ⏸️ **On hold** — local only |
+
+### Contents of the Release Candidate (`safe/2026-10-15-reviewed-fixes`)
+
+| Area | Change | Files | Note |
+| :--- | :--- | :--- | :--- |
+| **LG Issuance (Public Form)** | AI document verification fixed end-to-end | `PublicIssuanceForm.js`, `public_issuance.py`, `ai_integration.py` | 🔴 **Was also broken in production**: undefined `logger` (HTTP 500) + `ai_usage_logs` FK violation from `user_id=0`; the form's "proceed anyway" swallowed the error, so public submissions went unverified. Local WIP additionally had shifted call arguments. |
+| **Quotation History** | Self-heal no longer wipes winners | `quotations_endpoints.py:get_rfq_history` | 🔴 **Production bug**: leg-reset loop ran for RFQs *with* a winner. Now limited to the no-winner branch. |
+| **Corporate Approval** | Approval routes through Bank Approver (approval-required / heads-up / invitation emails) | `corporate_admin.py`, `unified_email_builder.py` | Push-event hooks stripped. |
+| **Dealer Quoting** | Passed-legs guard (single-leg null `leg_id` cleanup; leg config only for real legs) | `public_quotations.py:submit_fx_offers_batch` | Prevents FK errors. |
+| **Desk Session** | Same-dealer multi-tab handling + "Resume Quoting in This Tab" | `desk_session_service.py`, `QuotationBankOfferPage.js` | Backend + frontend must ship together. |
+| **Dealer Desk** | Spectator de-duplication | `bank_dealer_endpoints.py` | — |
+| **Email** | Outlook-compatible templates | `unified_email_builder.py` | — |
+| **Reconciliation** | Tweaks + AI date normalisation prompt | `reconciliation_service.py` | — |
+| **Results** | `hasWinner` guard; optional result schema fields | `ResultsView.js`, `schemas_quotation.py` | — |
+| **Issued LGs** | Custom export modal; `apiRequest` options object + blob detection | `CustomExportModal.js`, `IssuedLGsPage.js`, `apiService.js` | Backend export endpoints already in production. |
+
+**Verification (2026-10-15):** `import app.main` OK; 9/9 core suites pass (production_readiness, quotation_phase2 e2e/security, zero_knowledge_e2e, worm_audit_chain, tenant_key_service, security_crypto, bank_dealer_auth, privacy_preserving_analytics); frontend production build compiles (pre-existing lint warnings only); zero references to the notification engine / VAPID on the branch. **No DDL required** for this release.
+
+**Before merging to `main`:** manual UI test of the public issuance form with a real document upload; decide whether `ai_usage_logs.user_id` should become nullable so public-form AI usage is tracked/billed (currently skipped when no user).
+
+### Notification / Push Engine — Decision: Rebuild the Dispatch Layer, Do Not Start From Zero
+
+Keep: rules table concept, governance console UI, service worker, VAPID key handling, PWA manifest. Rebuild: recipient resolution, dealer enrolment auth, and delivery path. Blocking findings and the redesign plan are recorded in [§11.8](#118-independent-review-findings-2026-10-15--status-downgraded-) and [§12.7](#127-dispatch-layer-redesign-required-before-any-release-).
 
 ---
 
@@ -70,6 +110,19 @@ Before writing code for any sub-phase, perform a systematic 5-point inspection:
   2. **Technical Findings & Gotchas**: Uncovered realities or system nuances discovered during implementation.
   3. **Plan Deviations**: Any divergence from the original conceptual design with explicit architectural justification.
   4. **Verification Proof**: Exact test steps and database/UI checks confirming success.
+
+### Rule 7: Mandatory Database Change Documentation & Ledger Recording
+- **Zero Undocumented DB Alterations**: Any database changes required (including column additions, alterations, column type changes, new indexes, foreign keys, or constraint updates) **MUST** be explicitly documented in the specific roadmap phase section related to that feature AND logged in the [Production Database Migration Ledger](#-production-database-migration-ledger-manual-production-ddl) with the exact production SQL statements.
+- **New Tables Exception**: Detailed `ALTER TABLE` tracking may only be omitted if the feature introduces an entirely new database table (which is managed cleanly through ORM initial table creation), though logging the `CREATE TABLE` statement in the ledger remains best practice.
+
+### Rule 8: Release Gate (Added 2026-10-15)
+A feature may only be marked **Completed & Verified** when all of the following hold on a clean checkout of the release branch:
+1. **Boots clean**: every new import is in `requirements.txt` / `package.json`; `import app.main` succeeds.
+2. **Schema shipped**: every new column/table has a ledger entry with production SQL (Rule 7) — local-DB-only columns do not count.
+3. **Seeded by the app**: required reference data (e.g. rules) is seeded by startup/migration code, never by a scratch script.
+4. **Authenticated & scoped**: every new endpoint is authenticated, and every recipient query is scoped to customer + assignment (no global `bank_id` fan-out).
+5. **Non-blocking**: no network fan-out (push/email) inside the request handler.
+6. **Errors are visible**: no silent `except: pass` around business-critical paths; frontend "proceed anyway" fallbacks must log and surface the failure.
 
 ---
 
@@ -1252,6 +1305,60 @@ To provide instant sound and vibration alerting without the friction of Apple De
   * An intuitive prompt displayed when accessing on a mobile browser or inside the user profile/settings.
   * Step-by-step guidance for iOS users: *"Tap Share ➔ Add to Home Screen to receive instant sound alerts on your phone."*
 
+### 11.6 Mobile Device Trust, Session Security & Notification Lifecycle Governance
+* **11.6.1 Device Linking & Hardware Token Association**:
+  * Physical device hardware is linked to the user account using the W3C Push API / VAPID standard.
+  * The Service Worker requests a unique `PushSubscription` tuple (`endpoint`, `p256dh`, `auth`) from Apple APNs (iOS) or Google FCM (Android).
+  * Backend associates this cryptographic tuple with `user_id` and records the device profile (`iPhone 15 Pro — Mobile Safari`, IP, created timestamp).
+* **11.6.2 Explicit Sign-Out Behavior (Zero Leakage on Shared Devices)**:
+  * When a user explicitly clicks "Sign Out", the app triggers `POST /api/v1/notifications/push-unsubscribe` (marking `PushSubscription.is_active = False`).
+  * **Guaranteed Privacy**: Zero notifications are pushed to that physical phone while logged out, preventing company data exposure if the device is borrowed or handed off.
+* **11.6.3 Idle Session Timeout vs. Push Alerts (Secure Summons Protocol)**:
+  * When a user's session token (JWT) expires after an inactivity timeout (e.g. 15–30 minutes), push notifications continue to function as a **secure wake-up summons**.
+  * **Redacted Lock-Screen Content**: Payloads never disclose sensitive financial figures, currency amounts, or counterparty bank names on the lock screen.
+    * ❌ *Prohibited:* `"CIB offered 48.55 on $10,000,000 for RFQ #204"`
+    * ✅ *Enforced:* `"Action Required: 1 Quotation ready for evaluation. Tap to view."`
+  * **Gated Deep-Link Re-Authentication**: Tapping the notification opens the PWA directly to the target record URL (`/quotations/{rfq_id}`). Because the session is expired, the app intercepts the navigation, prompts for instant unlock (Password or **Face ID / Biometrics via WebAuthn**), and seamlessly resumes directly into the target view once authenticated.
+* **11.6.4 Device Trust Hierarchy & Verification**:
+  * **First Login on Phone**: If accessing from an unrecognized mobile device, authentication mandates **Password + Email OTP**.
+  * **Trusted Device Enrollment**: The user can check *"Trust this device for 30 days"*, issuing a persistent cryptographic device token.
+  * **Zero-Friction Push Enablement**: Because the user has already passed 2FA (Password + Email OTP) on that physical device, turning on push notifications requires only native OS consent—**no redundant secondary OTP is required**.
+  * **Remote Device Revocation**: Users and Corporate Admins can review all authorized mobile devices under *Profile ➔ Security & Devices* and click **"Revoke Device"** to immediately kill the session and burn the hardware push subscription.
+
+### 11.7 Phase 9 Post-Flight Summary (Work Done, Technical Gotchas & Verification Proof — ⚠️ Superseded by §11.8 Review)
+> **Note (2026-10-15):** The "verified" claims below were based on scratch scripts against a local database. The independent review in §11.8 found deployment blockers and confidentiality defects. This code lives only on `wip/notification-engine-2026-10-15` and is **not** in the release candidate.
+* **Work Actually Done**:
+  1. **Database Schema (`push_subscriptions`)**: Added `PushSubscription` model in [`app/models/models_notification.py`](file:///c:/Grow/app/models/models_notification.py) storing device endpoints, P-256 keys, device types, and active states. Table verified in PostgreSQL.
+  2. **VAPID Cryptographic Engine**: Built [`app/core/vapid_security.py`](file:///c:/Grow/app/core/vapid_security.py) generating EC P-256 base64url keys (87-char uncompressed point) with secure persistent storage in `data/vapid_keys.json` (git-ignored) and fallback to `.env`.
+  3. **Backend API Endpoints**: Extended [`app/api/v1/endpoints/notification_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/notification_endpoints.py) with `/vapid-public-key`, `/push-subscribe`, `/push-unsubscribe`, `/devices`, `/devices/{id}`, and `/test-push`.
+  4. **Centralized Notification Engine Integration**: Integrated WebPush dispatch into `notify()` in [`app/services/notification_service.py`](file:///c:/Grow/app/services/notification_service.py), with auto-invalidation of expired tokens (HTTP 404/410 Gone).
+  5. **PWA Standalone App Shell & Service Worker**: Created [`frontend/public/manifest.json`](file:///c:/Grow/frontend/public/manifest.json), [`frontend/public/sw.js`](file:///c:/Grow/frontend/public/sw.js), and updated [`frontend/public/index.html`](file:///c:/Grow/frontend/public/index.html) with iOS standalone meta tags and touch icons.
+  6. **Client Service & UI Control Center**: Built [`frontend/src/services/pushNotificationService.js`](file:///c:/Grow/frontend/src/services/pushNotificationService.js), added [`frontend/src/components/Notifications/MobileAlertModal.jsx`](file:///c:/Grow/frontend/src/components/Notifications/MobileAlertModal.jsx), and integrated the Mobile Alert status bar and modal into [`frontend/src/components/NotificationCenter.jsx`](file:///c:/Grow/frontend/src/components/NotificationCenter.jsx).
+  7. **Explicit Logout Hook**: Integrated automatic `unsubscribeFromPushNotifications()` on `logoutUser()` in [`frontend/src/services/apiService.js`](file:///c:/Grow/frontend/src/services/apiService.js) to guarantee zero notification leakage on shared devices.
+* **Technical Findings & Gotchas**:
+  * **VAPID Key Serialization**: `pywebpush` expects a live `py_vapid.Vapid` object or PEM file path rather than a raw string. Passing `Vapid.from_pem(...)` directly guarantees immediate cryptographic compatibility across Google FCM and Apple APNs gateways without ASN.1 format exceptions.
+  * **W3C applicationServerKey**: Browser `PushManager.subscribe()` requires uncompressed P-256 public keys (65 bytes starting with `0x04`) encoded in standard base64url format (87 characters).
+  * **410 Gone Resilience**: Google FCM / Apple APNs return HTTP 410 when an app is uninstalled or subscription rotated; backend automatically marks `is_active = False` on detection.
+* **Verification Proof**:
+  * Executed [`scratch/test_push_notifications.py`](file:///c:/Grow/scratch/test_push_notifications.py): 100% pass across VAPID key generation, database CRUD operations, and mock WebPush exception handling.
+  * Executed [`scratch/test_notify_push.py`](file:///c:/Grow/scratch/test_notify_push.py): 100% pass confirming `notify()` triggers WebPush dispatch and updates `last_notified_at`.
+  * Verified FastAPI startup (`app.main`): 666 routes verified without error.
+
+### 11.8 Independent Review Findings (2026-10-15) — Status Downgraded ⏸️
+Phases 9, 9.2, 9.3 and 10 (core) are downgraded from **Completed & Verified** to **Prototype — On Hold**. Findings against the Rule 8 release gate:
+
+| # | Category | Finding | Impact |
+| :--- | :--- | :--- | :--- |
+| 1 | **Deployment** | `pywebpush` / `py-vapid` missing from `requirements.txt`; `notification_endpoints.py` imports them at module level | App fails to boot on a clean server |
+| 2 | **Deployment** | New columns on `system_notifications`, `quotation_rfqs`, `quotation_legs` have no `ALTER` in `main.py` and no ledger SQL | 500s on first query in production |
+| 3 | **Deployment** | Rules seeded only by `scratch/clean_and_seed_quotation_rules.py`; VAPID keys regenerate when env vars are unset | Engine silent in prod; existing subscriptions invalidated on redeploy |
+| 4 | **Confidentiality** | Dealer push recipients filtered by global `bank_id` | A bank's dealers can be alerted about **other customers'** RFQs |
+| 5 | **Confidentiality** | `/notifications/dealer-push-subscribe` is unauthenticated | Anyone can enrol a device against a bank |
+| 6 | **Confidentiality** | `test_fire_rule` can push to all dealer devices; dismiss is broadcast platform-wide; logout does not tear down push | Test traffic / wipes leak across tenants; shared devices keep receiving |
+| 7 | **Correctness** | `int(rfq_id)` on UUID ids kills `DEAL_AWARDED` / `TENDER_CLOSED`; `rfq.trade_type` does not exist (kills `RFQ_SCHEDULED_NOTICE`) | Key events never fire (errors swallowed) |
+| 8 | **Correctness** | Admins double-pushed (`notify()` also pushes); `RFQ_MAKER` (UI) vs `DEAL_MAKER` (engine) mismatch; scanner ignores `assignment.approval_status` | Duplicate / missing / premature alerts |
+| 9 | **Performance** | Push sent synchronously inside request handlers; 5-second scanner in `main.py` | Slow quote submission; DB load |
+
 ---
 
 ## 12. Phase 10: Automated Notification & Lifecycle Event Engine
@@ -1324,9 +1431,343 @@ Phase 10 transitions the platform from *reactive* alerts (alerts triggered only 
   * **Quiet Hours Support**: Option to suppress non-emergency notifications between configured hours (e.g. 9:00 PM – 7:00 AM) while allowing emergency escalation alerts to break through.
   * **Frequency Throttling / Batching**: Bundles multiple alerts occurring within 5 minutes into a single consolidated notification.
 
+### 12.6 Enterprise Event-Driven Notification Policy Engine & Non-Developer Console (Phase 10 Core)
+To eliminate hardcoded notification strings, rigid endpoint couplings, and developer dependencies, Phase 10 establishes a **declarative, event-driven notification rules engine**:
+
+```
+[Business Action / Life-Cycle Event] ──► [event_bus.emit(event_code, context)]
+                                                         │
+                                                         ▼
+                                          [notification_event_rules DB]
+                                          • Dynamic Text Template Engine ({{placeholders}})
+                                          • Target Audience Resolver (Invited Dealers, Corp Admins)
+                                          • Anti-Annoyance Shield (Window-Matched TTL)
+                                          • Remote Wipe on Deal Concluded (Silent Dismiss)
+                                                         │
+                                         ┌───────────────┼───────────────┐
+                                         ▼               ▼               ▼
+                                    [Web Push]       [In-App Bell]    [Email]
+```
+
+1. **Declarative Rule Storage (`notification_event_rules`)**:
+   * `id`, `module`, `event_code` (Unique), `name`, `description`, `is_enabled`
+   * `action_type`, `action_url_template`, `open_in_new_tab`
+   * `expiry_mode` (`MATCH_EVENT_WINDOW`, `FIXED_DURATION`, `STICKY`), `ttl_seconds`, `dismiss_on_events` (JSONB)
+   * `target_audience` (`INVITED_DEALERS`, `CORPORATE_ADMINS`, `RFQ_MAKER`, `ASSIGNED_APPROVERS`)
+   * `send_push`, `send_in_app`, `send_email`
+   * `title_template`, `body_template`, `urgency` (`standard`, `high`, `urgent`)
+2. **The 3-Tier Anti-Annoyance & Expiry Shield**:
+   * **Tier 1 (Gateway TTL):** Payload sent to Apple APNs and Google FCM carries `TTL = window_duration`. Offline devices drop the message if expired.
+   * **Tier 2 (Client Service Worker Timer):** Phone and laptop notification centers auto-dismiss the active notification once the tender window ends.
+   * **Tier 3 (Remote Deal-Concluded Wipe):** When a deal is awarded or closed, the engine emits `TENDER_CLOSED_DISMISS`, firing a silent push that physically removes the alert from all losing bank dealers' screens immediately.
+3. **The Non-Developer Governance Console (`/system-owner/notification-governance`)**:
+   * **Module Catalog Tabs:** Quotations, LG Issuance, Facility Limits, Platform.
+   * **Click-to-Insert Placeholders:** Non-developers click chip buttons (`[+ Customer Name]`, `[+ RFQ #]`, `[+ Time Left]`) rather than typing raw code.
+   * **Live Smartphone & Desktop Preview:** Real-time lock-screen and banner mockup updating as the admin types.
+   * **1-Click Test Simulation:** "Test on My Device" button to preview sounds, vibrations, and deep links live before saving.
+
+### 12.7 Dispatch-Layer Redesign (Required Before Any Release) 🛠️
+Decision (2026-10-15): **do not start from zero**. Keep the rules model, governance console, service worker, VAPID handling and PWA shell from the WIP branch; rebuild the layer between "event emitted" and "device notified".
+
+1. **Authenticated dealer enrolment**: subscription tied to a verified `QuotationBankDealer` or a specific assignment token + OTP session; never to a bare `bank_id`.
+2. **Recipient resolution per assignment**: resolve recipients from `quotation_bank_assignments` for that RFQ (customer-scoped), honouring `approval_status` (approvers before approval, dealers only after) and leg exclusions.
+3. **Single send path**: one `dispatch(event, recipients)` function; `notify()` no longer pushes on its own (eliminates double sends).
+4. **Background delivery**: enqueue deliveries (`notification_deliveries` table or task queue) and send outside request handlers with retry + 404/410 cleanup; replace the 5-second scanner with a minute-level scheduler.
+5. **Correct event contracts**: typed context per `event_code` (string UUID ids, real RFQ fields); align audience enums (`RFQ_MAKER`); fail loudly in tests instead of `except: pass`.
+6. **Tenant-scoped dismiss / test**: dismiss only devices that received the original; test-fire only to the caller's own device.
+7. **Shippable schema & config**: ledger SQL + startup `ALTER`s for all columns, rules seeded by app startup, VAPID keys required from env (fail fast), dependencies pinned in `requirements.txt`.
+8. **Logout teardown & lock-screen redaction** as specified in §11.6.
+9. **Verification**: cross-customer isolation test (bank dealer of Customer A never receives Customer B events), approval-gating test, clean-checkout boot test.
+
+
 ---
 
-## 13. Master Implementation Status: What We Have vs. What Still Needs to Be Done
+## 13. Phase 11: Tender Window Governance, Dynamic Lead-Time Buffer & Granular Lifecycle Sub-statuses (Planned 🚀)
+
+Phase 11 solves two critical operational challenges discovered in live corporate treasury deployments:
+1. **The Lead-Time / 0-Bid Dilemma**: Approving tenders immediately prior to or after `window_start` blindsides bank dealers, leaving zero preparation time and producing false 0-bid / expired tenders.
+2. **Lifecycle Ambiguity**: Eliminates the confusing conflation of administrative compliance vetoes, user market pricing declines, automated system timeouts, and dealer illiquidity under generic "Rejected" or "Completed" banners.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                   Phase 11: Window Governance & Sub-Status Matrix Flow                           │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│   [RFQ Created] ──► [PENDING_APPROVAL]                                                           │
+│                            │                                                                     │
+│              ┌─────────────┴────────────────────────┐                                            │
+│              ▼                                      ▼                                            │
+│   (window_start - now) > 3 min           (window_start - now) <= 3 min OR now >= window_start    │
+│              │                                      │                                            │
+│     [Standard Approval]                   [Instant Approval Blocked]                             │
+│     Dispatches as scheduled                         │                                            │
+│                                           [Reschedule Modal Prompt]                              │
+│                                           "Window start is too close. Push start to +5 mins?"    │
+│                                                     │                                            │
+│                                           [Admin Confirms Push]                                  │
+│                                           window_start = confirmation_time + 5 min               │
+│                                           window_end   = new_start + original_duration           │
+│                                           Dispatches to banks with 5-minute preparation buffer   │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.1 The Dynamic Lead-Time Guardrail & 5-Minute Push Protocol
+* **The 3-Minute Buffer Rule**:
+  * In institutional FX Spot and T-Bill quoting, bank trading desks require advance notice to review requests, check credit lines, and configure pricing models.
+  * If `(window_start - now) < 3 minutes` or `now >= window_start`:
+    * Direct instant approval is **disabled on both Frontend and Backend API validation**.
+    * The Corporate Admin approval action opens a dedicated **Reschedule Guard Modal**.
+* **Dynamic 5-Minute Window Push**:
+  * The modal prompts: *"The tender start time is too close or has already passed. Reschedule the tender to start 5 minutes from your confirmation?"*
+  * **Timestamp Calculation**: The new start time is calculated from the exact millisecond of the user's confirmation (`new_window_start = confirmation_timestamp + 5 minutes`).
+  * **Duration Preservation**: The originally configured duration (e.g. 15 minutes) is strictly preserved (`new_window_end = new_window_start + duration`).
+  * **Dealer Preparation**: Banks receive email dispatches with a guaranteed 5-minute countdown, eliminating rushed or missed pricing windows.
+* **Backend Validation**:
+  * `POST /quotations/{rfq_id}/approve` checks the current server time. If `window_start - now < 180s` and the caller did not pass `confirm_reschedule=true`, the backend rejects with `400 Bad Request` requiring explicit reschedule confirmation.
+
+---
+
+### 13.2 Granular Sub-Status Matrix (Zero DB Enum Breaking Changes)
+To maintain 100% database stability and avoid invalidating existing PostgreSQL enum constraints, the primary `rfq.status` remains stable (`COMPLETED`, `REJECTED`, `CANCELLED`, `EXPIRED`, `ACTIVE`), while a granular `sub_status` (or resolved status payload) provides exact operational context:
+
+| Category | Primary DB `status` | Granular `sub_status` | Trigger Source | UI Badge & Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| **Traded** | `COMPLETED` | `TRADED` | End User | 🟢 **Executed / Traded**: User accepted a bank's quote within the 30-second acceptance window. Winner rate locked. |
+| **Auto Traded** | `COMPLETED` | `AUTO_ACCEPTED` | System STP Rule | 🟢 **Auto-Executed**: Best quote met corporate Straight-Through Processing rules and auto-accepted on timeout. |
+| **User Declined** | `REJECTED` | `USER_DECLINED` | End User | ⚪ **Declined by User**: Quotes arrived, but user actively chose "Decline Deal" (rates unfavorable or market moved). |
+| **Timer Timeout** | `REJECTED` | `AUTO_REJECT_TIMEOUT` | System Timeout | 🟠 **Acceptance Timed Out**: Bank quotes arrived, but the user's 30-second acceptance window expired without action. |
+| **No Quotes** | `COMPLETED` | `NO_QUOTES` | System | ⚪ **No Quotes Received**: Bidding window closed with zero participating bank quotes. |
+| **Admin Veto** | `REJECTED` | `ADMIN_REJECTED` | Corporate Admin | 🔴 **Rejected by Admin**: Corporate Admin explicitly refused the RFQ before banks were dispatched. |
+| **Admin Stale** | `EXPIRED` | `APPROVAL_EXPIRED` | System Scheduler | ⚪ **Expired (Unapproved)**: RFQ sat in `PENDING_APPROVAL` past the cutoff without being approved or rescheduled. |
+| **Auto-Approved** | `ACTIVE` | `AUTO_APPROVED` | System Rules Engine | 🔵 **Auto-Dispatched**: Dispatched to banks without manual admin review based on corporate policy limits. |
+
+---
+
+### 13.3 Retrospective Historical Position Reconstruction & Exposure Reporting
+* **Zero Historical Data Loss**:
+  * Existing past records in PostgreSQL already contain `winner_bank_id`, `acceptance_status`, `acceptance_resolved_by_user_id`, `admin_reviewed_by_user_id`, and `rejection_reason`.
+  * A deterministic backend resolver (`resolve_rfq_sub_status`) maps every existing past RFQ to its exact historical position without requiring destructive database migrations:
+    * `status == 'COMPLETED' and not winner_bank_id` $\rightarrow$ `NO_QUOTES`.
+    * `acceptance_status == 'REJECTED' and acceptance_resolved_by_user_id is not None` $\rightarrow$ `USER_DECLINED`.
+    * `acceptance_status == 'AUTO_REJECTED'` $\rightarrow$ `AUTO_REJECT_TIMEOUT`.
+    * `status == 'REJECTED' and not is_dispatched` $\rightarrow$ `ADMIN_REJECTED`.
+* **Treasury Position vs. Market Inquiry Separation**:
+  * **Traded Position**: Deals marked `TRADED` or `AUTO_ACCEPTED` feed into realized corporate FX cash flow, bank credit facility utilization, and accounting ledgers.
+  * **Unrealized Inquiries**: Deals marked `USER_DECLINED`, `AUTO_REJECT_TIMEOUT`, `NO_QUOTES`, or `APPROVAL_EXPIRED` are audited as unexecuted market inquiries with zero credit/cash impact.
+
+---
+
+### 13.4 Target Components & Verification Roadmap
+1. **Backend Endpoints & Logic**:
+   - `app/api/v1/endpoints/quotations_endpoints.py`:
+     - Update `approve_rfq` with 3-minute cutoff validation and dynamic 5-minute duration push.
+     - Add `resolve_rfq_sub_status(rfq)` utility for unified status resolution.
+     - Update `get_rfq_history` and `get_rfq_details` to return computed `sub_status`.
+   - `app/services/deal_acceptance_service.py`:
+     - Distinguish `USER_DECLINED` vs `AUTO_REJECT_TIMEOUT` in `resolve_deal_acceptance`.
+2. **Frontend UI Components**:
+   - `frontend/src/pages/CorporateAdmin/Quotations/CorporateAdminDashboard.js`:
+     - Intercept approval if within 3 minutes of `window_start`; present Reschedule & Push Modal.
+   - `frontend/src/pages/EndUser/Quotations/ResultsView.js`:
+     - Render distinct badges for "Declined by User" vs "Acceptance Timed Out" vs "No Quotes Received".
+   - `frontend/src/pages/EndUser/Quotations/QuotationHistoryDashboard.js`:
+     - Add filtering and badges for the new sub-statuses.
+3. **Automated Verification Test Suite**:
+   - `scratch/verify_lifecycle_scenarios.py`:
+     - Add test cases for 3-minute cutoff rejection, 5-minute push calculation, and sub-status resolution.
+
+---
+
+## 14. Phase 12: RFQ Document Governance — Decoupled Leg Scoping, Strict Exclusion Firewall & Internal-Only Confidential Vault (Planned 🚀)
+
+### 14.1 Business Need & Architecture Critique
+In competitive institutional quotation workflows (FX Spot, Multi-Leg Portfolios, and T-Bills), supporting commercial documents (pro-forma invoices, trade contracts, purchase orders, shipping manifests, customs clearances) are indispensable for accurate pricing, credit allocation, and trade settlement. However, corporate treasury analysis revealed two architectural deficiencies in the previous design:
+
+1. **Coupling of Document Release Timing & Leg Scoping**:
+   - Previously, the option to link an attached document to a specific currency leg vs. all pairs was coupled with or conditioned on the "Release to Winner Only" setting.
+   - **The Confidentiality Leakage Risk**: Leg-level scoping is critically necessary **regardless** of whether documents are released upfront to all participating banks during the tender bidding window, or withheld until deal execution and released only to the winning bank.
+   - In multi-leg tenders with selective counterparty exclusions (Phase 3 "Invisible Legs" or uninvited legs), a bank counterparty may be entirely excluded from Leg 2 (e.g. specialized JPY leg or illiquid exotic pair). If an attached document is linked to Leg 2, that bank must **NEVER** receive, preview, or download that document — under **ANY** circumstance. If documents are released during open bidding, the excluded bank must be blocked; if documents are released to winners only, an excluded bank that wins Leg 1 must still be blocked from Leg 2 documents.
+   - **Architectural Mandate**: Completely decouple document release timing (Bidding Window vs. Post-Execution Winner) from document leg association into two independent, orthogonal configuration axes.
+
+2. **Absence of Customer-Confidential Internal Archiving ("Internal Use Only")**:
+   - Corporate Treasuries routinely handle sensitive internal documentation that must be permanently bound to the RFQ transaction record for internal governance, Maker-Checker validation, internal audit compliance, and accounting reconciliation — but must **NEVER** reach external counterparties.
+   - Examples include: internal treasury committee approval memos, board risk ceiling authorization excerpts, proprietary hedge ratio calculation sheets, tax structuring notes, and bank credit facility allocation memos.
+   - Previously, any document uploaded to an RFQ was destined for external bank distribution (either globally or leg-scoped).
+   - **Architectural Mandate**: Establish a 3rd distinct document distribution scope: **`Internal Use Only`**, guaranteeing a mathematical 100% bank air-gap while providing full lifecycle persistence, indexing, and viewing for corporate customer users.
+
+---
+
+### 14.2 The 2-Dimensional Orthogonal Document Governance Model
+
+Document governance is decomposed into two completely decoupled, independently configurable dimensions:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                   Phase 12: Orthogonal Document Governance Matrix                      │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│                                  DIMENSION 1: SCOPE                                    │
+│                     ┌────────────────────┬────────────────────┬──────────────────────┐ │
+│                     │ 🌐 All Pairs       │ 🎯 Specific Leg    │ 🔒 Internal Only     │ │
+│                     │ (Global Portfolio) │ (e.g. Leg 1: USD)  │ (Customer Vault Only)│ │
+│ ┌───────────────────┼────────────────────┼────────────────────┼──────────────────────┤ │
+│ │ ⚡ During Bidding │ Visible to all     │ Visible ONLY to    │ 🚫 100% Bank Air-Gap │ │
+│ │ (All Invited)     │ participating      │ banks invited to   │ (Never shared, sent, │ │
+│ │                   │ banks during open  │ this specific leg  │ or exposed in APIs)  │ │
+│ D                   │ tender window      │ (Excluded = 0%)    │                      │ │
+│ I ──────────────────┼────────────────────┼────────────────────┼──────────────────────┤ │
+│ M │ 🏆 Winner Only  │ Withheld in tender │ Withheld in tender │ 🚫 100% Bank Air-Gap │ │
+│   │ (Post-Execution)│ Released to winning│ Released ONLY to   │ (Never shared, sent, │ │
+│ 2 │                 │ bank(s) upon trade │ winning bank of    │ or exposed in APIs)  │ │
+│   │                 │ execution          │ THIS specific leg  │                      │ │
+│ └─┴─────────────────┴────────────────────┴────────────────────┴──────────────────────┘ │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Dimension 1: Scope & Target Audience (Where Does It Apply?)
+1. **`🌐 All Pairs (Global Portfolio)`**:
+   - Applies across the entire quotation request.
+   - Accessible by all counterparties invited to the deal (or winning bank if Winner-Only is selected).
+2. **`🎯 Specific Leg (Leg-Scoped: Leg {N} - {Pair})`**:
+   - Bound strictly to an individual currency leg (e.g. Leg 1: `EUR/EGP`, Leg 2: `USD/EGP`).
+   - **Strict Exclusion Firewall**: If Bank B is set to `Invisible` on Leg 2 (or `is_invited=False`), Bank B is mathematically blocked from seeing, downloading, or receiving Leg 2 documents — under **BOTH** release timing modes (during bidding or upon execution).
+3. **`🔒 Internal Use Only (Corporate Treasury Vault)`**:
+   - **Zero Bank Visibility**: 100% excluded from all bank portals, counterparty REST responses, dealer blotters, and email dispatches.
+   - **Full Corporate Retention**: Recorded, indexed, stored, and accessible to authorized customer users (Corporate Admin, Treasury Maker, Approver, Auditor) in RFQ details, history records, and audit logs.
+   - Can optionally be linked to a specific leg or all pairs for internal customer tracking, but external bank distribution is hard-coded to 0%.
+
+#### Dimension 2: Release Timing (When Is It Dispatched?)
+*(Applies only to external documents; bypassed and deactivated when Scope = Internal Use Only)*
+1. **`⚡ During Bidding (Open Tender Window)`**:
+   - Available immediately upon RFQ dispatch to participating counterparties eligible for that leg.
+   - Provides commercial backing necessary for banks to price the tender.
+2. **`🏆 Winner Only (Trade Execution Sealed Vault)`**:
+   - Withheld and masked during the bidding round.
+   - Unsealed strictly upon trade acceptance/award and provided only to the bank awarded that specific leg.
+
+---
+
+### 14.3 Strict Multi-Leg Counterparty Exclusion & Leakage Shield
+
+To ensure zero information leakage in complex multi-leg tenders with selective exclusions:
+
+```
+                           ┌────────────────────────────┐
+                           │    Document Uploaded       │
+                           │   (Linked to Leg #1)       │
+                           └─────────────┬──────────────┘
+                                         │
+                 ┌───────────────────────┴───────────────────────┐
+                 ▼                                               ▼
+         [Bank A Invited to Leg 1]                       [Bank B Excluded from Leg 1]
+                 │                                               │
+        ┌────────┴────────┐                             ┌────────┴────────┐
+        ▼                 ▼                             ▼                 ▼
+  During Bidding     Winner Only                  During Bidding     Winner Only
+  [Document Visible] [Withheld until won]         [REDACTED (0%)]    [REDACTED (0%)]
+                                                  (Never in Portal   (Even if Bank B
+                                                   Never in Email)    wins Leg #2!)
+```
+
+1. **Bidding Window Shield (`app/api/v1/endpoints/public_quotations.py:353-460`)**:
+   - When Bank B requests `/public-quotation/{token}`, the payload engine matches documents against `visible_portal_legs`.
+   - If a document is tagged to Leg 1 and Bank B's `QuotationBankLegConfig.quotation_base == 'Invisible'` or `is_invited == False`:
+     - Document metadata is completely stripped from the response array.
+     - Direct download attempts return HTTP `403 Forbidden`.
+2. **Deal Execution Shield (`app/api/v1/endpoints/public_quotations.py:2500-2550`)**:
+   - In a split-leg award where Bank A wins Leg 1 and Bank B wins Leg 2:
+     - Bank B's execution receipt and outcome payload contains **ONLY** documents tagged to Leg 2 (or Global docs).
+     - Leg 1 documents are permanently withheld from Bank B, guaranteeing 0% cross-leg trade document leakage.
+3. **Internal-Only Air-Gap (`models_quotation.py`, `public_quotations.py`, `unified_email_builder.py`)**:
+   - Documents with `is_internal_only == True` or `scope == 'INTERNAL_ONLY'` are filtered out at the ORM/serialization layer before any counterparty data structure is assembled.
+
+---
+
+### 14.4 Standardized Document Storage Payload Schema
+
+To maintain 100% non-breaking backwards compatibility with existing database records, `quotation_rfqs.document_path` JSON structure is enhanced:
+
+```json
+{
+  "release_to_winner_only": false,
+  "documents": [
+    {
+      "id": "doc_9f83a1b2",
+      "name": "Commercial_Invoice_782.pdf",
+      "path": "gs://grow-treasury-docs/tenants/14/rfq_210/Commercial_Invoice_782.pdf",
+      "size_bytes": 1048576,
+      "mime_type": "application/pdf",
+      "scope": "SPECIFIC_LEG",
+      "leg_index": 0,
+      "leg_id": "leg_101",
+      "pair": "EUR/EGP",
+      "release_timing": "WINNER_ONLY",
+      "is_internal_only": false
+    },
+    {
+      "id": "doc_3c4d5e6f",
+      "name": "Internal_Risk_Committee_Approval.pdf",
+      "path": "gs://grow-treasury-docs/tenants/14/rfq_210/Internal_Risk_Committee_Approval.pdf",
+      "size_bytes": 524288,
+      "mime_type": "application/pdf",
+      "scope": "INTERNAL_ONLY",
+      "leg_index": null,
+      "leg_id": null,
+      "pair": null,
+      "release_timing": null,
+      "is_internal_only": true
+    }
+  ]
+}
+```
+
+- **Backwards Compatibility**:
+  - Legacy strings (`"path1.pdf,path2.pdf"`) continue to parse with default `scope = "ALL_PAIRS"`, `release_timing = "BIDDING"`, `is_internal_only = False`.
+  - Legacy payloads with top-level `"release_to_winner_only": true` automatically map to `release_timing = "WINNER_ONLY"` across non-internal documents.
+
+---
+
+### 14.5 Target Components & Implementation Deliverables
+
+1. **Frontend Request Wizard (`frontend/src/pages/EndUser/Quotations/QuotationRequestDashboard.js`)**:
+   - Refactor the **Supporting Documents** card:
+     - Replace the single coupled "Release documents only to winning bank(s)" checkbox with a per-document or structured configuration table.
+     - Document scope selector:
+       - `🌐 All Pairs (Global)`
+       - `🎯 Leg {i}: {Pair}` (Selectable for any multi-leg RFQ)
+       - `🔒 Internal Use Only (Customer / Treasury Only)`
+     - Release timing selector (visible and active only when scope is not Internal-Only):
+       - `⚡ During Tender (All Participating Banks)`
+       - `🏆 Winner Only (Awarded Bank Post-Trade)`
+     - Add visual helper tags and badges (`🔒 Internal`, `🏆 Winner Only`, `🌐 All Pairs`, `🎯 Leg 1`).
+2. **Backend Domain Models & Extraction (`app/models/models_quotation.py`)**:
+   - Update `get_parsed_documents()`:
+     - Provide filtered helper methods: `get_counterparty_documents(for_bank_id, leg_id=None, is_winner=False)` and `get_internal_documents()`.
+     - Filter out any document flagged as `is_internal_only == True` from all counterparty-facing methods.
+3. **Public Bank Portal Endpoints (`app/api/v1/endpoints/public_quotations.py`)**:
+   - In `GET /public-quotation/{token}`:
+     - Hard filter suppressing all internal-only documents.
+     - Enforce leg exclusion check: if document belongs to a specific leg, bank must be invited and visible on that leg.
+     - Withhold documents where `release_timing == 'WINNER_ONLY'` until trade completion.
+   - In `GET /public-quotation/{token}/outcome`:
+     - Hard filter suppressing all internal-only documents.
+     - Unseal ONLY documents matching the won legs for that specific bank.
+4. **Corporate Treasury Views (`ResultsView.js`, `AdminQuotationDashboard.js`, `QuotationHistoryDashboard.js`)**:
+   - Corporate Admins and Treasury Users view the complete document repository with distinct status badges (`Internal Only` badge in amber/slate, `Winner Only` badge in indigo, `Leg Scope` badge in blue).
+   - Dedicated filter to view "External Documents" vs. "Internal Audit Documents".
+5. **Email Builder & Dispatcher (`app/services/unified_email_builder.py`, `quotations_endpoints.py`)**:
+   - Guarantee zero email leakage: internal-only documents are strictly bypassed during bank email dispatch.
+6. **Automated Verification Suite (`tests/test_rfq_document_governance.py`)**:
+   - Unit & integration tests asserting:
+     - Internal-only files never leak into public bank JSON payloads or bank emails.
+     - Leg-scoped files are blocked from banks excluded from that leg under both bidding and winner-only release modes.
+     - Full backwards compatibility with legacy `document_path` formats.
+
+---
+
+## 15. Master Implementation Status: What We Have vs. What Still Needs to Be Done
 
 This matrix serves as the authoritative ground truth comparing active production code against upcoming deliverables:
 
@@ -1339,6 +1780,9 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Document Privacy** | Global vs. Leg-Specific File Attachment | ✅ **Completed & Verified** | `QuotationRequestDashboard.js` (`fileLegMap` with `_uid`) | Fully operational (prevented pair de-sync). |
 | **Document Privacy** | Winner-Only Release Scoping per Leg | ✅ **Completed & Verified** | `models_quotation.py`, `public_quotations.py:L2540-2580` | Fully operational (0% cross-leg document leakage). |
 | **Document Privacy** | Excluded/Invisible Leg File Shielding | ✅ **Completed & Verified** | `public_quotations.py`, `QuotationRequestDashboard.js` | Counterparties never receive files for hidden legs. |
+| **Document Governance** | **Decoupled Leg Scoping (Independent of Winner-Only) (Phase 12)** | 🚀 **Planned / Queued** | `QuotationRequestDashboard.js`, `models_quotation.py`, `public_quotations.py` | Eliminates coupling between winner-only release and leg-specific assignment. |
+| **Document Governance** | **Strict Leg Exclusion Firewall (All Modes) (Phase 12)** | 🚀 **Planned / Queued** | `public_quotations.py`, `unified_email_builder.py` | Guarantees banks excluded from Leg X never receive Leg X files (bidding or award). |
+| **Document Governance** | **Internal-Only Confidential Vault ("Customer Only") (Phase 12)** | 🚀 **Planned / Queued** | `QuotationRequestDashboard.js`, `models_quotation.py`, `ResultsView.js` | 100% bank air-gapped internal records (board memos, hedge calc sheets) maintained for customer users. |
 | **Zero-Knowledge (Tier 1)** | 256-bit AES-GCM Envelope Encryption (DEK/KEK) | ✅ **Completed & Verified** | `security_crypto.py`, `tenant_key_service.py`, `quotation_tenant_keys` table | 18 of 18 backend tests passing with 100% success. |
 | **Zero-Knowledge (Tier 1)** | Dual-Read Resolver for FX Spot & T-Bills | ✅ **Completed & Verified** | `tenant_key_service.py:resolve_offer_price` | Resolves ciphertext; backwards compatible with legacy deals. |
 | **Zero-Knowledge (Tier 1)** | **100% In-Memory Decryption & Leak Elimination (Sub-Phase 8.6)** | ✅ **Completed & Verified** | `quotation_benchmark_service.py`, `public_quotations.py`, `bank_dealer_endpoints.py`, `corporate_admin.py` | Orphaned `QuotationNotification` cleartext inserts decommissioned across all routes. 100% of reader endpoints now decrypt quotes in memory with backwards compatibility. |
@@ -1365,22 +1809,40 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Counterparty Security** | Automated Domain DNS/MX Enrichment (Phase 2.6) | ⏸️ **Intentionally Deferred** | Design specs in Phase 2.6 | Whitelist and official domain matching already deliver 100% protection against personal webmail. |
 | **Host-Blind Vault (Tier 2)** | Client-Side WebCrypto Bidding Engine | ⏸️ **Intentionally Deferred** | Section 10.2 | Deferred in favor of Tier 1 Envelope Encryption. Client-only decryption breaks automated background execution (AUTO_ACCEPT timeouts) and offline PDF report generation. |
 | **Enterprise BYOK (Tier 3)** | Cloud KMS Hardware Security Plug-in | ⏸️ **Deferred for Enterprise Mandates** | `security_crypto.py:CloudKmsKeyProvider` | Architectural abstraction complete. Deferred until a corporate client signs an enterprise cloud contract requiring dedicated Google Cloud KMS / AWS KMS provisioning ($5–$15/mo). |
-| **Mobile Experience** | **PWA Web App Shell & Standalone Manifest (Phase 9)** | 🚀 **Planned / Queued** | `manifest.json`, icon assets | Full-screen app shell with zero browser URL bar, home screen install on iOS Safari & Android Chrome. |
-| **Mobile Experience** | **Lock-Screen Web Push Dispatcher (Phase 9)** | 🚀 **Planned / Queued** | `sw.js`, `pywebpush`, `notification_service.py` | VAPID keypair generation, phone sound/vibration alerts, deep link direct navigation on notification click. |
+| **Mobile Experience** | **PWA Web App Shell & Standalone Manifest (Phase 9)** | ⏸️ **Prototype — On Hold (WIP branch)** | `manifest.json`, `index.html`, `MobileAlertModal.jsx` | Reusable as-is; ships together with the redesigned dispatch layer (§12.7). |
+| **Mobile Experience** | **Lock-Screen Web Push Dispatcher (Phase 9)** | ⏸️ **Prototype — On Hold (WIP branch)** | `sw.js`, `vapid_security.py`, `notification_service.py`, `pushNotificationService.js` | Missing deps, keys regenerate, sync sending, no logout teardown (§11.8 #1, #3, #6, #9). Rebuild per §12.7. |
+| **Dealer Experience** | **Bank Dealer Push Notification Enrollment (Phase 9.2)** | 🔴 **Blocked — Redesign Required** | `DealerPushNotificationBanner.jsx`, `QuotationBankOfferPage.js`, `/notifications/dealer-push-subscribe`, `notify_dealers_via_push` | Unauthenticated enrolment + global `bank_id` fan-out = cross-customer leak (§11.8 #4, #5). |
+| **Team Alerts** | **1-Click Smart Laptop Onboarding Banner (Phase 9.2)** | ⏸️ **Prototype — On Hold (WIP branch)** | `PushNotificationOnboardingBanner.jsx`, `AdminQuotationDashboard.js`, `QuotationRequestDashboard.js` | UI reusable; depends on §12.7. |
+| **Automated Notifications** | **Event-Driven Notification Policy Engine & Governance Console (Phase 10 Core)** | ⏸️ **Prototype — On Hold (WIP branch)** | `notification_event_engine.py`, `NotificationGovernance/`, `notification_event_rules` | Broken event contracts, double sends, scratch-script seeding (§11.8 #3, #7, #8). |
+| **LG Issuance** | **Public Form AI Document Verification Fix** | 🟡 **Fixed — Awaiting Release** | `PublicIssuanceForm.js`, `public_issuance.py`, `ai_integration.py` | Production bug. On `safe/2026-10-15-reviewed-fixes`. Needs manual UI test before merge. |
+| **Quoting Engine** | **History Self-Heal Winner Preservation** | 🟡 **Fixed — Awaiting Release** | `quotations_endpoints.py:get_rfq_history` | Production bug. On `safe/2026-10-15-reviewed-fixes`. |
+| **Approver Governance** | **Corporate Approval → Bank Approver Routing** | 🟡 **Fixed — Awaiting Release** | `corporate_admin.py`, `unified_email_builder.py` | On `safe/2026-10-15-reviewed-fixes`. |
+| **Dealer Experience** | **Desk Multi-Tab Resume & Spectator Dedupe** | 🟡 **Fixed — Awaiting Release** | `desk_session_service.py`, `bank_dealer_endpoints.py`, `QuotationBankOfferPage.js` | On `safe/2026-10-15-reviewed-fixes`. Backend + frontend ship together. |
+| **Quoting Engine** | **Passed-Legs Guard** | 🟡 **Fixed — Awaiting Release** | `public_quotations.py:submit_fx_offers_batch` | On `safe/2026-10-15-reviewed-fixes`. |
+| **LG Issuance** | **Issued LGs Custom Export** | 🟡 **Fixed — Awaiting Release** | `CustomExportModal.js`, `IssuedLGsPage.js`, `apiService.js` | On `safe/2026-10-15-reviewed-fixes`. |
 | **Automated Notifications** | **LG Expiry Cascade Background Scanner (Phase 10)** | 🚀 **Planned / Queued** | Periodic background scheduler, `notification_service.py` | Automated alerts at T-30, T-15, T-7, T-3, T-1, and T-0 days before guarantee expiration. |
 | **Automated Notifications** | **Approval SLA & Inactivity Escalation Nudge (Phase 10)** | 🚀 **Planned / Queued** | Background monitor, `notification_service.py` | 24-hour pending approval reminder to approvers; 48-hour escalation to Corporate Admin. |
 | **Automated Notifications** | **Quotation Dealer Offer & RFQ Countdown (Phase 10)** | 🚀 **Planned / Queued** | Quotation event triggers, `notification_service.py` | Real-time push on bank offer arrival; 15-minute warning before tender window expires. |
 | **Automated Notifications** | **Facility Limit 85%/95% Threshold Alert (Phase 10)** | 🚀 **Planned / Queued** | Issuance approval hook, `notification_service.py` | Automated warning when guarantee issuance pushes bank facility utilization over 85% or 95%. |
+| **Window Governance** | **Lead-Time Guardrail & 5-Min Push Protocol (Phase 11)** | 🚀 **Planned / Queued** | `CorporateAdminDashboard.js`, `quotations_endpoints.py:approve_rfq` | Enforces 3-min approval cutoff; prompts 5-minute dynamic window push calculated from confirmation timestamp. |
+| **Lifecycle Transparency** | **Granular Sub-Status Matrix (Phase 11)** | 🚀 **Planned / Queued** | `quotations_endpoints.py`, `deal_acceptance_service.py`, `ResultsView.js` | Disambiguates `TRADED`, `USER_DECLINED`, `AUTO_REJECT_TIMEOUT`, `NO_QUOTES`, `ADMIN_REJECTED`, and `APPROVAL_EXPIRED`. |
+| **Exposure Analytics** | **Retrospective Historical Position Classifier (Phase 11)** | 🚀 **Planned / Queued** | `quotations_endpoints.py:resolve_rfq_sub_status`, `QuotationHistoryDashboard.js` | Reconstructs true historical position for all past tenders using pre-existing DB columns without data loss. |
 
 ---
 
-## 14. Production Database Migration Ledger (Audit & Compliance Log)
+## 16. Production Database Migration Ledger (Audit & Compliance Log)
 
 This ledger tracks all production database schema states, DDL operations, and migration audits across the roadmap implementation:
 
 | Timestamp (UTC) | Phase | Target Table(s) | Column(s) / Constraints | Migration Type | Status & Operational Impact |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **2026-10-12** | **Phase 9 (Mobile PWA)** | `push_subscriptions` | `id`, `user_id` (FK), `endpoint` (Unique), `p256dh`, `auth`, `user_agent`, `device_type`, `is_active`, `created_at` | **New Table DDL** | 🚀 **Planned / Queued**<br>Stores user device WebPush endpoints and VAPID public encryption tokens. |
+| **2026-10-15** | **Release Candidate (`safe/2026-10-15-reviewed-fixes`)** | — | — | **No DDL Required** | 🟡 **Awaiting Release**<br>Reviewed fixes use only existing production columns. Open decision: make `ai_usage_logs.user_id` nullable to track public-form AI usage (currently skipped). |
+| **2026-10-14** | **Phase 10 (Event Rules Engine)** | `notification_event_rules` | `id`, `module`, `event_code` (Unique), `name`, `description`, `is_enabled`, `trigger_timing` (`INSTANT`, `BEFORE_ANCHOR`, `AFTER_ANCHOR`), `offset_minutes` (`INTEGER`), `anchor_field` (`VARCHAR`), `action_type`, `action_url_template`, `open_in_new_tab`, `expiry_mode`, `ttl_seconds`, `dismiss_on_events` (JSONB), `target_audience`, `target_audiences` (JSONB), `send_push`, `send_in_app`, `send_email`, `title_template`, `body_template`, `urgency` | **New Table DDL & Columns** | 🧪 **Local Dev DB Only — NOT in Production (WIP branch, On Hold)**<br>No production SQL recorded yet; rules seeded only by scratch script. Ship with §12.7. Originally: declarative event policy store for non-developer notification customization, relative scheduling offsets, multi-audience targeting, dynamic placeholder resolution, and remote anti-annoyance wipes. |
+| **2026-10-14** | **Phase 9.3 (System Owner Push Management)** | `system_notifications` | `send_push` (`BOOLEAN DEFAULT FALSE`), `push_title` (`VARCHAR(255)`), `push_body` (`TEXT`), `push_ttl_seconds` (`INTEGER DEFAULT 0`), `push_urgency` (`VARCHAR(50) DEFAULT 'standard'`), `target_bank_ids` (`JSONB`), `last_pushed_at` (`TIMESTAMPTZ`), `push_dispatched_count` (`INTEGER DEFAULT 0`) | **DDL Column Addition** | 🧪 **Local Dev DB Only — NOT in Production (WIP branch, On Hold)**<br>No `ALTER` in `main.py`, no production SQL yet. Originally: enables System Owner to broadcast lock-screen push alerts with configurable Auto-Expiry (TTL) and bank dealer targeting across devices. |
+| **2026-10-14** | **Phase 12 (Document Governance)** | `quotation_rfqs` | `document_path` JSON schema: `scope` (`ALL_PAIRS`, `SPECIFIC_LEG`, `INTERNAL_ONLY`), `release_timing` (`BIDDING`, `WINNER_ONLY`), `is_internal_only` (`BOOLEAN`) | **Non-Breaking Payload Extension** | 🚀 **Planned / Queued**<br>Backwards-compatible JSON payload extension within existing `document_path` text column. Zero DDL alterations / zero downtime. |
+| **2026-10-12** | **Phase 11 (Window Governance & Sub-Status)** | `quotation_rfqs` | `sub_status` (`VARCHAR(50) NULL`) | **Optional / Non-Breaking** | 🚀 **Planned / Queued**<br>Optional materialized column for `sub_status` indexing. Fully backfilled and resolved dynamically from pre-existing columns. Zero downtime. |
+| **2026-10-14** | **Phase 9.2 (Dealer & Laptop Push)** | `push_subscriptions` | `user_id` (`NULLABLE`), `dealer_id` (`INTEGER FK quotation_bank_dealers`), `dealer_email` (`VARCHAR(255)`), `bank_id` (`INTEGER FK banks`), indexes `ix_push_subscriptions_dealer_email`, `ix_push_subscriptions_dealer_id`, `ix_push_subscriptions_bank_id` | **DDL Alteration & Indexes** | 🧪 **Local Dev DB Only — NOT in Production (Blocked)**<br>Global `bank_id` targeting is the root of the cross-customer leak (§11.8 #4); schema to be redesigned per §12.7. Originally: extends hardware WebPush registry to institutional bank dealers and unregistered laptop/phone sessions. Enables instant lock-screen alerts for new quotation rounds. |
+| **2026-10-14** | **Phase 9 (Mobile PWA)** | `push_subscriptions` | `id`, `user_id` (FK), `endpoint` (Unique), `p256dh`, `auth`, `user_agent`, `device_type`, `is_active`, `created_at`, `last_notified_at` | **New Table DDL** | 🧪 **Local Dev DB Only — NOT in Production (WIP branch, On Hold)**<br>Stores physical device hardware WebPush endpoints and VAPID P-256 encryption keys. Verified on local PostgreSQL only. |
 | **2026-10-12** | **Phase 10 (Automated Engine)** | `user_notification_preferences` | `id`, `user_id` (FK Unique), `push_enabled`, `email_enabled`, `quiet_hours_start`, `quiet_hours_end`, `preferences_json` | **New Table DDL** | 🚀 **Planned / Queued**<br>Stores per-user notification channel preferences and quiet hours configuration. |
 | **2026-10-10** | **Phase 8 (Zero-Knowledge)** | `quotation_tenant_keys` | `id`, `customer_id` (FK Unique), `key_id` (Unique), `wrapped_dek`, `key_version`, `status`, `created_at`, `rotated_at` | **New Table DDL** | **Active & Verified ✅**<br>Stores AES-256-GCM wrapped Data Encryption Keys (DEKs) per Corporate Customer. Key isolation verified across tenants. |
 | **2026-10-10** | **Phase 8 (Zero-Knowledge)** | `quotation_offers` | `encrypted_price` (`VARCHAR(255)`), `encrypted_spread` (`VARCHAR(255)`), `encrypted_discount_rate` (`VARCHAR(255)`), `encrypted_max_amount` (`VARCHAR(255)`) | **DDL Column Addition** | **Active & Verified ✅**<br>Enables pure ciphertext storage for bids and spreads. Legacy `price` set to NULL on disk. |
@@ -1394,5 +1856,6 @@ This ledger tracks all production database schema states, DDL operations, and mi
 | **2026-10-04** | **Phase 7** | `dealer_feedbacks` | `id`, `rfq_id`, `assignment_id`, `rating`, `comment`, `created_at` | DDL Migration | Active ✅ |
 | **2026-10-03** | **Phase 2** | `quotation_access_otps` | `failed_attempts` (`INTEGER DEFAULT 0`), `hashed_otp` (`VARCHAR(64)`) | DDL Migration | Active ✅ |
 | **2026-10-02** | **Phase 6** | `quotation_bank_leg_configs` | Multi-leg tariff overrides (`cost_min`, `cost_percent`, `cost_max`, `cost_flat`, `value_date`, `quotation_base`, `allow_alternative_value_date`) | DDL Migration | Active ✅ |
+
 
 
