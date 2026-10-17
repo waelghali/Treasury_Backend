@@ -455,7 +455,7 @@ def restore_customer_entity(
                 CustomerEntity.id != entity_id
             ).count()
             if active_entities_count >= 1:
-                print(f"DEBUG: Not reactivating entity {db_entity.entity_name} during restore due to single-entity plan limit.")
+                logger.debug(f"Not reactivating entity ID {db_entity.id} during restore due to single-entity plan limit.")
                 restored_entity = crud_customer_entity.restore(db, db_entity, user_id=corporate_admin_context.user_id)
                 restored_entity.is_active = False
                 db.add(restored_entity)

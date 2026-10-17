@@ -880,14 +880,54 @@ async def extract_lg_copy(
     comparison["fields"].append(_name_compare("Beneficiary Name", request_beneficiary, extracted_beneficiary, beneficiary_threshold, "HIGH"))
 
     # Issuing Bank comparison
+    has_bank_mismatch = False
+    bank_mismatch_detail = None
     if verify_issuing_bank:
         request_bank = None
-        if lg.bank_id and lg.bank:
-            request_bank = lg.bank.name
-        elif lg.sub_limit and lg.sub_limit.facility and lg.sub_limit.facility.bank:
-            request_bank = lg.sub_limit.facility.bank.name
+        if lg.bank_id:
+            from app.models import Bank
+            b = db.query(Bank).get(lg.bank_id)
+            if b: request_bank = b.name
+        elif lg.facility_sub_limit_id:
+            from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
+            from app.models import Bank
+            sub = db.query(IssuanceFacilitySubLimit).get(lg.facility_sub_limit_id)
+            if sub:
+                fac = db.query(IssuanceFacility).get(sub.facility_id)
+                if fac and fac.bank_id:
+                    b = db.query(Bank).get(fac.bank_id)
+                    if b: request_bank = b.name
+        elif request_obj and request_obj.selected_sub_limit_id:
+            from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
+            from app.models import Bank
+            sub = db.query(IssuanceFacilitySubLimit).get(request_obj.selected_sub_limit_id)
+            if sub:
+                fac = db.query(IssuanceFacility).get(sub.facility_id)
+                if fac and fac.bank_id:
+                    b = db.query(Bank).get(fac.bank_id)
+                    if b: request_bank = b.name
+
         extracted_bank = extracted_data.get("issuingBankName", "")
-        comparison["fields"].append(_name_compare("Issuing Bank", request_bank, extracted_bank, 0.80, "HIGH"))
+        bank_comp = _name_compare("Issuing Bank", request_bank, extracted_bank, 0.80, "HIGH")
+        
+        # If there's an issuing bank mismatch, mark as internal routing discrepancy
+        if request_bank and extracted_bank and not bank_comp["match"]:
+            bank_comp["is_internal"] = True
+            bank_comp["internal_type"] = "BANK_MISMATCH"
+            bank_comp["note"] = "Internal Issue: Issuing bank differs from system record. The bank was changed without recording in the system, or an incorrect document was uploaded. Cannot be sent in a bank correction letter."
+            has_bank_mismatch = True
+            bank_mismatch_detail = {
+                "requested_bank": request_bank,
+                "extracted_bank": extracted_bank,
+            }
+            # Log audit trail for internal bank mismatch
+            from app.crud.base import log_action
+            log_action(
+                db, current_user.user_id, "ISSUANCE_BANK_MISMATCH_DETECTED", "IssuedLGRecord", lg.id,
+                {"requested_bank": request_bank, "extracted_bank": extracted_bank, "lg_ref": lg.lg_ref_number},
+                current_user.customer_id
+            )
+        comparison["fields"].append(bank_comp)
 
     # Issuer / Applicant comparison
     if verify_issuer_name:
@@ -916,6 +956,9 @@ async def extract_lg_copy(
         comparison["fields"].append(_compare("Operational Status", request_op_status, extracted_op_status, "HIGH"))
 
     comparison["has_discrepancy"] = any(not f["match"] for f in comparison["fields"])
+    comparison["has_bank_mismatch"] = has_bank_mismatch
+    comparison["bank_mismatch_detail"] = bank_mismatch_detail
+    comparison["has_bank_correctable_discrepancy"] = any(not f["match"] and not f.get("is_internal") for f in comparison["fields"])
 
     return {
         "extracted": {
@@ -952,7 +995,7 @@ async def generate_correction_letter(
 ):
     """
     Generate a formal correction request letter to the bank listing discrepancies
-    found during LG verification. Returns a downloadable PDF.
+    found during LG verification. Returns a downloadable PDF formatted to fit 1 page.
     """
     from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
     from app.models import User, Customer
@@ -969,9 +1012,25 @@ async def generate_correction_letter(
         raise HTTPException(404, "Issued LG record not found.")
 
     payload = await request.json()
-    discrepancies = payload.get("discrepancies", [])
-    if not discrepancies:
+    raw_discrepancies = payload.get("discrepancies", [])
+    if not raw_discrepancies:
         raise HTTPException(400, "No discrepancies provided.")
+
+    # Filter out internal company discrepancies (e.g. Bank Mismatch).
+    # Bank mismatches indicate an internal change of facility/bank or wrong document upload;
+    # they cannot be sent to an external bank as a correction request.
+    discrepancies = [
+        d for d in raw_discrepancies
+        if not d.get("is_internal")
+        and d.get("field") not in ("Issuing Bank", "issuing_bank")
+    ]
+    if not discrepancies:
+        raise HTTPException(
+            400,
+            "Cannot generate bank correction letter: The only detected discrepancy is an internal bank mismatch. "
+            "Bank mismatches are internal company routing issues and cannot be sent to the bank. "
+            "Please update the facility/bank in the system or re-upload the correct document."
+        )
 
     # Get context
     request_obj = db.query(IssuanceRequest).get(lg.request_id) if lg.request_id else None
@@ -986,120 +1045,251 @@ async def generate_correction_letter(
         if entity:
             entity_name = entity.entity_name
 
-    # Get bank name
-    bank_name = "The Bank"
-    if request_obj:
-        from sqlalchemy import text as sa_text
-        if hasattr(request_obj, 'selected_sub_limit_id') and request_obj.selected_sub_limit_id:
-            from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
-            sub = db.query(IssuanceFacilitySubLimit).get(request_obj.selected_sub_limit_id)
-            if sub:
-                fac = db.query(IssuanceFacility).get(sub.facility_id)
-                if fac and fac.bank_id:
-                    from app.models import Bank
-                    bank = db.query(Bank).get(fac.bank_id)
-                    if bank:
-                        bank_name = bank.name
+    # Resolve bank name robustly: payload override -> lg.bank_id -> lg.sub_limit -> request.sub_limit -> fallback
+    bank_name = payload.get("bank_name") or payload.get("issuing_bank_name")
+    if not bank_name and lg.bank_id:
+        from app.models import Bank
+        b = db.query(Bank).get(lg.bank_id)
+        if b: bank_name = b.name
+    if not bank_name and lg.facility_sub_limit_id:
+        from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
+        from app.models import Bank
+        sub = db.query(IssuanceFacilitySubLimit).get(lg.facility_sub_limit_id)
+        if sub:
+            fac = db.query(IssuanceFacility).get(sub.facility_id)
+            if fac and fac.bank_id:
+                b = db.query(Bank).get(fac.bank_id)
+                if b: bank_name = b.name
+    if not bank_name and request_obj and request_obj.selected_sub_limit_id:
+        from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
+        from app.models import Bank
+        sub = db.query(IssuanceFacilitySubLimit).get(request_obj.selected_sub_limit_id)
+        if sub:
+            fac = db.query(IssuanceFacility).get(sub.facility_id)
+            if fac and fac.bank_id:
+                b = db.query(Bank).get(fac.bank_id)
+                if b: bank_name = b.name
+    if not bank_name or bank_name.strip() in ("", "The Bank", "N/A"):
+        bank_name = "The Manager / Trade Finance Department"
+
+    # Resolve Bank LG Number (the identifier the bank actually recognizes)
+    bank_lg_num = payload.get("bank_lg_number") or lg.bank_lg_number
+    if bank_lg_num and str(bank_lg_num).strip() in ("N/A", "None", ""):
+        bank_lg_num = None
 
     today_str = date_type.today().strftime("%B %d, %Y")
 
-    # Build discrepancy rows
+    # Build discrepancy rows: NEVER show % match or internal confidence scores to the bank
     disc_rows = ""
     for d in discrepancies:
         severity_badge = "&#128308;" if d.get("severity") == "HIGH" else "&#128992;"
-        match_info = ""
-        if d.get("match_pct") is not None:
-            match_info = f' <span style="color:#888;font-size:11px;">({d["match_pct"]}% match)</span>'
+        req_val = str(d.get("requested", "N/A") or "N/A")
+        ext_val = str(d.get("extracted", d.get("bank_confirmed", "N/A")) or "N/A")
+        field_lbl = d.get("field", "")
+        # Format field name nicely if it was an internal slug
+        if field_lbl == "beneficiary_name": field_lbl = "Beneficiary Name"
+        elif field_lbl == "expiry_date": field_lbl = "Expiry Date"
+        elif field_lbl == "amount": field_lbl = "Amount"
+
         disc_rows += f"""
         <tr>
-            <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-weight:600;">{severity_badge} {d.get("field", "")}</td>
-            <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;color:#059669;">{d.get("requested", "N/A")}</td>
-            <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;color:#dc2626;">{d.get("extracted", "N/A")}{match_info}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:11px;color:#1e293b;">{severity_badge} {field_lbl}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;color:#047857;font-weight:500;font-size:11px;">{req_val}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;color:#b91c1c;font-weight:500;font-size:11px;">{ext_val}</td>
         </tr>"""
 
     user_fullname = (request_obj.requestor_name if request_obj and request_obj.requestor_name
                       else requesting_user.email if requesting_user
                       else "Authorized Signatory")
 
-    html = f"""
+    # Subject line references the Bank's LG number if available
+    if bank_lg_num:
+        subject_text = f"Request for Correction &mdash; Letter of Guarantee No. {bank_lg_num}"
+    else:
+        subject_text = f"Request for Correction of Letter of Guarantee (Our Ref: {lg.lg_ref_number or 'N/A'})"
+
+    # Premium, single-page executive letter template
+    html = f"""<!DOCTYPE html>
     <html>
     <head>
+        <meta charset="utf-8">
         <style>
-            @page {{ size: A4; margin: 2.5cm; }}
-            body {{ font-family: 'Segoe UI', Arial, sans-serif; color: #1e293b; line-height: 1.7; font-size: 13px; }}
-            .header {{ border-bottom: 3px solid #1e40af; padding-bottom: 15px; margin-bottom: 30px; }}
-            .header h1 {{ color: #1e40af; font-size: 18px; margin: 0; }}
-            .header p {{ color: #64748b; font-size: 12px; margin: 3px 0; }}
-            .meta-block {{ font-size: 12px; color: #475569; margin-bottom: 20px; }}
-            .meta-block strong {{ color: #1e293b; }}
-            h2 {{ color: #1e40af; font-size: 15px; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }}
-            table {{ width: 100%; border-collapse: collapse; margin: 15px 0; font-size: 12px; }}
-            th {{ background: #f1f5f9; padding: 10px 12px; text-align: left; font-weight: 700; color: #334155; border-bottom: 2px solid #cbd5e1; }}
-            .ref {{ background: #eff6ff; padding: 12px 16px; border-radius: 8px; border-left: 4px solid #3b82f6; margin: 20px 0; }}
-            .footer {{ margin-top: 50px; padding-top: 15px; border-top: 1px solid #e5e7eb; font-size: 11px; color: #94a3b8; }}
-            .signature {{ margin-top: 60px; }}
-            .signature .line {{ border-top: 1px solid #1e293b; width: 200px; margin-top: 40px; padding-top: 5px; }}
+            @page {{
+                size: A4 portrait;
+                margin: 12mm 16mm 12mm 16mm;
+            }}
+            * {{
+                box-sizing: border-box;
+            }}
+            body {{
+                font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+                color: #1e293b;
+                line-height: 1.42;
+                font-size: 11px;
+                margin: 0;
+                padding: 0;
+            }}
+            .letter-wrapper {{
+                width: 100%;
+                page-break-inside: avoid;
+            }}
+            .header {{
+                border-bottom: 2.5px solid #1e40af;
+                padding-bottom: 8px;
+                margin-bottom: 14px;
+            }}
+            .header h1 {{
+                color: #1e40af;
+                font-size: 16px;
+                margin: 0 0 2px 0;
+                font-weight: 700;
+                letter-spacing: -0.2px;
+            }}
+            .header p {{
+                color: #64748b;
+                font-size: 10.5px;
+                margin: 0;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }}
+            .meta-table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 12px;
+                font-size: 11px;
+            }}
+            .meta-table td {{
+                vertical-align: top;
+                padding: 0;
+            }}
+            .subject-banner {{
+                background: #eff6ff;
+                border-left: 3.5px solid #2563eb;
+                padding: 8px 12px;
+                border-radius: 4px;
+                margin: 10px 0 12px 0;
+                font-size: 11.5px;
+                font-weight: 600;
+                color: #1e3a8a;
+            }}
+            .body-text {{
+                margin: 6px 0;
+                color: #334155;
+                font-size: 11px;
+                text-align: justify;
+            }}
+            .disc-heading {{
+                color: #1e40af;
+                font-size: 11.5px;
+                font-weight: 700;
+                margin: 12px 0 6px 0;
+                text-transform: uppercase;
+                letter-spacing: 0.3px;
+            }}
+            .disc-table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 6px 0 12px 0;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 4px;
+            }}
+            .disc-table th {{
+                background: #f8fafc;
+                padding: 7px 10px;
+                text-align: left;
+                font-weight: 700;
+                color: #334155;
+                font-size: 10.5px;
+                border-bottom: 1.5px solid #cbd5e1;
+            }}
+            .signature {{
+                margin-top: 22px;
+                page-break-inside: avoid;
+            }}
+            .signature .line {{
+                border-top: 1px solid #334155;
+                width: 180px;
+                margin-top: 28px;
+                padding-top: 4px;
+            }}
+            .footer {{
+                margin-top: 16px;
+                padding-top: 8px;
+                border-top: 1px solid #e2e8f0;
+                font-size: 9.5px;
+                color: #94a3b8;
+                text-align: center;
+            }}
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>{entity_name}</h1>
-            <p>Letter of Guarantee &mdash; Correction Request</p>
-        </div>
-
-        <div class="meta-block">
-            <strong>To:</strong> {bank_name}<br>
-            <strong>Date:</strong> {today_str}<br>
-            <strong>LG Ref:</strong> {lg.lg_ref_number or "N/A"} &nbsp;|&nbsp;
-            <strong>Bank LG No:</strong> {lg.bank_lg_number or "N/A"} &nbsp;|&nbsp;
-            <strong>Request:</strong> {request_obj.serial_number if request_obj else "N/A"}
-        </div>
-
-        <div class="ref">
-            <strong>Subject:</strong> Request for Correction of Letter of Guarantee &mdash; {lg.lg_ref_number or "N/A"}
-        </div>
-
-        <p>Dear Sir/Madam,</p>
-        <p>
-            We refer to the above-mentioned Letter of Guarantee issued by your esteemed bank.
-            Upon reviewing the issued LG document, we have identified the following discrepancies
-            between our original request and the LG as issued:
-        </p>
-
-        <h2>Discrepancy Details</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Field</th>
-                    <th>As Requested</th>
-                    <th>As Issued</th>
-                </tr>
-            </thead>
-            <tbody>
-                {disc_rows}
-            </tbody>
-        </table>
-
-        <p>
-            We kindly request that you review the above discrepancies and issue a corrected
-            Letter of Guarantee at your earliest convenience to reflect the originally requested terms.
-        </p>
-        <p>
-            Please do not hesitate to contact us should you require any clarification or additional documentation.
-        </p>
-
-        <p>Thank you for your prompt attention to this matter.</p>
-
-        <div class="signature">
-            <p>Yours faithfully,</p>
-            <div class="line">
-                <strong>{user_fullname}</strong><br>
-                <span style="color:#64748b;font-size:12px;">{entity_name}</span>
+        <div class="letter-wrapper">
+            <div class="header">
+                <h1>{entity_name}</h1>
+                <p>Letter of Guarantee &mdash; Correction Request</p>
             </div>
-        </div>
 
-        <div class="footer">
-            Generated by Treasury Management System on {today_str}. Document reference: CORR-{lg.lg_ref_number or lg_id}
+            <table class="meta-table">
+                <tr>
+                    <td style="width: 58%;">
+                        <div style="font-size: 9.5px; text-transform: uppercase; color: #64748b; font-weight: 600; margin-bottom: 2px;">To:</div>
+                        <strong style="font-size: 12.5px; color: #0f172a;">{bank_name}</strong><br>
+                        <span style="color: #475569; font-size: 10.5px;">Trade Finance Operations / Guarantees Department</span>
+                    </td>
+                    <td style="width: 42%; text-align: right;">
+                        <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 600;">Date:</span> <strong>{today_str}</strong><br>
+                        {f'<span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 600;">Bank LG No:</span> <strong style="color: #0f172a;">{bank_lg_num}</strong><br>' if bank_lg_num else ''}
+                        <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 600;">Our Ref:</span> <span>{lg.lg_ref_number or "N/A"}</span>
+                    </td>
+                </tr>
+            </table>
+
+            <div class="subject-banner">
+                {subject_text}
+            </div>
+
+            <p class="body-text">Dear Sir / Madam,</p>
+            <p class="body-text">
+                We refer to the above-referenced Letter of Guarantee issued by your esteemed bank.
+                Upon reviewing the issued LG document against our submitted application, we have identified the following
+                discrepancies between the requested terms and the issued document:
+            </p>
+
+            <div class="disc-heading">Discrepancy Details</div>
+            <table class="disc-table">
+                <thead>
+                    <tr>
+                        <th style="width: 32%;">Field</th>
+                        <th style="width: 34%;">As Requested</th>
+                        <th style="width: 34%;">As Issued</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {disc_rows}
+                </tbody>
+            </table>
+
+            <p class="body-text">
+                We kindly request that you review the above discrepancies and issue an amended or corrected
+                Letter of Guarantee at your earliest convenience to reflect the originally agreed terms.
+            </p>
+            <p class="body-text">
+                Please do not hesitate to contact us should you require any clarification or additional documentation.
+                Thank you for your prompt attention to this matter.
+            </p>
+
+            <div class="signature">
+                <p style="margin: 0 0 2px 0;">Yours faithfully,</p>
+                <div class="line">
+                    <strong>{user_fullname}</strong><br>
+                    <span style="color:#64748b;font-size:10px;">{entity_name}</span>
+                </div>
+            </div>
+
+            <div class="footer">
+                Document Ref: CORR-{(bank_lg_num or lg.lg_ref_number or str(lg_id))} &bull; Generated via Treasury Management System on {today_str}
+            </div>
         </div>
     </body>
     </html>
@@ -1114,18 +1304,18 @@ async def generate_correction_letter(
         return StreamingResponse(
             io.BytesIO(html.encode("utf-8")),
             media_type="text/html",
-            headers={"Content-Disposition": f'inline; filename="correction_request_{lg.lg_ref_number or lg_id}.html"'}
+            headers={"Content-Disposition": f'inline; filename="correction_request_{bank_lg_num or lg.lg_ref_number or lg_id}.html"'}
         )
 
     # Log the action
     log_action(db, current_user.user_id, "ISSUANCE_CORRECTION_REQUESTED", "IssuedLGRecord", lg.id,
-               {"discrepancies": discrepancies, "bank": bank_name},
+               {"discrepancies": discrepancies, "bank": bank_name, "bank_lg_number": bank_lg_num},
                current_user.customer_id)
 
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="correction_request_{lg.lg_ref_number or lg_id}.pdf"'}
+        headers={"Content-Disposition": f'inline; filename="correction_request_{bank_lg_num or lg.lg_ref_number or lg_id}.pdf"'}
     )
 
 

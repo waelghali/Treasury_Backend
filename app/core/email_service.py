@@ -91,6 +91,35 @@ def get_global_email_settings() -> EmailSettings:
         reply_to=sender_email
     )
 
+def get_global_fallback_email_settings() -> Optional[EmailSettings]:
+    """
+    Retrieves the SECONDARY platform relay (e.g. Brevo) used when the primary global
+    relay (e.g. Resend) fails (quota exceeded, outage, auth error).
+    Returns None when not configured, in which case no secondary fallback is attempted.
+
+    Env vars:
+      EMAIL_SMTP_FALLBACK_HOST, EMAIL_SMTP_FALLBACK_PORT (default 587),
+      EMAIL_SMTP_FALLBACK_USERNAME, EMAIL_SMTP_FALLBACK_PASSWORD,
+      EMAIL_FALLBACK_SENDER_EMAIL (defaults to EMAIL_SENDER_EMAIL)
+    """
+    smtp_host = os.getenv("EMAIL_SMTP_FALLBACK_HOST")
+    smtp_username = os.getenv("EMAIL_SMTP_FALLBACK_USERNAME")
+    smtp_password = os.getenv("EMAIL_SMTP_FALLBACK_PASSWORD")
+    sender_email = os.getenv("EMAIL_FALLBACK_SENDER_EMAIL") or os.getenv("EMAIL_SENDER_EMAIL")
+
+    if not all([smtp_host, smtp_username, smtp_password, sender_email]):
+        return None
+
+    return EmailSettings(
+        smtp_host=smtp_host,
+        smtp_port=int(os.getenv("EMAIL_SMTP_FALLBACK_PORT", 587)),
+        smtp_username=smtp_username,
+        smtp_password=smtp_password,
+        sender_email=sender_email,
+        sender_display_name=os.getenv("GLOBAL_SENDER_DISPLAY_NAME", "Treasury Quotations"),
+        reply_to=sender_email
+    )
+
 def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSettings, str]:
     """
     Retrieves customer email settings with smart direct-customer delivery and automatic fallback:
@@ -184,13 +213,19 @@ async def send_email(
     sender_name: Optional[str] = None,
     attachments: Optional[List[EmailAttachment]] = None,
     reply_to: Optional[str] = None,
-    save_copy: bool = True
+    save_copy: bool = True,
+    allow_platform_fallback: bool = True
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using provided settings.
     Filters out dummy test domain addresses before sending.
     Encodes subject and headers with RFC 2047 UTF-8 compliance and sets Reply-To.
     When save_copy=False, Exchange EWS uses MessageDisposition="SendOnly" to avoid cluttering Sent Items.
+
+    Fallback chain on failure (when allow_platform_fallback=True):
+      provided settings -> global relay (Resend) -> secondary global relay (Brevo).
+    Set allow_platform_fallback=False for flows that must ONLY leave from the customer's
+    own mail server (e.g. Quotations to banks).
     """
     to_emails = process_recipients(to_emails)
     cc_emails = process_recipients(cc_emails or [])
@@ -344,58 +379,79 @@ async def send_email(
         else:
             _send_smtp()
 
+    import asyncio
+
     try:
-        import asyncio
         await asyncio.to_thread(_send_worker)
         logger.info(f"Email sent to {all_recipients} via {email_settings.smtp_host}:{email_settings.smtp_port}")
         return True, None
     except Exception as primary_err:
+        if not allow_platform_fallback:
+            logger.error(
+                f"SMTP ({email_settings.smtp_host}:{email_settings.smtp_port}) delivery failed: {primary_err}. "
+                f"Platform fallback is disabled for this message; not retrying via Grow relays."
+            )
+            return False, f"SMTP Error ({email_settings.smtp_host}): {primary_err}"
+
         logger.warning(
-            f"Custom SMTP ({email_settings.smtp_host}:{email_settings.smtp_port}) delivery failed: {primary_err}. "
-            f"Initiating automatic fallback to generic global email service..."
+            f"SMTP ({email_settings.smtp_host}:{email_settings.smtp_port}) delivery failed: {primary_err}. "
+            f"Initiating automatic fallback chain (global relay -> secondary relay)..."
         )
 
-        # --- AUTOMATIC FALLBACK TO GENERIC / GLOBAL EMAIL ---
-        try:
-            global_settings = get_global_email_settings()
-            if global_settings.smtp_host and (
-                global_settings.smtp_host != email_settings.smtp_host or
-                global_settings.smtp_username != email_settings.smtp_username
-            ):
-                def _send_global_fallback():
-                    # Update From header for global delivery, preserving customer identity in display name
+        # --- AUTOMATIC FALLBACK CHAIN: global relay (Resend) -> secondary relay (Brevo) ---
+        candidates: List[Tuple[str, EmailSettings]] = []
+        global_settings = get_global_email_settings()
+        if global_settings.smtp_host:
+            candidates.append(("global", global_settings))
+        secondary_settings = get_global_fallback_email_settings()
+        if secondary_settings:
+            candidates.append(("global_secondary", secondary_settings))
+
+        tried = {(email_settings.smtp_host or "").lower() + "|" + (email_settings.smtp_username or "").lower()}
+        errors = [f"{email_settings.smtp_host}: {primary_err}"]
+        original_sender = (email_settings.sender_email or "").lower()
+
+        for label, fb in candidates:
+            key = (fb.smtp_host or "").lower() + "|" + (fb.smtp_username or "").lower()
+            if key in tried:
+                continue
+            tried.add(key)
+
+            def _send_via_fallback(fb=fb):
+                # Only rewrite identity headers when the fallback sends from a different address
+                # (e.g. customer SMTP failed -> platform relay). Same-address fallback
+                # (Resend -> Brevo, both on the Grow domain) keeps the original headers intact.
+                if (fb.sender_email or "").lower() != original_sender:
                     from_name = f"{email_settings.sender_display_name or 'Corporate Treasury'} ({email_settings.sender_email})"
                     encoded_name = Header(from_name, 'utf-8').encode()
-                    from_header = f"{encoded_name} <{global_settings.sender_email}>"
                     if 'From' in msg:
                         del msg['From']
-                    msg['From'] = from_header
+                    msg['From'] = f"{encoded_name} <{fb.sender_email}>"
                     if 'Sender' in msg:
                         del msg['Sender']
-                    msg['Sender'] = global_settings.sender_email
+                    msg['Sender'] = fb.sender_email
                     if 'Reply-To' in msg:
                         del msg['Reply-To']
-                    msg['Reply-To'] = email_settings.sender_email
+                    msg['Reply-To'] = effective_reply_to or email_settings.sender_email
 
-                    if global_settings.smtp_port == 465:
-                        fb_server = smtplib.SMTP_SSL(global_settings.smtp_host, global_settings.smtp_port, timeout=8)
-                    else:
-                        fb_server = smtplib.SMTP(global_settings.smtp_host, global_settings.smtp_port, timeout=8)
-                        fb_server.starttls()
+                if int(fb.smtp_port) == 465:
+                    fb_server = smtplib.SMTP_SSL(fb.smtp_host, int(fb.smtp_port), timeout=8)
+                else:
+                    fb_server = smtplib.SMTP(fb.smtp_host, int(fb.smtp_port), timeout=8)
+                    fb_server.starttls()
+                fb_server.login(fb.smtp_username, fb.smtp_password)
+                fb_server.send_message(msg, from_addr=fb.sender_email, to_addrs=all_recipients)
+                fb_server.quit()
 
-                    fb_server.login(global_settings.smtp_username, global_settings.smtp_password)
-                    fb_server.send_message(msg, from_addr=global_settings.sender_email, to_addrs=all_recipients)
-                    fb_server.quit()
-
-                import asyncio
-                await asyncio.to_thread(_send_global_fallback)
-                logger.info(f"Email successfully delivered to {all_recipients} via generic global fallback ({global_settings.smtp_host})!")
+            try:
+                await asyncio.to_thread(_send_via_fallback)
+                logger.info(f"Email delivered to {all_recipients} via {label} fallback ({fb.smtp_host}).")
                 return True, None
-        except Exception as fb_err:
-            logger.error(f"Global email fallback also failed: {fb_err}")
-            return False, f"Custom SMTP failed: {primary_err} | Generic fallback failed: {fb_err}"
+            except Exception as fb_err:
+                logger.error(f"{label} fallback ({fb.smtp_host}) failed: {fb_err}")
+                errors.append(f"{fb.smtp_host}: {fb_err}")
 
-        return False, f"SMTP Error ({email_settings.smtp_host}): {primary_err}"
+        return False, "All email routes failed: " + " | ".join(errors)
 
 
 # --- Account Lockout Protection ---

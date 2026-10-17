@@ -1002,8 +1002,8 @@ class AuthService:
         )
 
         
-        # Optional: Print to console so you can test even if SMTP is not configured
-        print(f"DEBUG: MFA Code for {user.email} is {raw_code}")
+        # SECURITY: never log/print the raw MFA code or recipient - it would allow account takeover from logs.
+        logger.info(f"MFA code dispatched for user id={user.id}")
 
     def is_device_trusted(self, db: Session, user_id: int, device_id: str) -> bool:
         """Checks if the device_id is already marked as trusted for this user."""

@@ -213,7 +213,7 @@ class CRUDCustomer(CRUDBase):
                     for i, entity in enumerate(active_entities):
                         if i == 0: # Keep the first one active
                             continue
-                        logger.warning(f"Customer {db_obj.name} downgraded to single-entity plan. Deactivating excess entity: {entity.entity_name} (ID: {entity.id})")
+                        logger.warning(f"Customer {db_obj.id} downgraded to single-entity plan. Deactivating excess entity ID: {entity.id}")
                         self.crud_customer_entity_instance.soft_delete(db, entity, user_id)
                         db.flush()
 
@@ -255,13 +255,13 @@ class CRUDCustomer(CRUDBase):
             for entity in sorted(db_obj.entities, key=lambda e: e.created_at): # Restore by creation order
                 if entity.is_deleted:
                     if not restored_one_entity:
-                        logger.debug(f"DEBUG: Restoring single entity {entity.entity_name} for customer {db_obj.name}")
+                        logger.debug(f"Restoring single entity ID {entity.id} for customer {db_obj.id}")
                         self.crud_customer_entity_instance.restore(db, entity, user_id)
                         active_entities_count += 1
                         restored_one_entity = True
                         db.flush() # Flush to ensure it's counted
                     else:
-                        logger.debug(f"DEBUG: Not reactivating entity {entity.entity_name} as customer {db_obj.name} is on a single-entity plan.")
+                        logger.debug(f"Not reactivating entity ID {entity.id} as customer {db_obj.id} is on a single-entity plan.")
                         # Log that other entities were skipped from restoration due to plan limitations
                         log_action(db, user_id=user_id, action_type="ENTITY_RESTORE_SKIPPED", entity_type="CustomerEntity", entity_id=entity.id, details={"reason": "Customer on single-entity plan", "customer_name": db_obj.name, "entity_name": entity.entity_name}, customer_id=db_obj.id)
             if not restored_one_entity and db_obj.entities:
@@ -285,7 +285,7 @@ class CRUDCustomer(CRUDBase):
                     self.crud_user_instance.restore(db, user, user_id)
                     active_users_after_restore += 1
                 else:
-                    logger.warning(f"Skipping user restore for {user.email} (ID: {user.id}) due to subscription plan user limit for customer {db_obj.name}.")
+                    logger.warning(f"Skipping user restore for user ID {user.id} due to subscription plan user limit for customer {db_obj.id}.")
                     log_action(db, user_id=user_id, action_type="USER_RESTORE_SKIPPED", entity_type="User", entity_id=user.id, details={"reason": "Subscription plan user limit exceeded", "customer_name": db_obj.name, "user_email": user.email}, customer_id=db_obj.id)
         
         log_action(db, user_id=user_id, action_type=AUDIT_ACTION_TYPE_RESTORE, entity_type="Customer", entity_id=db_obj.id, details={"name": db_obj.name}, customer_id=db_obj.id)

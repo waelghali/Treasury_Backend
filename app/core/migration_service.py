@@ -83,7 +83,7 @@ def _apply_defaults_and_autofill(
     Applies defaults and attempts to autofill data for a single record.
     Returns the updated record_data dictionary.
     """
-    logger.debug(f"Autofill started for record: {record_data.get('lg_number', 'N/A')}")
+    logger.debug("Autofill started for record.")
     
     # --- Step 1: Autofill Internal Owner Contact (FIXED) ---
     existing_owner_id = record_data.get("internal_owner_contact_id")
@@ -552,16 +552,16 @@ class MigrationService:
                     uploaded_by_user_id=user_id
                 )
                 if doc_id:
-                    logger.info(f"Successfully attached document ID {doc_id} to {lg_number}")
+                    logger.info(f"Successfully attached document ID {doc_id} to LG id={new_lg_record.id}")
                     logger.info(f">>> UPLOAD SUCCESS. ID: {doc_id}")
                 else:
-                    logger.error(f"Failed to attach document to {lg_number}. _create_document_from_url returned None.")
-                    logger.error(f">>> UPLOAD RETURNED NONE for {lg_number}")
+                    logger.error(f"Failed to attach document to LG id={new_lg_record.id}. _create_document_from_url returned None.")
+                    logger.error(f">>> UPLOAD RETURNED NONE for LG id={new_lg_record.id}")
             except Exception as e:
-                logger.error(f"Exception during initial attachment upload for {lg_number}: {e}", exc_info=True)
-                logger.error(f">>> UPLOAD EXCEPTION for {lg_number}: {e}", exc_info=True)
+                logger.error(f"Exception during initial attachment upload for LG id={new_lg_record.id}: {e}", exc_info=True)
+                logger.error(f">>> UPLOAD EXCEPTION for LG id={new_lg_record.id}: {e}", exc_info=True)
         else:
-             logger.debug(f">>> NO URL FOUND IN RAW DATA for {lg_number}")
+             logger.debug(f">>> NO URL FOUND IN RAW DATA for LG id={new_lg_record.id}")
         
         db.refresh(new_lg_record)
         return new_lg_record
@@ -730,8 +730,8 @@ class MigrationService:
             return len(overlap) / max(len(s1), len(s2)) > 0.4
 
         for lg_num, group in grouped_records.items():
-            logger.debug(f"[AUDIT] Checking LG: {lg_num}")
             group.sort(key=lambda x: x.id)
+            logger.debug(f"[AUDIT] Checking LG group (first staged record id={group[0].id if group else 'N/A'})")
             first_rec = group[0]
             last_rec = group[-1]
             discrepancies = []
@@ -756,7 +756,7 @@ class MigrationService:
                 first_url = first_rec.file_name
 
             # DEBUG: Print what we found so you can see it in the console
-            logger.debug(f"Record {first_rec.id} | LG: {lg_num}")
+            logger.debug(f"Record {first_rec.id}")
             logger.debug(f"   -> JSON Keys Available: {list(json_data.keys())}")
             logger.debug(f"   -> Final Resolved Path: '{first_url}'")
 

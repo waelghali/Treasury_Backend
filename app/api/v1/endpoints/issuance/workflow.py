@@ -162,7 +162,7 @@ def get_my_pending_approvals(
             if ap.id not in existing_ids:
                 requests.append(ap)
 
-    print(f"[DEBUG APPROVAL] my-pending-approvals: user_id={current_user.user_id}, found {len(requests)} requests: {[(r.id, r.status, r.pending_approver_users) for r in requests]}")
+    logger.debug(f"my-pending-approvals: user_id={current_user.user_id}, found {len(requests)} requests: {[(r.id, r.status, r.pending_approver_users) for r in requests]}")
     
     return requests
 
@@ -235,7 +235,7 @@ async def submit_request_for_approval(
 
     result = issuance_service.submit_for_approval(db, request_id, current_user.user_id)
     
-    print(f"[DEBUG EMAIL] internal_submit: status={result.status}, approvers={result.pending_approver_users}")
+    logger.debug(f"internal_submit: status={result.status}, approvers={result.pending_approver_users}")
     
     # --- Notification (matching corporate_admin.py create_user pattern exactly) ---
     if result.status == "PENDING_APPROVAL" and result.pending_approver_users:
@@ -252,7 +252,7 @@ async def submit_request_for_approval(
         approver_emails = _get_user_emails(db, approver_ids)
         frontend_url = get_frontend_base_url(request)
         
-        print(f"[DEBUG EMAIL] internal_submit: approver_ids={approver_ids}, emails={approver_emails}, host={email_settings.smtp_host}")
+        logger.debug(f"internal_submit: approver_ids={approver_ids}, recipient_count={len(approver_emails)}, host={email_settings.smtp_host}")
         
         if approver_emails:
             submitter_email = submitter.email if submitter else result.requestor_email
@@ -289,7 +289,7 @@ async def submit_request_for_approval(
                 {},
                 email_settings,
             )
-            print(f"[DEBUG EMAIL] internal_submit: background_task added for {approver_emails}")
+            logger.debug(f"internal_submit: background_task added ({len(approver_emails)} recipients)")
     
     # --- In-App Notification (additive — does not replace email) ---
     if result.status == "PENDING_APPROVAL" and result.pending_approver_users:

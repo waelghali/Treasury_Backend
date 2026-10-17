@@ -1288,7 +1288,7 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
             reminder_days = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_FIRST_REMINDER_DAYS, 30)
             interval_cfg = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_REMINDER_INTERVAL, 7)
 
-            logger.info(f"[Customer: {customer.name}] Issuance expiry config: start={reminder_days}d, interval={interval_cfg}d")
+            logger.info(f"[Customer: {customer.id}] Issuance expiry config: start={reminder_days}d, interval={interval_cfg}d")
 
             eligible_lgs = db.query(IssuedLGRecord).filter(
                 IssuedLGRecord.customer_id == customer.id,
@@ -1302,7 +1302,7 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
                 selectinload(IssuedLGRecord.current_owner),
             ).all()
 
-            logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} active issued LGs.")
+            logger.info(f"[Customer: {customer.id}] Found {len(eligible_lgs)} active issued LGs.")
 
             start_dt = datetime.now() - timedelta(days=1)
             end_dt = datetime.now() + timedelta(days=30)
@@ -1553,7 +1553,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                         if already_sent:
                             continue
 
-                        logger.info(f" -> {entity_type} '{entity_name}' at {util_pct:.1f}% — alerting at {threshold}%")
+                        logger.info(f" -> {entity_type} id={entity_id} at {util_pct:.1f}% — alerting at {threshold}%")
 
                         start_dt = datetime.now() - timedelta(days=1)
                         end_dt = datetime.now() + timedelta(days=7)
@@ -1641,7 +1641,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                         msg = (f"{severity}: Facility '{facility.facility_name}' ({bank_name}) "
                                f"{date_label} is {days_text} ({date_val.strftime('%d %b %Y')}).")
 
-                        logger.info(f" -> Facility '{facility.facility_name}' {date_label} approaching: {days_until} days")
+                        logger.info(f" -> Facility id={facility.id} {date_label} approaching: {days_until} days")
 
                         start_dt = datetime.now() - timedelta(days=1)
                         end_dt = datetime.now() + timedelta(days=max(days_until, 1) + 1)

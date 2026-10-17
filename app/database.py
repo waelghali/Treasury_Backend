@@ -34,7 +34,10 @@ engine = create_engine(
     DATABASE_URL, 
     pool_pre_ping=True,
     # This now handles Decimals AND Dates for the audit log JSONB column
-    json_serializer=lambda obj: json.dumps(obj, default=sqlalchemy_json_serializer)
+    json_serializer=lambda obj: json.dumps(obj, default=sqlalchemy_json_serializer),
+    # PRIVACY: keep bound parameter values (LG numbers, amounts, emails...) out of
+    # exception messages and SQL logs. Set SQL_SHOW_PARAMS=true locally to debug.
+    hide_parameters=os.getenv("SQL_SHOW_PARAMS", "").lower() not in ("true", "1"),
 )
 
 # Create a SessionLocal class to get database sessions

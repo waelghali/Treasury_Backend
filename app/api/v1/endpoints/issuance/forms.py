@@ -1332,7 +1332,7 @@ async def auto_fill_bank_form(
         if not has_currency_field and _currency_code:
             # Prepend currency to amount: "EGP 250,000.00"
             request_data["amount"] = request_data.get("amount_with_currency") or f"{_currency_code} {float(request.amount):,.2f}"
-            _logger.info(f"No currency field in form → amount auto-set to '{request_data['amount']}'")
+            _logger.info("No currency field in form → amount auto-prefixed with currency code")
         # Harden amount_in_words — always include currency prefix + spelled-out currency name
         # e.g. "EGP 100,000.00 — One Hundred Thousand Egyptian Pounds Only"
         _amount_val = float(request.amount) if request.amount else 0
@@ -1341,7 +1341,7 @@ async def auto_fill_bank_form(
         request_data["amount_in_words"] = (
             f"{_currency_code} {_amount_val:,.2f} — {_words}" if _currency_code else _words
         )
-        _logger.info(f"amount_in_words set to: '{request_data['amount_in_words'][:80]}'")
+        _logger.info("amount_in_words generated")
         
         # --- Build filtering sets ---
         # Currency fields: ALWAYS auto-filled — never surface as missing or unmapped

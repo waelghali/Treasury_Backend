@@ -536,10 +536,17 @@ BASE_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "Output")
 OCR_INPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "OCR_Input_to_Gemini")
 GEMINI_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "Gemini")
 
+# PRIVACY: OCR text and Gemini JSON contain full LG details. Only dump them to disk for local
+# debugging. Off by default on Render/production; override with SAVE_AI_DEBUG_FILES=true|false.
+_is_production_env = (os.getenv("ENVIRONMENT", "").lower() == "production") or (os.getenv("RENDER") is not None)
+_save_ai_debug_env = os.getenv("SAVE_AI_DEBUG_FILES", "").lower()
+SAVE_AI_DEBUG_FILES = (_save_ai_debug_env in ("true", "1")) if _save_ai_debug_env else (not _is_production_env)
+
 # Ensure directories exist
-os.makedirs(OCR_INPUT_DIR, exist_ok=True)
-os.makedirs(GEMINI_OUTPUT_DIR, exist_ok=True)
-logger.info("Local AI output directories ensured (OCR_INPUT_DIR, GEMINI_OUTPUT_DIR)")
+if SAVE_AI_DEBUG_FILES:
+    os.makedirs(OCR_INPUT_DIR, exist_ok=True)
+    os.makedirs(GEMINI_OUTPUT_DIR, exist_ok=True)
+    logger.info("Local AI output directories ensured (OCR_INPUT_DIR, GEMINI_OUTPUT_DIR)")
 
 # --- GCS Operations ---
 async def _upload_to_gcs(bucket_name: str, blob_name: str, data: bytes, content_type: str) -> Optional[str]:
@@ -631,14 +638,14 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
         if full_text_annotation:
             text_content = full_text_annotation.text
             logger.info(f"OCR extracted {len(text_content)} characters from GCS source.")
-            logger.debug(text_content[:500] + "..." if len(text_content) > 500 else text_content)
             
-            sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
-            ocr_output_filename = os.path.join(OCR_INPUT_DIR, f"ocr_input_to_gemini_{sanitized_file_id}.txt")
-            
-            with open(ocr_output_filename, "w", encoding="utf-8") as f:
-                f.write(text_content)
-            logger.info(f"OCR input saved (file_id={sanitized_file_id})")
+            if SAVE_AI_DEBUG_FILES:
+                sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
+                ocr_output_filename = os.path.join(OCR_INPUT_DIR, f"ocr_input_to_gemini_{sanitized_file_id}.txt")
+                
+                with open(ocr_output_filename, "w", encoding="utf-8") as f:
+                    f.write(text_content)
+                logger.info(f"OCR input saved (file_id={sanitized_file_id})")
             logger.info(f"OCR Cost Metric: {len(text_content)} characters processed by Google Vision.")
             return text_content
         else:
@@ -1037,21 +1044,22 @@ Document Text:
         else:
             logger.warning("Gemini usage_metadata not available in response.")
 
-        sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
-        gemini_output_filename = os.path.join(GEMINI_OUTPUT_DIR, f"gemini_output_{sanitized_file_id}.json")
-        
-        with open(gemini_output_filename, "w", encoding="utf-8") as f:
-            f.write(extracted_data_str)
-        logger.info(f"Gemini output saved (file_id={sanitized_file_id})")
+        if SAVE_AI_DEBUG_FILES:
+            sanitized_file_id = re.sub(r'[\\/:*?"<>|]', '_', unique_file_id)
+            gemini_output_filename = os.path.join(GEMINI_OUTPUT_DIR, f"gemini_output_{sanitized_file_id}.json")
+            
+            with open(gemini_output_filename, "w", encoding="utf-8") as f:
+                f.write(extracted_data_str)
+            logger.info(f"Gemini output saved (file_id={sanitized_file_id})")
 
         extracted_data = json.loads(extracted_data_str)
         logger.info("Gemini AI extraction successful.")
         return extracted_data, usage_metadata
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error in Gemini response: {e}. Raw response: {extracted_data_str}", exc_info=True)
+        logger.error(f"JSON parsing error in Gemini response: {e}. Raw response length: {len(extracted_data_str or '')} chars", exc_info=True)
         return None, None
     except Exception as e:
-        logger.error(f"Error during Gemini AI extraction: {e}. Raw response: {extracted_data_str if 'extracted_data_str' in locals() else 'N/A'}", exc_info=True)
+        logger.error(f"Error during Gemini AI extraction: {e}. Raw response length: {len(extracted_data_str or '') if 'extracted_data_str' in locals() else 'N/A'}", exc_info=True)
         raise
 
 async def process_lg_document_with_ai(
@@ -1066,7 +1074,7 @@ async def process_lg_document_with_ai(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
 
     
-    logger.info(f"Starting AI processing for MIME type: {mime_type}, LG Hint: {lg_number_hint}")
+    logger.info(f"Starting AI processing for MIME type: {mime_type}, LG Hint provided: {bool(lg_number_hint)}")
     target_bucket_name = customer_bucket_name if customer_bucket_name else GCS_BUCKET_NAME
     
     if not target_bucket_name:
@@ -1169,7 +1177,7 @@ async def process_amendment_with_ai(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     
     lg_number_hint = lg_record_details.get("lgNumber", "unknown_amendment")
-    logger.info(f"Starting AI processing for LG amendment. LG Hint: {lg_number_hint}")
+    logger.info(f"Starting AI processing for LG amendment. LG Hint provided: {bool(lg_number_hint)}")
     target_bucket_name = customer_bucket_name if customer_bucket_name else GCS_BUCKET_NAME
     if not target_bucket_name:
         logger.error("No target bucket configured.")
@@ -2405,7 +2413,7 @@ If ALL fields are correctly placed: {{"corrections": [], "summary": "All fields 
         try:
             result = json.loads(clean_text)
         except json.JSONDecodeError as e:
-            logger.warning(f"Enhance: JSON parse failed: {e}. Response: {response_text[:500]}")
+            logger.warning(f"Enhance: JSON parse failed: {e}. Response length: {len(response_text or '')} chars")
             return current_mapping
     corrections = result.get("corrections", [])
     summary = result.get("summary", "")

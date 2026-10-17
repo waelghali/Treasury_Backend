@@ -153,7 +153,7 @@ class DeskSessionService:
                 to_remove = [k for k, s in desk.spectators.items() if (s.get("email") or "").strip().lower() == clean_email]
                 for k in to_remove:
                     desk.spectators.pop(k, None)
-                logger.info(f"Desk {assignment_id}: Active lock claimed by {clean_email} (session {session_token})")
+                logger.info(f"Desk {assignment_id}: Active lock claimed by {clean_email}")
                 return self._build_status(desk, clean_email, is_active=True, session_token=session_token)
 
             # Case 3: A different trader (different email) is currently active -> Caller is a spectator

@@ -365,7 +365,7 @@ class CRUDLGRecord(CRUDBase):
                 )
                 logger.info(f"Original LG Document saved: {db_original_lg_document.file_path}")
             except Exception as e:
-                logger.error(f"Failed to store original LG document for LG {db_lg_record.lg_number}: {e}", exc_info=True)
+                logger.error(f"Failed to store original LG document for LG id={db_lg_record.id}: {e}", exc_info=True)
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store original LG document: {e}")
 
         # Handle Internal Supporting Document if provided
@@ -389,7 +389,7 @@ class CRUDLGRecord(CRUDBase):
                 )
                 logger.info(f"Internal Supporting Document saved: {db_internal_supporting_document.file_path}")
             except Exception as e:
-                logger.error(f"Failed to store internal supporting document for LG {db_lg_record.lg_number}: {e}", exc_info=True)
+                logger.error(f"Failed to store internal supporting document for LG id={db_lg_record.id}: {e}", exc_info=True)
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store internal supporting document: {e}")
 
         customer = db.query(models.Customer).filter(models.Customer.id == customer_id).first()
@@ -585,7 +585,7 @@ class CRUDLGRecord(CRUDBase):
                 )
 
         except Exception as e:
-            logger.error(f"An error occurred while sending LG Recorded confirmation email for LG {getattr(db_lg_record, 'lg_number', 'N/A')}: {e}", exc_info=True)
+            logger.error(f"An error occurred while sending LG Recorded confirmation email for LG id={getattr(db_lg_record, 'id', 'N/A')}: {e}", exc_info=True)
             # NEVER rollback session here! The LG record was already successfully saved.
             # Email delivery failure should never delete or roll back the newly created LG record.
             try:
@@ -758,7 +758,7 @@ class CRUDLGRecord(CRUDBase):
 
         except Exception as e:
             db.rollback()
-            logger.exception(f"An unexpected error occurred during LG extension for LG {db_lg_record.lg_number}: {e}")
+            logger.exception(f"An unexpected error occurred during LG extension for LG id={db_lg_record.id}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG extension: {e}")
 
         customer_with_email_settings = db.query(models.Customer).options(selectinload(models.Customer.customer_email_settings)).filter(models.Customer.id == db_lg_record.customer_id).first()
@@ -1053,7 +1053,7 @@ class CRUDLGRecord(CRUDBase):
 
         except Exception as e:
             db.rollback()
-            logger.exception(f"An unexpected error occurred during LG release for LG {lg_record.lg_number}: {e}")
+            logger.exception(f"An unexpected error occurred during LG release for LG id={lg_record.id}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG release: {e}")
 
         if approval_request_id is None:
@@ -1342,7 +1342,7 @@ class CRUDLGRecord(CRUDBase):
 
         except Exception as e:
             db.rollback()
-            logger.exception(f"An unexpected error occurred during LG liquidation for LG {lg_record.lg_number}: {e}")
+            logger.exception(f"An unexpected error occurred during LG liquidation for LG id={lg_record.id}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG liquidation: {e}")
 
         log_action(
@@ -1570,7 +1570,7 @@ class CRUDLGRecord(CRUDBase):
 
             except Exception as e:
                 db.rollback()
-                logger.exception(f"An unexpected error occurred during LG amount decrease for LG {lg_record.lg_number}: {e}")
+                logger.exception(f"An unexpected error occurred during LG amount decrease for LG id={lg_record.id}: {e}")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG amount decrease: {e}")
             
             log_action(
@@ -1827,7 +1827,7 @@ class CRUDLGRecord(CRUDBase):
 
         except Exception as e:
             db.rollback()
-            logger.exception(f"An unexpected error occurred during LG activation for LG {db_lg_record.lg_number}: {e}")
+            logger.exception(f"An unexpected error occurred during LG activation for LG id={db_lg_record.id}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG activation: {e}")
 
         payment_details_for_log = payment_details.model_dump()
@@ -1946,7 +1946,7 @@ class CRUDLGRecord(CRUDBase):
         db.add(lg_record)
         db.flush()
 
-        logger.info(f"Auto-renewal for LG {lg_record.lg_number} toggled from {old_auto_renewal_status} to {new_auto_renewal_status}. No notification email sent as per requirement.")
+        logger.info(f"Auto-renewal for LG id={lg_record.id} toggled from {old_auto_renewal_status} to {new_auto_renewal_status}. No notification email sent as per requirement.")
 
         log_action(
             db, user_id, AUDIT_ACTION_TYPE_LG_AUTO_RENEWAL_TOGGLED, "LGRecord", lg_record.id,
@@ -2083,7 +2083,7 @@ class CRUDLGRecord(CRUDBase):
             updated_lg_record.lg_status_id = valid_status.id
             db.add(updated_lg_record)
             db.flush()
-            logger.info(f"LG {updated_lg_record.lg_number} status automatically updated from 'Expired' to 'Valid' due to expiry date amendment.")
+            logger.info(f"LG id={updated_lg_record.id} status automatically updated from 'Expired' to 'Valid' due to expiry date amendment.")
         # NEW LOGIC END
 
 
@@ -2586,11 +2586,11 @@ class CRUDLGRecord(CRUDBase):
                 all_generated_instruction_htmls.append(generated_html)
                 renewed_lg_count += 1
                 renewed_lg_numbers.append(updated_lg.lg_number)
-                logger.info(f"Successfully renewed LG {updated_lg.lg_number} (ID: {updated_lg.id}) to {updated_lg.expiry_date.date()}. Instruction ID: {instruction_id}.")
+                logger.info(f"Successfully renewed LG id={updated_lg.id} to {updated_lg.expiry_date.date()}. Instruction ID: {instruction_id}.")
             except HTTPException as e:
-                logger.error(f"Skipping LG {lg_num_label} due to error during extension: {e.detail}", exc_info=True)
+                logger.error(f"Skipping LG id={lg_id} due to error during extension: {e.detail}", exc_info=True)
             except Exception as e:
-                logger.error(f"Skipping LG {lg_num_label} due to unexpected error during extension: {e}", exc_info=True)
+                logger.error(f"Skipping LG id={lg_id} due to unexpected error during extension: {e}", exc_info=True)
 
         if not all_generated_instruction_htmls:
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs were successfully renewed for customer {customer_id}.")
@@ -2668,7 +2668,7 @@ class CRUDLGRecord(CRUDBase):
         """
         Helper function to send renewal reminder emails to relevant recipients.
         """
-        logger.info(f"Sending {reminder_type} renewal reminder for LG {lg_record.lg_number} (Type: {lg_type_context}).")
+        logger.info(f"Sending {reminder_type} renewal reminder for LG id={lg_record.id} (Type: {lg_type_context}).")
 
         email_settings_to_use, email_method_for_log = get_customer_email_settings(db, lg_record.customer_id)
 
@@ -2703,7 +2703,7 @@ class CRUDLGRecord(CRUDBase):
         cc_emails = list(set(cc_emails) - set(to_emails)) # Remove duplicates and emails already in 'to' list
 
         if not to_emails and not cc_emails:
-            logger.warning(f"No valid recipients found for LG {lg_record.lg_number} renewal reminder (type: {reminder_type}). Skipping email.")
+            logger.warning(f"No valid recipients found for LG id={lg_record.id} renewal reminder (type: {reminder_type}). Skipping email.")
             log_action(
                 db,
                 user_id=None,
@@ -2728,7 +2728,7 @@ class CRUDLGRecord(CRUDBase):
         ).order_by(models.Template.is_global.asc(), models.Template.is_default.desc()).first()  # Prefer customer-specific (is_global=False first), then global
 
         if not notification_template:
-            logger.error(f"Renewal reminder template '{template_name}' not found for customer {lg_record.customer.name} or globally. Cannot send renewal reminder for LG {lg_record.lg_number}.")
+            logger.error(f"Renewal reminder template '{template_name}' not found for customer id={lg_record.customer_id} or globally. Cannot send renewal reminder for LG id={lg_record.id}.")
             log_action(
                 db,
                 user_id=None,
@@ -2826,7 +2826,7 @@ class CRUDLGRecord(CRUDBase):
                 customer_id=lg_record.customer_id,
                 lg_record_id=lg_record.id,
             )
-            logger.info(f"{reminder_type.capitalize()} renewal reminder email sent successfully for LG {lg_record.lg_number}.")
+            logger.info(f"{reminder_type.capitalize()} renewal reminder email sent successfully for LG id={lg_record.id}.")
         else:
             log_action(
                 db,
@@ -2847,7 +2847,7 @@ class CRUDLGRecord(CRUDBase):
                 customer_id=lg_record.customer_id,
                 lg_record_id=lg_record.id,
             )
-            logger.error(f"Failed to send {reminder_type} renewal reminder email for LG {lg_record.lg_number}.")
+            logger.error(f"Failed to send {reminder_type} renewal reminder email for LG id={lg_record.id}.")
 
     async def run_renewal_reminders_to_users_and_admins(self, db: Session):
         """
@@ -2876,7 +2876,7 @@ class CRUDLGRecord(CRUDBase):
                 second_days_limit = first_days_limit // 2  # Urgent threshold is half the window
                 interval_days = int(next_reminder_config.get('effective_value', 7))
 
-                logger.info(f"[Customer: {customer.name}] Config: window={first_days_limit}d, urgent={second_days_limit}d, interval={interval_days}d")
+                logger.info(f"[Customer: {customer.id}] Config: window={first_days_limit}d, urgent={second_days_limit}d, interval={interval_days}d")
 
                 # 2. Get all VALID LGs with eager-loaded relationships
                 eligible_lgs = db.query(models.LGRecord).filter(
@@ -2893,7 +2893,7 @@ class CRUDLGRecord(CRUDBase):
                     selectinload(models.LGRecord.issuing_bank),
                 ).all()
 
-                logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} VALID LGs with future expiry.")
+                logger.info(f"[Customer: {customer.id}] Found {len(eligible_lgs)} VALID LGs with future expiry.")
 
                 due_lgs_for_digest = []
 
@@ -2973,7 +2973,7 @@ class CRUDLGRecord(CRUDBase):
 
             except Exception as e:
                 db.rollback()
-                logger.error(f"Error in Feature 1 for customer {customer.id} ({customer.name}): {e}", exc_info=True)
+                logger.error(f"Error in Feature 1 for customer {customer.id}: {e}", exc_info=True)
             finally:
                 db.commit()
 
@@ -2992,7 +2992,7 @@ class CRUDLGRecord(CRUDBase):
         if not due_lgs_info:
             return
 
-        logger.info(f"Preparing Feature 1 consolidated digest for Customer {customer.name} with {len(due_lgs_info)} LGs.")
+        logger.info(f"Preparing Feature 1 consolidated digest for Customer {customer.id} with {len(due_lgs_info)} LGs.")
 
         to_emails = []
         cc_emails = []
@@ -3029,7 +3029,7 @@ class CRUDLGRecord(CRUDBase):
         cc_emails = list(set(cc_emails) - set(to_emails))
 
         if not to_emails and not cc_emails:
-            logger.warning(f"No valid recipients found for Customer {customer.name} renewal digest. Skipping.")
+            logger.warning(f"No valid recipients found for Customer {customer.id} renewal digest. Skipping.")
             return
 
         items_for_html = []
@@ -3123,9 +3123,9 @@ class CRUDLGRecord(CRUDBase):
                 },
                 customer_id=customer.id,
             )
-            logger.info(f"Consolidated Feature 1 renewal digest sent successfully for Customer {customer.name} ({len(due_lgs_info)} LGs).")
+            logger.info(f"Consolidated Feature 1 renewal digest sent successfully for Customer {customer.id} ({len(due_lgs_info)} LGs).")
         else:
-            logger.error(f"Failed to send Feature 1 renewal digest email for Customer {customer.name}: {error_reason}")
+            logger.error(f"Failed to send Feature 1 renewal digest email for Customer {customer.id}: {error_reason}")
 
     async def run_internal_owner_renewal_reminders(self, db: Session):
         """
@@ -3156,7 +3156,7 @@ class CRUDLGRecord(CRUDBase):
                 
                 lookahead_date = current_date_only + timedelta(days=initial_days)
 
-                logger.info(f"[Customer: {customer.name}] Config: Start reminders {initial_days} days before. Lookahead until: {lookahead_date}")
+                logger.info(f"[Customer: {customer.id}] Config: Start reminders {initial_days} days before. Lookahead until: {lookahead_date}")
 
                 # 2. Query Eligible LGs
                 query = db.query(models.LGRecord).filter(
@@ -3177,7 +3177,7 @@ class CRUDLGRecord(CRUDBase):
                     selectinload(models.LGRecord.instructions)
                 ).all()
 
-                logger.info(f"[Customer: {customer.name}] Found {len(eligible_lgs)} LGs in the date window.")
+                logger.info(f"[Customer: {customer.id}] Found {len(eligible_lgs)} LGs in the date window.")
 
                 # Group LGs by internal_owner_contact_id
                 owner_groups: Dict[Optional[int], List[models.LGRecord]] = {}
@@ -3205,7 +3205,7 @@ class CRUDLGRecord(CRUDBase):
                         ).order_by(models.AuditLog.timestamp.desc()).first()
 
                         if relevant_action:
-                            logger.info(f" -> LG {lg.lg_number}: SKIPPED. Action '{relevant_action.action_type}' already exists.")
+                            logger.info(f" -> LG id={lg.id}: SKIPPED. Action '{relevant_action.action_type}' already exists.")
                             continue
 
                         # 4. Check Last Sent Reminder
@@ -3219,20 +3219,20 @@ class CRUDLGRecord(CRUDBase):
 
                         should_send = False
                         if not last_reminder:
-                            logger.info(f" -> LG {lg.lg_number}: Initial reminder due ({days_until_expiry} days left).")
+                            logger.info(f" -> LG id={lg.id}: Initial reminder due ({days_until_expiry} days left).")
                             should_send = True
                         else:
                             last_rem_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
                             days_since_last = (current_date_only - last_rem_date).days
                             
                             if is_critical_daily and last_rem_date < current_date_only:
-                                logger.info(f" -> LG {lg.lg_number}: Critical daily reminder due ({days_until_expiry} days left <= 3d).")
+                                logger.info(f" -> LG id={lg.id}: Critical daily reminder due ({days_until_expiry} days left <= 3d).")
                                 should_send = True
                             elif days_since_last >= interval_days:
-                                logger.info(f" -> LG {lg.lg_number}: Follow-up due. Last sent {days_since_last} days ago.")
+                                logger.info(f" -> LG id={lg.id}: Follow-up due. Last sent {days_since_last} days ago.")
                                 should_send = True
                             else:
-                                logger.info(f" -> LG {lg.lg_number}: SKIPPED. Last reminder was only {days_since_last} days ago (Interval: {interval_days}).")
+                                logger.info(f" -> LG id={lg.id}: SKIPPED. Last reminder was only {days_since_last} days ago (Interval: {interval_days}).")
 
                         if should_send:
                             owner_due_lgs.append({
@@ -3272,7 +3272,7 @@ class CRUDLGRecord(CRUDBase):
 
         owner_name = internal_owner.email if (internal_owner and getattr(internal_owner, 'email', None)) else "Internal Owner"
 
-        logger.info(f"Preparing Feature 2 consolidated digest for Internal Owner '{owner_name}' ({customer.name}) with {len(owner_due_lgs)} LGs.")
+        logger.info(f"Preparing Feature 2 consolidated digest for Internal Owner id={internal_owner.id if internal_owner else 'N/A'} (customer {customer.id}) with {len(owner_due_lgs)} LGs.")
 
         email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer.id)
 
@@ -3319,7 +3319,7 @@ class CRUDLGRecord(CRUDBase):
         cc_emails = list(set(cc_emails) - set(to_emails))
 
         if not to_emails and not cc_emails:
-            logger.warning(f"No valid recipients found for Internal Owner '{owner_name}' renewal digest. Skipping email.")
+            logger.warning(f"No valid recipients found for Internal Owner id={internal_owner.id if internal_owner else 'N/A'} renewal digest. Skipping email.")
             return
 
         items_for_html = []
@@ -3404,9 +3404,9 @@ class CRUDLGRecord(CRUDBase):
                 },
                 customer_id=customer.id,
             )
-            logger.info(f"Consolidated Feature 2 renewal digest sent successfully for Internal Owner '{owner_name}' ({len(owner_due_lgs)} LGs).")
+            logger.info(f"Consolidated Feature 2 renewal digest sent successfully for Internal Owner id={internal_owner.id if internal_owner else 'N/A'} ({len(owner_due_lgs)} LGs).")
         else:
-            logger.error(f"Failed to send Feature 2 renewal digest email for Internal Owner '{owner_name}': {error_reason}")
+            logger.error(f"Failed to send Feature 2 renewal digest email for Internal Owner id={internal_owner.id if internal_owner else 'N/A'}: {error_reason}")
 
     async def _send_internal_owner_renewal_reminder_email(self,
                                                            db: Session,
@@ -3417,7 +3417,7 @@ class CRUDLGRecord(CRUDBase):
         """
         Helper function to send internal owner renewal reminder emails.
         """
-        logger.info(f"Sending internal owner renewal reminder for LG {lg_record.lg_number}.")
+        logger.info(f"Sending internal owner renewal reminder for LG id={lg_record.id}.")
 
         email_settings_to_use, email_method_for_log = get_customer_email_settings(db, lg_record.customer_id)
 
@@ -3468,7 +3468,7 @@ class CRUDLGRecord(CRUDBase):
         cc_emails = list(set(cc_emails) - set(to_emails)) # Remove duplicates and emails already in 'to' list
 
         if not to_emails and not cc_emails:
-            logger.warning(f"No valid recipients found for LG {lg_record.lg_number} internal owner renewal reminder. Skipping email.")
+            logger.warning(f"No valid recipients found for LG id={lg_record.id} internal owner renewal reminder. Skipping email.")
             log_action(
                 db,
                 user_id=None,
@@ -3492,7 +3492,7 @@ class CRUDLGRecord(CRUDBase):
         ).order_by(models.Template.is_global.desc(), models.Template.is_default.desc()).first()
 
         if not notification_template:
-            logger.error(f"Internal owner renewal reminder template '{template_name}' not found for customer {lg_record.customer.name} or globally. Cannot send reminder for LG {lg_record.lg_number}.")
+            logger.error(f"Internal owner renewal reminder template '{template_name}' not found for customer id={lg_record.customer_id} or globally. Cannot send reminder for LG id={lg_record.id}.")
             log_action(
                 db,
                 user_id=None,
@@ -3584,7 +3584,7 @@ class CRUDLGRecord(CRUDBase):
                 customer_id=lg_record.customer_id,
                 lg_record_id=lg_record.id,
             )
-            logger.info(f"Internal owner renewal reminder email sent successfully for LG {lg_record.lg_number}.")
+            logger.info(f"Internal owner renewal reminder email sent successfully for LG id={lg_record.id}.")
         else:
             log_action(
                 db,
@@ -3604,7 +3604,7 @@ class CRUDLGRecord(CRUDBase):
                 customer_id=lg_record.customer_id,
                 lg_record_id=lg_record.id,
             )
-            logger.error(f"Failed to send internal owner renewal reminder email for LG {lg_record.lg_number}.")
+            logger.error(f"Failed to send internal owner renewal reminder email for LG id={lg_record.id}.")
 
 
     async def create_from_migration(
@@ -3711,7 +3711,7 @@ class CRUDLGRecord(CRUDBase):
         Determines the correct recipient name and address based on the LG's type and advising status.
         """
         # Debug print to confirm incoming data. This line can be removed once the issue is fixed.
-        print(f"DEBUG: LG {lg_record.lg_number} - Advising Status: '{lg_record.advising_status}', Communication Bank ID: {lg_record.communication_bank_id}")
+        logger.debug(f"LG id={lg_record.id} - Advising Status: '{lg_record.advising_status}', Communication Bank ID: {lg_record.communication_bank_id}")
 
         # Case 1: Local Guarantee (issuing_bank is NOT "Foreign Bank")
         # This check is now robust and case-insensitive.
@@ -3732,15 +3732,15 @@ class CRUDLGRecord(CRUDBase):
                         return recipient_name, recipient_address
                     else:
                         # Fallback if the communication bank record is missing.
-                        logger.error(f"LG {lg_record.lg_number} has advising status '{lg_record.advising_status}' but communication_bank_id {lg_record.communication_bank_id} does not match any bank record. Falling back to foreign bank details.")
+                        logger.error(f"LG id={lg_record.id} has advising status '{lg_record.advising_status}' but communication_bank_id {lg_record.communication_bank_id} does not match any bank record. Falling back to foreign bank details.")
                         return lg_record.foreign_bank_name, lg_record.foreign_bank_address
                 except Exception as e:
                     # Handle potential database errors during the query.
-                    logger.error(f"Error fetching communication bank for LG {lg_record.lg_number}: {e}. Falling back.")
+                    logger.error(f"Error fetching communication bank for LG id={lg_record.id}: {e}. Falling back.")
                     return lg_record.foreign_bank_name, lg_record.foreign_bank_address
             else:
                 # Fallback if communication bank ID is missing.
-                logger.error(f"LG {lg_record.lg_number} has advising status '{lg_record.advising_status}' but no communication_bank_id defined. Falling back to foreign bank details.")
+                logger.error(f"LG id={lg_record.id} has advising status '{lg_record.advising_status}' but no communication_bank_id defined. Falling back to foreign bank details.")
                 return lg_record.foreign_bank_name, lg_record.foreign_bank_address
 
         # Sub-case 2.2: Unadvised or Unconfirmed Counter Guarantee

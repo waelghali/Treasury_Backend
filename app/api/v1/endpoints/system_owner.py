@@ -1034,7 +1034,7 @@ def update_customer(
                             "reason": "Plan change to single-entity limited support"
                         }
                     )
-                print(f"DEBUG: Customer {db_customer.name} entities deactivated due to plan change.")
+                logger.debug(f"Customer {db_customer.id} entities deactivated due to plan change.")
                 log_action(
                     db,
                     user_id=current_user.user_id,
@@ -1127,7 +1127,7 @@ def restore_customer(
                     CustomerEntity.is_active == True
                 ).count()
                 if active_entities_count >= 1:
-                    print(f"DEBUG: Not reactivating entity {entity.entity_name} during restore due to single-entity plan limit.")
+                    logger.debug(f"Not reactivating entity ID {entity.id} during restore due to single-entity plan limit.")
                     restored_entity = crud_customer_entity.restore(db, entity, user_id=current_user.user_id)
                     restored_entity.is_active = False
                     db.add(restored_entity)
@@ -1373,7 +1373,7 @@ def restore_customer_entity(
             CustomerEntity.is_active == True
         ).count()
         if active_entities_count >= 1:
-            print(f"DEBUG: Not reactivating entity {db_entity.entity_name} during restore due to single-entity plan limit.")
+            logger.debug(f"Not reactivating entity ID {db_entity.id} during restore due to single-entity plan limit.")
             restored_entity = crud_customer_entity.restore(db, db_entity, user_id=current_user.user_id)
             restored_entity.is_active = False
             db.add(restored_entity)

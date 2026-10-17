@@ -271,8 +271,8 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     Applies defaults and attempts to autofill data for a single record.
     Returns the updated record_data dictionary.
     """
-    logger.debug(f"Autofill started for record: {record_data.get('lg_number', 'N/A')}")
-    logger.debug(f"Initial record data: {record_data}")
+    logger.debug("Autofill started for record.")
+    logger.debug(f"Initial record fields: {list(record_data.keys())}")
     # --- Step 1: Autofill Internal Owner Contact (FINAL) ---
     existing_owner_id = record_data.get("internal_owner_contact_id")
     email_input = record_data.get("internal_owner_email")
@@ -341,9 +341,9 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
         entity = crud_customer_entity.get_by_name_for_customer(db, customer_id, beneficiary_name)
         if entity:
             record_data["beneficiary_corporate_id"] = entity.id
-            logger.debug(f"Autofilled beneficiary_corporate_id from name '{beneficiary_name}' to: {entity.id}")
+            logger.debug(f"Autofilled beneficiary_corporate_id from name to: {entity.id}")
         else:
-            logger.warning(f"Could not find a matching ID for beneficiary_corporate_id with value: '{beneficiary_name}'")
+            logger.warning("Could not find a matching ID for the provided beneficiary_corporate name.")
 
     # NEW: Consolidated LG Category Autofill Logic (Unified)
     lg_category_input = record_data.get("lg_category_id")
@@ -434,7 +434,7 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     
     record_data["auto_renewal"] = record_data.get("auto_renewal", True)
     
-    logger.debug(f"Autofill process complete. Final data: {record_data}")
+    logger.debug(f"Autofill process complete. Final fields: {list(record_data.keys())}")
     return record_data
 
 
@@ -757,7 +757,7 @@ async def preview_historical_reconstruction(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
 ):
-    logger.info(f"Historical preview requested for customer {current_user.customer_id} for LG: {lg_number or 'all eligible'}")
+    logger.info(f"Historical preview requested for customer {current_user.customer_id} for LG: {'specific LG' if lg_number else 'all eligible'}")
     try:
         preview_data = await migration_history_service.preview_history(db, current_user.customer_id, lg_number)
         return preview_data
@@ -811,7 +811,7 @@ async def import_historical_records(
                 
                 existing_lg_in_prod = crud_lg_record.get_by_lg_number(db, lg_num)
                 if existing_lg_in_prod:
-                    logger.warning(f"LG number '{lg_num}' already exists in production. Skipping import.")
+                    logger.warning(f"LG already exists in production (LG id={existing_lg_in_prod.id}). Skipping import.")
                     for snap in snapshots:
                         snap.record_status = MigrationRecordStatusEnum.ERROR
                         snap.validation_log = snap.validation_log or {}
@@ -894,7 +894,7 @@ async def import_historical_records(
                     if attachment_url:
                         # Clean the URL
                         clean_url = str(attachment_url).strip().strip("'").strip('"')
-                        logger.info(f"Uploading initial document for LG {lg_num} from {clean_url}")
+                        logger.info(f"Uploading initial document for LG id={new_lg.id} from {clean_url}")
                         
                         try:
                             from app.constants import DOCUMENT_TYPE_ORIGINAL_LG
@@ -908,7 +908,7 @@ async def import_historical_records(
                                 uploaded_by_user_id=current_user.user_id
                             )
                         except Exception as e:
-                            logger.error(f"Failed to upload initial document for {lg_num}: {e}")
+                            logger.error(f"Failed to upload initial document for LG id={new_lg.id}: {e}")
                 # ------------------------------------------------------------------
 
                 if len(sorted_snapshots) > 1:
@@ -947,7 +947,7 @@ async def import_historical_records(
                     # If the last snapshot has an amount, force the master record to match it
                     if final_amount is not None:
                         new_lg.lg_amount = final_amount
-                        logger.info(f"Refreshed amount for LG {lg_num} to {final_amount}")
+                        logger.info(f"Refreshed amount for LG id={new_lg.id} to {final_amount}")
 
                 db.add(new_lg)
                 db.flush()
@@ -960,7 +960,7 @@ async def import_historical_records(
             
             except Exception as e:
                 nested_session.rollback()
-                logger.error(f"Failed to import LG '{lg_num}' during historical import: {e}", exc_info=True)
+                logger.error(f"Failed to import LG group (staged record ids={[s.id for s in snapshots]}) during historical import: {e}", exc_info=True)
                 for snap in snapshots:
                     snap.record_status = MigrationRecordStatusEnum.ERROR
                     snap.validation_log = snap.validation_log or {}
@@ -1070,7 +1070,7 @@ async def import_ready_records(
         
         # Check against the set of newly imported LG numbers in this batch
         if lg_number and lg_number in newly_imported_lg_numbers:
-            logger.warning(f"LG number '{lg_number}' is a duplicate within the same batch. Skipping staged record {record.id}.")
+            logger.warning(f"LG number is a duplicate within the same batch. Skipping staged record {record.id}.")
             record.record_status = MigrationRecordStatusEnum.DUPLICATE
             record.validation_log = record.validation_log or {}
             record.validation_log['import_error'] = 'Duplicate found within the same import batch.'
@@ -1101,7 +1101,7 @@ async def import_ready_records(
                     newly_imported_lg_numbers.add(lg_number)
 
                     imported_count += 1
-                    logger.info(f"Successfully imported LG {new_lg_record.lg_number} (ID: {new_lg_record.id}) from staged record {record.id}.")
+                    logger.info(f"Successfully imported LG id={new_lg_record.id} from staged record {record.id}.")
                     
                 elif record.migration_type == MigrationTypeEnum.INSTRUCTION:
                     new_instruction = await migration_service.migrate_instruction(
@@ -1261,7 +1261,7 @@ async def update_staged_record(
     """
     Updates a specific staged record for the current customer with complete record data and re-validates it.
     """
-    logger.info(f"Update staged record {record_id} endpoint hit for customer {current_user.customer_id} with complete data: {complete_record_data}")
+    logger.info(f"Update staged record {record_id} endpoint hit for customer {current_user.customer_id}.")
     record = crud_lg_migration.update_and_revalidate_staging_record(
         db=db,
         record_id=record_id,

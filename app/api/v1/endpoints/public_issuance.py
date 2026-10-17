@@ -24,6 +24,7 @@ from app.models import Customer, ExternalOTP, CustomerEntity, Currency, LgType, 
 from app.models.models_issuance import CustomerFormConfiguration
 from app.crud.crud import log_action, crud_customer_configuration
 from app.constants import GlobalConfigKey
+from app.core.security import get_current_active_user, TokenData
 
 router = APIRouter()
 
@@ -95,7 +96,7 @@ def verify_portal_token(token: str) -> dict:
     except HTTPException:
         raise  # Re-raise our own 403 errors
     except Exception as e:
-        print(f"Token Decryption Error: {str(e)}")
+        logger.warning(f"Token Decryption Error: {type(e).__name__}")
         raise HTTPException(status_code=403, detail="Invalid session token.")
 
 # --- ENDPOINTS ---
@@ -170,7 +171,7 @@ def public_verify_domain(
         email_settings=email_settings,
         save_copy=False
     )
-    print(f"[DEBUG EMAIL] verify-domain: OTP email queued for {email}")
+    logger.debug("verify-domain: OTP email queued")
     
     log_action(db, None, "EXTERNAL_OTP_SENT", "OTP", None, {"email": email}, customer.id)
     return {"message": "Verification code sent."}
@@ -253,21 +254,46 @@ def generate_invite_link(
     payload: InviteRequest,
     background_tasks: BackgroundTasks,
     request: Request = None,
+    current_user: TokenData = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    email = payload.email
+    """Generates an invitation link bound strictly to the authenticated admin's organization."""
+    if current_user.role not in ("corporate_admin", "super_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Corporate Administrators can generate issuance invitation links."
+        )
+
+    if not current_user.customer_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User must belong to a customer organization to generate invite links."
+        )
+
+    email = (payload.email or "").strip().lower()
     department = payload.department or "General"
     
+    if "@" not in email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid email format.")
+
     full_domain = email.split("@")[-1]
-    from sqlalchemy import cast
-    from sqlalchemy.dialects.postgresql import JSONB
+
+    # 1. Fetch the admin's own customer record
     customer = db.query(Customer).filter(
-        cast(Customer.domains, JSONB).contains([full_domain]),
+        Customer.id == current_user.customer_id,
         Customer.is_deleted == False
     ).first()
     
     if not customer:
-        raise HTTPException(status_code=404, detail="Customer domain not found")
+        raise HTTPException(status_code=404, detail="Customer organization not found.")
+
+    # 2. Enforce domain whitelisting: invited email MUST belong to the admin's organization domains
+    allowed_domains = [d.lower() for d in (customer.domains or [])]
+    if full_domain not in allowed_domains:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Email domain '@{full_domain}' is not authorized for your organization ({customer.name}). Allowed domains: {', '.join(allowed_domains) if allowed_domains else 'None'}"
+        )
 
     # Configurable invite link expiry (default 168 hours = 7 days)
     invite_hours = 168
@@ -290,7 +316,7 @@ def generate_invite_link(
     # --- Send invite email (matching corporate_admin.py create_user pattern exactly) ---
     from app.core.email_service import send_email, get_global_email_settings
     email_settings = get_global_email_settings()
-    print(f"[DEBUG EMAIL] generate_invite: to={email}, host={email_settings.smtp_host}, port={email_settings.smtp_port}")
+    logger.debug(f"generate_invite: host={email_settings.smtp_host}, port={email_settings.smtp_port}")
     
     subject = "LG Issuance Request — Your Access Link"
     body = f"""
@@ -310,16 +336,17 @@ def generate_invite_link(
     </body>
     </html>
     """
-    background_tasks.add_task(
-        send_email,
-        db,
-        [email],
-        subject,
-        body,
-        {},
-        email_settings,
-    )
-    print(f"[DEBUG EMAIL] generate_invite: background_task added for {email}")
+    if background_tasks:
+        background_tasks.add_task(
+            send_email,
+            db,
+            [email],
+            subject,
+            body,
+            {},
+            email_settings,
+        )
+    logger.debug("generate_invite: background_task added")
     
     return {"invite_link": invite_link}
 
@@ -448,7 +475,7 @@ async def public_submit_request(
         db, request_record.id, user_id=None
     )
     
-    print(f"[DEBUG EMAIL] public_submit: status={submitted_request.status}, approvers={submitted_request.pending_approver_users}, bg_tasks={background_tasks is not None}")
+    logger.debug(f"public_submit: status={submitted_request.status}, approvers={submitted_request.pending_approver_users}, bg_tasks={background_tasks is not None}")
     
     # --- Send email to approvers (matching corporate_admin.py create_user pattern exactly) ---
     if background_tasks and submitted_request.status == "PENDING_APPROVAL" and submitted_request.pending_approver_users:
@@ -462,7 +489,7 @@ async def public_submit_request(
         currency = submitted_request.currency.iso_code if submitted_request.currency else "N/A"
         frontend_url = get_frontend_base_url(request)
         
-        print(f"[DEBUG EMAIL] public_submit: approver_ids={approver_ids}, emails={approver_emails}, host={email_settings.smtp_host}")
+        logger.debug(f"public_submit: approver_ids={approver_ids}, recipient_count={len(approver_emails)}, host={email_settings.smtp_host}")
         
         if approver_emails:
             subject = f"ACTION REQUIRED: LG Request {submitted_request.serial_number} Awaiting Approval"
@@ -497,7 +524,7 @@ async def public_submit_request(
                 {},
                 email_settings,
             )
-            print(f"[DEBUG EMAIL] public_submit: background_task added for {approver_emails}")
+            logger.debug(f"public_submit: background_task added ({len(approver_emails)} recipients)")
     
     return submitted_request
 

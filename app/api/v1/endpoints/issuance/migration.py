@@ -1532,7 +1532,7 @@ async def import_ready_issuance_records(
                 imported += 1
 
             except Exception as e:
-                logger.error(f"Failed to import issuance LG '{lg_num}': {e}", exc_info=True)
+                logger.error(f"Failed to import issuance LG group (staged record ids={[r.id for r in sorted_group]}): {e}", exc_info=True)
                 for rec in sorted_group:
                     rec.record_status = MigrationRecordStatusEnum.ERROR
                     rec.validation_log = rec.validation_log or {}

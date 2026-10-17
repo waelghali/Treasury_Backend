@@ -502,7 +502,7 @@ class BankReconciliationService:
         mapping = self._detect_column_mapping(df)
         
         logger.info(f"Detected Mapping: {mapping}")
-        logger.info(f"Detected Metadata: {metadata}")
+        logger.info(f"Detected Metadata fields: {[k for k, v in (metadata or {}).items() if v is not None]}")
         
         # Fallback if detection still failed (mapping may be None when no column heuristic matched)
         if mapping is None:

@@ -27,8 +27,11 @@ from app.database import get_db, Base, engine, SessionLocal
 class SensitiveDataFilter(logging.Filter):
     """Regex-based filter that replaces sensitive values in log messages."""
 
-    def __init__(self):
+    def __init__(self, preserve_args: bool = False):
         super().__init__()
+        # preserve_args=True scrubs each arg in place instead of collapsing them into msg.
+        # Required for uvicorn/gunicorn access loggers whose formatters unpack record.args.
+        self._preserve_args = preserve_args
         self._patterns: list = []
 
         # 1. GCP Project ID (from env)
@@ -65,20 +68,117 @@ class SensitiveDataFilter(logging.Filter):
             "[CREDENTIALS_FILE]",
         ))
 
+        # --- Secrets & credentials (run before the generic digit masking below) ---
+        # 6a. JWTs (header.payload.signature)
+        self._patterns.append((
+            re.compile(r"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]+"),
+            "[JWT]",
+        ))
+
+        # 6b. Authorization headers (Bearer, Basic, or raw token) & standalone Bearer tokens
+        self._patterns.append((
+            re.compile(r"(\bAuthorization\s*[:=]\s*(?:Bearer\s+|Basic\s+)?)[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
+            r"\1[REDACTED]",
+        ))
+        self._patterns.append((
+            re.compile(r"(\bBearer\s+)[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
+            r"\1[REDACTED]",
+        ))
+
+        # 6c. Fernet-encrypted payloads (portal/invite tokens)
+        self._patterns.append((
+            re.compile(r"gAAAAA[A-Za-z0-9_\-=]{20,}"),
+            "[ENCRYPTED]",
+        ))
+
+        # 6d. Credentials embedded in connection strings: scheme://user:password@host
+        self._patterns.append((
+            re.compile(r"(\b[a-zA-Z][\w+.\-]*://[^:/\s@]+:)\S+@"),
+            r"\1[REDACTED]@",
+        ))
+
+        # 6e. Secret-bearing query params, e.g. ?token=abc&otp=123 (anchored to ?/& to avoid prose like "code=200")
+        self._patterns.append((
+            re.compile(r"([?&](?:token|access_token|refresh_token|otp|code|password|secret|signature|sig|api_key|key)=)[^&\s\"']+", re.IGNORECASE),
+            r"\1[REDACTED]",
+        ))
+
+        # 6f. Secret-bearing key/value pairs in dicts/JSON/kwargs
+        self._patterns.append((
+            re.compile(
+                r"""(['"]?(?:password|passwd|new_password|secret|client_secret|api_key|smtp_password|access_token|refresh_token|session_token|otp|otp_code|mfa_code|raw_code)['"]?\s*[:=]\s*['"]?)([^'",\s}&]+)""",
+                re.IGNORECASE,
+            ),
+            r"\1[REDACTED]",
+        ))
+
+        # 6g. Opaque tokens as URL path segments, e.g. /public/quotations/<token>/live-rank
+        self._patterns.append((
+            re.compile(r"(?<=/)[A-Za-z0-9_\-]{24,}(?=[/?#\s\"']|$)"),
+            "[TOKEN]",
+        ))
+
+        # 7. LG numbers in key/value form, e.g. 'lg_number': '5600772000008294'
+        self._patterns.append((
+            re.compile(r"""((?:lg_number|lgNumber|lg_number_hint)['"]?\s*[:=]\s*['"]?)([A-Za-z0-9/_\-]+)"""),
+            lambda m: m.group(1) + self._mask(m.group(2)),
+        ))
+
+        # 8. LG numbers following the word "LG", e.g. "LG 5600772000008294" / "LG No: ABC-12345".
+        #    Token must contain a digit and be >= 5 chars, so "LG id=42" is left untouched.
+        self._patterns.append((
+            re.compile(r"""\b(LG\s+(?:number\s*|No\.?\s*|#\s*)?[:#]?\s*['"]?)(?=[A-Za-z0-9/\-]*\d)([A-Za-z0-9/\-]{5,})"""),
+            lambda m: m.group(1) + self._mask(m.group(2)),
+        ))
+
+        # 9. Catch-all: any long digit run (10+ digits) - bank LG/account numbers
+        self._patterns.append((
+            re.compile(r"(?<![\w*])\d{10,}(?!\w)"),
+            lambda m: self._mask(m.group(0)),
+        ))
+
+        # 10. Email addresses: keep first char + domain, e.g. j***@acme.com
+        self._patterns.append((
+            re.compile(r"\b([A-Za-z0-9])[A-Za-z0-9._%+\-]*@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b"),
+            r"\1***@\2",
+        ))
+
+    @staticmethod
+    def _mask(value: str) -> str:
+        """Keep only the last 4 characters of an identifier."""
+        return "****" + value[-4:] if len(value) > 6 else "****"
+
+    def _scrub(self, text: str) -> str:
+        for pattern, replacement in self._patterns:
+            text = pattern.sub(replacement, text)
+        return text
+
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
-            for pattern, replacement in self._patterns:
-                record.msg = pattern.sub(replacement, record.msg)
+            record.msg = self._scrub(record.msg)
         # Also scrub formatted args if they were already interpolated
         if record.args:
             try:
-                formatted = record.getMessage()
-                for pattern, replacement in self._patterns:
-                    formatted = pattern.sub(replacement, formatted)
-                record.msg = formatted
-                record.args = None
+                if self._preserve_args:
+                    if isinstance(record.args, tuple):
+                        record.args = tuple(self._scrub(a) if isinstance(a, str) else a for a in record.args)
+                    elif isinstance(record.args, dict):
+                        record.args = {k: (self._scrub(v) if isinstance(v, str) else v) for k, v in record.args.items()}
+                else:
+                    record.msg = self._scrub(record.getMessage())
+                    record.args = None
             except Exception:
                 pass
+        # Scrub tracebacks: pre-render exc_text so the handler's Formatter reuses the cleaned copy
+        if record.exc_info:
+            try:
+                if not record.exc_text:
+                    record.exc_text = logging.Formatter().formatException(record.exc_info)
+                record.exc_text = self._scrub(record.exc_text)
+            except Exception:
+                pass
+        if record.stack_info:
+            record.stack_info = self._scrub(record.stack_info)
         return True
 
 # Configure logging
@@ -90,6 +190,12 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 _sensitive_filter = SensitiveDataFilter()
 for handler in logging.root.handlers:
     handler.addFilter(_sensitive_filter)
+
+# Server loggers don't propagate to root, so attach directly (logger-level filters survive
+# gunicorn/uvicorn swapping handlers). Access logs carry portal tokens in URLs.
+_server_log_filter = SensitiveDataFilter(preserve_args=True)
+for _server_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "gunicorn.error", "gunicorn.access"):
+    logging.getLogger(_server_logger_name).addFilter(_server_log_filter)
 
 logger = logging.getLogger(__name__)
 

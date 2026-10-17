@@ -230,7 +230,7 @@ def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], t
     best_match_id = None
     best_match_name = None
 
-    logger.debug(f"Fuzzy Match Debug: Searching for '{extracted_name}' among {len(valid_entities)} entities.")
+    logger.debug(f"Fuzzy Match Debug: Searching among {len(valid_entities)} entities.")
     for entity in valid_entities:
         entity_name = entity.get('name')
         entity_id = entity.get('id')
@@ -238,7 +238,7 @@ def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], t
             continue
         # FIX: Correct indentation for score calculation
         score = fuzz.token_set_ratio(extracted_name.lower(), entity_name.lower())
-        logger.debug(f"Fuzzy Match Debug: Comparing '{extracted_name}' with '{entity_name}' (ID: {entity_id}) - Score: {score}")
+        logger.debug(f"Fuzzy Match Debug: Comparing with entity ID {entity_id} - Score: {score}")
 
         if score > best_score and score >= threshold:
             best_score = score
@@ -246,9 +246,9 @@ def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], t
             best_match_name = entity_name
 
     if best_match_id:
-        logger.debug(f"Fuzzy Match Debug: Best match found for '{extracted_name}' is '{best_match_name}' (ID: {best_match_id}) with score {best_score}.")
+        logger.debug(f"Fuzzy Match Debug: Best match is ID {best_match_id} with score {best_score}.")
     else:
-        logger.debug(f"Fuzzy Match Debug: No good fuzzy match found for '{extracted_name}' above threshold {threshold}.")
+        logger.debug(f"Fuzzy Match Debug: No good fuzzy match found above threshold {threshold}.")
 
     return best_match_id
 
@@ -552,7 +552,7 @@ async def scan_lg_file(
             if beneficiary_id:
                 mapped_data["beneficiary_corporate_id"] = beneficiary_id
             else:
-                logger.warning(f"No good fuzzy match found for Beneficiary Corporate '{extracted_beneficiary_name}'.")
+                logger.warning("No good fuzzy match found for extracted Beneficiary Corporate.")
 
         if extracted_ai_data.get("currency"):
             currency = crud_currency.get_by_iso_code(db, extracted_ai_data["currency"])
@@ -699,10 +699,10 @@ async def scan_amendment_letter_file(
         return {"ai_suggested_details": ai_suggested_details}
         
     except HTTPException as e:
-        logger.error(f"AI processing failed for amendment letter on LG {lg_record.lg_number}: {e.detail}")
+        logger.error(f"AI processing failed for amendment letter on LG id={lg_record.id}: {e.detail}")
         raise e
     except Exception as e:
-        logger.error(f"AI processing failed for amendment letter on LG {lg_record.lg_number}: {e}", exc_info=True)
+        logger.error(f"AI processing failed for amendment letter on LG id={lg_record.id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred during AI analysis. Please try again or proceed manually."

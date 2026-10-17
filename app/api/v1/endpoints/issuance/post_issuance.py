@@ -740,10 +740,28 @@ def verify_lg_copy(
         # Issuing Bank check
         if verify_issuing_bank:
             expected_bank = None
-            if lg.bank_id and lg.bank:
-                expected_bank = lg.bank.name
-            elif lg.sub_limit and lg.sub_limit.facility and lg.sub_limit.facility.bank:
-                expected_bank = lg.sub_limit.facility.bank.name
+            if lg.bank_id:
+                from app.models import Bank
+                b = db.query(Bank).get(lg.bank_id)
+                if b: expected_bank = b.name
+            elif lg.facility_sub_limit_id:
+                from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
+                from app.models import Bank
+                sub = db.query(IssuanceFacilitySubLimit).get(lg.facility_sub_limit_id)
+                if sub:
+                    fac = db.query(IssuanceFacility).get(sub.facility_id)
+                    if fac and fac.bank_id:
+                        b = db.query(Bank).get(fac.bank_id)
+                        if b: expected_bank = b.name
+            elif request and request.selected_sub_limit_id:
+                from app.models.models_issuance import IssuanceFacilitySubLimit, IssuanceFacility
+                from app.models import Bank
+                sub = db.query(IssuanceFacilitySubLimit).get(request.selected_sub_limit_id)
+                if sub:
+                    fac = db.query(IssuanceFacility).get(sub.facility_id)
+                    if fac and fac.bank_id:
+                        b = db.query(Bank).get(fac.bank_id)
+                        if b: expected_bank = b.name
 
             confirmed_bank = payload.get("issuing_bank_name") or payload.get("bank_name")
             if expected_bank:
@@ -751,13 +769,23 @@ def verify_lg_copy(
                 all_comparisons.append({
                     "field": "Issuing Bank", "requested": expected_bank,
                     "bank_confirmed": confirmed_bank or "—",
-                    "severity": "OK" if bank_match else "HIGH", "match": bank_match
+                    "severity": "OK" if bank_match else "HIGH", "match": bank_match,
+                    "is_internal": not bank_match,
+                    "note": "Internal Issue: Issuing bank differs from system record. Cannot be sent in a bank correction letter." if not bank_match else None
                 })
                 if not bank_match and confirmed_bank:
                     discrepancies.append({
                         "field": "issuing_bank", "requested": expected_bank,
-                        "bank_confirmed": confirmed_bank, "severity": "HIGH"
+                        "bank_confirmed": confirmed_bank, "severity": "HIGH",
+                        "is_internal": True,
+                        "note": "Internal company issue: Bank mismatch"
                     })
+                    # Log audit action
+                    log_action(
+                        db, current_user.user_id, "ISSUANCE_BANK_MISMATCH_DETECTED", "IssuedLGRecord", lg.id,
+                        {"requested_bank": expected_bank, "confirmed_bank": confirmed_bank, "lg_ref": lg.lg_ref_number},
+                        current_user.customer_id
+                    )
 
         # Issuer / Applicant Name check
         if verify_issuer_name:

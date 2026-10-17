@@ -45,3 +45,4 @@ interactive-experience/
 # Temporary scratch and debug artifacts
 scratch/
 artifacts_*/
+data/

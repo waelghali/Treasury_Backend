@@ -243,7 +243,7 @@ class CRUDLGOwner(CRUDBase):
                     details={"recipient": to_emails, "cc_recipients": cc_emails, "subject": email_subject, "reason": "Email service failed to send notification", "method": email_method_for_log, "scope": scope},
                     customer_id=customer_id, lg_record_id=lg_records[0].id if lg_records else None,
                 )
-                logger.error(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Failed to send owner change notification for scope '{scope}' for LGs: {lg_numbers}.", exc_info=True)
+                logger.error(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Failed to send owner change notification for scope '{scope}' for LGs (count={len(lg_numbers)}).", exc_info=True)
 
         instruction_template = db.query(models.Template).filter(
             models.Template.action_type == action_type_constant,
@@ -254,7 +254,7 @@ class CRUDLGOwner(CRUDBase):
 
         if instruction_template:
             for lg_record in lg_records:
-                logger.debug(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Generating instruction for LG: {lg_record.lg_number}")
+                logger.debug(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Generating instruction for LG id={lg_record.id}")
                 
                 # CRITICAL: Late import for crud_lg_instruction instance
                 import app.crud.crud as crud_instances
@@ -305,7 +305,7 @@ class CRUDLGOwner(CRUDBase):
                     instruction_ids.append(db_lg_instruction.id)
                     logger.debug(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Instruction {db_lg_instruction.serial_number} created and flushed.")
                 except Exception as e:
-                    logger.error(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Error creating instruction for LG {lg_record.lg_number} owner change: {e}", exc_info=True)
+                    logger.error(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Error creating instruction for LG id={lg_record.id} owner change: {e}", exc_info=True)
 
         return instruction_ids
 
@@ -358,7 +358,7 @@ class CRUDLGOwner(CRUDBase):
                     logger.warning(f"[{self.__class__.__name__}.change_lg_internal_owner_single_or_bulk] LG record {lg_record.id} already assigned to this internal owner {new_owner_contact.email}.")
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="LG record already assigned to this internal owner.")
 
-                logger.debug(f"[{self.__class__.__name__}.change_lg_internal_owner_single_or_bulk] Updating LG {lg_record.lg_number} owner from {old_owner_contact.email if old_owner_contact else 'N/A'} to {new_owner_contact.email}.")
+                logger.debug(f"[{self.__class__.__name__}.change_lg_internal_owner_single_or_bulk] Updating LG id={lg_record.id} owner from contact id={old_owner_contact.id if old_owner_contact else 'N/A'} to contact id={new_owner_contact.id}.")
                 lg_record.internal_owner_contact_id = new_owner_contact.id
                 lg_record.updated_at = func.now()
                 db.add(lg_record)

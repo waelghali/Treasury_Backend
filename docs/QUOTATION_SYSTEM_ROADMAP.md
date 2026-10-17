@@ -1,6 +1,6 @@
 # Grow Treasury — Quotation Module Architectural Roadmap
 
-*Last Updated: October 15, 2026*  
+*Last Updated: October 16, 2026*  
 *Status: Production = `main` @ `12efde2` (backend) / `7955b8e` (frontend). Next release candidate = local branch `safe/2026-10-15-reviewed-fixes` (not merged, not pushed). Notification/Push engine = prototype on local branch `wip/notification-engine-2026-10-15` — **ON HOLD** (see [Current Release State](#-current-release-state--branch-split-2026-10-15)).*
 
 ---
@@ -63,6 +63,7 @@ A deep review of all uncommitted work since production (`main` @ `12efde2` / `79
 | **Reconciliation** | Tweaks + AI date normalisation prompt | `reconciliation_service.py` | — |
 | **Results** | `hasWinner` guard; optional result schema fields | `ResultsView.js`, `schemas_quotation.py` | — |
 | **Issued LGs** | Custom export modal; `apiRequest` options object + blob detection | `CustomExportModal.js`, `IssuedLGsPage.js`, `apiService.js` | Backend export endpoints already in production. |
+| **Log Privacy (added 2026-10-16)** | Production logs scrubbed of secrets, tokens, LG numbers, client names and LG data | 20 backend files — see [§2.9](#29-production-log-privacy-hardening-completed-) | 🔴 **Production leaks**: live MFA codes printed to stdout; portal tokens in access logs. ⚠️ Uncommitted on this branch at time of writing. |
 
 **Verification (2026-10-15):** `import app.main` OK; 9/9 core suites pass (production_readiness, quotation_phase2 e2e/security, zero_knowledge_e2e, worm_audit_chain, tenant_key_service, security_crypto, bank_dealer_auth, privacy_preserving_analytics); frontend production build compiles (pre-existing lint warnings only); zero references to the notification engine / VAPID on the branch. **No DDL required** for this release.
 
@@ -187,15 +188,16 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
   - **Strict Privacy Scope**: Scoped **strictly to the specific legs won by that bank counterparty**, guaranteeing 0% information leakage of other portfolio legs.
   - Displayed prominently in the portal outcome view and included in trade execution confirmation emails.
 
-### 2.5 Bank Admin / Authorized Terminal (Counterparty Self-Maintained Contacts & Desks with Multi-Tier Governance) (Planned 🚀)
-- **Objective & Paradigm Shift**: Transition authority from corporate clients having to manually enter or maintain bank contacts to an authorized Bank Counterparty Terminal where banks independently manage their own contact rosters, trading desks, and notification recipients.
-- **Self-Contained Counterparty Governance**:
-  - Eliminates administrative overhead on corporate treasuries and platform super-admins.
-  - Guarantees contacts adhere strictly to official bank domain validation (`@cibeg.com`, `@hsbc.com`, etc.).
-- **Multi-Level Review & Approval Hierarchy (Configurable Institutional Workflow)**:
-  - **Maker**: Bank team member submits additions, updates, or deactivations of trading desk personnel.
-  - **Checker**: Internal compliance/desk supervisor reviews domain authenticity, phone verification, and desk assignment.
+### 2.5 Bank Admin / Authorized Terminal (Counterparty Self-Maintained Contacts, Management Takeover & Multi-Tier Governance) (Planned 🚀)
+- **Objective & Paradigm Shift**: Transition authority from corporate clients having to manually enter or maintain bank contacts to an authorized Bank Counterparty Terminal where banks independently manage their own contact rosters, trading desks, notification recipients, and live operational takeovers.
+- **Self-Contained Management Takeover**:
+  - Banks must have the capability for real, self-contained management takeovers (reassigning active trading desks, rerouting deal blotters, or revoking trader access during leaves/departures) with zero dependence on corporate client admins.
+- **Multi-Level Authorization Hierarchy**:
+  - **Maker**: Bank team member submits additions, updates, deactivations, or desk reassignment requests.
+  - **Checker**: Internal compliance or desk supervisor verifies domain authenticity, phone verification, and desk assignment.
   - **Approver 1 / Approver 2**: Senior treasury management authorization before live execution capabilities or blotter feeds are enabled for any new dealer.
+- **Single System Owner Safety Valve**:
+  - The process is 100% self-contained on the bank side, with only **one final emergency safety valve** at the System Owner level (platform kill-switch / freeze override) for regulatory compliance and dispute intervention.
 - **Audit & Segregation of Duties**: Fully segregated duties with immutable WORM logging for all roster modifications, meeting institutional banking vendor risk compliance.
 
 ### 2.6 Automated Domain Consistency & Enrichment (Queued)
@@ -225,6 +227,81 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
   5. Public Issuance Requestor Portal
   6. Forgot Password & Account Recovery Request (`/forgot-password`)
   7. Public Bank Handshake & Counterparty Token Access
+
+### 2.9 Production Log Privacy Hardening (Completed ✅)
+- **Objective**: Keep production logs detailed enough to debug, without exposing secrets, client identities or LG data. Logs should show *what happened* (IDs, statuses, counts, timings), never the business data or credentials themselves.
+- **Trigger (2026-10-16)**: A production line `LG 5600772000008294: SKIPPED…` led to a full audit of all log output. Full report: `brain/177bf7b9-…/log_privacy_audit.md`.
+
+#### Work Actually Done
+**A. Critical leaks closed**
+
+| Leak | File | Fix |
+| :--- | :--- | :--- |
+| Live **MFA code + email** printed via `print()` on every login challenge | `auth_v2/services.py` | Removed; logs `user id` only |
+| **Portal tokens** in access logs (`/public-quotation/{token}/…`, `?token=…`) — uvicorn/gunicorn loggers don't propagate to root, so the old filter never saw them | `main.py` | Filter attached directly to `uvicorn`, `uvicorn.access`, `uvicorn.error`, `gunicorn.access`, `gunicorn.error` |
+| **Desk session token** logged on lock claim | `desk_session_service.py` | Removed |
+
+**B. Data leaks closed**
+
+| Data | File(s) | Fix |
+| :--- | :--- | :--- |
+| SQL errors carried full row values via `{e}` | `database.py` | `hide_parameters=True` (local override `SQL_SHOW_PARAMS=true`) |
+| Raw Gemini output (full LG details) in error logs | `ai_integration.py` | Logs response length only |
+| OCR text + Gemini JSON dumped to local disk on every extraction | `ai_integration.py` | Gated by `SAVE_AI_DEBUG_FILES`: **off** on Render/production, on locally |
+| First 500 chars of OCR document text at DEBUG | `ai_integration.py` | Removed |
+| Bank statement account number, balances, company name at INFO | `bank_reconciliation_service.py` | Logs detected field names only |
+| Full staged LG record payloads (INFO + DEBUG) | `migration.py` | Logs field names only |
+| LG amounts during form auto-fill | `issuance/forms.py` | Values removed |
+| Beneficiary names from documents / imports | `end_user.py`, `migration.py` | IDs + match scores only |
+| Approver emails via `print()` | `public_issuance.py`, `issuance/workflow.py` | `logger.debug` with recipient counts |
+
+**C. Identifiers → internal IDs** (~70 log lines)
+- **LG numbers** → `LG id=<db id>` in `crud_lg_record.py`, `crud_lg_owner.py`, `end_user.py`, `migration.py`, `migration_service.py`, `migration_history.py`, `issuance/migration.py`, `ai_integration.py` (LG hint → `provided: True/False`). Pre-import migration failures log staged record IDs.
+- **Customer / entity / facility / owner names** → IDs in `crud_lg_record.py` (reminder scheduler), `background_tasks.py`, `crud_customer.py`, `system_owner.py`, `corporate_admin.py`.
+- **Kept on purpose**: bank names, template names, subscription plan names (not client data); client IPs in access logs (normal operational data).
+
+**D. Safety-net redaction filter** — `SensitiveDataFilter` in `app/main.py`
+
+| Rule | Output |
+| :--- | :--- |
+| JWTs | `[JWT]` |
+| `Bearer <token>` | `Bearer [REDACTED]` |
+| Fernet-encrypted tokens (`gAAAAA…`) | `[ENCRYPTED]` |
+| Connection-string passwords | `postgresql://user:[REDACTED]@host` |
+| Query secrets (`?token=`, `&otp=`, `&code=`, `&key=`…) | `?token=[REDACTED]` |
+| Key/values: `password`, `otp_code`, `session_token`, `api_key`, `authorization`… | `'password': '[REDACTED]'` |
+| Opaque URL path segments ≥ 24 chars | `/[TOKEN]/live-rank` |
+| LG numbers (after "LG", in `lg_number` keys) and any 10+ digit run | `LG ****8294` |
+| Emails (domain kept — not treated as secret) | `j***@acme.com` |
+| Exception tracebacks + stack info | All of the above |
+
+#### Technical Findings & Gotchas
+- **`print()` bypasses logging entirely** — no filter can catch it. Rule: never `print()` in `app/`; always use `logger`.
+- **Server loggers are isolated**: gunicorn's `UvicornWorker` swaps handlers on `uvicorn.*` loggers with `propagate=False`. Only **logger-level** filters survive that, not root-handler filters.
+- **Access-log formatters unpack `record.args`** (uvicorn `AccessFormatter`). The server filter uses `preserve_args=True` to clean each argument in place; collapsing args into `msg` would crash the formatter.
+- **Tracebacks**: `Formatter` reuses a pre-filled `record.exc_text`, so the filter renders and cleans it first.
+- **SQLAlchemy** puts `[parameters: …]` (every column value) into `str(e)` unless `hide_parameters=True`.
+- The filter is a **safety net, not the primary control**. Names can't be pattern-matched, so code must log IDs by design.
+
+#### Plan Deviations
+- Option 3 (HMAC-hashed LG numbers) was not used: internal DB IDs are equally traceable with one query and need no key management.
+- Email domains are deliberately **not** masked (business decision 2026-10-16).
+- `log_action` audit-trail details in the database were **not** changed. They are product data and need the real values.
+
+#### Verification Proof
+- Filter test harness (`brain/177bf7b9-…/scratch/test_log_filter.py`) loads the class from `main.py` without booting the app. Every case passes, including: `LG id=1423` and `LG ID 12` left untouched; `Status code=200` not redacted; access-log args still a 5-element tuple after scrubbing; traceback last line masked (`Duplicate LG ****8294 for owner j***@corp.com`).
+- `python -m py_compile` passes on all 20 modified files.
+- `import app.main` (project venv) OK: `uvicorn.access` has `SensitiveDataFilter` attached, `engine.hide_parameters == True`, `SAVE_AI_DEBUG_FILES == True` locally (as intended).
+- **Pending before merge**: run the core suites (Rule 8), and check one Render deploy's access log shows `[TOKEN]` for public quotation URLs and `SAVE_AI_DEBUG_FILES` resolves to `False` there.
+
+#### New Environment Variables (all optional)
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `SQL_SHOW_PARAMS` | off | Show SQL parameter values in errors (local debugging only) |
+| `SAVE_AI_DEBUG_FILES` | off on Render/production, on locally | Write OCR text + Gemini JSON to temp disk |
+
+**DDL**: none.
 
 ---
 
@@ -1242,6 +1319,17 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
 - **Cross-Customer Quoting**: All RFQs dispatched to that bank across all corporate customers appear in a single, real-time feed.
 - **Real-Time Concurrency Lock**: Integrates with [desk_session_service.py](file:///c:/Grow/app/services/desk_session_service.py) to prevent desk colleagues from colliding or overwriting quotes.
 - **Institutional Archival**: Full history of won, lost, and passed quotes with instant cryptographic deal receipts and analytics.
+
+#### 5. Dealer Portal Strategic Evolution & Redesign Notes (Planned 🚀)
+- **Current State**: Active in production at `/dealer`, but intentionally unpublicized / dark (no link on homepage; accessed by direct route only).
+- **Interface & UX Overhaul**:
+  - The current UI is perceived as complex without conveying immediate high-density value.
+  - **Data-First Redesign**: Map out all rich data currently tracked (win rates, CBE spread benchmarks, competitive speed metrics, volume buckets, multi-customer status) and present it cleanly so it instantly matters to traders on the floor.
+- **Multi-Tier Feature Gating (System Owner Controlled)**:
+  - System Owner must have granular feature enablement switches wired hierarchically:
+    - **Tier A (Bank-Level)**: Enable/disable modules for an entire bank (e.g. FX Spot vs. T-Bills vs. Multi-Leg).
+    - **Tier B (Bank × Customer-Level)**: Enable/disable specific dealer capabilities for specific corporate clients (e.g. bilateral credit line flags, direct chat, tariff overrides).
+    - **Tier C (Bank × Customer × Dealer-Level)**: Individual trader authorization flags per corporate counterparty relationship.
 
 ---
 

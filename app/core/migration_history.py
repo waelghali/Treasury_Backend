@@ -185,7 +185,7 @@ class MigrationHistoryService:
                     # Proactive check against production table
                     existing_lg_in_prod = crud_lg_record.get_by_lg_number(db, lg_num)
                     if existing_lg_in_prod:
-                        logger.warning(f"LG number '{lg_num}' already exists in production. Skipping import.")
+                        logger.warning(f"LG already exists in production (LG id={existing_lg_in_prod.id}). Skipping import.")
                         for snap in snapshots:
                             snap.record_status = MigrationRecordStatusEnum.ERROR
                             snap.validation_log['import_error'] = 'LG already exists in production table. Skipping.'
@@ -202,7 +202,7 @@ class MigrationHistoryService:
                                 break
 
                     if conflict_found:
-                        logger.warning(f"Ambiguous history detected for LG '{lg_num}'. Flagging for review.")
+                        logger.warning(f"Ambiguous history detected for LG group (first staged record id={first_snapshot.id}). Flagging for review.")
                         for snap in snapshots:
                             snap.record_status = MigrationRecordStatusEnum.ERROR
                             snap.validation_log['import_error'] = 'Ambiguous history detected. Two snapshots share the same timeline key but have different values.'
@@ -264,7 +264,7 @@ class MigrationHistoryService:
                 
                 except Exception as e:
                     nested_session.rollback()
-                    logger.error(f"Failed to import LG '{lg_num}' during historical import: {e}", exc_info=True)
+                    logger.error(f"Failed to import LG group (staged record ids={[s.id for s in snapshots]}) during historical import: {e}", exc_info=True)
                     for snap in snapshots:
                         snap.record_status = MigrationRecordStatusEnum.ERROR
                         snap.validation_log['import_error'] = str(e)
