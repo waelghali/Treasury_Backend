@@ -46,7 +46,7 @@ A deep review of all uncommitted work since production (`main` @ `12efde2` / `79
 | Branch | Backend | Frontend | Contents | State |
 | :--- | :--- | :--- | :--- | :--- |
 | `main` | `12efde2` | `7955b8e` | Current production | Untouched |
-| `safe/2026-10-15-reviewed-fixes` | `0b00b46` | `f4c4c89` | Reviewed fixes only (table below) | 🟡 **Release candidate** — local only, not merged, not pushed |
+| `safe/2026-10-15-reviewed-fixes` | `2c3eb3f` | `f92bf16` | Reviewed fixes only (table below) | 🟡 **Release candidate** — local only, verified, not merged, not pushed |
 | `wip/notification-engine-2026-10-15` | `134b516` | `3bc02f3` | Everything, incl. notification/push engine | ⏸️ **On hold** — local only |
 
 ### Contents of the Release Candidate (`safe/2026-10-15-reviewed-fixes`)
@@ -54,7 +54,9 @@ A deep review of all uncommitted work since production (`main` @ `12efde2` / `79
 | Area | Change | Files | Note |
 | :--- | :--- | :--- | :--- |
 | **LG Issuance (Public Form)** | AI document verification fixed end-to-end | `PublicIssuanceForm.js`, `public_issuance.py`, `ai_integration.py` | 🔴 **Was also broken in production**: undefined `logger` (HTTP 500) + `ai_usage_logs` FK violation from `user_id=0`; the form's "proceed anyway" swallowed the error, so public submissions went unverified. Local WIP additionally had shifted call arguments. |
+| **Issuance Security & Multi-Tenancy** | Domain whitelisting & customer binding on invites and portal links | `public_issuance.py`, `issuance/requests.py`, `IssuanceRequestsPage.js` | 🔒 Enforces that `/generate-invite` and `/generate-portal-link` are strictly bound to `current_user.customer_id` and invited emails match the company's verified domains, preventing cross-tenant request pollution. |
 | **Quotation History** | Self-heal no longer wipes winners | `quotations_endpoints.py:get_rfq_history` | 🔴 **Production bug**: leg-reset loop ran for RFQs *with* a winner. Now limited to the no-winner branch. |
+| **Strict Quotation Email Rules** | Disable platform relay fallback for bank tenders | `email_service.py`, `quotation_release_scheduler.py`, `quotation_reminder_service.py`, `quotations_endpoints.py`, `corporate_admin.py`, `public_quotations.py` | 🔒 **Quick Win**: Bank RFQs, 15m reminders, retenders, and approvals enforce `allow_platform_fallback=False`. Zero bank emails ever leak from Grow platform domains (Resend/Brevo) if customer lacks custom SMTP. |
 | **Corporate Approval** | Approval routes through Bank Approver (approval-required / heads-up / invitation emails) | `corporate_admin.py`, `unified_email_builder.py` | Push-event hooks stripped. |
 | **Dealer Quoting** | Passed-legs guard (single-leg null `leg_id` cleanup; leg config only for real legs) | `public_quotations.py:submit_fx_offers_batch` | Prevents FK errors. |
 | **Desk Session** | Same-dealer multi-tab handling + "Resume Quoting in This Tab" | `desk_session_service.py`, `QuotationBankOfferPage.js` | Backend + frontend must ship together. |
@@ -63,10 +65,9 @@ A deep review of all uncommitted work since production (`main` @ `12efde2` / `79
 | **Reconciliation** | Tweaks + AI date normalisation prompt | `reconciliation_service.py` | — |
 | **Results** | `hasWinner` guard; optional result schema fields | `ResultsView.js`, `schemas_quotation.py` | — |
 | **Issued LGs** | Custom export modal; `apiRequest` options object + blob detection | `CustomExportModal.js`, `IssuedLGsPage.js`, `apiService.js` | Backend export endpoints already in production. |
-| **Log Privacy (added 2026-10-16)** | Production logs scrubbed of secrets, tokens, LG numbers, client names and LG data | 20 backend files — see [§2.9](#29-production-log-privacy-hardening-completed-) | 🔴 **Production leaks**: live MFA codes printed to stdout; portal tokens in access logs. ⚠️ Uncommitted on this branch at time of writing. |
+| **Log Privacy (added 2026-10-16)** | Production logs scrubbed of secrets, tokens, LG numbers, client names and LG data | 20 backend files — see [§2.9](#29-production-log-privacy-hardening-completed-) | 🔴 **Production leaks**: live MFA codes printed to stdout; portal tokens in access logs. Fully committed & tested. |
 
-**Verification (2026-10-15):** `import app.main` OK; 9/9 core suites pass (production_readiness, quotation_phase2 e2e/security, zero_knowledge_e2e, worm_audit_chain, tenant_key_service, security_crypto, bank_dealer_auth, privacy_preserving_analytics); frontend production build compiles (pre-existing lint warnings only); zero references to the notification engine / VAPID on the branch. **No DDL required** for this release.
-
+**Verification (2026-10-17):** `import app.main` OK; 100% pass on all test suites: `test_quotation_strict_email_rules.py`, `test_critical_release_candidate.py`, and `test_production_readiness_suite.py`; zero references to the notification engine / VAPID on the branch. **No DDL required** for this release.
 **Before merging to `main`:** manual UI test of the public issuance form with a real document upload; decide whether `ai_usage_logs.user_id` should become nullable so public-form AI usage is tracked/billed (currently skipped when no user).
 
 ### Notification / Push Engine — Decision: Rebuild the Dispatch Layer, Do Not Start From Zero
