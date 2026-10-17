@@ -2366,8 +2366,14 @@ def approve_quotation(
         "Please copy and distribute the secure links to your bank dealers manually, or configure your company email server in Settings."
     )
 
+    approval_msg = (
+        "Quotation approved and released to banks immediately."
+        if has_custom_smtp_check
+        else "Quotation approved and active. Note: Bank emails were not sent automatically because Custom SMTP is not configured."
+    )
+
     return {
-        "message": "Quotation approved and released to banks immediately.",
+        "message": approval_msg,
         "rfq_id": rfq.id,
         "status": rfq.status,
         "bank_dispatch_status": bank_dispatch_status,

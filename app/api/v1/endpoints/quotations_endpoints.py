@@ -1150,12 +1150,23 @@ def _dispatch_quotation_submission_email(
             cta_text = "Review & Approve Quotation"
             cta_url = f"{base_url}/corporate-admin/quotations/history?rfq_id={rfq.id}"
         else:
+            email_settings_check, source_check = get_customer_email_settings(db, current_user.customer_id, allow_platform_fallback=False)
+            has_custom_smtp_sub = bool(email_settings_check and source_check == "customer_specific")
+            if not has_custom_smtp_sub:
+                kv["Bank Email Dispatch"] = "Suppressed (No Custom SMTP Configured)"
+
             subject = f"NOTIFICATION: New {action_label} Request {rfq.ref_no}{multi_label} Submitted"
             title = f"{action_label} Request Submitted"
-            summary_text = (
-                f"A new {action_label.lower()} request ({rfq.ref_no}){f' for {len(legs_list)} currency pairs' if len(legs_list) > 1 else ''} has been submitted by {submitter_display} "
-                f"and released to counterparties."
-            )
+            if has_custom_smtp_sub:
+                summary_text = (
+                    f"A new {action_label.lower()} request ({rfq.ref_no}){f' for {len(legs_list)} currency pairs' if len(legs_list) > 1 else ''} has been submitted by {submitter_display} "
+                    f"and released to counterparties."
+                )
+            else:
+                summary_text = (
+                    f"A new {action_label.lower()} request ({rfq.ref_no}){f' for {len(legs_list)} currency pairs' if len(legs_list) > 1 else ''} has been submitted by {submitter_display} "
+                    f"and is now active. Note: Bank emails were not sent automatically because Custom SMTP is not configured for your organization."
+                )
             cta_text = "View Quotation"
             cta_url = f"{base_url}/corporate-admin/quotations/history?rfq_id={rfq.id}"
 

@@ -238,16 +238,27 @@ def dispatch_rfq_approved_email(
 
         base_url = get_frontend_base_url(request=request)
         email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
+        email_settings_check, source_check = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
+        has_custom_smtp = bool(email_settings_check and source_check == "customer_specific")
         customer_display_name = rfq.customer.name if getattr(rfq, "customer", None) and rfq.customer.name else "Corporate Treasury"
 
         is_scheduled = scheduled_time is not None
         sched_str = scheduled_time.strftime("%A, %d %b %Y at %H:%M UTC") if is_scheduled else None
 
+        if is_scheduled:
+            status_label = "Scheduled for Release"
+        elif has_custom_smtp:
+            status_label = "Approved & Released to Banks"
+        else:
+            status_label = "Approved (Manual Bank Handover Required)"
+
         kv = {
             "Quotation Reference": rfq.ref_no,
             "Approved By": admin_email,
-            "Status": "Scheduled for Release" if is_scheduled else "Approved & Released to Banks",
+            "Status": status_label,
         }
+        if not is_scheduled and not has_custom_smtp:
+            kv["Bank Email Dispatch"] = "Suppressed (No Custom SMTP Configured)"
         if is_scheduled:
             kv["Scheduled Release Time"] = sched_str
 
@@ -261,6 +272,15 @@ def dispatch_rfq_approved_email(
                 f"It is scheduled for automatic broadcast to invited banks on {sched_str}."
             )
             cta_text = "View Quotation Details"
+        elif not has_custom_smtp:
+            subject = f"CONFIRMATION: Quotation Request {rfq.ref_no} Approved (Manual Bank Handover Required)"
+            title = "⚠️ Quotation Approved (Bank Emails Not Sent)"
+            summary_text = (
+                f"Your quotation request ({rfq.ref_no}) has been approved by Corporate Admin ({admin_email}) and is now live. "
+                "However, because your organization has not configured a Custom SMTP server, automatic email invitations to banks were not sent. "
+                "Please copy and distribute the secure portal links to your bank dealers manually."
+            )
+            cta_text = "View Quotation & Copy Links"
         else:
             subject = f"CONFIRMATION: Quotation Request {rfq.ref_no} Approved & Released"
             title = "✅ Quotation Approved & Released"
