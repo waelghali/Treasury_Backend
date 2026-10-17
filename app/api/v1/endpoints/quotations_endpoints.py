@@ -1303,12 +1303,21 @@ def create_rfq(
             except Exception as rem_err:
                 logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
 
-            email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+            email_settings, source = get_customer_email_settings(db, current_user.customer_id, allow_platform_fallback=False)
+            if not email_settings or source != "customer_specific":
+                logger.warning(
+                    f"RFQ {rfq.id}: Customer {current_user.customer_id} has no valid custom SMTP configured. "
+                    "Bank email dispatch suppressed to protect platform domain from leaking."
+                )
+                assignments_to_email = []
+            else:
+                assignments_to_email = assignments
+
             from app.core.routing import get_frontend_base_url
             base_url = get_frontend_base_url(request=request)
             entity_display_name = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else 'Corporate Treasury')
             
-            for assignment in assignments:
+            for assignment in assignments_to_email:
                 q_bank_id = assignment.get("quotation_bank_id")
                 bank_row = db.query(QuotationBank).filter(QuotationBank.id == q_bank_id).first() if q_bank_id else None
                 if not bank_row:
@@ -1366,7 +1375,7 @@ def create_rfq(
                             link=approver_link,
                             email_purpose="BANK_APPROVAL_REQUIRED"
                         )
-                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
 
                     # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link) ALL TOGETHER in ONE email
                     if non_approver_emails:
@@ -1379,7 +1388,7 @@ def create_rfq(
                             link="",
                             email_purpose="BANK_HEADS_UP"
                         )
-                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
                 else:
                     # --- STANDARD FLOW (No bank-level approval needed: Indicative, or No Approver, or Approver without Execution role) ---
                     if db_assignment and db_assignment.approval_status == 'PENDING':
@@ -1405,6 +1414,7 @@ def create_rfq(
                             body,
                             {},
                             email_settings,
+                            allow_platform_fallback=False
                         )
 
         
@@ -2881,12 +2891,21 @@ def retender_quotation(
         except Exception as rem_err:
             logger.warning(f"Failed to schedule 15m reminder for RFQ {new_rfq.id}: {rem_err}")
 
-        email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
+        email_settings, source = get_customer_email_settings(db, current_user.customer_id, allow_platform_fallback=False)
+        if not email_settings or source != "customer_specific":
+            logger.warning(
+                f"RFQ {new_rfq.id}: Customer {current_user.customer_id} has no valid custom SMTP configured. "
+                "Bank email dispatch suppressed to protect platform domain from leaking."
+            )
+            assigned_records_to_email = []
+        else:
+            assigned_records_to_email = assigned_records
+
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         customer_branding = (new_rfq.entity.entity_name if new_rfq.entity else None) or (new_rfq.customer.name if new_rfq.customer else "Corporate Treasury")
 
-        for item in assigned_records:
+        for item in assigned_records_to_email:
             bank_row = item["bank_row"]
             if not bank_row: continue
             contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
@@ -2937,7 +2956,7 @@ def retender_quotation(
                         link=approver_link,
                         email_purpose="BANK_APPROVAL_REQUIRED"
                     )
-                    background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+                    background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
 
                 # Phase 1b: EXECUTION + VIEW_ONLY with heads-up (NO link) ALL TOGETHER in ONE email
                 if non_approver_emails:
@@ -2950,7 +2969,7 @@ def retender_quotation(
                         link="",
                         email_purpose="BANK_HEADS_UP"
                     )
-                    background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+                    background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
             else:
                 # --- STANDARD FLOW (no bank-level approval needed, e.g. Indicative or Execution without Approver) ---
                 if new_assignment and getattr(new_assignment, 'approval_status', None) == 'PENDING':
@@ -2976,6 +2995,7 @@ def retender_quotation(
                         body,
                         {},
                         email_settings,
+                        allow_platform_fallback=False
                     )
 
 
@@ -4021,7 +4041,13 @@ async def resend_rfq_bank_invite(
     if not q_bank or not q_bank.emails:
         raise HTTPException(status_code=400, detail="No email address configured for this bank")
         
-    email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
+    email_settings, source = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
+    if not email_settings or source != "customer_specific":
+        raise HTTPException(
+            status_code=400,
+            detail="Your organization does not have an active custom SMTP configuration. Direct bank emails cannot be sent via platform relay."
+        )
+
     from app.core.routing import get_frontend_base_url
     base_url = get_frontend_base_url(request=request)
     bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]
@@ -4047,6 +4073,7 @@ async def resend_rfq_bank_invite(
         body,
         {},
         email_settings,
+        allow_platform_fallback=False
     )
     return {"message": f"Invitation email resent to {bank_display_name}"}
 

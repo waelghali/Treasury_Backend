@@ -2595,13 +2595,21 @@ def approve_quotation_request(
 
     # Dispatch Emails if Approved
     if approval_in.status == "PENDING":
-        email_settings, _ = get_customer_email_settings_service(db, rfq.customer_id)
+        email_settings, source = get_customer_email_settings_service(db, rfq.customer_id, allow_platform_fallback=False)
+        if not email_settings or source != "customer_specific":
+            logger.warning(
+                f"Corporate Admin approve RFQ {rfq.id}: Customer {rfq.customer_id} has no valid custom SMTP configured. "
+                "Bank email dispatch suppressed to protect platform domain from leaking."
+            )
+            assignments_to_email = []
+        else:
+            assignments_to_email = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+
         from app.core.routing import get_frontend_base_url
         base_url = get_frontend_base_url(request=request)
         
         customer_branding = (rfq.entity.entity_name if rfq.entity else None) or (rfq.customer.name if rfq.customer else "Treasury Customer")
-        assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-        for assignment in assignments:
+        for assignment in assignments_to_email:
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if bank_row:
                 contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
@@ -2637,7 +2645,7 @@ def approve_quotation_request(
                             link=approver_link,
                             email_purpose="BANK_APPROVAL_REQUIRED"
                         )
-                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings)
+                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
 
                     if non_approver_emails:
                         subject, body = build_quotation_rfq_bank_email(
@@ -2648,7 +2656,7 @@ def approve_quotation_request(
                             link="",
                             email_purpose="BANK_HEADS_UP"
                         )
-                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
 
                 else:
                     # Standard Invitation - No bank approver required
@@ -2670,6 +2678,7 @@ def approve_quotation_request(
                             body,
                             {}, 
                             email_settings,
+                            allow_platform_fallback=False
                         )
 
     return {"message": "Quotation status updated successfully.", "status": rfq.status}
@@ -2733,48 +2742,50 @@ def approve_quotation_cancellation(
 
     # Dispatch withdrawal emails to all assigned banks
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-    email_settings, _ = get_customer_email_settings_service(db, rfq.customer_id)
+    email_settings, source = get_customer_email_settings_service(db, rfq.customer_id, allow_platform_fallback=False)
     customer_branding = rfq.customer.name if rfq.customer else "Corporate Treasury"
 
-    from app.services.unified_email_builder import build_quotation_withdrawn_bank_email
-    for assignment in assignments:
-        # If bank already declined participation or expired, do not send cancellation emails
-        if assignment.approval_status in ('DECLINED', 'EXPIRED'):
-            continue
+    if email_settings and source == "customer_specific":
+        from app.services.unified_email_builder import build_quotation_withdrawn_bank_email
+        for assignment in assignments:
+            # If bank already declined participation or expired, do not send cancellation emails
+            if assignment.approval_status in ('DECLINED', 'EXPIRED'):
+                continue
 
-        bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
-        if not bank_row:
-            continue
+            bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+            if not bank_row:
+                continue
 
-        # Extract structured contacts with roles
-        if bank_row.contacts and isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0:
-            contacts = bank_row.contacts
-        else:
-            emails_list = [e.strip() for e in (bank_row.emails or "").split(",") if e.strip()]
-            contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
+            # Extract structured contacts with roles
+            if bank_row.contacts and isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0:
+                contacts = bank_row.contacts
+            else:
+                emails_list = [e.strip() for e in (bank_row.emails or "").split(",") if e.strip()]
+                contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
 
-        all_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
+            all_emails = [c.get("email", "").strip() for c in contacts if c.get("email")]
 
-        # All contacts received the original RFQ notification (approvers got the approval request,
-        # execution/viewers got a heads-up), so all should be notified of cancellation.
-        target_emails = all_emails
+            # All contacts received the original RFQ notification (approvers got the approval request,
+            # execution/viewers got a heads-up), so all should be notified of cancellation.
+            target_emails = all_emails
 
-        if target_emails:
-            bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
-            subject, body = build_quotation_withdrawn_bank_email(
-                rfq=rfq,
-                bank_name=bank_display_name,
-                customer_branding=customer_branding
-            )
-            background_tasks.add_task(
-                send_email,
-                db,
-                target_emails,
-                subject,
-                body,
-                {},
-                email_settings
-            )
+            if target_emails:
+                bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                subject, body = build_quotation_withdrawn_bank_email(
+                    rfq=rfq,
+                    bank_name=bank_display_name,
+                    customer_branding=customer_branding
+                )
+                background_tasks.add_task(
+                    send_email,
+                    db,
+                    target_emails,
+                    subject,
+                    body,
+                    {},
+                    email_settings,
+                    allow_platform_fallback=False
+                )
 
 
 

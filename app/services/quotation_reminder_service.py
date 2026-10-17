@@ -164,7 +164,14 @@ async def execute_rfq_15m_reminder(rfq_id: str, db: Optional[Session] = None) ->
         from app.services.unified_email_builder import build_quotation_rfq_bank_email
         from app.crud.base import log_action
 
-        email_settings, _ = get_customer_email_settings(db, rfq.customer_id)
+        email_settings, source = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
+        if not email_settings or source != "customer_specific":
+            logger.warning(
+                f"15m reminder skipped: RFQ {rfq.ref_no} ({rfq_id}) customer {rfq.customer_id} has no valid custom SMTP. "
+                "Platform fallback disabled for bank quotation emails."
+            )
+            return False
+
         base_url = get_frontend_base_url()
         customer_branding = (
             (rfq.entity.entity_name if rfq.entity else None)
@@ -219,7 +226,8 @@ async def execute_rfq_15m_reminder(rfq_id: str, db: Optional[Session] = None) ->
                         subject_template=subject,
                         body_template=body,
                         template_data={},
-                        email_settings=email_settings
+                        email_settings=email_settings,
+                        allow_platform_fallback=False
                     )
                     if success:
                         total_emails_sent += 1
@@ -255,7 +263,8 @@ async def execute_rfq_15m_reminder(rfq_id: str, db: Optional[Session] = None) ->
                         subject_template=subject,
                         body_template=body,
                         template_data={},
-                        email_settings=email_settings
+                        email_settings=email_settings,
+                        allow_platform_fallback=False
                     )
                     if success:
                         total_emails_sent += 1

@@ -120,13 +120,18 @@ def get_global_fallback_email_settings() -> Optional[EmailSettings]:
         reply_to=sender_email
     )
 
-def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSettings, str]:
+def get_customer_email_settings(
+    db: Session,
+    customer_id: int,
+    allow_platform_fallback: bool = True
+) -> Tuple[Optional[EmailSettings], str]:
     """
     Retrieves customer email settings with smart direct-customer delivery and automatic fallback:
     1. If customer has valid active custom SMTP settings, returns customer-specific settings so
        emails are sent 100% directly from the customer's email address.
-    2. If customer has no custom settings or incomplete settings, returns platform relay settings
-       with branded display name and Reply-To set to the customer desk.
+    2. If customer has no custom settings or incomplete settings:
+       - If allow_platform_fallback=True (default): returns platform relay settings with branded display name and Reply-To set to the customer desk.
+       - If allow_platform_fallback=False: returns (None, "no_customer_settings") to prevent leaking emails from Grow's platform domain (e.g. for bank quotations).
     """
     customer = db.query(Customer).options(
         selectinload(Customer.customer_email_settings)
@@ -158,7 +163,16 @@ def get_customer_email_settings(db: Session, customer_id: int) -> Tuple[EmailSet
                     reply_to=settings.sender_email
                 ), "customer_specific"
             except Exception as e:
-                logger.error(f"Customer {customer_id}: decryption failed ({e}). Fallback to Global.", exc_info=True)
+                logger.error(f"Customer {customer_id}: decryption failed ({e}).", exc_info=True)
+                if not allow_platform_fallback:
+                    return None, "customer_decryption_failed"
+
+    if not allow_platform_fallback:
+        logger.warning(
+            f"Customer {customer_id}: No valid custom SMTP configured and allow_platform_fallback=False. "
+            "Suppressing platform relay to protect platform domain from leaking to external parties."
+        )
+        return None, "no_customer_settings"
 
     # Fallback to platform global relay
     global_settings = get_global_email_settings()

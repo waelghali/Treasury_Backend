@@ -2039,7 +2039,7 @@ async def approve_rfq_for_bank(
     bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Bank Partner"
     customer_name = (rfq.entity.entity_name if rfq and rfq.entity else None) or (rfq.customer.name if rfq and rfq.customer else "Treasury Client")
     base_url = get_frontend_base_url(request=request)
-    email_settings, source = get_customer_email_settings(db, rfq.customer_id)
+    email_settings, source = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
 
     contacts = _get_bank_contacts_list(q_bank) if q_bank else []
     approver_email_set = {approver_email.lower()} if approver_email else set()
@@ -2052,7 +2052,7 @@ async def approve_rfq_for_bank(
         assignment.approval_status = "APPROVED"
         
         # Phase 2: Email EXECUTION + VIEW_ONLY contacts WITH active link (ALL TOGETHER in ONE email, NEVER to APPROVER)
-        if non_approver_emails:
+        if non_approver_emails and email_settings and source == "customer_specific":
             link = f"{base_url}/public-quotation/{assignment.token}"
             from app.services.unified_email_builder import build_quotation_rfq_bank_email
             subject, body = build_quotation_rfq_bank_email(
@@ -2063,13 +2063,13 @@ async def approve_rfq_for_bank(
                 link=link,
                 email_purpose="APPROVED_BY_BANK"
             )
-            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
 
     elif action == "DECLINE":
         assignment.approval_status = "DECLINED"
 
         # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
-        if non_approver_emails:
+        if non_approver_emails and email_settings and source == "customer_specific":
             from app.services.unified_email_builder import build_alert_email_html
             subject = f"RFQ {rfq.ref_no} ({customer_name}) - Bank Participation Declined"
             reason_part = f"<br/><br/><strong>Approver Notes / Justification:</strong> {action_in.notes}" if action_in.notes else ""
@@ -2086,7 +2086,7 @@ async def approve_rfq_for_bank(
                 recipient_name=f"{bank_name} FX &amp; Treasury Desk",
                 platform_name="Grow Treasury Platform"
             )
-            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings)
+            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
 
     db.commit()
 

@@ -103,7 +103,14 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
 
         # Broadcast emails to assigned banks
         assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
-        email_settings, source = get_customer_email_settings(db, rfq.customer_id)
+        email_settings, source = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
+
+        if not email_settings or source != "customer_specific":
+            logger.warning(
+                f"broadcast_rfq_to_banks: RFQ {rfq.id} (Customer {rfq.customer_id}) has no valid custom SMTP configured. "
+                "Bank email dispatch suppressed to prevent leaking platform domain."
+            )
+            assignments = []
 
         if not base_url:
             from app.core.routing import get_frontend_base_url
@@ -161,7 +168,7 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
                         link=approver_link,
                         email_purpose="BANK_APPROVAL_REQUIRED"
                     )
-                    await send_email(db, [app_email], subject, body, {}, email_settings)
+                    await send_email(db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
                     emails_sent += 1
 
                 if non_approver_emails:
@@ -173,7 +180,7 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
                         link="",
                         email_purpose="BANK_HEADS_UP"
                     )
-                    await send_email(db, non_approver_emails, subject, body, {}, email_settings)
+                    await send_email(db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
                     emails_sent += len(non_approver_emails)
             else:
                 if assignment.approval_status == 'PENDING':
@@ -189,7 +196,7 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
                         link=link,
                         email_purpose="INVITATION"
                     )
-                    await send_email(db, all_bank_emails, subject, body, {}, email_settings)
+                    await send_email(db, all_bank_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
                     emails_sent += len(all_bank_emails)
 
 
