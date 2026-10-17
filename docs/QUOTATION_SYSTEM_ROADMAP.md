@@ -46,7 +46,7 @@ A deep review of all uncommitted work since production (`main` @ `12efde2` / `79
 | Branch | Backend | Frontend | Contents | State |
 | :--- | :--- | :--- | :--- | :--- |
 | `main` | `12efde2` | `7955b8e` | Current production | Untouched |
-| `safe/2026-10-15-reviewed-fixes` | `d579afa` | `271d635` | Reviewed fixes only (table below) | 🟡 **Release candidate** — local only, verified, not merged, not pushed |
+| `safe/2026-10-15-reviewed-fixes` | `00b6419` | `541eec9` | Reviewed fixes only (table below) | 🚀 **Ready to Merge to main** |
 | `wip/notification-engine-2026-10-15` | `134b516` | `3bc02f3` | Everything, incl. notification/push engine | ⏸️ **On hold** — local only |
 
 ### Contents of the Release Candidate (`safe/2026-10-15-reviewed-fixes`)
