@@ -348,6 +348,36 @@ def test_generate_invite_security():
         assert parts[0] == str(cust.id), f"Token customer_id mismatch: {parts[0]} != {cust.id}"
         assert parts[2] == "engineer@acmecorp.com"
         print(f"  [PASS] Authorized invite minted strictly for customer_id={parts[0]} (Acme Corp)")
+
+        # 4. Also test generate_portal_link in requests.py (domain lockdown)
+        from app.api.v1.endpoints.issuance.requests import generate_portal_link
+        try:
+            generate_portal_link(
+                recipient_email="intruder@externaldomain.com",
+                department="Legal",
+                hours_valid=24,
+                db=db,
+                current_user=admin_user
+            )
+            assert False, "Should have blocked unauthorized domain on generate_portal_link"
+        except HTTPException as e:
+            assert e.status_code == 400
+            assert "not authorized for your organization" in e.detail
+            print("  [PASS] requests.generate_portal_link blocked unauthorized domain (HTTP 400)")
+
+        portal_res = generate_portal_link(
+            recipient_email="legal@acmecorp.com",
+            department="Legal",
+            hours_valid=24,
+            db=db,
+            current_user=admin_user
+        )
+        assert "token" in portal_res
+        p_raw = decrypt_data(portal_res["token"])
+        p_parts = p_raw.split("|")
+        assert p_parts[0] == str(cust.id)
+        assert p_parts[2] == "legal@acmecorp.com"
+        print(f"  [PASS] requests.generate_portal_link minted strictly for customer_id={p_parts[0]}")
     finally:
         db.close()
     print("ALL ISSUANCE INVITE SECURITY CHECKS PASSED.")

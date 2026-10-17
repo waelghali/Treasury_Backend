@@ -16,7 +16,7 @@ from app.core.document_generator import generate_pdf_from_html
 from app.core.encryption import encrypt_data 
 
 # Models
-from app.models.models import Bank, Currency 
+from app.models.models import Bank, Currency, Customer 
 from app.models.models_issuance import IssuedLGRecord, IssuanceRequest, IssuanceFacilitySubLimit, IssuanceFacility, IssuanceWorkflowPolicy, CustomerFormConfiguration, IssuanceRequestSnapshot, IssuanceRequestVersion, AdminChangeRequest, BankFormIssueReport
 # NOTE: Ensure you created app/models/models_reconciliation.py first!
 from app.models.models_reconciliation import BankPositionBatch, BankPositionRow 
@@ -650,23 +650,43 @@ def generate_portal_link(
     from datetime import datetime, timedelta, timezone
     from app.crud.crud import log_action # Ensure this is imported
 
-    # 1. Calculate Expiry
+    # 1. Fetch customer and enforce domain whitelisting
+    customer = db.query(Customer).filter(
+        Customer.id == current_user.customer_id,
+        Customer.is_deleted == False
+    ).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer organization not found.")
+
+    email = (recipient_email or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid email format.")
+
+    full_domain = email.split("@")[-1]
+    allowed_domains = [d.lower() for d in (customer.domains or [])]
+    if full_domain not in allowed_domains:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Email domain '@{full_domain}' is not authorized for your organization ({customer.name}). Allowed domains: {', '.join(allowed_domains) if allowed_domains else 'None'}"
+        )
+
+    # 2. Calculate Expiry
     expiry = (datetime.now(timezone.utc) + timedelta(hours=hours_valid)).isoformat()
     
-    # 2. Build Payload (using | as a separator for clarity)
-    payload = f"{current_user.customer_id}|{department}|{recipient_email}|{expiry}"
+    # 3. Build Payload (using | as a separator for clarity)
+    payload = f"{current_user.customer_id}|{department}|{email}|{expiry}"
     
-    # 3. Encrypt using your core encryption
+    # 4. Encrypt using your core encryption
     token = encrypt_data(payload)
 
-    # 4. Record the action in the System Log
+    # 5. Record the action in the System Log
     log_action(
         db,
         user_id=current_user.user_id,
         action_type="EXTERNAL_INVITE_GENERATED",
         entity_type="IssuanceRequest",
         entity_id=None,
-        details={"recipient": recipient_email, "dept": department, "expiry": expiry},
+        details={"recipient": email, "dept": department, "expiry": expiry},
         customer_id=current_user.customer_id
     )
 
