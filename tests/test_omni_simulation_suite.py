@@ -207,15 +207,17 @@ class OmniTestFixture:
 
         # 3. Setup 5 Institutional Banks & Customer Quotation Banks
         bank_specs = [
-            ("CIB", "Commercial International Bank", "cibeg.com"),
+            ("CIB", "Commercial International Bank (CIB)", "cibeg.com"),
             ("HSBC", "HSBC Bank Egypt", "hsbc.com"),
-            ("NBE", "National Bank of Egypt", "nbe.com.eg"),
+            ("NBE", "National Bank of Egypt (NBE)", "nbe.com.eg"),
             ("BM", "Banque Misr", "banquemisr.com"),
-            ("QNB", "Qatar National Bank Alahli", "qnb.com"),
+            ("QNB", "QNB Al Ahli", "qnb.com.eg"),
         ]
 
         for code, full_name, domain in bank_specs:
-            b = self.db.query(Bank).filter(Bank.name == full_name).first()
+            b = self.db.query(Bank).filter(
+                (Bank.email_domain == domain) | (Bank.name == full_name) | (Bank.name.ilike(f"%({code})%"))
+            ).first()
             if not b:
                 b = Bank(name=full_name, email_domain=domain)
                 self.db.add(b)
@@ -889,12 +891,22 @@ def run_omni_simulation_suite():
 
     finally:
         # Check if user requested preserving test quotations in UI history for visual inspection
-        preserve_data = (
-            "--preserve" in sys.argv 
-            or os.getenv("PRESERVE_TEST_DATA", "").strip().lower() in ("1", "true", "yes")
-        )
+        preserve_data = False
+        if "--preserve" in sys.argv or os.getenv("PRESERVE_TEST_DATA", "").strip().lower() in ("1", "true", "yes"):
+            preserve_data = True
+        elif "--clean" in sys.argv:
+            preserve_data = False
+        elif hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+            try:
+                ans = input("\n[TEARDOWN PROMPT] Keep test RFQ records in database for UI inspection? (y/N) [Default: N]: ").strip().lower()
+                preserve_data = ans in ("y", "yes")
+            except Exception:
+                preserve_data = False
+        else:
+            preserve_data = False
+
         if preserve_data:
-            print("\n--- [PRESERVE] --preserve flag detected: Test RFQs preserved in database for UI inspection ---")
+            print("\n--- [PRESERVE] Test RFQs preserved in database for UI inspection ---")
             print(f"  [UI] You can view these RFQs in Quotation History under Customer 1 (Acme Corporation):")
             for rid in created_rfq_ids:
                 print(f"       -> RFQ ID: {rid}")
