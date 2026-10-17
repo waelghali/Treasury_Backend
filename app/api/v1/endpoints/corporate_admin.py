@@ -2357,11 +2357,23 @@ def approve_quotation(
         request=request
     )
 
-    from app.core.routing import get_frontend_base_url
-    base_url = get_frontend_base_url(request=request)
-    background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url)
+    from app.core.email_service import get_customer_email_settings
+    email_settings_check, source_check = get_customer_email_settings(db, corporate_admin_context.customer_id, allow_platform_fallback=False)
+    has_custom_smtp_check = bool(email_settings_check and source_check == "customer_specific")
+    bank_dispatch_status = "DISPATCHED" if has_custom_smtp_check else "SUPPRESSED_NO_SMTP"
+    email_notice = None if has_custom_smtp_check else (
+        "Bank invitations were not sent via email because your organization does not have Custom SMTP configured. "
+        "Please copy and distribute the secure links to your bank dealers manually, or configure your company email server in Settings."
+    )
 
-    return {"message": "Quotation approved and released to banks immediately.", "rfq_id": rfq.id, "status": rfq.status}
+    return {
+        "message": "Quotation approved and released to banks immediately.",
+        "rfq_id": rfq.id,
+        "status": rfq.status,
+        "bank_dispatch_status": bank_dispatch_status,
+        "bank_email_dispatched": has_custom_smtp_check,
+        "email_notice": email_notice
+    }
 
 @router.post("/quotations/{rfq_id}/reschedule-release")
 def reschedule_quotation_release(
@@ -2681,7 +2693,22 @@ def approve_quotation_request(
                             allow_platform_fallback=False
                         )
 
-    return {"message": "Quotation status updated successfully.", "status": rfq.status}
+    has_custom_smtp_patch = bool(approval_in.status == "PENDING" and email_settings and source == "customer_specific")
+    bank_dispatch_status = "DISPATCHED" if has_custom_smtp_patch else ("SUPPRESSED_NO_SMTP" if approval_in.status == "PENDING" else "REJECTED")
+    email_notice = None
+    if approval_in.status == "PENDING" and not has_custom_smtp_patch:
+        email_notice = (
+            "Bank invitations were not sent via email because your organization does not have Custom SMTP configured. "
+            "Please copy and distribute the secure links to your bank dealers manually, or configure your company email server in Settings."
+        )
+
+    return {
+        "message": "Quotation status updated successfully.",
+        "status": rfq.status,
+        "bank_dispatch_status": bank_dispatch_status,
+        "bank_email_dispatched": has_custom_smtp_patch,
+        "email_notice": email_notice
+    }
 
 
 class QuotationCancellationRejectRequest(BaseModel):

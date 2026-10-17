@@ -1304,7 +1304,8 @@ def create_rfq(
                 logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
 
             email_settings, source = get_customer_email_settings(db, current_user.customer_id, allow_platform_fallback=False)
-            if not email_settings or source != "customer_specific":
+            has_custom_smtp = bool(email_settings and source == "customer_specific")
+            if not has_custom_smtp:
                 logger.warning(
                     f"RFQ {rfq.id}: Customer {current_user.customer_id} has no valid custom SMTP configured. "
                     "Bank email dispatch suppressed to protect platform domain from leaking."
@@ -1429,7 +1430,23 @@ def create_rfq(
             is_retender=False
         )
 
-        return {"rfq_id": rfq.id, "ref_no": rfq.ref_no, "assignments": assignments}
+        has_custom_smtp_flag = has_custom_smtp if not requires_approval else False
+        bank_dispatch_status = "PENDING_APPROVAL" if requires_approval else ("DISPATCHED" if has_custom_smtp_flag else "SUPPRESSED_NO_SMTP")
+        email_notice = None
+        if not requires_approval and not has_custom_smtp_flag:
+            email_notice = (
+                "Bank invitations were not sent via email because your organization does not have Custom SMTP configured. "
+                "Please copy and distribute the secure links to your bank dealers manually, or configure your company email server in Settings."
+            )
+
+        return {
+            "rfq_id": rfq.id,
+            "ref_no": rfq.ref_no,
+            "assignments": assignments,
+            "bank_dispatch_status": bank_dispatch_status,
+            "bank_email_dispatched": has_custom_smtp_flag,
+            "email_notice": email_notice
+        }
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -2892,7 +2909,8 @@ def retender_quotation(
             logger.warning(f"Failed to schedule 15m reminder for RFQ {new_rfq.id}: {rem_err}")
 
         email_settings, source = get_customer_email_settings(db, current_user.customer_id, allow_platform_fallback=False)
-        if not email_settings or source != "customer_specific":
+        has_custom_smtp_retender = bool(email_settings and source == "customer_specific")
+        if not has_custom_smtp_retender:
             logger.warning(
                 f"RFQ {new_rfq.id}: Customer {current_user.customer_id} has no valid custom SMTP configured. "
                 "Bank email dispatch suppressed to protect platform domain from leaking."
@@ -3010,12 +3028,23 @@ def retender_quotation(
         is_retender=True
     )
 
+    bank_dispatch_status = "PENDING_APPROVAL" if requires_approval else ("DISPATCHED" if has_custom_smtp_retender else "SUPPRESSED_NO_SMTP")
+    email_notice = None
+    if not requires_approval and not has_custom_smtp_retender:
+        email_notice = (
+            "Bank invitations were not sent via email because your organization does not have Custom SMTP configured. "
+            "Please copy and distribute the secure links to your bank dealers manually, or configure your company email server in Settings."
+        )
+
     return {
         "message": "Quotation re-tendered successfully.",
         "rfq_id": new_rfq.id,
         "ref_no": new_rfq.ref_no,
         "parent_ref_no": parent.ref_no,
-        "status": new_rfq.status
+        "status": new_rfq.status,
+        "bank_dispatch_status": bank_dispatch_status,
+        "bank_email_dispatched": has_custom_smtp_retender if not requires_approval else False,
+        "email_notice": email_notice
     }
 
 @router.post("/{rfq_id}/resubmit")
