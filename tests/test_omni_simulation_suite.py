@@ -888,6 +888,19 @@ def run_omni_simulation_suite():
         print("=" * 80)
 
     finally:
+        # Check if user requested preserving test quotations in UI history for visual inspection
+        preserve_data = (
+            "--preserve" in sys.argv 
+            or os.getenv("PRESERVE_TEST_DATA", "").strip().lower() in ("1", "true", "yes")
+        )
+        if preserve_data:
+            print("\n--- [PRESERVE] --preserve flag detected: Test RFQs preserved in database for UI inspection ---")
+            print(f"  [UI] You can view these RFQs in Quotation History under Customer 1 (Acme Corporation):")
+            for rid in created_rfq_ids:
+                print(f"       -> RFQ ID: {rid}")
+            db.close()
+            return
+
         # Guaranteed Idempotent Cleanup: Purge test RFQs created during this run
         print("\n--- [TEARDOWN] Purging test RFQ artifacts to guarantee 100% idempotency ---")
         try:
