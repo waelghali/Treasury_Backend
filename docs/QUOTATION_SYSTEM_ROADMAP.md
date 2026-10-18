@@ -1057,19 +1057,30 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
 #### 📌 Sub-Phase 8.7: Document Encryption at Rest & Authenticated Streaming Gateway (Upcoming Post-Freeze Track 🚀)
 *Scope: AES-256-GCM authenticated document encryption at rest on Google Cloud Storage, high-performance chunked in-memory streaming gateway, dual-read backwards compatibility, multi-pair leg isolation, and WORM decryption audit trail.*
 
-- **Architectural Mechanics & Specifications**:
-  - **Storage-at-Rest Encryption ([`security_crypto.py`](file:///c:/Grow/app/core/security_crypto.py))**:
-    - Raw document bytes (PDF, DOCX, XLSX, scans) are encrypted using AES-256-GCM with the customer's unique 256-bit Tenant DEK before upload to Google Cloud Storage.
-    - Encrypted binary structure: 12-byte Magic (`ENC_FILE_V1\x00`) + 12-byte Nonce + GCM Ciphertext + 16-byte Authentication Tag. Direct inspection of Cloud Storage reveals 100% ciphertext.
-  - **Chunked Decryption Streaming Gateway ([`quotations_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py))**:
-    - Dedicated authenticated streaming route: `GET /api/v1/quotations/documents/download?gcs_uri={uri}&token={bank_token}`.
-    - Uses non-buffering chunked response generators to stream decrypted PDF bytes with negligible server RAM consumption (~0 MB overhead), even during concurrent multi-megabyte bank downloads.
+> [!IMPORTANT]
+> **Postponement Rationale & Memory Safeguard Mandate:**
+> The initial trial prototype on `feature/phase3-invisible-legs` implemented whole-file AES-256-GCM encryption (`encrypt_file_bytes`). While cryptographically sound for small files, whole-file AES-GCM requires loading the *entire* ciphertext into Python heap memory to verify the 16-byte MAC authentication tag before emitting any plaintext. 
+> 
+> For large corporate treasury attachments (e.g. 20MB–100MB audited financial packages, multi-page scanned facility contracts) under concurrent bank downloads (5 to 10 dealers downloading simultaneously upon tender award), whole-file buffering would cause severe server RAM ballooning, garbage collection stalls, and risk Out-Of-Memory (OOM) worker termination.
+> 
+> Therefore, Phase 8.7 was intentionally **postponed to the post-freeze track** to engineer a **bounded-memory chunked streaming architecture** before production deployment.
+
+- **Required Engineering Solutions & Production Pre-requisites**:
+  - **Chunked Authenticated Envelope (STREAM / 64KB Blocks)**:
+    - Files must not be encrypted as a single monolithic block. Instead, files must be segmented into fixed-size authenticated chunks (e.g., 64 KB or 1 MB blocks) following the provably secure STREAM construction (RFC-style chunked AEAD).
+    - Each block possesses its own incremental counter nonce and 16-byte GCM authentication tag, with a final-block marker.
+    - **Memory Ceiling:** Server memory consumption during both upload and download is strictly bounded to $< 128 \text{ KB}$ per connection, regardless of whether the file is 5 MB or 500 MB.
+  - **Direct Cloud Storage Chunked Streaming Pipeline**:
+    - Decryption gateway (`GET /api/v1/quotations/documents/download`) streams bytes directly from Google Cloud Storage via chunked byte-range requests, decrypts block-by-block on the fly, and yields to the client via FastAPI `StreamingResponse`.
+    - Zero server disk writes and zero full-buffer heap allocations.
   - **Zero-Downtime Dual-Read Compatibility**:
-    - Detection routine checks for `RAW_FILE_MAGIC`. Unencrypted legacy contracts and newly encrypted files stream seamlessly side-by-side with zero data migration or historical re-upload requirements.
+    - Detection routine checks for `RAW_FILE_MAGIC` (`ENC_FILE_V1\x00` / `ENC_STREAM_V2\x00`). Unencrypted legacy contracts and newly encrypted files stream seamlessly side-by-side with zero data migration or historical re-upload requirements.
   - **Multi-Pair Leg Gating & Isolation**:
     - Strict validation in split awards: a winning bank dealer on Leg 1 can unseal ONLY Leg 1's attached documents. Attempting to download Leg 2's documents yields HTTP 403 Forbidden.
   - **Cryptographic WORM Audit Integration**:
     - Every file unsealing action is stamped into the tamper-proof forward hash-chained audit ledger (`[TIMESTAMP] Dealer {email} unsealed Document {doc_id} SHA-256: {hash}`).
+  - **Pre-Release Load & Stress Verification**:
+    - Must pass an automated concurrency test: 20 simultaneous downloads of a 50 MB document with server RAM delta strictly remaining under $60 \text{ MB}$.
 
 #### 📌 Sub-Phase 8.8: Notional Volume & Ticket Size Zero-Knowledge Encryption (Upcoming Post-Freeze Track 🚀)
 *Scope: Sealing trade amounts and minimum ticket sizes on quotation requests and legs under Tenant DEK, combined with blind bucketing for search and zero-knowledge volume analytics.*
