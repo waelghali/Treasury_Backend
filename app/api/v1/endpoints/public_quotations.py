@@ -445,11 +445,9 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
 
             p_str = d.get("path", "")
             if p_str and str(p_str).startswith("gs://"):
-                try:
-                    signed_url = await generate_signed_gcs_url(p_str, expiration=604800)
-                    p_str = signed_url or p_str
-                except Exception:
-                    pass
+                matched_leg_id = matched_portal_leg.get("id") if matched_portal_leg else d_id
+                leg_query = f"&leg_id={matched_leg_id}" if matched_leg_id else ""
+                p_str = f"/api/v1/quotations/documents/download?gcs_uri={p_str}&token={token}{leg_query}"
 
             doc_pair_label = (
                 matched_portal_leg.get("currency_pair")

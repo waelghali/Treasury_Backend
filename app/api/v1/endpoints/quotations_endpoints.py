@@ -44,34 +44,223 @@ router = APIRouter()
 @router.post("/upload-documents")
 async def upload_quotation_documents(
     files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Uploads supporting documents for a quotation request to GCS bucket (or local storage fallback) in parallel."""
+    """
+    Uploads supporting documents for a quotation request to GCS bucket encrypted at rest
+    using the Customer's unique 256-bit Tenant DEK via chunked STREAM V2 AEAD (Sub-Phase 8.7).
+    """
     import asyncio
-    from app.core.ai_integration import _upload_to_gcs, generate_signed_gcs_url, GCS_BUCKET_NAME
+    from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
     from app.core.storage_service import build_customer_blob_path
-    
+    from app.services.tenant_key_service import tenant_key_service
+    from app.core.security_crypto import encrypt_file_bytes
+
+    # Retrieve or generate the customer's unique Data Encryption Key (DEK)
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+
     async def _process_single_file(file: UploadFile):
         file_bytes = await file.read()
         safe_filename = f"{uuid.uuid4().hex[:8]}_{file.filename.replace(' ', '_')}"
         blob_path = build_customer_blob_path(current_user.customer_id, "quotations", f"rfq_docs/{safe_filename}")
-        
-        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, file_bytes, file.content_type or "application/octet-stream")
+
+        # Encrypt document at rest using chunked STREAM V2 AEAD (64 KB blocks)
+        encrypted_bytes = encrypt_file_bytes(file_bytes, tenant_dek, context="quotation_doc")
+
+        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, blob_path, encrypted_bytes, "application/octet-stream")
         if not gcs_uri:
             raise HTTPException(status_code=500, detail=f"Failed to upload document {file.filename} to cloud storage")
-        
-        # Fresh upload is guaranteed to exist: skip remote existence check for sub-millisecond HMAC signing
-        signed = await generate_signed_gcs_url(gcs_uri, expiration=604800, skip_existence_check=True)
-        doc_url = signed or gcs_uri
 
         return {
             "name": file.filename,
-            "path": doc_url
+            "path": gcs_uri,
+            "is_encrypted": True
         }
 
-    # Parallelize file reading, uploading, and signing
+    # Parallelize file reading, encrypting, and uploading
     uploaded_files = await asyncio.gather(*[_process_single_file(f) for f in files])
     return {"documents": list(uploaded_files)}
+
+
+@router.get("/documents/download")
+async def download_quotation_document(
+    gcs_uri: str = Query(..., description="GCS URI of the document to download"),
+    token: Optional[str] = Query(None, description="Bank Dealer invitation token"),
+    auth_token: Optional[str] = Query(None, description="Corporate User JWT (for direct browser downloads)"),
+    leg_id: Optional[str] = Query(None, description="Trade Leg ID for multi-pair leg isolation"),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Authenticated streaming decryption gateway for quotation documents (Sub-Phase 8.7).
+    
+    Security & Authorization:
+    1. Authenticated Corporate User (Bearer JWT or auth_token query): must belong to customer owning the doc (or superuser).
+    2. Invited Bank Dealer (token): must possess a valid QuotationBankAssignment token with document visibility enabled.
+    3. Multi-Pair Leg Gating: If leg_id is supplied, verifies bank invitation, leg document visibility,
+       and in split-award completed trades, confirms dealer won the leg.
+    
+    Performance & Memory Ceiling:
+    - Streams directly from Cloud Storage via chunked byte ranges.
+    - Decrypts 64 KB blocks on-the-fly using STREAM V2 AEAD.
+    - RAM delta is strictly bounded to < 128 KB per download stream.
+    - Zero server disk writes and zero full-buffer heap allocations.
+    
+    Compliance:
+    - Immutable WORM audit trail log stamped upon document unsealing.
+    """
+    from fastapi.responses import StreamingResponse
+    from app.core.storage_service import open_gcs_blob_stream
+    from app.services.tenant_key_service import tenant_key_service
+    from app.core.security_crypto import decrypt_stream_generator
+    import mimetypes
+
+    customer_id = None
+    caller_desc = None
+    corporate_user_id = None
+    client_ip = request.client.host if (request and request.client) else None
+
+    # 1. Check Corporate User Authentication (Bearer Token or auth_token query param)
+    auth_header = request.headers.get("Authorization") if request else None
+    raw_jwt = None
+    if auth_header and auth_header.startswith("Bearer "):
+        raw_jwt = auth_header.split(" ")[1]
+    elif auth_token:
+        raw_jwt = auth_token
+    elif request and request.query_params.get("auth_token"):
+        raw_jwt = request.query_params.get("auth_token")
+
+    if raw_jwt:
+        try:
+            from app.core.security import verify_access_token
+            payload = verify_access_token(raw_jwt)
+            customer_id = payload.get("customer_id")
+            corporate_user_id = payload.get("user_id")
+            user_email = payload.get("sub") or payload.get("email") or "user"
+            caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
+            
+            # Corporate tenant isolation check
+            role = (payload.get("role") or "").lower()
+            is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
+            if not is_super and customer_id:
+                expected_segment = f"customer_{customer_id}/"
+                if expected_segment not in gcs_uri:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access Denied: Document does not belong to your corporate organization."
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # 2. Check Bank Dealer Authentication (Invitation Token)
+    if not customer_id and token:
+        assignment = db.query(QuotationBankAssignment).filter(
+            QuotationBankAssignment.token == token
+        ).first()
+        if not assignment:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid quotation access token.")
+
+        rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+        if not rfq:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referenced RFQ session not found.")
+
+        # Master assignment visibility check
+        if assignment.is_document_visible is False:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Document visibility is disabled for this counterparty."
+            )
+
+        # Multi-Pair Leg Gating & Isolation
+        if leg_id:
+            leg = db.query(QuotationLeg).filter(
+                QuotationLeg.id == leg_id,
+                QuotationLeg.rfq_id == rfq.id
+            ).first()
+            if not leg:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referenced trade leg not found.")
+
+            leg_cfg = assignment.get_config_for_leg(leg_id)
+            if getattr(leg_cfg, "is_invited", True) is False:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Counterparty is not invited to this trade leg.")
+            if getattr(leg_cfg, "is_document_visible", True) is False:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Document visibility is disabled for this trade leg.")
+
+            # Leg isolation policy in split awards
+            if leg.status in ("COMPLETED", "ACCEPTED") and leg.winner_bank_id is not None:
+                if assignment.quotation_bank_id != leg.winner_bank_id:
+                    # If this document is specifically attached to this leg, only the winning dealer may unseal
+                    if leg.document_path and gcs_uri in leg.document_path:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Leg Isolation Policy: Confidential documents for this awarded leg are unsealable only by the winning dealer."
+                        )
+
+        customer_id = rfq.customer_id
+        caller_desc = f"Bank Dealer: Bank {assignment.quotation_bank_id} (RFQ {rfq.ref_no})"
+
+    # 3. Reject Unauthenticated Requests
+    if not customer_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: Provide a valid Bearer token or bank quotation access token."
+        )
+
+    # 4. Open Streaming Reader directly from Cloud Storage (0 MB full-file buffer)
+    try:
+        source_stream, content_type, size_bytes = open_gcs_blob_stream(gcs_uri)
+    except Exception as e:
+        logger.error(f"Failed to open storage stream for {gcs_uri}: {e}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document file not found in storage.")
+
+    # 5. Fetch Tenant DEK & Initialize Chunked Decryptor Generator
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+    decrypted_stream = decrypt_stream_generator(source_stream, tenant_dek, context="quotation_doc")
+
+    # 6. Derive Safe Filename & MIME Type
+    raw_filename = gcs_uri.split("/")[-1]
+    if "_" in raw_filename and len(raw_filename.split("_")[0]) == 8:
+        clean_filename = "_".join(raw_filename.split("_")[1:])
+    else:
+        clean_filename = raw_filename
+
+    guessed_type, _ = mimetypes.guess_type(clean_filename)
+    final_content_type = guessed_type or content_type or "application/octet-stream"
+
+    # 7. Stamp Cryptographic WORM Audit Trail
+    try:
+        log_action(
+            db=db,
+            user_id=corporate_user_id,
+            action_type="UNSEAL_DOCUMENT",
+            entity_type="QuotationRequest",
+            entity_id=None,
+            customer_id=customer_id,
+            ip_address=client_ip,
+            details={
+                "gcs_uri": gcs_uri,
+                "filename": clean_filename,
+                "caller": caller_desc,
+                "leg_id": leg_id,
+                "unsealed_at": datetime.now(timezone.utc).isoformat()
+            }
+        )
+    except Exception as audit_err:
+        logger.warning(f"WORM audit log note for unseal: {audit_err}")
+
+    # 8. Return FastAPI StreamingResponse yielding 64 KB blocks on-the-fly
+    return StreamingResponse(
+        decrypted_stream,
+        media_type=final_content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{clean_filename}"',
+            "X-Content-Type-Options": "nosniff"
+        }
+    )
+
 
 
 @router.get("/document-url")

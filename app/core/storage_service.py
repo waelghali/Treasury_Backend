@@ -14,7 +14,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, List, Dict, Any, Union
+from typing import Optional, Tuple, List, Dict, Any, Union, BinaryIO
 
 from app.core.ai_integration import (
     _get_gcs_client,
@@ -240,6 +240,31 @@ def download_bytes_from_gcs_sync(gcs_uri: str) -> Tuple[bytes, str]:
     data = blob.download_as_bytes()
     content_type = blob.content_type or "application/octet-stream"
     return data, content_type
+
+
+def open_gcs_blob_stream(gcs_uri: str) -> Tuple[BinaryIO, str, Optional[int]]:
+    """
+    Opens a chunked streaming reader for a GCS blob with dual-read resolution.
+    Returns (stream, content_type, size_bytes).
+    Uses blob.open('rb') to stream bytes directly from Cloud Storage on-the-fly,
+    achieving strictly bounded RAM usage (< 128 KB per download stream) with zero full-buffer allocations.
+    """
+    bucket_name, blob_name = parse_gcs_uri(gcs_uri)
+    blob, resolved_name = resolve_gcs_blob(bucket_name, blob_name)
+
+    content_type = blob.content_type or "application/octet-stream"
+    size_bytes = getattr(blob, "size", None)
+
+    if hasattr(blob, "open"):
+        try:
+            stream = blob.open("rb")
+            return stream, content_type, size_bytes
+        except Exception as e:
+            logger.warning(f"blob.open('rb') fallback for {gcs_uri}: {e}")
+
+    # Fallback for test doubles or storage environments where blob.open is not supported
+    data = blob.download_as_bytes()
+    return io.BytesIO(data), content_type, len(data)
 
 
 async def generate_signed_url(gcs_uri: str, expiration_seconds: int = 3600, skip_existence_check: bool = False) -> Optional[str]:

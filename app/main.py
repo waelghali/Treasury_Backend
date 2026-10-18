@@ -438,6 +438,13 @@ def configure_app_instance(fastapi_app: FastAPI):
         tags=["Quotation Module"],
         dependencies=[Depends(require_quotation_module)]
     )
+    # Direct quotation document gateway accessible to both Corporate Users & Invited Bank Dealers
+    fastapi_app.include_router(
+        quotations_endpoints.router,
+        prefix="/api/v1/quotations",
+        tags=["Quotation Document Gateway"]
+    )
+
     fastapi_app.include_router(
         public_quotations.router, 
         prefix="/api/v1/public-quotation", 
