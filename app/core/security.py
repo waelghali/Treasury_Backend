@@ -82,6 +82,17 @@ def get_client_ip(request: Request) -> str:
         
     return "IP_NOT_FOUND"
 
+def verify_access_token(token: str) -> Dict[str, Any]:
+    """Decodes and validates a JWT access token, returning the payload dict."""
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid or expired access token: {e}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
 # --- Dependencies ---
 
 
