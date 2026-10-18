@@ -2523,11 +2523,8 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                             seen_paths.add(p_val)
                             p_signed = p_val
                             if str(p_val).startswith("gs://"):
-                                try:
-                                    signed = await generate_signed_gcs_url(p_val, expiration=604800)
-                                    p_signed = signed or p_val
-                                except Exception:
-                                    pass
+                                p_signed = f"/api/v1/quotations/documents/download?gcs_uri={p_val}&token={token}&leg_id={wl_id}"
+
                             released_docs.append({
                                 "name": d.get("name") or "Document",
                                 "path": p_signed,
@@ -2599,11 +2596,8 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 p_val = d.get("path")
                 p_signed = p_val
                 if str(p_val).startswith("gs://"):
-                    try:
-                        signed = await generate_signed_gcs_url(p_val, expiration=604800)
-                        p_signed = signed or p_val
-                    except Exception:
-                        pass
+                    p_signed = f"/api/v1/quotations/documents/download?gcs_uri={p_val}&token={token}"
+
                 released_docs.append({
                     "name": d.get("name") or "Document",
                     "path": p_signed,
