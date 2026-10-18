@@ -174,6 +174,14 @@ async def download_quotation_document(
                 detail="Document visibility is disabled for this counterparty."
             )
 
+        # Verify that requested document is attached to this RFQ session
+        rfq_docs_str = rfq.document_path or ""
+        if gcs_uri not in rfq_docs_str:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: Document is not attached to this quotation request."
+            )
+
         # Multi-Pair Leg Gating & Isolation
         if leg_id:
             leg = db.query(QuotationLeg).filter(
