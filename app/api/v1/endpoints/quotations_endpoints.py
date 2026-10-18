@@ -183,29 +183,59 @@ async def download_quotation_document(
             )
 
         # Multi-Pair Leg Gating & Isolation
+        assigned_bank_master_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
+
+        target_leg = None
         if leg_id:
-            leg = db.query(QuotationLeg).filter(
+            target_leg = db.query(QuotationLeg).filter(
                 QuotationLeg.id == leg_id,
                 QuotationLeg.rfq_id == rfq.id
             ).first()
-            if not leg:
+            if not target_leg:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referenced trade leg not found.")
+        else:
+            # Auto-detect if this document is attached specifically to a leg
+            doc_filename = gcs_uri.split("/")[-1]
+            for l in (rfq.legs or []):
+                if l.document_path and doc_filename in l.document_path:
+                    target_leg = l
+                    break
 
-            leg_cfg = assignment.get_config_for_leg(leg_id)
+        if target_leg:
+            leg_cfg = assignment.get_config_for_leg(target_leg.id)
             if getattr(leg_cfg, "is_invited", True) is False:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Counterparty is not invited to this trade leg.")
             if getattr(leg_cfg, "is_document_visible", True) is False:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Document visibility is disabled for this trade leg.")
 
-            # Leg isolation policy in split awards
-            if leg.status in ("COMPLETED", "ACCEPTED") and leg.winner_bank_id is not None:
-                if assignment.quotation_bank_id != leg.winner_bank_id:
-                    # If this document is specifically attached to this leg, only the winning dealer may unseal
-                    if leg.document_path and gcs_uri in leg.document_path:
+            # Leg isolation policy in split awards: match against master Bank.id and QuotationBank.id
+            if target_leg.status in ("COMPLETED", "ACCEPTED") and target_leg.winner_bank_id is not None:
+                is_leg_winner = (
+                    (assigned_bank_master_id is not None and assigned_bank_master_id == target_leg.winner_bank_id) or
+                    assignment.quotation_bank_id == target_leg.winner_bank_id
+                )
+                if not is_leg_winner:
+                    if target_leg.document_path and doc_filename in target_leg.document_path:
                         raise HTTPException(
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail="Leg Isolation Policy: Confidential documents for this awarded leg are unsealable only by the winning dealer."
                         )
+        elif getattr(rfq, "release_to_winner_only", False) and rfq.status in ("COMPLETED", "ACCEPTED"):
+            # RFQ-level winner check
+            rfq_winner_match = (
+                (assigned_bank_master_id is not None and assigned_bank_master_id == rfq.winner_bank_id) or
+                assignment.quotation_bank_id == rfq.winner_bank_id
+            )
+            any_leg_won = any(
+                (assigned_bank_master_id is not None and assigned_bank_master_id == l.winner_bank_id) or
+                assignment.quotation_bank_id == l.winner_bank_id
+                for l in (rfq.legs or [])
+            )
+            if not (rfq_winner_match or any_leg_won):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Winner-Only Policy: This document is released exclusively to winning counterparty desks."
+                )
 
         customer_id = rfq.customer_id
         caller_desc = f"Bank Dealer: Bank {assignment.quotation_bank_id} (RFQ {rfq.ref_no})"
