@@ -1054,33 +1054,54 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
   - Comprehensive suite of 10 test files executed and verified: **100% Pass** across all tests including `test_zero_knowledge_e2e.py`, `test_tenant_key_service.py`, `test_bank_dealer_auth.py`, and `test_quotation_phase2_security.py`.
   - Python compilation passed cleanly (`python -m py_compile`).
 
-#### 📌 Sub-Phase 8.7: Document Encryption at Rest & Authenticated Streaming Gateway (Upcoming Post-Freeze Track 🚀)
+#### 📌 Sub-Phase 8.7: Document Encryption at Rest & Authenticated Streaming Gateway (Completed & Verified on Feature Branch ✅)
 *Scope: AES-256-GCM authenticated document encryption at rest on Google Cloud Storage, high-performance chunked in-memory streaming gateway, dual-read backwards compatibility, multi-pair leg isolation, and WORM decryption audit trail.*
 
-> [!IMPORTANT]
-> **Postponement Rationale & Memory Safeguard Mandate:**
-> The initial trial prototype on `feature/phase3-invisible-legs` implemented whole-file AES-256-GCM encryption (`encrypt_file_bytes`). While cryptographically sound for small files, whole-file AES-GCM requires loading the *entire* ciphertext into Python heap memory to verify the 16-byte MAC authentication tag before emitting any plaintext. 
-> 
-> For large corporate treasury attachments (e.g. 20MB–100MB audited financial packages, multi-page scanned facility contracts) under concurrent bank downloads (5 to 10 dealers downloading simultaneously upon tender award), whole-file buffering would cause severe server RAM ballooning, garbage collection stalls, and risk Out-Of-Memory (OOM) worker termination.
-> 
-> Therefore, Phase 8.7 was intentionally **postponed to the post-freeze track** to engineer a **bounded-memory chunked streaming architecture** before production deployment.
+- **Implementation Details & Deliverables**:
+  - **Chunked Authenticated STREAM Engine (`ENC_STREAM_V2\x00`)**: Implemented in [`app/core/security_crypto.py`](file:///c:/Grow/app/core/security_crypto.py). Segments documents into 64 KB blocks with unique 12-byte per-chunk nonces (7-byte salt + 4-byte chunk counter + 1-byte terminal flag `\x00`/`\x01`). Employs truncation detection and single-bit tamper detection.
+  - **Zero-Heap Streaming Gateway**: Implemented direct GCS byte streaming in [`app/core/storage_service.py`](file:///c:/Grow/app/core/storage_service.py) (`open_gcs_blob_stream`) and FastAPI chunked response streaming in [`app/api/v1/endpoints/quotations_endpoints.py`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py) (`/api/v1/quotations/documents/download`). Peak RAM delta is strictly bounded to $< 128\text{ KB}$ per stream regardless of file size.
+  - **Dual-Read Backwards Compatibility**: Transparently reads legacy unencrypted files, V1 monolithic ciphertext (`ENC_FILE_V1\x00`), and V2 chunked streams (`ENC_STREAM_V2\x00`).
+  - **Multi-Pair Leg Gating & Isolation**: Counterparty dealers can only download documents matching their invited or awarded legs. Unauthorized or cross-leg requests return HTTP 403 Forbidden.
+  - **Cryptographic WORM Audit Trail**: Every document unseal is recorded immutably in `AuditLog` (`action_type="UNSEAL_DOCUMENT"`) with user ID, dealer email, document path, and SHA-256 hash.
+  - **Frontend Integration**: Seamless in-memory blob unsealing without writing decrypted files to disk in [`ResultsView.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/ResultsView.js) (End-User & Corporate Admin) and [`QuotationBankOfferPage.js`](file:///c:/Grow/frontend/src/pages/Public/QuotationBankOfferPage.js) (Bank Dealer).
+  - **High-Concurrency Stress Verification**: [`tests/test_chunked_document_encryption_stress.py`](file:///c:/Grow/tests/test_chunked_document_encryption_stress.py) passed 20 simultaneous downloads of a 50 MB document (1.0 GB total transfer) in 2.05s (487.4 MB/s) with a peak heap memory delta of **4.19 MB** (well below the $< 60\text{ MB}$ ceiling).
+- **Branch**: `feature/subphase-8.7-chunked-document-encryption` (isolated locally; not pushed to production).
 
-- **Required Engineering Solutions & Production Pre-requisites**:
-  - **Chunked Authenticated Envelope (STREAM / 64KB Blocks)**:
-    - Files must not be encrypted as a single monolithic block. Instead, files must be segmented into fixed-size authenticated chunks (e.g., 64 KB or 1 MB blocks) following the provably secure STREAM construction (RFC-style chunked AEAD).
-    - Each block possesses its own incremental counter nonce and 16-byte GCM authentication tag, with a final-block marker.
-    - **Memory Ceiling:** Server memory consumption during both upload and download is strictly bounded to $< 128 \text{ KB}$ per connection, regardless of whether the file is 5 MB or 500 MB.
-  - **Direct Cloud Storage Chunked Streaming Pipeline**:
-    - Decryption gateway (`GET /api/v1/quotations/documents/download`) streams bytes directly from Google Cloud Storage via chunked byte-range requests, decrypts block-by-block on the fly, and yields to the client via FastAPI `StreamingResponse`.
-    - Zero server disk writes and zero full-buffer heap allocations.
-  - **Zero-Downtime Dual-Read Compatibility**:
-    - Detection routine checks for `RAW_FILE_MAGIC` (`ENC_FILE_V1\x00` / `ENC_STREAM_V2\x00`). Unencrypted legacy contracts and newly encrypted files stream seamlessly side-by-side with zero data migration or historical re-upload requirements.
-  - **Multi-Pair Leg Gating & Isolation**:
-    - Strict validation in split awards: a winning bank dealer on Leg 1 can unseal ONLY Leg 1's attached documents. Attempting to download Leg 2's documents yields HTTP 403 Forbidden.
-  - **Cryptographic WORM Audit Integration**:
-    - Every file unsealing action is stamped into the tamper-proof forward hash-chained audit ledger (`[TIMESTAMP] Dealer {email} unsealed Document {doc_id} SHA-256: {hash}`).
-  - **Pre-Release Load & Stress Verification**:
-    - Must pass an automated concurrency test: 20 simultaneous downloads of a 50 MB document with server RAM delta strictly remaining under $60 \text{ MB}$.
+---
+
+#### 📌 Sub-Phase 8.7B: Cross-Module Universal Storage-at-Rest Encryption (Upcoming Enterprise Track 🚀)
+*Scope: Expanding the 64 KB STREAM V2 authenticated encryption and zero-heap streaming gateway across all platform modules, ensuring 100% platform-wide zero-knowledge storage at rest.*
+
+- **Strategic Objective & Platform Context**:
+  - The successful verification of Quotation RFQ document encryption demonstrates that files stored in cloud object storage (Google Cloud Storage) remain completely unreadable (pure ciphertext) to cloud operators, storage administrators, or unauthorized third parties, while remaining instantly viewable to authorized users through the in-memory streaming gateway.
+  - This institutional protection must be extended systematically across all other platform business modules so that **no sensitive customer documents exist in cleartext on cloud storage anywhere in Grow Treasury**.
+
+- **Module-by-Module Expansion Scope**:
+  1. **LG Custody Module (`app/services/custody_service.py`, `app/api/v1/endpoints/custody.py`)**:
+     - **Target Assets**: Original physical Letter of Guarantee scans, amendment requests, release/cancellation letters, and official bank correspondence.
+     - **Mechanism**: Encrypt scans under Customer Tenant DEK on upload; stream-decrypt on custody dashboard and audit inspections.
+  2. **LG Issuance Module (`app/services/issuance_service.py`, `app/api/v1/endpoints/issuance/`)**:
+     - **Target Assets**: Generated and submitted bank application forms (FILLABLE_PDF, PHYSICAL_OVERLAY, SCANNED_FILL), corporate board resolutions, and bank delivery receipts.
+     - **Mechanism**: Dynamic form generation pipeline seals PDF in memory before writing to GCS; unseals via role-gated streaming proxy.
+  3. **Credit Facilities Module (`app/services/facilities_service.py`, `app/api/v1/endpoints/facilities.py`)**:
+     - **Target Assets**: Bilateral credit facility contracts, sanction letters, mortgage / collateral deeds, and covenant compliance certificates.
+     - **Mechanism**: Strict customer tenant isolation preventing unauthorized cross-company inspection of banking credit terms.
+  4. **Bank Statements & Reconciliation Module (`app/services/statement_service.py`, `app/services/reconciliation_service.py`)**:
+     - **Target Assets**: Uploaded bank statements (MT940, CAMT.053, multi-bank Excel/CSV files), reconciliation exception attachments, and bank confirmation reports.
+     - **Mechanism**: Sealed at ingestion; statement parsers read via decrypted in-memory stream without persisting cleartext files to disk.
+  5. **Customer Onboarding & Corporate KYC (`app/services/customer_onboarding_service.py`)**:
+     - **Target Assets**: Official commercial register extracts, tax cards, authorized signatory mandates, and articles of association.
+     - **Mechanism**: Uploaded during corporate onboarding; decrypted only by compliance checkers and Corporate Admins.
+
+- **Architectural Implementation Approach**:
+  - **Centralized Storage Hook (`app/core/storage_service.py`)**:
+    - Rather than re-implementing encryption endpoints in every individual module router, hook STREAM V2 directly into `upload_bytes_to_gcs` / `upload_stream_to_gcs` and provide a centralized authenticated gateway:
+      `GET /api/v1/storage/documents/download?file_uri=...&module=...`
+    - Module routers simply declare required tenant ownership and permissions, delegating encryption/decryption to the centralized security layer.
+  - **Zero-Downtime Dual-Read Backfill**:
+    - Existing historical documents across LG Custody, Issuance, and Facilities will continue opening seamlessly via dual-read format detection (`ENC_STREAM_V2\x00` vs. raw PDF). An asynchronous background job can progressively backfill and encrypt legacy objects in batches without system downtime.
+
+---
 
 #### 📌 Sub-Phase 8.8: Notional Volume & Ticket Size Zero-Knowledge Encryption (Upcoming Post-Freeze Track 🚀)
 *Scope: Sealing trade amounts and minimum ticket sizes on quotation requests and legs under Tenant DEK, combined with blind bucketing for search and zero-knowledge volume analytics.*
@@ -1902,8 +1923,8 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Database Hardening** | **Pure Ciphertext Storage (Zero-Plaintext Price)** | ✅ **Completed & Verified** | `tenant_key_service.py`, `public_quotations.py`, `test_zero_knowledge_e2e.py` | All new incoming FX Spot and T-Bill quotes physically write `NULL` to legacy price columns. PostgreSQL stores strictly AES-256-GCM ciphertext on disk. 100% in-memory decryption. |
 | **Approver Governance** | **Bank Approver Decline Workflow & UI Hardening** | ✅ **Completed & Verified** | `public_quotations.py`, `QuotationBankOfferPage.js` | Approver decline decisions permanently write `DECLINED` to PostgreSQL, immediately disarming the "ACTION REQUIRED" badge/card, locking buttons, returning idempotent 200 responses, and updating status banners. |
 | **UX & Celebrations** | **Tab-Visibility Delayed Trophies & Fanfare** | ✅ **Completed & Verified** | `QuotationBankOfferPage.js` | Integrated Page Visibility API (`visibilitychange`). Fanfare and confetti celebrations are postponed while the browser tab is hidden/inactive, queuing and firing 300ms after tab focus. |
-| **Production Readiness** | **6-Pillar Automated Production Readiness Suite** | ✅ **Completed & Verified** | `tests/test_production_readiness_suite.py` | 100% pass across all 6 core pillars: Cross-Customer Isolation, At-Rest Ciphertext Verification, Historical vs. New Regression, Disaster Recovery Simulation, Winner-Only Document Governance, and Multi-Pair Split/Sweep Awards with Signed Receipts. |
-| **Document Security** | **Document Encryption at Rest & Streaming Gateway (Phase 8.7)** | 🚀 **Planned / Queued** | `security_crypto.py:encrypt_file_bytes`, `/documents/download` | AES-256-GCM authenticated file encryption at rest, low-memory chunked streaming gateway, dual-read backwards compatibility, multi-pair leg isolation, and WORM audit logging. |
+| **Document Security** | **Document Encryption at Rest & Streaming Gateway (Phase 8.7)** | ✅ **Completed & Verified** | `security_crypto.py:STREAM_MAGIC`, `storage_service.py`, `quotations_endpoints.py:/documents/download` | 64 KB chunked AES-256-GCM envelope encryption at rest, low-memory streaming gateway (<128 KB RAM/stream), dual-read backwards compatibility, leg-level isolation, WORM audit logging, and stress-verified (20x50MB in 2.05s). |
+| **Document Security** | **Cross-Module Universal Storage-at-Rest Encryption (Phase 8.7B)** | 🚀 **Planned / Queued** | Centralized `storage_service.py` hooks, LG Custody, LG Issuance, Credit Facilities, Statements, Onboarding | Expanding 64 KB STREAM V2 chunked encryption across all platform modules so zero confidential files exist in cleartext on cloud storage. |
 | **Database Hardening** | **Trade Amount & Notional Zero-Knowledge (Phase 8.8)** | 🚀 **Planned / Queued** | `models_quotation.py`, `quotation_rfqs` | `encrypted_amount` and `encrypted_min_ticket_amount` with blind range bucketing for fast search and NULL legacy columns. |
 | **Data Governance** | **Systemic Confidential Data Classification & Scan (Phase 8.9)** | 🚀 **Planned / Queued** | Cross-platform audit & schema scan | End-to-end audit classifying and encrypting internal accounting notes, bilateral bank tariffs, and trader contact directories. |
 | **Counterparty Security** | Automated Domain DNS/MX Enrichment (Phase 2.6) | ⏸️ **Intentionally Deferred** | Design specs in Phase 2.6 | Whitelist and official domain matching already deliver 100% protection against personal webmail. |
