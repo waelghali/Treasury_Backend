@@ -13,6 +13,8 @@ import uuid
 import shutil
 import threading
 import asyncio
+import hashlib
+import time
 
 from app.database import get_db
 from app.core.security import get_current_active_user, TokenData
