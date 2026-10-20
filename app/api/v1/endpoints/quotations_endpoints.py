@@ -111,23 +111,40 @@ async def create_document_download_ticket(
         try:
             payload = verify_access_token(raw_jwt)
             customer_id = payload.get("customer_id")
+            corporate_user_id = payload.get("user_id")
             user_email = payload.get("sub") or payload.get("email") or "user"
             caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
 
             role = (payload.get("role") or "").lower()
             is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
-            if not is_super and customer_id:
+            if is_super and not customer_id:
+                import re
+                m = re.search(r"customer_(\d+)", gcs_uri)
+                if m:
+                    customer_id = int(m.group(1))
+            elif not is_super and customer_id:
                 expected_segment = f"customer_{customer_id}/"
                 if expected_segment not in gcs_uri:
-                    logger.warning(f"Document access blocked: Cross-tenant corporate isolation breach attempt by user {corporate_user_id} on {gcs_uri}")
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Access denied or Not found"
-                    )
+                    has_access = False
+                    import re
+                    m = re.search(r"customer_(\d+)", gcs_uri)
+                    if m:
+                        target_cid = int(m.group(1))
+                        from app.models.models import Customer
+                        target_cust = db.query(Customer).filter(Customer.id == target_cid).first()
+                        if target_cust and getattr(target_cust, "parent_id", None) == customer_id:
+                            has_access = True
+                            customer_id = target_cid
+                    if not has_access:
+                        logger.warning(f"Document access blocked: Cross-tenant corporate isolation breach attempt by user {corporate_user_id} on {gcs_uri}")
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Access denied or Not found"
+                        )
         except HTTPException:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Corporate token verification exception: {e}")
 
     # 2. Bank Dealer Auth (Option B: Requires assignment token + active OTP session)
     if not customer_id and req.token:
@@ -362,18 +379,34 @@ async def download_quotation_document(
                 # Corporate tenant isolation check
                 role = (payload.get("role") or "").lower()
                 is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
-                if not is_super and customer_id:
+                if is_super and not customer_id:
+                    import re
+                    m = re.search(r"customer_(\d+)", gcs_uri)
+                    if m:
+                        customer_id = int(m.group(1))
+                elif not is_super and customer_id:
                     expected_segment = f"customer_{customer_id}/"
                     if expected_segment not in gcs_uri:
-                        logger.warning(f"Document download blocked: Tenant isolation breach attempt by user {corporate_user_id} on {gcs_uri}")
-                        raise HTTPException(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Access denied or Not found"
-                        )
+                        has_access = False
+                        import re
+                        m = re.search(r"customer_(\d+)", gcs_uri)
+                        if m:
+                            target_cid = int(m.group(1))
+                            from app.models.models import Customer
+                            target_cust = db.query(Customer).filter(Customer.id == target_cid).first()
+                            if target_cust and getattr(target_cust, "parent_id", None) == customer_id:
+                                has_access = True
+                                customer_id = target_cid
+                        if not has_access:
+                            logger.warning(f"Document download blocked: Tenant isolation breach attempt by user {corporate_user_id} on {gcs_uri}")
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Access denied or Not found"
+                            )
             except HTTPException:
                 raise
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Download token verification error: {e}")
 
     # 2. Check Bank Dealer Authentication (Invitation Token)
     if not customer_id and token:
