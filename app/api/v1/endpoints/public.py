@@ -19,6 +19,7 @@ from app.crud.crud import crud_legal_artifact, crud_global_configuration, crud_t
 from app.core.email_service import get_global_email_settings, send_email, EmailAttachment
 from app.core.document_generator import generate_pdf_from_html
 from app.constants import GlobalConfigKey, LegalArtifactType
+from app.core.honeypot import verify_honeypot
 
 # *** FIXED: Use storage.Client() inside function (not at module level) ***
 import logging
@@ -131,10 +132,14 @@ async def register_free_trial(
     requested_modules: str = Form("custody", description="Comma-separated list of requested modules: custody, issuance, or both"),
     commercial_register_document: UploadFile = File(...),
     accepted_terms: str = Form(...),
+    website_url: Optional[str] = Form(None),
 ):
     """
     Handles a new free trial registration from a public user.
     """
+    # Perimeter Anti-Bot Honeypot Defense (§2.8)
+    await verify_honeypot(website_url, request=request, context="free_trial_registration")
+
     if accepted_terms.lower() != 'true':
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Terms and Conditions must be accepted.")
         
