@@ -582,13 +582,16 @@ async def download_quotation_document(
     except Exception as audit_err:
         logger.warning(f"WORM audit log note for unseal: {audit_err}")
 
-    # 8. Return FastAPI StreamingResponse yielding 64 KB blocks on-the-fly
+    # 8. Return FastAPI StreamingResponse yielding 64 KB blocks on-the-fly with ephemeral non-caching headers
     return StreamingResponse(
         decrypted_stream,
         media_type=final_content_type,
         headers={
             "Content-Disposition": f'inline; filename="{clean_filename}"',
-            "X-Content-Type-Options": "nosniff"
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Pragma": "no-cache",
+            "Expires": "0"
         }
     )
 
