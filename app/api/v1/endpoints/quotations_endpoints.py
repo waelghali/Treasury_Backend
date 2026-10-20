@@ -161,6 +161,28 @@ async def create_document_download_ticket(
                 detail="Access denied or Not found"
             )
 
+        # Phase 12 Document Governance Checks
+        parsed_rfq_docs = rfq.get_parsed_documents() if hasattr(rfq, 'get_parsed_documents') else []
+        matching_doc = next(
+            (d for d in parsed_rfq_docs if (d.get("path") and (gcs_uri in d.get("path") or doc_filename in d.get("path")))),
+            None
+        )
+
+        # 1. 100% Bank Air-Gap: Reject INTERNAL_ONLY documents for bank counterparties immediately
+        if matching_doc and (matching_doc.get("is_internal_only") or matching_doc.get("scope") == "INTERNAL_ONLY"):
+            logger.warning(f"Document ticket rejected: Dealer attempted access to INTERNAL_ONLY document {doc_filename} on RFQ {rfq.id}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+        # 2. Orthogonal Timing Gate: If release_timing == WINNER_ONLY, withhold until deal execution
+        is_deal_executed = (rfq.status in ("COMPLETED", "ACCEPTED") or getattr(rfq, "acceptance_status", None) in ("ACCEPTED", "AUTO_ACCEPTED"))
+        is_winner_timing = (
+            (matching_doc and matching_doc.get("release_timing") == "WINNER_ONLY") or
+            getattr(rfq, "release_to_winner_only", False)
+        )
+        if is_winner_timing and not is_deal_executed:
+            logger.warning(f"Document ticket rejected: WINNER_ONLY document {doc_filename} requested during bidding window on RFQ {rfq.id}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
         # Multi-Pair Leg Gating & Isolation
         assigned_bank_master_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
 
@@ -198,7 +220,7 @@ async def create_document_download_ticket(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="Access denied or Not found"
                     )
-        elif getattr(rfq, "release_to_winner_only", False) and rfq.status in ("COMPLETED", "ACCEPTED"):
+        elif is_winner_timing and is_deal_executed:
             rfq_winner_match = (
                 (assigned_bank_master_id is not None and assigned_bank_master_id == rfq.winner_bank_id) or
                 assignment.quotation_bank_id == rfq.winner_bank_id
@@ -385,12 +407,35 @@ async def download_quotation_document(
 
         # Verify that requested document is attached to this RFQ session
         rfq_docs_str = rfq.document_path or ""
-        if gcs_uri not in rfq_docs_str:
+        doc_filename = gcs_uri.split("/")[-1]
+        if gcs_uri not in rfq_docs_str and doc_filename not in rfq_docs_str:
             logger.warning(f"Document download rejected: Document not attached to RFQ {rfq.id}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied or Not found"
             )
+
+        # Phase 12 Document Governance Checks
+        parsed_rfq_docs = rfq.get_parsed_documents() if hasattr(rfq, 'get_parsed_documents') else []
+        matching_doc = next(
+            (d for d in parsed_rfq_docs if (d.get("path") and (gcs_uri in d.get("path") or doc_filename in d.get("path")))),
+            None
+        )
+
+        # 1. 100% Bank Air-Gap: Reject INTERNAL_ONLY documents for bank counterparties immediately
+        if matching_doc and (matching_doc.get("is_internal_only") or matching_doc.get("scope") == "INTERNAL_ONLY"):
+            logger.warning(f"Document download rejected: Dealer attempted access to INTERNAL_ONLY document {doc_filename} on RFQ {rfq.id}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+        # 2. Orthogonal Timing Gate: If release_timing == WINNER_ONLY, withhold until deal execution
+        is_deal_executed = (rfq.status in ("COMPLETED", "ACCEPTED") or getattr(rfq, "acceptance_status", None) in ("ACCEPTED", "AUTO_ACCEPTED"))
+        is_winner_timing = (
+            (matching_doc and matching_doc.get("release_timing") == "WINNER_ONLY") or
+            getattr(rfq, "release_to_winner_only", False)
+        )
+        if is_winner_timing and not is_deal_executed:
+            logger.warning(f"Document download rejected: WINNER_ONLY document {doc_filename} requested during bidding window on RFQ {rfq.id}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
 
         # Multi-Pair Leg Gating & Isolation
         assigned_bank_master_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
@@ -405,7 +450,6 @@ async def download_quotation_document(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
         else:
             # Auto-detect if this document is attached specifically to a leg
-            doc_filename = gcs_uri.split("/")[-1]
             for l in (rfq.legs or []):
                 if l.document_path and doc_filename in l.document_path:
                     target_leg = l
@@ -433,7 +477,7 @@ async def download_quotation_document(
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail="Access denied or Not found"
                         )
-        elif getattr(rfq, "release_to_winner_only", False) and rfq.status in ("COMPLETED", "ACCEPTED"):
+        elif is_winner_timing and is_deal_executed:
             # RFQ-level winner check
             rfq_winner_match = (
                 (assigned_bank_master_id is not None and assigned_bank_master_id == rfq.winner_bank_id) or

@@ -357,12 +357,14 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     # Phase 9: Secure Leg-Scoped Document Filtering Engine
     # Documents associated with invisible legs, uninvited legs, or legs with is_document_visible=False are strictly excluded.
     # Indicative legs default to hidden, but intentional user override (is_document_visible=True) is honored.
-    # If release_docs_to_winner_only is active, all documents are withheld during the bidding window.
+    # Phase 12 Orthogonal Document Governance:
+    # 1. 100% Bank Air-Gap: INTERNAL_ONLY documents are strictly excluded from all counterparties.
+    # 2. Orthogonal Timing: Documents with release_timing == 'WINNER_ONLY' are withheld during bidding.
+    # 3. Strict Leg Firewall: Leg-scoped documents are only visible to banks invited to that leg with docs enabled.
     parsed_docs = []
-    is_winner_only = bool(getattr(rfq, 'release_docs_to_winner_only', False))
     is_cross = bool(getattr(assignment, 'is_cross_entity', False))
 
-    if not is_winner_only and not is_cross and rfq.document_path and (assignment.is_document_visible is not False):
+    if not is_cross and rfq.document_path and (assignment.is_document_visible is not False):
         raw_docs = rfq.get_parsed_documents() if hasattr(rfq, 'get_parsed_documents') else []
         if not raw_docs and rfq.document_path:
             try:
@@ -403,6 +405,15 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         from app.core.ai_integration import generate_signed_gcs_url
 
         for d in raw_docs:
+            # Phase 12 Air-Gap Check: Skip internal-only documents
+            if d.get("is_internal_only") or d.get("scope") == "INTERNAL_ONLY":
+                continue
+
+            # Phase 12 Timing Gate: Withhold winner-only documents during open bidding
+            timing = d.get("release_timing") or ("WINNER_ONLY" if getattr(rfq, 'release_docs_to_winner_only', False) else "BIDDING")
+            if timing == "WINNER_ONLY":
+                continue
+
             d_idx = d.get("leg_index")
             d_id = str(d.get("leg_id") or "").strip()
             d_pair = str(d.get("pair") or "").strip().upper()
@@ -2532,6 +2543,9 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                         continue
                     leg_docs = rfq.get_documents_for_leg(leg_index=wl_idx, leg_id=wl_id, pair=wl_pair)
                     for d in leg_docs:
+                        # Phase 12 Air-Gap Check: Skip internal-only documents
+                        if d.get("is_internal_only") or d.get("scope") == "INTERNAL_ONLY":
+                            continue
                         d_pair = d.get("pair")
                         # Strict check: If doc has a pair, it MUST match the won leg's pair!
                         if d_pair and d_pair.strip().upper() != wl_pair.strip().upper():
@@ -2611,6 +2625,9 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
             all_docs = rfq.get_parsed_documents()
             from app.core.ai_integration import generate_signed_gcs_url
             for d in all_docs:
+                # Phase 12 Air-Gap Check: Skip internal-only documents
+                if d.get("is_internal_only") or d.get("scope") == "INTERNAL_ONLY":
+                    continue
                 p_val = d.get("path")
                 p_signed = p_val
                 if str(p_val).startswith("gs://"):

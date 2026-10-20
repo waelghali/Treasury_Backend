@@ -382,28 +382,155 @@ class QuotationRequest(BaseModel):
         return False
 
     def get_parsed_documents(self) -> list:
+        """
+        Phase 12: Returns all attached documents normalized with the 2-dimensional
+        orthogonal governance matrix: Scope (ALL_PAIRS, SPECIFIC_LEG, INTERNAL_ONLY)
+        and Release Timing (BIDDING, WINNER_ONLY). Fully backwards-compatible with legacy formats.
+        """
         if not self.document_path:
             return []
+        
+        raw_docs = []
+        root_winner_only = False
         try:
             import json, os
             data = json.loads(self.document_path)
             if isinstance(data, dict):
-                return data.get("documents", [])
+                root_winner_only = bool(data.get("release_to_winner_only"))
+                raw_docs = data.get("documents", [])
             elif isinstance(data, list):
-                return data
+                raw_docs = data
+            elif isinstance(data, str):
+                raw_docs = [{"name": os.path.basename(data.strip()), "path": data.strip()}]
         except Exception:
             import os
-            return [{"name": os.path.basename(p.strip()), "path": p.strip()} for p in self.document_path.split(',') if p.strip()]
-        return []
+            raw_docs = [{"name": os.path.basename(p.strip()), "path": p.strip()} for p in self.document_path.split(',') if p.strip()]
 
-    def get_documents_for_leg(self, leg_index: int = None, leg_id: str = None, pair: str = None) -> list:
-        """Returns documents associated with a specific leg (or global docs applicable to all legs)."""
-        docs = self.get_parsed_documents()
+        normalized = []
+        for idx, doc in enumerate(raw_docs):
+            if not isinstance(doc, dict):
+                continue
+            
+            p_val = doc.get("path") or ""
+            doc_name = doc.get("name") or doc.get("filename") or (os.path.basename(p_val) if p_val else f"Document_{idx+1}")
+            doc_id = doc.get("id") or f"doc_{idx}_{abs(hash(p_val)) % 1000000}"
+            
+            # Check internal only flag
+            is_internal = bool(
+                doc.get("is_internal_only") is True or 
+                str(doc.get("scope") or "").upper() == "INTERNAL_ONLY"
+            )
+            
+            leg_idx = doc.get("leg_index")
+            leg_id_val = str(doc.get("leg_id") or "").strip() or None
+            pair_val = str(doc.get("pair") or "").strip().upper() or None
+            
+            if is_internal:
+                scope = "INTERNAL_ONLY"
+                release_timing = None
+            else:
+                raw_scope = str(doc.get("scope") or "").upper()
+                if raw_scope in ("ALL_PAIRS", "SPECIFIC_LEG"):
+                    scope = raw_scope
+                elif leg_idx is not None or leg_id_val or pair_val:
+                    scope = "SPECIFIC_LEG"
+                else:
+                    scope = "ALL_PAIRS"
+                
+                raw_timing = str(doc.get("release_timing") or "").upper()
+                if raw_timing in ("BIDDING", "WINNER_ONLY"):
+                    release_timing = raw_timing
+                elif doc.get("release_to_winner_only") is True or root_winner_only:
+                    release_timing = "WINNER_ONLY"
+                else:
+                    release_timing = "BIDDING"
+
+            normalized.append({
+                "id": doc_id,
+                "name": doc_name,
+                "path": p_val,
+                "scope": scope,
+                "leg_index": leg_idx,
+                "leg_id": leg_id_val,
+                "pair": pair_val,
+                "release_timing": release_timing,
+                "is_internal_only": is_internal,
+                "release_to_winner_only": (release_timing == "WINNER_ONLY")
+            })
+
+        return normalized
+
+    def get_internal_documents(self) -> list:
+        """Phase 12: Returns customer-only internal vault documents (100% bank air-gap)."""
+        return [d for d in self.get_parsed_documents() if d.get("is_internal_only") is True]
+
+    def get_counterparty_documents(
+        self,
+        leg_index: int = None,
+        leg_id: str = None,
+        pair: str = None,
+        is_winner: bool = False,
+        is_bidding: bool = False
+    ) -> list:
+        """
+        Phase 12: Counterparty-safe document extractor.
+        1. STRICT BANK AIR-GAP: Discards any document where is_internal_only is True.
+        2. Orthogonal Timing Filter: If is_bidding, withholds WINNER_ONLY docs until deal award.
+        3. Strict Leg Firewall: Filters to docs applicable to the given leg or all pairs.
+        """
+        all_docs = self.get_parsed_documents()
         filtered = []
 
-        # Check if 0-based indexing is used in the uploaded doc set (e.g. frontend pIdx 0, 1...)
-        has_zero_indexed = any(d.get("leg_index") == 0 for d in docs if d.get("leg_index") is not None)
+        # Zero-Knowledge bank air-gap: filter out all internal docs immediately
+        external_docs = [d for d in all_docs if not d.get("is_internal_only")]
 
+        has_zero_indexed = any(d.get("leg_index") == 0 for d in external_docs if d.get("leg_index") is not None)
+        clean_pair = pair.strip().upper() if pair else None
+        clean_leg_id = str(leg_id).strip() if leg_id else None
+
+        for d in external_docs:
+            timing = d.get("release_timing") or "BIDDING"
+            # If during bidding window and doc is winner-only -> withhold
+            if is_bidding and timing == "WINNER_ONLY":
+                continue
+
+            d_idx = d.get("leg_index")
+            d_id = str(d.get("leg_id") or "").strip()
+            d_pair = str(d.get("pair") or "").strip().upper()
+
+            # Global docs (scope == ALL_PAIRS or no leg identifiers) apply across legs
+            if d.get("scope") == "ALL_PAIRS" or (d_idx is None and not d_id and not d_pair):
+                filtered.append(d)
+                continue
+
+            # Leg-scoped: strict cross-leg firewall
+            if d_pair and clean_pair and d_pair != clean_pair:
+                continue
+            if clean_leg_id and d_id and d_id == clean_leg_id:
+                filtered.append(d)
+                continue
+            if clean_pair and d_pair and d_pair == clean_pair:
+                filtered.append(d)
+                continue
+            if leg_index is not None and d_idx is not None and not d_pair:
+                expected_idx = (leg_index - 1) if (has_zero_indexed and leg_index >= 1) else leg_index
+                if d_idx == expected_idx:
+                    filtered.append(d)
+                    continue
+
+        return filtered
+
+    def get_documents_for_leg(self, leg_index: int = None, leg_id: str = None, pair: str = None, include_internal: bool = False) -> list:
+        """
+        Returns documents associated with a specific leg (or global docs applicable to all legs).
+        By default, include_internal=False enforces zero counterparty leakage of internal docs.
+        """
+        docs = self.get_parsed_documents()
+        if not include_internal:
+            docs = [d for d in docs if not d.get("is_internal_only")]
+        
+        filtered = []
+        has_zero_indexed = any(d.get("leg_index") == 0 for d in docs if d.get("leg_index") is not None)
         clean_pair = pair.strip().upper() if pair else None
         clean_leg_id = str(leg_id).strip() if leg_id else None
 
@@ -412,27 +539,18 @@ class QuotationRequest(BaseModel):
             d_id = str(d.get("leg_id") or "").strip()
             d_pair = str(d.get("pair") or "").strip().upper()
 
-            # Global documents (no leg_index, no leg_id, no pair specified) apply to all legs
-            if d_idx is None and not d_id and not d_pair:
+            if d.get("scope") == "ALL_PAIRS" or (d_idx is None and not d_id and not d_pair):
                 filtered.append(d)
                 continue
 
-            # Critical Safeguard: If a document has an explicit pair and clean_pair is provided,
-            # it must NEVER be assigned to a different currency pair!
             if d_pair and clean_pair and d_pair != clean_pair:
                 continue
-
-            # Exact leg_id match
             if clean_leg_id and d_id and d_id == clean_leg_id:
                 filtered.append(d)
                 continue
-
-            # Exact pair match if provided
             if clean_pair and d_pair and d_pair == clean_pair:
                 filtered.append(d)
                 continue
-
-            # Accurate index matching (ONLY if the document does not specify a conflicting pair)
             if leg_index is not None and d_idx is not None and not d_pair:
                 expected_idx = (leg_index - 1) if (has_zero_indexed and leg_index >= 1) else leg_index
                 if d_idx == expected_idx:
