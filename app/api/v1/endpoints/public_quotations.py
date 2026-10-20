@@ -29,6 +29,7 @@ from app.core.email_service import send_email, get_customer_email_settings, get_
 from app.core.routing import get_frontend_base_url
 from app.core.rate_limiter import quotation_rate_limiter
 from app.core.otp_security import hash_otp_code, verify_otp_code, MAX_OTP_FAILED_ATTEMPTS
+from app.core.honeypot import verify_honeypot, verify_honeypot_sync
 
 router = APIRouter()
 
@@ -615,6 +616,9 @@ async def request_quotation_otp(
     db: Session = Depends(get_db)
 ):
     """Generates and emails a 6-digit OTP code + 1-Click Magic Link to the bank representative."""
+    # Perimeter Anti-Bot Honeypot Defense
+    await verify_honeypot(req.website_url, request=request, context="quotation_request_otp")
+
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == req.token).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
@@ -911,6 +915,9 @@ def verify_quotation_otp(
     db: Session = Depends(get_db)
 ):
     """Verifies 6-digit OTP code or Magic Link token and establishes authenticated portal session."""
+    # Perimeter Anti-Bot Honeypot Defense
+    verify_honeypot_sync(req.website_url, request=request, context="quotation_verify_otp")
+
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == req.token).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
@@ -2762,6 +2769,7 @@ def confirm_bank_handshake(token: str, request: Request, db: Session = Depends(g
 
 class DealerHandshakeVerifyIn(BaseModel):
     otp: str
+    website_url: Optional[str] = None
 
 
 @router.get("/dealer-handshake/{token}")
@@ -2879,12 +2887,16 @@ def request_dealer_handshake_otp(
     token: str,
     background_tasks: BackgroundTasks,
     request: Request,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    website_url: Optional[str] = None
 ):
     """
     Generates and dispatches a single-use 6-digit OTP to the dealer's verified email.
     Enforces a strict 60-second cooldown rate limit and 5-minute code expiration.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    verify_honeypot_sync(website_url, request=request, context="dealer_handshake_request_otp")
+
     from app.core.masking import mask_email
     from app.models.models import Customer, Bank
     from app.services.unified_email_builder import build_dealer_handshake_otp_email
@@ -2976,6 +2988,9 @@ def verify_dealer_handshake_otp(
     and PERMANENTLY BURNS the single-activation link.
     Enforces a 3-attempt lockout defense against brute force.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    verify_honeypot_sync(body.website_url, request=request, context="dealer_handshake_verify_otp")
+
     from app.models.models import Bank, Customer
     from app.models.models_quotation import QuotationBank
 
@@ -3143,6 +3158,7 @@ class DealerFeedbackCreateRequest(BaseModel):
     comment: Optional[str] = Field(None, max_length=500)
     is_anonymous: bool = False
     dealer_email: Optional[str] = None
+    website_url: Optional[str] = None
 
 
 @router.post("/feedback")
@@ -3156,6 +3172,9 @@ def submit_dealer_feedback(
     Allows bank dealers to submit fast, non-blocking ratings and usability comments
     directly from their quotation terminal.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    verify_honeypot_sync(req_body.website_url, request=request, context="dealer_feedback")
+
     from app.models.models_quotation import QuotationBankAssignment, QuotationDealerFeedback, QuotationBank
     from app.models.models import Bank
 

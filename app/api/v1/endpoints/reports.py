@@ -26,6 +26,7 @@ from app.schemas.all_schemas import (
 )
 from app.crud.crud import crud_reports, log_action
 from app.constants import UserRole, GlobalConfigKey
+from app.core.honeypot import verify_honeypot
 
 import logging
 logger = logging.getLogger(__name__)
@@ -379,6 +380,9 @@ async def submit_demo_request(
     Receives and stores demo request form data.
     This is a public endpoint and does not require authentication.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    await verify_honeypot(demo_request.website_url, request=request, context="demo_request")
+
     try:
         # Define a private directory for storing the data, relative to the project root
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))

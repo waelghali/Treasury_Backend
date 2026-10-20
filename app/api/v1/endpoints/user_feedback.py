@@ -39,11 +39,14 @@ class FeedbackResponse(BaseModel):
 
 
 
+from app.core.honeypot import verify_honeypot_sync
+
 class FeedbackCreateRequest(BaseModel):
     message: str
     feedback_type: Optional[str] = "GENERAL_FEEDBACK"
     sentiment: Optional[str] = "NEUTRAL"
     ai_summary: Optional[str] = None
+    website_url: Optional[str] = None
 
 
 @router.post("/", response_model=FeedbackResponse)
@@ -55,6 +58,9 @@ def create_user_feedback(
     """
     Submit a new user feedback, issue report, or AI response evaluation.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    verify_honeypot_sync(payload.website_url, context="user_feedback")
+
     user = db.query(User).filter(User.id == current_user.user_id).first()
     u_email = user.email if user else (current_user.email if hasattr(current_user, 'email') else None)
     

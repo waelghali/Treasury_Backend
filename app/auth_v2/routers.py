@@ -24,6 +24,7 @@ from app.auth_v2.services import auth_service # Import the instantiated service
 
 # Constants for roles and permissions
 from app.constants import UserRole
+from app.core.honeypot import verify_honeypot
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ async def login_for_access_token(
     """
     Authenticate user and return JWT or MFA requirement.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    await verify_honeypot(login_data.website_url, request=request, context="login")
+
     try:
         # Pass the fields from login_data to the service
         auth_response = await auth_service.authenticate_user(
@@ -115,6 +119,9 @@ async def forgot_password(
     """
     Initiates the password reset process by sending a reset link to the user's email.
     """
+    # Perimeter Anti-Bot Honeypot Defense
+    await verify_honeypot(request_body.website_url, request=request, context="forgot_password")
+
     try:
         await auth_service.initiate_password_reset(
             db, request_body.email, get_client_ip(request), request=request

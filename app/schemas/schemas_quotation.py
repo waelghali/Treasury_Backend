@@ -318,12 +318,14 @@ class QuotationResubmitRequest(BaseModel):
 class OTPRequestCreate(BaseModel):
     token: str
     email: str
+    website_url: Optional[str] = None
 
 class OTPVerifyCreate(BaseModel):
     token: str
     email: Optional[str] = None
     otp_code: Optional[str] = None
     magic_token: Optional[str] = None
+    website_url: Optional[str] = None
 
 class DeskSessionActionRequest(BaseModel):
     email: str

@@ -108,6 +108,7 @@ class LoginRequest(BaseModel):
     device_id: str                      # Mandatory for device tracking
     device_name: Optional[str] = None    # Friendly name for the device
     remember_me: bool = False            # User choice to trust this device
+    website_url: Optional[str] = Field(None, description="Perimeter anti-bot honeypot trap")
 
 class VerifyMFARequest(BaseModel):
     email: EmailStr
@@ -134,6 +135,7 @@ class ChangePasswordRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr = Field(..., description="Email address associated with the account to reset.")
+    website_url: Optional[str] = Field(None, description="Perimeter anti-bot honeypot trap")
 
 class ResetPasswordRequest(BaseModel):
     token: str = Field(..., description="Password reset token received via email.")
@@ -1445,6 +1447,7 @@ class DemoRequestCreate(BaseModel):
     email: EmailStr = Field(..., description="Email address of the requester.")
     phone: str = Field(..., description="Phone number of the requester.")
     message: Optional[str] = Field(None, description="Optional notes from the requester.")
+    website_url: Optional[str] = Field(None, description="Perimeter anti-bot honeypot trap")
 
 # --- NEW: Report Schemas (MINIMALIST) ---
 class ReportDataOut(BaseModel):
