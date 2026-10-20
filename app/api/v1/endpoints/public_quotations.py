@@ -576,6 +576,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "is_cross_entity": bool(assignment.is_cross_entity),
         "bank_name": bank_name,
         "allow_dealer_comments": bool(getattr(q_bank.bank, 'allow_dealer_comments', True)) if (q_bank and q_bank.bank) else True,
+        "allow_dealer_feedback": bool(getattr(q_bank.bank, 'allow_dealer_feedback', True)) if (q_bank and q_bank.bank) else True,
         "customer_name": customer_name,
         "entity_name": customer_name if assignment.is_cross_entity else (rfq.entity.entity_name if rfq.entity else customer_name),
         "entity_tax_id": None if assignment.is_cross_entity else (rfq.entity.tax_id if rfq.entity else None),
@@ -3176,6 +3177,12 @@ def submit_dealer_feedback(
         )
 
     quotation_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    if quotation_bank and quotation_bank.bank and quotation_bank.bank.allow_dealer_feedback is False:
+        raise HTTPException(
+            status_code=403,
+            detail="Terminal feedback is currently disabled for this institution."
+        )
+
     bank_id = quotation_bank.bank_id if quotation_bank else None
     bank_name = "Unknown Bank"
     if bank_id:

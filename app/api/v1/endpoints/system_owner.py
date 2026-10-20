@@ -2770,6 +2770,47 @@ def toggle_bank_dealer_comments(
         "allow_dealer_comments": db_bank.allow_dealer_comments
     }
 
+class BankDealerFeedbackToggleRequest(BaseModel):
+    allow_dealer_feedback: bool
+
+@router.put("/banks/{bank_id}/dealer-feedback")
+def toggle_bank_dealer_feedback(
+    bank_id: int,
+    payload: BankDealerFeedbackToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """Toggle whether dealers quoting for this bank are allowed to submit terminal feedback / see feedback button."""
+    db_bank = crud_bank.get(db, id=bank_id)
+    if db_bank is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    
+    db_bank.allow_dealer_feedback = payload.allow_dealer_feedback
+    db.commit()
+    db.refresh(db_bank)
+    
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UPDATE",
+        entity_type="Bank",
+        entity_id=db_bank.id,
+        details={
+            "action": "toggle_dealer_feedback",
+            "name": db_bank.name,
+            "allow_dealer_feedback": db_bank.allow_dealer_feedback,
+            "ip_address": client_host
+        }
+    )
+    return {
+        "success": True,
+        "bank_id": db_bank.id,
+        "name": db_bank.name,
+        "allow_dealer_feedback": db_bank.allow_dealer_feedback
+    }
+
 @router.get("/banks/{bank_id}/dealers")
 def get_bank_dealers(
     bank_id: int,

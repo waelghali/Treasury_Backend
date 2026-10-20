@@ -403,6 +403,7 @@ class BankBase(BaseModel):
     email_domain: Optional[str] = Field(None, max_length=100, description="Email domain of the bank (e.g., 'cibeg.com')")
     portal_access_enabled: Optional[bool] = Field(True, description="Whether trading portal / dealer desk access is enabled for this bank")
     allow_dealer_comments: Optional[bool] = Field(True, description="Whether dealers quoting for this bank can enter free-text notes/comments")
+    allow_dealer_feedback: Optional[bool] = Field(True, description="Whether dealers quoting for this bank are allowed to submit terminal feedback / see feedback button")
 
 class BankCreate(BankBase):
     pass
@@ -418,6 +419,7 @@ class BankUpdate(BankBase):
     email_domain: Optional[str] = None
     portal_access_enabled: Optional[bool] = None
     allow_dealer_comments: Optional[bool] = None
+    allow_dealer_feedback: Optional[bool] = None
 
 class BankOut(BankBase, BaseSchema):
     dealer_count: Optional[int] = Field(0, description="Total active enrolled dealers under this bank")
