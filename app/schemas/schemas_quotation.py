@@ -20,10 +20,13 @@ class QuotationContactInvitationOut(BaseModel):
     customer_id: int
     bank_id: int
     quotation_bank_id: Optional[int] = None
-    email: str
+    email: Optional[str] = None
+    email_blind_index: Optional[str] = None
+    handshake_link: Optional[str] = None
     title: Optional[str] = None
     role: str
     status: str
+    failed_otp_attempts: Optional[int] = 0
     expires_at: datetime
     accepted_at: Optional[datetime] = None
     created_at: datetime
@@ -54,6 +57,7 @@ class BankSimpleOut(BaseModel):
     id: int
     name: str
     email_domain: Optional[str] = None
+    allow_dealer_comments: Optional[bool] = True
 
     class Config:
         from_attributes = True
@@ -160,6 +164,7 @@ class QuotationLegOut(BaseModel):
     direction: Optional[str] = None
     buy_currency: Optional[str] = None
     sell_currency: Optional[str] = None
+    currency_pair: Optional[str] = None
     amount: Optional[float] = None
     min_ticket_amount: Optional[float] = None
     value_date: Optional[Union[str, date]] = None
@@ -446,3 +451,15 @@ class BankLiveRankingConfigOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+# --- Document Ephemeral Ticket Schemas (Sub-Phase 8.7 Option A & B) ---
+class DocumentTicketRequest(BaseModel):
+    gcs_uri: str
+    token: Optional[str] = None
+    session_token: Optional[str] = None
+    leg_id: Optional[str] = None
+
+class DocumentTicketOut(BaseModel):
+    ticket: str
+    download_url: str
+    expires_in_seconds: int = 900

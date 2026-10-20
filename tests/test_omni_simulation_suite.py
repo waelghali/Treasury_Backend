@@ -51,6 +51,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import json
 import uuid
 import time
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
@@ -74,7 +75,10 @@ from app.models.models_quotation import (
 from app.core.security import create_access_token
 from app.core.security_crypto import (
     encrypt_field, decrypt_field, is_encrypted,
-    generate_tenant_dek, TamperDetectedError
+    generate_tenant_dek, TamperDetectedError,
+    encrypt_file_bytes, decrypt_file_bytes, decrypt_stream_generator,
+    encrypt_file_stream, is_encrypted_file, generate_download_ticket,
+    verify_download_ticket, STREAM_MAGIC, RAW_FILE_MAGIC, DEFAULT_STREAM_CHUNK_SIZE
 )
 from app.core.otp_security import hash_otp_code, verify_otp_code, generate_scoped_deal_receipt
 from app.services.tenant_key_service import tenant_key_service
@@ -82,6 +86,11 @@ from app.services.dealer_achievement_service import DealerAchievementService
 from app.services.desk_session_service import desk_session_service
 from app.api.v1.endpoints.quotations_endpoints import compute_rfq_standings
 from app.core.email_service import get_customer_email_settings, send_email
+
+import tempfile
+import hashlib
+import concurrent.futures
+import tracemalloc
 
 client = TestClient(app)
 
@@ -881,6 +890,233 @@ def run_omni_simulation_suite():
             assert off.price is None, f"SECURITY LEAK: Plaintext price found in DB: {off.price}"
             assert off.encrypted_price.startswith("enc:v1:"), "Encrypted price not properly formatted"
         print("  [PASS] All quotation offers confirmed NULL in plaintext and encrypted at rest")
+
+        # ==============================================================================
+        # PART 4: SUB-PHASE 8.7 DOCUMENT ENCRYPTION & EPHEMERAL STREAMING GATEWAY
+        # ==============================================================================
+        print("\n" + "=" * 80)
+        print("[ENCRYPTION] PART 4: SUB-PHASE 8.7 DOCUMENT ENCRYPTION & STREAMING GATEWAY")
+        print("=" * 80)
+
+        # 4.1 Cryptographic Engine Verification (STREAM V2 AEAD 64 KB Blocks)
+        print("\n--- [PART 4 - STEP 1] STREAM V2 64 KB Block Cryptographic Engine Checks ---")
+        test_dek = secrets.token_bytes(32)
+        raw_pdf_sample = b"%PDF-1.4\n" + (b"CONFIDENTIAL_FACILITY_AGREEMENT_DATA_" * 2000)  # ~76 KB (> 1 chunk)
+        enc_stream_doc = encrypt_file_bytes(raw_pdf_sample, test_dek, context="quotation_doc")
+
+        assert is_encrypted_file(enc_stream_doc), "Document must be identified as STREAM V2 encrypted"
+        assert enc_stream_doc.startswith(STREAM_MAGIC), "Ciphertext must begin with STREAM_MAGIC"
+        assert raw_pdf_sample not in enc_stream_doc, "Plaintext must never appear in ciphertext"
+
+        dec_stream_doc = decrypt_file_bytes(enc_stream_doc, test_dek, context="quotation_doc")
+        assert dec_stream_doc == raw_pdf_sample, "Decrypted stream must match original PDF byte-for-byte"
+        print("  [PASS] STREAM V2 Multi-chunk (64 KB) encryption/decryption roundtrip verified")
+
+        # Bit-flip tamper detection
+        corrupted_bytes = bytearray(enc_stream_doc)
+        corrupted_bytes[len(corrupted_bytes) - 10] ^= 0x55
+        try:
+            decrypt_file_bytes(bytes(corrupted_bytes), test_dek, context="quotation_doc")
+            assert False, "Should have raised TamperDetectedError on corrupted ciphertext"
+        except TamperDetectedError:
+            print("  [PASS] Tamper detection active: Bit-flip rejected with TamperDetectedError")
+
+        # Foreign DEK rejection
+        foreign_dek = secrets.token_bytes(32)
+        try:
+            decrypt_file_bytes(enc_stream_doc, foreign_dek, context="quotation_doc")
+            assert False, "Should have raised TamperDetectedError on foreign tenant DEK"
+        except TamperDetectedError:
+            print("  [PASS] Cross-tenant key isolation: Foreign DEK rejected with TamperDetectedError")
+
+        # Dual-Read backwards compatibility
+        legacy_plaintext = b"%PDF-1.4\nLEGACY_UNENCRYPTED_HISTORICAL_QUOTATION_DOC"
+        assert decrypt_file_bytes(legacy_plaintext, test_dek) == legacy_plaintext
+        print("  [PASS] Dual-read compatibility: Unencrypted legacy PDF passes through transparently")
+
+        # 4.2 Adversarial Gateway Security Gates (Option A + Option B)
+        print("\n--- [PART 4 - STEP 2] Adversarial Security Gateway & Ephemeral Ticket Gates ---")
+        
+        # Setup real attachment & OTP for CIB assignment on Cycle 2 RFQ
+        cib_ass = assignment_map["CIB"]
+        cib_token = token_map["CIB"]
+        hsbc_token = token_map["HSBC"]
+
+        rfq_c2_db.document_path = json.dumps({
+            "release_to_winner_only": True,
+            "documents": [
+                {"name": "Contract_Leg1_USD.pdf", "path": "gs://lg_custody_bucket/development/customer_1/quotations/rfq_docs/test_leg1.pdf", "leg_id": str(leg_1.id), "pair": "USD/EGP"},
+                {"name": "Contract_Leg2_EUR.pdf", "path": "gs://lg_custody_bucket/development/customer_1/quotations/rfq_docs/test_leg2.pdf", "leg_id": str(leg_2.id), "pair": "EUR/EGP"}
+            ]
+        })
+        db.commit()
+
+        # Seed valid OTP magic token for CIB assignment
+        cib_otp_rec = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == cib_ass.id).first()
+        if not cib_otp_rec:
+            cib_otp_rec = QuotationAccessOTP(
+                assignment_id=cib_ass.id,
+                email="dealer.cib@cibeg.com",
+                otp_code="DUMMY_CODE",
+                magic_token=secrets.token_urlsafe(32),
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=2)
+            )
+            db.add(cib_otp_rec)
+            db.commit()
+            db.refresh(cib_otp_rec)
+
+        target_gcs = "gs://lg_custody_bucket/development/customer_1/quotations/rfq_docs/test_leg1.pdf"
+
+        # Gate 1: Direct static URL download block (Option B enforcement)
+        res_gate1 = client.get(f"/api/v1/quotations/documents/download?gcs_uri={target_gcs}&token={cib_token}")
+        assert res_gate1.status_code == 403
+        assert res_gate1.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 1: Direct static capability download blocked (HTTP 403: Access denied or Not found)")
+
+        # Gate 2: Missing OTP session token on ticket request
+        res_gate2 = client.post("/api/v1/quotations/documents/ticket", json={"gcs_uri": target_gcs, "token": cib_token})
+        assert res_gate2.status_code == 403
+        assert res_gate2.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 2: Ticket request without active OTP session blocked (HTTP 403: Access denied or Not found)")
+
+        # Gate 3: Invalid/fake OTP session token on ticket request
+        res_gate3 = client.post("/api/v1/quotations/documents/ticket", json={"gcs_uri": target_gcs, "token": cib_token, "session_token": "fake_intruder_token"})
+        assert res_gate3.status_code == 403
+        assert res_gate3.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 3: Invalid OTP session token blocked (HTTP 403: Access denied or Not found)")
+
+        # Gate 4: Unattached document request
+        res_gate4 = client.post("/api/v1/quotations/documents/ticket", json={"gcs_uri": "gs://lg_custody_bucket/development/customer_1/secret_unattached.pdf", "token": cib_token, "session_token": cib_otp_rec.magic_token})
+        assert res_gate4.status_code == 403
+        assert res_gate4.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 4: Unattached document request blocked (HTTP 403: Access denied or Not found)")
+
+        # Gate 5: Legitimate 15-Minute Ephemeral Ticket Minted (Option A + B)
+        res_gate5 = client.post("/api/v1/quotations/documents/ticket", json={"gcs_uri": target_gcs, "token": cib_token, "session_token": cib_otp_rec.magic_token, "leg_id": str(leg_1.id)})
+        assert res_gate5.status_code == 200
+        ticket_data = res_gate5.json()
+        assert "ticket" in ticket_data and "download_url" in ticket_data
+        assert ticket_data.get("expires_in_seconds") == 900
+        ephemeral_ticket = ticket_data["ticket"]
+        print("  [PASS] Gate 5: Legitimate 15-minute signed ticket minted successfully (Option A + B)")
+
+        # Gate 6: Tampered Ticket Blocked
+        tampered_ticket = ephemeral_ticket[:-6] + "abcdef"
+        res_gate6 = client.get(f"/api/v1/quotations/documents/download?ticket={tampered_ticket}")
+        assert res_gate6.status_code == 401
+        assert res_gate6.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 6: Tampered ticket signature blocked (HTTP 401: Access denied or Not found)")
+
+        # Gate 7: Expired Ticket Blocked
+        expired_ticket = generate_download_ticket({"customer_id": 1, "gcs_uri": target_gcs}, expiry_minutes=-1)
+        res_gate7 = client.get(f"/api/v1/quotations/documents/download?ticket={expired_ticket}")
+        assert res_gate7.status_code == 401
+        assert res_gate7.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 7: Expired ticket blocked (HTTP 401: Access denied or Not found)")
+
+        # Gate 8: Multi-Pair Leg Isolation: Competitor bank trying to access winning bank's leg document
+        hsbc_otp_rec = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == assignment_map["HSBC"].id).first()
+        if not hsbc_otp_rec:
+            hsbc_otp_rec = QuotationAccessOTP(
+                assignment_id=assignment_map["HSBC"].id,
+                email="dealer.hsbc@hsbc.com",
+                otp_code="DUMMY_CODE",
+                magic_token=secrets.token_urlsafe(32),
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=2)
+            )
+            db.add(hsbc_otp_rec)
+            db.commit()
+            db.refresh(hsbc_otp_rec)
+
+        res_gate8 = client.post("/api/v1/quotations/documents/ticket", json={"gcs_uri": target_gcs, "token": hsbc_token, "session_token": hsbc_otp_rec.magic_token, "leg_id": str(leg_1.id)})
+        assert res_gate8.status_code == 403
+        assert res_gate8.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 8: Leg isolation policy: Competitor bank blocked from Leg 1 document (HTTP 403)")
+
+        # Gate 9: Pure Unauthenticated Request Blocked
+        res_gate9 = client.get(f"/api/v1/quotations/documents/download?gcs_uri={target_gcs}")
+        assert res_gate9.status_code == 401
+        assert res_gate9.json().get("detail") == "Access denied or Not found"
+        print("  [PASS] Gate 9: Pure unauthenticated direct request blocked (HTTP 401: Access denied or Not found)")
+
+        # 4.3 Local Concurrency & RAM Stress Benchmark
+        print("\n--- [PART 4 - STEP 3] Local Concurrency & RAM Stress Benchmark ---")
+        is_full_stress = "--stress" in sys.argv or os.getenv("RUN_STRESS_BENCHMARK", "").strip().lower() in ("1", "true", "yes")
+        stress_file_mb = 50 if is_full_stress else 5
+        stress_workers = 20 if is_full_stress else 5
+        stress_ceiling = 60.0
+
+        print(f"  [BENCHMARK] Mode: {'FULL 1.0 GB STRESS' if is_full_stress else 'FAST LOCAL CHECK'} ({stress_file_mb} MB x {stress_workers} workers)")
+        
+        bench_dek = secrets.token_bytes(32)
+        bench_pattern = b"GROW_TREASURY_OMNI_STREAMING_CRYPTO_BENCHMARK_2026_"
+        bench_total_bytes = stress_file_mb * 1024 * 1024
+
+        temp_raw = tempfile.NamedTemporaryFile(delete=False, suffix=".raw")
+        temp_raw_path = temp_raw.name
+        temp_raw.close()
+
+        temp_stress = tempfile.NamedTemporaryFile(delete=False, suffix=".enc")
+        temp_stress_path = temp_stress.name
+        temp_stress.close()
+
+        try:
+            # Generate deterministic raw file locally
+            def _gen_chunks():
+                written = 0
+                while written < bench_total_bytes:
+                    to_take = min(64 * 1024, bench_total_bytes - written)
+                    yield (bench_pattern * ((to_take // len(bench_pattern)) + 1))[:to_take]
+                    written += to_take
+
+            hasher_ref = hashlib.sha256()
+            with open(temp_raw_path, "wb") as f_out:
+                for chunk in _gen_chunks():
+                    hasher_ref.update(chunk)
+                    f_out.write(chunk)
+            ref_digest = hasher_ref.hexdigest()
+
+            # Stream-encrypt to encrypted destination
+            with open(temp_raw_path, "rb") as f_in, open(temp_stress_path, "wb") as f_out:
+                encrypt_file_stream(f_in, f_out, bench_dek, context="omni_bench")
+
+            if os.path.exists(temp_raw_path):
+                os.remove(temp_raw_path)
+
+            # Concurrent streaming decryption
+            tracemalloc.start()
+            t_bench_start = time.time()
+
+            def _bench_worker(wid):
+                h = hashlib.sha256()
+                with open(temp_stress_path, "rb") as f:
+                    for c in decrypt_stream_generator(f, bench_dek, context="omni_bench"):
+                        h.update(c)
+                if h.hexdigest() != ref_digest:
+                    raise ValueError(f"Worker {wid} digest mismatch")
+                return True
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=stress_workers) as executor:
+                futures = [executor.submit(_bench_worker, w) for w in range(stress_workers)]
+                for fut in concurrent.futures.as_completed(futures):
+                    fut.result()
+
+            bench_duration = time.time() - t_bench_start
+            _, bench_peak_mem = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            bench_peak_mb = bench_peak_mem / (1024 * 1024)
+            bench_throughput = (stress_file_mb * stress_workers) / bench_duration
+
+            print(f"  [PASS] Completed {stress_workers}/{stress_workers} concurrent workers (100% SHA-256 match)")
+            print(f"  [PASS] Aggregate Decryption Throughput: {bench_throughput:.1f} MB/s in {bench_duration:.2f}s")
+            print(f"  [PASS] Peak Python Heap Allocation: {bench_peak_mb:.2f} MB (Ceiling: < {stress_ceiling} MB)")
+            assert bench_peak_mb < stress_ceiling, f"Memory ceiling exceeded: {bench_peak_mb:.2f} MB >= {stress_ceiling} MB"
+        finally:
+            if os.path.exists(temp_raw_path):
+                os.remove(temp_raw_path)
+            if os.path.exists(temp_stress_path):
+                os.remove(temp_stress_path)
 
         # ==============================================================================
         # ALL TESTS COMPLETE

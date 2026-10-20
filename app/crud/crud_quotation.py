@@ -3,6 +3,9 @@ from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timezone, date
 import uuid
 import json
+import threading
+
+_ROSTER_LOCK = threading.Lock()
 
 from app.models.models_quotation import (
     QuotationBank, QuotationRequest, QuotationBankAssignment, 
@@ -92,49 +95,91 @@ class CRUDQuotation:
                 if not is_valid:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
 
-        # Check if updating an existing counterparty profile or creating a new one
-        existing = None
-        target_id = getattr(obj_in, 'id', None)
-        if target_id:
-            existing = db.query(QuotationBank).filter(
-                QuotationBank.id == target_id,
-                QuotationBank.customer_id == customer_id
-            ).first()
-        elif getattr(obj_in, "entity_scope", "ALL_ENTITIES") == "ALL_ENTITIES":
-            # If creating without explicit ID with ALL_ENTITIES, check if an ALL_ENTITIES profile already exists
-            existing = db.query(QuotationBank).filter(
-                QuotationBank.customer_id == customer_id,
-                QuotationBank.bank_id == obj_in.bank_id,
-                QuotationBank.entity_scope == "ALL_ENTITIES",
-                QuotationBank.trade_type == (obj_in.trade_type or "BOTH")
-            ).first()
-        
-        entity_scope = getattr(obj_in, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
-        entity_ids = getattr(obj_in, "entity_ids", []) or []
+        with _ROSTER_LOCK:
+            # Check if updating an existing counterparty profile or creating a new one
+            existing = None
+            target_id = getattr(obj_in, 'id', None)
+            entity_scope = getattr(obj_in, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
+            entity_ids = getattr(obj_in, "entity_ids", []) or []
+            target_trade = obj_in.trade_type or "BOTH"
 
-        auth_email = getattr(obj_in, 'authorized_contact_email', None)
-        auth_name = getattr(obj_in, 'authorized_contact_name', None)
+            if target_id:
+                existing = db.query(QuotationBank).filter(
+                    QuotationBank.id == target_id,
+                    QuotationBank.customer_id == customer_id
+                ).first()
+            else:
+                # 1. Exact match on (customer_id, bank_id, entity_scope, trade_type)
+                existing = db.query(QuotationBank).filter(
+                    QuotationBank.customer_id == customer_id,
+                    QuotationBank.bank_id == obj_in.bank_id,
+                    QuotationBank.entity_scope == entity_scope,
+                    QuotationBank.trade_type == target_trade
+                ).first()
 
-        if existing:
-            # Update emails and contacts if changed
-            existing.emails = emails_str
-            existing.contacts = contacts_data
-            existing.entity_scope = entity_scope
-            existing.authorized_contact_email = (auth_email.strip() if auth_email else None)
-            existing.authorized_contact_name = (auth_name.strip() if auth_name else None)
+                # 2. If entity_scope is ALL_ENTITIES, match any ALL_ENTITIES profile for this bank
+                if not existing and entity_scope == "ALL_ENTITIES":
+                    existing = db.query(QuotationBank).filter(
+                        QuotationBank.customer_id == customer_id,
+                        QuotationBank.bank_id == obj_in.bank_id,
+                        QuotationBank.entity_scope == "ALL_ENTITIES"
+                    ).first()
 
-            from app.models.models_quotation import QuotationBankEntity
-            existing.entity_associations.clear()
-            db.flush()
-            if entity_scope == "SPECIFIC_ENTITIES":
-                unique_eids = list(dict.fromkeys(entity_ids))
-                for eid in unique_eids:
-                    existing.entity_associations.append(QuotationBankEntity(entity_id=eid))
+                # 3. Fallback: match any existing profile for this bank to prevent duplicate rows for the same bank
+                if not existing:
+                    existing = db.query(QuotationBank).filter(
+                        QuotationBank.customer_id == customer_id,
+                        QuotationBank.bank_id == obj_in.bank_id
+                    ).first()
 
-            db.commit()
-            db.refresh(existing)
-            existing.entity_ids = [a.entity_id for a in existing.entity_associations] if entity_scope == "SPECIFIC_ENTITIES" else []
-            return existing
+            auth_email = getattr(obj_in, 'authorized_contact_email', None)
+            auth_name = getattr(obj_in, 'authorized_contact_name', None)
+
+            if existing:
+                # If explicit target_id was passed, user explicitly managed contacts (including removals)
+                # If target_id was NOT passed, user is adding contacts to an existing bank -> merge without loss
+                if target_id:
+                    final_contacts = contacts_data
+                else:
+                    existing_contacts = list(existing.contacts or [])
+                    contact_map = {c.get("email", "").strip().lower(): dict(c) for c in existing_contacts if c.get("email")}
+                    for nc in contacts_data:
+                        e_low = nc.get("email", "").strip().lower()
+                        if not e_low:
+                            continue
+                        if e_low in contact_map:
+                            if nc.get("role"):
+                                contact_map[e_low]["role"] = nc["role"]
+                            if nc.get("name"):
+                                contact_map[e_low]["name"] = nc["name"]
+                            if nc.get("title"):
+                                contact_map[e_low]["title"] = nc["title"]
+                        else:
+                            contact_map[e_low] = nc
+                    final_contacts = list(contact_map.values())
+
+                existing.contacts = final_contacts
+                existing.emails = ", ".join([c["email"].strip() for c in final_contacts if c.get("email")])
+                existing.entity_scope = entity_scope
+                if auth_email:
+                    existing.authorized_contact_email = auth_email.strip()
+                if auth_name:
+                    existing.authorized_contact_name = auth_name.strip()
+                if obj_in.trade_type:
+                    existing.trade_type = obj_in.trade_type
+
+                from app.models.models_quotation import QuotationBankEntity
+                existing.entity_associations.clear()
+                db.flush()
+                if entity_scope == "SPECIFIC_ENTITIES":
+                    unique_eids = list(dict.fromkeys(entity_ids))
+                    for eid in unique_eids:
+                        existing.entity_associations.append(QuotationBankEntity(entity_id=eid))
+
+                db.commit()
+                db.refresh(existing)
+                existing.entity_ids = [a.entity_id for a in existing.entity_associations] if entity_scope == "SPECIFIC_ENTITIES" else []
+                return existing
 
         db_obj = QuotationBank(
             customer_id=customer_id,
@@ -183,9 +228,15 @@ class CRUDQuotation:
         ).all()
         inv_map = {}
         for inv in invitations:
-            key = (inv.bank_id, (inv.email or "").strip().lower())
-            if key not in inv_map or inv.status == "ACCEPTED":
-                inv_map[key] = inv.status
+            decrypted_email = (inv.get_email(db) if hasattr(inv, "get_email") else (inv.email or "")).strip().lower()
+            if decrypted_email:
+                key_email = (inv.bank_id, decrypted_email)
+                if key_email not in inv_map or inv.status == "ACCEPTED":
+                    inv_map[key_email] = inv.status
+            if inv.email_blind_index:
+                key_blind = (inv.bank_id, inv.email_blind_index)
+                if key_blind not in inv_map or inv.status == "ACCEPTED":
+                    inv_map[key_blind] = inv.status
 
         def enrich_bank(b):
             assoc_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
@@ -199,10 +250,15 @@ class CRUDQuotation:
             pending_count = 0
             accepted_count = 0
 
+            from app.core.security_crypto import compute_email_blind_index
+
             for c in raw_contacts:
                 c_item = dict(c)
                 c_email = (c_item.get("email") or "").strip().lower()
                 inv_status = inv_map.get((b.bank_id, c_email))
+                if not inv_status and c_email:
+                    inv_status = inv_map.get((b.bank_id, compute_email_blind_index(c_email)))
+
                 if inv_status == "PENDING":
                     c_item["invitation_status"] = "PENDING"
                     c_item["is_pending"] = True

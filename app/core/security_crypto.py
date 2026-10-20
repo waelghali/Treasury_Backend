@@ -560,3 +560,91 @@ def verify_recovery_token(token: str, secret_salt: str) -> Optional[str]:
     except Exception:
         return None
 
+
+# --- Ephemeral Signed Document Download Tickets (Sub-Phase 8.7 Option A) ---
+
+def generate_download_ticket(payload: dict, secret_salt: Optional[str] = None, expiry_minutes: int = 15) -> str:
+    """
+    Generates a secure, cryptographically signed, short-lived (15-minute) ephemeral ticket 
+    for unsealing quotation documents (Sub-Phase 8.7 Option A).
+    """
+    salt = secret_salt or os.environ.get("SECRET_KEY", "grow-ephemeral-doc-ticket-secret-2026")
+    exp_ts = int(time.time()) + (expiry_minutes * 60)
+    data = dict(payload)
+    data["exp"] = exp_ts
+    raw_json = json.dumps(data, sort_keys=True, separators=(',', ':'))
+    b64_payload = base64.urlsafe_b64encode(raw_json.encode("utf-8")).decode("ascii").rstrip("=")
+    mac = hmac.new(
+        key=salt.encode("utf-8"),
+        msg=b64_payload.encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    return f"{b64_payload}.{mac}"
+
+def verify_download_ticket(ticket: str, secret_salt: Optional[str] = None) -> Tuple[bool, Optional[dict], Optional[str]]:
+    """
+    Validates an ephemeral download ticket.
+    Returns (is_valid, payload, error_message).
+    """
+    salt = secret_salt or os.environ.get("SECRET_KEY", "grow-ephemeral-doc-ticket-secret-2026")
+    try:
+        parts = ticket.strip().split(".")
+        if len(parts) != 2:
+            return False, None, "Malformed download ticket."
+        
+        b64_payload, signature = parts
+        expected_mac = hmac.new(
+            key=salt.encode("utf-8"),
+            msg=b64_payload.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, expected_mac):
+            return False, None, "Invalid ticket signature or tampered ticket."
+
+        # Pad base64 string if needed
+        padding = 4 - (len(b64_payload) % 4)
+        if padding < 4:
+            b64_payload += "=" * padding
+
+        raw_json = base64.urlsafe_b64decode(b64_payload.encode("ascii")).decode("utf-8")
+        payload = json.loads(raw_json)
+
+        exp = payload.get("exp")
+        if not exp or time.time() > float(exp):
+            return False, None, "Download ticket has expired. Please refresh the portal to generate a new ticket."
+
+        return True, payload, None
+    except Exception as e:
+        return False, None, f"Ticket verification failed: {e}"
+
+
+# --- Zero-Knowledge Blind Indexing for Counterparty Identification ---
+
+def compute_email_blind_index(email: Optional[str], secret_key: Optional[Union[bytes, str]] = None) -> str:
+    """
+    Computes a deterministic, one-way HMAC-SHA256 blind index for an email address.
+    Used for O(1) deduplication and lookup in Zero-Knowledge tables without cleartext leakage.
+    Derives an isolated blind index subkey via HKDF-SHA256.
+    """
+    if not email:
+        return ""
+    clean = email.strip().lower().encode("utf-8")
+    
+    if secret_key is None:
+        raw_key = os.getenv("MASTER_ENCRYPTION_KEY") or os.getenv("SECRET_KEY", "default-grow-dev-secret-change-in-prod")
+        key_bytes = raw_key.encode("utf-8") if isinstance(raw_key, str) else raw_key
+    elif isinstance(secret_key, str):
+        key_bytes = secret_key.encode("utf-8")
+    else:
+        key_bytes = secret_key
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"GrowTreasury-BlindIndex-Salt-v1",
+        info=b"GrowTreasury-EmailBlindIndex",
+    )
+    derived_sub_key = hkdf.derive(key_bytes)
+    return hmac.new(derived_sub_key, clean, hashlib.sha256).hexdigest()
+

@@ -197,16 +197,13 @@ async def execute_shared_deal_acceptance(
             direction=rfq.direction or "BUY",
             amount=rfq.amount
         )
-        best_price = None
-        for leg in (rfq.legs or []):
-            if leg.winner_rate:
-                best_price = leg.winner_rate
-                break
+        leg1 = next((l for l in (rfq.legs or []) if (l.buy_currency or rfq.buy_currency) == root_from and (l.sell_currency or rfq.sell_currency) == root_to), None)
+        best_price = (leg1.winner_rate if leg1 else None) or (rfq.winner_rate if not getattr(rfq, 'legs', []) else None)
         if best_price and root_bm:
             root_bm["quote_evaluation"] = live_market_service.evaluate_quote_spread(
                 quote_rate=float(best_price),
                 benchmark=root_bm,
-                direction=rfq.direction or "BUY"
+                direction=(leg1.direction if leg1 else None) or rfq.direction or "BUY"
             )
         root_bm["frozen_at"] = datetime.now(timezone.utc).isoformat()
         root_bm["frozen_by_user_id"] = user.id

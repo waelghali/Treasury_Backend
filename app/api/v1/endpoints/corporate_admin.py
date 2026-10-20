@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Body, BackgroundTasks
 
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, joinedload
 from sqlalchemy import func
 
 from app.database import get_db
@@ -2146,8 +2146,8 @@ async def get_active_system_notifications_corporate_admin( # Use your existing f
 # QUOTATION MANAGEMENT
 # ==============================================================================
 
-from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationBank
-from app.schemas.schemas_quotation import QuotationRequestOut, QuotationApprovalRequest, QuotationRescheduleRequest
+from app.models.models_quotation import QuotationRequest, QuotationBankAssignment, QuotationBank, QuotationLeg
+from app.schemas.schemas_quotation import QuotationRequestOut, QuotationLegOut, QuotationApprovalRequest, QuotationRescheduleRequest
 from pydantic import BaseModel
 from app.core.email_service import send_email, get_global_email_settings
 from fastapi import BackgroundTasks
@@ -2174,7 +2174,12 @@ def get_pending_quotation_approvals(
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Lists all quotations awaiting internal corporate approval or scheduled for delayed release."""
-    rfqs = db.query(QuotationRequest).filter(
+    rfqs = db.query(QuotationRequest).options(
+        selectinload(QuotationRequest.legs).selectinload(QuotationLeg.bank_configs),
+        selectinload(QuotationRequest.assignments).selectinload(QuotationBankAssignment.quotation_bank).selectinload(QuotationBank.bank),
+        joinedload(QuotationRequest.entity),
+        joinedload(QuotationRequest.creator)
+    ).filter(
         QuotationRequest.customer_id == corporate_admin_context.customer_id,
         QuotationRequest.status.in_(['PENDING_APPROVAL', 'APPROVED_SCHEDULED'])
     ).order_by(QuotationRequest.created_at.desc()).all()
@@ -2183,7 +2188,15 @@ def get_pending_quotation_approvals(
     for rfq in rfqs:
         rfq_dict = {c.name: getattr(rfq, c.name) for c in rfq.__table__.columns}
         rfq_dict['entity_name'] = rfq.entity.entity_name if rfq.entity else None
-        rfq_dict['creator_name'] = rfq.created_by.name if hasattr(rfq, 'created_by') and rfq.created_by else None
+        
+        creator_name = None
+        if hasattr(rfq, 'creator') and rfq.creator:
+            f_name = getattr(rfq.creator, 'first_name', '') or ''
+            l_name = getattr(rfq.creator, 'last_name', '') or ''
+            creator_name = f"{f_name} {l_name}".strip() or getattr(rfq.creator, 'email', None)
+        elif hasattr(rfq, 'created_by') and rfq.created_by:
+            creator_name = getattr(rfq.created_by, 'name', None) or getattr(rfq.created_by, 'email', None)
+        rfq_dict['creator_name'] = creator_name
 
         banks_list = []
         for a in rfq.assignments:
@@ -2207,6 +2220,7 @@ def get_pending_quotation_approvals(
                 "cost_flat": a.cost_flat or 0.0,
             })
         rfq_dict['assigned_banks'] = banks_list
+        rfq_dict['legs'] = [QuotationLegOut.model_validate(leg) for leg in (rfq.legs or [])]
         results.append(QuotationRequestOut(**rfq_dict))
     return results
 

@@ -335,7 +335,7 @@ def test_generate_invite_security():
 
         # 3. Admin successfully invites company domain
         res = generate_invite_link(
-            payload=InviteRequest(email="engineer@acmecorp.com", department="Engineering"),
+            payload=InviteRequest(email="engineer@acme.com", department="Engineering"),
             background_tasks=None,
             current_user=admin_user,
             db=db
@@ -346,7 +346,7 @@ def test_generate_invite_security():
         # raw_decrypted format: customer_id|department|email|expiry
         parts = raw_decrypted.split("|")
         assert parts[0] == str(cust.id), f"Token customer_id mismatch: {parts[0]} != {cust.id}"
-        assert parts[2] == "engineer@acmecorp.com"
+        assert parts[2] == "engineer@acme.com"
         print(f"  [PASS] Authorized invite minted strictly for customer_id={parts[0]} (Acme Corp)")
 
         # 4. Also test generate_portal_link in requests.py (domain lockdown)
@@ -366,7 +366,7 @@ def test_generate_invite_security():
             print("  [PASS] requests.generate_portal_link blocked unauthorized domain (HTTP 400)")
 
         portal_res = generate_portal_link(
-            recipient_email="legal@acmecorp.com",
+            recipient_email="legal@acme.com",
             department="Legal",
             hours_valid=24,
             db=db,
@@ -376,7 +376,7 @@ def test_generate_invite_security():
         p_raw = decrypt_data(portal_res["token"])
         p_parts = p_raw.split("|")
         assert p_parts[0] == str(cust.id)
-        assert p_parts[2] == "legal@acmecorp.com"
+        assert p_parts[2] == "legal@acme.com"
         print(f"  [PASS] requests.generate_portal_link minted strictly for customer_id={p_parts[0]}")
     finally:
         db.close()

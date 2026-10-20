@@ -290,6 +290,7 @@ class Bank(BaseModel):
     sla_commitment_pct = Column(Numeric(precision=5, scale=2), nullable=True, comment="Bank-wide on-time SLA commitment rate")
     total_completed_issuances = Column(Integer, default=0, nullable=False, comment="Total completed issuances across all facilities for this bank")
     portal_access_enabled = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether trading portal / dealer desk access is enabled for this bank")
+    allow_dealer_comments = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can enter free-text notes/comments")
 
     def __repr__(self: Bank):
         return f"<Bank(id={self.id}, name='{self.name}')>"

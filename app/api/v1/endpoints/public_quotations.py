@@ -1,10 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict
 import os
 import secrets
 import uuid
+import hmac
+import hashlib
+from pydantic import BaseModel, Field
 
 from app.database import get_db
 from app.crud.base import log_action
@@ -557,6 +561,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "assignment_id": assignment.id,
         "is_cross_entity": bool(assignment.is_cross_entity),
         "bank_name": bank_name,
+        "allow_dealer_comments": bool(getattr(q_bank.bank, 'allow_dealer_comments', True)) if (q_bank and q_bank.bank) else True,
         "customer_name": customer_name,
         "entity_name": customer_name if assignment.is_cross_entity else (rfq.entity.entity_name if rfq.entity else customer_name),
         "entity_tax_id": None if assignment.is_cross_entity else (rfq.entity.tax_id if rfq.entity else None),
@@ -1379,11 +1384,12 @@ def submit_fx_offer(
     from app.services.tenant_key_service import tenant_key_service
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
 
+    allow_dealer_comments = bool(getattr(q_bank.bank, 'allow_dealer_comments', True)) if (q_bank and q_bank.bank) else True
     offer = QuotationOffer(
         assignment_id=assignment.id,
         price=None,
         offered_value_date=final_offered_value_date,
-        notes=offer_in.notes,
+        notes=offer_in.notes if allow_dealer_comments else None,
         submitted_by_email=submitted_by,
         leg_id=target_leg_id
     )
@@ -1579,11 +1585,12 @@ def submit_fx_offers_batch(
         from app.services.tenant_key_service import tenant_key_service
         tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
 
+        allow_dealer_comments = bool(getattr(q_bank.bank, 'allow_dealer_comments', True)) if (q_bank and q_bank.bank) else True
         offer = QuotationOffer(
             assignment_id=assignment.id,
             price=None,
             offered_value_date=final_val_date,
-            notes=item.notes,
+            notes=item.notes if allow_dealer_comments else None,
             submitted_by_email=submitted_by,
             leg_id=item.leg_id
         )
@@ -1789,6 +1796,7 @@ def submit_tbill_offer(
     from app.services.tenant_key_service import tenant_key_service
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
 
+    allow_dealer_comments = bool(getattr(q_bank.bank, 'allow_dealer_comments', True)) if (q_bank and q_bank.bank) else True
     for line in offer_in.lines:
         o = QuotationTBillOffer(
             assignment_id=assignment.id,
@@ -1796,7 +1804,7 @@ def submit_tbill_offer(
             maturity_date=line.maturityDate,
             discount_rate=None,
             max_amount=None,
-            notes=line.notes or offer_in.notes,
+            notes=(line.notes or offer_in.notes) if allow_dealer_comments else None,
             submitted_by_email=submitted_by
         )
         tenant_key_service.apply_encrypted_tbill_offer(o, line.discountRate, line.maxAmount, tenant_dek)
@@ -2363,19 +2371,29 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
                 "detail": "Indicative pricing received. Thank you for your quote."
             }
 
-        # If acceptance is currently pending corporate decision (ONLY for Execution deals!)
-        if getattr(rfq, 'acceptance_status', None) == 'PENDING':
-            return {
-                "status": "AWAITING_MANUAL_SELECTION",
-                "message": "Quotation window closed. Awaiting corporate treasury acceptance.",
-                "acceptance_deadline": rfq.acceptance_deadline.isoformat() if getattr(rfq, 'acceptance_deadline', None) else None
-            }
-
         # If deal was rejected or auto-rejected
         if rfq.status == 'REJECTED' or getattr(rfq, 'acceptance_status', None) in ('REJECTED', 'AUTO_REJECTED'):
             return {
                 "status": "UNEXECUTED",
                 "detail": "This quotation request has concluded and your offer was not selected for trade execution on this occasion."
+            }
+
+        # If deal concluded without any winning execution quote
+        if getattr(rfq, 'acceptance_status', None) == 'NO_QUOTES':
+            return {
+                "status": "INCONCLUSIVE",
+                "detail": "This quotation request has concluded without an awarded execution."
+            }
+
+        # Strict trade execution governance:
+        # A counterparty must NEVER receive a confirmed execution / cryptographic receipt
+        # until corporate treasury has officially accepted the trade!
+        is_deal_accepted = getattr(rfq, 'acceptance_status', None) in ('ACCEPTED', 'AUTO_ACCEPTED')
+        if not is_deal_accepted:
+            return {
+                "status": "AWAITING_MANUAL_SELECTION",
+                "message": "Quotation window closed. Awaiting corporate treasury acceptance.",
+                "acceptance_deadline": rfq.acceptance_deadline.isoformat() if getattr(rfq, 'acceptance_deadline', None) else None
             }
 
         bank_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
@@ -2719,18 +2737,32 @@ def confirm_bank_handshake(token: str, request: Request, db: Session = Depends(g
 
 # --- Public Dealer Handshake & Self-Activation Endpoints ---
 
+# --- Public Dealer Handshake & Self-Activation Endpoints ---
+
+class DealerHandshakeVerifyIn(BaseModel):
+    otp: str
+
+
 @router.get("/dealer-handshake/{token}")
 def get_dealer_handshake_details(token: str, db: Session = Depends(get_db)):
-    """Validates the dealer invitation token and returns invitation details for verification."""
+    """
+    Validates the dealer invitation token and returns invitation details for verification.
+    Gate-only: does NOT burn the token on read (defends against email scanners).
+    """
+    from app.core.masking import mask_email
+    from app.models.models import Customer, Bank, CustomerEntity
+    from app.models.models_quotation import QuotationBank
+
+    th = hashlib.sha256(token.encode("utf-8")).hexdigest()
     inv = db.query(QuotationBankContactInvitation).filter(
-        QuotationBankContactInvitation.token == token
+        or_(
+            QuotationBankContactInvitation.token == token,
+            QuotationBankContactInvitation.token_hash == th
+        )
     ).first()
 
     if not inv:
         raise HTTPException(status_code=404, detail="The invitation link is invalid or has expired.")
-
-    from app.models.models import Customer, Bank, CustomerEntity
-    from app.models.models_quotation import QuotationBank
 
     cust = db.query(Customer).filter(Customer.id == inv.customer_id).first()
     bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
@@ -2774,12 +2806,35 @@ def get_dealer_handshake_details(token: str, db: Session = Depends(get_db)):
             scope_display = f"{len(entities_list)} Specific Entit{'ies' if len(entities_list) > 1 else 'y'}"
 
     now_utc = datetime.now(timezone.utc)
-    is_expired = inv.expires_at < now_utc if inv.expires_at else False
+    is_expired = bool(inv.expires_at and inv.expires_at < now_utc)
+    is_locked = bool(inv.status in ["REVOKED", "LOCKED"] or (inv.failed_otp_attempts and inv.failed_otp_attempts >= 3))
+    already_accepted = bool(inv.status == "ACCEPTED")
+
+    # Cooldown remaining for OTP generation (60s)
+    cooldown_remaining = 0
+    if inv.otp_last_sent_at:
+        elapsed = (now_utc - inv.otp_last_sent_at).total_seconds()
+        if elapsed < 60:
+            cooldown_remaining = int(60 - elapsed)
+
+    # Active OTP seconds remaining (5 minutes)
+    otp_active_seconds = 0
+    if inv.otp_expires_at and inv.otp_expires_at > now_utc:
+        otp_active_seconds = int((inv.otp_expires_at - now_utc).total_seconds())
+
+    # Resolve Zero-Knowledge email and mask for privacy on the public gate
+    clean_email = inv.get_email(db)
+    masked = mask_email(clean_email)
+
+    effective_status = "LOCKED" if is_locked else ("ACCEPTED" if already_accepted else ("EXPIRED" if is_expired else inv.status))
 
     return {
-        "status": inv.status,
+        "status": effective_status,
         "is_expired": is_expired,
-        "email": inv.email,
+        "is_locked": is_locked,
+        "already_accepted": already_accepted,
+        "masked_email": masked,
+        "email": masked,
         "title": inv.title,
         "role": inv.role,
         "bank_name": bank.name if bank else f"Bank {inv.bank_id}",
@@ -2788,21 +2843,137 @@ def get_dealer_handshake_details(token: str, db: Session = Depends(get_db)):
         "entity_scope_display": scope_display,
         "entities": entities_list,
         "trade_type": qb.trade_type if qb else "BOTH",
+        "cooldown_remaining": cooldown_remaining,
+        "otp_active_seconds": otp_active_seconds,
+        "failed_otp_attempts": inv.failed_otp_attempts or 0,
+        "max_attempts": 3,
+        "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
         "created_at": inv.created_at.isoformat() if inv.created_at else None,
-        "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None,
-        "already_accepted": (inv.status == "ACCEPTED")
+        "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None
     }
 
 
-@router.post("/dealer-handshake/{token}/accept")
-def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(get_db)):
-    """Accepts the dealer invitation and promotes the contact into quotation_banks.contacts."""
+@router.post("/dealer-handshake/{token}/request-otp")
+def request_dealer_handshake_otp(
+    token: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Generates and dispatches a single-use 6-digit OTP to the dealer's verified email.
+    Enforces a strict 60-second cooldown rate limit and 5-minute code expiration.
+    """
+    from app.core.masking import mask_email
+    from app.models.models import Customer, Bank
+    from app.services.unified_email_builder import build_dealer_handshake_otp_email
+
+    th = hashlib.sha256(token.encode("utf-8")).hexdigest()
     inv = db.query(QuotationBankContactInvitation).filter(
-        QuotationBankContactInvitation.token == token
+        or_(
+            QuotationBankContactInvitation.token == token,
+            QuotationBankContactInvitation.token_hash == th
+        )
     ).first()
 
     if not inv:
         raise HTTPException(status_code=404, detail="The invitation link is invalid or has expired.")
+
+    if inv.status in ["REVOKED", "LOCKED"] or (inv.failed_otp_attempts and inv.failed_otp_attempts >= 3):
+        raise HTTPException(status_code=400, detail="This invitation has been permanently locked due to security restrictions.")
+
+    if inv.status == "ACCEPTED":
+        raise HTTPException(status_code=400, detail="This invitation has already been accepted and completed.")
+
+    now_utc = datetime.now(timezone.utc)
+    if inv.expires_at and inv.expires_at < now_utc:
+        raise HTTPException(status_code=400, detail="This invitation link has expired (48-hour limit). Please request a new invitation.")
+
+    # Enforce 60-second cooldown rate limit
+    if inv.otp_last_sent_at:
+        elapsed = (now_utc - inv.otp_last_sent_at).total_seconds()
+        if elapsed < 60:
+            wait_sec = int(60 - elapsed)
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait_sec} seconds before requesting a new verification code."
+            )
+
+    # Generate cryptographically secure 6-digit OTP
+    otp_code = f"{secrets.randbelow(900000) + 100000:06d}"
+    inv.otp_hash = hashlib.sha256(otp_code.encode("utf-8")).hexdigest()
+    inv.otp_expires_at = now_utc + timedelta(minutes=5)  # 5-minute TTL
+    inv.otp_last_sent_at = now_utc
+    db.commit()
+
+    cust = db.query(Customer).filter(Customer.id == inv.customer_id).first()
+    bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
+    clean_email = inv.get_email(db)
+
+    # Dispatch OTP email (save_copy=False to prevent email server Sent Items retention)
+    try:
+        subj, email_html = build_dealer_handshake_otp_email(
+            customer_branding=cust.name if cust else "Corporate Treasury",
+            bank_name=bank.name if bank else "Trading Counterparty",
+            otp_code=otp_code,
+            valid_minutes=5
+        )
+        email_settings, _ = get_customer_email_settings(db, inv.customer_id)
+        background_tasks.add_task(
+            send_email,
+            db,
+            [clean_email],
+            subj,
+            email_html,
+            {},
+            email_settings,
+            save_copy=False
+        )
+    except Exception as email_err:
+        logger.warning(f"Failed to dispatch dealer handshake OTP email: {email_err}")
+
+    # Zero-Knowledge logging: no cleartext email logged
+    logger.info(f"Dispatched dealer handshake OTP code to counterparty [blind_index={inv.email_blind_index[:12] if inv.email_blind_index else 'none'}]")
+
+    return {
+        "status": "otp_sent",
+        "message": f"Verification code sent to {mask_email(clean_email)}. Code is valid for 5 minutes.",
+        "cooldown_seconds": 60,
+        "expires_in_seconds": 300
+    }
+
+
+@router.post("/dealer-handshake/{token}/verify-otp")
+def verify_dealer_handshake_otp(
+    token: str,
+    body: DealerHandshakeVerifyIn,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Verifies the 6-digit OTP, promotes the dealer to active counterparty,
+    and PERMANENTLY BURNS the single-activation link.
+    Enforces a 3-attempt lockout defense against brute force.
+    """
+    from app.models.models import Bank, Customer
+    from app.models.models_quotation import QuotationBank
+
+    th = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    inv = db.query(QuotationBankContactInvitation).filter(
+        or_(
+            QuotationBankContactInvitation.token == token,
+            QuotationBankContactInvitation.token_hash == th
+        )
+    ).first()
+
+    if not inv:
+        raise HTTPException(status_code=404, detail="The invitation link is invalid or has expired.")
+
+    if inv.status in ["REVOKED", "LOCKED"] or (inv.failed_otp_attempts and inv.failed_otp_attempts >= 3):
+        inv.status = "REVOKED"
+        inv.token = None  # Burn token
+        db.commit()
+        raise HTTPException(status_code=400, detail="This invitation link has been permanently locked due to security restrictions.")
 
     if inv.status == "ACCEPTED":
         return {
@@ -2811,25 +2982,51 @@ def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(
             "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None
         }
 
-    if inv.status == "REVOKED":
-        raise HTTPException(status_code=400, detail="This invitation has been revoked by the corporate treasury administrator.")
-
     now_utc = datetime.now(timezone.utc)
     if inv.expires_at and inv.expires_at < now_utc:
-        raise HTTPException(status_code=400, detail="This invitation has expired. Please request a new invitation link from your corporate treasury administrator.")
+        raise HTTPException(status_code=400, detail="This invitation link has expired (48-hour limit). Please request a new invitation link from your corporate treasury administrator.")
 
-    # Promote contact to QuotationBank
+    if not inv.otp_hash or not inv.otp_expires_at:
+        raise HTTPException(status_code=400, detail="No active verification code found. Please click 'Send Verification Code' first.")
+
+    if inv.otp_expires_at < now_utc:
+        raise HTTPException(status_code=400, detail="Your verification code has expired (5-minute limit). Please request a new code.")
+
+    # Verify submitted OTP hash with constant-time comparison
+    submitted_code = body.otp.strip()
+    submitted_hash = hashlib.sha256(submitted_code.encode("utf-8")).hexdigest()
+
+    if not hmac.compare_digest(submitted_hash, inv.otp_hash):
+        inv.failed_otp_attempts = (inv.failed_otp_attempts or 0) + 1
+        attempts_left = 3 - inv.failed_otp_attempts
+        if inv.failed_otp_attempts >= 3:
+            inv.status = "REVOKED"
+            inv.token = None  # Single-activation: BURN token on 3 failed attempts
+            inv.otp_hash = None
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail="Incorrect code. Maximum verification attempts exceeded (3/3). This invitation has been permanently locked for security."
+            )
+        else:
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Incorrect verification code. {attempts_left} attempt{'s' if attempts_left > 1 else ''} remaining before link lockout."
+            )
+
+    # --- SUCCESSFUL VERIFICATION: PROMOTE DEALER & BURN SINGLE-ACTIVATION LINK ---
+    clean_email = inv.get_email(db)
     qb = db.query(QuotationBank).filter(
         QuotationBank.customer_id == inv.customer_id,
         QuotationBank.bank_id == inv.bank_id
     ).first()
 
-    from app.models.models import Bank, Customer
     bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
     cust = db.query(Customer).filter(Customer.id == inv.customer_id).first()
 
     new_contact_entry = {
-        "email": inv.email.strip().lower(),
+        "email": clean_email.strip().lower(),
         "title": inv.title or "",
         "name": inv.title or "",
         "role": (inv.role or "EXECUTION").upper()
@@ -2857,13 +3054,17 @@ def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(
         db.add(qb)
         db.flush()
 
+    # SINGLE-ACTIVATION LINK BURN: nullify raw URL token, clear OTP, record timestamp
     inv.status = "ACCEPTED"
     inv.accepted_at = now_utc
+    inv.token = None  # Raw URL token permanently burned from DB!
+    inv.otp_hash = None
+    inv.failed_otp_attempts = 0
     inv.quotation_bank_id = qb.id
-
     db.commit()
 
     client_ip = request.client.host if request and request.client else "unknown"
+    # Zero-Knowledge audit log: store HMAC blind index instead of cleartext email
     log_action(
         db,
         user_id=None,
@@ -2873,7 +3074,7 @@ def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(
         details={
             "bank_id": inv.bank_id,
             "bank_name": bank.name if bank else f"Bank {inv.bank_id}",
-            "dealer_email": inv.email,
+            "email_blind_index": inv.email_blind_index,
             "role": inv.role,
             "ip_address": client_ip
         },
@@ -2887,6 +3088,29 @@ def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(
         "bank_name": bank.name if bank else "",
         "customer_name": cust.name if cust else ""
     }
+
+
+@router.post("/dealer-handshake/{token}/accept")
+async def accept_dealer_handshake(token: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Accept endpoint supporting both OTP verification and backward-compatibility.
+    If OTP is provided in JSON body, executes verification and burn handshake.
+    If no OTP is provided, rejects and enforces 6-digit OTP interactive gate.
+    """
+    try:
+        body_json = await request.json()
+    except Exception:
+        body_json = {}
+
+    otp = (body_json.get("otp") or "").strip()
+    if not otp:
+        raise HTTPException(
+            status_code=400,
+            detail="Interactive 6-digit verification code (OTP) is required. Please click 'Send Verification Code' to verify your identity."
+        )
+
+    verify_in = DealerHandshakeVerifyIn(otp=otp)
+    return verify_dealer_handshake_otp(token=token, body=verify_in, request=request, db=db)
 
 
 from pydantic import BaseModel, Field

@@ -1,4 +1,5 @@
 # app/models_quotation.py
+from typing import Optional, List, Union
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey, Text, Index, Date
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
@@ -41,13 +42,28 @@ class QuotationBankContactInvitation(Base):
     customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
     bank_id = Column(Integer, ForeignKey("banks.id", ondelete="CASCADE"), nullable=False, index=True)
     quotation_bank_id = Column(Integer, ForeignKey("quotation_banks.id", ondelete="CASCADE"), nullable=True)
-    email = Column(String(255), nullable=False)
+    
+    # Dual-read & Zero-Knowledge storage
+    email = Column(String(255), nullable=True, comment="Legacy cleartext email fallback")
+    encrypted_email = Column(Text, nullable=True, comment="Phase 8 Zero-Knowledge AES-256-GCM encrypted email")
+    email_blind_index = Column(String(64), nullable=True, index=True, comment="HMAC-SHA256 blind index for O(1) deduplication/lookup")
+    
     title = Column(String(255), nullable=True)
     role = Column(String(50), default="EXECUTION")
-    token = Column(String(255), nullable=False, unique=True, index=True)
-    status = Column(String(30), default="PENDING")  # 'PENDING', 'ACCEPTED', 'REVOKED'
+    
+    # Handshake security & single-activation burn
+    token = Column(String(255), nullable=True, unique=True, index=True, comment="Single-activation URL token (burned upon verification)")
+    token_hash = Column(String(64), nullable=True, index=True, comment="SHA-256 hash of URL invitation token")
+    status = Column(String(30), default="PENDING")  # 'PENDING', 'ACCEPTED', 'REVOKED', 'LOCKED'
+    
+    # Interactive OTP gate (5m TTL, 60s cooldown, 3-attempt lockout)
+    otp_hash = Column(String(128), nullable=True, comment="SHA-256 hash of active 6-digit OTP")
+    otp_expires_at = Column(DateTime(timezone=True), nullable=True, comment="5-minute OTP TTL")
+    otp_last_sent_at = Column(DateTime(timezone=True), nullable=True, comment="Rate limit 60s cooldown anchor")
+    failed_otp_attempts = Column(Integer, default=0, nullable=False, comment="Failed OTP attempts; locked out at 3")
+    
     invited_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False, comment="48-hour invitation link TTL")
     accepted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -55,6 +71,37 @@ class QuotationBankContactInvitation(Base):
     customer = relationship("Customer")
     bank = relationship("Bank")
     quotation_bank = relationship("QuotationBank")
+
+    def get_email(self, db) -> str:
+        """Decrypts and returns contact email via Tenant DEK, falling back to legacy cleartext."""
+        if self.encrypted_email:
+            try:
+                from app.services.tenant_key_service import tenant_key_service
+                from app.core.security_crypto import decrypt_field
+                dek = tenant_key_service.get_or_create_tenant_dek(db, self.customer_id)
+                decrypted = decrypt_field(self.encrypted_email, dek, field_context="dealer_email")
+                if decrypted:
+                    return decrypted
+            except Exception:
+                pass
+        return self.email or ""
+
+    def set_email(self, raw_email: str, db, dek: Optional[bytes] = None) -> None:
+        """Sets Zero-Knowledge AES-256-GCM encrypted email and HMAC blind index."""
+        clean = (raw_email or "").strip().lower()
+        if not clean:
+            self.email = None
+            self.encrypted_email = None
+            self.email_blind_index = None
+            return
+        
+        from app.core.security_crypto import encrypt_field, compute_email_blind_index
+        from app.services.tenant_key_service import tenant_key_service
+        
+        tenant_dek = dek or tenant_key_service.get_or_create_tenant_dek(db, self.customer_id)
+        self.encrypted_email = encrypt_field(clean, tenant_dek, field_context="dealer_email")
+        self.email_blind_index = compute_email_blind_index(clean)
+        self.email = None  # Zero-Knowledge: cleartext email is NOT stored in DB
 
 
 class QuotationRequest(BaseModel):
@@ -279,6 +326,45 @@ class QuotationRequest(BaseModel):
     @approved_by_email.setter
     def approved_by_email(self, value):
         self._approved_by_email = value
+
+    @property
+    def entity_name(self) -> Optional[str]:
+        if hasattr(self, '_entity_name') and self._entity_name is not None:
+            return self._entity_name
+        if self.entity:
+            return getattr(self.entity, "entity_name", None)
+        return None
+
+    @entity_name.setter
+    def entity_name(self, value):
+        self._entity_name = value
+
+    @property
+    def entity_code(self) -> Optional[str]:
+        if hasattr(self, '_entity_code') and self._entity_code is not None:
+            return self._entity_code
+        if self.entity:
+            return getattr(self.entity, "code", None)
+        return None
+
+    @entity_code.setter
+    def entity_code(self, value):
+        self._entity_code = value
+
+    @property
+    def creator_name(self) -> Optional[str]:
+        if hasattr(self, '_creator_name') and self._creator_name is not None:
+            return self._creator_name
+        if self.creator:
+            f_name = getattr(self.creator, "first_name", "") or ""
+            l_name = getattr(self.creator, "last_name", "") or ""
+            name = f"{f_name} {l_name}".strip()
+            return name or getattr(self.creator, "email", None)
+        return None
+
+    @creator_name.setter
+    def creator_name(self, value):
+        self._creator_name = value
 
     @property
     def release_docs_to_winner_only(self) -> bool:

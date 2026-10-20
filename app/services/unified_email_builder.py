@@ -1641,7 +1641,7 @@ def build_dealer_invitation_email(
                             </p>
 
                             <!-- ACTION BUTTON -->
-                            <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 26px auto 20px auto;">
+                            <table role="presentation" border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 26px auto 16px auto;">
                                 <tr>
                                     <td align="center" bgcolor="#0f172a" style="border-radius: 8px; background-color: #0f172a;">
                                         <a href="{handshake_link}" target="_blank" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; padding: 13px 32px; border-radius: 8px; border: 1px solid #0f172a; display: inline-block;">
@@ -1651,9 +1651,14 @@ def build_dealer_invitation_email(
                                 </tr>
                             </table>
 
-                            <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: -10px; margin-bottom: 24px;">
+                            <p style="text-align: center; font-size: 11.5px; color: #64748b; margin-top: 0; margin-bottom: 20px;">
                                 Or open: <a href="{handshake_link}" style="color: #0284c7; word-break: break-all;">{handshake_link}</a>
                             </p>
+
+                            <!-- SECURITY NOTICE -->
+                            <div style="background-color: #f1f5f9; border-left: 3px solid #0284c7; padding: 10px 14px; border-radius: 4px; margin-bottom: 20px; font-size: 12px; color: #334155; line-height: 1.4;">
+                                <strong>🔒 Institutional Security Notice:</strong> This single-activation link expires in <strong>48 hours</strong>. Upon opening, an interactive 6-digit verification code (OTP) will be verified to securely bind your desk access.
+                            </div>
 
                             <p style="margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.5; border-top: 1px solid #f1f5f9; padding-top: 16px;">
                                 If you believe you received this invitation in error, you may disregard this email or reply to contact the treasury team.
@@ -1669,6 +1674,138 @@ def build_dealer_invitation_email(
                             </p>
                             <p style="margin: 0; font-size: 11px; color: #94a3b8;">
                                 Dispatched on {current_time_str} on behalf of {customer_branding} Treasury Desk.
+                            </p>
+                        </td>
+                    </tr>
+
+                </table>
+                <!--[if (gte mso 9)|(IE)]>
+                </td>
+                </tr>
+                </table>
+                <![endif]-->
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
+    return subject, html_body
+
+
+def build_dealer_handshake_otp_email(
+    customer_branding: str,
+    bank_name: str,
+    otp_code: str,
+    valid_minutes: int = 5,
+    platform_name: str = "Grow Treasury Platform"
+) -> Tuple[str, str]:
+    """
+    Builds the single-use 6-digit OTP verification code email dispatched when a dealer
+    interacts with their invitation link.
+    Strictly isolated: does not log recipient email in cleartext.
+    """
+    now = datetime.now()
+    current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
+    subject = f"Your Grow Treasury Verification Code: {otp_code} (Valid {valid_minutes}m)"
+
+    html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{subject}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        body, table, td, p, a, span {{ font-family: 'Segoe UI', Arial, sans-serif !important; }}
+    </style>
+    <![endif]-->
+    <style type="text/css">
+        body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+        table {{ border-collapse: collapse !important; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+        img {{ border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }}
+        a {{ text-decoration: none; }}
+        @media only screen and (max-width: 640px) {{
+            .email-container {{ width: 100% !important; max-width: 100% !important; }}
+            .mobile-padding {{ padding: 20px 16px !important; }}
+            .otp-code-box {{ font-size: 28px !important; letter-spacing: 6px !important; padding: 14px 18px !important; }}
+        }}
+    </style>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; -webkit-font-smoothing: antialiased;">
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; width: 100%; margin: 0; padding: 24px 0;">
+        <tr>
+            <td align="center" style="padding: 0 10px;">
+                <!--[if (gte mso 9)|(IE)]>
+                <table role="presentation" width="580" align="center" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                <td>
+                <![endif]-->
+                <table role="presentation" class="email-container" width="100%" border="0" cellpadding="0" cellspacing="0" style="max-width: 580px; width: 100%; background-color: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+                    
+                    <!-- HEADER -->
+                    <tr>
+                        <td bgcolor="#0f172a" style="background-color: #0f172a; padding: 22px 28px; color: #ffffff;" class="mobile-padding">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td valign="middle" align="left">
+                                        <span style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #10b981; display: block; margin-bottom: 4px;">SECURITY VERIFICATION</span>
+                                        <h1 style="margin: 0; font-size: 18px; font-weight: 700; color: #ffffff; line-height: 1.3;">One-Time Handshake Code</h1>
+                                    </td>
+                                    <td valign="middle" align="right" style="text-align: right;">
+                                        <span style="background-color: #1e293b; color: #38bdf8; padding: 5px 12px; border-radius: 16px; font-size: 11px; font-weight: 700; border: 1px solid #38bdf8; display: inline-block;">
+                                            {customer_branding}
+                                        </span>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <!-- CONTENT BODY -->
+                    <tr>
+                        <td bgcolor="#ffffff" style="background-color: #ffffff; padding: 28px 30px;" class="mobile-padding">
+                            <p style="margin-top: 0; margin-bottom: 12px; font-size: 14px; color: #0f172a; font-weight: 600;">
+                                Authorization Request for {bank_name}
+                            </p>
+                            <p style="margin-top: 0; margin-bottom: 22px; font-size: 13.5px; color: #334155; line-height: 1.5;">
+                                A verification code was requested to authorize your trading desk access for corporate treasury client <strong>{customer_branding}</strong>. Enter the following code into your verification screen:
+                            </p>
+
+                            <!-- OTP CODE CARD -->
+                            <div style="background-color: #f8fafc; border: 2px dashed #0284c7; border-radius: 10px; padding: 20px; text-align: center; margin-bottom: 22px;">
+                                <span style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #64748b; display: block; margin-bottom: 8px;">
+                                    Your 6-Digit Verification Code
+                                </span>
+                                <div class="otp-code-box" style="font-family: 'Courier New', Courier, monospace; font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #0f172a; background: #ffffff; display: inline-block; padding: 10px 24px; border-radius: 8px; border: 1px solid #cbd5e1; user-select: all;">
+                                    {otp_code}
+                                </div>
+                                <span style="font-size: 11.5px; color: #dc2626; font-weight: 600; display: block; margin-top: 10px;">
+                                    ⏳ Valid for {valid_minutes} minutes &bull; Single-use only
+                                </span>
+                            </div>
+
+                            <!-- SECURITY INSTRUCTIONS -->
+                            <p style="margin-top: 0; margin-bottom: 8px; font-size: 12.5px; color: #475569; line-height: 1.5;">
+                                <strong>Security Protocol:</strong>
+                            </p>
+                            <ul style="margin: 0; padding-left: 20px; font-size: 12px; color: #64748b; line-height: 1.6; margin-bottom: 20px;">
+                                <li>Never share this code with anyone. Grow support will never ask for your code.</li>
+                                <li>Entering 3 incorrect attempts will automatically lock this invitation.</li>
+                                <li>If you did not request this verification, please disregard this email.</li>
+                            </ul>
+
+                            <p style="margin: 0; font-size: 11.5px; color: #94a3b8; line-height: 1.4; border-top: 1px solid #f1f5f9; padding-top: 14px;">
+                                Generated automatically on {current_time_str}.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <!-- FOOTER -->
+                    <tr>
+                        <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 14px 28px; text-align: center;" class="mobile-padding">
+                            <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                                {platform_name} &bull; Zero-Knowledge Institutional Security
                             </p>
                         </td>
                     </tr>

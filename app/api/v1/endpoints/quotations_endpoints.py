@@ -29,7 +29,8 @@ from app.schemas.schemas_quotation import (
     QuotationResultsOut, QuotationResultItem,
     ReTenderRequest, QuotationResubmitRequest,
     QuotationCancellationRequest, QuotationRescheduleRequest,
-    QuotationDelegateRequest
+    QuotationDelegateRequest,
+    DocumentTicketRequest, DocumentTicketOut
 )
 from app.crud.crud_quotation import crud_quotation, get_bank_leg_signature
 from app.models.models_quotation import (
@@ -83,9 +84,189 @@ async def upload_quotation_documents(
     return {"documents": list(uploaded_files)}
 
 
+@router.post("/documents/ticket", response_model=DocumentTicketOut)
+async def create_document_download_ticket(
+    req: DocumentTicketRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Mints a short-lived (15-minute) cryptographically signed ephemeral download ticket 
+    bound to the authenticated corporate user or active bank dealer session (Sub-Phase 8.7 Option A & B).
+    """
+    import time
+    from app.core.security_crypto import generate_download_ticket
+    from app.core.security import verify_access_token
+
+    customer_id = None
+    caller_desc = None
+    target_leg = None
+    gcs_uri = req.gcs_uri.strip()
+
+    # 1. Corporate User Auth
+    auth_header = request.headers.get("Authorization")
+    raw_jwt = auth_header.split(" ")[1] if (auth_header and auth_header.startswith("Bearer ")) else None
+
+    if raw_jwt:
+        try:
+            payload = verify_access_token(raw_jwt)
+            customer_id = payload.get("customer_id")
+            user_email = payload.get("sub") or payload.get("email") or "user"
+            caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
+
+            role = (payload.get("role") or "").lower()
+            is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
+            if not is_super and customer_id:
+                expected_segment = f"customer_{customer_id}/"
+                if expected_segment not in gcs_uri:
+                    logger.warning(f"Document access blocked: Cross-tenant corporate isolation breach attempt by user {corporate_user_id} on {gcs_uri}")
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access denied or Not found"
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # 2. Bank Dealer Auth (Option B: Requires assignment token + active OTP session)
+    if not customer_id and req.token:
+        assignment = db.query(QuotationBankAssignment).filter(
+            QuotationBankAssignment.token == req.token
+        ).first()
+        if not assignment:
+            logger.warning(f"Document ticket rejected: Invalid assignment token {req.token}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+        rfq = assignment.rfq or db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+        if not rfq:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
+
+        # Master assignment visibility check
+        if assignment.is_document_visible is False:
+            logger.warning(f"Document ticket rejected: Document visibility disabled for assignment {assignment.id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied or Not found"
+            )
+
+        # Verify that requested document is attached to this RFQ session
+        rfq_docs_str = rfq.document_path or ""
+        doc_filename = gcs_uri.split("/")[-1]
+        all_rfq_doc_paths = rfq_docs_str + " ".join([l.document_path or "" for l in (rfq.legs or [])])
+        if doc_filename not in all_rfq_doc_paths:
+            logger.warning(f"Document ticket rejected: Document {doc_filename} not attached to RFQ {rfq.id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied or Not found"
+            )
+
+        # Multi-Pair Leg Gating & Isolation
+        assigned_bank_master_id = assignment.quotation_bank.bank_id if assignment.quotation_bank else None
+
+        if req.leg_id:
+            target_leg = db.query(QuotationLeg).filter(
+                QuotationLeg.id == req.leg_id,
+                QuotationLeg.rfq_id == rfq.id
+            ).first()
+            if not target_leg:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
+        else:
+            for l in (rfq.legs or []):
+                if l.document_path and doc_filename in l.document_path:
+                    target_leg = l
+                    break
+
+        if target_leg:
+            leg_cfg = assignment.get_config_for_leg(target_leg.id)
+            if getattr(leg_cfg, "is_invited", True) is False:
+                logger.warning(f"Document ticket rejected: Bank not invited to leg {target_leg.id}")
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+            if getattr(leg_cfg, "is_document_visible", True) is False:
+                logger.warning(f"Document ticket rejected: Leg document visibility disabled for leg {target_leg.id}")
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+            # Leg isolation policy in split awards
+            if target_leg.status in ("COMPLETED", "ACCEPTED") and target_leg.winner_bank_id is not None:
+                is_leg_winner = (
+                    (assigned_bank_master_id is not None and assigned_bank_master_id == target_leg.winner_bank_id) or
+                    assignment.quotation_bank_id == target_leg.winner_bank_id
+                )
+                if not is_leg_winner:
+                    logger.warning(f"Document ticket rejected: Leg isolation breach attempt on leg {target_leg.id}")
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access denied or Not found"
+                    )
+        elif getattr(rfq, "release_to_winner_only", False) and rfq.status in ("COMPLETED", "ACCEPTED"):
+            rfq_winner_match = (
+                (assigned_bank_master_id is not None and assigned_bank_master_id == rfq.winner_bank_id) or
+                assignment.quotation_bank_id == rfq.winner_bank_id
+            )
+            any_leg_won = any(
+                (assigned_bank_master_id is not None and assigned_bank_master_id == l.winner_bank_id) or
+                assignment.quotation_bank_id == l.winner_bank_id
+                for l in (rfq.legs or [])
+            )
+            if not (rfq_winner_match or any_leg_won):
+                logger.warning(f"Document ticket rejected: Winner-only policy breach attempt on RFQ {rfq.id}")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied or Not found"
+                )
+
+        # Option B: Verify Active OTP Session if OTP records exist for this assignment
+        has_otps = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == assignment.id).first()
+        session_email = None
+        if has_otps:
+            clean_session = req.session_token.split('_tab_')[0] if (req.session_token and '_tab_' in req.session_token) else req.session_token
+            if not clean_session:
+                logger.warning(f"Document ticket rejected: Missing active OTP session for assignment {assignment.id}")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied or Not found"
+                )
+            otp_match = db.query(QuotationAccessOTP).filter(
+                QuotationAccessOTP.assignment_id == assignment.id,
+                QuotationAccessOTP.magic_token == clean_session
+            ).first()
+            if not otp_match:
+                logger.warning(f"Document ticket rejected: Invalid/expired OTP session for assignment {assignment.id}")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied or Not found"
+                )
+            session_email = otp_match.email
+
+        customer_id = rfq.customer_id
+        caller_desc = f"Bank Dealer: Bank {assignment.quotation_bank_id} ({session_email or 'Verified Session'}) (RFQ {rfq.ref_no})"
+
+    if not customer_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access denied or Not found"
+        )
+
+    # 3. Mint 15-Minute Signed Ephemeral Ticket
+    ticket_payload = {
+        "gcs_uri": gcs_uri,
+        "customer_id": customer_id,
+        "caller_desc": caller_desc,
+        "leg_id": req.leg_id or (target_leg.id if target_leg else None),
+        "created_at": int(time.time())
+    }
+    ticket = generate_download_ticket(ticket_payload, expiry_minutes=15)
+    return {
+        "ticket": ticket,
+        "download_url": f"/api/v1/quotations/documents/download?ticket={ticket}",
+        "expires_in_seconds": 900
+    }
+
+
 @router.get("/documents/download")
 async def download_quotation_document(
-    gcs_uri: str = Query(..., description="GCS URI of the document to download"),
+    gcs_uri: Optional[str] = Query(None, description="GCS URI of the document to download"),
+    ticket: Optional[str] = Query(None, description="15-minute signed ephemeral download ticket"),
     token: Optional[str] = Query(None, description="Bank Dealer invitation token"),
     auth_token: Optional[str] = Query(None, description="Corporate User JWT (for direct browser downloads)"),
     leg_id: Optional[str] = Query(None, description="Trade Leg ID for multi-pair leg isolation"),
@@ -96,6 +277,7 @@ async def download_quotation_document(
     Authenticated streaming decryption gateway for quotation documents (Sub-Phase 8.7).
     
     Security & Authorization:
+    0. Ephemeral Signed Ticket (Option A): Validates 15-minute cryptographically signed ticket.
     1. Authenticated Corporate User (Bearer JWT or auth_token query): must belong to customer owning the doc (or superuser).
     2. Invited Bank Dealer (token): must possess a valid QuotationBankAssignment token with document visibility enabled.
     3. Multi-Pair Leg Gating: If leg_id is supplied, verifies bank invitation, leg document visibility,
@@ -113,7 +295,7 @@ async def download_quotation_document(
     from fastapi.responses import StreamingResponse
     from app.core.storage_service import open_gcs_blob_stream
     from app.services.tenant_key_service import tenant_key_service
-    from app.core.security_crypto import decrypt_stream_generator
+    from app.core.security_crypto import decrypt_stream_generator, verify_download_ticket
     import mimetypes
 
     customer_id = None
@@ -121,39 +303,55 @@ async def download_quotation_document(
     corporate_user_id = None
     client_ip = request.client.host if (request and request.client) else None
 
-    # 1. Check Corporate User Authentication (Bearer Token or auth_token query param)
-    auth_header = request.headers.get("Authorization") if request else None
-    raw_jwt = None
-    if auth_header and auth_header.startswith("Bearer "):
-        raw_jwt = auth_header.split(" ")[1]
-    elif auth_token:
-        raw_jwt = auth_token
-    elif request and request.query_params.get("auth_token"):
-        raw_jwt = request.query_params.get("auth_token")
+    # 0. Check Ephemeral Signed Ticket (Option A - Highest Priority)
+    if ticket:
+        ok, payload, err = verify_download_ticket(ticket)
+        if not ok or not payload:
+            logger.warning(f"Download rejected: Invalid/expired ticket: {err}")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Access denied or Not found")
+        customer_id = payload.get("customer_id")
+        gcs_uri = payload.get("gcs_uri") or gcs_uri
+        leg_id = payload.get("leg_id") or leg_id
+        caller_desc = payload.get("caller_desc") or "Ephemeral Signed Ticket"
 
-    if raw_jwt:
-        try:
-            from app.core.security import verify_access_token
-            payload = verify_access_token(raw_jwt)
-            customer_id = payload.get("customer_id")
-            corporate_user_id = payload.get("user_id")
-            user_email = payload.get("sub") or payload.get("email") or "user"
-            caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
-            
-            # Corporate tenant isolation check
-            role = (payload.get("role") or "").lower()
-            is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
-            if not is_super and customer_id:
-                expected_segment = f"customer_{customer_id}/"
-                if expected_segment not in gcs_uri:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Access Denied: Document does not belong to your corporate organization."
-                    )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+    if not gcs_uri and not customer_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Access denied or Not found")
+
+    # 1. Check Corporate User Authentication (Bearer Token or auth_token query param)
+    if not customer_id:
+        auth_header = request.headers.get("Authorization") if request else None
+        raw_jwt = None
+        if auth_header and auth_header.startswith("Bearer "):
+            raw_jwt = auth_header.split(" ")[1]
+        elif auth_token:
+            raw_jwt = auth_token
+        elif request and request.query_params.get("auth_token"):
+            raw_jwt = request.query_params.get("auth_token")
+
+        if raw_jwt:
+            try:
+                from app.core.security import verify_access_token
+                payload = verify_access_token(raw_jwt)
+                customer_id = payload.get("customer_id")
+                corporate_user_id = payload.get("user_id")
+                user_email = payload.get("sub") or payload.get("email") or "user"
+                caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
+                
+                # Corporate tenant isolation check
+                role = (payload.get("role") or "").lower()
+                is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
+                if not is_super and customer_id:
+                    expected_segment = f"customer_{customer_id}/"
+                    if expected_segment not in gcs_uri:
+                        logger.warning(f"Document download blocked: Tenant isolation breach attempt by user {corporate_user_id} on {gcs_uri}")
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Access denied or Not found"
+                        )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
 
     # 2. Check Bank Dealer Authentication (Invitation Token)
     if not customer_id and token:
@@ -161,25 +359,37 @@ async def download_quotation_document(
             QuotationBankAssignment.token == token
         ).first()
         if not assignment:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid quotation access token.")
+            logger.warning(f"Document download rejected: Invalid token {token}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+        # Option B enforcement: If OTP records exist for this assignment, forbid direct static URL download
+        has_otps = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == assignment.id).first()
+        if has_otps:
+            logger.warning(f"Document download rejected: Direct static link access attempted for OTP-enabled assignment {assignment.id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied or Not found"
+            )
 
         rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
         if not rfq:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referenced RFQ session not found.")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
 
         # Master assignment visibility check
         if assignment.is_document_visible is False:
+            logger.warning(f"Document download rejected: Document visibility disabled for assignment {assignment.id}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Document visibility is disabled for this counterparty."
+                detail="Access denied or Not found"
             )
 
         # Verify that requested document is attached to this RFQ session
         rfq_docs_str = rfq.document_path or ""
         if gcs_uri not in rfq_docs_str:
+            logger.warning(f"Document download rejected: Document not attached to RFQ {rfq.id}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access Denied: Document is not attached to this quotation request."
+                detail="Access denied or Not found"
             )
 
         # Multi-Pair Leg Gating & Isolation
@@ -192,7 +402,7 @@ async def download_quotation_document(
                 QuotationLeg.rfq_id == rfq.id
             ).first()
             if not target_leg:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Referenced trade leg not found.")
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
         else:
             # Auto-detect if this document is attached specifically to a leg
             doc_filename = gcs_uri.split("/")[-1]
@@ -204,9 +414,11 @@ async def download_quotation_document(
         if target_leg:
             leg_cfg = assignment.get_config_for_leg(target_leg.id)
             if getattr(leg_cfg, "is_invited", True) is False:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Counterparty is not invited to this trade leg.")
+                logger.warning(f"Document download rejected: Bank not invited to leg {target_leg.id}")
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
             if getattr(leg_cfg, "is_document_visible", True) is False:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Document visibility is disabled for this trade leg.")
+                logger.warning(f"Document download rejected: Document visibility disabled for leg {target_leg.id}")
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
 
             # Leg isolation policy in split awards: match against master Bank.id and QuotationBank.id
             if target_leg.status in ("COMPLETED", "ACCEPTED") and target_leg.winner_bank_id is not None:
@@ -216,9 +428,10 @@ async def download_quotation_document(
                 )
                 if not is_leg_winner:
                     if target_leg.document_path and doc_filename in target_leg.document_path:
+                        logger.warning(f"Document download rejected: Leg isolation breach attempt on leg {target_leg.id}")
                         raise HTTPException(
                             status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Leg Isolation Policy: Confidential documents for this awarded leg are unsealable only by the winning dealer."
+                            detail="Access denied or Not found"
                         )
         elif getattr(rfq, "release_to_winner_only", False) and rfq.status in ("COMPLETED", "ACCEPTED"):
             # RFQ-level winner check
@@ -232,9 +445,10 @@ async def download_quotation_document(
                 for l in (rfq.legs or [])
             )
             if not (rfq_winner_match or any_leg_won):
+                logger.warning(f"Document download rejected: Winner-only breach attempt on RFQ {rfq.id}")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Winner-Only Policy: This document is released exclusively to winning counterparty desks."
+                    detail="Access denied or Not found"
                 )
 
         customer_id = rfq.customer_id
@@ -244,7 +458,7 @@ async def download_quotation_document(
     if not customer_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required: Provide a valid Bearer token or bank quotation access token."
+            detail="Access denied or Not found"
         )
 
     # 4. Open Streaming Reader directly from Cloud Storage (0 MB full-file buffer)
@@ -252,7 +466,7 @@ async def download_quotation_document(
         source_stream, content_type, size_bytes = open_gcs_blob_stream(gcs_uri)
     except Exception as e:
         logger.error(f"Failed to open storage stream for {gcs_uri}: {e}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document file not found in storage.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
 
     # 5. Fetch Tenant DEK & Initialize Chunked Decryptor Generator
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
@@ -364,18 +578,32 @@ def create_quotation_bank(
     # Capture previous state for structured role audit
     existing_bank = None
     target_id = getattr(bank_in, 'id', None)
+    entity_scope = getattr(bank_in, "entity_scope", "ALL_ENTITIES") or "ALL_ENTITIES"
+    target_trade = bank_in.trade_type or "BOTH"
+
     if target_id:
         existing_bank = db.query(QuotationBank).filter(
             QuotationBank.id == target_id,
             QuotationBank.customer_id == current_user.customer_id
         ).first()
-    elif (bank_in.entity_scope or "ALL_ENTITIES") == "ALL_ENTITIES":
+    else:
         existing_bank = db.query(QuotationBank).filter(
             QuotationBank.customer_id == current_user.customer_id,
             QuotationBank.bank_id == bank_in.bank_id,
-            QuotationBank.entity_scope == "ALL_ENTITIES",
-            QuotationBank.trade_type == (bank_in.trade_type or "BOTH")
+            QuotationBank.entity_scope == entity_scope,
+            QuotationBank.trade_type == target_trade
         ).first()
+        if not existing_bank and entity_scope == "ALL_ENTITIES":
+            existing_bank = db.query(QuotationBank).filter(
+                QuotationBank.customer_id == current_user.customer_id,
+                QuotationBank.bank_id == bank_in.bank_id,
+                QuotationBank.entity_scope == "ALL_ENTITIES"
+            ).first()
+        if not existing_bank:
+            existing_bank = db.query(QuotationBank).filter(
+                QuotationBank.customer_id == current_user.customer_id,
+                QuotationBank.bank_id == bank_in.bank_id
+            ).first()
 
     old_contacts = list(existing_bank.contacts) if (existing_bank and existing_bank.contacts) else []
     old_auth_email = getattr(existing_bank, 'authorized_contact_email', None) if existing_bank else None
@@ -444,31 +672,45 @@ def create_quotation_bank(
         bank_obj = bank.bank if bank.bank else db.query(Bank).filter(Bank.id == bank_in.bank_id).first()
         bank_name_str = bank_obj.name if bank_obj else f"Bank {bank_in.bank_id}"
 
+        from app.core.security_crypto import compute_email_blind_index, encrypt_field
+        from app.services.tenant_key_service import tenant_key_service
+        tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+
         for contact in added_contacts:
             c_email = (contact.get("email") or "").strip().lower()
             if not c_email:
                 continue
 
+            blind_idx = compute_email_blind_index(c_email)
             existing_inv = db.query(QuotationBankContactInvitation).filter(
                 QuotationBankContactInvitation.customer_id == current_user.customer_id,
                 QuotationBankContactInvitation.bank_id == bank_in.bank_id,
-                QuotationBankContactInvitation.email == c_email,
+                or_(
+                    QuotationBankContactInvitation.email_blind_index == blind_idx,
+                    QuotationBankContactInvitation.email == c_email
+                ),
                 QuotationBankContactInvitation.status.in_(["PENDING", "ACCEPTED"])
             ).first()
 
             if not existing_inv:
                 inv_token = secrets.token_urlsafe(32)
-                inv_expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+                inv_token_hash = hashlib.sha256(inv_token.encode("utf-8")).hexdigest()
+                inv_expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+                enc_email = encrypt_field(c_email, tenant_dek, field_context="dealer_email")
 
                 invitation = QuotationBankContactInvitation(
                     customer_id=current_user.customer_id,
                     bank_id=bank_in.bank_id,
                     quotation_bank_id=bank.id,
-                    email=c_email,
+                    email=None,  # Zero-Knowledge: cleartext email is not stored in DB
+                    encrypted_email=enc_email,
+                    email_blind_index=blind_idx,
                     title=contact.get("name") or None,
                     role=(contact.get("role") or "EXECUTION").upper(),
                     token=inv_token,
+                    token_hash=inv_token_hash,
                     status="PENDING",
+                    failed_otp_attempts=0,
                     invited_by_user_id=current_user.user_id,
                     expires_at=inv_expires_at
                 )
@@ -483,7 +725,7 @@ def create_quotation_bank(
                     subj, email_html = build_dealer_invitation_email(
                         customer_branding=cust.name if cust else "Corporate Treasury",
                         bank_name=bank_name_str,
-                        dealer_email=invitation.email,
+                        dealer_email=c_email,
                         dealer_title=invitation.title,
                         role=invitation.role,
                         handshake_link=handshake_link,
@@ -494,11 +736,12 @@ def create_quotation_bank(
                     background_tasks.add_task(
                         send_email,
                         db,
-                        [invitation.email],
+                        [c_email],
                         subj,
                         email_html,
                         {},
-                        email_settings
+                        email_settings,
+                        save_copy=False
                     )
                 except Exception as email_err:
                     logger.warning(f"Could not dispatch dealer handshake invitation email on onboarding: {email_err}")
@@ -567,22 +810,46 @@ def send_bank_roster_report(
 
 # --- Staged Dealer Contact Invitations & Handshake Management ---
 
-@router.get("/banks/{bank_id}/invitations", response_model=List[QuotationContactInvitationOut])
+@router.get("/banks/{bank_id}/invitations")
 def get_bank_contact_invitations(
     bank_id: int,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Retrieves all pending staged invitations for a given bank partner."""
+    """Retrieves all pending or locked staged invitations for a given bank partner."""
+    from app.core.routing import get_frontend_base_url
+    frontend_base = get_frontend_base_url(request) if request else ""
+    
     invitations = db.query(QuotationBankContactInvitation).filter(
         QuotationBankContactInvitation.customer_id == current_user.customer_id,
         QuotationBankContactInvitation.bank_id == bank_id,
-        QuotationBankContactInvitation.status == "PENDING"
+        QuotationBankContactInvitation.status.in_(["PENDING", "LOCKED", "REVOKED"])
     ).order_by(QuotationBankContactInvitation.created_at.desc()).all()
-    return invitations
+
+    out = []
+    for inv in invitations:
+        decrypted_email = inv.get_email(db)
+        out.append({
+            "id": inv.id,
+            "customer_id": inv.customer_id,
+            "bank_id": inv.bank_id,
+            "quotation_bank_id": inv.quotation_bank_id,
+            "email": decrypted_email,
+            "email_blind_index": inv.email_blind_index,
+            "title": inv.title,
+            "role": inv.role,
+            "status": inv.status,
+            "failed_otp_attempts": inv.failed_otp_attempts or 0,
+            "expires_at": inv.expires_at,
+            "accepted_at": inv.accepted_at,
+            "created_at": inv.created_at,
+            "handshake_link": f"{frontend_base}/public/dealer-handshake/{inv.token}" if inv.token else None
+        })
+    return out
 
 
-@router.post("/banks/{bank_id}/invite-contact", response_model=QuotationContactInvitationOut)
+@router.post("/banks/{bank_id}/invite-contact")
 def invite_bank_contact(
     bank_id: int,
     body: QuotationContactInvitationCreate,
@@ -594,13 +861,15 @@ def invite_bank_contact(
     """
     Stages a new trading representative in the invitation table and dispatches
     a personal tokenized welcome handshake email to the dealer.
-    Enforces all counterparty controls (bank domain, public provider blocks, anti-collusion, duplicates).
+    Enforces Zero-Knowledge storage (AES-256-GCM + HMAC blind index) and 48-hour link TTL.
     """
     from app.models.models import Bank, Customer
     from app.core.bank_validation import validate_bank_contact_email
     from app.services.unified_email_builder import build_dealer_invitation_email
     from app.core.routing import get_frontend_base_url
     from app.core.email_service import get_customer_email_settings
+    from app.core.security_crypto import compute_email_blind_index, encrypt_field
+    from app.services.tenant_key_service import tenant_key_service
 
     bank = db.query(Bank).filter(Bank.id == bank_id).first()
     if not bank:
@@ -632,32 +901,43 @@ def invite_bank_contact(
                 detail=f"{clean_email} is already an active registered trading representative for this bank."
             )
 
-    # 3. Check if already pending an invitation
+    # 3. Check if already pending an invitation (via blind index or legacy email)
+    blind_idx = compute_email_blind_index(clean_email)
     existing_inv = db.query(QuotationBankContactInvitation).filter(
         QuotationBankContactInvitation.customer_id == current_user.customer_id,
         QuotationBankContactInvitation.bank_id == bank_id,
-        QuotationBankContactInvitation.email == clean_email,
+        or_(
+            QuotationBankContactInvitation.email_blind_index == blind_idx,
+            QuotationBankContactInvitation.email == clean_email
+        ),
         QuotationBankContactInvitation.status == "PENDING"
     ).first()
     if existing_inv:
         raise HTTPException(
             status_code=400,
-            detail=f"An invitation is already pending for {clean_email}. Use the resend option to refresh it."
+            detail=f"An invitation is already pending for this contact. Use the resend option to refresh it."
         )
 
-    # 4. Create staged invitation record
+    # 4. Zero-Knowledge Encryption & Staged Invitation Record
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+    enc_email = encrypt_field(clean_email, tenant_dek, field_context="dealer_email")
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=48)  # 48-hour link TTL
 
     invitation = QuotationBankContactInvitation(
         customer_id=current_user.customer_id,
         bank_id=bank_id,
         quotation_bank_id=qb.id if qb else None,
-        email=clean_email,
+        email=None,  # Zero-Knowledge: cleartext email is not stored in DB
+        encrypted_email=enc_email,
+        email_blind_index=blind_idx,
         title=body.title.strip() if body.title else None,
         role=(body.role or "EXECUTION").upper(),
         token=token,
+        token_hash=token_hash,
         status="PENDING",
+        failed_otp_attempts=0,
         invited_by_user_id=current_user.user_id,
         expires_at=expires_at
     )
@@ -665,19 +945,16 @@ def invite_bank_contact(
     db.commit()
     db.refresh(invitation)
 
-    # 5. Dispatch dealer invitation handshake email
+    frontend_base = get_frontend_base_url(request) if request else ""
+    handshake_link = f"{frontend_base}/public/dealer-handshake/{token}"
+
+    # 5. Dispatch dealer invitation handshake email (save_copy=False to prevent Sent Items retention)
     try:
-        frontend_base = get_frontend_base_url(request)
-        handshake_link = f"{frontend_base}/public/dealer-handshake/{token}"
-        qb = db.query(QuotationBank).filter(
-            QuotationBank.customer_id == current_user.customer_id,
-            QuotationBank.bank_id == bank_id
-        ).first()
         ents_for_email, scope_str = _resolve_entities_for_invitation(db, current_user.customer_id, qb)
         subj, email_html = build_dealer_invitation_email(
             customer_branding=cust.name if cust else "Corporate Treasury",
             bank_name=bank.name,
-            dealer_email=invitation.email,
+            dealer_email=clean_email,
             dealer_title=invitation.title,
             role=invitation.role,
             handshake_link=handshake_link,
@@ -688,15 +965,17 @@ def invite_bank_contact(
         background_tasks.add_task(
             send_email,
             db,
-            [invitation.email],
+            [clean_email],
             subj,
             email_html,
             {},
-            email_settings
+            email_settings,
+            save_copy=False
         )
     except Exception as email_err:
         logger.warning(f"Could not dispatch dealer handshake invitation email: {email_err}")
 
+    # Zero-Knowledge audit log: store HMAC blind index instead of cleartext email
     log_action(
         db,
         user_id=current_user.user_id,
@@ -706,14 +985,29 @@ def invite_bank_contact(
         details={
             "bank_id": bank_id,
             "bank_name": bank.name,
-            "email": invitation.email,
+            "email_blind_index": invitation.email_blind_index,
             "title": invitation.title,
             "role": invitation.role
         },
         customer_id=current_user.customer_id
     )
 
-    return invitation
+    return {
+        "id": invitation.id,
+        "customer_id": invitation.customer_id,
+        "bank_id": invitation.bank_id,
+        "quotation_bank_id": invitation.quotation_bank_id,
+        "email": clean_email,
+        "email_blind_index": invitation.email_blind_index,
+        "handshake_link": handshake_link,
+        "title": invitation.title,
+        "role": invitation.role,
+        "status": invitation.status,
+        "failed_otp_attempts": invitation.failed_otp_attempts,
+        "expires_at": invitation.expires_at,
+        "accepted_at": invitation.accepted_at,
+        "created_at": invitation.created_at
+    }
 
 
 @router.post("/banks/invitations/{invitation_id}/resend")
@@ -724,7 +1018,7 @@ def resend_contact_invitation(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user)
 ):
-    """Refreshes the token and resends the invitation email to the pending dealer."""
+    """Refreshes the token and resends the 48h invitation email with reset attempt counter."""
     from app.models.models import Bank, Customer
     from app.services.unified_email_builder import build_dealer_invitation_email
     from app.core.routing import get_frontend_base_url
@@ -736,18 +1030,24 @@ def resend_contact_invitation(
     ).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invitation not found.")
-    if inv.status != "PENDING":
+    if inv.status not in ["PENDING", "LOCKED", "REVOKED"]:
         raise HTTPException(status_code=400, detail=f"Cannot resend invitation with status '{inv.status}'.")
 
-    # Refresh token and expiration
-    inv.token = secrets.token_urlsafe(32)
-    inv.expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+    # Refresh token and reset failure counters (48h TTL)
+    new_token = secrets.token_urlsafe(32)
+    inv.token = new_token
+    inv.token_hash = hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    inv.expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+    inv.failed_otp_attempts = 0
+    inv.otp_hash = None
+    inv.otp_expires_at = None
+    inv.status = "PENDING"
     db.commit()
     db.refresh(inv)
 
     cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
     bank = db.query(Bank).filter(Bank.id == inv.bank_id).first()
-    frontend_base = get_frontend_base_url(request)
+    frontend_base = get_frontend_base_url(request) if request else ""
     handshake_link = f"{frontend_base}/public/dealer-handshake/{inv.token}"
 
     qb = None
@@ -762,11 +1062,12 @@ def resend_contact_invitation(
         ).first()
 
     ents_for_email, scope_str = _resolve_entities_for_invitation(db, current_user.customer_id, qb)
+    clean_email = inv.get_email(db)
 
     subj, email_html = build_dealer_invitation_email(
         customer_branding=cust.name if cust else "Corporate Treasury",
         bank_name=bank.name if bank else f"Bank {inv.bank_id}",
-        dealer_email=inv.email,
+        dealer_email=clean_email,
         dealer_title=inv.title,
         role=inv.role,
         handshake_link=handshake_link,
@@ -777,14 +1078,29 @@ def resend_contact_invitation(
     background_tasks.add_task(
         send_email,
         db,
-        [inv.email],
+        [clean_email],
         subj,
         email_html,
         {},
-        email_settings
+        email_settings,
+        save_copy=False
     )
 
-    return {"status": "success", "message": f"Invitation resent to {inv.email}."}
+    # Zero-Knowledge audit log
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_BANK_DEALER_INVITATION_RESENT",
+        entity_type="QuotationBankContactInvitation",
+        entity_id=inv.id,
+        details={
+            "bank_id": inv.bank_id,
+            "email_blind_index": inv.email_blind_index
+        },
+        customer_id=current_user.customer_id
+    )
+
+    return {"status": "success", "message": f"Invitation refreshed and resent.", "handshake_link": handshake_link}
 
 
 @router.delete("/banks/invitations/{invitation_id}")
@@ -2280,10 +2596,14 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     leg.status = 'COMPLETED'
 
             leg_is_uncontested = bool(len(execution_bids) == 1)
-            leg_uncontested_reason = (
-                "Only 1 bank counterparty provided a quote on this currency pair. No competing offers were received to establish market spread."
-                if leg_is_uncontested else None
-            )
+            has_indicative_competing = bool(len(indicative_bids) > 0)
+            if leg_is_uncontested:
+                if has_indicative_competing:
+                    leg_uncontested_reason = "Only 1 bank counterparty provided a firm Execution quote. Competing quote(s) were submitted on an Indicative (non-binding) basis."
+                else:
+                    leg_uncontested_reason = "Only 1 bank counterparty provided a quote on this currency pair. No competing offers were received to establish market spread."
+            else:
+                leg_uncontested_reason = None
 
             # Phase 6.6: Use Frozen Snapshot if deal accepted, else live benchmark
             leg_market_bm = leg.market_benchmark_snapshot if getattr(leg, 'market_benchmark_snapshot', None) else None
@@ -2425,19 +2745,30 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     primary_leg = legs_data[0] if legs_data else None
     if primary_leg:
         results = primary_leg["results"]
-        winner_bank_id = primary_leg["winner_bank_id"]
+        # In multi-leg tenders, check if any leg has a winner if primary leg was inconclusive
+        winner_leg = next((l for l in legs_data if l.get("winner_bank_id")), None)
+        winner_bank_id = winner_leg["winner_bank_id"] if winner_leg else primary_leg["winner_bank_id"]
         is_inconclusive = all(l["is_inconclusive"] for l in legs_data)
         inconclusive_reason = primary_leg["inconclusive_reason"]
         best_indicative_rate = primary_leg["best_indicative_rate"]
         best_execution_rate = primary_leg["best_execution_rate"]
         deviation_percent = primary_leg["deviation_percent"]
         has_execution_banks = any(l["has_execution_banks"] for l in legs_data)
-        savings_summary = primary_leg["savings_summary"]
+        savings_summary = (winner_leg.get("savings_summary") if winner_leg else None) or primary_leg.get("savings_summary")
         is_uncontested = any(l.get("is_uncontested", False) for l in legs_data)
-        uncontested_reason = primary_leg.get("uncontested_reason")
+        uncontested_legs = [l for l in legs_data if l.get("is_uncontested")]
+        if len(uncontested_legs) == 1 and primary_leg.get("is_uncontested"):
+            uncontested_reason = primary_leg.get("uncontested_reason")
+        elif uncontested_legs:
+            pair_labels = [l.get("currency_pair") or f"{l.get('buy_currency')}/{l.get('sell_currency')}" for l in uncontested_legs]
+            uncontested_reason = f"Sole-source uncontested quote received on leg(s): {', '.join(pair_labels)}. No competing offers were received to establish market spread."
+        else:
+            uncontested_reason = None
+
+    has_any_winner = any(bool(l.get("winner_bank_id")) for l in legs_data) if legs_data else bool(winner_bank_id)
 
     # Attach winner and rate attributes to RFQ object
-    if savings_summary and not is_inconclusive:
+    if savings_summary and not is_inconclusive and has_any_winner:
         rfq.winner_bank_name = savings_summary.get("winner_bank_name")
         tenant_key_service.apply_encrypted_rfq_winner(
             rfq,
@@ -2457,8 +2788,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             rfq.status = 'REJECTED'
             if not rfq.acceptance_status:
                 rfq.acceptance_status = 'REJECTED'
-        elif is_inconclusive or not winner_bank_id:
-            # Tender window closed with NO winning executable quote!
+        elif is_inconclusive or not has_any_winner:
+            # Tender window closed with NO winning executable quote on any leg!
             # Conclude tender directly as COMPLETED without opening an acceptance window.
             rfq.status = 'COMPLETED'
             rfq.acceptance_status = 'NO_QUOTES'
@@ -2474,7 +2805,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     leg.status = 'COMPLETED'
                     leg.winner_bank_id = None
                     leg.winner_bank_name = None
-        elif not is_inconclusive and winner_bank_id:
+        elif not is_inconclusive and has_any_winner:
             # Acceptance decision is still pending for a valid winning quote!
             # Check if acceptance window has expired!
             if acc_deadline and now > acc_deadline:
@@ -3095,6 +3426,58 @@ def retender_quotation(
     db.add(new_rfq)
     db.flush()
 
+    # Replicate Constituent Legs (Multi-Leg & Single-Leg)
+    leg_id_map = {}
+    parent_legs = db.query(QuotationLeg).filter(QuotationLeg.rfq_id == parent.id).order_by(QuotationLeg.leg_index.asc()).all()
+    if parent_legs:
+        for pleg in parent_legs:
+            new_leg_id = f"{new_rfq.id}-leg-{pleg.leg_index}"
+            leg_amt = payload.amount if (payload.amount is not None and len(parent_legs) == 1) else pleg.amount
+            new_leg = QuotationLeg(
+                id=new_leg_id,
+                rfq_id=new_rfq.id,
+                leg_index=pleg.leg_index,
+                type=pleg.type,
+                direction=pleg.direction,
+                buy_currency=pleg.buy_currency,
+                sell_currency=pleg.sell_currency,
+                amount=leg_amt,
+                min_ticket_amount=pleg.min_ticket_amount,
+                value_date=pleg.value_date,
+                allow_alternative_value_date=pleg.allow_alternative_value_date,
+                quotation_base=pleg.quotation_base,
+                max_tolerance_percent=pleg.max_tolerance_percent,
+                document_path=pleg.document_path,
+                status=initial_status,
+                entity_id=pleg.entity_id or getattr(payload, 'entity_id', None) or parent.entity_id
+            )
+            db.add(new_leg)
+            leg_id_map[pleg.id] = new_leg_id
+    else:
+        # Fallback for legacy single-leg RFQ without rows in quotation_legs
+        leg_id = f"{new_rfq.id}-leg-1"
+        new_leg = QuotationLeg(
+            id=leg_id,
+            rfq_id=new_rfq.id,
+            leg_index=1,
+            type=new_rfq.type or "FX_SPOT",
+            direction=new_rfq.direction or "Buy",
+            buy_currency=new_rfq.buy_currency or "USD",
+            sell_currency=new_rfq.sell_currency or "EGP",
+            amount=new_rfq.amount,
+            min_ticket_amount=new_rfq.min_ticket_amount,
+            value_date=new_rfq.value_date,
+            allow_alternative_value_date=new_rfq.allow_alternative_value_date,
+            quotation_base=new_rfq.quotation_base,
+            max_tolerance_percent=new_rfq.max_tolerance_percent,
+            document_path=new_rfq.document_path,
+            status=initial_status,
+            entity_id=new_rfq.entity_id
+        )
+        db.add(new_leg)
+        leg_id_map[f"{parent.id}-leg-1"] = leg_id
+    db.flush()
+
     # Replicate Bank Assignments
     parent_assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == parent.id).all()
     assigned_records = []
@@ -3129,6 +3512,48 @@ def retender_quotation(
             approval_status=assignment_approval_status
         )
         db.add(new_assignment)
+        db.flush()
+
+        # Replicate per-leg bank configurations
+        parent_leg_configs = db.query(QuotationBankLegConfig).filter(QuotationBankLegConfig.assignment_id == pa.id).all()
+        if parent_leg_configs:
+            for plc in parent_leg_configs:
+                new_mapped_leg_id = leg_id_map.get(plc.leg_id)
+                if new_mapped_leg_id:
+                    new_lc = QuotationBankLegConfig(
+                        id=str(uuid.uuid4()),
+                        assignment_id=new_assignment.id,
+                        leg_id=new_mapped_leg_id,
+                        cost_min=plc.cost_min,
+                        cost_percent=plc.cost_percent,
+                        cost_max=plc.cost_max,
+                        cost_flat=plc.cost_flat,
+                        quotation_base=plc.quotation_base,
+                        value_date=plc.value_date,
+                        allow_alternative_value_date=plc.allow_alternative_value_date,
+                        is_document_visible=plc.is_document_visible,
+                        is_invited=plc.is_invited,
+                        is_passed=False
+                    )
+                    db.add(new_lc)
+        else:
+            for new_l_id in leg_id_map.values():
+                db.add(QuotationBankLegConfig(
+                    id=str(uuid.uuid4()),
+                    assignment_id=new_assignment.id,
+                    leg_id=new_l_id,
+                    cost_min=pa.cost_min,
+                    cost_percent=pa.cost_percent,
+                    cost_max=pa.cost_max,
+                    cost_flat=pa.cost_flat,
+                    quotation_base=pa.quotation_base,
+                    value_date=pa.value_date,
+                    allow_alternative_value_date=pa.allow_alternative_value_date,
+                    is_document_visible=pa.is_document_visible,
+                    is_invited=True,
+                    is_passed=False
+                ))
+
         assigned_records.append({"assignment": new_assignment, "bank_row": bank_row, "token": token})
 
     db.commit()
@@ -3989,7 +4414,6 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                 # Attached Supporting Documents for Won Legs
                 won_docs = []
                 seen_doc_paths = set()
-                from app.core.ai_integration import generate_signed_gcs_url
                 for leg in won_legs:
                     l_idx = leg.get("leg_index")
                     l_id = str(leg.get("id") or leg.get("leg_id") or "")
@@ -3999,24 +4423,22 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         p_val = d.get("path")
                         if p_val and p_val not in seen_doc_paths:
                             seen_doc_paths.add(p_val)
-                            p_signed = p_val
-                            if str(p_val).startswith("gs://"):
-                                try:
-                                    signed = await generate_signed_gcs_url(p_val, expiration=604800)
-                                    p_signed = signed or p_val
-                                except Exception:
-                                    pass
                             won_docs.append({
                                 "name": d.get("name") or "Document",
-                                "path": p_signed,
                                 "pair": d.get("pair") or leg.get("currency_pair")
                             })
                 if won_docs:
-                    doc_html_links = []
-                    for wd in won_docs:
-                        pair_str = f" <span style='color: #64748b; font-size: 11px;'>({wd['pair']})</span>" if wd.get('pair') else ""
-                        doc_html_links.append(f"<a href='{wd['path']}' target='_blank' style='color: #0284c7; text-decoration: underline; font-weight: 600;'>📄 {wd['name']}</a>{pair_str}")
-                    key_vals["Trade Supporting Documents"] = "<br/>".join(doc_html_links)
+                    asgn = next((a for a in rfq.assignments if a.quotation_bank and a.quotation_bank.bank_id == b_id), None)
+                    asgn_token = asgn.token if asgn else None
+                    from app.core.routing import get_frontend_base_url
+                    frontend_base = get_frontend_base_url()
+                    portal_url = f"{frontend_base}/public-quotation/{asgn_token}" if asgn_token else f"{frontend_base}/public-quotation"
+                    doc_items = "".join([f"<li style='margin-bottom: 4px;'>📄 <strong>{wd['name']}</strong>" + (f" <span style='color: #64748b; font-size: 11px;'>({wd['pair']})</span>" if wd.get('pair') else "") + "</li>" for wd in won_docs])
+                    key_vals["Trade Supporting Documents"] = (
+                        f"<ul style='margin: 0 0 8px 0; padding-left: 20px; color: #1e293b; font-size: 13px;'>{doc_items}</ul>"
+                        f"<div style='margin-top: 6px;'><a href='{portal_url}' target='_blank' style='display: inline-block; background: #0284c7; color: #ffffff; padding: 7px 14px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 13px;'>🔒 View &amp; Download in Secure Deal Portal</a></div>"
+                        f"<div style='margin-top: 4px; color: #64748b; font-size: 11px;'>Documents are encrypted at rest and accessible via your authenticated desk session.</div>"
+                    )
 
                 if is_partial and lost_legs:
                     for i, leg in enumerate(lost_legs):
@@ -4139,19 +4561,17 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
 
                 single_docs = rfq.get_parsed_documents()
                 if single_docs:
-                    from app.core.ai_integration import generate_signed_gcs_url
-                    doc_html_links = []
-                    for sd in single_docs:
-                        p_val = sd.get("path")
-                        p_signed = p_val
-                        if str(p_val).startswith("gs://"):
-                            try:
-                                signed = await generate_signed_gcs_url(p_val, expiration=604800)
-                                p_signed = signed or p_val
-                            except Exception:
-                                pass
-                        doc_html_links.append(f"<a href='{p_signed}' target='_blank' style='color: #0284c7; text-decoration: underline; font-weight: 600;'>📄 {sd.get('name') or 'Document'}</a>")
-                    single_key_vals["Trade Supporting Documents"] = "<br/>".join(doc_html_links)
+                    asgn = next((a for a in rfq.assignments if a.quotation_bank and a.quotation_bank.bank_id == bank_res['bank_id']), None)
+                    asgn_token = asgn.token if asgn else None
+                    from app.core.routing import get_frontend_base_url
+                    frontend_base = get_frontend_base_url()
+                    portal_url = f"{frontend_base}/public-quotation/{asgn_token}" if asgn_token else f"{frontend_base}/public-quotation"
+                    doc_items = "".join([f"<li style='margin-bottom: 4px;'>📄 <strong>{sd.get('name') or 'Document'}</strong></li>" for sd in single_docs])
+                    single_key_vals["Trade Supporting Documents"] = (
+                        f"<ul style='margin: 0 0 8px 0; padding-left: 20px; color: #1e293b; font-size: 13px;'>{doc_items}</ul>"
+                        f"<div style='margin-top: 6px;'><a href='{portal_url}' target='_blank' style='display: inline-block; background: #0284c7; color: #ffffff; padding: 7px 14px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 13px;'>🔒 View &amp; Download in Secure Deal Portal</a></div>"
+                        f"<div style='margin-top: 4px; color: #64748b; font-size: 11px;'>Documents are encrypted at rest and accessible via your authenticated desk session.</div>"
+                    )
 
                 subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
                 body = build_transaction_email_html(

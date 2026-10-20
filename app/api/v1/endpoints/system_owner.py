@@ -2729,6 +2729,47 @@ def toggle_bank_portal_access(
         "portal_access_enabled": db_bank.portal_access_enabled
     }
 
+class BankDealerCommentsToggleRequest(BaseModel):
+    allow_dealer_comments: bool
+
+@router.put("/banks/{bank_id}/dealer-comments")
+def toggle_bank_dealer_comments(
+    bank_id: int,
+    payload: BankDealerCommentsToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """Toggle whether dealers quoting for this bank are allowed to enter free-text execution notes/comments."""
+    db_bank = crud_bank.get(db, id=bank_id)
+    if db_bank is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    
+    db_bank.allow_dealer_comments = payload.allow_dealer_comments
+    db.commit()
+    db.refresh(db_bank)
+    
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UPDATE",
+        entity_type="Bank",
+        entity_id=db_bank.id,
+        details={
+            "action": "toggle_dealer_comments",
+            "name": db_bank.name,
+            "allow_dealer_comments": db_bank.allow_dealer_comments,
+            "ip_address": client_host
+        }
+    )
+    return {
+        "success": True,
+        "bank_id": db_bank.id,
+        "name": db_bank.name,
+        "allow_dealer_comments": db_bank.allow_dealer_comments
+    }
+
 @router.get("/banks/{bank_id}/dealers")
 def get_bank_dealers(
     bank_id: int,
