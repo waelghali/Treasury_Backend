@@ -8,7 +8,10 @@ import secrets
 import uuid
 import hmac
 import hashlib
+import logging
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 from app.database import get_db
 from app.crud.base import log_action
