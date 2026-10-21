@@ -2371,6 +2371,10 @@ def approve_quotation(
         request=request
     )
 
+    from app.core.routing import get_frontend_base_url
+    base_url = get_frontend_base_url(request=request)
+    background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url)
+
     from app.core.email_service import get_customer_email_settings
     email_settings_check, source_check = get_customer_email_settings(db, corporate_admin_context.customer_id, allow_platform_fallback=False)
     has_custom_smtp_check = bool(email_settings_check and source_check == "customer_specific")
@@ -2394,6 +2398,27 @@ def approve_quotation(
         "bank_email_dispatched": has_custom_smtp_check,
         "email_notice": email_notice
     }
+
+@router.post("/quotations/{rfq_id}/broadcast")
+def broadcast_quotation_to_banks(
+    rfq_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context),
+    request: Request = None
+):
+    """Manually broadcasts or re-broadcasts RFQ invitation emails to all assigned banks."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == corporate_admin_context.customer_id
+    ).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+    
+    from app.core.routing import get_frontend_base_url
+    base_url = get_frontend_base_url(request=request)
+    background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url, force=True)
+    return {"message": f"RFQ {rfq.ref_no} broadcast queued for all participating banks.", "rfq_id": rfq.id}
 
 @router.post("/quotations/{rfq_id}/reschedule-release")
 def reschedule_quotation_release(

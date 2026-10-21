@@ -41,10 +41,15 @@ async def execute_scheduled_rfq_release_async(rfq_id: str):
         db.close()
 
 
-async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base_url: Optional[str] = None) -> dict:
+async def broadcast_rfq_to_banks(
+    rfq_id: str,
+    db: Optional[Session] = None,
+    base_url: Optional[str] = None,
+    force: bool = False
+) -> dict:
     """
     Executes bank email broadcast and status transition for an RFQ.
-    Idempotent: will not re-broadcast if is_dispatched is already True.
+    Idempotent: will not re-broadcast if is_dispatched is already True (unless force=True).
     """
     owns_session = False
     if db is None:
@@ -57,7 +62,7 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
             logger.warning(f"broadcast_rfq_to_banks: RFQ {rfq_id} not found.")
             return {"status": "error", "message": "RFQ not found"}
 
-        if rfq.is_dispatched:
+        if not force and rfq.is_dispatched:
             logger.info(f"broadcast_rfq_to_banks: RFQ {rfq_id} is already dispatched.")
             return {"status": "skipped", "message": "RFQ already dispatched"}
 
@@ -124,7 +129,15 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
             if not bank_row:
                 continue
 
-            contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
+            contacts = bank_row.contacts
+            if isinstance(contacts, str):
+                import json
+                try:
+                    contacts = json.loads(contacts)
+                except Exception:
+                    contacts = []
+            if not isinstance(contacts, list):
+                contacts = []
             if not contacts and bank_row.emails:
                 contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
             if not contacts:
@@ -219,7 +232,12 @@ async def broadcast_rfq_to_banks(rfq_id: str, db: Optional[Session] = None, base
             db.close()
 
 
-def broadcast_rfq_to_banks_sync(rfq_id: str, db: Optional[Session] = None, base_url: Optional[str] = None) -> dict:
+def broadcast_rfq_to_banks_sync(
+    rfq_id: str,
+    db: Optional[Session] = None,
+    base_url: Optional[str] = None,
+    force: bool = False
+) -> dict:
     """Synchronous runner for testing and CLI scripts."""
     try:
         loop = asyncio.get_running_loop()
@@ -229,9 +247,9 @@ def broadcast_rfq_to_banks_sync(rfq_id: str, db: Optional[Session] = None, base_
     if loop and loop.is_running():
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, broadcast_rfq_to_banks(rfq_id=rfq_id, db=db, base_url=base_url)).result()
+            return pool.submit(asyncio.run, broadcast_rfq_to_banks(rfq_id=rfq_id, db=db, base_url=base_url, force=force)).result()
     else:
-        return asyncio.run(broadcast_rfq_to_banks(rfq_id=rfq_id, db=db, base_url=base_url))
+        return asyncio.run(broadcast_rfq_to_banks(rfq_id=rfq_id, db=db, base_url=base_url, force=force))
 
 
 def schedule_rfq_bank_release(
@@ -302,6 +320,7 @@ def sync_pending_scheduled_releases_on_startup(scheduler: Any, session_factory: 
     """
     Scans for any RFQs in APPROVED_SCHEDULED state upon server startup
     and restores their one-off DateTrigger release timers on APScheduler.
+    Also recovers any active PENDING RFQs that were approved immediately but not yet dispatched.
     """
     logger.info("Syncing pending scheduled RFQ releases on startup...")
     db = session_factory()
@@ -326,7 +345,7 @@ def sync_pending_scheduled_releases_on_startup(scheduler: Any, session_factory: 
 
             if rel_time <= now_utc:
                 logger.info(f"RFQ {rfq.id} scheduled release time {rel_time.isoformat()} already passed. Dispatching now.")
-                broadcast_rfq_to_banks(rfq.id, db=db)
+                broadcast_rfq_to_banks_sync(rfq.id, db=db)
                 dispatched_now += 1
             else:
                 job_id = schedule_rfq_bank_release(rfq.id, rel_time, scheduler=scheduler)
@@ -334,6 +353,18 @@ def sync_pending_scheduled_releases_on_startup(scheduler: Any, session_factory: 
                     rfq.scheduled_release_job_id = job_id
                     db.commit()
                     restored += 1
+
+        # Also auto-dispatch any active PENDING RFQs that were approved immediately but never dispatched
+        active_undispatched = db.query(QuotationRequest).filter(
+            QuotationRequest.status == "PENDING",
+            QuotationRequest.is_dispatched == False,
+            QuotationRequest.is_deleted == False,
+            QuotationRequest.window_end > now_utc
+        ).all()
+        for rfq in active_undispatched:
+            logger.info(f"RFQ {rfq.id} ({rfq.ref_no}) is PENDING and undispatched with active window. Dispatching now.")
+            broadcast_rfq_to_banks_sync(rfq.id, db=db)
+            dispatched_now += 1
 
         logger.info(f"Startup scheduled RFQ releases sync complete: {restored} scheduled, {dispatched_now} dispatched immediately.")
     except Exception as e:

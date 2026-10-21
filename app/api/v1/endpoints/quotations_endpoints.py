@@ -102,6 +102,7 @@ async def create_document_download_ticket(
 
     customer_id = None
     caller_desc = None
+    target_leg = None
     import urllib.parse
     gcs_uri = urllib.parse.unquote(req.gcs_uri.strip())
 
@@ -4811,7 +4812,23 @@ async def resend_rfq_bank_invite(
         raise HTTPException(status_code=404, detail="Bank assignment not found for this RFQ")
         
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == quotation_bank_id).first()
-    if not q_bank or not q_bank.emails:
+    if not q_bank:
+        raise HTTPException(status_code=404, detail="Quotation bank not found")
+
+    contacts = q_bank.contacts
+    if isinstance(contacts, str):
+        import json
+        try:
+            contacts = json.loads(contacts)
+        except Exception:
+            contacts = []
+    if not isinstance(contacts, list):
+        contacts = []
+    if not contacts and q_bank.emails:
+        contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in q_bank.emails.split(',') if e.strip()]
+
+    bank_emails = list(dict.fromkeys(c.get("email", "").strip() for c in contacts if c.get("email")))
+    if not bank_emails:
         raise HTTPException(status_code=400, detail="No email address configured for this bank")
         
     email_settings, source = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
@@ -4823,7 +4840,6 @@ async def resend_rfq_bank_invite(
 
     from app.core.routing import get_frontend_base_url
     base_url = get_frontend_base_url(request=request)
-    bank_emails = [e.strip() for e in q_bank.emails.split(',') if e.strip()]
     link = f"{base_url}/public-quotation/{assignment.token}"
     
     from app.services.unified_email_builder import build_quotation_rfq_bank_email
@@ -4849,6 +4865,28 @@ async def resend_rfq_bank_invite(
         allow_platform_fallback=False
     )
     return {"message": f"Invitation email resent to {bank_display_name}"}
+
+@router.post("/{rfq_id}/broadcast")
+def broadcast_quotation_to_banks_enduser(
+    rfq_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user),
+    request: Request = None
+):
+    """Manually broadcasts or re-broadcasts RFQ invitation emails to all assigned banks."""
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation not found.")
+    
+    from app.core.routing import get_frontend_base_url
+    from app.services.quotation_release_scheduler import broadcast_rfq_to_banks
+    base_url = get_frontend_base_url(request=request)
+    background_tasks.add_task(broadcast_rfq_to_banks, rfq_id=rfq.id, base_url=base_url, force=True)
+    return {"message": f"RFQ {rfq.ref_no} broadcast queued for all participating banks.", "rfq_id": rfq.id}
 
 @router.get("/notifications")
 def get_my_notifications(
