@@ -120,49 +120,61 @@ def parse_gcs_uri(gcs_uri: str) -> Tuple[str, str]:
 def resolve_gcs_blob(bucket_name: str, blob_name: str) -> Tuple[Any, str]:
     """
     Dual-read resolver: Checks if the blob exists at blob_name.
-    If not found, attempts fallback resolution (e.g. legacy unprefixed path vs new prefixed path).
+    Handles URL-encoding discrepancies (e.g. '%2C' vs ',') and legacy unprefixed vs env-prefixed paths.
     Returns (gcs_blob_object, resolved_blob_name).
     """
+    import urllib.parse
     client = _get_gcs_client()
     if not client:
         raise RuntimeError("GCS client is not initialized.")
 
     bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
 
-    # Fast path: check if exact path exists
-    try:
-        if blob.exists():
-            return blob, blob_name
-    except Exception as e:
-        logger.warning(f"Error checking existence of {blob_name}: {e}")
+    # 1. Build candidate paths (handling URL-encoded vs decoded filenames)
+    raw_candidates = [blob_name]
+    unquoted = urllib.parse.unquote(blob_name)
+    if unquoted != blob_name and unquoted not in raw_candidates:
+        raw_candidates.append(unquoted)
+    quoted = urllib.parse.quote(blob_name, safe="/")
+    if quoted != blob_name and quoted not in raw_candidates:
+        raw_candidates.append(quoted)
 
-    # Fallback 1: If searching for a legacy path, check if it was migrated under current env
     env = get_storage_environment()
-    if not blob_name.startswith(f"{env}/") and not any(blob_name.startswith(f"{e}/") for e in VALID_ENVIRONMENTS):
-        candidate_prefixed = f"{env}/{blob_name}"
-        candidate_blob = bucket.blob(candidate_prefixed)
+
+    for cand in raw_candidates:
+        # Check exact candidate
         try:
+            candidate_blob = bucket.blob(cand)
             if candidate_blob.exists():
-                logger.info(f"Dual-read resolved legacy '{blob_name}' -> '{candidate_prefixed}'")
-                return candidate_blob, candidate_prefixed
+                return candidate_blob, cand
         except Exception:
             pass
 
-    # Fallback 2: If searching for an env-prefixed path, check if it exists in legacy root
-    for env_name in VALID_ENVIRONMENTS:
-        if blob_name.startswith(f"{env_name}/"):
-            candidate_unprefixed = blob_name[len(env_name) + 1:]
-            candidate_blob = bucket.blob(candidate_unprefixed)
+        # Fallback 1: If searching for a legacy path, check if it was migrated under current env
+        if not cand.startswith(f"{env}/") and not any(cand.startswith(f"{e}/") for e in VALID_ENVIRONMENTS):
+            candidate_prefixed = f"{env}/{cand}"
             try:
+                candidate_blob = bucket.blob(candidate_prefixed)
                 if candidate_blob.exists():
-                    logger.info(f"Dual-read resolved prefixed '{blob_name}' -> legacy '{candidate_unprefixed}'")
-                    return candidate_blob, candidate_unprefixed
+                    logger.info(f"Dual-read resolved legacy '{cand}' -> '{candidate_prefixed}'")
+                    return candidate_blob, candidate_prefixed
             except Exception:
                 pass
 
-    # Default to original blob object even if not found (caller will handle 404)
-    return blob, blob_name
+        # Fallback 2: If searching for an env-prefixed path, check if it exists in legacy root
+        for env_name in VALID_ENVIRONMENTS:
+            if cand.startswith(f"{env_name}/"):
+                candidate_unprefixed = cand[len(env_name) + 1:]
+                try:
+                    candidate_blob = bucket.blob(candidate_unprefixed)
+                    if candidate_blob.exists():
+                        logger.info(f"Dual-read resolved prefixed '{cand}' -> legacy '{candidate_unprefixed}'")
+                        return candidate_blob, candidate_unprefixed
+                except Exception:
+                    pass
+
+    # Default to original blob object if not found
+    return bucket.blob(blob_name), blob_name
 
 
 # --- Core Cloud Storage Operations ---
@@ -251,6 +263,15 @@ def open_gcs_blob_stream(gcs_uri: str) -> Tuple[BinaryIO, str, Optional[int]]:
     """
     bucket_name, blob_name = parse_gcs_uri(gcs_uri)
     blob, resolved_name = resolve_gcs_blob(bucket_name, blob_name)
+
+    # Validate existence before returning lazy streaming handle to prevent unhandled 500s in ASGI stream
+    try:
+        if hasattr(blob, "exists") and not blob.exists():
+            raise FileNotFoundError(f"Blob not found in GCS: gs://{bucket_name}/{blob_name}")
+    except Exception as e:
+        if isinstance(e, FileNotFoundError):
+            raise
+        logger.warning(f"Error checking blob existence in open_gcs_blob_stream: {e}")
 
     content_type = blob.content_type or "application/octet-stream"
     size_bytes = getattr(blob, "size", None)

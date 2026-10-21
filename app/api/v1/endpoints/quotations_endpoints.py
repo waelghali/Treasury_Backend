@@ -102,8 +102,8 @@ async def create_document_download_ticket(
 
     customer_id = None
     caller_desc = None
-    target_leg = None
-    gcs_uri = req.gcs_uri.strip()
+    import urllib.parse
+    gcs_uri = urllib.parse.unquote(req.gcs_uri.strip())
 
     # 1. Corporate User Auth
     auth_header = request.headers.get("Authorization")
@@ -354,6 +354,10 @@ async def download_quotation_document(
         gcs_uri = payload.get("gcs_uri") or gcs_uri
         leg_id = payload.get("leg_id") or leg_id
         caller_desc = payload.get("caller_desc") or "Ephemeral Signed Ticket"
+
+    if gcs_uri:
+        import urllib.parse
+        gcs_uri = urllib.parse.unquote(gcs_uri.strip())
 
     if not gcs_uri and not customer_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Access denied or Not found")

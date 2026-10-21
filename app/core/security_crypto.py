@@ -282,7 +282,11 @@ def _read_exact(stream: BinaryIO, n: int) -> bytes:
     """Reads exactly n bytes from a binary stream, or fewer if EOF is reached."""
     buf = bytearray()
     while len(buf) < n:
-        chunk = stream.read(n - len(buf))
+        try:
+            chunk = stream.read(n - len(buf))
+        except Exception as e:
+            logger.warning(f"Error reading chunk from storage stream: {e}")
+            break
         if not chunk:
             break
         buf.extend(chunk)
