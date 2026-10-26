@@ -70,21 +70,14 @@ def _clean_magic_token(token_str: Optional[str]) -> Optional[str]:
         return None
     return token_str.split('_tab_')[0] if '_tab_' in token_str else token_str
 
-@router.get("/{token}")
-async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(get_db)):
-    """Fetch RFQ details securely using token."""
-    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
-    if not assignment:
-        raise HTTPException(status_code=404, detail="Invalid token")
+def _validate_rfq_accessible_for_dealers(rfq):
+    """Validates that an RFQ exists, is not deleted, and is not cancelled or rejected before bidding."""
+    if not rfq or getattr(rfq, 'is_deleted', False):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quotation request not found or has been decommissioned."
+        )
 
-    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
-    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
-    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
-    
-    # Send detailed customer name as requested! 
-    customer_name = rfq.customer.name if rfq.customer else "Unknown Customer"
-
-    # Process Gap Closure: Block access if awaiting internal approval
     if rfq.status == 'PENDING_APPROVAL':
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
@@ -96,6 +89,34 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             status_code=status.HTTP_410_GONE,
             detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
         )
+
+    if rfq.status == 'REJECTED':
+        if getattr(rfq, 'acceptance_status', None) == 'AUTO_REJECTED':
+            detail_msg = "This quotation request concluded without trade execution as the corporate acceptance window expired."
+        elif not getattr(rfq, 'is_dispatched', False) or rfq.dispatched_at is None:
+            detail_msg = "This quotation request was rejected or expired before corporate approval. No quotation is required."
+        else:
+            detail_msg = "This quotation request was rejected by the corporate treasury desk. No quotation is required."
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=detail_msg
+        )
+
+@router.get("/{token}")
+async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(get_db)):
+    """Fetch RFQ details securely using token."""
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
+    _validate_rfq_accessible_for_dealers(rfq)
+
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    bank_name = q_bank.bank.name if q_bank and q_bank.bank else "Unknown Bank"
+    
+    # Send detailed customer name as requested! 
+    customer_name = rfq.customer.name if rfq.customer else "Unknown Customer"
 
     now = datetime.now(timezone.utc)
     
@@ -635,16 +656,7 @@ async def request_quotation_otp(
         )
 
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == assignment.rfq_id).first()
-    if rfq.status == 'CANCELLED':
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
-        )
-    if rfq.status == 'PENDING_APPROVAL':
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This quotation is not currently open for bidding."
-        )
+    _validate_rfq_accessible_for_dealers(rfq)
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
     if not q_bank:
         raise HTTPException(status_code=404, detail="Bank configuration not found")
@@ -922,6 +934,8 @@ def verify_quotation_otp(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
+    _validate_rfq_accessible_for_dealers(assignment.rfq)
+
     # 1. Rate limiting (max 5 verification attempts per 60 seconds per IP + assignment token)
     client_ip = request.client.host if request and request.client else "unknown"
     rate_key = f"otp_verify:{client_ip}:{assignment.token}"
@@ -1097,6 +1111,8 @@ def get_desk_session(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
+    _validate_rfq_accessible_for_dealers(assignment.rfq)
+
     if not email:
         desk = desk_session_service._get_or_create(assignment.id)
         return desk_session_service._build_status(desk, caller_email="", is_active=False)
@@ -1118,6 +1134,8 @@ def desk_heartbeat(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
+    _validate_rfq_accessible_for_dealers(assignment.rfq)
+
     # Authoritatively resolve user role from database session if session_token provided
     resolved_role = (payload.role or "EXECUTION").strip().upper()
     if payload.session_token:
@@ -1130,11 +1148,6 @@ def desk_heartbeat(
             resolved_role = otp_rec.role.strip().upper()
 
     rfq = assignment.rfq
-    if rfq and rfq.status == 'CANCELLED':
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
-        )
 
     # Check if quotation bidding window or corporate acceptance period is currently active
     now = datetime.now(timezone.utc)
@@ -1217,12 +1230,8 @@ def desk_takeover(
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")
 
+    _validate_rfq_accessible_for_dealers(assignment.rfq)
     rfq = assignment.rfq
-    if rfq and rfq.status == 'CANCELLED':
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
-        )
 
     # Authoritatively resolve user role
     resolved_role = (payload.role or "EXECUTION").strip().upper()
@@ -2353,8 +2362,14 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     w_start = _to_utc_dt(rfq.window_start)
     w_end = _to_utc_dt(rfq.window_end)
 
+    if rfq.status == 'CANCELLED':
+        return {
+            "status": "CANCELLED",
+            "detail": "This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
+        }
+
     # If quotation bidding window has not opened yet, it can NEVER be closed or completed
-    if w_start and now < w_start:
+    if w_start and now < w_start and rfq.status != 'REJECTED':
         return {"status": "SCHEDULED"}
 
     # Align with 2-second network latency buffer
@@ -2395,9 +2410,23 @@ async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
 
         # If deal was rejected or auto-rejected
         if rfq.status == 'REJECTED' or getattr(rfq, 'acceptance_status', None) in ('REJECTED', 'AUTO_REJECTED'):
+            offers_count = (
+                db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == assignment.id).count()
+                if rfq.type == 'TBILL'
+                else db.query(QuotationOffer).filter(QuotationOffer.assignment_id == assignment.id).count()
+            )
+            if offers_count == 0:
+                detail = "Quotation window closed with no offer submitted from your desk. The request has been concluded."
+            elif getattr(rfq, 'acceptance_status', None) == 'AUTO_REJECTED':
+                detail = "This quotation request concluded without trade execution as the corporate acceptance window expired."
+            elif rfq.admin_revision_notes:
+                detail = f"This quotation request concluded without trade execution: {rfq.admin_revision_notes}"
+            else:
+                detail = "This quotation request was concluded without trade execution by corporate treasury decision."
+
             return {
-                "status": "UNEXECUTED",
-                "detail": "This quotation request has concluded and your offer was not selected for trade execution on this occasion."
+                "status": "REJECTED",
+                "detail": detail
             }
 
         # If deal concluded without any winning execution quote
