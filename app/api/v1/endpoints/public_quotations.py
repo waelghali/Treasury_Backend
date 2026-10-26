@@ -3289,3 +3289,262 @@ def submit_dealer_feedback(
         "id": feedback.id
     }
 
+
+# ── N7: Bank Dealer Web Push Mobile Alerts ────────────────────────────────────
+
+class DealerPushKeys(BaseModel):
+    p256dh: str = Field(..., min_length=10, max_length=255)
+    auth: str = Field(..., min_length=8, max_length=255)
+
+
+class DealerPushSubscribeIn(BaseModel):
+    token: str = Field(..., max_length=255)
+    email: str = Field(..., max_length=255)
+    endpoint: str = Field(..., max_length=1024)
+    keys: DealerPushKeys
+    device_label: Optional[str] = Field(None, max_length=120)
+    platform: Optional[str] = Field(None, max_length=20)
+
+
+class DealerPushUnsubscribeIn(BaseModel):
+    endpoint: str = Field(..., max_length=1024)
+    token: Optional[str] = Field(None, max_length=255)
+
+
+class DealerPushStatusIn(BaseModel):
+    endpoint: str = Field(..., max_length=1024)
+    token: Optional[str] = Field(None, max_length=255)
+    email: Optional[str] = Field(None, max_length=255)
+
+
+class DealerStandingSubscribeIn(BaseModel):
+    endpoint: str = Field(..., max_length=1024)
+    keys: DealerPushKeys
+    device_label: Optional[str] = Field(None, max_length=120)
+    platform: Optional[str] = Field(None, max_length=20)
+
+
+@router.get("/push/public-key")
+def get_dealer_push_public_key():
+    """Returns VAPID public key needed for dealer browser push subscription."""
+    from app.services.notifications.push_config import get_vapid_config
+    config = get_vapid_config()
+    return {"enabled": config is not None, "public_key": config.public_key if config else None}
+
+
+@router.post("/push/subscribe")
+def subscribe_dealer_push(
+    payload: DealerPushSubscribeIn,
+    db: Session = Depends(get_db)
+):
+    """
+    N7a: Bank dealer enables mobile alerts from an RFQ invitation link.
+    One enable per phone covers ALL RFQs from ALL customers that invite this dealer.
+    """
+    from app.services.notifications.push_channel import is_allowed_endpoint
+    from app.services.notifications.push_config import get_vapid_config
+    from app.models.models_push import PushSubscription
+    from app.models.models_quotation import QuotationBankDealer
+
+    if get_vapid_config() is None:
+        raise HTTPException(status_code=503, detail="Mobile alerts are not enabled on this server.")
+    if not is_allowed_endpoint(payload.endpoint):
+        raise HTTPException(status_code=400, detail="Unsupported push service.")
+
+    assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == payload.token).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Invalid quotation token.")
+
+    q_bank = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
+    if not q_bank:
+        raise HTTPException(status_code=404, detail="Bank counterparty configuration not found.")
+
+    norm_email = payload.email.strip().lower()
+    contacts = _get_bank_contacts_list(q_bank)
+    is_roster_contact = any(c.get("email", "").strip().lower() == norm_email for c in contacts)
+    dealer_rec = db.query(QuotationBankDealer).filter(
+        QuotationBankDealer.email == norm_email,
+        QuotationBankDealer.bank_id == q_bank.bank_id
+    ).first()
+
+    if not is_roster_contact and not dealer_rec:
+        raise HTTPException(
+            status_code=400,
+            detail="The specified email is not registered in this bank counterparty roster."
+        )
+
+    platform = (payload.platform or "").lower()
+    platform = platform if platform in ("ios", "android", "desktop") else "web"
+
+    sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
+    if sub is None:
+        sub = PushSubscription(endpoint=payload.endpoint)
+        db.add(sub)
+    elif sub.user_id is not None:
+        # Browser was previously used by an internal user; reassign to dealer
+        sub.revoked_reason = "REASSIGNED"
+
+    sub.user_id = None
+    sub.customer_id = None
+    sub.dealer_email = norm_email
+    sub.bank_id = q_bank.bank_id
+    sub.dealer_id = dealer_rec.id if dealer_rec else None
+    sub.p256dh = payload.keys.p256dh
+    sub.auth = payload.keys.auth
+    sub.device_label = payload.device_label or f"{platform.capitalize()} Device"
+    sub.platform = platform
+    sub.device_type = platform
+    sub.is_active = True
+    sub.is_deleted = False
+    sub.revoked_reason = None
+    sub.failure_count = 0
+    sub.last_error = None
+    db.commit()
+    db.refresh(sub)
+
+    return {
+        "success": True,
+        "message": "Phone alerts enabled successfully for all RFQs sent to your desk.",
+        "email": norm_email,
+        "is_active": True,
+        "device_id": sub.id
+    }
+
+
+@router.post("/push/unsubscribe")
+def unsubscribe_dealer_push(
+    payload: DealerPushUnsubscribeIn,
+    db: Session = Depends(get_db)
+):
+    """Turns off dealer alerts for this device."""
+    from app.models.models_push import PushSubscription
+    sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
+    if sub:
+        sub.is_active = False
+        sub.revoked_reason = "USER_REMOVED"
+        db.commit()
+    return {"message": "Phone alerts turned off for this device."}
+
+
+@router.post("/push/status")
+def get_dealer_push_status(
+    payload: DealerPushStatusIn,
+    db: Session = Depends(get_db)
+):
+    """Checks whether this browser has active alerts enabled."""
+    from app.models.models_push import PushSubscription
+    sub = db.query(PushSubscription).filter(
+        PushSubscription.endpoint == payload.endpoint,
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False,  # noqa: E712
+    ).first()
+
+    if sub and sub.dealer_email:
+        return {
+            "is_active": True,
+            "email": sub.dealer_email,
+            "device_label": sub.device_label,
+            "platform": sub.platform
+        }
+    return {"is_active": False, "email": None}
+
+
+# ── N7b: Standing Setup Link Endpoints ────────────────────────────────────────
+
+@router.get("/dealer-alerts/setup/{setup_token}")
+def get_dealer_standing_setup(
+    setup_token: str,
+    db: Session = Depends(get_db)
+):
+    """Loads standing setup session for a dealer arriving via Grow reminder email."""
+    from app.models.models_push import DealerAlertReminder
+    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Invalid or expired setup token.")
+
+    reminder.link_opened_at = datetime.now(timezone.utc)
+    db.commit()
+
+    bank_name = reminder.bank.name if reminder.bank else "Treasury Desk"
+    return {
+        "email": reminder.email,
+        "bank_name": bank_name,
+        "opted_out": reminder.opted_out,
+        "reminders_sent": reminder.reminders_sent
+    }
+
+
+@router.post("/dealer-alerts/setup/{setup_token}/subscribe")
+def subscribe_dealer_standing(
+    setup_token: str,
+    payload: DealerStandingSubscribeIn,
+    db: Session = Depends(get_db)
+):
+    """Enables phone alerts via the standing setup link."""
+    from app.models.models_push import DealerAlertReminder, PushSubscription
+    from app.services.notifications.push_channel import is_allowed_endpoint
+    from app.services.notifications.push_config import get_vapid_config
+    from app.models.models_quotation import QuotationBankDealer
+
+    if get_vapid_config() is None:
+        raise HTTPException(status_code=503, detail="Mobile alerts are not enabled on this server.")
+    if not is_allowed_endpoint(payload.endpoint):
+        raise HTTPException(status_code=400, detail="Unsupported push service.")
+
+    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Invalid setup token.")
+
+    platform = (payload.platform or "").lower()
+    platform = platform if platform in ("ios", "android", "desktop") else "web"
+
+    dealer_rec = db.query(QuotationBankDealer).filter(QuotationBankDealer.email == reminder.email).first()
+
+    sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
+    if sub is None:
+        sub = PushSubscription(endpoint=payload.endpoint)
+        db.add(sub)
+    elif sub.user_id is not None:
+        sub.revoked_reason = "REASSIGNED"
+
+    sub.user_id = None
+    sub.customer_id = None
+    sub.dealer_email = reminder.email
+    sub.bank_id = reminder.bank_id
+    sub.dealer_id = dealer_rec.id if dealer_rec else None
+    sub.p256dh = payload.keys.p256dh
+    sub.auth = payload.keys.auth
+    sub.device_label = payload.device_label or f"{platform.capitalize()} Device"
+    sub.platform = platform
+    sub.device_type = platform
+    sub.is_active = True
+    sub.is_deleted = False
+    sub.revoked_reason = None
+    sub.failure_count = 0
+    sub.last_error = None
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Phone alerts enabled successfully for all RFQs sent to your desk.",
+        "email": reminder.email,
+        "is_active": True
+    }
+
+
+@router.post("/dealer-alerts/setup/{setup_token}/opt-out")
+def opt_out_dealer_standing(
+    setup_token: str,
+    db: Session = Depends(get_db)
+):
+    """Dealer opts out of future email reminders to enable phone alerts."""
+    from app.models.models_push import DealerAlertReminder
+    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Invalid setup token.")
+
+    reminder.opted_out = True
+    db.commit()
+    return {"message": "You have successfully opted out of future reminders."}
+
+

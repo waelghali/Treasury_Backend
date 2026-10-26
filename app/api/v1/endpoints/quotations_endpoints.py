@@ -4718,6 +4718,30 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
             )
             emails_dispatched += 1
 
+            # N7a: Dealer mobile push alert for trade confirmation / conclusion
+            try:
+                from app.services.notifications.push_channel import enqueue_dealer_push
+                asgn = next((a for a in rfq.assignments if a.quotation_bank and a.quotation_bank.bank_id == bank_res.get('bank_id')), None)
+                if asgn:
+                    event_code = "DEALER_DEAL_CONFIRMED" if is_winner else "DEALER_DEAL_CONCLUDED"
+                    title = f"RFQ {ref_no} · Deal confirmed" if is_winner else f"RFQ {ref_no} · Quotation concluded"
+                    body = "Your offer has been selected for trade execution." if is_winner else "Thank you for quoting. This quotation request has concluded."
+                    enqueue_dealer_push(
+                        db=db,
+                        assignment_id=asgn.id,
+                        rfq_id=str(rfq.id),
+                        ref_no=ref_no,
+                        target_url=f"/public-quotation/{asgn.token}",
+                        event_code=event_code,
+                        title=title,
+                        body=body,
+                        dealer_emails=bank_emails,
+                        bank_id=bank_res.get('bank_id'),
+                        urgency="high" if is_winner else "normal",
+                    )
+            except Exception as push_err:
+                logger.warning(f"Failed to enqueue dealer result push for bank {bank_res.get('bank_id')}: {push_err}")
+
     # Finalize or record audit log for idempotency
     if audit_entry:
         audit_entry.details = {

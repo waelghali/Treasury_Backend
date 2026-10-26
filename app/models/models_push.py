@@ -56,9 +56,13 @@ class PushSubscription(BaseModel):
 class NotificationDelivery(BaseModel):
     __tablename__ = "notification_deliveries"
 
-    notification_id = Column(Integer, ForeignKey("user_notifications.id", ondelete="CASCADE"), nullable=False, index=True)
+    notification_id = Column(Integer, ForeignKey("user_notifications.id", ondelete="CASCADE"), nullable=True, index=True)
     subscription_id = Column(Integer, ForeignKey("push_subscriptions.id", ondelete="CASCADE"), nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    dealer_email = Column(String(255), nullable=True, index=True)
+    dealer_id = Column(Integer, ForeignKey("quotation_bank_dealers.id", ondelete="CASCADE"), nullable=True, index=True)
+    payload_json = Column(Text, nullable=True, comment="Direct JSON payload for dealer alerts (no user_notifications row)")
+    dedupe_key = Column(String(128), unique=True, nullable=True, index=True)
     channel = Column(String(16), nullable=False, default="PUSH", server_default="PUSH")
 
     status = Column(String(16), nullable=False, default="PENDING", server_default="PENDING",
@@ -71,8 +75,28 @@ class NotificationDelivery(BaseModel):
 
     notification = relationship("UserNotification")
     subscription = relationship("PushSubscription")
+    dealer = relationship("QuotationBankDealer")
 
     __table_args__ = (
         Index("uq_notification_delivery_pair", "notification_id", "subscription_id", unique=True),
         Index("ix_notification_deliveries_due", "status", "next_attempt_at"),
     )
+
+
+class DealerAlertReminder(BaseModel):
+    """
+    N7b: Tracks standing reminder status and setup links sent to bank dealers
+    inviting them to enable mobile RFQ push alerts.
+    """
+    __tablename__ = "dealer_alert_reminders"
+
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    bank_id = Column(Integer, ForeignKey("banks.id", ondelete="SET NULL"), nullable=True, index=True)
+    setup_token = Column(String(64), nullable=False, unique=True, index=True)
+    reminders_sent = Column(Integer, nullable=False, default=0, server_default="0")
+    last_reminded_at = Column(DateTime(timezone=True), nullable=True)
+    link_opened_at = Column(DateTime(timezone=True), nullable=True)
+    opted_out = Column(Boolean, nullable=False, default=False, server_default="false")
+
+    bank = relationship("Bank")
+

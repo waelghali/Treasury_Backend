@@ -151,6 +151,86 @@ def enqueue_push(db: Session, notifications: Iterable[UserNotification]) -> int:
     return count
 
 
+def enqueue_dealer_push(
+    db: Session,
+    assignment_id: str,
+    rfq_id: str,
+    ref_no: str,
+    target_url: str,
+    event_code: str,
+    title: str,
+    body: str,
+    dealer_emails: Iterable[str],
+    bank_id: Optional[int] = None,
+    urgency: str = "high",
+    expires_at: Optional[datetime] = None,
+) -> int:
+    """
+    Stages push deliveries for bank dealers who registered alerts on their phones.
+    Matches active push_subscriptions where dealer_email is in dealer_emails.
+    A dealer's single phone registration covers all RFQs from all customers that invite them.
+    """
+    if not push_enabled():
+        return 0
+
+    norm_emails = {e.strip().lower() for e in dealer_emails if e and e.strip()}
+    if not norm_emails:
+        return 0
+
+    query = db.query(PushSubscription).filter(
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False,  # noqa: E712
+        PushSubscription.dealer_email.isnot(None),
+    )
+    if bank_id is not None:
+        query = query.filter(
+            (PushSubscription.bank_id == bank_id) | (PushSubscription.bank_id.is_(None))
+        )
+
+    subs = [s for s in query.all() if (s.dealer_email or "").strip().lower() in norm_emails]
+    if not subs:
+        return 0
+
+    now = _now()
+    tag = f"dealer-rfq-{ref_no}"
+    payload = {
+        "title": title,
+        "body": body,
+        "url": target_url,
+        "tag": tag,
+        "urgency": urgency,
+        "expires_at": _as_utc(expires_at).isoformat() if expires_at else None,
+    }
+    payload_str = json.dumps(payload)
+
+    count = 0
+    for sub in subs:
+        dedupe = f"dealer-{assignment_id}-{sub.id}-{event_code}"
+        existing = db.query(NotificationDelivery).filter(
+            NotificationDelivery.dedupe_key == dedupe
+        ).first()
+        if existing:
+            continue
+
+        db.add(NotificationDelivery(
+            subscription_id=sub.id,
+            dealer_email=sub.dealer_email,
+            dealer_id=sub.dealer_id,
+            payload_json=payload_str,
+            dedupe_key=dedupe,
+            channel="PUSH",
+            status="PENDING",
+            attempts=0,
+            next_attempt_at=now,
+            expires_at=_as_utc(expires_at),
+        ))
+        count += 1
+
+    if count:
+        db.info[_SESSION_FLAG] = True
+    return count
+
+
 # ── After-commit nudge ──────────────────────────────────────────────────────
 
 @event.listens_for(Session, "after_commit")
@@ -319,18 +399,30 @@ async def dispatch_once(db: Session, sender=send_web_push) -> dict:
             continue
         sub = delivery.subscription
         notif = delivery.notification
-        if sub is None or not sub.is_active or notif is None:
+        has_payload = notif is not None or bool(delivery.payload_json)
+        if sub is None or not sub.is_active or not has_payload:
             delivery.status = "FAILED"
-            delivery.last_error = "subscription inactive"
+            delivery.last_error = "subscription inactive or missing payload"
             db.commit()
             stats["failed"] += 1
             continue
 
-        payload = build_payload(notif)
+        if notif is not None:
+            payload = build_payload(notif)
+        else:
+            try:
+                payload = json.loads(delivery.payload_json)
+            except Exception as e:
+                delivery.status = "FAILED"
+                delivery.last_error = f"malformed payload json: {e}"
+                db.commit()
+                stats["failed"] += 1
+                continue
+
         expires = _as_utc(delivery.expires_at)
         ttl = DEFAULT_TTL_SECONDS if not expires else max(0, min(MAX_TTL_SECONDS, int((expires - _now()).total_seconds())))
         result, error = await asyncio.to_thread(
-            sender, sub, payload, ttl, payload["urgency"], _topic_for(payload["tag"])
+            sender, sub, payload, ttl, payload.get("urgency", "normal"), _topic_for(payload["tag"])
         )
         _record_result(db, delivery, result, error, _now())
         db.commit()

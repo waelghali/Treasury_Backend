@@ -106,16 +106,16 @@ async def broadcast_rfq_to_banks(
         except Exception as rem_err:
             logger.warning(f"Failed to schedule 15m reminder for RFQ {rfq.id}: {rem_err}")
 
-        # Broadcast emails to assigned banks
+        # Broadcast emails and push alerts to assigned banks
         assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
         email_settings, source = get_customer_email_settings(db, rfq.customer_id, allow_platform_fallback=False)
+        can_send_email = bool(email_settings and source == "customer_specific")
 
-        if not email_settings or source != "customer_specific":
+        if not can_send_email:
             logger.warning(
                 f"broadcast_rfq_to_banks: RFQ {rfq.id} (Customer {rfq.customer_id}) has no valid custom SMTP configured. "
-                "Bank email dispatch suppressed to prevent leaking platform domain."
+                "Bank email dispatch suppressed to prevent leaking platform domain (phone push alerts proceed)."
             )
-            assignments = []
 
         if not base_url:
             from app.core.routing import get_frontend_base_url
@@ -169,48 +169,74 @@ async def broadcast_rfq_to_banks(
             has_approver = len(approver_emails) > 0
             has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
 
-            # Bank approval flow check
-            if assignment.approval_status == 'PENDING' and not is_indicative and has_approver and has_execution:
-                for app_email in approver_emails:
-                    approver_link = f"{base_url}/public-quotation/{assignment.token}?email={app_email}"
-                    subject, body = build_quotation_rfq_bank_email(
-                        rfq=rfq,
-                        assignment=assignment,
-                        bank_name=bank_display_name,
-                        customer_branding=customer_branding,
-                        link=approver_link,
-                        email_purpose="BANK_APPROVAL_REQUIRED"
-                    )
-                    await send_email(db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
-                    emails_sent += 1
+            # Bank email dispatch (only if custom SMTP is configured)
+            if can_send_email:
+                if assignment.approval_status == 'PENDING' and not is_indicative and has_approver and has_execution:
+                    for app_email in approver_emails:
+                        approver_link = f"{base_url}/public-quotation/{assignment.token}?email={app_email}"
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=assignment,
+                            bank_name=bank_display_name,
+                            customer_branding=customer_branding,
+                            link=approver_link,
+                            email_purpose="BANK_APPROVAL_REQUIRED"
+                        )
+                        await send_email(db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
+                        emails_sent += 1
 
-                if non_approver_emails:
-                    subject, body = build_quotation_rfq_bank_email(
-                        rfq=rfq,
-                        assignment=assignment,
-                        bank_name=bank_display_name,
-                        customer_branding=customer_branding,
-                        link="",
-                        email_purpose="BANK_HEADS_UP"
-                    )
-                    await send_email(db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
-                    emails_sent += len(non_approver_emails)
+                    if non_approver_emails:
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=assignment,
+                            bank_name=bank_display_name,
+                            customer_branding=customer_branding,
+                            link="",
+                            email_purpose="BANK_HEADS_UP"
+                        )
+                        await send_email(db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+                        emails_sent += len(non_approver_emails)
+                else:
+                    if assignment.approval_status == 'PENDING':
+                        assignment.approval_status = None
+                        db.commit()
+
+                    if all_bank_emails:
+                        subject, body = build_quotation_rfq_bank_email(
+                            rfq=rfq,
+                            assignment=assignment,
+                            bank_name=bank_display_name,
+                            customer_branding=customer_branding,
+                            link=link,
+                            email_purpose="INVITATION"
+                        )
+                        await send_email(db, all_bank_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+                        emails_sent += len(all_bank_emails)
             else:
-                if assignment.approval_status == 'PENDING':
+                if assignment.approval_status == 'PENDING' and not (has_approver and has_execution and not is_indicative):
                     assignment.approval_status = None
                     db.commit()
 
-                if all_bank_emails:
-                    subject, body = build_quotation_rfq_bank_email(
-                        rfq=rfq,
-                        assignment=assignment,
-                        bank_name=bank_display_name,
-                        customer_branding=customer_branding,
-                        link=link,
-                        email_purpose="INVITATION"
-                    )
-                    await send_email(db, all_bank_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
-                    emails_sent += len(all_bank_emails)
+            # N7a: Dealer mobile push notification (VAPID, independent of customer SMTP)
+            try:
+                from app.services.notifications.push_channel import enqueue_dealer_push
+                enqueue_dealer_push(
+                    db=db,
+                    assignment_id=assignment.id,
+                    rfq_id=str(rfq.id),
+                    ref_no=rfq.ref_no,
+                    target_url=f"/public-quotation/{assignment.token}",
+                    event_code="DEALER_RFQ_INVITATION",
+                    title=f"RFQ {rfq.ref_no} · Invitation to quote",
+                    body="You have received a new quotation request. Open to submit your rate.",
+                    dealer_emails=all_bank_emails,
+                    bank_id=bank_row.bank_id,
+                    urgency="high",
+                    expires_at=rfq.window_end,
+                )
+            except Exception as push_err:
+                logger.warning(f"Failed to enqueue dealer push for RFQ {rfq.id}, assignment {assignment.id}: {push_err}")
+
 
 
 
