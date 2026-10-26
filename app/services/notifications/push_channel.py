@@ -17,7 +17,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Optional, Set
+from typing import Iterable, List, Optional
 from urllib.parse import urlparse
 
 from sqlalchemy import event
@@ -110,8 +110,7 @@ def _topic_for(tag: str) -> str:
 
 # ── Enqueue (called from emit, inside the caller's transaction) ─────────────
 
-def enqueue_push(db: Session, notifications: Iterable[UserNotification],
-                 only_subscription_ids: Optional[Set[int]] = None) -> int:
+def enqueue_push(db: Session, notifications: Iterable[UserNotification]) -> int:
     """Stages one PENDING delivery per (notification, active subscription)."""
     if not push_enabled():
         return 0
@@ -120,14 +119,11 @@ def enqueue_push(db: Session, notifications: Iterable[UserNotification],
         return 0
 
     user_ids = {n.user_id for n in notifications}
-    subs_q = db.query(PushSubscription).filter(
+    subs = db.query(PushSubscription).filter(
         PushSubscription.user_id.in_(user_ids),
         PushSubscription.is_active == True,  # noqa: E712
         PushSubscription.is_deleted == False,  # noqa: E712
-    )
-    if only_subscription_ids is not None:
-        subs_q = subs_q.filter(PushSubscription.id.in_(only_subscription_ids or {-1}))
-    subs = subs_q.all()
+    ).all()
     if not subs:
         return 0
 

@@ -752,6 +752,10 @@ def configure_app_instance(fastapi_app: FastAPI):
         validate_on_startup()
         init_push_dispatcher(scheduler, SessionLocal)
 
+        # Timed quotation alerts (Notifications Q4): closing soon / quotes ready / auto-resolved.
+        from app.services.notifications.quotation_timers import init_quotation_timers
+        init_quotation_timers(scheduler, SessionLocal)
+
         # Re-register dynamic 15-minute prior quotation reminders for active RFQs
         try:
             from app.services.quotation_reminder_service import sync_pending_rfq_reminders_on_startup

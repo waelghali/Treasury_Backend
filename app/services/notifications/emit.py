@@ -66,6 +66,12 @@ def compute_expiry(spec: EventSpec, rfq: QuotationRequest, now: datetime) -> dat
         if w_end and w_end > now:
             return w_end
         return now + timedelta(hours=1)
+    if spec.expiry == ExpiryPolicy.UNTIL_WINDOW_END:
+        w_end = _as_utc(rfq.window_end)
+        return w_end if w_end and w_end > now else now + timedelta(minutes=1)
+    if spec.expiry == ExpiryPolicy.UNTIL_ACCEPTANCE_DEADLINE:
+        deadline = _as_utc(rfq.acceptance_deadline)
+        return deadline if deadline and deadline > now else now + timedelta(minutes=1)
     return now + timedelta(hours=24)
 
 

@@ -10,7 +10,6 @@ Verifies:
    with backoff; expired alerts are never sent.
 5. Endpoints are own-data only: unsubscribe/remove cannot touch another user's
    device; the same browser re-subscribed by another user moves to that user.
-6. Test alert: queued to the caller's devices, rate limited.
 
 Runs against the local development database inside one outer transaction that
 is always rolled back (dispatcher/endpoint commits become savepoints).
@@ -172,7 +171,12 @@ def test_emit_queues_only_recipient_devices():
         db.flush()
 
         targeted = {d.subscription_id for d in _deliveries_for(db, rfq)}
-        assert targeted == {s.id for s in admin_subs} | {extra_admin_sub.id}
+        expected = {s.id for s in admin_subs} | {extra_admin_sub.id}
+        assert expected <= targeted, "every admin device must be queued"
+        # Real devices enabled in the dev DB may also be targeted - but only recipients' own:
+        admin_ids = {a.id for a in t["a_admins"]}
+        owners = {s.user_id for s in db.query(PushSubscription).filter(PushSubscription.id.in_(targeted))}
+        assert owners <= admin_ids, "push queued for a non-recipient"
         assert inactive.id not in targeted
         assert maker_sub.id not in targeted, "actor must not get a push"
         assert other_customer_sub.id not in targeted, "cross-customer push leak!"
@@ -287,19 +291,6 @@ def test_endpoints_are_own_data_only():
     print("  [PASS] endpoints own-data only; shared browser moves owner; sign-out deactivates")
 
 
-def test_test_alert_queued_and_rate_limited():
-    with _session() as db:
-        t = _tenants(db)
-        user = t["a_admins"][0]
-        s1, s2 = _sub(db, user), _sub(db, user)
-        out = ep.send_test_push(ep.PushTestIn(endpoint=s1.endpoint), db=db, current_user=_token(user))
-        assert out["queued"] == 1
-        queued = db.query(NotificationDelivery).filter(NotificationDelivery.subscription_id.in_([s1.id, s2.id])).all()
-        assert [d.subscription_id for d in queued] == [s1.id]
-        _expect_http(429, ep.send_test_push, ep.PushTestIn(), db=db, current_user=_token(user))
-    print("  [PASS] test alert targets the chosen device and is rate limited")
-
-
 if __name__ == "__main__":
     print("=" * 70)
     print("NOTIFICATION PROGRAMME - PHASE Q3 VERIFICATION (WEB PUSH)")
@@ -310,7 +301,6 @@ if __name__ == "__main__":
     test_payload_is_lock_screen_safe()
     test_dispatch_success_gone_retry_expired()
     test_endpoints_are_own_data_only()
-    test_test_alert_queued_and_rate_limited()
     print("\n" + "=" * 70)
     print("ALL PHASE Q3 CHECKS PASSED")
     print("=" * 70)

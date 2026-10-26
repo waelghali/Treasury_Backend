@@ -1103,37 +1103,150 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
 
 ---
 
-#### 📌 Sub-Phase 8.7B: Cross-Module Universal Storage-at-Rest Encryption (Upcoming Enterprise Track 🚀)
-*Scope: Expanding the 64 KB STREAM V2 authenticated encryption and zero-heap streaming gateway across all platform modules, ensuring 100% platform-wide zero-knowledge storage at rest.*
+#### 📌 Sub-Phase 8.7B: Cross-Module Universal Storage-at-Rest Encryption & Zero-Buffer Streaming ("The Bytes Method") (Ready for 1-Click Implementation 🚀)
+*Scope: Expanding the 64 KB STREAM V2 authenticated encryption and zero-heap streaming gateway across LG Custody, LG Issuance, Credit Facilities, and Customer Onboarding, guaranteeing 100% platform-wide zero-knowledge storage at rest with strictly bounded RAM consumption (< 128 KB).*
 
-- **Strategic Objective & Platform Context**:
-  - The successful verification of Quotation RFQ document encryption demonstrates that files stored in cloud object storage (Google Cloud Storage) remain completely unreadable (pure ciphertext) to cloud operators, storage administrators, or unauthorized third parties, while remaining instantly viewable to authorized users through the in-memory streaming gateway.
-  - This institutional protection must be extended systematically across all other platform business modules so that **no sensitive customer documents exist in cleartext on cloud storage anywhere in Grow Treasury**.
+- **1. Strategic Objective & Problem Statement**:
+  - **The Vulnerability**: While Quotation RFQ documents are encrypted at rest under 256-bit Tenant DEKs using STREAM V2 AEAD, documents in **LG Custody** (physical guarantee scans, amendment requests, delivery proofs, bank replies) and **LG Issuance** (contract attachments, tender specs, signed receiving copies, bank replies, cancellation letters) are currently stored in **plain unencrypted format** in Google Cloud Storage.
+  - **The Memory Crash Hazard (OOM)**: Current upload and download logic across `crud_lg_document.py`, `issuance/requests.py`, `issuance/base.py`, and `issuance/workflow.py` loads entire files into heap memory via `await file.read()`, `io.BytesIO()`, and `blob.download_as_bytes()`. A single 30 MB scanned PDF results in ~90 MB of memory allocations across Python layers; 5 concurrent uploads exceed 450 MB RAM, causing instant container crashes (SIGKILL) on cloud hosting (512 MB/1 GB RAM tiers).
+  - **The Signed URL Trap**: Endpoints currently call `generate_signed_gcs_url` to return direct Google Cloud Storage links to the client. If GCS blobs are encrypted at rest, direct GCS links send raw ciphertext (`ENC_STREAM_V2\x00`) to the browser, resulting in broken PDF rendering ("Corrupted file").
+  - **Target State**: All customer documents across LG Custody and Issuance encrypted at rest under the customer's unique 256-bit Tenant DEK; downloads decrypted on-the-fly via chunked streaming with RAM usage strictly $< 128\text{ KB}$; zero server disk writes; and 100% seamless in-browser preview via 15-minute signed ephemeral tickets.
 
-- **Module-by-Module Expansion Scope**:
-  1. **LG Custody Module (`app/services/custody_service.py`, `app/api/v1/endpoints/custody.py`)**:
-     - **Target Assets**: Original physical Letter of Guarantee scans, amendment requests, release/cancellation letters, and official bank correspondence.
-     - **Mechanism**: Encrypt scans under Customer Tenant DEK on upload; stream-decrypt on custody dashboard and audit inspections.
-  2. **LG Issuance Module (`app/services/issuance_service.py`, `app/api/v1/endpoints/issuance/`)**:
-     - **Target Assets**: Generated and submitted bank application forms (FILLABLE_PDF, PHYSICAL_OVERLAY, SCANNED_FILL), corporate board resolutions, and bank delivery receipts.
-     - **Mechanism**: Dynamic form generation pipeline seals PDF in memory before writing to GCS; unseals via role-gated streaming proxy.
-  3. **Credit Facilities Module (`app/services/facilities_service.py`, `app/api/v1/endpoints/facilities.py`)**:
-     - **Target Assets**: Bilateral credit facility contracts, sanction letters, mortgage / collateral deeds, and covenant compliance certificates.
-     - **Mechanism**: Strict customer tenant isolation preventing unauthorized cross-company inspection of banking credit terms.
-  4. **Bank Statements & Reconciliation Module (`app/services/statement_service.py`, `app/services/reconciliation_service.py`)**:
-     - **Target Assets**: Uploaded bank statements (MT940, CAMT.053, multi-bank Excel/CSV files), reconciliation exception attachments, and bank confirmation reports.
-     - **Mechanism**: Sealed at ingestion; statement parsers read via decrypted in-memory stream without persisting cleartext files to disk.
-  5. **Customer Onboarding & Corporate KYC (`app/services/customer_onboarding_service.py`)**:
-     - **Target Assets**: Official commercial register extracts, tax cards, authorized signatory mandates, and articles of association.
-     - **Mechanism**: Uploaded during corporate onboarding; decrypted only by compliance checkers and Corporate Admins.
+- **2. Cryptographic & Memory Architecture ("The Bytes Method")**:
+  - **Per-Tenant Envelope Encryption**:
+    - Uses the platform-wide `TenantKeyService`. Because every corporate tenant is identified by `Customer.id`, the customer's 256-bit Tenant DEK is unwrapped from `QuotationTenantKey` using the Master KEK and cached in-memory with a 10-minute TTL.
+  - **STREAM V2 Wire Format**:
+    - Header (25 bytes): `STREAM_MAGIC` (`b"ENC_STREAM_V2\x00"`, 14B) + `chunk_size` (uint32 big-endian, 4B) + `stream_salt` (random crypto bytes, 7B).
+    - Chunk Frames: `flag` (1B: `0x00` intermediate, `0x01` final) + `frame_len` (uint32 big-endian, 4B) + `[Ciphertext + 16-byte AES-GCM Tag]`.
+    - Nonce (12 bytes): `stream_salt` (7B) + `chunk_idx` (4B) + `flag` (1B).
+  - **Cryptographic Context Separation (AAD Binding)**:
+    - LG Custody: `context = "lg_custody_doc"`
+    - LG Issuance: `context = "lg_issuance_doc"`
+    - Quotations: `context = "quotation_doc"`
+    - Facilities: `context = "facility_doc"`
+    - KYC / Corporate Entity: `context = "kyc_doc"`
+    - *Security Invariant*: If an attacker copies an encrypted Custody blob to an Issuance path, decryption will fail immediately with `TamperDetectedError` because the AAD context string does not match.
+  - **Dual-Read Backwards Compatibility (Zero Downtime)**:
+    - `decrypt_stream_generator` inspects the first 14 bytes:
+      1. `b"ENC_STREAM_V2\x00"`: Decrypts block-by-block with tag verification.
+      2. `b"ENC_FILE_V1\x00"`: Decrypts legacy monolithic ciphertext.
+      3. Raw `%PDF` or image magic: Passes raw bytes untouched! **Existing historical documents continue opening with zero downtime and zero corruption.**
+  - **Bounded RAM Invariants**:
+    - Upload: `UploadFile.file` (disk-spooled) $\to$ `encrypt_stream_generator` (64 KB) $\to$ GCS `blob.open("wb")`. RAM delta strictly $< 128\text{ KB}$.
+    - Download: GCS `open_gcs_blob_stream` (`blob.open("rb")`) $\to$ `decrypt_stream_generator` $\to$ FastAPI `StreamingResponse`. Zero full-buffer heap allocations.
 
-- **Architectural Implementation Approach**:
-  - **Centralized Storage Hook (`app/core/storage_service.py`)**:
-    - Rather than re-implementing encryption endpoints in every individual module router, hook STREAM V2 directly into `upload_bytes_to_gcs` / `upload_stream_to_gcs` and provide a centralized authenticated gateway:
-      `GET /api/v1/storage/documents/download?file_uri=...&module=...`
-    - Module routers simply declare required tenant ownership and permissions, delegating encryption/decryption to the centralized security layer.
-  - **Zero-Downtime Dual-Read Backfill**:
-    - Existing historical documents across LG Custody, Issuance, and Facilities will continue opening seamlessly via dual-read format detection (`ENC_STREAM_V2\x00` vs. raw PDF). An asynchronous background job can progressively backfill and encrypt legacy objects in batches without system downtime.
+- **3. Comprehensive Module Inventory & Exact File Modifications**:
+
+  #### A. LG Custody Module
+  1. **`app/crud/crud_lg_document.py` (`create_document`)**:
+     - Update signature to accept `source_stream: BinaryIO` (e.g. `file.file`) and fallback `file_content: Optional[bytes] = None`.
+     - Retrieve tenant DEK: `tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)`.
+     - Upload via centralized stream encryptor `upload_stream_to_gcs_encrypted(...)` with `context="lg_custody_doc"`.
+  2. **`app/api/v1/endpoints/end_user.py` (`view_lg_document_securely`, line 755)**:
+     - Mint an ephemeral signed ticket bound to the user's customer session (`generate_download_ticket`).
+     - Return `{"signed_url": f"/api/v1/documents/download?ticket={ticket}", "download_url": f"/api/v1/documents/download?ticket={ticket}"}`.
+     - *Frontend Compatibility*: In `LGDetailsPage.js:332`, `response.signed_url` is passed directly to `window.open(signedUrl, '_blank')`. Returning `signed_url: download_url` keeps the frontend working immediately with **zero frontend code edits**.
+  3. **`app/core/ai_integration.py` (`process_lg_document_with_ai` & `_convert_pdf_to_images_and_upload_to_gcs`)**:
+     - PyMuPDF opens stream or file directly; memory dynamic clamping preserved: max 1800 px on longest side, immediate C-buffer deletion (`del pix`, `del page`), and `_reclaim_system_memory()` after each page. Temporary OCR slices in `lg_scans_temp/` cleaned up post-analysis.
+
+  #### B. LG Issuance Module
+  1. **`app/api/v1/endpoints/issuance/requests.py` (`upload_request_documents`, line 960)**:
+     - Stream-encrypt directly from `file.file` using `upload_stream_to_gcs_encrypted(file.file, blob_path, tenant_dek, file.content_type, context="lg_issuance_doc")`.
+  2. **`app/api/v1/endpoints/issuance/base.py` (`download_request_document`, line 235)**:
+     - Mint signed download ticket and return `{"download_url": f"/api/v1/documents/download?ticket={ticket}", "file_name": doc.file_name}`.
+  3. **`app/api/v1/endpoints/issuance/base.py` (`handover_signed_copy` line 414, `upload_scanned_copy` line 688)**:
+     - Stream-encrypt `signed_copy_file.file` and `file.file` directly to GCS via tenant DEK.
+  4. **`app/api/v1/endpoints/issuance/workflow.py` (`delivery-proof` line 676, `bank-reply` line 799, `cancellation notice` line 1000)**:
+     - Delivery proofs and bank replies stream-encrypted on upload.
+     - Generated cancellation notice PDF (`generated_pdf_bytes`) stream-encrypted via `encrypt_file_bytes(generated_pdf_bytes, tenant_dek, context="lg_issuance_doc")`.
+     - `download_cancellation_notice_pdf` (line 1080) returns signed ticket download URL.
+  5. **`app/api/v1/endpoints/issuance/reconciliation.py` (`get_maintenance_document_url`, line 161)**:
+     - Mint signed ticket and return `{"download_url": f"/api/v1/documents/download?ticket={ticket}", "doc_type": doc_type}`.
+  6. **`app/services/issuance_maintenance_service.py` (lines 464, 561, 1296, 1526)**:
+     - Replace raw `_upload_to_gcs` calls with `upload_stream_to_gcs_encrypted` bound to customer DEK.
+  7. **`app/api/v1/endpoints/public_issuance.py` (Public Requestor Portal)**:
+     - External requestors uploading contracts and tender documents have their files encrypted at rest under the inviting corporate customer's DEK.
+     - Automated AI verification (`perform_auto_verification`, line 389) streams decrypted chunks into a temporary `tempfile.SpooledTemporaryFile(max_size=2*1024*1024)` rather than calling `blob.download_as_bytes()`.
+  8. **Bank Form Templates Clarification**:
+     - Official bank application form templates (`BankFormTemplate` in `models_issuance.py:501`) are blank administrative PDFs uploaded by superadmins under `system/bank_forms/...`. They contain no customer confidential data and remain system-scoped (unencrypted).
+     - **Filled forms** containing corporate guarantee amounts, account numbers, and applicant data are customer-confidential and are sealed under Tenant DEK on save.
+
+  #### C. Credit Facilities & Customer Legal Entities
+  1. **`app/api/v1/endpoints/facility_endpoints.py` (`upload_facility_contract`, line 135)**:
+     - Stream-encrypt bilateral credit facility agreements under Tenant DEK (`context="facility_doc"`).
+  2. **`app/api/v1/endpoints/public.py` (Commercial Register Extracts, line 168)**:
+     - Stream-encrypt corporate registration documents under Tenant DEK (`context="kyc_doc"`).
+
+- **4. New Centralized Core Infrastructure Primitives**:
+
+  #### A. Enhanced Cloud Storage Service (`app/core/storage_service.py`)
+  ```python
+  def upload_stream_to_gcs_encrypted(
+      source_stream: BinaryIO,
+      blob_name: str,
+      dek: bytes,
+      content_type: str = "application/octet-stream",
+      bucket_name: Optional[str] = None,
+      chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+      context: str = "doc_attachment"
+  ) -> Tuple[str, int]:
+      """
+      Streams bytes directly from source_stream (disk/spool), encrypts in 64 KB STREAM V2 AEAD frames,
+      and writes chunk-by-chunk to Cloud Storage via blob.open('wb').
+      Strict memory bound: < 128 KB RAM delta regardless of file size (1 MB to 500 MB+).
+      Returns (gcs_uri, total_bytes_written).
+      """
+      target_bucket = bucket_name or GCS_BUCKET_NAME
+      client = _get_gcs_client()
+      bucket = client.bucket(target_bucket)
+      blob = bucket.blob(blob_name)
+      
+      total_written = 0
+      with blob.open("wb", content_type="application/octet-stream") as dest:
+          for chunk in encrypt_stream_generator(source_stream, dek, chunk_size=chunk_size, context=context):
+              dest.write(chunk)
+              total_written += len(chunk)
+              
+      return f"gs://{target_bucket}/{blob_name}", total_written
+
+  def stream_decrypted_gcs_blob(
+      gcs_uri: str,
+      dek: bytes,
+      context: str = "doc_attachment"
+  ) -> Tuple[Iterator[bytes], str, str]:
+      """
+      Opens a chunked streaming reader on GCS (blob.open('rb')) and wraps it in decrypt_stream_generator.
+      Dual-read safe: decrypts STREAM V2, legacy V1, or passes raw unencrypted bytes untouched.
+      Returns (chunk_generator, final_content_type, clean_filename).
+      """
+      source_stream, content_type, size_bytes = open_gcs_blob_stream(gcs_uri)
+      generator = decrypt_stream_generator(source_stream, dek, context=context)
+      
+      raw_filename = gcs_uri.split("/")[-1]
+      clean_filename = "_".join(raw_filename.split("_")[1:]) if "_" in raw_filename and len(raw_filename.split("_")[0]) == 8 else raw_filename
+      guessed_type, _ = mimetypes.guess_type(clean_filename)
+      final_content_type = guessed_type or content_type or "application/octet-stream"
+      
+      return generator, final_content_type, clean_filename
+  ```
+
+  #### B. Centralized Document Streaming Router (`app/api/v1/endpoints/document_streaming.py`)
+  - `POST /api/v1/documents/ticket`: Validates tenant authorization across quotation, lg_custody, lg_issuance, or facility; mints short-lived (15 min) HMAC-SHA256 signed ticket.
+  - `GET /api/v1/documents/download`: Universal streaming decryption gateway. Validates ticket, resolves Tenant DEK, streams 64 KB blocks directly to client, stamps immutable WORM audit log (`UNSEAL_DOCUMENT`), and returns `StreamingResponse` with strict no-cache headers.
+
+- **5. Critical Edge Cases, Exceptions & Engineering Invariants**:
+  1. **Truncation & Tamper Defense**: If a network drop or malicious actor truncates an encrypted file, the final chunk will lack `FLAG_FINAL` (0x01). `decrypt_stream_generator` catches this and raises `TamperDetectedError("Document stream was truncated before the authenticated final block")`, aborting delivery before corrupt bytes can be consumed.
+  2. **Chromium Blob Sandbox Workaround**: Direct top-level HTTP navigation (`window.open(url, '_blank')`) with standard `Content-Disposition: inline; filename="..."` and `Content-Type: application/pdf` natively opens Chrome's built-in PDF viewer without encountering Chromium's blob URL sandbox restrictions.
+  3. **PyMuPDF Memory Isolation**: All image-rendering operations on PDF pages explicitly call `del pix`, `del page`, and invoke `_reclaim_system_memory()` (calling `ctypes.CDLL("libc.so.6").malloc_trim(0)` on Linux / glibc) to prevent Python C-extension memory fragmentation.
+  4. **Multi-Leg / Multi-Party Gating**: When a bank dealer views an Issuance or Quotation document, the gateway verifies active counterparty assignment. Only dealers awarded a specific leg or granted explicit document visibility can mint tickets.
+  5. **WORM Forensic Traceability**: Every call to `/documents/download` records an immutable audit trail entry (`UNSEAL_DOCUMENT`) containing `user_id`, `customer_id`, `client_ip`, `gcs_uri`, `filename`, and timestamp.
+
+- **6. 1-Click Implementation Runbook**:
+  - **Step 1: Core Storage Primitives**: Add `upload_stream_to_gcs_encrypted` and `stream_decrypted_gcs_blob` to `app/core/storage_service.py`. Register universal `document_streaming.router` in `app/api/v1/api.py`.
+  - **Step 2: LG Custody Encryption & Viewing**: Refactor `create_document` in `app/crud/crud_lg_document.py` to use `upload_stream_to_gcs_encrypted` with `context="lg_custody_doc"`. Update `view_lg_document_securely` in `app/api/v1/endpoints/end_user.py` to generate tickets pointing to `/api/v1/documents/download`.
+  - **Step 3: LG Issuance Encryption & Viewing**: Update `upload_request_documents` in `app/api/v1/endpoints/issuance/requests.py`. Update `download_request_document`, `handover_signed_copy`, and `upload_scanned_copy` in `app/api/v1/endpoints/issuance/base.py`. Update maintenance upload and download handlers in `app/api/v1/endpoints/issuance/workflow.py` and `reconciliation.py`.
+  - **Step 4: Verification Suite (`tests/test_lg_document_streaming_encryption.py`)**: Execute automated test verifying 100 MB upload/download RSS memory delta $< 10\text{ MB}$, raw GCS `ENC_STREAM_V2` bytes inspection, AAD context mismatch rejection, dual-read backwards compatibility, and ticket expiry.
+  - **Step 5: Offline Legacy Backfill Script (`scripts/reencrypt_legacy_documents.py`)**: Idempotent batch script to scan existing `LGDocument`, `IssuanceRequestDocument`, and `IssuedLGRecord` records, detecting unencrypted files and upgrading them to STREAM V2 at rest in batches of 50 with zero downtime.
 
 ---
 
@@ -1447,7 +1560,7 @@ Focus moved to **quotation mobile alerts first**. Issuance migration onto `emit(
 | **Q1** | Notification core (`app/services/notifications/`: catalog, role audiences, `emit()`) + 6 instant quotation events → in-app bell | Quotation alerts in the bell, right people only | ✅ Done |
 | **Q2** | Installable PWA shell (= N2) | Add to Home Screen; test notification deep-links | ✅ Done |
 | **Q3** | Web Push channel (= N3 + outbox/dispatcher) | Q1 events on phone lock screen; logout/revoke stops delivery | ✅ Done |
-| **Q4** | Timed quotation alerts via per-RFQ `DateTrigger` jobs + startup re-sync: `RFQ_CLOSING_SOON` (T-2m), `RFQ_QUOTES_READY` (at `window_end`, TTL = acceptance deadline), `RFQ_CLOSED_NO_QUOTES`, `RFQ_DEAL_AUTO_RESOLVED` | Alerts fire on time and survive restart | Planned |
+| **Q4** | Timed quotation alerts (single 5s sweeper): `RFQ_CLOSING_SOON` (T-2m), `RFQ_QUOTES_READY` (at `window_end`, TTL = acceptance deadline), `RFQ_RESULTS_READY`, `RFQ_CLOSED_NO_QUOTES`, `RFQ_DEAL_AUTO_RESOLVED` | Alerts fire on time and survive restart | ✅ Done |
 | **Q5** | Mobile Alerts UX (= N4 lite) | Enable guide, devices + test, quotation toggle, deep link after re-login, phone-usable acceptance screen | Planned |
 
 #### Q1 Post-Flight (2026-10-26) — Quotation Notification Core (In-App) ✅
@@ -1496,6 +1609,17 @@ Focus moved to **quotation mobile alerts first**. Issuance migration onto `emit(
   * Session timeout must not unsubscribe, otherwise an idle phone loses exactly the alerts it exists for. Only explicit sign-out, "Turn off", device removal or another user enabling on the same browser stop delivery.
   * The service worker cannot call the authenticated API (no token in SW scope); key rotation (`pushsubscriptionchange`) is re-synced by the app on next open.
 * **Verification Proof:** `tests/test_notifications_push_q3.py` 7/7 PASS (SSRF allowlist, recipient-only devices incl. cross-customer + actor + inactive, payload whitelist, dispatcher SENT/410/503/expired, own-data endpoints + owner move + sign-out, targeted + rate-limited test alert); Q1 9/9 and strict email rules 7/7 PASS (regression); live FCM call with a fake device returned 410 → classified GONE (proves VAPID signing + HTTP path); no test data left in the DB; `npm run build` OK.
+* **Follow-up (2026-10-26):** the test alert was removed at the user's request (`POST /push/test`, the bell "Test" button, `sendTestPush`, `only_subscription_ids`); only real catalog events reach phones. Q3 suite now 6 checks.
+
+#### Q4 Post-Flight (2026-10-26) — Timed Quotation Alerts ✅ (no DDL)
+* **Work Actually Done:**
+  1. [`catalog.py`](file:///c:/Grow/app/services/notifications/catalog.py): `RFQ_CLOSING_SOON` (high, expires at `window_end`), `RFQ_QUOTES_READY` (high, expires at `acceptance_deadline`), `RFQ_RESULTS_READY`, `RFQ_CLOSED_NO_QUOTES`, `RFQ_DEAL_AUTO_RESOLVED` (`decision` = auto-accepted / auto-rejected). Audience: maker + delegate. New expiry policies `UNTIL_WINDOW_END` / `UNTIL_ACCEPTANCE_DEADLINE`.
+  2. [`quotation_timers.py`](file:///c:/Grow/app/services/notifications/quotation_timers.py): sweeper every 5s (`quotation_timed_alerts_sweep`, off the event loop). Closing soon: live, dispatched, ≤ 2 min to close, not indicative-only. Window closed (30 min catch-up): runs `compute_rfq_standings(dispatch_emails=False)` once, then quotes ready / no quotes / results ready. Deadline passed: evaluates once, then auto-resolved. Idempotency = existing notification with the same `event_type` + `reference_key`.
+  3. [`main.py`](file:///c:/Grow/app/main.py): `init_quotation_timers` after the push dispatcher.
+  4. Bell "Phone alerts" enable message lists the real alerts.
+* **Plan Deviations:** one sweeper instead of per-RFQ `DateTrigger` jobs + re-sync — no hooks needed in every approve / cancel / reschedule / re-tender path, restart-safe by design, at most 5s late. No index added: `quotation_rfqs` already indexes `acceptance_status`, and the table is small (289 rows locally); revisit if it grows large.
+* **Technical Findings & Gotchas:** `compute_rfq_standings` commits internally and an uncontested AUTO_ACCEPT can halt and log on every call → evaluated once per RFQ per stage (in-memory guard). Results emails stay on their existing path. The local DB has `quotation_rfqs.acceptance_timeout_seconds/action` as NOT NULL though the model says nullable (pre-existing drift).
+* **Verification Proof:** `tests/test_notifications_timed_q4.py` 5/5 PASS (closing soon once + maker-only push + expiry; none before approval / far windows; quotes ready / no quotes / indicative once each with single evaluation; auto-resolution once without amounts; all timed texts lock-screen safe).
 
 Corporate treasury officers, CFOs, and approvers frequently miss time-critical milestones—such as urgent LG renewals, expiring RFQ quotation windows, and blocking approval requests—because they are away from their workstations.
 

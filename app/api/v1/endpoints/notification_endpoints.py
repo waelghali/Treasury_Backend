@@ -4,7 +4,6 @@ General-purpose notification API.
 Serves UserNotification records for the bell icon across all modules.
 """
 
-from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,7 +18,6 @@ from app.models.models_push import PushSubscription
 from app.services.notifications.push_channel import (
     MAX_SUBSCRIPTIONS_PER_USER,
     endpoint_fingerprint,
-    enqueue_push,
     is_allowed_endpoint,
 )
 from app.services.notifications.push_config import get_vapid_config
@@ -104,10 +102,6 @@ class PushSubscribeIn(BaseModel):
 
 class PushUnsubscribeIn(BaseModel):
     endpoint: str = Field(..., max_length=1024)
-
-
-class PushTestIn(BaseModel):
-    endpoint: Optional[str] = Field(None, max_length=1024, description="Limit the test to this device")
 
 
 def _device_out(sub: PushSubscription) -> dict:
@@ -218,47 +212,3 @@ def remove_push_device(
     sub.revoked_reason = "USER_REMOVED"
     db.commit()
     return {"message": "Device removed"}
-
-
-@router.post("/push/test")
-def send_test_push(
-    payload: PushTestIn,
-    db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_active_user),
-):
-    """Queues a test alert to the caller's devices (or just one). Sent by the dispatcher."""
-    if get_vapid_config() is None:
-        raise HTTPException(status_code=503, detail="Mobile alerts are not enabled on this server.")
-
-    now = datetime.now(timezone.utc)
-    recent = db.query(UserNotification).filter(
-        UserNotification.user_id == current_user.user_id,
-        UserNotification.event_type == "PUSH_TEST",
-        UserNotification.created_at >= now - timedelta(seconds=10),
-    ).first()
-    if recent:
-        raise HTTPException(status_code=429, detail="Please wait a few seconds before sending another test.")
-
-    subs_q = _active_subs_query(db, current_user.user_id)
-    if payload.endpoint:
-        subs_q = subs_q.filter(PushSubscription.endpoint == payload.endpoint)
-    if subs_q.count() == 0:
-        raise HTTPException(status_code=404, detail="No device with mobile alerts enabled.")
-
-    notif = UserNotification(
-        user_id=current_user.user_id,
-        module="SYSTEM",
-        event_type="PUSH_TEST",
-        title="Grow test alert",
-        message="Mobile alerts are working on this device.",
-        link="/app",
-        is_read=True,  # informational only; don't add to the bell badge
-        reference_type="PushTest",
-        reference_key=f"test-{current_user.user_id}",
-        urgency="high",
-        expires_at=now + timedelta(minutes=10),
-    )
-    db.add(notif)
-    queued = enqueue_push(db, [notif], only_subscription_ids={s.id for s in subs_q.all()})
-    db.commit()
-    return {"queued": queued}

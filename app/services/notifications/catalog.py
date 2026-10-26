@@ -27,6 +27,13 @@ class EventCode(str, Enum):
     RFQ_CANCELLATION_REQUESTED = "RFQ_CANCELLATION_REQUESTED"
     RFQ_CANCELLATION_DECIDED = "RFQ_CANCELLATION_DECIDED"
 
+    # Quotation — timed events raised by the window sweeper (Phase Q4)
+    RFQ_CLOSING_SOON = "RFQ_CLOSING_SOON"
+    RFQ_QUOTES_READY = "RFQ_QUOTES_READY"
+    RFQ_RESULTS_READY = "RFQ_RESULTS_READY"
+    RFQ_CLOSED_NO_QUOTES = "RFQ_CLOSED_NO_QUOTES"
+    RFQ_DEAL_AUTO_RESOLVED = "RFQ_DEAL_AUTO_RESOLVED"
+
 
 class Urgency(str, Enum):
     # Values mirror the RFC 8030 Web Push "Urgency" header (used from Phase Q3).
@@ -44,6 +51,8 @@ class LinkTarget(str, Enum):
 
 class ExpiryPolicy(str, Enum):
     UNTIL_WINDOW_START = "UNTIL_WINDOW_START"  # falls back to window_end when start has passed
+    UNTIL_WINDOW_END = "UNTIL_WINDOW_END"
+    UNTIL_ACCEPTANCE_DEADLINE = "UNTIL_ACCEPTANCE_DEADLINE"
     FIXED_24H = "FIXED_24H"
 
 
@@ -121,6 +130,59 @@ CATALOG: Dict[EventCode, EventSpec] = {
         title="RFQ {ref_no} · Cancellation {decision}",
         body="Your cancellation request was {decision} by a corporate admin.",
         link=LinkTarget.RFQ_HISTORY,
+        allowed_fields=("ref_no", "decision"),
+    ),
+
+    # ── Timed events (Phase Q4) ──────────────────────────────────────────────────────
+    # Who can accept/reject a deal: the maker and their delegate.
+    EventCode.RFQ_CLOSING_SOON: EventSpec(
+        code=EventCode.RFQ_CLOSING_SOON,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Closing soon",
+        body="Be ready: the quotation window closes in about 2 minutes and you will need to decide quickly.",
+        link=LinkTarget.RFQ_RESULTS,
+        urgency=Urgency.HIGH,
+        expiry=ExpiryPolicy.UNTIL_WINDOW_END,
+    ),
+    EventCode.RFQ_QUOTES_READY: EventSpec(
+        code=EventCode.RFQ_QUOTES_READY,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Quotes ready – decide now",
+        body="The window has closed. Accept or reject before the acceptance time runs out.",
+        link=LinkTarget.RFQ_RESULTS,
+        urgency=Urgency.HIGH,
+        expiry=ExpiryPolicy.UNTIL_ACCEPTANCE_DEADLINE,
+    ),
+    EventCode.RFQ_RESULTS_READY: EventSpec(
+        code=EventCode.RFQ_RESULTS_READY,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Results ready",
+        body="The quotation window has closed. Open Grow to review the indicative results.",
+        link=LinkTarget.RFQ_RESULTS,
+    ),
+    EventCode.RFQ_CLOSED_NO_QUOTES: EventSpec(
+        code=EventCode.RFQ_CLOSED_NO_QUOTES,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Closed with no quotes",
+        body="The quotation window closed without any executable quotes.",
+        link=LinkTarget.RFQ_RESULTS,
+    ),
+    EventCode.RFQ_DEAL_AUTO_RESOLVED: EventSpec(
+        code=EventCode.RFQ_DEAL_AUTO_RESOLVED,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Deal {decision}",
+        body="The acceptance time ran out and the deal was {decision} by your company policy.",
+        link=LinkTarget.RFQ_RESULTS,
         allowed_fields=("ref_no", "decision"),
     ),
 }
