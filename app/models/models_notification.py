@@ -28,6 +28,12 @@ class UserNotification(BaseModel):
                           comment="ID of the related object (request, LG record, etc.)")
     reference_type = Column(String, nullable=True,
                             comment="Type of related object: IssuanceRequest, LGRecord, etc.")
+    reference_key = Column(String(64), nullable=True, index=True,
+                           comment="String ID of the related object (e.g. RFQ UUID); reference_id stays for integer IDs")
+    urgency = Column(String(10), nullable=False, default="normal", server_default="normal",
+                     comment="low | normal | high (mirrors the Web Push Urgency header)")
+    expires_at = Column(DateTime(timezone=True), nullable=True,
+                        comment="After this time the alert is stale (e.g. approval needed before window start)")
 
     # Relationships
     user = relationship("User", foreign_keys=[user_id])

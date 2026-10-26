@@ -1913,6 +1913,11 @@ def create_rfq(
             requires_approval=requires_approval,
             obj_in=rfq_in
         )
+
+        if requires_approval:
+            from app.services.notifications import emit, EventCode
+            emit(db, EventCode.RFQ_APPROVAL_REQUIRED, rfq, actor_user_id=current_user.user_id)
+            db.commit()
         
         log_action(
             db,
@@ -3319,6 +3324,8 @@ def request_rfq_cancellation(
         rfq.cancellation_notes = payload.notes
         rfq.cancellation_requested_by = current_user.user_id
         rfq.cancellation_requested_at = now
+        from app.services.notifications import emit, EventCode
+        emit(db, EventCode.RFQ_CANCELLATION_REQUESTED, rfq, actor_user_id=current_user.user_id)
         db.commit()
 
 
@@ -3433,6 +3440,8 @@ def cancel_rfq_release_maker(
     rfq.status = 'PENDING_APPROVAL'
     rfq.scheduled_release_at = None
     rfq.scheduled_release_job_id = None
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_APPROVAL_REQUIRED, rfq, actor_user_id=current_user.user_id)
     db.commit()
 
     return {"message": "Scheduled release cancelled. RFQ returned to pending approval.", "rfq_id": rfq.id, "status": rfq.status}
@@ -3642,6 +3651,10 @@ def retender_quotation(
                 ))
 
         assigned_records.append({"assignment": new_assignment, "bank_row": bank_row, "token": token})
+
+    if requires_approval:
+        from app.services.notifications import emit, EventCode
+        emit(db, EventCode.RFQ_APPROVAL_REQUIRED, new_rfq, actor_user_id=current_user.user_id)
 
     db.commit()
 
@@ -4166,6 +4179,8 @@ def resubmit_quotation(
             logger.error(f"Failed to update bank assignments on resubmit: {e}")
 
     rfq.status = 'PENDING_APPROVAL'
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_APPROVAL_REQUIRED, rfq, actor_user_id=current_user.user_id)
     db.commit()
 
 

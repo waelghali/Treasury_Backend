@@ -149,6 +149,7 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
 **Run these exact statements manually on Production PostgreSQL BEFORE deploying the corresponding release:**
 
 | Release & Phase | Feature / Component Relation | Target Table | Action | Production SQL Statement | Verification Query |
+| **v2.5 (2026-10-26)<br>Notifications Q1** | **Quotation notification core:** string reference for RFQ UUIDs (`reference_id` is INTEGER), urgency (mirrors Web Push `Urgency`), and stale-after time for per-user notifications. | `user_notifications` | Add columns `reference_key`, `urgency`, `expires_at` + index | ```sql<br>ALTER TABLE user_notifications<br>ADD COLUMN IF NOT EXISTS reference_key VARCHAR(64),<br>ADD COLUMN IF NOT EXISTS urgency VARCHAR(10) NOT NULL DEFAULT 'normal',<br>ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;<br>CREATE INDEX IF NOT EXISTS ix_user_notifications_reference_key<br>ON user_notifications (reference_key);<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'user_notifications'<br>AND column_name IN ('reference_key', 'urgency', 'expires_at');<br>``` |
 | **v2.4 (2026-10-20)<br>Phase 7.2** | **Bank Compliance:** Allow banks to optionally dim/disable the trader execution comments textarea per institutional treasury compliance policy. | `banks` | Add column `allow_dealer_comments` | ```sql<br>ALTER TABLE banks<br>ADD COLUMN IF NOT EXISTS allow_dealer_comments BOOLEAN NOT NULL DEFAULT TRUE;<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'banks' AND column_name = 'allow_dealer_comments';<br>``` |
 | **v2.4 (2026-10-20)<br>Phase 7.2** | **Institutional Governance:** Allow banks to enable/disable the dealer terminal experience feedback rating button and post-quote prompt per institution policy. | `banks` | Add column `allow_dealer_feedback` | ```sql<br>ALTER TABLE banks<br>ADD COLUMN IF NOT EXISTS allow_dealer_feedback BOOLEAN NOT NULL DEFAULT TRUE;<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'banks' AND column_name = 'allow_dealer_feedback';<br>``` |
 | **v2.4 (2026-10-19)<br>Phase 8.8** | **Dealer Handshake Protocol:** Zero-Knowledge storage (AES-256-GCM `encrypted_email` + HMAC-SHA256 `email_blind_index`), single-activation link token burn, and 6-digit interactive OTP gate with lockout defense. | `quotation_bank_contact_invitations` | Add Zero-Knowledge, OTP gate, and token hash columns; drop NOT NULL on email/token; create blind index & token hash indexes | ```sql<br>ALTER TABLE quotation_bank_contact_invitations<br>ADD COLUMN IF NOT EXISTS encrypted_email TEXT,<br>ADD COLUMN IF NOT EXISTS email_blind_index VARCHAR(64),<br>ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64),<br>ADD COLUMN IF NOT EXISTS otp_hash VARCHAR(128),<br>ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ,<br>ADD COLUMN IF NOT EXISTS otp_last_sent_at TIMESTAMPTZ,<br>ADD COLUMN IF NOT EXISTS failed_otp_attempts INTEGER NOT NULL DEFAULT 0,<br>ALTER COLUMN email DROP NOT NULL,<br>ALTER COLUMN token DROP NOT NULL;<br>CREATE INDEX IF NOT EXISTS ix_quotation_bank_contact_invitations_email_blind_index<br>ON quotation_bank_contact_invitations (email_blind_index);<br>CREATE INDEX IF NOT EXISTS ix_quotation_bank_contact_invitations_token_hash<br>ON quotation_bank_contact_invitations (token_hash);<br>``` | ```sql<br>SELECT column_name, data_type, is_nullable<br>FROM information_schema.columns<br>WHERE table_name = 'quotation_bank_contact_invitations'<br>AND column_name IN ('encrypted_email', 'email_blind_index', 'token_hash', 'otp_hash', 'failed_otp_attempts');<br>``` |
@@ -1436,6 +1437,38 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
   * Maintenance titles embed the LG reference (`LG {ref} — …`): acceptable in-app, **must be redacted** in push payloads (N3/N5).
 * **Plan Deviations:** none.
 * **Verification Proof:** `import app.main` OK; `npm run build` compiles; manual bell check pending (issuance submit → approver sees amber clock; approve → requester sees green check).
+
+#### Quotation-First Track (Re-scoped 2026-10-26) — Executes Before the Remaining N-Phases
+Focus moved to **quotation mobile alerts first**. Issuance migration onto `emit()` is deferred until after Q5. Decisions: "Be ready" heads-up fires **2 minutes before `window_end`**; **no live "bank offer received" alerts** to the maker (sealed-bid governance).
+
+| Phase | Scope | Testable outcome | Status |
+| :--- | :--- | :--- | :--- |
+| **Q1** | Notification core (`app/services/notifications/`: catalog, role audiences, `emit()`) + 6 instant quotation events → in-app bell | Quotation alerts in the bell, right people only | ✅ Done |
+| **Q2** | Installable PWA shell (= N2) | Add to Home Screen; test notification deep-links | Planned |
+| **Q3** | Web Push channel (= N3 + outbox/dispatcher) | Q1 events on phone lock screen; logout/revoke stops delivery | Planned |
+| **Q4** | Timed quotation alerts via per-RFQ `DateTrigger` jobs + startup re-sync: `RFQ_CLOSING_SOON` (T-2m), `RFQ_QUOTES_READY` (at `window_end`, TTL = acceptance deadline), `RFQ_CLOSED_NO_QUOTES`, `RFQ_DEAL_AUTO_RESOLVED` | Alerts fire on time and survive restart | Planned |
+| **Q5** | Mobile Alerts UX (= N4 lite) | Enable guide, devices + test, quotation toggle, deep link after re-login, phone-usable acceptance screen | Planned |
+
+#### Q1 Post-Flight (2026-10-26) — Quotation Notification Core (In-App) ✅
+* **Work Actually Done:**
+  1. New package [`app/services/notifications/`](file:///c:/Grow/app/services/notifications/__init__.py):
+     * [`catalog.py`](file:///c:/Grow/app/services/notifications/catalog.py): `EventCode`, `EventSpec` (module, category, role audiences, urgency, expiry policy, link target, templates with a whitelist of allowed placeholders).
+     * [`audiences.py`](file:///c:/Grow/app/services/notifications/audiences.py): role keys `RFQ_CREATOR`, `RFQ_DELEGATE`, `CUSTOMER_CORPORATE_ADMINS`, `CANCELLATION_REQUESTER`; actor excluded; final tenancy re-check on loaded `User` rows (drops out-of-customer/deleted recipients).
+     * [`emit.py`](file:///c:/Grow/app/services/notifications/emit.py): stages `UserNotification` rows in the caller's transaction (never commits); role-aware deep links; unknown codes / non-whitelisted fields raise; runtime resolver errors logged at ERROR without blocking the business action.
+  2. Events wired before the existing `db.commit()` (atomic with the status change):
+     * `RFQ_APPROVAL_REQUIRED` → corporate admins: `create_rfq`, `retender_quotation`, `resubmit_quotation`, `cancel_rfq_release_maker` ([quotations_endpoints.py](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py)).
+     * `RFQ_APPROVED` / `RFQ_REJECTED` / `RFQ_REVISION_REQUESTED` → maker: `approve_quotation` (immediate + scheduled), `approve_quotation_request` (PATCH), `reject_quotation`, `request_quotation_revision` ([corporate_admin.py](file:///c:/Grow/app/api/v1/endpoints/corporate_admin.py)).
+     * `RFQ_CANCELLATION_REQUESTED` → corporate admins (`request_rfq_cancellation`); `RFQ_CANCELLATION_DECIDED` → requester (`approve_quotation_cancellation`, `reject_quotation_cancellation`).
+  3. [`models_notification.py`](file:///c:/Grow/app/models/models_notification.py): `reference_key`, `urgency`, `expires_at` (ledger entry v2.5 Q1).
+  4. [`NotificationCenter.jsx`](file:///c:/Grow/frontend/src/components/NotificationCenter.jsx): icons for the new quotation codes.
+  5. [`tests/test_notifications_quotation_q1.py`](file:///c:/Grow/tests/test_notifications_quotation_q1.py): 9 checks.
+* **Technical Findings & Gotchas:**
+  * RFQ window-close and acceptance transitions are **lazy** (`compute_rfq_standings()` runs on read; the only sweep is every 5 hours) → Q4 must schedule one-off jobs at `window_end` / `acceptance_deadline` (same pattern as `quotation_reminder_service`).
+  * Default acceptance windows are 30s (FX) / 120s (T-Bill): a push at `window_end` alone is too late for a cold phone → the T-2m heads-up is the critical alert.
+  * The repo has no `pytest` installed; tests follow the existing standalone-script convention (`python tests/<file>.py`) while staying pytest-compatible.
+  * Notification text carries only the RFQ reference and action — the same rendering will be safe for push in Q3.
+* **Plan Deviations:** outbox (`notification_deliveries`) and dispatcher moved from N1 to Q3, where the push channel first needs them; Issuance stays on `notify()` for now.
+* **Verification Proof:** Q1 suite 9/9 PASS (tenancy isolation, actor exclusion, cross-customer delegate dropped, fail-loud errors, lock-screen-safe text for all events, rollback leaves no rows, role-aware links); `test_quotation_strict_email_rules.py` 7/7 PASS (regression); `import app.main` OK; `npm run build` OK. Manual bell check pending: end user creates RFQ needing approval → admin bell "Approval required"; admin approves → maker bell "Approved".
 
 Corporate treasury officers, CFOs, and approvers frequently miss time-critical milestones—such as urgent LG renewals, expiring RFQ quotation windows, and blocking approval requests—because they are away from their workstations.
 

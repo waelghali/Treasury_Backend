@@ -2281,6 +2281,8 @@ def approve_quotation(
         for leg in (rfq.legs or []):
             if leg.status == 'PENDING_APPROVAL':
                 leg.status = 'APPROVED_SCHEDULED'
+        from app.services.notifications import emit, EventCode
+        emit(db, EventCode.RFQ_APPROVED, rfq, actor_user_id=corporate_admin_context.user_id)
         db.commit()
 
         job_id = schedule_rfq_bank_release(rfq_id=rfq.id, release_at=scheduled_time)
@@ -2333,6 +2335,8 @@ def approve_quotation(
     for leg in (rfq.legs or []):
         if leg.status in ('PENDING_APPROVAL', 'APPROVED_SCHEDULED'):
             leg.status = 'PENDING'
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_APPROVED, rfq, actor_user_id=corporate_admin_context.user_id)
     db.commit()
 
     log_action(
@@ -2541,6 +2545,8 @@ def reject_quotation(
     for leg in (rfq.legs or []):
         if leg.status not in ('REJECTED', 'CANCELLED'):
             leg.status = 'REJECTED'
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_REJECTED, rfq, actor_user_id=corporate_admin_context.user_id)
     db.commit()
     
 
@@ -2578,6 +2584,8 @@ def request_quotation_revision(
     rfq.status = 'NEEDS_REVISION'
     rfq.admin_revision_notes = notes
     rfq.admin_reviewed_at = func.now()
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_REVISION_REQUESTED, rfq, actor_user_id=corporate_admin_context.user_id)
     db.commit()
 
 
@@ -2625,6 +2633,13 @@ def approve_quotation_request(
         raise HTTPException(status_code=400, detail=f"Cannot approve/reject RFQ in {rfq.status} state.")
 
     rfq.status = approval_in.status
+    from app.services.notifications import emit, EventCode
+    emit(
+        db,
+        EventCode.RFQ_APPROVED if approval_in.status == "PENDING" else EventCode.RFQ_REJECTED,
+        rfq,
+        actor_user_id=corporate_admin_context.user_id,
+    )
     db.commit()
 
     # Log the action
@@ -2803,6 +2818,9 @@ def approve_quotation_cancellation(
     for leg in (rfq.legs or []):
         if leg.status not in ('CANCELLED',):
             leg.status = 'CANCELLED'
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_CANCELLATION_DECIDED, rfq,
+         actor_user_id=corporate_admin_context.user_id, extra={"decision": "approved"})
     db.commit()
 
     # Cancel scheduled 15m reminder if registered
@@ -2901,6 +2919,9 @@ def reject_quotation_cancellation(
         raise HTTPException(status_code=400, detail=f"Quotation is in {rfq.status} status and has no pending cancellation request.")
 
     rfq.status = 'PENDING'
+    from app.services.notifications import emit, EventCode
+    emit(db, EventCode.RFQ_CANCELLATION_DECIDED, rfq,
+         actor_user_id=corporate_admin_context.user_id, extra={"decision": "declined"})
     db.commit()
 
     # Notify maker
