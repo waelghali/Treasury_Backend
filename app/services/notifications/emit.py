@@ -29,6 +29,7 @@ from app.services.notifications.catalog import (
     LinkTarget,
     get_spec,
 )
+from app.services.notifications.push_channel import enqueue_push
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +121,14 @@ def emit(
             for user_id, role in recipients.items()
         ]
         db.add_all(rows)
+        try:
+            pushes = enqueue_push(db, rows)
+        except Exception:
+            pushes = 0
+            logger.exception("Notification %s for RFQ %s: push enqueue failed (in-app kept)", spec.code.value, rfq.id)
         logger.info(
-            "Notification %s staged for RFQ %s → %d recipient(s)",
-            spec.code.value, rfq.id, len(rows),
+            "Notification %s staged for RFQ %s -> %d recipient(s), %d push delivery(ies)",
+            spec.code.value, rfq.id, len(rows), pushes,
         )
         return len(rows)
     except Exception:

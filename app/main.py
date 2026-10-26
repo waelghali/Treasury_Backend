@@ -269,6 +269,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         import app.models.models_quotation
         import app.models.models_reconciliation_v2
         import app.models.models_notification
+        import app.models.models_push
         import app.models.models_inbox
         import app.models.models_campaign
         
@@ -743,6 +744,13 @@ def configure_app_instance(fastapi_app: FastAPI):
 
         scheduler.start()
         logger.info("APScheduler started.")
+
+        # Web Push (Notifications Q3). Misconfigured VAPID keys raise here on
+        # purpose (fail fast); missing keys just leave push disabled.
+        from app.services.notifications.push_config import validate_on_startup
+        from app.services.notifications.push_channel import init_push_dispatcher
+        validate_on_startup()
+        init_push_dispatcher(scheduler, SessionLocal)
 
         # Re-register dynamic 15-minute prior quotation reminders for active RFQs
         try:
