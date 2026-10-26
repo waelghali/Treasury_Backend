@@ -1537,8 +1537,19 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
 | **N4** | Onboarding UX: Mobile Alerts page, device list + test, soft-ask, iOS guide, 4 category toggles, app badge, deep-link return after login | New `user_notification_preferences` | Planned |
 | **N5** | Event coverage: 5a Issuance, 5b Quotation (internal), 5c LG/facility/SLA deadlines | — | Planned |
 | **N6** | System Owner console: enable/disable, templates, channels, urgency, role audiences, test-on-my-device, delivery dashboard; rules seeded at startup | New `notification_event_rules` | Planned |
-| **N7** | Bank dealer push (flagged): authenticated dealer subscribe; recipients via assignment → customer `quotation_banks` → contacts ∩ enrolled dealers; cross-customer isolation test mandatory | `push_subscriptions.dealer_id` + CHECK | Planned |
+| **N7a** | Bank dealer push (flagged): dealer enables from the RFQ bank-offer link (no login); one enable per phone covers **all** RFQs from **all** customers that invite him; recipients via assignment → customer `quotation_banks` → contacts ∩ enrolled dealers; cross-customer isolation test mandatory | `push_subscriptions.dealer_id` + CHECK | Planned |
+| **N7b** | Dealer alert reminder email (Grow-branded) to dealers without phone alerts, with a standing setup link | New reminder-tracking table (TBD) | Planned |
 | N8 (backlog) | Quiet hours, batching, morning briefing, real-time bell (SSE) | — | Backlog |
+
+**Dealer alert decisions (2026-10-26):**
+1. **Enable once, covers everything.** A dealer enables alerts once per phone; from then on that phone gets alerts for every RFQ sent to him, from **every customer** that invites him, whichever link he used. No per-RFQ step. Stays on until he turns it off, blocks notifications, or the phone stops answering (410 cleanup). Lock-screen text stays redacted (RFQ ref + action), so nothing leaks between customers.
+2. **Primary entry point: the RFQ link.** Every bank-offer page offers "Alert me on this phone" (iPhone: Add to Home Screen guide first) and "Stop alerts on this phone".
+3. **Additional entry point: reminder email (N7b).** Sent to dealers who have recently received RFQs but have no active phone alerts, away from the RFQ moment:
+   * Never while that dealer has an open RFQ; business hours only.
+   * Frequency and maximum count to be decided later (system settings); stops immediately once alerts are enabled.
+   * Contains a **standing setup link** (not tied to any RFQ, does not expire with a deal) and a "Don't remind me again" link.
+   * Tracked: sent / link opened / alerts enabled.
+4. **Sender exception to the Strict Quotation Email Rules.** The reminder is sent **from Grow (platform address)**, not via a customer's SMTP: it is a Grow service covering all customers, and customers' mail servers must only send emails triggered by actions they took. This is the **only** dealer-facing email allowed on the platform relay; every RFQ email (invitation, reminder, results, cancellation) stays on the customer's own server with no platform fallback. The strict-rules test must be extended to prove both sides.
 
 #### N0 Post-Flight (2026-10-26) — Bell Display Fixes ✅
 * **Work Actually Done:**
