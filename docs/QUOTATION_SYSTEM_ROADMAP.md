@@ -1572,9 +1572,27 @@ Focus moved to **quotation mobile alerts first**. Issuance migration onto `emit(
 | **Q2** | Installable PWA shell (= N2) | Add to Home Screen; test notification deep-links | ✅ Done |
 | **Q3** | Web Push channel (= N3 + outbox/dispatcher) | Q1 events on phone lock screen; logout/revoke stops delivery | ✅ Done |
 | **Q4** | Timed quotation alerts (single 5s sweeper): `RFQ_CLOSING_SOON` (T-2m), `RFQ_QUOTES_READY` (at `window_end`, TTL = acceptance deadline), `RFQ_RESULTS_READY`, `RFQ_CLOSED_NO_QUOTES`, `RFQ_DEAL_AUTO_RESOLVED` | Alerts fire on time and survive restart | ✅ Done |
-| **Q5** | Mobile Alerts UX (= N4 lite) | Enable guide, devices + test, quotation toggle, deep link after re-login, phone-usable acceptance screen | Planned |
+| **Q5** | Mobile Alerts UX (= N4 lite) | Enable guide, devices list & revoke, shared-browser notice, deep link after re-login, mobile-usable acceptance screen | ✅ Done |
 
-#### Q1 Post-Flight (2026-10-26) — Quotation Notification Core (In-App) ✅
+#### Q5 Post-Flight (2026-10-26) — Mobile Alerts UX & Mobile Acceptance Flow ✅ (frontend only)
+* **Work Actually Done:**
+  1. [`PushDevicesModal.jsx`](file:///c:/Grow/frontend/src/components/Modals/PushDevicesModal.jsx): New modal to list active devices via `GET /notifications/push/devices`, identify current browser/device with an active badge, and revoke devices individually with confirmation via `DELETE /notifications/push/devices/{id}`.
+  2. [`PushInstallGuideModal.jsx`](file:///c:/Grow/frontend/src/components/Modals/PushInstallGuideModal.jsx): Step-by-step PWA install & push enable guide for iOS Safari (Share -> Add to Home Screen -> launch from Home Screen -> allow push) and Android Chrome / Desktop.
+  3. [`MobileAlertsControl.jsx`](file:///c:/Grow/frontend/src/components/MobileAlertsControl.jsx): Added "Manage Devices" settings button and "How to Install" guide in the bell menu. Added visual alert banner when push was deactivated because another user signed into the same browser.
+  4. [`pushService.js`](file:///c:/Grow/frontend/src/services/pushService.js): Added `listPushDevices()`, `removePushDevice()`, and detection of switched ownership via `localStorage.getItem('grow_push_switched_owner')`.
+  5. [`AuthWrapper.js`](file:///c:/Grow/frontend/src/components/AuthWrapper.js): Deep-link preservation on unauthenticated access — intercepts incoming push notification target URL and preserves it as `/login?next=...`.
+  6. [`App.js`](file:///c:/Grow/frontend/src/App.js): `handleLoginSuccess` and `handleAcceptSuccess` navigate user directly to `?next=` URL after authentication via `getPostLoginTarget()`.
+  7. Layout bells ([`CorporateAdminLayout.js`](file:///c:/Grow/frontend/src/components/Layout/CorporateAdminLayout.js), [`EndUserLayout.js`](file:///c:/Grow/frontend/src/components/Layout/EndUserLayout.js)): Responsive notification dropdown sizing (`Math.min(320, window.innerWidth - 24)`, max-height `min(24rem, 70vh)`).
+  8. [`ResultsView.js`](file:///c:/Grow/frontend/src/pages/EndUser/Quotations/ResultsView.js): Replaced raw `window.prompt` on deal decline with an accessible, mobile-friendly dialog (`role="dialog"`, presets for common governance rejection reasons, custom text input, 44px min tap targets, touch-friendly action bar).
+* **Technical Findings & Gotchas:**
+  * Multi-tenant shared device protection: when user A and user B share a browser, `syncPushOwnership` deactivates user A's subscription to prevent data leaks. The new banner informs user B why push was turned off so they can intentionally re-enable it for their account.
+  * Deep-linking: clicking a push notification while the session is expired no longer dumps the user on their dashboard; they log in and land right back on the target RFQ results/acceptance view.
+* **Verification Proof:**
+  * Frontend production build: `$env:CI="false"; npm run build` compiles with 0 errors (`build/static/js/main.991cdd27.js`).
+  * Backend regression test suites:
+    * `test_notifications_timed_q4.py` (5/5 checks PASS).
+    * `test_notifications_push_q3.py` (6/6 checks PASS).
+    * `test_notifications_quotation_q1.py` (9/9 checks PASS).
 * **Work Actually Done:**
   1. New package [`app/services/notifications/`](file:///c:/Grow/app/services/notifications/__init__.py):
      * [`catalog.py`](file:///c:/Grow/app/services/notifications/catalog.py): `EventCode`, `EventSpec` (module, category, role audiences, urgency, expiry policy, link target, templates with a whitelist of allowed placeholders).
