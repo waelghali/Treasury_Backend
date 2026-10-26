@@ -846,7 +846,12 @@ class QuotationAnalytics(BaseModel):
     winner_bank = relationship("QuotationBank")
 
 class QuotationNotification(BaseModel):
-    """Per-user notifications for RFQ status changes and live updates."""
+    """Per-user notifications for RFQ status changes and live updates.
+
+    DEPRECATED (2026-10-26, Notification Programme N0): never read or written by the app.
+    All per-user notifications use `user_notifications` (app/models/models_notification.py).
+    Table retained until a future ledger entry drops it.
+    """
     __tablename__ = "quotation_notifications"
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     type = Column(String, nullable=False, comment="'RFQ_PENDING_APPROVAL', 'RFQ_APPROVED', 'RFQ_REJECTED', 'NEW_OFFER'")

@@ -1400,6 +1400,43 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
 
 ## 11. Phase 9: Mobile PWA & Web Push Alerting Infrastructure (Zero-Store Footprint)
 
+### 11.0 Notification Programme N0–N7 (Restarted 2026-10-26) — Supersedes the Implementation Plan in §11.7–§12.7
+> The conceptual goals of §11 and §12 remain valid. **Implementation now follows the phased programme below**, built fresh on `main` (the WIP branch is a parts bin only — never merged). Each phase ships and is tested independently on its own branch `feature/notif-N{n}-{slug}`.
+
+**Agreed decisions (2026-10-26):**
+1. **Audience is configurable by role, never by individual user.** Rules select from role-based audience keys (e.g. `CORPORATE_ADMINS`, `ASSIGNED_APPROVERS`, `RFQ_CREATOR`, `INVITED_DEALERS`); each key is resolved in code, customer- and assignment-scoped, with tests.
+2. **Dealer push (N7) stays in the programme**, built last behind a System Owner feature flag.
+3. **PWA + Web Push now**; delivery goes through channel adapters so a native app (FCM/APNs) can be added later without redesign.
+4. **Outbox handles push + in-app only**; existing emails stay on their current paths and migrate gradually later.
+
+**Platform corrections vs. the WIP design:** no silent pushes (Safari revokes subscriptions; Chrome shows a generic notice) — "tender closed" uses a visible same-`tag` replacement plus RFC 8030 `Topic`/`TTL` headers; no service-worker `setTimeout` (workers are killed after ~30s); `requireInteraction` dropped (ignored on mobile); iOS push requires 16.4+ and Home Screen install; permission requested only from a user gesture; payload ≤ 4 KB and redacted (no amounts, rates, bank/client names, LG numbers).
+
+**Architecture:** `emit(event_code, typed context)` inside the business transaction → role audience resolver → `user_notifications` (in-app) + `notification_deliveries` (outbox, unique `dedupe_key`) → background dispatcher (after-commit nudge + 30s sweep, `FOR UPDATE SKIP LOCKED`, retry/backoff, 404/410 cleanup) → channel adapters (Web Push now; native later).
+
+| Phase | Scope | DDL | Status |
+| :--- | :--- | :--- | :--- |
+| **N0** | Bell display fixes, dead-table deprecation note | None | ✅ Done (see post-flight below) |
+| **N1** | Event catalog + `emit()` + outbox + dispatcher (in-app); issuance moved onto `emit()` | `user_notifications` + `reference_key`, `expires_at`, `urgency`; new `notification_deliveries` | Planned |
+| **N2** | Installable PWA shell: manifest, icons, minimal SW (push/click/subscription-change only, no caching) | None | Planned |
+| **N3** | Web Push for internal users: env-only VAPID (fail fast), `push_subscriptions` tied to `user_devices`, scoped endpoints, push adapter, logout/revoke teardown | New `push_subscriptions` | Planned |
+| **N4** | Onboarding UX: Mobile Alerts page, device list + test, soft-ask, iOS guide, 4 category toggles, app badge, deep-link return after login | New `user_notification_preferences` | Planned |
+| **N5** | Event coverage: 5a Issuance, 5b Quotation (internal), 5c LG/facility/SLA deadlines | — | Planned |
+| **N6** | System Owner console: enable/disable, templates, channels, urgency, role audiences, test-on-my-device, delivery dashboard; rules seeded at startup | New `notification_event_rules` | Planned |
+| **N7** | Bank dealer push (flagged): authenticated dealer subscribe; recipients via assignment → customer `quotation_banks` → contacts ∩ enrolled dealers; cross-customer isolation test mandatory | `push_subscriptions.dealer_id` + CHECK | Planned |
+| N8 (backlog) | Quiet hours, batching, morning briefing, real-time bell (SSE) | — | Backlog |
+
+#### N0 Post-Flight (2026-10-26) — Bell Display Fixes ✅
+* **Work Actually Done:**
+  1. [`NotificationCenter.jsx`](file:///c:/Grow/frontend/src/components/NotificationCenter.jsx): reads `event_type` (fallback `notification_type`); icons now mapped by exact key then outcome pattern (`*_SUBMITTED`/`*_PENDING` amber clock, `*_APPROVED`/`*_BANK_CONFIRMED`/`LG_ISSUED` green check, `*_REJECTED`/`*_CANCELLED` red X, `BANK_INITIATED_*` blue bank, `BANK_FORM_ISSUE*` orange alert); mark-read/mark-all use functional state updates (removes stale-closure race).
+  2. [`models_quotation.py`](file:///c:/Grow/app/models/models_quotation.py): `QuotationNotification` docstring marked DEPRECATED (no reader/writer in `app/`; table retained).
+* **Technical Findings & Gotchas:**
+  * The bell had **always** shown the default icon: UI read `notification_type`, API (`UserNotification`) only exposes `event_type`. Old icon keys were `system_notifications` banner types that never reach the bell.
+  * Issuance `event_type` values are dynamic (`MAINTENANCE_{action}_{OUTCOME}`, `BANK_INITIATED_{action}`) — N1 must register these as catalog families, not single codes.
+  * `user_notifications.reference_id` is `INTEGER` while RFQ/assignment IDs are UUID strings — root cause of WIP bug #7; fixed in N1 via `reference_key`.
+  * Maintenance titles embed the LG reference (`LG {ref} — …`): acceptable in-app, **must be redacted** in push payloads (N3/N5).
+* **Plan Deviations:** none.
+* **Verification Proof:** `import app.main` OK; `npm run build` compiles; manual bell check pending (issuance submit → approver sees amber clock; approve → requester sees green check).
+
 Corporate treasury officers, CFOs, and approvers frequently miss time-critical milestones—such as urgent LG renewals, expiring RFQ quotation windows, and blocking approval requests—because they are away from their workstations.
 
 To provide instant sound and vibration alerting without the friction of Apple Developer ($99/year) and Google Play Console review delays, Grow Treasury introduces an installable **Progressive Web App (PWA) with Web Push (VAPID)**.
