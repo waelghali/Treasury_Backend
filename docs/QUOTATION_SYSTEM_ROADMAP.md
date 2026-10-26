@@ -1444,7 +1444,7 @@ Focus moved to **quotation mobile alerts first**. Issuance migration onto `emit(
 | Phase | Scope | Testable outcome | Status |
 | :--- | :--- | :--- | :--- |
 | **Q1** | Notification core (`app/services/notifications/`: catalog, role audiences, `emit()`) + 6 instant quotation events → in-app bell | Quotation alerts in the bell, right people only | ✅ Done |
-| **Q2** | Installable PWA shell (= N2) | Add to Home Screen; test notification deep-links | Planned |
+| **Q2** | Installable PWA shell (= N2) | Add to Home Screen; test notification deep-links | ✅ Done |
 | **Q3** | Web Push channel (= N3 + outbox/dispatcher) | Q1 events on phone lock screen; logout/revoke stops delivery | Planned |
 | **Q4** | Timed quotation alerts via per-RFQ `DateTrigger` jobs + startup re-sync: `RFQ_CLOSING_SOON` (T-2m), `RFQ_QUOTES_READY` (at `window_end`, TTL = acceptance deadline), `RFQ_CLOSED_NO_QUOTES`, `RFQ_DEAL_AUTO_RESOLVED` | Alerts fire on time and survive restart | Planned |
 | **Q5** | Mobile Alerts UX (= N4 lite) | Enable guide, devices + test, quotation toggle, deep link after re-login, phone-usable acceptance screen | Planned |
@@ -1469,6 +1469,17 @@ Focus moved to **quotation mobile alerts first**. Issuance migration onto `emit(
   * Notification text carries only the RFQ reference and action — the same rendering will be safe for push in Q3.
 * **Plan Deviations:** outbox (`notification_deliveries`) and dispatcher moved from N1 to Q3, where the push channel first needs them; Issuance stays on `notify()` for now.
 * **Verification Proof:** Q1 suite 9/9 PASS (tenancy isolation, actor exclusion, cross-customer delegate dropped, fail-loud errors, lock-screen-safe text for all events, rollback leaves no rows, role-aware links); `test_quotation_strict_email_rules.py` 7/7 PASS (regression); `import app.main` OK; `npm run build` OK. Manual bell check pending: end user creates RFQ needing approval → admin bell "Approval required"; admin approves → maker bell "Approved".
+
+#### Q2 Post-Flight (2026-10-26) — Installable PWA Shell ✅ (frontend only, no DDL)
+* **Work Actually Done:**
+  1. [`public/manifest.webmanifest`](file:///c:/Grow/frontend/public/manifest.webmanifest): name "Grow Treasury", short name "Grow", standalone, `id`/`start_url` = `/app` (not a real route on purpose: logged-out → `/login` via `AuthWrapper`, logged-in → role home via the protected catch-all).
+  2. Icons in `public/icons/` (192, 512, maskable 512, 180 apple-touch, 96 monochrome badge) built from the leaf mark (the full logo is unreadable at icon size).
+  3. [`public/sw.js`](file:///c:/Grow/frontend/public/sw.js): push → **always** shows a notification (no silent pushes, which make Safari revoke subscriptions); expired payloads show a generic "open Grow" text; click → focus the existing tab and navigate, or open a window; links restricted to same origin; `pushsubscriptionchange` stub for Q3. **No fetch handler, no caching, no timers.**
+  4. [`public/index.html`](file:///c:/Grow/frontend/public/index.html): manifest, theme colour, apple-touch-icon, iOS standalone meta (SEO tags untouched).
+  5. [`src/index.js`](file:///c:/Grow/frontend/src/index.js): service worker registered in production builds only, after `load`.
+  6. [`vercel.json`](file:///c:/Grow/frontend/vercel.json): `/sw.js` served `no-store` (phones always pick up a new worker); manifest content type.
+* **Technical Findings & Gotchas:** `/login` does not redirect already-logged-in users, hence the `/app` start URL. The WIP branch's worker was not reused (silent-dismiss, `setTimeout` and `requireInteraction` flaws).
+* **Verification Proof:** `npm run build` OK; `build/` contains `sw.js`, `manifest.webmanifest`, `icons/`. Manual after deploy: Chrome DevTools → Application → Manifest (installable, no errors) → Service Workers → "Push" with `{"title":"Test","body":"Hi","url":"/app"}` shows a notification and the click opens the app; iPhone Safari → Share → Add to Home Screen opens full-screen.
 
 Corporate treasury officers, CFOs, and approvers frequently miss time-critical milestones—such as urgent LG renewals, expiring RFQ quotation windows, and blocking approval requests—because they are away from their workstations.
 
