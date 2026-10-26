@@ -271,15 +271,59 @@ class OmniTestFixture:
             self.banks[code] = qb
 
 
+def print_usage():
+    print("""
+GROW TREASURY - MASTER OMNI SIMULATION & ADVERSARIAL SUITE
+Usage: python tests/test_omni_simulation_suite.py [OPTIONS]
+
+Options:
+  --stress      Run full 1.0 GB streaming concurrency & RAM stress benchmark
+                (50 MB payload x 20 concurrent worker threads)
+  --fast        Run fast local streaming concurrency check (5 MB x 5 workers)
+                [Default when not interactive]
+  --preserve    Keep test RFQ records in database for UI inspection
+  --clean       Cleanly wipe test RFQs after run [Default]
+  --help, -h    Show this help message and exit
+
+Environment Variables:
+  RUN_STRESS_BENCHMARK=1    Equivalent to --stress
+  PRESERVE_TEST_DATA=1      Equivalent to --preserve
+""")
+
+
 # ======================================================================================
 # MASTER RUNNER
 # ======================================================================================
 def run_omni_simulation_suite():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print_usage()
+        sys.exit(0)
+
+    # Determine stress mode early
+    is_full_stress: bool = False
+    if "--stress" in sys.argv or os.getenv("RUN_STRESS_BENCHMARK", "").strip().lower() in ("1", "true", "yes"):
+        is_full_stress = True
+    elif "--fast" in sys.argv:
+        is_full_stress = False
+    elif hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+        try:
+            print("\n" + "=" * 80)
+            print("[BENCHMARK CONFIGURATION]")
+            print("  This suite includes a streaming crypto concurrency & memory stress benchmark (Part 4).")
+            print("  - FAST mode: 5 MB payload x 5 concurrent threads (runs in ~1s)")
+            print("  - FULL STRESS mode: 50 MB payload x 20 concurrent threads = 1.0 GB total (runs in ~6s)")
+            ans = input("  Run FULL 1.0 GB Stress Test? (y/N) [Default: N (Fast mode)]: ").strip().lower()
+            is_full_stress = ans in ("y", "yes")
+            print("=" * 80 + "\n")
+        except Exception:
+            is_full_stress = False
+
     db = SessionLocal()
     fixture = OmniTestFixture(db)
 
     print("=" * 80)
     print("[OMNI] GROW TREASURY - MASTER OMNI SIMULATION & ADVERSARIAL SUITE")
+    print(f"[MODE] Benchmark: {'FULL 1.0 GB STRESS (--stress)' if is_full_stress else 'FAST LOCAL CHECK (use --stress for 1.0 GB)'}")
     print("=" * 80)
 
     # Track RFQ IDs created in this run for guaranteed cleanup
@@ -1041,7 +1085,6 @@ def run_omni_simulation_suite():
 
         # 4.3 Local Concurrency & RAM Stress Benchmark
         print("\n--- [PART 4 - STEP 3] Local Concurrency & RAM Stress Benchmark ---")
-        is_full_stress = "--stress" in sys.argv or os.getenv("RUN_STRESS_BENCHMARK", "").strip().lower() in ("1", "true", "yes")
         stress_file_mb = 50 if is_full_stress else 5
         stress_workers = 20 if is_full_stress else 5
         stress_ceiling = 60.0
