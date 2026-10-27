@@ -101,10 +101,11 @@ def build_payload(notification: UserNotification) -> dict:
     }
 
 
-def _topic_for(tag: str) -> str:
+def _topic_for(tag: Optional[str]) -> str:
     # Topic header: <= 32 chars from the URL-safe base64 alphabet. Lets the push
     # service replace an undelivered older alert for the same RFQ.
-    digest = hashlib.sha256(tag.encode("utf-8")).digest()
+    safe_tag = (tag or "grow-default").strip() or "grow-default"
+    digest = hashlib.sha256(safe_tag.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:32]
 
 
@@ -422,7 +423,7 @@ async def dispatch_once(db: Session, sender=send_web_push) -> dict:
         expires = _as_utc(delivery.expires_at)
         ttl = DEFAULT_TTL_SECONDS if not expires else max(0, min(MAX_TTL_SECONDS, int((expires - _now()).total_seconds())))
         result, error = await asyncio.to_thread(
-            sender, sub, payload, ttl, payload.get("urgency", "normal"), _topic_for(payload["tag"])
+            sender, sub, payload, ttl, payload.get("urgency", "normal"), _topic_for(payload.get("tag"))
         )
         _record_result(db, delivery, result, error, _now())
         db.commit()

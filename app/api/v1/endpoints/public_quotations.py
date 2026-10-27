@@ -3544,14 +3544,18 @@ def opt_out_dealer_standing(
     db: Session = Depends(get_db)
 ):
     """Dealer opts out of future email reminders to enable phone alerts."""
-    from app.models.models_push import DealerAlertReminder
+    from app.models.models_push import DealerAlertReminder, PushSubscription
     reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
     if not reminder:
         raise HTTPException(status_code=404, detail="Invalid setup token.")
 
     reminder.opted_out = True
+    db.query(PushSubscription).filter(
+        PushSubscription.dealer_email == reminder.email,
+        PushSubscription.is_active == True  # noqa: E712
+    ).update({"is_active": False, "revoked_reason": "DEALER_OPT_OUT"}, synchronize_session=False)
     db.commit()
-    return {"message": "You have successfully opted out of future reminders."}
+    return {"message": "You have successfully opted out of future reminders and alerts."}
 
 
 @router.post("/dealer-alerts/qr-pair")
@@ -3582,10 +3586,10 @@ def generate_dealer_qr_pair(
         if assignment.quotation_bank and assignment.quotation_bank.bank:
             bank_id = assignment.quotation_bank.bank_id
             bank_name = assignment.quotation_bank.bank.name
-        if not target_email:
+        if not target_email and bank_id:
             inv = db.query(QuotationBankContactInvitation).filter(
                 QuotationBankContactInvitation.rfq_id == assignment.rfq_id,
-                QuotationBankContactInvitation.bank_id == assignment.bank_id
+                QuotationBankContactInvitation.bank_id == bank_id
             ).first()
             if inv and inv.email:
                 target_email = inv.email.strip().lower()
