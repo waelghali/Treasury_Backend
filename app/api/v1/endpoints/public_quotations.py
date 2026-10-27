@@ -3324,6 +3324,12 @@ class DealerStandingSubscribeIn(BaseModel):
     platform: Optional[str] = Field(None, max_length=20)
 
 
+class DealerQRPairIn(BaseModel):
+    token: str = Field(..., max_length=255)
+    email: Optional[str] = Field(None, max_length=255)
+    frontend_origin: Optional[str] = Field(None, max_length=512)
+
+
 @router.get("/push/public-key")
 def get_dealer_push_public_key():
     """Returns VAPID public key needed for dealer browser push subscription."""
@@ -3546,5 +3552,99 @@ def opt_out_dealer_standing(
     reminder.opted_out = True
     db.commit()
     return {"message": "You have successfully opted out of future reminders."}
+
+
+@router.post("/dealer-alerts/qr-pair")
+def generate_dealer_qr_pair(
+    payload: DealerQRPairIn,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Generates a dynamic QR code for pairing a mobile phone to dealer alerts."""
+    assignment = db.query(QuotationBankAssignment).filter(
+        or_(
+            QuotationBankAssignment.token == payload.token,
+            QuotationBankAssignment.rfq_id == payload.token
+        )
+    ).first()
+
+    if not assignment:
+        # Check magic_token
+        otp_rec = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.magic_token == payload.token).first()
+        if otp_rec and otp_rec.assignment:
+            assignment = otp_rec.assignment
+
+    target_email = (payload.email or "").strip().lower()
+    bank_id = None
+    bank_name = "Treasury Desk"
+
+    if assignment:
+        if assignment.quotation_bank and assignment.quotation_bank.bank:
+            bank_id = assignment.quotation_bank.bank_id
+            bank_name = assignment.quotation_bank.bank.name
+        if not target_email:
+            inv = db.query(QuotationBankContactInvitation).filter(
+                QuotationBankContactInvitation.rfq_id == assignment.rfq_id,
+                QuotationBankContactInvitation.bank_id == assignment.bank_id
+            ).first()
+            if inv and inv.email:
+                target_email = inv.email.strip().lower()
+
+    if not target_email:
+        raise HTTPException(status_code=400, detail="Dealer email is required to pair a mobile device.")
+
+    from app.services.dealer_alert_reminder_service import get_or_create_dealer_reminder
+    from app.services.dealer_auth_service import generate_qr_code_base64
+    from app.models.models_push import PushSubscription
+
+    reminder = get_or_create_dealer_reminder(db, target_email, bank_id=bank_id)
+
+    base_origin = (payload.frontend_origin or get_frontend_base_url(request)).rstrip("/")
+    setup_url = f"{base_origin}/dealer/alerts/setup/{reminder.setup_token}"
+    qr_b64 = generate_qr_code_base64(setup_url)
+
+    active_sub = db.query(PushSubscription).filter(
+        PushSubscription.dealer_email == target_email,
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False   # noqa: E712
+    ).order_by(PushSubscription.updated_at.desc(), PushSubscription.id.desc()).first()
+
+    return {
+        "success": True,
+        "qr_code_base64": qr_b64,
+        "setup_url": setup_url,
+        "setup_token": reminder.setup_token,
+        "email": target_email,
+        "bank_name": bank_name,
+        "is_paired": bool(active_sub),
+        "device_label": active_sub.device_label if active_sub else None,
+        "platform": active_sub.platform if active_sub else None
+    }
+
+
+@router.get("/dealer-alerts/qr-status/{setup_token}")
+def get_dealer_qr_status(
+    setup_token: str,
+    db: Session = Depends(get_db)
+):
+    """Live status check polled by desktop QR modal while waiting for phone scan."""
+    from app.models.models_push import DealerAlertReminder, PushSubscription
+    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Invalid setup token.")
+
+    active_sub = db.query(PushSubscription).filter(
+        PushSubscription.dealer_email == reminder.email,
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False   # noqa: E712
+    ).order_by(PushSubscription.updated_at.desc(), PushSubscription.id.desc()).first()
+
+    return {
+        "email": reminder.email,
+        "is_paired": bool(active_sub),
+        "device_label": active_sub.device_label if active_sub else None,
+        "platform": active_sub.platform if active_sub else None,
+        "is_opened": reminder.link_opened_at is not None
+    }
 
 
