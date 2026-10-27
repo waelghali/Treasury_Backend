@@ -504,6 +504,9 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
     # --- APScheduler Setup ---
+    # Quiet internal APScheduler executor tick spam ("Running job ...", "Job ... executed successfully")
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
     scheduler = AsyncIOScheduler()
     fastapi_app.state.scheduler = scheduler
     EGYPT_TIMEZONE = pytz.timezone('Africa/Cairo')

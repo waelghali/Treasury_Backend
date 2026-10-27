@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 from app.database import get_db
 from app.crud.base import log_action
+from app.models.models import Bank
 from app.models.models_quotation import (
     QuotationBankAssignment, QuotationRequest, QuotationOffer, 
     QuotationTBillOffer, QuotationBank, QuotationBankContactInvitation, QuotationAccessOTP, QuotationAnalytics,

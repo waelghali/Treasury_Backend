@@ -27,7 +27,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Optional, Set, Tuple
 
-from sqlalchemy import exists
+from sqlalchemy import and_, exists, or_, event
 from sqlalchemy.orm import Session
 
 from app.models.models_notification import UserNotification
@@ -38,15 +38,20 @@ from app.services.notifications.emit import emit
 logger = logging.getLogger(__name__)
 
 SWEEP_JOB_ID = "quotation_timed_alerts_sweep"
-SWEEP_SECONDS = 5
+NUDGE_JOB_ID = "quotation_timed_alerts_nudge"
+IDLE_SWEEP_SECONDS = 30
+ACTIVE_SWEEP_SECONDS = 5
 CLOSING_SOON_LEAD = timedelta(minutes=2)
 CATCH_UP = timedelta(minutes=30)      # how far back a missed alert is still worth raising
+APPROACHING_LEAD = CLOSING_SOON_LEAD + timedelta(seconds=IDLE_SWEEP_SECONDS)
 LIVE_STATUSES = ("PENDING", "OPEN")
 CLOSE_STATUSES = ("PENDING", "OPEN", "EVALUATING")
 OUTCOME_CODES = (EventCode.RFQ_QUOTES_READY, EventCode.RFQ_RESULTS_READY, EventCode.RFQ_CLOSED_NO_QUOTES)
 
 _scheduler = None
 _session_factory = None
+_current_interval: int = IDLE_SWEEP_SECONDS
+_SESSION_FLAG = "quotation_timer_nudge_pending"
 # Evaluations already run in this process: (stage, rfq_id). Prevents re-running
 # compute_rfq_standings every few seconds for an RFQ whose state does not change.
 _evaluated: Dict[Tuple[str, str], datetime] = {}
@@ -164,10 +169,124 @@ def _acceptance_expired(db: Session, now: datetime, evaluate: Callable) -> int:
     return raised
 
 
+def _inspect_rfq_activity(db: Session, now: datetime) -> Tuple[bool, bool]:
+    """
+    Fast inspection of candidate RFQs:
+    Returns (has_work_now, is_active_or_approaching).
+    - has_work_now: any RFQ needs one of the three stages evaluated right now.
+    - is_active_or_approaching: any RFQ is active or approaching its closing/deadline window.
+    """
+    now = _as_utc(now) or _now()
+    candidates = db.query(
+        QuotationRequest.id,
+        QuotationRequest.status,
+        QuotationRequest.is_dispatched,
+        QuotationRequest.window_start,
+        QuotationRequest.window_end,
+        QuotationRequest.acceptance_status,
+        QuotationRequest.acceptance_deadline,
+    ).filter(
+        or_(
+            and_(
+                QuotationRequest.is_dispatched == True,  # noqa: E712
+                or_(
+                    QuotationRequest.status.in_(LIVE_STATUSES),
+                    QuotationRequest.window_end > now - CATCH_UP,
+                ),
+            ),
+            and_(
+                QuotationRequest.acceptance_status.in_(("PENDING", "AUTO_ACCEPTED", "AUTO_REJECTED")),
+                QuotationRequest.acceptance_deadline > now - CATCH_UP,
+            ),
+        )
+    ).all()
+
+    if not candidates:
+        return False, False
+
+    has_work_now = False
+    is_active_or_approaching = False
+    approaching = now + APPROACHING_LEAD
+
+    for r in candidates:
+        w_start = _as_utc(r.window_start)
+        w_end = _as_utc(r.window_end)
+        acc_dl = _as_utc(r.acceptance_deadline)
+
+        # Stage 1: Closing soon due now?
+        if (
+            r.is_dispatched
+            and r.status in LIVE_STATUSES
+            and w_start
+            and w_end
+            and w_start <= now < w_end <= now + CLOSING_SOON_LEAD
+        ):
+            has_work_now = True
+
+        # Stage 2: Window closed due now?
+        if (
+            r.is_dispatched
+            and r.status in (CLOSE_STATUSES + ("COMPLETED",))
+            and w_end
+            and now - CATCH_UP < w_end <= now
+        ):
+            if ("close", str(r.id)) not in _evaluated:
+                has_work_now = True
+
+        # Stage 3: Acceptance expired due now?
+        if (
+            r.acceptance_status in ("PENDING", "AUTO_ACCEPTED", "AUTO_REJECTED")
+            and acc_dl
+            and now - CATCH_UP < acc_dl <= now
+        ):
+            if ("deadline", str(r.id)) not in _evaluated:
+                has_work_now = True
+
+        # Approaching closing soon / window close
+        if (
+            r.is_dispatched
+            and r.status in LIVE_STATUSES
+            and w_end
+            and now < w_end <= approaching
+        ):
+            is_active_or_approaching = True
+
+        # Live window open
+        if (
+            r.is_dispatched
+            and r.status in LIVE_STATUSES
+            and w_start
+            and w_end
+            and w_start <= now <= w_end
+        ):
+            if w_end <= approaching:
+                is_active_or_approaching = True
+
+        # Approaching or within acceptance deadline
+        if (
+            r.acceptance_status == "PENDING"
+            and acc_dl
+            and now < acc_dl <= approaching
+        ):
+            is_active_or_approaching = True
+
+    if has_work_now:
+        is_active_or_approaching = True
+
+    return has_work_now, is_active_or_approaching
+
+
 def sweep_once(db: Session, evaluate: Callable = _default_evaluate, now: Optional[datetime] = None) -> Dict[str, int]:
     """One pass over all stages. Each stage is isolated so one bad RFQ cannot block the others."""
     now = now or _now()
     stats = {"closing_soon": 0, "window_closed": 0, "auto_resolved": 0}
+
+    # Fast-path check: avoid 3 separate stage queries when there is no work to do
+    has_work_now, _ = _inspect_rfq_activity(db, now)
+    if not has_work_now:
+        _prune(now)
+        return stats
+
     for name, stage in (("closing_soon", lambda: _closing_soon(db, now)),
                         ("window_closed", lambda: _window_closed(db, now, evaluate)),
                         ("auto_resolved", lambda: _acceptance_expired(db, now, evaluate))):
@@ -180,10 +299,66 @@ def sweep_once(db: Session, evaluate: Callable = _default_evaluate, now: Optiona
     return stats
 
 
-def _sweep_in_thread() -> Dict[str, int]:
-    db = _session_factory()
+def _adjust_interval(target_interval: int) -> None:
+    global _current_interval
+    if _scheduler is None or _current_interval == target_interval:
+        return
     try:
-        return sweep_once(db)
+        _scheduler.reschedule_job(SWEEP_JOB_ID, trigger="interval", seconds=target_interval)
+        _current_interval = target_interval
+        logger.debug("Quotation timer sweeper adjusted interval to %ss.", target_interval)
+    except Exception:
+        logger.debug("Could not reschedule quotation timer sweeper to %ss", target_interval)
+
+
+def nudge_quotation_timers() -> None:
+    """Wakes the quotation timer sweeper immediately (thread-safe, coalesced)."""
+    if _scheduler is None:
+        return
+    try:
+        _scheduler.add_job(
+            run_quotation_timer_sweep, trigger="date", id=NUDGE_JOB_ID, replace_existing=True,
+            misfire_grace_time=60, coalesce=True, max_instances=1,
+        )
+    except Exception:
+        logger.debug("Could not schedule quotation timer nudge")
+
+
+# ── After-commit nudge on RFQ state changes ───────────────────────────────────
+
+@event.listens_for(QuotationRequest, "after_insert")
+@event.listens_for(QuotationRequest, "after_update")
+def _on_rfq_change(mapper, connection, target):
+    session = Session.object_session(target)
+    if session is not None and not session.info.get("_is_sweeper_session"):
+        session.info[_SESSION_FLAG] = True
+
+
+@event.listens_for(Session, "after_commit")
+def _after_commit(session):
+    if session.info.pop(_SESSION_FLAG, False):
+        nudge_quotation_timers()
+
+
+@event.listens_for(Session, "after_rollback")
+def _after_rollback(session):
+    session.info.pop(_SESSION_FLAG, None)
+
+
+def _sweep_in_thread() -> Tuple[Dict[str, int], int]:
+    if _session_factory is None:
+        return {"closing_soon": 0, "window_closed": 0, "auto_resolved": 0}, IDLE_SWEEP_SECONDS
+    db = _session_factory()
+    db.info["_is_sweeper_session"] = True
+    try:
+        now = _now()
+        has_work_now, is_active_or_approaching = _inspect_rfq_activity(db, now)
+        target_interval = ACTIVE_SWEEP_SECONDS if is_active_or_approaching else IDLE_SWEEP_SECONDS
+        if not has_work_now:
+            _prune(now)
+            return {"closing_soon": 0, "window_closed": 0, "auto_resolved": 0}, target_interval
+        stats = sweep_once(db, now=now)
+        return stats, target_interval
     finally:
         db.close()
 
@@ -193,19 +368,26 @@ async def run_quotation_timer_sweep() -> None:
         return
     try:
         # compute_rfq_standings is synchronous (DB + optional market lookups): keep it off the event loop.
-        await asyncio.to_thread(_sweep_in_thread)
+        stats, target_interval = await asyncio.to_thread(_sweep_in_thread)
+        _adjust_interval(target_interval)
     except Exception:
         logger.exception("Timed quotation alerts sweep failed")
 
 
 def init_quotation_timers(scheduler, session_factory) -> None:
-    """Registers the sweeper. Called once at startup."""
-    global _scheduler, _session_factory
+    """Registers the sweeper. Starts at IDLE_SWEEP_SECONDS (30s) and adapts dynamically."""
+    global _scheduler, _session_factory, _current_interval
     _scheduler = scheduler
     _session_factory = session_factory
+    _current_interval = IDLE_SWEEP_SECONDS
+
+    # Silence internal APScheduler executor tick messages
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
     scheduler.add_job(
-        run_quotation_timer_sweep, trigger="interval", seconds=SWEEP_SECONDS, id=SWEEP_JOB_ID,
+        run_quotation_timer_sweep, trigger="interval", seconds=IDLE_SWEEP_SECONDS, id=SWEEP_JOB_ID,
         name="Timed quotation alerts (closing soon / quotes ready / auto-resolved)",
-        replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=SWEEP_SECONDS,
+        replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=IDLE_SWEEP_SECONDS,
     )
-    logger.info("Timed quotation alerts sweeper scheduled every %ss.", SWEEP_SECONDS)
+    logger.info("Timed quotation alerts sweeper scheduled (adaptive idle: %ss, active: %ss).",
+                IDLE_SWEEP_SECONDS, ACTIVE_SWEEP_SECONDS)
