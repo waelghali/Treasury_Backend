@@ -292,6 +292,7 @@ class Bank(BaseModel):
     portal_access_enabled = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether trading portal / dealer desk access is enabled for this bank")
     allow_dealer_comments = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can enter free-text notes/comments")
     allow_dealer_feedback = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can submit terminal feedback or see feedback button")
+    allow_dealer_mobile_alerts = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can receive mobile push alerts or see pairing banners")
 
     def __repr__(self: Bank):
         return f"<Bank(id={self.id}, name='{self.name}')>"

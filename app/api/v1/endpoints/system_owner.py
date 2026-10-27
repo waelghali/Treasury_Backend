@@ -2811,6 +2811,47 @@ def toggle_bank_dealer_feedback(
         "allow_dealer_feedback": db_bank.allow_dealer_feedback
     }
 
+class BankDealerMobileAlertsToggleRequest(BaseModel):
+    allow_dealer_mobile_alerts: bool
+
+@router.put("/banks/{bank_id}/dealer-mobile-alerts")
+def toggle_bank_dealer_mobile_alerts(
+    bank_id: int,
+    payload: BankDealerMobileAlertsToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """Toggle whether dealers quoting for this bank are allowed to receive mobile push alerts or see pairing banners."""
+    db_bank = crud_bank.get(db, id=bank_id)
+    if db_bank is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    
+    db_bank.allow_dealer_mobile_alerts = payload.allow_dealer_mobile_alerts
+    db.commit()
+    db.refresh(db_bank)
+    
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UPDATE",
+        entity_type="Bank",
+        entity_id=db_bank.id,
+        details={
+            "action": "toggle_dealer_mobile_alerts",
+            "name": db_bank.name,
+            "allow_dealer_mobile_alerts": db_bank.allow_dealer_mobile_alerts,
+            "ip_address": client_host
+        }
+    )
+    return {
+        "success": True,
+        "bank_id": db_bank.id,
+        "name": db_bank.name,
+        "allow_dealer_mobile_alerts": db_bank.allow_dealer_mobile_alerts
+    }
+
 @router.get("/banks/{bank_id}/dealers")
 def get_bank_dealers(
     bank_id: int,

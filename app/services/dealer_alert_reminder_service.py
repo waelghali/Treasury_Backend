@@ -144,6 +144,9 @@ async def send_dealer_reminder_email(
     if reminder.bank_id:
         bank = db.get(Bank, reminder.bank_id)
         if bank:
+            if getattr(bank, "allow_dealer_mobile_alerts", True) is False:
+                logger.info(f"Bank {bank.name} has disabled mobile alerts by institutional policy; skipping reminder for {reminder.email}.")
+                return False
             bank_name = bank.name
 
     subject, html_body = build_dealer_reminder_email_html(

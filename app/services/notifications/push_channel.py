@@ -178,6 +178,13 @@ def enqueue_dealer_push(
     if not norm_emails:
         return 0
 
+    if bank_id is not None:
+        from app.models.models import Bank
+        target_bank = db.get(Bank, bank_id)
+        if target_bank and getattr(target_bank, "allow_dealer_mobile_alerts", True) is False:
+            logger.info("Mobile alerts disabled by policy for bank %s (ID %s); skipping push enqueue.", target_bank.name, bank_id)
+            return 0
+
     query = db.query(PushSubscription).filter(
         PushSubscription.is_active == True,  # noqa: E712
         PushSubscription.is_deleted == False,  # noqa: E712

@@ -599,6 +599,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
         "bank_name": bank_name,
         "allow_dealer_comments": bool(getattr(q_bank.bank, 'allow_dealer_comments', True)) if (q_bank and q_bank.bank) else True,
         "allow_dealer_feedback": bool(getattr(q_bank.bank, 'allow_dealer_feedback', True)) if (q_bank and q_bank.bank) else True,
+        "allow_dealer_mobile_alerts": bool(getattr(q_bank.bank, 'allow_dealer_mobile_alerts', True)) if (q_bank and q_bank.bank) else True,
         "customer_name": customer_name,
         "entity_name": customer_name if assignment.is_cross_entity else (rfq.entity.entity_name if rfq.entity else customer_name),
         "entity_tax_id": None if assignment.is_cross_entity else (rfq.entity.tax_id if rfq.entity else None),
@@ -3472,11 +3473,13 @@ def get_dealer_standing_setup(
     db.commit()
 
     bank_name = reminder.bank.name if reminder.bank else "Treasury Desk"
+    allow_dealer_mobile_alerts = bool(getattr(reminder.bank, 'allow_dealer_mobile_alerts', True)) if reminder.bank else True
     return {
         "email": reminder.email,
         "bank_name": bank_name,
         "opted_out": reminder.opted_out,
-        "reminders_sent": reminder.reminders_sent
+        "reminders_sent": reminder.reminders_sent,
+        "allow_dealer_mobile_alerts": allow_dealer_mobile_alerts
     }
 
 
@@ -3500,6 +3503,12 @@ def subscribe_dealer_standing(
     reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
     if not reminder:
         raise HTTPException(status_code=404, detail="Invalid setup token.")
+
+    if reminder.bank and reminder.bank.allow_dealer_mobile_alerts is False:
+        raise HTTPException(
+            status_code=403,
+            detail="Mobile alerts are disabled for this bank by institutional administrator policy."
+        )
 
     platform = (payload.platform or "").lower()
     platform = platform if platform in ("ios", "android", "desktop") else "web"
@@ -3584,6 +3593,11 @@ def generate_dealer_qr_pair(
 
     if assignment:
         if assignment.quotation_bank and assignment.quotation_bank.bank:
+            if assignment.quotation_bank.bank.allow_dealer_mobile_alerts is False:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Mobile alerts are disabled for this bank by institutional administrator policy."
+                )
             bank_id = assignment.quotation_bank.bank_id
             bank_name = assignment.quotation_bank.bank.name
         if not target_email and bank_id:
@@ -3593,6 +3607,14 @@ def generate_dealer_qr_pair(
             ).first()
             if inv and inv.email:
                 target_email = inv.email.strip().lower()
+
+    if bank_id:
+        target_bank = db.get(Bank, bank_id)
+        if target_bank and target_bank.allow_dealer_mobile_alerts is False:
+            raise HTTPException(
+                status_code=403,
+                detail="Mobile alerts are disabled for this bank by institutional administrator policy."
+            )
 
     if not target_email:
         raise HTTPException(status_code=400, detail="Dealer email is required to pair a mobile device.")

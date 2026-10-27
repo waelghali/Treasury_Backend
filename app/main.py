@@ -255,7 +255,8 @@ def configure_app_instance(fastapi_app: FastAPI):
         public, public_issuance, reports, facility_endpoints,
         quotations_endpoints, public_quotations, bank_dealer_endpoints, reconciliation_endpoints,
         notification_endpoints, ai_query_assistant, user_feedback,
-        inbox_endpoints, system_holidays_endpoints, campaign_endpoints
+        inbox_endpoints, system_holidays_endpoints, campaign_endpoints,
+        document_streaming
     )
 
     from app.api.v1.endpoints import issuance as issuance_package
@@ -300,6 +301,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE quotation_anonymous_benchmarks ALTER COLUMN cbe_benchmark_rate DROP NOT NULL;",
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_comments BOOLEAN NOT NULL DEFAULT TRUE;",
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_feedback BOOLEAN NOT NULL DEFAULT TRUE;",
+                    "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_mobile_alerts BOOLEAN NOT NULL DEFAULT TRUE;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS encrypted_email TEXT;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS email_blind_index VARCHAR(64);",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);",
@@ -455,6 +457,12 @@ def configure_app_instance(fastapi_app: FastAPI):
         quotations_endpoints.router,
         prefix="/api/v1/quotations",
         tags=["Quotation Document Gateway"]
+    )
+    # Universal Document Security Gateway (Streaming Unsealing across Custody, Issuance, Facilities)
+    fastapi_app.include_router(
+        document_streaming.router,
+        prefix="/api/v1",
+        tags=["Universal Document Security Gateway"]
     )
 
     fastapi_app.include_router(

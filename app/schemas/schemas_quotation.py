@@ -59,6 +59,7 @@ class BankSimpleOut(BaseModel):
     email_domain: Optional[str] = None
     allow_dealer_comments: Optional[bool] = True
     allow_dealer_feedback: Optional[bool] = True
+    allow_dealer_mobile_alerts: Optional[bool] = True
 
     class Config:
         from_attributes = True
