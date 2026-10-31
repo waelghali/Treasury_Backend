@@ -194,25 +194,24 @@ def get_my_approval_history(
         if req.status == "PENDING_APPROVAL":
             # Show if designated approver OR if corporate_admin
             approvers = [int(x) for x in (req.pending_approver_users or [])]
-            if uid not in approvers and not is_admin:
+            if uid not in approvers:
                 continue
         elif req.status in ("EDIT_REQUESTED", "CANCELLATION_REQUESTED"):
             # Corporate Admins and Checkers always see requests requiring edit/cancel resolution
             if not is_admin:
                 continue
         else:
-            # For completed/rejected: show if user participated in the audit trail or is admin
-            if not is_admin:
-                audit = req.approval_chain_audit or []
-                participated = any(
-                    entry.get("user_id") == uid
-                    for entry in audit
-                    if isinstance(entry, dict) and entry.get("action") in (
-                        "APPROVED_STEP", "REJECTED", "REVISION_REQUIRED", "EDIT_RESOLVED"
-                    )
+            # For completed/rejected: show only if this user participated in the audit trail
+            audit = req.approval_chain_audit or []
+            participated = any(
+                entry.get("user_id") == uid
+                for entry in audit
+                if isinstance(entry, dict) and entry.get("action") in (
+                    "APPROVED_STEP", "REJECTED", "REVISION_REQUIRED", "EDIT_RESOLVED", "CANCELLATION_RESOLVED"
                 )
-                if not participated:
-                    continue
+            )
+            if not participated:
+                continue
         filtered.append(req)
 
     return filtered
@@ -455,7 +454,7 @@ def reject_request_action(
     
     if to_emails:
         link = f"{_base_url()}/corporate-admin/issuance/requests"
-        subject = f"LG Request {result.serial_number} — Rejected ❌"
+        subject = f"LG Request {result.serial_number} · Rejected"
         body = f"""
         <html>
         <body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f5f5f5; padding: 20px;">
@@ -564,7 +563,7 @@ def return_for_revision_action(
     if to_emails:
         link = f"{_base_url()}/corporate-admin/issuance/requests"
         notes_html = f"<p><strong>Revision Notes:</strong> {payload.revision_notes}</p>" if payload.revision_notes else ""
-        subject = f"LG Request {result.serial_number} — Returned for Revision 🔄"
+        subject = f"LG Request {result.serial_number} · Revision Requested"
         body = f"""
         <html>
         <body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f5f5f5; padding: 20px;">
@@ -670,10 +669,17 @@ async def record_delivery(
             file_ext = delivery_proof_file.filename.rsplit(".", 1)[-1] if "." in delivery_proof_file.filename else "pdf"
             
             # Organized path: {env}/customer_{customer_id}/issuance/issued_lgs/issued_{lg_id}/delivery_proofs/{file}
-            from app.core.storage_service import build_customer_blob_path
+            from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+            from app.services.tenant_key_service import tenant_key_service
             gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg_id}/delivery_proofs/{delivery_proof_display_name}")
-            file_content = await delivery_proof_file.read()
-            stored_uri = await _upload_to_gcs(bucket_name, gcs_path, file_content, delivery_proof_file.content_type)
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+            stored_uri = upload_stream_to_gcs_encrypted(
+                source_stream=delivery_proof_file.file,
+                destination_blob_name=gcs_path,
+                tenant_dek=tenant_dek,
+                content_type=delivery_proof_file.content_type or "application/pdf",
+                context="lg_issuance_doc"
+            )
 
             if stored_uri:
                 new_doc = IssuanceRequestDocument(
@@ -774,7 +780,6 @@ async def record_bank_reply(
 
     # If a file was uploaded (e.g., REJECTED attachment, or Issued copy), save it to the request documents
     if bank_reply_file and bank_reply_file.filename and lg.request_id:
-        file_bytes = await bank_reply_file.read()
         file_ext = bank_reply_file.filename.split(".")[-1] if "." in bank_reply_file.filename else "pdf"
         sanitized_orig = "".join([c if c.isalnum() else "_" for c in bank_reply_file.filename.split(".")[0]])
         safe_ref = (lg.lg_ref_number or "REQ").replace("/", "-").replace(" ", "_")
@@ -792,11 +797,19 @@ async def record_bank_reply(
         # Format: DOC_TYPE_LG-REF-123_20260325_filename.pdf
         new_filename = f"{doc_type}_{safe_ref}_{date_str}_{sanitized_orig}.{file_ext}"
         
-        from app.core.storage_service import build_customer_blob_path
+        from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+        from app.services.tenant_key_service import tenant_key_service
         gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg.id}/bank_replies/{new_filename}")
+        tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
         
         try:
-            gcs_url = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, file_bytes, bank_reply_file.content_type)
+            gcs_url = upload_stream_to_gcs_encrypted(
+                source_stream=bank_reply_file.file,
+                destination_blob_name=gcs_path,
+                tenant_dek=tenant_dek,
+                content_type=bank_reply_file.content_type or "application/octet-stream",
+                context="lg_issuance_doc"
+            )
             if gcs_url:
                 with db.begin_nested():
                     doc = IssuanceRequestDocument(
@@ -991,13 +1004,21 @@ async def record_bank_reply(
                 pdf_filename = f"cancellation_notice_{lg.lg_ref_number}_{date.today().isoformat()}"
                 generated_pdf_bytes = await generate_pdf_from_html(generated_html, pdf_filename)
 
-                # Upload to GCS
-                from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
-                from app.core.storage_service import build_customer_blob_path
+                # Upload to GCS encrypted
+                import io
+                from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+                from app.services.tenant_key_service import tenant_key_service
                 gcs_path = build_customer_blob_path(lg.customer_id, "issuance/issued_lgs", f"issued_{lg.id}/cancellations/{pdf_filename}.pdf")
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, lg.customer_id)
                 pdf_path = None
                 try:
-                    gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, generated_pdf_bytes, "application/pdf")
+                    gcs_uri = upload_stream_to_gcs_encrypted(
+                        source_stream=io.BytesIO(generated_pdf_bytes),
+                        destination_blob_name=gcs_path,
+                        tenant_dek=tenant_dek,
+                        content_type="application/pdf",
+                        context="lg_issuance_doc"
+                    )
                     if gcs_uri:
                         pdf_path = gcs_uri
                     else:
@@ -1079,12 +1100,14 @@ async def record_bank_reply(
 @router.get("/lg-records/{lg_id}/cancellation-notice-pdf")
 async def download_cancellation_notice_pdf(
     lg_id: int,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context)
 ):
     """Download the generated cancellation notice PDF (GCS signed URL or local FileResponse)."""
     from app.models.models_issuance import IssuedLGRecord
     from fastapi.responses import FileResponse, RedirectResponse
+    from app.core.routing import get_backend_base_url
     import os
 
     lg = db.query(IssuedLGRecord).filter(
@@ -1099,13 +1122,20 @@ async def download_cancellation_notice_pdf(
     pdf_path = lg.cancellation_notice["pdf_path"]
     filename = f"cancellation_notice_{lg.lg_ref_number}.pdf"
 
-    # GCS path — generate a signed URL
+    # GCS path — generate streaming download ticket
     if pdf_path.startswith("gs://"):
-        from app.core.ai_integration import generate_signed_gcs_url
-        signed_url = await generate_signed_gcs_url(pdf_path, expiration=3600)
-        if not signed_url:
-            raise HTTPException(status_code=500, detail="Could not generate download link.")
-        return {"download_url": signed_url, "filename": filename}
+        from app.api.v1.endpoints.document_streaming import generate_download_ticket
+        ticket = generate_download_ticket(
+            file_path=pdf_path,
+            customer_id=current_user.customer_id,
+            context="lg_issuance_doc",
+            original_filename=filename,
+            mime_type="application/pdf",
+            ttl_seconds=900
+        )
+        backend_base = get_backend_base_url(request)
+        streaming_url = f"{backend_base}/api/v1/documents/download?ticket={ticket}"
+        return {"download_url": streaming_url, "signed_url": streaming_url, "filename": filename}
 
     # Local fallback
     if not os.path.exists(pdf_path):

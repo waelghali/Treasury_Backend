@@ -58,11 +58,11 @@ def create_user_feedback(
     """
     Submit a new user feedback, issue report, or AI response evaluation.
     """
-    # Perimeter Anti-Bot Honeypot Defense
-    verify_honeypot_sync(payload.website_url, context="user_feedback")
-
     user = db.query(User).filter(User.id == current_user.user_id).first()
     u_email = user.email if user else (current_user.email if hasattr(current_user, 'email') else None)
+
+    # Perimeter Anti-Bot Honeypot Defense
+    verify_honeypot_sync(payload.website_url, context="user_feedback", legitimate_values=[u_email])
     
     f_type = payload.feedback_type.upper() if payload.feedback_type else "GENERAL_FEEDBACK"
     sentiment_val = payload.sentiment.upper() if payload.sentiment else "NEUTRAL"

@@ -23,8 +23,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # 1. Prevent MIME-type sniffing
         response.headers["X-Content-Type-Options"] = "nosniff"
 
-        # 2. Clickjacking protection (Permit embedding only by same origin)
-        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        # 2. Clickjacking protection (Permit embedding only by same origin, except document preview stream)
+        if not request.url.path.endswith("/documents/download"):
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
 
         # 3. Legacy XSS protection filter for older browsers
         response.headers["X-XSS-Protection"] = "1; mode=block"

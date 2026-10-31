@@ -455,7 +455,7 @@ class CRUDLGRecord(CRUDBase):
                     "lg_number": db_lg_record.lg_number,
                     "lg_amount": float(db_lg_record.lg_amount),
                     "lg_currency": db_lg_record.lg_currency.iso_code,
-                    "issuing_bank_name": db_lg_record.issuing_bank.name,
+                    "issuing_bank_name": self._get_effective_issuing_bank_name(db_lg_record),
                     "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
                     "lg_owner_email": db_lg_record.internal_owner_contact.email,
                     "internal_owner_email": db_lg_record.internal_owner_contact.email, # NEW
@@ -493,7 +493,8 @@ class CRUDLGRecord(CRUDBase):
                 # 5. Get email settings and send structured corporate transaction email
                 email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer_id)
                 
-                subject = f"New LG Recorded: LG #{db_lg_record.lg_number} ({db_lg_record.customer.name})"
+                _lg_mask = f"...{str(db_lg_record.lg_number)[-4:]}" if db_lg_record.lg_number and len(str(db_lg_record.lg_number)) > 4 else db_lg_record.lg_number
+                subject = f"LG {_lg_mask} · New Guarantee Recorded"
                 if notification_template and notification_template.subject:
                     custom_subj = notification_template.subject
                     for k, v in template_data.items():
@@ -514,7 +515,7 @@ class CRUDLGRecord(CRUDBase):
                     transaction_type="New LG Registration",
                     key_value_dict={
                         "LG Number": db_lg_record.lg_number,
-                        "Issuing Bank": db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "N/A",
+                        "Issuing Bank": self._get_effective_issuing_bank_name(db_lg_record),
                         "Beneficiary": db_lg_record.beneficiary_corporate.entity_name if db_lg_record.beneficiary_corporate else "N/A",
                         "LG Type": db_lg_record.lg_type.name if db_lg_record.lg_type else "N/A",
                         "Category": db_lg_record.lg_category.name if db_lg_record.lg_category else "N/A",
@@ -525,7 +526,7 @@ class CRUDLGRecord(CRUDBase):
                     },
                     summary_text=f"A new Letter of Guarantee (#{db_lg_record.lg_number}) has been recorded into the Grow BD Treasury Platform and registered under your custody.",
                     cta_text="View LG Details",
-                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                    cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{db_lg_record.id}",
                     recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
                 )
 
@@ -612,12 +613,11 @@ class CRUDLGRecord(CRUDBase):
         
     async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None, background_tasks: Optional[BackgroundTasks] = None) -> Tuple[models.LGRecord, int, str]:
         db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
-        recipient_name = db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "To Whom It May Concern"
-        recipient_address = db_lg_record.issuing_bank.address if db_lg_record.issuing_bank and db_lg_record.issuing_bank.address else "N/A"
         if not db_lg_record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or is deleted."
             )
+        recipient_name, recipient_address = self._get_recipient_details(db, db_lg_record)
 
         if db_lg_record.lg_status_id != models.LgStatusEnum.VALID.value:
             raise HTTPException(
@@ -690,7 +690,7 @@ class CRUDLGRecord(CRUDBase):
             "lg_number": db_lg_record.lg_number,
             "lg_amount": f"{float(db_lg_record.lg_amount):,.2f}",
             "lg_currency": db_lg_record.lg_currency.iso_code,
-            "issuing_bank_name": db_lg_record.issuing_bank.name,
+            "issuing_bank_name": self._get_effective_issuing_bank_name(db_lg_record),
             "internal_owner_email": db_lg_record.internal_owner_contact.email,
             "internal_owner_phone": db_lg_record.internal_owner_contact.phone_number,
             "internal_owner_id": db_lg_record.internal_owner_contact.internal_id,
@@ -795,7 +795,8 @@ class CRUDLGRecord(CRUDBase):
                 )
         cc_emails = list(set(cc_emails))
 
-        email_subject = f"LG Extension Issued: LG #{updated_lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+        _lg_mask = f"...{str(updated_lg_record.lg_number)[-4:]}" if updated_lg_record.lg_number and len(str(updated_lg_record.lg_number)) > 4 else updated_lg_record.lg_number
+        email_subject = f"LG {_lg_mask} · Extension Instruction Issued"
         
         email_body_html = build_transaction_email_html(
             customer_name=customer.name if customer else "Grow Treasury",
@@ -805,16 +806,16 @@ class CRUDLGRecord(CRUDBase):
             key_value_dict={
                 "LG Number": updated_lg_record.lg_number,
                 "Instruction Serial": db_lg_instruction.serial_number,
-                "Issuing Bank": updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else "N/A",
+                "Issuing Bank": self._get_effective_issuing_bank_name(updated_lg_record),
                 "Beneficiary": updated_lg_record.beneficiary_corporate.entity_name if updated_lg_record.beneficiary_corporate else "N/A",
                 "Amount": f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}",
                 "Previous Expiry Date": instruction_details["old_expiry_date"],
                 "New Expiry Date": f"<span style='color: #16a34a; font-weight: 700;'>{instruction_details['new_expiry_date']}</span>",
                 "Notes": notes if notes else "None"
             },
-            summary_text=f"An official LG Extension instruction has been generated and issued to {updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else 'the bank'}.",
+            summary_text=f"An official LG Extension instruction has been generated and issued to {recipient_name or self._get_effective_issuing_bank_name(updated_lg_record)}.",
             cta_text="View LG in System",
-            cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+            cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{updated_lg_record.id}",
             recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
         )
 
@@ -911,8 +912,7 @@ class CRUDLGRecord(CRUDBase):
         """
 
         instruction_maker_user_id = user_id
-        recipient_name = "To Whom It May Concern"
-        recipient_address = "N/A"
+        recipient_name, recipient_address = self._get_recipient_details(db, lg_record)
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -974,7 +974,7 @@ class CRUDLGRecord(CRUDBase):
             "lg_number": lg_record.lg_number,
             "lg_amount": float(lg_record.lg_amount),
             "lg_currency": lg_record.lg_currency.iso_code,
-            "issuing_bank_name": lg_record.issuing_bank.name,
+            "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
             "lg_issuer_name": lg_record.issuer_name,
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
@@ -1085,7 +1085,8 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            email_subject = f"LG Release Issued: LG #{lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+            _lg_mask = f"...{str(lg_record.lg_number)[-4:]}" if lg_record.lg_number and len(str(lg_record.lg_number)) > 4 else lg_record.lg_number
+            email_subject = f"LG {_lg_mask} · Release Instruction Issued"
             
             email_body_html = build_transaction_email_html(
                 customer_name=lg_record.customer.name if lg_record.customer else "Grow Treasury",
@@ -1095,7 +1096,7 @@ class CRUDLGRecord(CRUDBase):
                 key_value_dict={
                     "LG Number": lg_record.lg_number,
                     "Instruction Serial": db_lg_instruction.serial_number,
-                    "Issuing Bank": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+                    "Issuing Bank": self._get_effective_issuing_bank_name(lg_record),
                     "Beneficiary": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else "N/A",
                     "Amount": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
                     "Status": "<span style='color: #16a34a; font-weight: 700;'>Released</span>",
@@ -1103,7 +1104,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An official LG Release instruction has been generated to release LG #{lg_record.lg_number} from further claims.",
                 cta_text="View LG in System",
-                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{lg_record.id}",
                 recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -1163,8 +1164,7 @@ class CRUDLGRecord(CRUDBase):
         """
 
         instruction_maker_user_id = user_id
-        recipient_name = "To Whom It May Concern"
-        recipient_address = "N/A"
+        recipient_name, recipient_address = self._get_recipient_details(db, lg_record)
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -1244,7 +1244,7 @@ class CRUDLGRecord(CRUDBase):
             "original_lg_amount": float(original_amount),
             "new_lg_amount": float(lg_record.lg_amount),
             "lg_currency": lg_record.lg_currency.iso_code,
-            "issuing_bank_name": lg_record.issuing_bank.name,
+            "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "lg_issuer_name": lg_record.issuer_name,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
@@ -1380,7 +1380,8 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            email_subject = f"LG Liquidation Issued: LG #{lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+            _lg_mask = f"...{str(lg_record.lg_number)[-4:]}" if lg_record.lg_number and len(str(lg_record.lg_number)) > 4 else lg_record.lg_number
+            email_subject = f"LG {_lg_mask} · Liquidation Instruction Issued"
             
             email_body_html = build_transaction_email_html(
                 customer_name=lg_record.customer.name if lg_record.customer else "Grow Treasury",
@@ -1391,7 +1392,7 @@ class CRUDLGRecord(CRUDBase):
                     "LG Number": lg_record.lg_number,
                     "Instruction Serial": db_lg_instruction.serial_number,
                     "Liquidation Type": liquidation_type.capitalize(),
-                    "Issuing Bank": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+                    "Issuing Bank": self._get_effective_issuing_bank_name(lg_record),
                     "Beneficiary": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else "N/A",
                     "Original Amount": f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}",
                     "Remaining LG Amount": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
@@ -1399,7 +1400,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An official LG Liquidation instruction ({liquidation_type.capitalize()}) has been issued for LG #{lg_record.lg_number}.",
                 cta_text="View LG in System",
-                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{lg_record.id}",
                 recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -1438,8 +1439,7 @@ class CRUDLGRecord(CRUDBase):
         and notifies stakeholders. LG status remains 'Valid'.
         """
         instruction_maker_user_id = user_id
-        recipient_name = "To Whom It May Concern"
-        recipient_address = "N/A"
+        recipient_name, recipient_address = self._get_recipient_details(db, lg_record)
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -1491,7 +1491,7 @@ class CRUDLGRecord(CRUDBase):
                 "decrease_amount": float(decrease_amount),
                 "new_lg_amount": float(new_amount),
                 "lg_currency": lg_record.lg_currency.iso_code,
-                "issuing_bank_name": lg_record.issuing_bank.name,
+                "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
                 "lg_issuer_name": lg_record.issuer_name,
                 "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
                 "current_date": datetime.now().strftime("%Y-%m-%d"),
@@ -1615,7 +1615,8 @@ class CRUDLGRecord(CRUDBase):
                         logger.warning(f"COMMON_COMMUNICATION_LIST for customer {lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
                 cc_emails = list(set(cc_emails))
 
-                email_subject = f"LG Amount Decrease Issued: LG #{lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+                _lg_mask = f"...{str(lg_record.lg_number)[-4:]}" if lg_record.lg_number and len(str(lg_record.lg_number)) > 4 else lg_record.lg_number
+                email_subject = f"LG {_lg_mask} · Decrease Instruction Issued"
                 
                 email_body_html = build_transaction_email_html(
                     customer_name=lg_record.customer.name if lg_record.customer else "Grow Treasury",
@@ -1625,7 +1626,7 @@ class CRUDLGRecord(CRUDBase):
                     key_value_dict={
                         "LG Number": lg_record.lg_number,
                         "Instruction Serial": db_lg_instruction.serial_number,
-                        "Issuing Bank": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+                        "Issuing Bank": self._get_effective_issuing_bank_name(lg_record),
                         "Beneficiary": lg_record.beneficiary_corporate.entity_name if lg_record.beneficiary_corporate else "N/A",
                         "Original Amount": f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}" if lg_record.lg_currency else f"{float(original_amount):,.2f}",
                         "Decrease Amount": f"<span style='color: #dc2626; font-weight: 700;'>- {lg_record.lg_currency.symbol} {float(decrease_amount):,.2f}</span>" if lg_record.lg_currency else f"- {float(decrease_amount):,.2f}",
@@ -1634,7 +1635,7 @@ class CRUDLGRecord(CRUDBase):
                     },
                     summary_text=f"An official instruction to decrease the amount of LG #{lg_record.lg_number} has been generated.",
                     cta_text="View LG in System",
-                    cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                    cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{lg_record.id}",
                     recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
                 )
 
@@ -1681,8 +1682,7 @@ class CRUDLGRecord(CRUDBase):
         logger.debug(f"[CRUDLGRecord.activate_non_operative_lg] Initiating activation for LG ID: {lg_record.id}")
 
         instruction_maker_user_id = user_id
-        recipient_name = "To Whom It May Concern"
-        recipient_address = "N/A"
+        recipient_name, recipient_address = self._get_recipient_details(db, lg_record)
         if approval_request_id:
             approval_request = db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_request_id).first()
             if approval_request:
@@ -1741,7 +1741,7 @@ class CRUDLGRecord(CRUDBase):
             "lg_number": db_lg_record.lg_number,
             "lg_amount": float(db_lg_record.lg_amount),
             "lg_currency": db_lg_record.lg_currency.iso_code,
-            "issuing_bank_name": db_lg_record.issuing_bank.name,
+            "issuing_bank_name": self._get_effective_issuing_bank_name(db_lg_record),
             "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
             "lg_issuer_name": db_lg_record.issuer_name,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
@@ -1869,7 +1869,8 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {db_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            email_subject = f"LG Activation Issued: LG #{db_lg_record.lg_number} — Instruction #{db_lg_instruction.serial_number}"
+            _lg_mask = f"...{str(db_lg_record.lg_number)[-4:]}" if db_lg_record.lg_number and len(str(db_lg_record.lg_number)) > 4 else db_lg_record.lg_number
+            email_subject = f"LG {_lg_mask} · Activation Instruction Issued"
             
             email_body_html = build_transaction_email_html(
                 customer_name=db_lg_record.customer.name if db_lg_record.customer else "Grow Treasury",
@@ -1879,7 +1880,7 @@ class CRUDLGRecord(CRUDBase):
                 key_value_dict={
                     "LG Number": db_lg_record.lg_number,
                     "Instruction Serial": db_lg_instruction.serial_number,
-                    "Issuing Bank": db_lg_record.issuing_bank.name if db_lg_record.issuing_bank else "N/A",
+                    "Issuing Bank": self._get_effective_issuing_bank_name(db_lg_record),
                     "Beneficiary": db_lg_record.beneficiary_corporate.entity_name if db_lg_record.beneficiary_corporate else "N/A",
                     "LG Amount": f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}",
                     "Payment Method": payment_details.payment_method,
@@ -1888,7 +1889,7 @@ class CRUDLGRecord(CRUDBase):
                 },
                 summary_text=f"An official instruction to activate non-operative LG #{db_lg_record.lg_number} has been generated.",
                 cta_text="View LG in System",
-                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{db_lg_record.id}",
                 recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -2042,12 +2043,26 @@ class CRUDLGRecord(CRUDBase):
         updates_to_apply = {}
         for key, value in amendment_details.items():
             if key in updatable_fields:
-                if key in ["issuance_date", "expiry_date"] and isinstance(value, str):
-                    try:
-                        # FIX: Use date.fromisoformat to handle ISO 8601 dates correctly.
-                        updates_to_apply[key] = date.fromisoformat(value.split("T")[0])
-                    except ValueError:
-                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid date format for {key}. Expected YYYY-MM-DD.")
+                if key in ["issuance_date", "expiry_date"] and value is not None:
+                    if isinstance(value, datetime):
+                        updates_to_apply[key] = value
+                    elif isinstance(value, date):
+                        updates_to_apply[key] = datetime.combine(value, datetime.min.time())
+                    elif isinstance(value, str):
+                        raw_dt_str = value.strip().split("T")[0]
+                        parsed_dt = None
+                        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+                            try:
+                                parsed_dt = datetime.strptime(raw_dt_str, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                        if not parsed_dt:
+                            try:
+                                parsed_dt = date.fromisoformat(raw_dt_str)
+                            except ValueError:
+                                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid date format for {key}. Expected YYYY-MM-DD.")
+                        updates_to_apply[key] = datetime.combine(parsed_dt, datetime.min.time())
                 elif key in ["lg_amount"] and isinstance(value, (int, float, str)):
                     try:
                         updates_to_apply[key] = decimal.Decimal(str(value))
@@ -2072,7 +2087,9 @@ class CRUDLGRecord(CRUDBase):
 
         # NEW LOGIC START: Check for expired status and future expiry date
         is_currently_expired = db_lg_record.lg_status_id == models.LgStatusEnum.EXPIRED.value
-        has_future_expiry_date = "expiry_date" in updates_to_apply and updates_to_apply["expiry_date"] > date.today()
+        new_exp_val = updates_to_apply.get("expiry_date")
+        new_exp_date = new_exp_val.date() if isinstance(new_exp_val, datetime) else new_exp_val
+        has_future_expiry_date = new_exp_date is not None and new_exp_date > date.today()
 
         if is_currently_expired and has_future_expiry_date:
             valid_status = db.query(models.LgStatus).filter(models.LgStatus.id == models.LgStatusEnum.VALID.value).first()
@@ -2085,16 +2102,7 @@ class CRUDLGRecord(CRUDBase):
             db.flush()
             logger.info(f"LG id={updated_lg_record.id} status automatically updated from 'Expired' to 'Valid' due to expiry date amendment.")
         # NEW LOGIC END
-
-
-        if "issuance_date" in updates_to_apply or "expiry_date" in updates_to_apply:
-            if updated_lg_record.issuance_date and updated_lg_record.expiry_date:
-                delta = updated_lg_record.expiry_date.date() - updated_lg_record.issuance_date.date()
-                new_lg_period_months = max(1, round(delta.days / 30.44))
-                updated_lg_record.lg_period_months = new_lg_period_months
-                db.add(updated_lg_record)
-                db.flush()
-                db.refresh(updated_lg_record)
+        # Note: lg_period_months represents the initial 3-month-rounded period for renewal suggestions and is intentionally NOT overwritten here.
 
         json_serializable_amended_fields = {}
         for k, v in updates_to_apply.items():
@@ -2145,7 +2153,8 @@ class CRUDLGRecord(CRUDBase):
                     logger.warning(f"COMMON_COMMUNICATION_LIST for customer {updated_lg_record.customer_id} is not a valid JSON list of emails. Skipping.")
             cc_emails = list(set(cc_emails))
 
-            email_subject = f"LG Amendment Issued: LG #{updated_lg_record.lg_number}"
+            _lg_mask = f"...{str(updated_lg_record.lg_number)[-4:]}" if updated_lg_record.lg_number and len(str(updated_lg_record.lg_number)) > 4 else updated_lg_record.lg_number
+            email_subject = f"LG {_lg_mask} · Amendment Recorded"
             
             email_body_html = build_transaction_email_html(
                 customer_name=updated_lg_record.customer.name if updated_lg_record.customer else "Grow Treasury",
@@ -2154,14 +2163,14 @@ class CRUDLGRecord(CRUDBase):
                 transaction_type="LG Amendment",
                 key_value_dict={
                     "LG Number": updated_lg_record.lg_number,
-                    "Issuing Bank": updated_lg_record.issuing_bank.name if updated_lg_record.issuing_bank else "N/A",
+                    "Issuing Bank": self._get_effective_issuing_bank_name(updated_lg_record),
                     "Beneficiary": updated_lg_record.beneficiary_corporate.entity_name if updated_lg_record.beneficiary_corporate else "N/A",
                     "Amount": f"{updated_lg_record.lg_currency.symbol} {float(updated_lg_record.lg_amount):,.2f}",
                     "Amended Fields": ", ".join(json_serializable_amended_fields.keys())
                 },
                 summary_text=f"An amendment instruction has been recorded and issued for LG #{updated_lg_record.lg_number}.",
                 cta_text="View LG in System",
-                cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+                cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{updated_lg_record.id}",
                 recipient_name=updated_lg_record.internal_owner_contact.email if updated_lg_record.internal_owner_contact else "Internal Owner"
             )
 
@@ -2453,7 +2462,7 @@ class CRUDLGRecord(CRUDBase):
                     id=lg.id,
                     lg_number=lg.lg_number,
                     beneficiary_name=lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else "N/A",
-                    bank_name=lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                    bank_name=self._get_effective_issuing_bank_name(lg),
                     amount=lg.lg_amount,
                     currency_code=lg.lg_currency.iso_code if lg.lg_currency else None,
                     current_expiry_date=lg_expiry_date,
@@ -2473,7 +2482,7 @@ class CRUDLGRecord(CRUDBase):
                     id=lg.id,
                     lg_number=lg.lg_number,
                     beneficiary_name=lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else "N/A",
-                    bank_name=lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                    bank_name=self._get_effective_issuing_bank_name(lg),
                     amount=lg.lg_amount,
                     currency_code=lg.lg_currency.iso_code if lg.lg_currency else None,
                     current_expiry_date=lg_expiry_date,
@@ -2760,7 +2769,7 @@ class CRUDLGRecord(CRUDBase):
             "internal_owner_email": lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "N/A",
             "is_urgent_style": "color: red; font-weight: bold;" if is_urgent else "", # For urgent styling
             "subject_prefix": subject_prefix, # Pass prefix for potential use in template subject
-            "issuing_bank_name": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+            "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
             "lg_issuer_name": lg_record.issuer_name if lg_record.issuer_name else "N/A",
         }
         template_data["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
@@ -2790,7 +2799,7 @@ class CRUDLGRecord(CRUDBase):
             message=f"Letter of Guarantee #{lg_record.lg_number} will expire on {lg_record.expiry_date.strftime('%Y-%m-%d')} ({days_until_expiry} days remaining). Please initiate renewal or release actions.",
             details_table_html=details_table,
             cta_text="View LG in System",
-            cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+            cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{lg_record.id}",
             recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
         )
 
@@ -3045,7 +3054,7 @@ class CRUDLGRecord(CRUDBase):
             items_for_html.append({
                 "lg_number": lg.lg_number,
                 "lg_type": lg.lg_type.name if lg.lg_type else "N/A",
-                "issuing_bank": lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                "issuing_bank": self._get_effective_issuing_bank_name(lg),
                 "currency": lg.lg_currency.iso_code if lg.lg_currency else "EGP",
                 "amount": float(lg.lg_amount),
                 "amount_formatted": f"{lg.lg_currency.symbol if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}",
@@ -3057,7 +3066,7 @@ class CRUDLGRecord(CRUDBase):
 
         subject_prefix = "URGENT: " if has_urgent else ""
         digest_title = "DAILY EXPIRY & RENEWAL DIGEST"
-        email_subject = f"{subject_prefix}[GROW TREASURY] Renewal Digest - {len(due_lgs_info)} LG(s) Expiring Soon ({customer.name})"
+        email_subject = f"{'Urgent · ' if has_urgent else ''}Expiry Digest · {len(due_lgs_info)} LG(s) Nearing Expiry"
 
         email_body_html = build_lg_renewal_digest_html(
             customer_name=customer.name,
@@ -3330,7 +3339,7 @@ class CRUDLGRecord(CRUDBase):
             items_for_html.append({
                 "lg_number": lg.lg_number,
                 "lg_type": lg.lg_type.name if lg.lg_type else "N/A",
-                "issuing_bank": lg.issuing_bank.name if lg.issuing_bank else "N/A",
+                "issuing_bank": self._get_effective_issuing_bank_name(lg),
                 "currency": lg.lg_currency.iso_code if lg.lg_currency else "EGP",
                 "amount": float(lg.lg_amount),
                 "amount_formatted": f"{lg.lg_currency.symbol if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}",
@@ -3341,7 +3350,7 @@ class CRUDLGRecord(CRUDBase):
             })
 
         digest_title = "MY ACTION REQUIRED: EXPIRING LGS"
-        email_subject = f"[ACTION REQUIRED] Expiring LGs Digest - {len(owner_due_lgs)} LG(s) Nearing Expiry ({customer.name})"
+        email_subject = f"Expiry Digest · {len(owner_due_lgs)} LG(s) Nearing Expiry"
 
         email_body_html = build_lg_renewal_digest_html(
             customer_name=customer.name,
@@ -3522,7 +3531,7 @@ class CRUDLGRecord(CRUDBase):
             "internal_owner_email": lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "N/A",
             "manager_email": lg_record.internal_owner_contact.manager_email if lg_record.internal_owner_contact else "N/A",
             "is_urgent_style": "", # Not urgent by default for this reminder type
-            "issuing_bank_name": lg_record.issuing_bank.name if lg_record.issuing_bank else "N/A",
+            "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
             "lg_issuer_name": lg_record.issuer_name if lg_record.issuer_name else "N/A",
         }
         template_data["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {template_data['lg_amount']:,.2f}"
@@ -3550,7 +3559,7 @@ class CRUDLGRecord(CRUDBase):
             message=f"Letter of Guarantee #{lg_record.lg_number} registered under your custody will expire on {lg_record.expiry_date.strftime('%Y-%m-%d')} ({days_until_expiry} days remaining). Please coordinate renewal or release actions.",
             details_table_html=details_table,
             cta_text="View LG in System",
-            cta_url=f"{get_frontend_base_url()}/corporate-admin/issuance/issued-lgs",
+            cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{lg_record.id}",
             recipient_name=lg_record.internal_owner_contact.email if lg_record.internal_owner_contact else "Internal Owner"
         )
 
@@ -3706,6 +3715,21 @@ class CRUDLGRecord(CRUDBase):
         )
         return db_lg_record
 
+    def _get_effective_issuing_bank_name(self, lg_record: models.LGRecord) -> str:
+        """
+        Returns the effective issuing bank name for an LG record.
+        When the LG is issued by a Foreign Bank (where issuing_bank.name is 'Foreign Bank'),
+        returns lg_record.foreign_bank_name if present.
+        """
+        if not lg_record:
+            return "N/A"
+        bank_name = lg_record.issuing_bank.name if getattr(lg_record, "issuing_bank", None) else None
+        if bank_name and bank_name.strip().upper() == "FOREIGN BANK":
+            foreign_name = getattr(lg_record, "foreign_bank_name", None)
+            if foreign_name and str(foreign_name).strip():
+                return str(foreign_name).strip()
+        return bank_name or getattr(lg_record, "foreign_bank_name", None) or "N/A"
+
     def _get_recipient_details(self, db: Session, lg_record: models.LGRecord) -> Tuple[str, str]:
         """
         Determines the correct recipient name and address based on the LG's type and advising status.
@@ -3715,8 +3739,8 @@ class CRUDLGRecord(CRUDBase):
 
         # Case 1: Local Guarantee (issuing_bank is NOT "Foreign Bank")
         # This check is now robust and case-insensitive.
-        if lg_record.issuing_bank.name and lg_record.issuing_bank.name.strip().upper() != "FOREIGN BANK":
-            return lg_record.issuing_bank.name, lg_record.issuing_bank.address
+        if lg_record.issuing_bank and lg_record.issuing_bank.name and lg_record.issuing_bank.name.strip().upper() != "FOREIGN BANK":
+            return lg_record.issuing_bank.name, (lg_record.issuing_bank.address or "N/A")
 
         # Case 2: Counter Guarantee
         # Sub-case 2.1: Advised or Confirmed Counter Guarantee

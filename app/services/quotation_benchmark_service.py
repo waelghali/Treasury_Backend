@@ -75,6 +75,8 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
         except Exception:
             tenant_dek = None
 
+    is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
+
     if rfq.type == 'FX_SPOT':
         for a in assignments:
             off = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
@@ -86,11 +88,17 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
                         first_quote_time = off.submitted_at
     else:
         for a in assignments:
-            off = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).order_by(QuotationTBillOffer.discount_rate.asc()).first()
-            if off:
-                rate = tenant_key_service.resolve_tbill_discount_rate(off, tenant_dek)
-                if rate and rate > 0:
-                    quotes.append(rate)
+            tb_offers = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
+            if tb_offers:
+                rates = [
+                    r for r in (tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek) for o in tb_offers)
+                    if r and r > 0
+                ]
+                if rates:
+                    # Buy T-Bill: higher discount rate is better; Sell T-Bill: lower discount rate is better
+                    best_bank_rate = min(rates) if is_sell else max(rates)
+                    quotes.append(best_bank_rate)
+                for off in tb_offers:
                     if not first_quote_time or (off.submitted_at and off.submitted_at < first_quote_time):
                         first_quote_time = off.submitted_at
 
@@ -98,14 +106,28 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
     if num_quotes == 0:
         return None
 
-    is_sell = (rfq.direction and rfq.direction.lower() == 'sell')
-    quotes.sort(reverse=is_sell)
+    if rfq.type == 'TBILL':
+        # Buy T-Bill wants highest discount rate first; Sell T-Bill wants lowest discount rate first
+        quotes.sort(reverse=(not is_sell))
+    else:
+        quotes.sort(reverse=is_sell)
     winning_quote = quotes[0]
     avg_quote = sum(quotes) / len(quotes)
 
     # Calculate reference spread (normalized in basis points)
-    # If eval_rate or baseline rate exists on RFQ, use it; otherwise use average as anchor
-    cbe_ref = rfq.eval_rate or (avg_quote * 0.998 if not is_sell else avg_quote * 1.002)
+    # For TBILL, eval_rate is an interest rate (%) and can serve as reference if set;
+    # For FX_SPOT, eval_rate is a TVM interest rate (~20.25%), NOT an FX exchange rate (~50.00), so resolve from market_benchmark_snapshot or avg_quote anchor.
+    cbe_ref = None
+    if rfq.type == 'TBILL' and rfq.eval_rate and rfq.eval_rate > 0:
+        cbe_ref = float(rfq.eval_rate)
+    elif rfq.type == 'FX_SPOT':
+        bm_snap = getattr(rfq, 'market_benchmark_snapshot', None)
+        if not bm_snap and getattr(rfq, 'legs', None):
+            bm_snap = getattr(rfq.legs[0], 'market_benchmark_snapshot', None)
+        if isinstance(bm_snap, dict):
+            cbe_ref = bm_snap.get('cbe_official_mid') or bm_snap.get('live_mid') or bm_snap.get('suggested_reference_rate')
+    if not cbe_ref or cbe_ref <= 0:
+        cbe_ref = (avg_quote * 0.998 if not is_sell else avg_quote * 1.002)
     if cbe_ref and cbe_ref > 0:
         winning_spread_bps = round(((winning_quote - cbe_ref) / cbe_ref) * 10000.0, 2)
         avg_spread_bps = round(((avg_quote - cbe_ref) / cbe_ref) * 10000.0, 2)

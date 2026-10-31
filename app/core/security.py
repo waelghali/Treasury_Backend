@@ -17,7 +17,7 @@ from app.crud.crud import crud_user, crud_role_permission
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 20))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 25))
 TRUST_X_FORWARDED = os.getenv("TRUST_X_FORWARDED", "false").lower() == "true"
 
 if SECRET_KEY is None:

@@ -15,7 +15,8 @@ from app.constants import GlobalConfigKey
 from app.services.unified_email_builder import (
     build_transaction_email_html,
     build_alert_email_html,
-    build_standard_email_html
+    build_standard_email_html,
+    get_bank_short_label
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,7 @@ async def notify_approvers_of_submission(
     link = f"{_base_url()}/issuance/requests"
     cc_emails = get_common_communication_emails(db, customer_id)
 
-    subject = f"ACTION REQUIRED: LG Issuance Request {request_serial} Awaiting Your Approval"
+    subject = f"LG Request {request_serial} · Approval Required"
 
     body = build_transaction_email_html(
         customer_name=customer_name,
@@ -147,9 +148,9 @@ async def notify_submitter_of_approval(
     cc_emails = get_common_communication_emails(db, customer_id)
 
     is_final = new_status == "APPROVED_INTERNAL"
-    status_label = "Fully Approved ✅" if is_final else "Step Approved — Proceeding to Next Approver"
+    status_label = "Approved" if is_final else "Step Approved"
 
-    subject = f"LG Request {request_serial} — {status_label}"
+    subject = f"LG Request {request_serial} · {status_label}"
     summary = "Your request is now ready for issuance execution." if is_final else "The request is moving to the next approval step."
 
     body = build_transaction_email_html(
@@ -203,7 +204,7 @@ async def notify_submitter_of_rejection(
     link = f"{_base_url()}/issuance/requests"
     cc_emails = get_common_communication_emails(db, customer_id)
 
-    subject = f"LG Request {request_serial} — Rejected ❌"
+    subject = f"LG Request {request_serial} · Rejected"
 
     table_details = f"""
     <table style="width: 100%; border-collapse: collapse; text-align: left;">
@@ -293,7 +294,7 @@ async def notify_maintenance_action_executed(
     link = f"{_base_url()}/issuance/issued-lgs"
 
     type_label = ACTION_TYPE_LABELS.get(action_type, action_type.replace("_", " ").title())
-    subject = f"LG Maintenance: {type_label} Instruction Issued — {lg_ref_number}"
+    subject = f"LG {lg_ref_number} · {type_label} Instruction Issued"
 
     body = build_transaction_email_html(
         customer_name=customer_name,
@@ -346,7 +347,8 @@ async def notify_maintenance_bank_confirmed(
     link = f"{_base_url()}/issuance/issued-lgs"
 
     type_label = ACTION_TYPE_LABELS.get(action_type, action_type.replace("_", " ").title())
-    subject = f"LG Maintenance: {type_label} Confirmed by Bank — {lg_ref_number}"
+    bank_short = get_bank_short_label(bank_name)
+    subject = f"LG {lg_ref_number} · {type_label} Confirmed ({bank_short})"
 
     body = build_transaction_email_html(
         customer_name=customer_name,
@@ -403,7 +405,8 @@ async def notify_reconciliation_summary(
     submitter_email = _get_user_email(db, submitter_user_id) or 'Unknown User'
     link = f"{_base_url()}/issuance/reconciliation"
 
-    subject = f"Reconciliation Complete: {bank_name} ({position_date})"
+    bank_short = get_bank_short_label(bank_name)
+    subject = f"Reconciliation Complete · {bank_short} ({position_date})"
 
     body = build_transaction_email_html(
         customer_name=customer_name,

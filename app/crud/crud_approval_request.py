@@ -2,6 +2,7 @@
 
 from typing import List, Optional, Type, Dict, Any, Union # <-- ADD Union
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql import func, desc
 from sqlalchemy import and_, or_
 from fastapi import HTTPException, status
@@ -251,6 +252,25 @@ class CRUDApprovalRequest(CRUDBase):
                 customer_id=customer_id,
                 lg_record_id=db_obj.entity_id if db_obj.entity_type == "LGRecord" else None,
             )
+
+        # Stage in-app UserNotification + Web Push to Corporate Admins for Custody approvals
+        try:
+            if db_obj.entity_type == "LGRecord":
+                from app.services.notifications.lg_custody_service import notify_custody_approval_required
+                target_lg = lg_record or (
+                    db.query(models.LGRecord).filter(models.LGRecord.id == db_obj.entity_id).first()
+                    if db_obj.entity_id else None
+                )
+                if target_lg:
+                    notify_custody_approval_required(
+                        db=db,
+                        lg_record=target_lg,
+                        action_type=db_obj.action_type,
+                        maker_user_id=maker_user_id,
+                    )
+                    db.flush()
+        except Exception as push_err:
+            logger.error(f"Failed to stage custody approval push notification for request ID {db_obj.id}: {push_err}", exc_info=True)
 
         return db_obj
 
@@ -718,6 +738,23 @@ class CRUDApprovalRequest(CRUDBase):
                     approval_request_id=db_request.id,
                     existing_document_id=existing_document_id_from_request
                 )
+                source_inst_id = (db_request.request_details or {}).get("source_instruction_id")
+                if source_inst_id:
+                    source_inst = db.query(models.LGInstruction).filter(models.LGInstruction.id == int(source_inst_id)).first()
+                    if source_inst:
+                        inst_details = dict(source_inst.details or {})
+                        existing_approval = dict(inst_details.get("bank_terms_admin_approval") or {})
+                        inst_details["bank_terms_admin_approval"] = {
+                            **existing_approval,
+                            "status": "APPROVED",
+                            "approved_by_user_id": checker_user_id,
+                            "approved_at": datetime.utcnow().isoformat(),
+                        }
+                        if isinstance(inst_details.get("bank_reply_ai_verification"), dict):
+                            inst_details["bank_reply_ai_verification"]["status"] = "verified"
+                        source_inst.details = inst_details
+                        db.add(source_inst)
+                        db.flush()
                 generated_instruction_id = None
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.amend_lg call completed.")
 
@@ -896,6 +933,20 @@ class CRUDApprovalRequest(CRUDBase):
             )
             logger.debug(f"DEBUG: Final audit log for approval request {db_request.id} completed.")
 
+            try:
+                if db_request.entity_type == "LGRecord" and db_request.lg_record:
+                    from app.services.notifications.lg_custody_service import notify_custody_request_decided
+                    notify_custody_request_decided(
+                        db=db,
+                        lg_record=db_request.lg_record,
+                        status="APPROVED",
+                        maker_user_id=db_request.maker_user_id,
+                        checker_user_id=checker_user_id,
+                    )
+                    db.flush()
+            except Exception as push_err:
+                logger.error(f"Failed to stage custody approval decision push notification for AR {db_request.id}: {push_err}", exc_info=True)
+
             db.refresh(db_request)
             logger.debug(f"DEBUG: Approval request {db_request.id} refreshed successfully.")
             return db_request
@@ -953,6 +1004,21 @@ class CRUDApprovalRequest(CRUDBase):
             lg_record_id=db_request.entity_id if db_request.entity_type == "LGRecord" else None,
         )
         _nuke_document(db, db_request.request_details or {})
+        self._handle_bank_modified_terms_rejection(db, db_request, reason=reason, checker_user_id=checker_user_id)
+        self._clear_pending_cancellation_flag(db, db_request)
+        try:
+            if db_request.entity_type == "LGRecord" and db_request.lg_record:
+                from app.services.notifications.lg_custody_service import notify_custody_request_decided
+                notify_custody_request_decided(
+                    db=db,
+                    lg_record=db_request.lg_record,
+                    status="REJECTED",
+                    maker_user_id=db_request.maker_user_id,
+                    checker_user_id=checker_user_id,
+                )
+                db.flush()
+        except Exception as push_err:
+            logger.error(f"Failed to stage custody rejection decision push notification for AR {db_request.id}: {push_err}", exc_info=True)
         db.refresh(db_request)
         return db_request
 
@@ -1003,6 +1069,18 @@ class CRUDApprovalRequest(CRUDBase):
             lg_record_id=approval_request.entity_id if approval_request.entity_type == "LGRecord" else None,
         )
         _nuke_document(db, approval_request.request_details or {})
+        self._clear_pending_cancellation_flag(db, approval_request)
+        try:
+            if approval_request.entity_type == "LGRecord" and approval_request.entity_id:
+                from app.services.notifications.lg_custody_service import resolve_stale_custody_notifications, EventCode
+                resolve_stale_custody_notifications(
+                    db=db,
+                    lg_record_id=approval_request.entity_id,
+                    event_codes=[EventCode.LG_CUSTODY_APPROVAL_REQUIRED],
+                )
+                db.flush()
+        except Exception as resolve_err:
+            logger.error(f"Failed to resolve stale custody notifications on withdrawal of AR {approval_request.id}: {resolve_err}", exc_info=True)
         db.refresh(approval_request)
         return approval_request
 
@@ -1054,6 +1132,7 @@ class CRUDApprovalRequest(CRUDBase):
                 lg_record_id=req.entity_id if req.entity_type == "LGRecord" else None,
             )
             _nuke_document(db, req.request_details or {})
+            self._clear_pending_cancellation_flag(db, req)
         if auto_rejected_requests:
             db.commit()
             for req in auto_rejected_requests:
@@ -1061,6 +1140,116 @@ class CRUDApprovalRequest(CRUDBase):
             logger.info(f"Auto-rejected {len(auto_rejected_requests)} expired approval requests.")
 
         return auto_rejected_requests
+
+    def _clear_pending_cancellation_flag(
+        self,
+        db: Session,
+        db_request: models.ApprovalRequest,
+    ) -> None:
+        """
+        When a cancellation approval request (LG_CANCEL_LAST_INSTRUCTION) is rejected,
+        withdrawn, or auto-rejected, clear `pending_cancellation_request_id` from the
+        target instruction's details so the user can retry if needed.
+        """
+        if db_request.action_type != ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION:
+            return
+        req_details = db_request.request_details or {}
+        inst_id = req_details.get("instruction_id")
+        if not inst_id:
+            return
+        inst = db.query(models.LGInstruction).filter(models.LGInstruction.id == inst_id).first()
+        if inst and isinstance(inst.details, dict) and "pending_cancellation_request_id" in inst.details:
+            updated_details = dict(inst.details)
+            updated_details.pop("pending_cancellation_request_id", None)
+            inst.details = updated_details
+            flag_modified(inst, "details")
+            db.add(inst)
+            db.flush()
+
+    def _handle_bank_modified_terms_rejection(
+        self,
+        db: Session,
+        db_request: models.ApprovalRequest,
+        reason: Optional[str] = None,
+        checker_user_id: Optional[int] = None,
+    ) -> None:
+        """
+        When Corporate Admin rejects (or Maker withdraws) an LG_AMEND approval request
+        originating from a Bank Reply with modified terms (BANK_MODIFIED_TERMS_APPROVAL_REQUIRED):
+        1. Re-open the source instruction for the corrected bank reply (reset bank_reply_date to None
+           and status back to 'Instruction Delivered' / 'Instruction Issued').
+        2. Reclassify the rejected bank reply document to 'REJECTED_BANK_REPLY' so it remains
+           auditable without blocking the new corrected BANK_REPLY upload.
+        3. Mark bank_terms_admin_approval.status = 'REJECTED_BY_ADMIN' with discrepancy_letter_ready = True.
+        """
+        req_details = db_request.request_details or {}
+        source_inst_id = req_details.get("source_instruction_id")
+        if not source_inst_id:
+            return
+        try:
+            source_inst = db.query(models.LGInstruction).filter(models.LGInstruction.id == int(source_inst_id)).first()
+            if not source_inst:
+                return
+
+            rejected_reply_date = (
+                source_inst.bank_reply_date.date().isoformat()
+                if source_inst.bank_reply_date
+                else None
+            )
+            source_inst.bank_reply_date = None
+            source_inst.status = "Instruction Delivered" if source_inst.delivery_date else "Instruction Issued"
+
+            doc_id = req_details.get("amendment_document_id")
+            rejected_doc = None
+            if doc_id:
+                rejected_doc = db.query(models.LGDocument).filter(models.LGDocument.id == int(doc_id)).first()
+            if not rejected_doc:
+                rejected_doc = db.query(models.LGDocument).filter(
+                    models.LGDocument.lg_instruction_id == source_inst.id,
+                    models.LGDocument.document_type == "BANK_REPLY",
+                    models.LGDocument.is_deleted == False,
+                ).order_by(models.LGDocument.id.desc()).first()
+            if rejected_doc:
+                rejected_doc.document_type = "REJECTED_BANK_REPLY"
+                db.add(rejected_doc)
+
+            inst_details = dict(source_inst.details or {})
+            existing_approval = dict(inst_details.get("bank_terms_admin_approval") or {})
+            inst_details["bank_terms_admin_approval"] = {
+                **existing_approval,
+                "status": "REJECTED_BY_ADMIN",
+                "approval_request_id": db_request.id,
+                "rejection_reason": reason or "Corporate Admin rejected the bank-modified terms.",
+                "rejected_by_user_id": checker_user_id,
+                "rejected_at": datetime.utcnow().isoformat(),
+                "rejected_bank_reply_date": rejected_reply_date,
+                "rejected_document_id": rejected_doc.id if rejected_doc else doc_id,
+                "discrepancy_letter_ready": True,
+            }
+            source_inst.details = inst_details
+            db.add(source_inst)
+            db.flush()
+
+            log_action(
+                db,
+                user_id=checker_user_id or db_request.maker_user_id,
+                action_type="LG_BANK_REPLY_TERMS_REJECTED",
+                entity_type="LGInstruction",
+                entity_id=source_inst.id,
+                details={
+                    "lg_number": source_inst.lg_record.lg_number if source_inst.lg_record else None,
+                    "instruction_id": source_inst.id,
+                    "instruction_serial": source_inst.serial_number,
+                    "approval_request_id": db_request.id,
+                    "rejected_amendment_details": req_details.get("amendment_details"),
+                    "rejection_reason": reason or "Corporate Admin rejected the bank-modified terms.",
+                    "discrepancy_letter_ready": True,
+                },
+                customer_id=db_request.customer_id,
+                lg_record_id=source_inst.lg_record_id,
+            )
+        except Exception as e:
+            logger.error(f"Failed to handle bank modified terms rejection for instruction {source_inst_id}: {e}", exc_info=True)
 
     async def _send_approval_for_processing_notification(self, db: Session, approval_request: models.ApprovalRequest):
         logger.info(f"Attempting to send 'Approval for Processing' notification for Approval Request ID: {approval_request.id}.")

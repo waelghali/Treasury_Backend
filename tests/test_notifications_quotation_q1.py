@@ -149,8 +149,14 @@ def test_rendered_text_is_lock_screen_safe():
         t = _tenants(db)
         rfq = _transient_rfq(t["a"], t["a_maker"].id)
     for code, spec in CATALOG.items():
-        extra = {"decision": "approved"} if "decision" in spec.allowed_fields else None
-        text = render(spec, rfq, extra)
+        if spec.module != "QUOTATION":
+            continue
+        extra = {}
+        if "decision" in spec.allowed_fields:
+            extra["decision"] = "approved"
+        if "invited_count" in spec.allowed_fields:
+            extra["invited_count"] = "3"
+        text = render(spec, rfq, extra if extra else None)
         blob = f"{text['title']} {text['body']}"
         assert rfq.ref_no in text["title"], f"{code}: title must carry the RFQ reference"
         for forbidden in ("USD", "EGP", "12500000", "12,500,000", "12.5"):
@@ -171,7 +177,7 @@ def test_emit_stages_rows_and_rollback_leaves_none():
             assert row.event_type == "RFQ_APPROVAL_REQUIRED"
             assert row.module == "QUOTATION"
             assert row.urgency == "high"
-            assert row.link == "/corporate-admin/quotations/approvals"
+            assert row.link == f"/corporate-admin/quotations/approvals?rfq_id={rfq.id}"
             assert row.expires_at is not None
 
         db.rollback()
@@ -189,8 +195,8 @@ def test_creator_events_target_maker_with_role_aware_links():
 
         expectations = {
             EventCode.RFQ_APPROVED: f"/end-user/quotations/results/{rfq.id}",
-            EventCode.RFQ_REJECTED: "/end-user/quotations/history",
-            EventCode.RFQ_REVISION_REQUESTED: "/end-user/quotations/active",
+            EventCode.RFQ_REJECTED: f"/end-user/quotations/results/{rfq.id}",
+            EventCode.RFQ_REVISION_REQUESTED: f"/end-user/quotations/active?revision_rfq_id={rfq.id}",
         }
         for code in expectations:
             assert emit(db, code, rfq, actor_user_id=admin.id) == 1

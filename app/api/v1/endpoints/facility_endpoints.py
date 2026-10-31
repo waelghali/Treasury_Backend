@@ -123,26 +123,25 @@ async def upload_facility_attachment(
     file: UploadFile = File(...),
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
-    # 1. Read the file content
-    file_content = await file.read()
-    
-    # 2. Define the path: {env}/customer_{customer_id}/facilities/fac_docs/{filename}
-    from app.core.storage_service import build_customer_blob_path
+    # 1. Define the path: {env}/customer_{customer_id}/facilities/fac_docs/{filename}
+    from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+    from app.services.tenant_key_service import tenant_key_service
     blob_path = build_customer_blob_path(current_user.customer_id, "facilities", f"fac_docs/{file.filename}")
     
-    # 3. Use your existing _upload_to_gcs function from ai_integration.py
-    # This function already handles the technical upload logic
-    stored_uri = await _upload_to_gcs(
-        bucket_name=GCS_BUCKET_NAME, 
-        blob_name=blob_path, 
-        data=file_content, 
-        content_type=file.content_type
+    # 2. Upload stream encrypted under Tenant DEK (context='facility_doc')
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+    stored_uri = upload_stream_to_gcs_encrypted(
+        source_stream=file.file,
+        destination_blob_name=blob_path,
+        tenant_dek=tenant_dek,
+        content_type=file.content_type or "application/pdf",
+        context="facility_doc"
     )
     
     if not stored_uri:
         raise HTTPException(status_code=500, detail="Failed to upload to cloud storage")
 
-    return {"url": stored_uri, "filename": file.filename}
+    return {"url": str(stored_uri), "filename": file.filename}
 
 
 # ==============================================================================

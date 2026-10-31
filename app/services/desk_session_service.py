@@ -383,5 +383,26 @@ class DeskSessionService:
             }
         }
 
+    def is_desk_active(self, assignment_id: str) -> bool:
+        """
+        Returns True if at least one execution dealer (active controller or
+        EXECUTION spectator) is currently connected with a live heartbeat on
+        this counterparty desk. Viewers (VIEW_ONLY) and Approvers (APPROVER)
+        do not suppress absence alerts.
+        """
+        with self._lock:
+            desk = self._desks.get(str(assignment_id))
+            if not desk:
+                return False
+            now = datetime.now(timezone.utc)
+            desk.clean_inactive_spectators(now)
+            desk.check_and_release_expired_lock(now)
+            if desk.active_trader_email:
+                return True
+            return any(
+                (spec.get("role") or "EXECUTION").upper() == "EXECUTION"
+                for spec in desk.spectators.values()
+            )
+
 
 desk_session_service = DeskSessionService()

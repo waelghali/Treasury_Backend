@@ -69,7 +69,7 @@ async def send_corporate_admin_activation_email(
         try:
             email_settings, _ = get_customer_email_settings(db, user.customer_id)
         except Exception:
-            email_settings, _ = get_global_email_settings()
+            email_settings = get_global_email_settings()
 
         # 5. Build high-aesthetic security email
         role_label = custom_role_label

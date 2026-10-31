@@ -213,21 +213,23 @@ def create_bank_form_issue(
     attachment_path = None
     if attachment and attachment.filename:
         try:
-            import asyncio, re as _re
+            import re as _re, uuid
             from datetime import date as _date
-            from app.core.ai_integration import _upload_to_gcs
-            file_bytes = attachment.file.read()
+            from app.core.storage_service import upload_stream_to_gcs_encrypted
+            from app.services.tenant_key_service import tenant_key_service
             ext = attachment.filename.rsplit('.', 1)[-1] if '.' in attachment.filename else 'bin'
-            import uuid
             _today = _date.today().strftime('%Y%m%d')
             _safe_orig = _re.sub(r'[^\w\-]', '_', attachment.filename.rsplit('.', 1)[0] if '.' in attachment.filename else attachment.filename)[:40]
             blob_name = f"customer_{current_user.customer_id}/form_issues/FORM_ISSUE_{issue_type}_BANK-{bank_id}_{_today}_{_safe_orig}_{uuid.uuid4().hex[:6]}.{ext}"
-            loop = asyncio.new_event_loop()
-            try:
-                gcs_url = loop.run_until_complete(_upload_to_gcs(file_bytes, blob_name, attachment.content_type or 'application/octet-stream'))
-                attachment_path = gcs_url
-            finally:
-                loop.close()
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+            gcs_url = upload_stream_to_gcs_encrypted(
+                source_stream=attachment.file,
+                blob_name=blob_name,
+                dek=tenant_dek,
+                content_type=attachment.content_type or 'application/octet-stream',
+                context="lg_issuance_doc"
+            )
+            attachment_path = str(gcs_url)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"Failed to upload form issue attachment: {e}")

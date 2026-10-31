@@ -381,7 +381,12 @@ async def submit_demo_request(
     This is a public endpoint and does not require authentication.
     """
     # Perimeter Anti-Bot Honeypot Defense
-    await verify_honeypot(demo_request.website_url, request=request, context="demo_request")
+    await verify_honeypot(
+        demo_request.website_url,
+        request=request,
+        context="demo_request",
+        legitimate_values=[demo_request.email, demo_request.name, demo_request.company, demo_request.phone]
+    )
 
     try:
         # Define a private directory for storing the data, relative to the project root

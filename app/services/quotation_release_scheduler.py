@@ -220,27 +220,52 @@ async def broadcast_rfq_to_banks(
             # N7a: Dealer mobile push notification (VAPID, independent of customer SMTP)
             try:
                 from app.services.notifications.push_channel import enqueue_dealer_push
-                enqueue_dealer_push(
-                    db=db,
-                    assignment_id=assignment.id,
-                    rfq_id=str(rfq.id),
-                    ref_no=rfq.ref_no,
-                    target_url=f"/public-quotation/{assignment.token}",
-                    event_code="DEALER_RFQ_INVITATION",
-                    title=f"RFQ {rfq.ref_no} · Invitation to quote",
-                    body="You have received a new quotation request. Open to submit your rate.",
-                    dealer_emails=all_bank_emails,
-                    bank_id=bank_row.bank_id,
-                    urgency="high",
-                    expires_at=rfq.window_end,
-                )
+                execution_emails = list(dict.fromkeys(
+                    c.get("email", "").strip() for c in contacts
+                    if (c.get("role") or "EXECUTION").upper() == "EXECUTION" and c.get("email")
+                ))
+                if assignment.approval_status == 'PENDING' and not is_indicative and has_approver and has_execution:
+                    # Bank requires approval first: send push ONLY to bank approvers (not execution dealers yet)
+                    if approver_emails:
+                        enqueue_dealer_push(
+                            db=db,
+                            assignment_id=assignment.id,
+                            rfq_id=str(rfq.id),
+                            ref_no=rfq.ref_no,
+                            target_url=f"/public-quotation/{assignment.token}",
+                            event_code="DEALER_RFQ_APPROVAL_REQUIRED",
+                            title=f"RFQ {rfq.ref_no} · Approval required",
+                            body="Customer quotation request requires your authorization for desk participation.",
+                            dealer_emails=approver_emails,
+                            bank_id=bank_row.bank_id,
+                            urgency="high",
+                            expires_at=rfq.window_end,
+                        )
+                else:
+                    target_dealer_emails = execution_emails or non_approver_emails or all_bank_emails
+                    if target_dealer_emails:
+                        enqueue_dealer_push(
+                            db=db,
+                            assignment_id=assignment.id,
+                            rfq_id=str(rfq.id),
+                            ref_no=rfq.ref_no,
+                            target_url=f"/public-quotation/{assignment.token}",
+                            event_code="DEALER_RFQ_INVITATION",
+                            title=f"RFQ {rfq.ref_no} · Invitation to quote",
+                            body="You have received a new quotation request. Open to submit your rate.",
+                            dealer_emails=target_dealer_emails,
+                            bank_id=bank_row.bank_id,
+                            urgency="high",
+                            expires_at=rfq.window_end,
+                        )
             except Exception as push_err:
                 logger.warning(f"Failed to enqueue dealer push for RFQ {rfq.id}, assignment {assignment.id}: {push_err}")
 
-
-
-
-        # Schedule 15m reminder before bidding window starts if lead time >= 60m
+        # Commit dealer invitation push notifications
+        try:
+            db.commit()
+        except Exception as commit_err:
+            logger.warning(f"Failed to commit dealer push deliveries for RFQ {rfq.id}: {commit_err}")        # Schedule 15m reminder before bidding window starts if lead time >= 60m
         try:
             schedule_rfq_15m_reminder(
                 rfq_id=rfq.id,

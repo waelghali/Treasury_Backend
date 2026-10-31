@@ -266,8 +266,12 @@ class DealerAchievementService:
                                 qa = db.query(QuotationAnalytics).filter(QuotationAnalytics.rfq_id == rfq.id).first()
                                 if qa and qa.winner_quotation_bank_id and asgn.quotation_bank:
                                     if qa.winner_quotation_bank_id == asgn.quotation_bank.id and rfq.status == 'COMPLETED':
+                                        target_win_rate = rfq.winner_rate
                                         dealer_submitted_winning_rate = any(
-                                            o.assignment_id == asgn.id and abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(rfq.eval_rate or 0.0)) < 1e-4
+                                            o.assignment_id == asgn.id and (
+                                                target_win_rate is None or
+                                                abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(target_win_rate)) < 1e-4
+                                            )
                                             for o in fx_offers
                                         )
                                         if dealer_submitted_winning_rate:
@@ -276,7 +280,11 @@ class DealerAchievementService:
                                             pair = "/".join(sorted([rfq.buy_currency.upper(), rfq.sell_currency.upper()]))
                                             currency_pairs_won.add(pair)
                                             amt = float(rfq.amount or 0.0)
-                                            rate = float(rfq.eval_rate or 50.0)
+                                            dealer_resolved_rates = [
+                                                float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0)
+                                                for o in fx_offers if o.assignment_id == asgn.id
+                                            ]
+                                            rate = float(target_win_rate or (dealer_resolved_rates[0] if dealer_resolved_rates else 50.0))
                                             rfq_volume_egp = (amt * rate) if 'EGP' in pair else amt
                                             if 'USD' in pair:
                                                 rfq_volume_usd = amt
@@ -355,8 +363,10 @@ class DealerAchievementService:
                                 dealer_won_all_awarded = all(
                                     (getattr(l, 'winner_bank_id', None) or (getattr(rfq, 'winner_bank_id', None) if l == rfq else None)) == bank_id_val and
                                     any(
-                                        (o.leg_id == l.id if hasattr(l, 'id') and l != rfq else o.assignment_id == asgn.id) and
-                                        abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(getattr(l, 'winner_rate', None) or getattr(rfq, 'eval_rate', None) or 0.0)) < 1e-4
+                                        (o.leg_id == l.id if hasattr(l, 'id') and l != rfq else o.assignment_id == asgn.id) and (
+                                            (getattr(l, 'winner_rate', None) is None and getattr(rfq, 'winner_rate', None) is None) or
+                                            abs(float(tenant_key_service.resolve_offer_price(o, tenant_dek) or 0.0) - float(getattr(l, 'winner_rate', None) or getattr(rfq, 'winner_rate', None) or 0.0)) < 1e-4
+                                        )
                                         for o in fx_offers
                                     )
                                     for l in awarded_legs

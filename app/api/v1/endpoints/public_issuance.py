@@ -381,12 +381,15 @@ async def _auto_verify_request_documents(db: Session, request_id: int, customer_
     pdf_bytes = None
     if target_doc.file_path.startswith("gs://"):
         try:
-            path_parts = target_doc.file_path[5:].split('/', 1)
-            client = _get_gcs_client()
-            if client:
-                bucket = client.bucket(path_parts[0])
-                blob = bucket.blob(path_parts[1])
-                pdf_bytes = blob.download_as_bytes()
+            from app.services.tenant_key_service import tenant_key_service
+            from app.core.storage_service import stream_decrypted_gcs_blob
+            import io
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+            buf = io.BytesIO()
+            stream_gen, _, _ = stream_decrypted_gcs_blob(target_doc.file_path, tenant_dek, context="lg_issuance_doc")
+            for chunk in stream_gen:
+                buf.write(chunk)
+            pdf_bytes = buf.getvalue()
         except Exception as e:
             _log.warning(f"Could not download doc {target_doc.id} from GCS for auto-verification: {e}")
     elif os.path.exists(target_doc.file_path):
@@ -1163,29 +1166,22 @@ async def public_upload_document(
     if not request:
         raise HTTPException(status_code=404, detail="Request not found")
 
-    # Validate file size (max 10 MB)
-    file_content = await file.read()
-    if len(file_content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File size exceeds 10MB limit")
-
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     unique_filename = f"REQ-{request_id}_{document_type}_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
 
-    from app.core.storage_service import build_customer_blob_path
+    from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+    from app.services.tenant_key_service import tenant_key_service
     doc_type_slug = _slugify_doc_type(document_type)
     blob_path = build_customer_blob_path(customer_id, "issuance/requests", f"req_{request_id}/{doc_type_slug}/{unique_filename}")
 
-    # Get customer-specific bucket or fallback
-    from app.crud import crud_customer_configuration
-    bucket_name = GCS_BUCKET_NAME
-    bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(
-        db, customer_id, "STORAGE_BUCKET_NAME"
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+    stored_uri = upload_stream_to_gcs_encrypted(
+        source_stream=file.file,
+        destination_blob_name=blob_path,
+        tenant_dek=tenant_dek,
+        content_type=file.content_type or "application/pdf",
+        context="lg_issuance_doc"
     )
-    if bucket_config and bucket_config.get('effective_value'):
-        bucket_name = bucket_config['effective_value']
-
-    # Upload
-    stored_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, file.content_type)
     if not stored_uri:
         raise HTTPException(status_code=500, detail="Failed to upload document")
 
@@ -1318,14 +1314,17 @@ async def public_analyze_document(
             target_doc_type = target_doc.document_type or target_doc_type
             if target_doc.file_path and target_doc.file_path.startswith("gs://"):
                 try:
-                    path_parts = target_doc.file_path[5:].split('/', 1)
-                    client = _get_gcs_client()
-                    if client:
-                        bucket = client.bucket(path_parts[0])
-                        blob = bucket.blob(path_parts[1])
-                        pdf_bytes = blob.download_as_bytes()
+                    from app.services.tenant_key_service import tenant_key_service
+                    from app.core.storage_service import stream_decrypted_gcs_blob
+                    import io
+                    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+                    buf = io.BytesIO()
+                    stream_gen, _, _ = stream_decrypted_gcs_blob(target_doc.file_path, tenant_dek, context="lg_issuance_doc")
+                    for chunk in stream_gen:
+                        buf.write(chunk)
+                    pdf_bytes = buf.getvalue()
                 except Exception as e:
-                    logger.warning(f"Failed to download attached doc from GCS: {e}")
+                    logger.warning(f"Failed to download and decrypt attached doc from GCS: {e}")
             elif target_doc.file_path and os.path.exists(target_doc.file_path):
                 try:
                     with open(target_doc.file_path, "rb") as f:
@@ -1494,30 +1493,26 @@ async def public_upload_maintenance_document(
     access_data = verify_portal_token(token)
     customer_id = access_data["customer_id"]
 
-    file_content = await file.read()
-    if len(file_content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File size exceeds 10MB limit")
-
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     unique_name = f"MAINT_DOC_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
-    from app.core.storage_service import build_customer_blob_path
+    from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+    from app.services.tenant_key_service import tenant_key_service
     blob_path = build_customer_blob_path(customer_id, "issuance/maintenance", f"maint_docs/{unique_name}")
 
-    bucket_name = GCS_BUCKET_NAME
-    bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(
-        db, customer_id, "STORAGE_BUCKET_NAME"
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+    stored_uri = upload_stream_to_gcs_encrypted(
+        source_stream=file.file,
+        destination_blob_name=blob_path,
+        tenant_dek=tenant_dek,
+        content_type=file.content_type or "application/pdf",
+        context="lg_issuance_doc"
     )
-    if bucket_config and bucket_config.get('effective_value'):
-        bucket_name = bucket_config['effective_value']
-
-    stored_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, file.content_type)
     if not stored_uri:
         raise HTTPException(status_code=500, detail="Failed to upload document")
 
     return {
         "uri": stored_uri,
         "file_name": file.filename,
-        "size_bytes": len(file_content),
     }
 
 

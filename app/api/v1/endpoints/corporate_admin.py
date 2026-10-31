@@ -2134,7 +2134,10 @@ async def get_active_system_notifications_corporate_admin( # Use your existing f
         
         if n.image_url and n.image_url.startswith("gs://"):
             # Use the safe async wrapper
-            signed_url = await _safe_generate_signed_url(n.image_url)
+            import asyncio
+            from app.core.ai_integration import generate_signed_gcs_url
+            res_url = generate_signed_gcs_url(n.image_url)
+            signed_url = await res_url if asyncio.iscoroutine(res_url) else res_url
             if signed_url:
                 n.image_url = signed_url
         
@@ -2717,7 +2720,7 @@ def approve_quotation_request(
                             link=approver_link,
                             email_purpose="BANK_APPROVAL_REQUIRED"
                         )
-                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
+                        background_tasks.add_task(send_email, None, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
 
                     if non_approver_emails:
                         subject, body = build_quotation_rfq_bank_email(
@@ -2728,7 +2731,7 @@ def approve_quotation_request(
                             link="",
                             email_purpose="BANK_HEADS_UP"
                         )
-                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+                        background_tasks.add_task(send_email, None, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
 
                 else:
                     # Standard Invitation - No bank approver required
@@ -2744,7 +2747,7 @@ def approve_quotation_request(
                         )
                         background_tasks.add_task(
                             send_email,
-                            db,
+                            None,
                             all_bank_emails,
                             subject,
                             body,
@@ -2868,7 +2871,7 @@ def approve_quotation_cancellation(
                 )
                 background_tasks.add_task(
                     send_email,
-                    db,
+                    None,
                     target_emails,
                     subject,
                     body,
@@ -2995,12 +2998,14 @@ async def decline_quotation_deal(
         except Exception:
             body = {}
     reason = body.get("reason", "Declined by corporate treasury desk")
+    update_reason_only = bool(body.get("update_reason_only", False))
 
     return await execute_shared_deal_decline(
         rfq_id=rfq_id,
         user_id=corporate_admin_context.user_id,
         reason=reason,
-        db=db
+        db=db,
+        update_reason_only=update_reason_only
     )
 
 

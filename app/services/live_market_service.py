@@ -17,6 +17,7 @@ Live Market Benchmark & Dynamic Empirical Reference Service (Phase 6.5).
    - Mandatory Regulatory & Governance Disclaimer attached to all payloads.
 """
 
+import os
 import logging
 import json
 import urllib.request
@@ -37,9 +38,11 @@ _LIVE_CACHE: Dict[str, Dict[str, Any]] = {}
 _LAST_FETCH_ATTEMPT: Optional[datetime] = None
 _ARCHIVE_THROTTLE: Dict[str, datetime] = {}
 _EMPIRICAL_CACHE: Dict[str, Dict[str, Any]] = {}
+_TWELVE_DATA_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 300
 RETRY_BACKOFF_SECONDS = 60
 EMPIRICAL_CACHE_TTL_SECONDS = 30
+TWELVE_DATA_CACHE_TTL_SECONDS = 30
 
 DISCLAIMER_TEXT = (
     "⚠️ Historical Empirical Model: Reference rate and spread are derived mathematically from "
@@ -135,6 +138,65 @@ class LiveMarketService:
             return cache_entry["rates"]
         return {}
 
+    def fetch_twelve_data_rates(self, pairs: List[str]) -> Dict[str, float]:
+        """
+        Fetches real-time intraday FX spot rates using Twelve Data batch API.
+        Enforces a 30s in-memory cache to eliminate redundant external calls across
+        multiple legs or users observing the same closing tender.
+        """
+        api_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+        if not api_key:
+            return {}
+
+        now = datetime.now(timezone.utc)
+        normalized_pairs = [p.upper().strip() for p in pairs if p and "/" in p]
+        if not normalized_pairs:
+            return {}
+
+        results: Dict[str, float] = {}
+        missing_pairs: List[str] = []
+
+        # Check in-memory cache first
+        for pair in normalized_pairs:
+            cached = _TWELVE_DATA_CACHE.get(pair)
+            if cached and (now - cached["timestamp"]).total_seconds() < TWELVE_DATA_CACHE_TTL_SECONDS:
+                results[pair] = cached["rate"]
+            else:
+                missing_pairs.append(pair)
+
+        if not missing_pairs:
+            return results
+
+        try:
+            symbols_param = ",".join(missing_pairs)
+            url = f"https://api.twelvedata.com/price?symbol={symbols_param}&apikey={api_key}"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "GrowTreasury/2.0 (Platform Benchmark Engine)"}
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as response:
+                if response.status == 200:
+                    payload = json.loads(response.read().decode('utf-8'))
+
+                    # Single symbol response: {"price": "56.1005"}
+                    if len(missing_pairs) == 1 and "price" in payload:
+                        pair = missing_pairs[0]
+                        rate_val = round(float(payload["price"]), 4)
+                        results[pair] = rate_val
+                        _TWELVE_DATA_CACHE[pair] = {"rate": rate_val, "timestamp": now}
+
+                    # Multi-symbol response: {"USD/EGP": {"price": "56.1005"}, "EUR/EGP": {"price": "62.5158"}}
+                    elif isinstance(payload, dict):
+                        for pair in missing_pairs:
+                            if pair in payload and isinstance(payload[pair], dict) and "price" in payload[pair]:
+                                rate_val = round(float(payload[pair]["price"]), 4)
+                                results[pair] = rate_val
+                                _TWELVE_DATA_CACHE[pair] = {"rate": rate_val, "timestamp": now}
+        except Exception as e:
+            logger.warning(f"Twelve Data live FX batch fetch failed or timed out: {e}. Falling back gracefully.")
+
+        return results
+
     def get_live_interbank_mid(
         self,
         db: Session,
@@ -143,7 +205,7 @@ class LiveMarketService:
     ) -> Dict[str, Any]:
         """
         Calculates live interbank mid rate and CBE gap (drift).
-        Multi-tier: Live Market API -> CBE Local Database.
+        Multi-tier: Twelve Data Real-Time -> Open ER-API Feed -> CBE Local Database.
         """
         from_code = (from_code or "USD").upper().strip()
         to_code = (to_code or "EGP").upper().strip()
@@ -152,24 +214,38 @@ class LiveMarketService:
         cbe_info = self.get_cbe_official_rate(db, from_code, to_code)
         cbe_mid = cbe_info["cbe_mid"] if cbe_info else None
 
-        rates = self.fetch_live_rates()
         live_mid = None
         source = "CBE_OFFICIAL_FIXING"
 
-        # Direct cross calculation from USD base rates
-        if rates:
-            if from_code == "USD" and to_code in rates:
-                live_mid = round(float(rates[to_code]), 4)
-                source = "INTERBANK_LIVE_FEED"
-            elif to_code == "USD" and from_code in rates:
-                live_mid = round(1.0 / float(rates[from_code]), 4)
-                source = "INTERBANK_LIVE_FEED"
-            elif from_code in rates and to_code in rates and float(rates[from_code]) > 0:
-                # Triangulate: e.g. EUR/EGP = (USD/EGP) / (USD/EUR)
-                live_mid = round(float(rates[to_code]) / float(rates[from_code]), 4)
-                source = "INTERBANK_LIVE_FEED"
+        # Tier 1: Real-time Intraday Spot from Twelve Data (if API key configured)
+        td_rates = self.fetch_twelve_data_rates([pair_str])
+        if pair_str in td_rates and td_rates[pair_str] > 0:
+            live_mid = td_rates[pair_str]
+            source = "TWELVE_DATA_REALTIME"
+        else:
+            # Check inverse pair e.g. EGP/USD
+            inv_pair = f"{to_code}/{from_code}"
+            inv_rates = self.fetch_twelve_data_rates([inv_pair])
+            if inv_pair in inv_rates and inv_rates[inv_pair] > 0:
+                live_mid = round(1.0 / float(inv_rates[inv_pair]), 4)
+                source = "TWELVE_DATA_REALTIME"
 
-        # Fallback to CBE official fixing if live feed is unavailable or missing pair
+        # Tier 2: Open Market API (Open ER-API free fallback)
+        if live_mid is None:
+            rates = self.fetch_live_rates()
+            if rates:
+                if from_code == "USD" and to_code in rates:
+                    live_mid = round(float(rates[to_code]), 4)
+                    source = "INTERBANK_LIVE_FEED"
+                elif to_code == "USD" and from_code in rates:
+                    live_mid = round(1.0 / float(rates[from_code]), 4)
+                    source = "INTERBANK_LIVE_FEED"
+                elif from_code in rates and to_code in rates and float(rates[from_code]) > 0:
+                    # Triangulate: e.g. EUR/EGP = (USD/EGP) / (USD/EUR)
+                    live_mid = round(float(rates[to_code]) / float(rates[from_code]), 4)
+                    source = "INTERBANK_LIVE_FEED"
+
+        # Tier 3: Fallback to CBE official fixing if live feeds are unavailable or missing pair
         if live_mid is None:
             if cbe_mid is not None:
                 live_mid = cbe_mid
@@ -212,13 +288,92 @@ class LiveMarketService:
             "currency_pair": pair_str,
             "live_mid": live_mid,
             "source": source,
-            "is_live_feed": (source == "INTERBANK_LIVE_FEED"),
+            "is_live_feed": (source in ("TWELVE_DATA_REALTIME", "INTERBANK_LIVE_FEED")),
             "cbe_official_mid": cbe_mid,
             "cbe_fixing_date": cbe_info["rate_date"] if cbe_info else None,
             "cbe_gap": cbe_gap,
             "cbe_gap_bps": cbe_gap_bps,
             "cbe_gap_pips": cbe_gap_pips,
             "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+    def snapshot_rfq_market_benchmarks(
+        self,
+        db: Session,
+        rfq: QuotationRequest
+    ) -> Dict[str, Any]:
+        """
+        Batches and permanently freezes real-time market benchmarks for an RFQ and all its legs
+        at the moment the RFQ window closes. Pre-fetches all unique currency pairs across all
+        legs in a SINGLE Twelve Data batch API call to maximize rate freshness while minimizing API usage.
+        """
+        if not rfq or (getattr(rfq, 'type', None) and rfq.type != 'FX_SPOT'):
+            return {}
+
+        now_utc = datetime.now(timezone.utc)
+
+        # 1. Collect all distinct currency pairs across RFQ and its legs
+        pairs_to_fetch = set()
+
+        root_from = (rfq.buy_currency or "USD").upper().strip()
+        root_to = (rfq.sell_currency or "EGP").upper().strip()
+        if root_from and root_to and root_from != root_to:
+            pairs_to_fetch.add(f"{root_from}/{root_to}")
+
+        legs = getattr(rfq, 'legs', []) or []
+        for leg in legs:
+            l_from = (getattr(leg, 'buy_currency', None) or root_from).upper().strip()
+            l_to = (getattr(leg, 'sell_currency', None) or root_to).upper().strip()
+            if l_from and l_to and l_from != l_to:
+                pairs_to_fetch.add(f"{l_from}/{l_to}")
+
+        # 2. Pre-fetch all pairs in a single batch Twelve Data call (populates in-memory 30s cache)
+        if pairs_to_fetch:
+            self.fetch_twelve_data_rates(list(pairs_to_fetch))
+
+        # 3. Snapshot for each leg
+        for leg in legs:
+            if getattr(leg, 'market_benchmark_snapshot', None):
+                continue
+            l_from = (getattr(leg, 'buy_currency', None) or root_from).upper().strip()
+            l_to = (getattr(leg, 'sell_currency', None) or root_to).upper().strip()
+            leg_dir = (getattr(leg, 'direction', None) or rfq.direction or 'BUY').upper().strip()
+            try:
+                leg_bm = self.get_empirical_reference(
+                    db,
+                    customer_id=rfq.customer_id,
+                    from_code=l_from,
+                    to_code=l_to,
+                    direction=leg_dir,
+                    amount=getattr(leg, 'amount', None)
+                )
+                leg_bm["frozen_at"] = now_utc.isoformat()
+                leg_bm["is_frozen_snapshot"] = True
+                leg.market_benchmark_snapshot = leg_bm
+            except Exception as leg_err:
+                logger.warning(f"Error snapshotting leg {leg.id} benchmark: {leg_err}")
+
+        # 4. Snapshot for root RFQ
+        root_bm = getattr(rfq, 'market_benchmark_snapshot', None)
+        if not root_bm:
+            try:
+                root_bm = self.get_empirical_reference(
+                    db,
+                    customer_id=rfq.customer_id,
+                    from_code=root_from,
+                    to_code=root_to,
+                    direction=(rfq.direction or 'BUY').upper().strip(),
+                    amount=rfq.amount
+                )
+                root_bm["frozen_at"] = now_utc.isoformat()
+                root_bm["is_frozen_snapshot"] = True
+                rfq.market_benchmark_snapshot = root_bm
+            except Exception as root_err:
+                logger.warning(f"Error snapshotting root RFQ {rfq.id} benchmark: {root_err}")
+
+        return {
+            "root_benchmark": root_bm,
+            "legs_snapshotted": len(legs)
         }
 
     def get_empirical_reference(
@@ -306,7 +461,7 @@ class LiveMarketService:
                         hist_mid = (float(cbe_hist.buy_rate) + float(cbe_hist.sell_rate)) / 2.0
 
                 if not hist_mid or hist_mid <= 0:
-                    hist_mid = r.eval_rate or (sum(prices) / len(prices))
+                    hist_mid = (sum(prices) / len(prices)) if prices else None
 
                 if hist_mid and hist_mid > 0:
                     spread_bps = ((winning_price - hist_mid) / hist_mid) * 10000.0

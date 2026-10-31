@@ -50,6 +50,36 @@ def get_frontend_base_url(request: Optional[object] = None) -> str:
     return "http://localhost:3000"
 
 
+def get_backend_base_url(request: Optional[object] = None) -> str:
+    """
+    Returns the canonical backend API base URL for document streaming and download endpoints.
+    Priority:
+    1. BACKEND_URL or API_BASE_URL environment variable
+    2. Host and proto from incoming request
+    3. Production / Staging domain detection
+    4. Default: http://localhost:8000
+    """
+    env_backend = os.getenv("BACKEND_URL") or os.getenv("API_BASE_URL")
+    if env_backend and env_backend.strip():
+        return env_backend.rstrip("/")
+
+    if request and hasattr(request, "headers"):
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if host:
+            is_ssl = "growbusinessdevelopment.com" in str(host) or "render.com" in str(host) or "vercel.app" in str(host)
+            proto = request.headers.get("x-forwarded-proto", "https" if is_ssl else "http")
+            return f"{proto}://{host}".rstrip("/")
+
+    db_url = os.getenv("DATABASE_URL", "").lower()
+    if "staging" in db_url or os.getenv("ENVIRONMENT") == "staging":
+        return "https://staging-api.growbusinessdevelopment.com"
+    if "grow_xl8z" in db_url or os.getenv("ENVIRONMENT") == "production" or os.getenv("RENDER"):
+        return "https://api.growbusinessdevelopment.com"
+
+    return "http://localhost:8000"
+
+
+
 def get_entity_link(entity_type: str, entity_id: Optional[int] = None, role: str = "end_user") -> str:
     """
     Returns the canonical frontend in-app route for a given entity type and role.

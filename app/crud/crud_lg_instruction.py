@@ -143,6 +143,46 @@ class CRUDLGInstruction(CRUDBase):
                 db.add(db_obj)
                 db.flush()
                 db.refresh(db_obj)
+
+                # Auto-supersede any unprinted Discrepancy Letter on older instructions when a new operational instruction is issued on the same LG
+                if full_action_type_for_db != ACTION_TYPE_LG_REMINDER_TO_BANKS:
+                    try:
+                        from sqlalchemy.orm.attributes import flag_modified
+                        prior_rejected_insts = db.query(self.model).filter(
+                            self.model.lg_record_id == lg_record_id,
+                            self.model.id != db_obj.id,
+                            self.model.is_deleted == False,
+                            self.model.details['bank_terms_admin_approval']['status'].astext == 'REJECTED_BY_ADMIN',
+                        ).all()
+                        for prior_inst in prior_rejected_insts:
+                            p_details = dict(prior_inst.details or {})
+                            p_approval = dict(p_details.get("bank_terms_admin_approval") or {})
+                            p_approval["status"] = "SUPERSEDED_BY_NEW_INSTRUCTION"
+                            p_approval["superseded_by_instruction_id"] = db_obj.id
+                            p_approval["superseded_by_serial"] = db_obj.serial_number
+                            p_approval["discrepancy_letter_ready"] = False
+                            p_details["bank_terms_admin_approval"] = p_approval
+                            prior_inst.details = p_details
+                            flag_modified(prior_inst, "details")
+                            db.add(prior_inst)
+                        if prior_rejected_insts:
+                            db.flush()
+                    except Exception:
+                        logger.warning("Failed to auto-supersede prior discrepancy letters on new instruction create", exc_info=True)
+                try:
+                    from app.services.notifications.lg_custody_service import resolve_stale_custody_notifications
+                    from app.services.notifications.catalog import EventCode
+                    resolve_stale_custody_notifications(
+                        db,
+                        lg_record_id,
+                        event_codes=[
+                            EventCode.LG_CUSTODY_INACTION_ESCALATION,
+                            EventCode.LG_USER_EXPIRY_ACTION_NOTICE,
+                            EventCode.LG_USER_PRE_ESCALATION_WARNING,
+                        ],
+                    )
+                except Exception:
+                    logger.warning("Failed to auto-resolve stale custody notifications on instruction create", exc_info=True)
                 return db_obj
 
             except IntegrityError as e:
@@ -180,6 +220,8 @@ class CRUDLGInstruction(CRUDBase):
         if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != customer_id:
             logger.warning(f"[CRUDLGInstruction.record_instruction_delivery] Instruction {instruction_id} not found or not accessible for customer {customer_id}.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
+        if db_instruction.status == "Canceled":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot record delivery for a canceled instruction.")
         if db_instruction.status == "Instruction Delivered":
             logger.warning(f"[CRUDLGInstruction.record_instruction_delivery] Instruction {instruction_id} is already marked as delivered.")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Instruction is already marked as delivered.")
@@ -244,6 +286,11 @@ class CRUDLGInstruction(CRUDBase):
             lg_record_id=db_instruction.lg_record.id,
         )
         logger.debug(f"[CRUDLGInstruction.record_instruction_delivery] Audit log recorded for instruction delivery.")
+        try:
+            from app.services.notifications.lg_custody_service import resolve_stale_custody_notifications
+            resolve_stale_custody_notifications(db, db_instruction.lg_record.id)
+        except Exception:
+            logger.warning("Failed to auto-resolve stale custody notifications on delivery record", exc_info=True)
         db.refresh(db_instruction)
         return db_instruction
 
@@ -261,6 +308,8 @@ class CRUDLGInstruction(CRUDBase):
         if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != customer_id:
             logger.warning(f"[CRUDLGInstruction.record_bank_reply] Instruction {instruction_id} not found or not accessible for customer {customer_id}.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
+        if db_instruction.status == "Canceled":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot record bank reply for a canceled instruction.")
         if db_instruction.bank_reply_date is not None:
             logger.warning(f"[CRUDLGInstruction.record_bank_reply] Bank reply date already set for instruction {instruction_id}. Overwriting existing reply details.")
         db_instruction.bank_reply_date = obj_in.bank_reply_date
@@ -325,6 +374,11 @@ class CRUDLGInstruction(CRUDBase):
             lg_record_id=db_instruction.lg_record.id,
         )
         logger.debug(f"[CRUDLGInstruction.record_bank_reply] Audit log recorded for bank reply.")
+        try:
+            from app.services.notifications.lg_custody_service import resolve_stale_custody_notifications
+            resolve_stale_custody_notifications(db, db_instruction.lg_record.id)
+        except Exception:
+            logger.warning("Failed to auto-resolve stale custody notifications on bank reply", exc_info=True)
         db.refresh(db_instruction)
         return db_instruction
 
@@ -424,8 +478,12 @@ class CRUDLGInstruction(CRUDBase):
             func.date(self.model.instruction_date) <= (current_date_obj - timedelta(days=days_since_issuance))
         )
 
+        condition_terms_rejected = (
+            self.model.details['bank_terms_admin_approval']['status'].astext == 'REJECTED_BY_ADMIN'
+        )
+
         final_query = query.filter(
-            condition_delivered_and_overdue | condition_undelivered_and_overdue_by_issuance
+            condition_delivered_and_overdue | condition_undelivered_and_overdue_by_issuance | condition_terms_rejected
         )
 
         logger.info(f"Generated SQL Query (get_instructions_for_bank_reminders): {final_query.statement.compile(dialect=db.bind.dialect, compile_kwargs={'literal_binds': True})}")
@@ -534,7 +592,7 @@ class CRUDLGInstruction(CRUDBase):
             "lg_amount": float(lg_record.lg_amount),
             "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
             "lg_currency": lg_record.lg_currency.iso_code,
-            "issuing_bank_name": lg_record.issuing_bank.name,
+            "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record),
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "customer_name": lg_record.customer.name,
             "customer_address": customer_address,
@@ -780,7 +838,7 @@ class CRUDLGInstruction(CRUDBase):
                 "lg_amount": float(lg_record.lg_amount),
                 "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
                 "lg_currency": lg_record.lg_currency.iso_code,
-                "issuing_bank_name": lg_record.issuing_bank.name,
+                "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record),
                 "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
                 "customer_name": lg_record.customer.name,
                 "customer_address": customer_address_final,

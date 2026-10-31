@@ -98,6 +98,14 @@ class LiveRankingService:
 
         # Resolve target leg
         from app.models.models_quotation import QuotationLeg
+        from app.services.tenant_key_service import tenant_key_service
+        tenant_dek = None
+        if getattr(rfq, "customer_id", None):
+            try:
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+            except Exception:
+                tenant_dek = None
+
         target_leg = None
         if leg_id:
             target_leg = db.query(QuotationLeg).filter(QuotationLeg.id == leg_id, QuotationLeg.rfq_id == rfq_id).first()
@@ -118,9 +126,13 @@ class LiveRankingService:
             offers = offers_query.order_by(QuotationOffer.submitted_at.desc()).all()
 
             latest_offers_by_assignment = {}
+            resolved_prices_by_assignment = {}
             for off in offers:
-                if off.assignment_id not in latest_offers_by_assignment and off.price is not None:
-                    latest_offers_by_assignment[off.assignment_id] = off
+                if off.assignment_id not in latest_offers_by_assignment:
+                    resolved_p = tenant_key_service.resolve_offer_price(off, tenant_dek)
+                    if resolved_p and resolved_p > 0:
+                        latest_offers_by_assignment[off.assignment_id] = off
+                        resolved_prices_by_assignment[off.assignment_id] = float(resolved_p)
 
             if assignment_id not in latest_offers_by_assignment:
                 return None  # Bank hasn't submitted a quote yet for this leg
@@ -133,7 +145,7 @@ class LiveRankingService:
             ranked_items = []
             for aid, off in latest_offers_by_assignment.items():
                 a = assignment_map.get(aid)
-                price = float(off.price)
+                price = resolved_prices_by_assignment[aid]
 
                 # Bank fee calculation using pair config if available
                 raw_fee = 0.0
@@ -183,26 +195,27 @@ class LiveRankingService:
                     return idx + 1
 
         elif rfq.type == "TBILL":
-            # For T-Bills, get offers per assignment and compute average/effective discount rate
+            # For T-Bills, get offers per assignment and resolve encrypted discount rate
             tbill_offers = db.query(QuotationTBillOffer).filter(
                 QuotationTBillOffer.assignment_id.in_(assignment_ids)
             ).all()
 
             rates_by_assignment: Dict[str, List[float]] = {}
             for off in tbill_offers:
-                if off.discount_rate is not None:
-                    rates_by_assignment.setdefault(off.assignment_id, []).append(float(off.discount_rate))
+                resolved_rate = tenant_key_service.resolve_tbill_discount_rate(off, tenant_dek)
+                if resolved_rate and resolved_rate > 0:
+                    rates_by_assignment.setdefault(off.assignment_id, []).append(float(resolved_rate))
 
             if assignment_id not in rates_by_assignment:
                 return None
 
-            # For each bank, take the best (highest) discount rate offered
+            is_sell = (rfq.direction or "").upper() == "SELL"
+            # Buy T-Bill: highest discount rate is best; Sell T-Bill: lowest discount rate is best
             best_rate_by_assignment = {
-                aid: max(rates) for aid, rates in rates_by_assignment.items() if rates
+                aid: (min(rates) if is_sell else max(rates))
+                for aid, rates in rates_by_assignment.items() if rates
             }
 
-            # Higher discount rate / yield is better for corporate buyer (descending sort)
-            is_sell = (rfq.direction or "").upper() == "SELL"
             sorted_items = sorted(
                 best_rate_by_assignment.items(),
                 key=lambda item: item[1],

@@ -183,7 +183,7 @@ async def run_daily_undelivered_instructions_report(db: Session):
                 </div>
             """
 
-            subject = f"Urgent: {len(undelivered)} Undelivered LG Instruction(s) Found — {customer.name}"
+            subject = f"Action Required · {len(undelivered)} Undelivered LG Letter(s)"
 
             body = build_alert_email_html(
                 customer_name=customer.name,
@@ -317,7 +317,7 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
     email_settings, _ = get_customer_email_settings(db, customer.id)
     await send_email(
         db=db, to_emails=to_emails, 
-        subject_template=f"System Notification: Configuration Update for {customer.name}",
+        subject_template="Configuration Update · Policy Adjustment",
         body_template=html_body, template_data={}, 
         email_settings=email_settings, sender_name=customer.name
     )
@@ -473,7 +473,7 @@ async def run_daily_print_reminders(db: Session):
 
                 alert_type = "critical" if has_escalation else "warning"
                 title_text = f"⚠️ Action Required: {len(items)} Approved LG Physical Print(s) Pending"
-                subject = f"{'ESCALATION' if has_escalation else 'REMINDER'}: {len(items)} Approved LG Instruction(s) Pending Physical Print — {customer.name}"
+                subject = f"{'Escalation' if has_escalation else 'Print Reminder'} · {len(items)} Approved LG Letter(s)"
                 recipient_display = items[0]["maker_user"].email.split('@')[0]
 
                 email_body_html = build_alert_email_html(
@@ -539,6 +539,14 @@ async def run_daily_renewal_reminders(db: Session):
     except Exception as e:
         db.rollback()
         logger.error(f"Error in Feature 2 (Internal Owners) reminders: {e}", exc_info=True)
+
+    # Feature 3: Smart Mobile Alerts for LG Custody (Inaction Escalation, Undelivered Letters, Day 0 Cutoff)
+    try:
+        from app.services.notifications.lg_custody_service import run_lg_custody_mobile_alerts_sweep
+        await run_lg_custody_mobile_alerts_sweep(db)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error in Feature 3 (LG Custody Mobile Alerts): {e}", exc_info=True)
 
     logger.info("Renewal reminders completed.")
 
@@ -1772,7 +1780,7 @@ async def run_daily_sla_breach_alerts(db: Session):
 
                 cust = db.query(models.Customer).filter(models.Customer.id == cust_id).first()
                 cust_name = cust.name if cust else "Grow Treasury"
-                subject = f"⚠️ SLA Breach Alert — {len(breaches)} LG(s) Awaiting Bank Response"
+                subject = f"SLA Breach Alert · {len(breaches)} LG(s) Awaiting Bank Response"
                 
                 table_html = f"""
                 <table style="width:100%; border-collapse:collapse; text-align:left;">
@@ -2850,5 +2858,25 @@ async def run_daily_memory_maintenance(db: Session):
             
     except Exception as e:
         logger.warning(f"Error during memory maintenance job: {e}")
+
+
+async def run_quiet_times_dealer_mobile_reminders(db: Session):
+    """
+    Daily off-peak / quiet-hours job (scheduled at 16:30 Cairo time, after main trading hours):
+    Quietly sends an optional Grow-branded invitation to bank dealers with NO linked device.
+    Strictly enforces:
+    - Calm, non-pushy language with clear assurance that web portal remains fully functional.
+    - 45-day cooldown between emails.
+    - Only dealers whose bank allows dealer mobile alerts.
+    - Only dealers with zero active linked push devices.
+    """
+    logger.info("Running quiet-times dealer mobile alert reminder check...")
+    try:
+        from app.services.dealer_alert_reminder_service import process_quiet_times_dealer_reminders
+        sent_count = await process_quiet_times_dealer_reminders(db)
+        logger.info(f"Quiet-times dealer reminders completed: {sent_count} emails dispatched.")
+    except Exception as e:
+        logger.error(f"Error in quiet-times dealer reminder job: {e}", exc_info=True)
+
 
 

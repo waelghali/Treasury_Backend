@@ -28,11 +28,24 @@ class EventCode(str, Enum):
     RFQ_CANCELLATION_DECIDED = "RFQ_CANCELLATION_DECIDED"
 
     # Quotation — timed events raised by the window sweeper (Phase Q4)
+    RFQ_STARTING_SOON = "RFQ_STARTING_SOON"
+    RFQ_NO_DEALERS_CHECKED_IN = "RFQ_NO_DEALERS_CHECKED_IN"
     RFQ_CLOSING_SOON = "RFQ_CLOSING_SOON"
     RFQ_QUOTES_READY = "RFQ_QUOTES_READY"
     RFQ_RESULTS_READY = "RFQ_RESULTS_READY"
     RFQ_CLOSED_NO_QUOTES = "RFQ_CLOSED_NO_QUOTES"
     RFQ_DEAL_AUTO_RESOLVED = "RFQ_DEAL_AUTO_RESOLVED"
+
+    # LG Custody (Inbound Guarantees)
+    LG_CUSTODY_INACTION_ESCALATION = "LG_CUSTODY_INACTION_ESCALATION"
+    LG_CUSTODY_UNDELIVERED_LETTER = "LG_CUSTODY_UNDELIVERED_LETTER"
+    LG_CUSTODY_APPROVAL_REQUIRED = "LG_CUSTODY_APPROVAL_REQUIRED"
+    LG_CUSTODY_DAY_ZERO = "LG_CUSTODY_DAY_ZERO"
+    LG_CUSTODY_BANK_DEFECT = "LG_CUSTODY_BANK_DEFECT"
+    LG_USER_EXPIRY_ACTION_NOTICE = "LG_USER_EXPIRY_ACTION_NOTICE"
+    LG_USER_PRE_ESCALATION_WARNING = "LG_USER_PRE_ESCALATION_WARNING"
+    LG_USER_REQUEST_DECIDED = "LG_USER_REQUEST_DECIDED"
+    LG_CUSTODY_PORTFOLIO_BURST_DIGEST = "LG_CUSTODY_PORTFOLIO_BURST_DIGEST"
 
 
 class Urgency(str, Enum):
@@ -47,6 +60,9 @@ class LinkTarget(str, Enum):
     RFQ_APPROVALS = "RFQ_APPROVALS"      # /corporate-admin/quotations/approvals
     RFQ_ACTIVE = "RFQ_ACTIVE"            # maker's active/editable RFQs
     RFQ_HISTORY = "RFQ_HISTORY"          # maker's RFQ history
+    LG_CUSTODY_DETAIL = "LG_CUSTODY_DETAIL"          # /{role}/lg-records/{lg_id}
+    LG_CUSTODY_LIST = "LG_CUSTODY_LIST"              # /{role}/lg-records
+    LG_CUSTODY_APPROVALS = "LG_CUSTODY_APPROVALS"    # /corporate-admin/approval-requests
 
 
 class ExpiryPolicy(str, Enum):
@@ -72,6 +88,7 @@ class EventSpec:
 
 
 QUOTATIONS = "QUOTATIONS"
+LG_CUSTODY = "LG_CUSTODY"
 
 CATALOG: Dict[EventCode, EventSpec] = {
     EventCode.RFQ_APPROVAL_REQUIRED: EventSpec(
@@ -134,12 +151,39 @@ CATALOG: Dict[EventCode, EventSpec] = {
     ),
 
     # ── Timed events (Phase Q4) ──────────────────────────────────────────────────────
-    # Who can accept/reject a deal: the maker and their delegate.
+    EventCode.RFQ_STARTING_SOON: EventSpec(
+        code=EventCode.RFQ_STARTING_SOON,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Starting soon",
+        body="The quotation window opens in 5 minutes. Get ready to monitor incoming quotes.",
+        link=LinkTarget.RFQ_RESULTS,
+        urgency=Urgency.NORMAL,
+        expiry=ExpiryPolicy.UNTIL_WINDOW_START,
+    ),
+    EventCode.RFQ_NO_DEALERS_CHECKED_IN: EventSpec(
+        code=EventCode.RFQ_NO_DEALERS_CHECKED_IN,
+        module="QUOTATION",
+        category=QUOTATIONS,
+        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        title="RFQ {ref_no} · Low attendance warning",
+        body="0 of {invited_count} invited banks are currently checked in for the upcoming window.",
+        link=LinkTarget.RFQ_RESULTS,
+        urgency=Urgency.HIGH,
+        expiry=ExpiryPolicy.UNTIL_WINDOW_START,
+        allowed_fields=("ref_no", "invited_count"),
+    ),
+    # Who can accept/reject a deal: the maker, their delegate, and corporate admins.
     EventCode.RFQ_CLOSING_SOON: EventSpec(
         code=EventCode.RFQ_CLOSING_SOON,
         module="QUOTATION",
         category=QUOTATIONS,
-        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        audiences=(
+            AudienceKey.RFQ_CREATOR,
+            AudienceKey.RFQ_DELEGATE,
+            AudienceKey.CUSTOMER_CORPORATE_ADMINS,
+        ),
         title="RFQ {ref_no} · Closing soon",
         body="Be ready: the quotation window closes in about 2 minutes and you will need to decide quickly.",
         link=LinkTarget.RFQ_RESULTS,
@@ -150,9 +194,13 @@ CATALOG: Dict[EventCode, EventSpec] = {
         code=EventCode.RFQ_QUOTES_READY,
         module="QUOTATION",
         category=QUOTATIONS,
-        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        audiences=(
+            AudienceKey.RFQ_CREATOR,
+            AudienceKey.RFQ_DELEGATE,
+            AudienceKey.CUSTOMER_CORPORATE_ADMINS,
+        ),
         title="RFQ {ref_no} · Quotes ready – decide now",
-        body="The window has closed. Accept or reject before the acceptance time runs out.",
+        body="Quotes are ready for acceptance. Accept or reject before the acceptance time runs out.",
         link=LinkTarget.RFQ_RESULTS,
         urgency=Urgency.HIGH,
         expiry=ExpiryPolicy.UNTIL_ACCEPTANCE_DEADLINE,
@@ -179,11 +227,116 @@ CATALOG: Dict[EventCode, EventSpec] = {
         code=EventCode.RFQ_DEAL_AUTO_RESOLVED,
         module="QUOTATION",
         category=QUOTATIONS,
-        audiences=(AudienceKey.RFQ_CREATOR, AudienceKey.RFQ_DELEGATE),
+        audiences=(
+            AudienceKey.RFQ_CREATOR,
+            AudienceKey.RFQ_DELEGATE,
+            AudienceKey.CUSTOMER_CORPORATE_ADMINS,
+        ),
         title="RFQ {ref_no} · Deal {decision}",
         body="The acceptance time ran out and the deal was {decision} by your company policy.",
         link=LinkTarget.RFQ_RESULTS,
         allowed_fields=("ref_no", "decision"),
+    ),
+
+    # ── LG Custody events ──────────────────────────────────────────────────────────
+    EventCode.LG_CUSTODY_INACTION_ESCALATION: EventSpec(
+        code=EventCode.LG_CUSTODY_INACTION_ESCALATION,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_CORPORATE_ADMINS,),
+        title="Action Overdue · Custody Escalation",
+        body="LG {masked_lg_no} ({masked_issuer}) expires in {days}d. No extension or release instruction initiated by treasury user.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.HIGH,
+        allowed_fields=("masked_lg_no", "masked_issuer", "days"),
+    ),
+    EventCode.LG_CUSTODY_UNDELIVERED_LETTER: EventSpec(
+        code=EventCode.LG_CUSTODY_UNDELIVERED_LETTER,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_CORPORATE_ADMINS,),
+        title="Risk Alert · Undelivered Bank Letter",
+        body="Instruction for LG {masked_lg_no} ({masked_issuer}) was generated but not marked delivered to the bank. Expiry in {days}d.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.HIGH,
+        allowed_fields=("masked_lg_no", "masked_issuer", "days"),
+    ),
+    EventCode.LG_CUSTODY_APPROVAL_REQUIRED: EventSpec(
+        code=EventCode.LG_CUSTODY_APPROVAL_REQUIRED,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_CORPORATE_ADMINS,),
+        title="Authorization Required · Custody Action",
+        body="User requested {action_type} for LG {masked_lg_no} ({masked_issuer}). Open desktop terminal to review.",
+        link=LinkTarget.LG_CUSTODY_APPROVALS,
+        urgency=Urgency.HIGH,
+        allowed_fields=("masked_lg_no", "masked_issuer", "action_type"),
+    ),
+    EventCode.LG_CUSTODY_DAY_ZERO: EventSpec(
+        code=EventCode.LG_CUSTODY_DAY_ZERO,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_CORPORATE_ADMINS,),
+        title="Final Cutoff · Guarantee Expiry Today",
+        body="LG {masked_lg_no} ({masked_issuer}) expires today with no extension or claim on file.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.HIGH,
+        allowed_fields=("masked_lg_no", "masked_issuer"),
+    ),
+    EventCode.LG_CUSTODY_BANK_DEFECT: EventSpec(
+        code=EventCode.LG_CUSTODY_BANK_DEFECT,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_CORPORATE_ADMINS,),
+        title="Notice · Bank Objection / Defect",
+        body="Bank reply recorded for LG {masked_lg_no} ({masked_issuer}) indicates an objection or defect. Review required.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.HIGH,
+        allowed_fields=("masked_lg_no", "masked_issuer"),
+    ),
+    EventCode.LG_USER_EXPIRY_ACTION_NOTICE: EventSpec(
+        code=EventCode.LG_USER_EXPIRY_ACTION_NOTICE,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_END_USERS,),
+        title="Advisory · Guarantee Action Required",
+        body="LG {masked_lg_no} ({masked_issuer}) expires in 30 days. Please log into desktop terminal to prepare formal instruction.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.NORMAL,
+        allowed_fields=("masked_lg_no", "masked_issuer"),
+    ),
+    EventCode.LG_USER_PRE_ESCALATION_WARNING: EventSpec(
+        code=EventCode.LG_USER_PRE_ESCALATION_WARNING,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_END_USERS,),
+        title="Notice · Pending Management Escalation",
+        body="LG {masked_lg_no} ({masked_issuer}) requires action. Case will escalate to Corporate Treasury in 48h if unaddressed.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.HIGH,
+        allowed_fields=("masked_lg_no", "masked_issuer"),
+    ),
+    EventCode.LG_USER_REQUEST_DECIDED: EventSpec(
+        code=EventCode.LG_USER_REQUEST_DECIDED,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.LG_ACTION_MAKER,),
+        title="Update · Request {status}",
+        body="Your request for LG {masked_lg_no} ({masked_issuer}) has been {status} by Corporate Treasury.",
+        link=LinkTarget.LG_CUSTODY_DETAIL,
+        urgency=Urgency.NORMAL,
+        allowed_fields=("masked_lg_no", "masked_issuer", "status"),
+    ),
+    EventCode.LG_CUSTODY_PORTFOLIO_BURST_DIGEST: EventSpec(
+        code=EventCode.LG_CUSTODY_PORTFOLIO_BURST_DIGEST,
+        module="CUSTODY",
+        category=LG_CUSTODY,
+        audiences=(AudienceKey.CUSTOMER_CORPORATE_ADMINS,),
+        title="Portfolio Alert · {count} Guarantees Require Attention",
+        body="{count} guarantees in your custody portfolio triggered '{summary_type}' today (including LG {masked_lg_no}). Open Grow to review all.",
+        link=LinkTarget.LG_CUSTODY_LIST,
+        urgency=Urgency.HIGH,
+        allowed_fields=("count", "summary_type", "masked_lg_no"),
     ),
 }
 

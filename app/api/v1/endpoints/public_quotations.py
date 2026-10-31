@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict
 import os
@@ -91,16 +91,13 @@ def _validate_rfq_accessible_for_dealers(rfq):
             detail="This quotation request was officially withdrawn by the corporate treasury desk. No quotation is required."
         )
 
-    if rfq.status == 'REJECTED':
-        if getattr(rfq, 'acceptance_status', None) == 'AUTO_REJECTED':
-            detail_msg = "This quotation request concluded without trade execution as the corporate acceptance window expired."
-        elif not getattr(rfq, 'is_dispatched', False) or rfq.dispatched_at is None:
-            detail_msg = "This quotation request was rejected or expired before corporate approval. No quotation is required."
-        else:
-            detail_msg = "This quotation request was rejected by the corporate treasury desk. No quotation is required."
+    # Only lock out dealers if the RFQ was rejected BEFORE it was ever dispatched to banks
+    # (e.g. rejected by Corporate Admin during the pre-dispatch approval workflow).
+    # Once dispatched, dealers must retain access to view the concluded request and outcome.
+    if rfq.status == 'REJECTED' and not getattr(rfq, 'is_dispatched', False):
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
-            detail=detail_msg
+            detail="This quotation request was rejected or expired before corporate approval. No quotation is required."
         )
 
 @router.get("/{token}")
@@ -212,7 +209,7 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
             "settlement_date": o.settlement_date,
             "maturity_date": o.maturity_date,
             "discount_rate": tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek),
-            "max_amount": o.max_amount,
+            "max_amount": tenant_key_service.resolve_tbill_max_amount(o, tenant_dek),
             "notes": o.notes,
             "submitted_by_email": o.submitted_by_email,
             "submitted_at": o.submitted_at
@@ -390,7 +387,14 @@ async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(g
     parsed_docs = []
     is_cross = bool(getattr(assignment, 'is_cross_entity', False))
 
-    if not is_cross and rfq.document_path and (assignment.is_document_visible is not False):
+    if len(portal_legs) == 1:
+        if portal_legs[0].get("value_date"):
+            effective_value_date_str = portal_legs[0]["value_date"]
+        if portal_legs[0].get("allow_alternative_value_date") is not None:
+            effective_allow_alt = bool(portal_legs[0]["allow_alternative_value_date"])
+
+    has_any_leg_doc_vis = any(pl.get("is_document_visible") is True for pl in portal_legs) if portal_legs else (assignment.is_document_visible is not False)
+    if not is_cross and rfq.document_path and ((assignment.is_document_visible is not False) or has_any_leg_doc_vis):
         raw_docs = rfq.get_parsed_documents() if hasattr(rfq, 'get_parsed_documents') else []
         if not raw_docs and rfq.document_path:
             try:
@@ -640,7 +644,7 @@ async def request_quotation_otp(
 ):
     """Generates and emails a 6-digit OTP code + 1-Click Magic Link to the bank representative."""
     # Perimeter Anti-Bot Honeypot Defense
-    await verify_honeypot(req.website_url, request=request, context="quotation_request_otp")
+    await verify_honeypot(req.website_url, request=request, context="quotation_request_otp", legitimate_values=[req.email])
 
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == req.token).first()
     if not assignment:
@@ -772,7 +776,8 @@ async def request_quotation_otp(
     """
 
     bank_display = q_bank.bank.name if q_bank and q_bank.bank else "Treasury Portal"
-    subject = f"RFQ {rfq.ref_no} - Portal Verification Code - {bank_display}"
+    bank_short = (q_bank.bank.short_name or q_bank.bank.name) if q_bank and q_bank.bank else "Treasury Portal"
+    subject = f"RFQ {rfq.ref_no} · Verification Code ({bank_short})"
     body = f"""
     <!DOCTYPE html>
     <html>
@@ -820,7 +825,7 @@ async def request_quotation_otp(
 
     background_tasks.add_task(
         send_email,
-        db=db,
+        db=None,
         to_emails=[target_email],
         subject_template=subject,
         body_template=body,
@@ -930,7 +935,7 @@ def verify_quotation_otp(
 ):
     """Verifies 6-digit OTP code or Magic Link token and establishes authenticated portal session."""
     # Perimeter Anti-Bot Honeypot Defense
-    verify_honeypot_sync(req.website_url, request=request, context="quotation_verify_otp")
+    verify_honeypot_sync(req.website_url, request=request, context="quotation_verify_otp", legitimate_values=[req.email, req.otp_code])
 
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == req.token).first()
     if not assignment:
@@ -1324,24 +1329,32 @@ def submit_fx_offer(
     if w_end and now > (w_end + timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window is closed.")
 
-    # Verify submitter authorization & role if session provided
-    submitted_by = offer_in.email
-    if offer_in.session_token:
-        clean_token = _clean_magic_token(offer_in.session_token)
-        otp_rec = db.query(QuotationAccessOTP).filter(
-            QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == clean_token
-        ).first()
-        if otp_rec:
-            if otp_rec.role == "VIEW_ONLY":
-                raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
-            elif otp_rec.role == "APPROVER":
-                contacts = _get_bank_contacts_list(q_bank) if q_bank else []
-                has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-                is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
-                if not is_indicative and has_execution_dealers:
-                    raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
-            submitted_by = otp_rec.email
+    # Require verified portal session_token (never expires mid-window once verified via OTP or magic link)
+    if not offer_in.session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Active dealer portal authentication session is required to submit a quote."
+        )
+    clean_token = _clean_magic_token(offer_in.session_token)
+    otp_rec = db.query(QuotationAccessOTP).filter(
+        QuotationAccessOTP.assignment_id == assignment.id,
+        QuotationAccessOTP.magic_token == clean_token,
+        QuotationAccessOTP.is_used == True
+    ).first()
+    if not otp_rec:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or unverified dealer session token. Please verify your access code."
+        )
+    if otp_rec.role == "VIEW_ONLY":
+        raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
+    elif otp_rec.role == "APPROVER":
+        contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+        has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+        is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
+        if not is_indicative and has_execution_dealers:
+            raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
+    submitted_by = otp_rec.email
 
     # Verify active trader session lock
     if submitted_by:
@@ -1530,23 +1543,32 @@ def submit_fx_offers_batch(
     if w_end and now > (w_end + timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window is closed.")
 
-    # Authorize submitter
-    submitted_by = payload.email
-    if payload.session_token:
-        clean_token = _clean_magic_token(payload.session_token)
-        otp_rec = db.query(QuotationAccessOTP).filter(
-            QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == clean_token
-        ).first()
-        if otp_rec:
-            if otp_rec.role == "VIEW_ONLY":
-                raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
-            elif otp_rec.role == "APPROVER":
-                contacts = _get_bank_contacts_list(q_bank) if q_bank else []
-                has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-                if has_execution_dealers:
-                    raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
-            submitted_by = otp_rec.email
+    # Require verified portal session_token (never expires mid-window once verified via OTP or magic link)
+    if not payload.session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Active dealer portal authentication session is required to submit quotes."
+        )
+    clean_token = _clean_magic_token(payload.session_token)
+    otp_rec = db.query(QuotationAccessOTP).filter(
+        QuotationAccessOTP.assignment_id == assignment.id,
+        QuotationAccessOTP.magic_token == clean_token,
+        QuotationAccessOTP.is_used == True
+    ).first()
+    if not otp_rec:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or unverified dealer session token. Please verify your access code."
+        )
+    if otp_rec.role == "VIEW_ONLY":
+        raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
+    elif otp_rec.role == "APPROVER":
+        contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+        has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+        is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
+        if not is_indicative and has_execution_dealers:
+            raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
+    submitted_by = otp_rec.email
 
     if submitted_by:
         can_submit, block_reason = desk_session_service.can_submit_quote(
@@ -1782,23 +1804,32 @@ def submit_tbill_offer(
     if w_end and now > (w_end + timedelta(seconds=2)):
         raise HTTPException(status_code=403, detail="Bidding window is closed.")
     
-    # Verify submitter authorization & role if session provided
-    submitted_by = offer_in.email
-    if offer_in.session_token:
-        clean_token = _clean_magic_token(offer_in.session_token)
-        otp_rec = db.query(QuotationAccessOTP).filter(
-            QuotationAccessOTP.assignment_id == assignment.id,
-            QuotationAccessOTP.magic_token == clean_token
-        ).first()
-        if otp_rec:
-            if otp_rec.role == "VIEW_ONLY":
-                raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
-            elif otp_rec.role == "APPROVER":
-                contacts = _get_bank_contacts_list(q_bank) if q_bank else []
-                has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
-                if has_execution_dealers:
-                    raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
-            submitted_by = otp_rec.email
+    # Require verified portal session_token (never expires mid-window once verified via OTP or magic link)
+    if not offer_in.session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Active dealer portal authentication session is required to submit a T-Bill quote."
+        )
+    clean_token = _clean_magic_token(offer_in.session_token)
+    otp_rec = db.query(QuotationAccessOTP).filter(
+        QuotationAccessOTP.assignment_id == assignment.id,
+        QuotationAccessOTP.magic_token == clean_token,
+        QuotationAccessOTP.is_used == True
+    ).first()
+    if not otp_rec:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or unverified dealer session token. Please verify your access code."
+        )
+    if otp_rec.role == "VIEW_ONLY":
+        raise HTTPException(status_code=403, detail="View-only contacts are not authorized to submit bids.")
+    elif otp_rec.role == "APPROVER":
+        contacts = _get_bank_contacts_list(q_bank) if q_bank else []
+        has_execution_dealers = any(c.get("role") == "EXECUTION" for c in contacts)
+        is_indicative = (assignment.quotation_base or rfq.quotation_base or "").lower() == "indicative"
+        if not is_indicative and has_execution_dealers:
+            raise HTTPException(status_code=403, detail="Quotes can only be submitted by authorized Execution dealers.")
+    submitted_by = otp_rec.email
 
     # Verify active trader session lock
     if submitted_by:
@@ -1899,7 +1930,8 @@ def submit_tbill_offer(
     )
     db.commit()
 
-    best_rate = max([line.discountRate for line in offer_in.lines]) if offer_in.lines else 0.0
+    is_sell_tbill = (rfq.direction or "Buy").lower() == "sell"
+    best_rate = (min([line.discountRate for line in offer_in.lines]) if is_sell_tbill else max([line.discountRate for line in offer_in.lines])) if offer_in.lines else 0.0
     desk_session_service.record_quote_submission(assignment.id, submitted_by or "Dealer", best_rate)
 
     return {"success": True, "submitted_by": submitted_by, "live_rank": live_rank_data}
@@ -2102,7 +2134,35 @@ async def approve_rfq_for_bank(
                 link=link,
                 email_purpose="APPROVED_BY_BANK"
             )
-            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+            background_tasks.add_task(send_email, None, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+
+        # Also enqueue dealer push alert to execution dealers now that bank participation is approved
+        try:
+            from app.services.notifications.push_channel import enqueue_dealer_push
+            execution_emails = list(dict.fromkeys(
+                c.get("email", "").strip() for c in contacts
+                if (c.get("role") or "EXECUTION").upper() == "EXECUTION"
+                and c.get("email")
+                and c.get("email").strip().lower() not in approver_email_set
+            ))
+            target_dealer_emails = execution_emails or non_approver_emails
+            if target_dealer_emails:
+                enqueue_dealer_push(
+                    db=db,
+                    assignment_id=assignment.id,
+                    rfq_id=str(rfq.id),
+                    ref_no=rfq.ref_no,
+                    target_url=f"/public-quotation/{assignment.token}",
+                    event_code="DEALER_RFQ_INVITATION",
+                    title=f"RFQ {rfq.ref_no} · Invitation to quote",
+                    body="Bank participation was approved. Open to submit your rate.",
+                    dealer_emails=target_dealer_emails,
+                    bank_id=q_bank.bank_id if q_bank else None,
+                    urgency="high",
+                    expires_at=rfq.window_end,
+                )
+        except Exception as push_err:
+            logger.warning(f"Failed to enqueue dealer push after bank approval for RFQ {rfq.id}: {push_err}")
 
     elif action == "DECLINE":
         assignment.approval_status = "DECLINED"
@@ -2110,7 +2170,7 @@ async def approve_rfq_for_bank(
         # Phase 2 (declined): Email EXECUTION + VIEW_ONLY contacts
         if non_approver_emails and email_settings and source == "customer_specific":
             from app.services.unified_email_builder import build_alert_email_html
-            subject = f"RFQ {rfq.ref_no} ({customer_name}) - Bank Participation Declined"
+            subject = f"RFQ {rfq.ref_no} · Participation Declined"
             reason_part = f"<br/><br/><strong>Approver Notes / Justification:</strong> {action_in.notes}" if action_in.notes else ""
             msg = (
                 f"Your bank's authorized approver (<strong>{approver_email}</strong>) has <strong>declined participation</strong> "
@@ -2125,7 +2185,7 @@ async def approve_rfq_for_bank(
                 recipient_name=f"{bank_name} FX &amp; Treasury Desk",
                 platform_name="Grow Treasury Platform"
             )
-            background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+            background_tasks.add_task(send_email, None, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
 
     db.commit()
 
@@ -2204,7 +2264,9 @@ def get_bank_quotation_history(
         if rfq.type == "TBILL":
             tb_offers = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
             if tb_offers:
-                best_price = min(tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek) for o in tb_offers)
+                is_sell_tbill = (rfq.direction or "Buy").lower() == "sell"
+                resolved_rates = [tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek) for o in tb_offers]
+                best_price = min(resolved_rates) if is_sell_tbill else max(resolved_rates)
                 submitted_by = tb_offers[0].submitted_by_email
                 submitted_at = tb_offers[0].submitted_at
                 notes = tb_offers[0].notes
@@ -2212,7 +2274,7 @@ def get_bank_quotation_history(
                     "settlement_date": o.settlement_date,
                     "maturity_date": o.maturity_date,
                     "discount_rate": tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek),
-                    "max_amount": o.max_amount,
+                    "max_amount": tenant_key_service.resolve_tbill_max_amount(o, tenant_dek),
                     "notes": o.notes
                 } for o in tb_offers]
         else:
@@ -2985,7 +3047,7 @@ def request_dealer_handshake_otp(
         email_settings, _ = get_customer_email_settings(db, inv.customer_id)
         background_tasks.add_task(
             send_email,
-            db,
+            None,
             [clean_email],
             subj,
             email_html,
@@ -3020,7 +3082,7 @@ def verify_dealer_handshake_otp(
     Enforces a 3-attempt lockout defense against brute force.
     """
     # Perimeter Anti-Bot Honeypot Defense
-    verify_honeypot_sync(body.website_url, request=request, context="dealer_handshake_verify_otp")
+    verify_honeypot_sync(body.website_url, request=request, context="dealer_handshake_verify_otp", legitimate_values=[body.otp])
 
     from app.models.models import Bank, Customer
     from app.models.models_quotation import QuotationBank
@@ -3204,7 +3266,7 @@ def submit_dealer_feedback(
     directly from their quotation terminal.
     """
     # Perimeter Anti-Bot Honeypot Defense
-    verify_honeypot_sync(req_body.website_url, request=request, context="dealer_feedback")
+    verify_honeypot_sync(req_body.website_url, request=request, context="dealer_feedback", legitimate_values=[req_body.dealer_email])
 
     from app.models.models_quotation import QuotationBankAssignment, QuotationDealerFeedback, QuotationBank
     from app.models.models import Bank
@@ -3309,12 +3371,14 @@ class DealerPushSubscribeIn(BaseModel):
 
 
 class DealerPushUnsubscribeIn(BaseModel):
-    endpoint: str = Field(..., max_length=1024)
+    endpoint: Optional[str] = Field(None, max_length=1024)
     token: Optional[str] = Field(None, max_length=255)
+    email: Optional[str] = Field(None, max_length=255)
+    target: Optional[str] = Field("all", max_length=20)
 
 
 class DealerPushStatusIn(BaseModel):
-    endpoint: str = Field(..., max_length=1024)
+    endpoint: Optional[str] = Field(None, max_length=1024)
     token: Optional[str] = Field(None, max_length=255)
     email: Optional[str] = Field(None, max_length=255)
 
@@ -3324,6 +3388,7 @@ class DealerStandingSubscribeIn(BaseModel):
     keys: DealerPushKeys
     device_label: Optional[str] = Field(None, max_length=120)
     platform: Optional[str] = Field(None, max_length=20)
+    otp_code: Optional[str] = Field(None, min_length=4, max_length=10)
 
 
 class DealerQRPairIn(BaseModel):
@@ -3419,19 +3484,70 @@ def subscribe_dealer_push(
     }
 
 
+def _is_phone_sub_filter(PushSubscription):
+    """SQLAlchemy filter clause that strictly matches only mobile/smartphone push subscriptions."""
+    from sqlalchemy import or_, and_, not_
+    return and_(
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False,  # noqa: E712
+        or_(
+            PushSubscription.platform.in_(["ios", "android", "mobile", "phone"]),
+            PushSubscription.device_type.in_(["ios", "android", "mobile", "phone"]),
+            PushSubscription.device_label.ilike("%phone%"),
+            PushSubscription.device_label.ilike("%mobile%"),
+            PushSubscription.device_label.ilike("%iphone%"),
+            PushSubscription.device_label.ilike("%android%"),
+            PushSubscription.device_label.ilike("%ipad%")
+        ),
+        not_(PushSubscription.platform == "desktop"),
+        not_(PushSubscription.device_type == "desktop"),
+        not_(PushSubscription.device_label.ilike("%windows%")),
+        not_(PushSubscription.device_label.ilike("%desktop%"))
+    )
+
+
 @router.post("/push/unsubscribe")
 def unsubscribe_dealer_push(
     payload: DealerPushUnsubscribeIn,
     db: Session = Depends(get_db)
 ):
-    """Turns off dealer alerts for this device."""
+    """Turns off dealer alerts for this device or dealer email (supports target='browser' | 'phone' | 'all')."""
     from app.models.models_push import PushSubscription
-    sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
-    if sub:
-        sub.is_active = False
-        sub.revoked_reason = "USER_REMOVED"
+    subs = []
+    target = getattr(payload, "target", "all") or "all"
+
+    # Target 1: Specific Browser / Desktop device endpoint
+    if target in ("browser", "all") and payload.endpoint:
+        sub = db.query(PushSubscription).filter(
+            PushSubscription.endpoint == payload.endpoint,
+            PushSubscription.is_active == True  # noqa: E712
+        ).first()
+        if sub and sub not in subs:
+            subs.append(sub)
+
+    # Target 2: Paired Mobile Phone(s) only
+    if payload.email and target in ("phone", "all"):
+        q = db.query(PushSubscription).filter(
+            PushSubscription.dealer_email == payload.email.strip().lower(),
+            PushSubscription.is_active == True  # noqa: E712
+        )
+        if target == "phone":
+            # Strictly filter to only mobile phones so the desktop browser is NEVER deactivated
+            q = q.filter(_is_phone_sub_filter(PushSubscription))
+            if payload.endpoint:
+                q = q.filter(PushSubscription.endpoint != payload.endpoint)
+
+        phone_subs = q.all()
+        for es in phone_subs:
+            if es not in subs:
+                subs.append(es)
+
+    for s in subs:
+        s.is_active = False
+        s.revoked_reason = "USER_REMOVED"
+    if subs:
         db.commit()
-    return {"message": "Phone alerts turned off for this device."}
+    return {"message": "Alerts turned off successfully.", "count": len(subs)}
 
 
 @router.post("/push/status")
@@ -3439,22 +3555,43 @@ def get_dealer_push_status(
     payload: DealerPushStatusIn,
     db: Session = Depends(get_db)
 ):
-    """Checks whether this browser has active alerts enabled."""
+    """Checks whether this browser and/or dealer email has active alerts enabled."""
     from app.models.models_push import PushSubscription
-    sub = db.query(PushSubscription).filter(
-        PushSubscription.endpoint == payload.endpoint,
-        PushSubscription.is_active == True,  # noqa: E712
-        PushSubscription.is_deleted == False,  # noqa: E712
-    ).first()
+    local_sub = None
+    if payload.endpoint:
+        local_sub = db.query(PushSubscription).filter(
+            PushSubscription.endpoint == payload.endpoint,
+            PushSubscription.is_active == True,  # noqa: E712
+            PushSubscription.is_deleted == False,  # noqa: E712
+        ).first()
 
-    if sub and sub.dealer_email:
-        return {
-            "is_active": True,
-            "email": sub.dealer_email,
-            "device_label": sub.device_label,
-            "platform": sub.platform
-        }
-    return {"is_active": False, "email": None}
+    target_email = (payload.email or (local_sub.dealer_email if local_sub else None) or "").strip().lower()
+    phone_sub = None
+    if target_email:
+        # Search strictly for active mobile smartphone push subscriptions for this email
+        phone_q = db.query(PushSubscription).filter(
+            PushSubscription.dealer_email == target_email,
+            _is_phone_sub_filter(PushSubscription)
+        )
+        if payload.endpoint:
+            phone_q = phone_q.filter(PushSubscription.endpoint != payload.endpoint)
+
+        phone_sub = phone_q.order_by(PushSubscription.updated_at.desc(), PushSubscription.id.desc()).first()
+
+    is_browser_active = bool(local_sub)
+    is_phone_active = bool(phone_sub)
+    is_active = is_browser_active or is_phone_active
+
+    return {
+        "is_active": is_active,
+        "is_browser_active": is_browser_active,
+        "is_phone_active": is_phone_active,
+        "email": target_email or (local_sub.dealer_email if local_sub else None) or (phone_sub.dealer_email if phone_sub else None),
+        "browser_label": local_sub.device_label if local_sub else "Windows / Desktop Browser",
+        "phone_label": phone_sub.device_label if phone_sub else None,
+        "device_label": local_sub.device_label if local_sub else (phone_sub.device_label if phone_sub else None),
+        "platform": local_sub.platform if local_sub else (phone_sub.platform if phone_sub else None)
+    }
 
 
 # ── N7b: Standing Setup Link Endpoints ────────────────────────────────────────
@@ -3464,34 +3601,204 @@ def get_dealer_standing_setup(
     setup_token: str,
     db: Session = Depends(get_db)
 ):
-    """Loads standing setup session for a dealer arriving via Grow reminder email."""
-    from app.models.models_push import DealerAlertReminder
-    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    from app.models.models_push import DealerAlertReminder, DealerMobilePairToken, PushSubscription
+    clean_token = (setup_token or "").strip().replace(" ", "")
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Ephemeral pairing token (15-minute dynamic session)
+    pair_token = db.query(DealerMobilePairToken).filter(DealerMobilePairToken.pairing_token == clean_token).first()
+    if pair_token:
+        if now_utc > pair_token.expires_at:
+            raise HTTPException(
+                status_code=410,
+                detail="This pairing session has expired (15-minute institutional security limit). Please scan a fresh QR code from your trading desk."
+            )
+        bank_name = pair_token.bank.name if pair_token.bank else "Treasury Desk"
+        allow_dealer_mobile_alerts = bool(getattr(pair_token.bank, 'allow_dealer_mobile_alerts', True)) if pair_token.bank else True
+        has_active_push = db.query(PushSubscription).filter(
+            PushSubscription.dealer_email == pair_token.email,
+            PushSubscription.is_active == True,  # noqa: E712
+            PushSubscription.is_deleted == False   # noqa: E712
+        ).first()
+
+        return {
+            "email": pair_token.email,
+            "bank_name": bank_name,
+            "opted_out": False,
+            "reminders_sent": 0,
+            "allow_dealer_mobile_alerts": allow_dealer_mobile_alerts,
+            "has_active_device": bool(has_active_push),
+            "requires_otp": True,
+            "is_ephemeral": True,
+            "expires_at": pair_token.expires_at.isoformat()
+        }
+
+    # 2. Standing reminder token fallback
+    reminder = db.query(DealerAlertReminder).filter(
+        or_(
+            DealerAlertReminder.setup_token == clean_token,
+            func.lower(DealerAlertReminder.setup_token) == func.lower(clean_token)
+        )
+    ).first()
     if not reminder:
         raise HTTPException(status_code=404, detail="Invalid or expired setup token.")
 
-    reminder.link_opened_at = datetime.now(timezone.utc)
+    reminder.link_opened_at = now_utc
     db.commit()
 
     bank_name = reminder.bank.name if reminder.bank else "Treasury Desk"
     allow_dealer_mobile_alerts = bool(getattr(reminder.bank, 'allow_dealer_mobile_alerts', True)) if reminder.bank else True
+    has_active_push = db.query(PushSubscription).filter(
+        PushSubscription.dealer_email == reminder.email,
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False   # noqa: E712
+    ).first()
+
     return {
         "email": reminder.email,
         "bank_name": bank_name,
         "opted_out": reminder.opted_out,
         "reminders_sent": reminder.reminders_sent,
-        "allow_dealer_mobile_alerts": allow_dealer_mobile_alerts
+        "allow_dealer_mobile_alerts": allow_dealer_mobile_alerts,
+        "has_active_device": bool(has_active_push),
+        "requires_otp": True,
+        "is_ephemeral": False
     }
+
+
+@router.post("/dealer-alerts/setup/{setup_token}/send-otp")
+async def send_dealer_setup_otp(
+    setup_token: str,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Dispatches a 6-digit OTP to the dealer's corporate bank email.
+    Protects against unauthorized pairing from unattended unlocked computers.
+    Enforces IP rate limiting and a 60-second resend cooldown timer.
+    """
+    from app.models.models_push import DealerAlertReminder, DealerMobilePairToken
+    clean_token = (setup_token or "").strip().replace(" ", "")
+    client_ip = request.client.host if request and request.client else "unknown"
+
+    # IP rate-limiting: max 5 OTP requests per 60 seconds
+    rate_key = f"dealer_otp_send:{client_ip}:{clean_token}"
+    is_limited, retry_after = quotation_rate_limiter.is_rate_limited(rate_key, max_requests=5, window_seconds=60)
+    if is_limited:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many verification requests. Please wait {retry_after} seconds before requesting a new code.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    pair_token = db.query(DealerMobilePairToken).filter(DealerMobilePairToken.pairing_token == clean_token).first()
+
+    if pair_token:
+        if now_utc > pair_token.expires_at:
+            raise HTTPException(
+                status_code=410,
+                detail="This pairing session has expired (15-minute security limit). Please generate a fresh QR code on your trading desk."
+            )
+        if pair_token.bank and pair_token.bank.allow_dealer_mobile_alerts is False:
+            raise HTTPException(status_code=403, detail="Mobile alerts are disabled for this bank by institutional policy.")
+
+        # 60-second cooldown enforcement
+        if pair_token.last_otp_sent_at and (now_utc - pair_token.last_otp_sent_at).total_seconds() < 60:
+            cooldown_rem = int(60 - (now_utc - pair_token.last_otp_sent_at).total_seconds())
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Please wait {cooldown_rem} seconds before requesting another verification code.",
+                headers={"Retry-After": str(cooldown_rem)}
+            )
+
+        target_email = pair_token.email
+        bank_name = pair_token.bank.name if pair_token.bank else "Treasury Desk"
+        otp_code = f"{secrets.randbelow(900000) + 100000}"
+        pair_token.otp_code = hash_otp_code(otp_code)
+        pair_token.otp_expires_at = now_utc + timedelta(minutes=15)
+        pair_token.otp_failed_attempts = 0
+        pair_token.last_otp_sent_at = now_utc
+        db.commit()
+        target_id = pair_token.id
+        entity_type = "DEALER_MOBILE_PAIR"
+    else:
+        reminder = db.query(DealerAlertReminder).filter(
+            or_(
+                DealerAlertReminder.setup_token == clean_token,
+                func.lower(DealerAlertReminder.setup_token) == func.lower(clean_token)
+            )
+        ).first()
+        if not reminder:
+            raise HTTPException(status_code=404, detail="Invalid setup token.")
+
+        if reminder.bank and reminder.bank.allow_dealer_mobile_alerts is False:
+            raise HTTPException(status_code=403, detail="Mobile alerts are disabled for this bank by institutional policy.")
+
+        target_email = reminder.email
+        bank_name = reminder.bank.name if reminder.bank else "Treasury Desk"
+        otp_code = f"{secrets.randbelow(900000) + 100000}"
+        reminder.otp_code = hash_otp_code(otp_code)
+        reminder.otp_expires_at = now_utc + timedelta(minutes=15)
+        reminder.otp_failed_attempts = 0
+        db.commit()
+        target_id = reminder.id
+        entity_type = "DEALER_ALERT_REMINDER"
+
+    # Send verification email via Grow platform global SMTP
+    platform_settings = get_global_email_settings()
+    if platform_settings and (platform_settings.smtp_host or platform_settings.sender_email):
+        subject = "Grow Treasury · Phone Alert Verification Code"
+        body = f"""<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 500px; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
+            <h2 style="color: #0f172a; margin-top: 0; font-size: 18px;">Mobile Device Pairing Verification</h2>
+            <p style="color: #475569; font-size: 14px; line-height: 1.5;">To confirm you are authorizing this mobile device for <strong>{target_email}</strong> ({bank_name}), enter the following verification code on your phone:</p>
+            <div style="text-align: center; margin: 24px 0;">
+                <span style="font-family: monospace; font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #047857; background: #f0fdf4; padding: 12px 24px; border-radius: 8px; border: 1px solid #bbf7d0; display: inline-block;">{otp_code}</span>
+            </div>
+            <p style="color: #64748b; font-size: 12px; line-height: 1.4;">This code is valid for 15 minutes. If you did not scan a setup QR code from your trading desk, please ignore this email.</p>
+            <hr style="border: none; border-top: 1px solid #f1f5f9; margin: 20px 0;">
+            <p style="color: #94a3b8; font-size: 11px; margin-bottom: 0;">Grow Treasury Management System · Institutional Alert Service</p>
+        </div>"""
+        try:
+            await send_email(
+                db=db,
+                to_emails=[target_email],
+                subject_template=subject,
+                body_template=body,
+                template_data={},
+                email_settings=platform_settings,
+                sender_name="Grow Treasury Security",
+                allow_platform_fallback=True
+            )
+        except Exception as e:
+            logger.exception(f"Failed to send dealer setup OTP email: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to deliver verification email. Please check server mail settings or try again."
+            )
+
+    log_action(
+        db=db,
+        user_id=None,
+        action_type="DEALER_SETUP_OTP_SENT",
+        entity_type=entity_type,
+        entity_id=target_id,
+        details={"email": target_email},
+        ip_address=client_ip
+    )
+
+    return {"success": True, "message": f"Verification code sent to {target_email}."}
 
 
 @router.post("/dealer-alerts/setup/{setup_token}/subscribe")
 def subscribe_dealer_standing(
     setup_token: str,
     payload: DealerStandingSubscribeIn,
+    request: Request,
     db: Session = Depends(get_db)
 ):
-    """Enables phone alerts via the standing setup link."""
-    from app.models.models_push import DealerAlertReminder, PushSubscription
+    """Enables phone alerts via the standing setup link with institutional OTP verification (max 3 failed attempts)."""
+    from app.models.models_push import DealerAlertReminder, DealerMobilePairToken, PushSubscription
     from app.services.notifications.push_channel import is_allowed_endpoint
     from app.services.notifications.push_config import get_vapid_config
     from app.models.models_quotation import QuotationBankDealer
@@ -3501,20 +3808,111 @@ def subscribe_dealer_standing(
     if not is_allowed_endpoint(payload.endpoint):
         raise HTTPException(status_code=400, detail="Unsupported push service.")
 
-    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
-    if not reminder:
-        raise HTTPException(status_code=404, detail="Invalid setup token.")
+    clean_token = (setup_token or "").strip().replace(" ", "")
+    client_ip = request.client.host if request and request.client else "unknown"
 
-    if reminder.bank and reminder.bank.allow_dealer_mobile_alerts is False:
+    # Rate limiting verification attempts (max 5 per 60 seconds per IP)
+    rate_key = f"dealer_otp_verify:{client_ip}:{clean_token}"
+    is_limited, retry_after = quotation_rate_limiter.is_rate_limited(rate_key, max_requests=5, window_seconds=60)
+    if is_limited:
         raise HTTPException(
-            status_code=403,
-            detail="Mobile alerts are disabled for this bank by institutional administrator policy."
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many verification attempts. Please wait {retry_after} seconds before trying again.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    pair_token = db.query(DealerMobilePairToken).filter(DealerMobilePairToken.pairing_token == clean_token).first()
+    reminder = None
+
+    if pair_token:
+        if now_utc > pair_token.expires_at:
+            raise HTTPException(
+                status_code=410,
+                detail="This pairing session has expired (15-minute security limit). Please scan a fresh QR code from your trading desk."
+            )
+        if pair_token.bank and pair_token.bank.allow_dealer_mobile_alerts is False:
+            raise HTTPException(
+                status_code=403,
+                detail="Mobile alerts are disabled for this bank by institutional administrator policy."
+            )
+        target_record = pair_token
+        target_email = pair_token.email
+        target_bank_id = pair_token.bank_id
+        entity_type = "DEALER_MOBILE_PAIR"
+    else:
+        reminder = db.query(DealerAlertReminder).filter(
+            or_(
+                DealerAlertReminder.setup_token == clean_token,
+                func.lower(DealerAlertReminder.setup_token) == func.lower(clean_token)
+            )
+        ).first()
+        if not reminder:
+            raise HTTPException(status_code=404, detail="Invalid setup token.")
+
+        if reminder.bank and reminder.bank.allow_dealer_mobile_alerts is False:
+            raise HTTPException(
+                status_code=403,
+                detail="Mobile alerts are disabled for this bank by institutional administrator policy."
+            )
+        target_record = reminder
+        target_email = reminder.email
+        target_bank_id = reminder.bank_id
+        entity_type = "DEALER_ALERT_REMINDER"
+
+    # OTP Verification (Unattended Laptop Protection & Strict Institutional Controls)
+    if not target_record.otp_code:
+        raise HTTPException(status_code=400, detail="No active verification code found. Please click 'Resend Code' on the screen to receive a fresh verification code.")
+    if not payload.otp_code:
+        raise HTTPException(status_code=400, detail="Verification code is required to authorize this device.")
+    if target_record.otp_expires_at and now_utc > target_record.otp_expires_at:
+        raise HTTPException(status_code=400, detail="Verification code has expired. Please click 'Resend Code' to request a new code.")
+
+    # Strict Institutional Standard: Lockout after 3 failed attempts
+    LOCKOUT_LIMIT = 3
+    if (target_record.otp_failed_attempts or 0) >= LOCKOUT_LIMIT:
+        log_action(
+            db=db,
+            user_id=None,
+            action_type="DEALER_OTP_LOCKOUT",
+            entity_type=entity_type,
+            entity_id=target_record.id,
+            details={"email": target_email, "failed_attempts": target_record.otp_failed_attempts},
+            ip_address=client_ip
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Too many incorrect attempts (maximum 3). For your security, this verification code is locked. Please click 'Resend Code' to request a fresh code."
+        )
+
+    if not verify_otp_code(payload.otp_code.strip(), target_record.otp_code):
+        target_record.otp_failed_attempts = (target_record.otp_failed_attempts or 0) + 1
+        rem = max(0, LOCKOUT_LIMIT - target_record.otp_failed_attempts)
+        db.commit()
+        log_action(
+            db=db,
+            user_id=None,
+            action_type="DEALER_OTP_FAILED",
+            entity_type=entity_type,
+            entity_id=target_record.id,
+            details={"email": target_email, "remaining_attempts": rem},
+            ip_address=client_ip
+        )
+        if rem == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Incorrect verification code. Maximum attempts exceeded. Please click 'Resend Code' to request a new code."
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Incorrect verification code. {rem} attempt{'s' if rem != 1 else ''} remaining."
         )
 
     platform = (payload.platform or "").lower()
-    platform = platform if platform in ("ios", "android", "desktop") else "web"
+    platform = platform if platform in ("ios", "android") else "mobile"
+    device_label = payload.device_label or ("iPhone / iOS" if platform == "ios" else "Android Phone" if platform == "android" else "Mobile Smartphone")
 
-    dealer_rec = db.query(QuotationBankDealer).filter(QuotationBankDealer.email == reminder.email).first()
+    dealer_rec = db.query(QuotationBankDealer).filter(QuotationBankDealer.email == target_email).first()
 
     sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
     if sub is None:
@@ -3525,25 +3923,47 @@ def subscribe_dealer_standing(
 
     sub.user_id = None
     sub.customer_id = None
-    sub.dealer_email = reminder.email
-    sub.bank_id = reminder.bank_id
+    sub.dealer_email = target_email
+    sub.bank_id = target_bank_id
     sub.dealer_id = dealer_rec.id if dealer_rec else None
     sub.p256dh = payload.keys.p256dh
     sub.auth = payload.keys.auth
-    sub.device_label = payload.device_label or f"{platform.capitalize()} Device"
+    sub.device_label = device_label
     sub.platform = platform
-    sub.device_type = platform
+    sub.device_type = "mobile"
     sub.is_active = True
     sub.is_deleted = False
     sub.revoked_reason = None
     sub.failure_count = 0
     sub.last_error = None
+
+    # Clear OTP and update pairing state
+    target_record.otp_code = None
+    target_record.otp_expires_at = None
+    target_record.otp_failed_attempts = 0
+
+    if pair_token:
+        pair_token.is_paired = True
+        pair_token.paired_at = now_utc
+        pair_token.device_label = device_label
+        pair_token.platform = platform
+
     db.commit()
+
+    log_action(
+        db=db,
+        user_id=None,
+        action_type="DEALER_MOBILE_PAIR_SUCCESS",
+        entity_type=entity_type,
+        entity_id=target_record.id,
+        details={"email": target_email, "platform": platform, "device_label": device_label},
+        ip_address=client_ip
+    )
 
     return {
         "success": True,
         "message": "Phone alerts enabled successfully for all RFQs sent to your desk.",
-        "email": reminder.email,
+        "email": target_email,
         "is_active": True
     }
 
@@ -3553,9 +3973,14 @@ def opt_out_dealer_standing(
     setup_token: str,
     db: Session = Depends(get_db)
 ):
-    """Dealer opts out of future email reminders to enable phone alerts."""
     from app.models.models_push import DealerAlertReminder, PushSubscription
-    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    clean_token = (setup_token or "").strip().replace(" ", "")
+    reminder = db.query(DealerAlertReminder).filter(
+        or_(
+            DealerAlertReminder.setup_token == clean_token,
+            func.lower(DealerAlertReminder.setup_token) == func.lower(clean_token)
+        )
+    ).first()
     if not reminder:
         raise HTTPException(status_code=404, detail="Invalid setup token.")
 
@@ -3574,7 +3999,10 @@ def generate_dealer_qr_pair(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    """Generates a dynamic QR code for pairing a mobile phone to dealer alerts."""
+    """
+    Generates a dynamic, ephemeral QR code (15-minute validity) for pairing a mobile phone.
+    Complies with Institutional Security Standards (ephemeral token, zero persistent attack surface).
+    """
     assignment = db.query(QuotationBankAssignment).filter(
         or_(
             QuotationBankAssignment.token == payload.token,
@@ -3622,30 +4050,55 @@ def generate_dealer_qr_pair(
 
     from app.services.dealer_alert_reminder_service import get_or_create_dealer_reminder
     from app.services.dealer_auth_service import generate_qr_code_base64
-    from app.models.models_push import PushSubscription
+    from app.models.models_push import DealerMobilePairToken, PushSubscription
 
-    reminder = get_or_create_dealer_reminder(db, target_email, bank_id=bank_id)
+    # Maintain standing reminder record in sync for fallback / counters
+    get_or_create_dealer_reminder(db, target_email, bank_id=bank_id)
+
+    # Mint fresh ephemeral 15-minute session token (Institutional Standard)
+    now_utc = datetime.now(timezone.utc)
+    pairing_token = secrets.token_urlsafe(32)
+    pair_rec = DealerMobilePairToken(
+        pairing_token=pairing_token,
+        email=target_email,
+        bank_id=bank_id,
+        expires_at=now_utc + timedelta(minutes=15),
+        is_paired=False
+    )
+    db.add(pair_rec)
+    db.commit()
+
+    client_ip = request.client.host if request and request.client else None
+    log_action(
+        db=db,
+        user_id=None,
+        action_type="DEALER_QR_PAIR_INITIATED",
+        entity_type="DEALER_MOBILE_PAIR",
+        entity_id=pair_rec.id,
+        details={"email": target_email, "bank_id": bank_id},
+        ip_address=client_ip
+    )
 
     base_origin = (payload.frontend_origin or get_frontend_base_url(request)).rstrip("/")
-    setup_url = f"{base_origin}/dealer/alerts/setup/{reminder.setup_token}"
+    setup_url = f"{base_origin}/dealer/alerts/setup/{pairing_token}"
     qr_b64 = generate_qr_code_base64(setup_url)
 
-    active_sub = db.query(PushSubscription).filter(
+    active_phone_sub = db.query(PushSubscription).filter(
         PushSubscription.dealer_email == target_email,
-        PushSubscription.is_active == True,  # noqa: E712
-        PushSubscription.is_deleted == False   # noqa: E712
+        _is_phone_sub_filter(PushSubscription)
     ).order_by(PushSubscription.updated_at.desc(), PushSubscription.id.desc()).first()
 
     return {
         "success": True,
         "qr_code_base64": qr_b64,
         "setup_url": setup_url,
-        "setup_token": reminder.setup_token,
+        "setup_token": pairing_token,
         "email": target_email,
         "bank_name": bank_name,
-        "is_paired": bool(active_sub),
-        "device_label": active_sub.device_label if active_sub else None,
-        "platform": active_sub.platform if active_sub else None
+        "is_paired": bool(active_phone_sub),
+        "device_label": active_phone_sub.device_label if active_phone_sub else None,
+        "platform": active_phone_sub.platform if active_phone_sub else None,
+        "expires_in_seconds": 900
     }
 
 
@@ -3654,24 +4107,51 @@ def get_dealer_qr_status(
     setup_token: str,
     db: Session = Depends(get_db)
 ):
-    """Live status check polled by desktop QR modal while waiting for phone scan."""
-    from app.models.models_push import DealerAlertReminder, PushSubscription
-    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == setup_token).first()
+    """
+    Live status check polled by desktop QR modal while waiting for phone scan.
+    Queries ephemeral pairing session first, then falls back to standing reminder token.
+    """
+    from app.models.models_push import DealerAlertReminder, DealerMobilePairToken, PushSubscription
+    clean_token = (setup_token or "").strip().replace(" ", "")
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Ephemeral pairing token
+    pair_rec = db.query(DealerMobilePairToken).filter(DealerMobilePairToken.pairing_token == clean_token).first()
+    if pair_rec:
+        is_expired = now_utc > pair_rec.expires_at
+        active_phone_sub = db.query(PushSubscription).filter(
+            PushSubscription.dealer_email == pair_rec.email,
+            _is_phone_sub_filter(PushSubscription)
+        ).order_by(PushSubscription.updated_at.desc(), PushSubscription.id.desc()).first()
+
+        is_paired = bool(pair_rec.is_paired or active_phone_sub)
+        return {
+            "email": pair_rec.email,
+            "is_paired": is_paired,
+            "device_label": pair_rec.device_label or (active_phone_sub.device_label if active_phone_sub else None),
+            "platform": pair_rec.platform or (active_phone_sub.platform if active_phone_sub else None),
+            "is_expired": is_expired,
+            "is_opened": True
+        }
+
+    # 2. Standing reminder token fallback
+    reminder = db.query(DealerAlertReminder).filter(DealerAlertReminder.setup_token == clean_token).first()
     if not reminder:
         raise HTTPException(status_code=404, detail="Invalid setup token.")
 
-    active_sub = db.query(PushSubscription).filter(
+    active_phone_sub = db.query(PushSubscription).filter(
         PushSubscription.dealer_email == reminder.email,
-        PushSubscription.is_active == True,  # noqa: E712
-        PushSubscription.is_deleted == False   # noqa: E712
+        _is_phone_sub_filter(PushSubscription)
     ).order_by(PushSubscription.updated_at.desc(), PushSubscription.id.desc()).first()
 
     return {
         "email": reminder.email,
-        "is_paired": bool(active_sub),
-        "device_label": active_sub.device_label if active_sub else None,
-        "platform": active_sub.platform if active_sub else None,
+        "is_paired": bool(active_phone_sub),
+        "device_label": active_phone_sub.device_label if active_phone_sub else None,
+        "platform": active_phone_sub.platform if active_phone_sub else None,
+        "is_expired": False,
         "is_opened": reminder.link_opened_at is not None
     }
+
 
 

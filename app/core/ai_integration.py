@@ -685,8 +685,13 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
     image_uris = []
     pdf_document = None
     try:
-        pdf_stream = io.BytesIO(pdf_bytes)
-        pdf_document = fitz.open(stream=pdf_stream, filetype="pdf")
+        if hasattr(pdf_bytes, "read"):
+            pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        elif isinstance(pdf_bytes, (bytes, bytearray)):
+            pdf_stream = io.BytesIO(pdf_bytes)
+            pdf_document = fitz.open(stream=pdf_stream, filetype="pdf")
+        else:
+            pdf_document = fitz.open(pdf_bytes)
         
         max_pages_to_process = 5
         num_pages = min(len(pdf_document), max_pages_to_process)
@@ -905,12 +910,14 @@ Document Text:
                 "applicableRule": { "type": "STRING", "description": "The name of the applicable rule, e.g., 'URDG 758' or 'ISP98'."},
                 "beneficiaryAddress": { "type": "STRING", "description": "The full address of the beneficiary as stated on the LG document."},
                 "operationalStatus": { "type": "STRING", "description": "The operational status of the LG — 'Operative' or 'Non-Operative'. Primarily applicable to Advance Payment LGs. Look for terms like 'operative', 'non-operative', 'conditional', 'unconditional', 'مشروط', 'غير مشروط'."},
+                "paymentConditions": { "type": "STRING", "description": "If operationalStatus is 'Non-Operative', extract the exact condition sentence stating how/when the guarantee becomes operative (e.g., 'becomes operative only upon receipt of the advance payment of ... into account ...')."},
+                "advisingStatus": { "type": "STRING", "description": "For foreign bank guarantees: return 'Confirmed' if a local bank confirms/adds confirmation to the guarantee, 'Advised' if a local bank advises it without responsibility/confirmation, or 'Not Advised' if no advising bank is involved."},
                 "mandatoryClaimStatement": { "type": "STRING", "description": "Any specific mandatory statement, declaration, or sentence that the LG stipulates MUST be written/included in a liquidation or claim demand letter (e.g. 'accompanied by your signed statement certifying that the Principal is in breach of contract...', 'شريطة أن يتضمن طلب المصادرة إقراراً يفيد إخلال العميل بالتزاماته'). Extract exact sentence as written. Return empty if not specified."},
                 # NEW FIELDS FOR FOREIGN BANKS
-                "foreign_bank_name": {"type": "STRING", "description": "Manually entered bank name for foreign banks. Prioritize this if the issuing bank is explicitly a foreign bank and not found in the list."},
-                "foreign_bank_country": {"type": "STRING", "description": "Manually entered country for foreign banks."},
-                "foreign_bank_address": {"type": "STRING", "description": "Manually entered address for foreign banks."},
-                "foreign_bank_swift_code": {"type": "STRING", "description": "Manually entered SWIFT code for foreign banks."},
+                "foreign_bank_name": {"type": "STRING", "description": "The name of the foreign issuing bank if the LG is issued by a non-Egyptian / foreign bank (either directly or advised through a local bank)."},
+                "foreign_bank_country": {"type": "STRING", "description": "The country of the foreign issuing bank."},
+                "foreign_bank_address": {"type": "STRING", "description": "The full address of the foreign issuing bank."},
+                "foreign_bank_swift_code": {"type": "STRING", "description": "The SWIFT/BIC code of the foreign issuing bank if mentioned in the document."},
             },
             "required": ["issuerName", "beneficiaryName", "issuingBankName", "lgNumber", "lgAmount", "currency", "lgType", "purpose", "issuanceDate", "expiryDate"]
         }
@@ -945,7 +952,10 @@ Return your output as a JSON object with the following fields, based strictly on
 
 7.  **lgType**:
     Identify the type of guarantee based on the provided text. Look for keywords such as "Performance", "Bid Bond", "Advance Payment", "Payment Guarantee", "Tender Bond", "Retention Money", or their Arabic equivalents like "ابتدائي", "نهائي", "دفعة مقدمة".
-    If you find any of the following terms: Performance, Final, خطاب ضمان الأداء, ضمان الوفاء, نهائي then return "Performance Guarantee", If you find any of the following terms: "bid bond", "tender bond" or "ابتدائي" then return "Bid Bond LG". Prioritize guarantee titles or explicit phrases when available. If multiple types appear, choose the most specific or clearly stated one.
+    - If you find any of the following terms: Performance, Final, خطاب ضمان الأداء, ضمان الوفاء, نهائي then return `"Performance Guarantee"`.
+    - If you find any of the following terms: "bid bond", "tender bond" or "ابتدائي" then return `"Bid Bond"`.
+    - If you find any of the following terms: "advance payment", "advance payment guarantee", "APG", or "دفعة مقدمة" then return `"Advance Payment LG"`.
+    Prioritize guarantee titles or explicit phrases when available. If multiple types appear, choose the most specific or clearly stated one.
 
 8.  **purpose**:  
     A short phrase or sentence describing the purpose of the LG.  
@@ -974,25 +984,31 @@ Return your output as a JSON object with the following fields, based strictly on
     The full address of the beneficiary as stated on the LG. Look near the beneficiary name section, under "Address" or "عنوان المستفيد". Extract as-is.
 
 16. **operationalStatus**:
-    Applicable primarily to Advance Payment LGs. Look for terms like "Operative", "Non-Operative", "Conditional", "Unconditional", "مشروط", "غير مشروط". Return either "Operative" or "Non-Operative". If not stated or not applicable, return empty.
+    Applicable primarily to Advance Payment LGs. Look for terms like "Operative", "Non-Operative", "NON-OPERATIVE", "Conditional", "Unconditional", "مشروط", "غير مشروط", or clauses stating "This guarantee is currently NON-OPERATIVE and shall only become operative upon...". Return either `"Operative"` or `"Non-Operative"`. If not stated or not applicable, return empty.
 
-17. **mandatoryClaimStatement**:
+17. **paymentConditions**:
+    If `operationalStatus` is `"Non-Operative"`, extract the exact condition sentence explaining how/when the guarantee becomes operative (e.g., "This guarantee shall only become operative upon receipt of the advance payment of EGP 500,000.00 into Account No. ..."). Return empty if Operative.
+
+18. **advisingStatus**:
+    If the LG is issued by a foreign bank and advised/confirmed through a local bank, return `"Confirmed"` if the local bank adds its confirmation, `"Advised"` if the local bank advises it without responsibility/confirmation, or `"Not Advised"` if no advising bank is present.
+
+19. **mandatoryClaimStatement**:
     Inspect the guarantee text for any claim conditions, demand clauses, or mandatory declarations that MUST be stated or included in a liquidation/claim demand letter.
     Examples in English: "Any demand for payment must contain the statement that...", "accompanied by your signed declaration certifying that the Principal is in breach of contract...", "stating in what respect the applicant is in breach...".
     Examples in Arabic: "يشترط لصرف قيمة هذا الضمان أن يتضمن طلبكم إقراراً يفيد إخلال العميل بالتزاماته التعاقدية", "بشرط تقديم إقرار كتابي من جهتكم يوضح أوجه الإخلال التعاقدي".
     Extract the exact required sentence/statement as written in the document in its original language. If no specific required statement is mentioned or unconditional, return empty string.
     
-18. **foreign_bank_name**:
-    The name of the foreign bank if the issuing bank is a foreign bank.
+20. **foreign_bank_name**:
+    The name of the foreign bank if the issuing bank is a foreign (non-Egyptian) bank (even if the letter is an advice letter on a local advising bank's letterhead).
     
-19. **foreign_bank_country**:
-    The country of the foreign bank.
+21. **foreign_bank_country**:
+    The country of the foreign issuing bank (e.g., "Germany", "United Kingdom", "UAE").
 
-20. **foreign_bank_address**:
-    The address of the foreign bank.
+22. **foreign_bank_address**:
+    The full address of the foreign issuing bank.
 
-21. **foreign_bank_swift_code**:
-    The SWIFT code of the foreign bank.
+23. **foreign_bank_swift_code**:
+    The SWIFT / BIC code of the foreign issuing bank if stated in the document (e.g., "DEUTDEFF").
 
 
 ---

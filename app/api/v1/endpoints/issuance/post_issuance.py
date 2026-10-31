@@ -415,14 +415,23 @@ async def resolve_lg_cancellation(
                     pdf_filename = f"cancellation_notice_{lg.lg_ref_number}_{date.today().isoformat()}"
                     generated_pdf_bytes = await generate_pdf_from_html(generated_html, pdf_filename)
 
-                    # Upload to GCS; fall back to local tempdir if GCS is unavailable
-                    from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
-                    gcs_path = f"issuance/{lg.customer_id}/cancellation_notices/{pdf_filename}.pdf"
+                    # Upload to GCS encrypted; fall back to local tempdir if GCS is unavailable
+                    import io
+                    from app.core.storage_service import upload_stream_to_gcs_encrypted
+                    from app.services.tenant_key_service import tenant_key_service
+                    gcs_path = f"customer_{lg.customer_id}/cancellation_notices/{pdf_filename}.pdf"
+                    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, lg.customer_id)
                     pdf_path = None
                     try:
-                        gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, generated_pdf_bytes, "application/pdf")
+                        gcs_uri = upload_stream_to_gcs_encrypted(
+                            source_stream=io.BytesIO(generated_pdf_bytes),
+                            blob_name=gcs_path,
+                            dek=tenant_dek,
+                            content_type="application/pdf",
+                            context="lg_issuance_doc"
+                        )
                         if gcs_uri:
-                            pdf_path = gcs_uri
+                            pdf_path = str(gcs_uri)
                         else:
                             raise Exception("GCS upload returned None")
                     except Exception as gcs_err:
@@ -1892,7 +1901,7 @@ def reject_maintenance_action(
         cc_emails = get_common_communication_emails(db, current_user.customer_id)
         if initiator_emails:
             reason_text = payload.reason or "Not specified"
-            subject = f"LG {ref} — {action.action_type.replace('_', ' ')} Rejected ❌"
+            subject = f"LG {ref} · {action.action_type.replace('_', ' ').title()} Rejected"
             body = f"""
             <html><body style="font-family: 'Segoe UI', sans-serif; color: #333; padding: 20px;">
             <div style="max-width: 600px; margin: auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
@@ -2116,29 +2125,26 @@ async def upload_maintenance_document(
     import uuid
     from datetime import datetime as dt
 
-    file_content = await file.read()
-    if len(file_content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File size exceeds 10MB limit")
-
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     unique_name = f"MAINT_DOC_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
     blob_path = f"customer_{current_user.customer_id}/maintenance_docs/{unique_name}"
 
-    bucket_name = GCS_BUCKET_NAME
-    bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(
-        db, current_user.customer_id, "STORAGE_BUCKET_NAME"
+    from app.core.storage_service import upload_stream_to_gcs_encrypted
+    from app.services.tenant_key_service import tenant_key_service
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+    stored_uri = upload_stream_to_gcs_encrypted(
+        source_stream=file.file,
+        blob_name=blob_path,
+        dek=tenant_dek,
+        content_type=file.content_type or "application/pdf",
+        context="lg_issuance_doc"
     )
-    if bucket_config and bucket_config.get('effective_value'):
-        bucket_name = bucket_config['effective_value']
-
-    stored_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, file.content_type)
     if not stored_uri:
         raise HTTPException(status_code=500, detail="Failed to upload document")
 
     return {
-        "uri": stored_uri,
+        "uri": str(stored_uri),
         "file_name": file.filename,
-        "size_bytes": len(file_content),
     }
 
 

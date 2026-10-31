@@ -42,7 +42,12 @@ async def login_for_access_token(
     Authenticate user and return JWT or MFA requirement.
     """
     # Perimeter Anti-Bot Honeypot Defense
-    await verify_honeypot(login_data.website_url, request=request, context="login")
+    await verify_honeypot(
+        login_data.website_url,
+        request=request,
+        context="login",
+        legitimate_values=[login_data.email]
+    )
 
     try:
         # Pass the fields from login_data to the service
@@ -120,7 +125,12 @@ async def forgot_password(
     Initiates the password reset process by sending a reset link to the user's email.
     """
     # Perimeter Anti-Bot Honeypot Defense
-    await verify_honeypot(request_body.website_url, request=request, context="forgot_password")
+    await verify_honeypot(
+        request_body.website_url,
+        request=request,
+        context="forgot_password",
+        legitimate_values=[request_body.email]
+    )
 
     try:
         await auth_service.initiate_password_reset(

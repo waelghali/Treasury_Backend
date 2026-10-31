@@ -94,7 +94,7 @@ def dispatch_rfq_revision_requested_email(
         # Append trade details
         kv.update(_format_rfq_key_values(rfq))
 
-        subject = f"ACTION REQUIRED: Quotation Request {rfq.ref_no} Returned for Revision"
+        subject = f"RFQ {rfq.ref_no} · Revision Requested"
         title = "⚠️ Quotation Returned for Revision"
         summary_text = (
             f"Your quotation request ({rfq.ref_no}) has been returned for revision by Corporate Admin ({admin_email}). "
@@ -119,7 +119,7 @@ def dispatch_rfq_revision_requested_email(
 
         background_tasks.add_task(
             send_email,
-            db,
+            None,
             [maker.email],
             subject,
             body,
@@ -181,7 +181,7 @@ def dispatch_rfq_resubmitted_email(
         legs_list = getattr(rfq, "legs", []) or []
         multi_label = f" ({len(legs_list)} Pairs)" if len(legs_list) > 1 else ""
 
-        subject = f"ACTION REQUIRED: Revised Quotation {rfq.ref_no}{multi_label} Resubmitted for Approval"
+        subject = f"RFQ {rfq.ref_no} · Resubmitted for Approval"
         title = "🔔 Revised Quotation Awaiting Approval"
         summary_text = (
             f"Maker {submitter_email} has addressed the previous revision feedback and resubmitted Quotation Request ({rfq.ref_no}). "
@@ -205,7 +205,7 @@ def dispatch_rfq_resubmitted_email(
 
         background_tasks.add_task(
             send_email,
-            db,
+            None,
             to_recipients,
             subject,
             body,
@@ -265,7 +265,7 @@ def dispatch_rfq_approved_email(
         kv.update(_format_rfq_key_values(rfq))
 
         if is_scheduled:
-            subject = f"CONFIRMATION: Quotation Request {rfq.ref_no} Approved & Scheduled"
+            subject = f"RFQ {rfq.ref_no} · Approved & Scheduled"
             title = "📅 Quotation Approved & Scheduled"
             summary_text = (
                 f"Your quotation request ({rfq.ref_no}) has been approved by Corporate Admin ({admin_email}). "
@@ -273,7 +273,7 @@ def dispatch_rfq_approved_email(
             )
             cta_text = "View Quotation Details"
         elif not has_custom_smtp:
-            subject = f"CONFIRMATION: Quotation Request {rfq.ref_no} Approved (Manual Bank Handover Required)"
+            subject = f"RFQ {rfq.ref_no} · Approved (Manual Link Share Needed)"
             title = "⚠️ Quotation Approved (Bank Emails Not Sent)"
             summary_text = (
                 f"Your quotation request ({rfq.ref_no}) has been approved by Corporate Admin ({admin_email}) and is now live. "
@@ -282,7 +282,7 @@ def dispatch_rfq_approved_email(
             )
             cta_text = "View Quotation & Copy Links"
         else:
-            subject = f"CONFIRMATION: Quotation Request {rfq.ref_no} Approved & Released"
+            subject = f"RFQ {rfq.ref_no} · Approved & Released"
             title = "✅ Quotation Approved & Released"
             summary_text = (
                 f"Your quotation request ({rfq.ref_no}) has been approved by Corporate Admin ({admin_email}) "
@@ -308,7 +308,7 @@ def dispatch_rfq_approved_email(
 
         background_tasks.add_task(
             send_email,
-            db,
+            None,
             [maker.email],
             subject,
             body,

@@ -10,6 +10,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from email.header import Header
+from email.utils import formatdate, make_msgid
 from sqlalchemy.orm import Session, selectinload
 
 # App Imports
@@ -39,6 +40,29 @@ class EmailAttachment:
     filename: str
     content: bytes
     mime_type: str
+
+
+class EmailSendResult(tuple):
+    """
+    A 2-tuple (success: bool, error: Optional[str]) whose truthiness (`bool(res)`)
+    evaluates to `self[0]` (the boolean success flag) rather than `len(self) > 0`.
+    This guarantees 100% compatibility with both:
+      - `success, err = await send_email(...)` (tuple unpacking)
+      - `sent = await send_email(...)` followed by `if sent:` (boolean truthiness check)
+    """
+    def __new__(cls, success: bool, error: Optional[str] = None):
+        return super().__new__(cls, (bool(success), error))
+
+    @property
+    def success(self) -> bool:
+        return self[0]
+
+    @property
+    def error(self) -> Optional[str]:
+        return self[1]
+
+    def __bool__(self) -> bool:
+        return bool(self[0])
 
 
 def clean_subject_line(subject: str) -> str:
@@ -217,7 +241,7 @@ def process_recipients(recipient_list: Optional[List[str]]) -> List[str]:
 # --- Core Sending Logic ---
 
 async def send_email(
-    db: Session,
+    db: Optional[Session],
     to_emails: List[str],
     subject_template: str,
     body_template: str,
@@ -229,7 +253,7 @@ async def send_email(
     reply_to: Optional[str] = None,
     save_copy: bool = True,
     allow_platform_fallback: bool = True
-) -> Tuple[bool, Optional[str]]:
+) -> EmailSendResult:
     """
     Sends an email using provided settings.
     Filters out dummy test domain addresses before sending.
@@ -241,12 +265,16 @@ async def send_email(
     Set allow_platform_fallback=False for flows that must ONLY leave from the customer's
     own mail server (e.g. Quotations to banks).
     """
+    if not email_settings:
+        logger.warning("Email delivery skipped: email_settings is None.")
+        return EmailSendResult(False, "Email settings not configured")
+
     to_emails = process_recipients(to_emails)
     cc_emails = process_recipients(cc_emails or [])
 
     if not to_emails and not cc_emails:
         logger.info("Email delivery suppressed: All recipients belong to dummy/test domains.")
-        return True, None
+        return EmailSendResult(True, None)
 
     # Logic to handle display name override
     display_name = sender_name if sender_name else email_settings.sender_display_name
@@ -263,6 +291,13 @@ async def send_email(
     msg = MIMEMultipart('mixed')
     msg['From'] = sender_header
     msg['To'] = ", ".join(to_emails)
+    msg['Date'] = formatdate(localtime=True)
+    sender_domain = (
+        email_settings.sender_email.split('@')[-1]
+        if email_settings.sender_email and '@' in email_settings.sender_email
+        else None
+    )
+    msg['Message-ID'] = make_msgid(domain=sender_domain)
     
     # Universal RFC-2047 Subject sanitization and UTF-8 encoding
     clean_subj = clean_subject_line(subject_template)
@@ -318,7 +353,7 @@ async def send_email(
     all_recipients = list(set(to_emails + (cc_emails or [])))
     if not all_recipients:
         logger.info("Email delivery suppressed: No valid recipients found after filtering.")
-        return True, None
+        return EmailSendResult(True, None)
 
     # 4. Send via SMTP or Exchange EWS in background worker thread
     logger.debug(f"Connecting to Mail Server: {email_settings.smtp_host}:{email_settings.smtp_port}")
@@ -398,14 +433,14 @@ async def send_email(
     try:
         await asyncio.to_thread(_send_worker)
         logger.info(f"Email sent to {all_recipients} via {email_settings.smtp_host}:{email_settings.smtp_port}")
-        return True, None
+        return EmailSendResult(True, None)
     except Exception as primary_err:
         if not allow_platform_fallback:
             logger.error(
                 f"SMTP ({email_settings.smtp_host}:{email_settings.smtp_port}) delivery failed: {primary_err}. "
                 f"Platform fallback is disabled for this message; not retrying via Grow relays."
             )
-            return False, f"SMTP Error ({email_settings.smtp_host}): {primary_err}"
+            return EmailSendResult(False, f"SMTP Error ({email_settings.smtp_host}): {primary_err}")
 
         logger.warning(
             f"SMTP ({email_settings.smtp_host}:{email_settings.smtp_port}) delivery failed: {primary_err}. "
@@ -460,12 +495,12 @@ async def send_email(
             try:
                 await asyncio.to_thread(_send_via_fallback)
                 logger.info(f"Email delivered to {all_recipients} via {label} fallback ({fb.smtp_host}).")
-                return True, None
+                return EmailSendResult(True, None)
             except Exception as fb_err:
                 logger.error(f"{label} fallback ({fb.smtp_host}) failed: {fb_err}")
                 errors.append(f"{fb.smtp_host}: {fb_err}")
 
-        return False, "All email routes failed: " + " | ".join(errors)
+        return EmailSendResult(False, "All email routes failed: " + " | ".join(errors))
 
 
 # --- Account Lockout Protection ---

@@ -129,6 +129,18 @@ class TenantKeyService:
 
         return float(tbill_offer.discount_rate) if tbill_offer.discount_rate is not None else 0.0
 
+    def resolve_tbill_max_amount(self, tbill_offer: QuotationTBillOffer, dek: Optional[bytes] = None) -> float:
+        """Resolves T-Bill max amount using ciphertext when available, falling back to legacy column."""
+        if getattr(tbill_offer, "encrypted_max_amount", None) and dek:
+            try:
+                decrypted = decrypt_field(tbill_offer.encrypted_max_amount, dek, field_context="max_amount")
+                if decrypted is not None:
+                    return float(decrypted)
+            except Exception as e:
+                logger.warning(f"Failed to decrypt tbill max amount for offer {tbill_offer.id}: {e}")
+
+        return float(tbill_offer.max_amount) if tbill_offer.max_amount is not None else 0.0
+
     def apply_encrypted_tbill_offer(self, tbill_offer: QuotationTBillOffer, discount_rate: float, max_amount: float, dek: bytes) -> None:
         """Encrypts T-Bill terms and ensures legacy plaintext columns are NULL for pure ciphertext storage."""
         tbill_offer.encrypted_discount_rate = encrypt_field(float(discount_rate), dek, field_context="discount_rate")

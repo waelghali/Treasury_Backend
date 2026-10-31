@@ -10,12 +10,13 @@ loaded User rows, so a bad foreign key can never leak an alert across customers.
 
 import logging
 from enum import Enum
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.constants import UserRole
-from app.models.models import User
+from app.models.models import User, UserCustomerEntityAssociation
 from app.models.models_quotation import QuotationRequest
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,9 @@ class AudienceKey(str, Enum):
     RFQ_DELEGATE = "RFQ_DELEGATE"
     CUSTOMER_CORPORATE_ADMINS = "CUSTOMER_CORPORATE_ADMINS"
     CANCELLATION_REQUESTER = "CANCELLATION_REQUESTER"
+    CUSTOMER_END_USERS = "CUSTOMER_END_USERS"
+    LG_INTERNAL_OWNER = "LG_INTERNAL_OWNER"  # Alias kept for backward compatibility -> resolves to CUSTOMER_END_USERS
+    LG_ACTION_MAKER = "LG_ACTION_MAKER"
 
 
 def _creator(db: Session, rfq: QuotationRequest) -> List[int]:
@@ -97,3 +101,73 @@ def resolve_rfq_audience(
             len(dropped), rfq.id,
         )
     return {u.id: u.role for u in users}
+
+
+def resolve_lg_audience(
+    db: Session,
+    customer_id: int,
+    audiences: Iterable[AudienceKey],
+    lg_record: Optional[Any] = None,
+    target_user_id: Optional[int] = None,
+    actor_user_id: Optional[int] = None,
+) -> Dict[int, UserRole]:
+    """
+    Returns {user_id: role} for all recipients of the given audience keys for an LG Custody event.
+    Scoped strictly to customer_id, non-deleted users, and excludes actor_user_id.
+    """
+    candidate_ids = set()
+    for key in audiences:
+        k = AudienceKey(key)
+        if k == AudienceKey.CUSTOMER_CORPORATE_ADMINS:
+            admin_rows = db.query(User.id).filter(
+                User.customer_id == customer_id,
+                User.role == UserRole.CORPORATE_ADMIN,
+                User.is_deleted == False,  # noqa: E712
+            ).all()
+            candidate_ids.update(r[0] for r in admin_rows)
+        elif k in (AudienceKey.CUSTOMER_END_USERS, AudienceKey.LG_INTERNAL_OWNER):
+            entity_id = getattr(lg_record, "beneficiary_corporate_id", None) if lg_record else None
+            base_query = db.query(User.id).filter(
+                User.customer_id == customer_id,
+                User.role == UserRole.END_USER,
+                User.is_deleted == False,  # noqa: E712
+            )
+            if entity_id:
+                entity_user_ids = db.query(UserCustomerEntityAssociation.user_id).filter(
+                    UserCustomerEntityAssociation.customer_entity_id == entity_id,
+                    UserCustomerEntityAssociation.is_deleted == False,  # noqa: E712
+                )
+                scoped_rows = base_query.filter(
+                    or_(
+                        User.has_all_entity_access == True,  # noqa: E712
+                        User.id.in_(entity_user_ids),
+                    )
+                ).all()
+                if scoped_rows:
+                    candidate_ids.update(r[0] for r in scoped_rows)
+                else:
+                    # Fallback to all active end users of the customer if none matched entity
+                    all_end_users = base_query.all()
+                    candidate_ids.update(r[0] for r in all_end_users)
+            else:
+                all_end_users = base_query.all()
+                candidate_ids.update(r[0] for r in all_end_users)
+        elif k == AudienceKey.LG_ACTION_MAKER:
+            if target_user_id:
+                candidate_ids.add(target_user_id)
+        else:
+            logger.warning("resolve_lg_audience: unsupported audience key %s for LG event", key)
+
+    if actor_user_id:
+        candidate_ids.discard(actor_user_id)
+    if not candidate_ids:
+        return {}
+
+    users = db.query(User.id, User.role).filter(
+        User.id.in_(candidate_ids),
+        User.customer_id == customer_id,
+        User.is_deleted == False,  # noqa: E712
+    ).all()
+
+    return {u.id: u.role for u in users}
+

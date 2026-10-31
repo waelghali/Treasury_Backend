@@ -1,6 +1,6 @@
-# Grow Treasury — Quotation Module Architectural Roadmap
+        # Grow Treasury — Quotation Module Architectural Roadmap
 
-*Last Updated: October 20, 2026*  
+*Last Updated: October 29, 2026*  
 *Status: Production = `main` @ `12efde2` (backend) / `7955b8e` (frontend). Next release candidate = local branch `safe/2026-10-15-reviewed-fixes` (not merged, not pushed). Notification/Push engine = prototype on local branch `wip/notification-engine-2026-10-15` — **ON HOLD** (see [Current Release State](#-current-release-state--branch-split-2026-10-15)).*
 
 ---
@@ -24,8 +24,12 @@
 14. [Phase 10: Automated Notification & Lifecycle Event Engine — ⏸️ Prototype, On Hold (redesign in §12.7)](#12-phase-10-automated-notification--lifecycle-event-engine)
 15. [Phase 11: Tender Window Governance, Dynamic Lead-Time Buffer & Granular Lifecycle Sub-statuses (Planned 🚀)](#13-phase-11-tender-window-governance-dynamic-lead-time-buffer--granular-lifecycle-sub-statuses-planned-)
 16. [Phase 12: RFQ Document Governance — Decoupled Leg Scoping, Strict Exclusion Firewall & Internal-Only Confidential Vault (Completed & Verified ✅)](#14-phase-12-rfq-document-governance--decoupled-leg-scoping-strict-exclusion-firewall--internal-only-confidential-vault-completed--verified-)
-17. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#15-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
-18. [Production Database Migration Ledger](#16-production-database-migration-ledger-audit--compliance-log)
+17. [Phase 13: UI De-Noising — Eliminate Competing Deal Acceptance UI & Fake Ticker Metrics](#15-phase-13-ui-de-noising--eliminate-competing-deal-acceptance-ui--fake-ticker-metrics)
+18. [Phase 14: Instrument Expansion — FX Forwards, NDFs, FX Swaps & Money Market Deposits](#16-phase-14-instrument-expansion--fx-forwards-ndfs-fx-swaps--money-market-deposits-deep-product--variable-analysis)
+19. [Phase 15: Partial Fill & Tiered Multi-Bank Allocation on T-Bills & Large FX Orders](#17-phase-15-partial-fill--tiered-multi-bank-allocation-on-t-bills--large-fx-orders)
+20. [Phase 16: Outbound Email Governance & Multi-Tier Sender Identity Architecture (Planned 🚀)](#18-phase-16-outbound-email-governance--multi-tier-sender-identity-architecture-planned-)
+21. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#19-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
+22. [Production Database Migration Ledger](#20-production-database-migration-ledger-audit--compliance-log)
 
 ---
 
@@ -149,6 +153,7 @@ To maintain a clean codebase without single-use migration scripts, all manual DD
 **Run these exact statements manually on Production PostgreSQL BEFORE deploying the corresponding release:**
 
 | Release & Phase | Feature / Component Relation | Target Table | Action | Production SQL Statement | Verification Query |
+| **v2.8 (2026-10-29)<br>Notifications N7d & Q5b** | **Zero-Trust Mobile QR Pairing & Institutional Dealer OTP Hardening:** Create `user_mobile_pair_tokens` for password-verified desktop-to-phone QR pairing (Corporate Admins & End Users); create `dealer_mobile_pair_tokens` for ephemeral 15-minute dealer QR sessions with HMAC-SHA256 OTP hashing, 60-second resend cooldown (`last_otp_sent_at`), and 3-attempt burn protection; extend `dealer_alert_reminders` with OTP verification columns. | `user_mobile_pair_tokens`, `dealer_mobile_pair_tokens`, `dealer_alert_reminders` | Create 2 new tables + 5 indexes; add 3 columns to `dealer_alert_reminders` | ```sql<br>-- 1. user_mobile_pair_tokens: Corporate User & Admin QR pairing<br>CREATE TABLE IF NOT EXISTS user_mobile_pair_tokens (<br>  id SERIAL PRIMARY KEY,<br>  pairing_token VARCHAR(64) NOT NULL UNIQUE,<br>  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,<br>  expires_at TIMESTAMPTZ NOT NULL,<br>  is_paired BOOLEAN NOT NULL DEFAULT FALSE,<br>  paired_at TIMESTAMPTZ,<br>  device_label VARCHAR(120),<br>  platform VARCHAR(20),<br>  created_at TIMESTAMPTZ DEFAULT now(),<br>  updated_at TIMESTAMPTZ,<br>  is_deleted BOOLEAN DEFAULT FALSE,<br>  deleted_at TIMESTAMPTZ<br>);<br>CREATE UNIQUE INDEX IF NOT EXISTS ix_user_mobile_pair_tokens_token ON user_mobile_pair_tokens (pairing_token);<br>CREATE INDEX IF NOT EXISTS ix_user_mobile_pair_tokens_user_id ON user_mobile_pair_tokens (user_id);<br><br>-- 2. dealer_mobile_pair_tokens: Ephemeral 15m Dealer QR pairing & HMAC OTP<br>CREATE TABLE IF NOT EXISTS dealer_mobile_pair_tokens (<br>  id SERIAL PRIMARY KEY,<br>  pairing_token VARCHAR(64) NOT NULL UNIQUE,<br>  email VARCHAR(255) NOT NULL,<br>  bank_id INTEGER REFERENCES banks(id) ON DELETE SET NULL,<br>  expires_at TIMESTAMPTZ NOT NULL,<br>  is_paired BOOLEAN NOT NULL DEFAULT FALSE,<br>  paired_at TIMESTAMPTZ,<br>  device_label VARCHAR(120),<br>  platform VARCHAR(20),<br>  otp_code VARCHAR(255),<br>  otp_expires_at TIMESTAMPTZ,<br>  otp_failed_attempts INTEGER NOT NULL DEFAULT 0,<br>  last_otp_sent_at TIMESTAMPTZ,<br>  created_at TIMESTAMPTZ DEFAULT now(),<br>  updated_at TIMESTAMPTZ,<br>  is_deleted BOOLEAN DEFAULT FALSE,<br>  deleted_at TIMESTAMPTZ<br>);<br>CREATE UNIQUE INDEX IF NOT EXISTS ix_dealer_mobile_pair_tokens_token ON dealer_mobile_pair_tokens (pairing_token);<br>CREATE INDEX IF NOT EXISTS ix_dealer_mobile_pair_tokens_email ON dealer_mobile_pair_tokens (email);<br>CREATE INDEX IF NOT EXISTS ix_dealer_mobile_pair_tokens_bank_id ON dealer_mobile_pair_tokens (bank_id);<br><br>-- 3. dealer_alert_reminders: OTP columns for standing setup links<br>ALTER TABLE dealer_alert_reminders<br>ADD COLUMN IF NOT EXISTS otp_code VARCHAR(255),<br>ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ,<br>ADD COLUMN IF NOT EXISTS otp_failed_attempts INTEGER NOT NULL DEFAULT 0;<br>``` | ```sql<br>SELECT<br>(SELECT count(*) FROM information_schema.tables WHERE table_name IN ('user_mobile_pair_tokens', 'dealer_mobile_pair_tokens')) AS qr_tables, -- expect 2<br>(SELECT count(*) FROM information_schema.columns WHERE table_name = 'dealer_mobile_pair_tokens' AND column_name = 'last_otp_sent_at') AS cooldown_col, -- expect 1<br>(SELECT count(*) FROM information_schema.columns WHERE table_name = 'dealer_alert_reminders' AND column_name IN ('otp_code', 'otp_expires_at', 'otp_failed_attempts')) AS reminder_otp_cols; -- expect 3<br>``` |
 | **v2.7 (2026-10-26)<br>Notifications N7** | **Bank Dealer Web Push & Standing Alert Reminders:** Support standalone dealer payloads without internal user account requirement; make `notification_deliveries` `notification_id` and `user_id` NULLABLE; add `dealer_email`, `dealer_id`, `payload_json`, and unique `dedupe_key`; add owner CHECK constraint on `push_subscriptions`; create `dealer_alert_reminders` table for standing setup tokens and opt-out tracking. | `notification_deliveries`, `push_subscriptions`, `dealer_alert_reminders` | Make columns nullable + add 4 columns + 3 indexes; add CHECK constraint on push_subscriptions; create new tracking table + 2 indexes | ```sql<br>-- 1. notification_deliveries: standalone dealer payloads<br>ALTER TABLE notification_deliveries ALTER COLUMN notification_id DROP NOT NULL;<br>ALTER TABLE notification_deliveries ALTER COLUMN user_id DROP NOT NULL;<br>ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS dealer_email VARCHAR(255);<br>ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS dealer_id INTEGER REFERENCES quotation_bank_dealers(id);<br>ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS payload_json TEXT;<br>ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS dedupe_key VARCHAR(128);<br>CREATE UNIQUE INDEX IF NOT EXISTS uq_notification_deliveries_dedupe_key ON notification_deliveries (dedupe_key);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_dealer_email ON notification_deliveries (dealer_email);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_dealer_id ON notification_deliveries (dealer_id);<br><br>-- 2. push_subscriptions: clean orphaned dealer_email & enforce owner constraint<br>UPDATE push_subscriptions SET dealer_email = NULL WHERE user_id IS NOT NULL AND dealer_email IS NOT NULL;<br>ALTER TABLE push_subscriptions DROP CONSTRAINT IF EXISTS chk_push_sub_owner;<br>ALTER TABLE push_subscriptions ADD CONSTRAINT chk_push_sub_owner CHECK (<br>  (user_id IS NOT NULL AND dealer_email IS NULL) OR<br>  (user_id IS NULL AND (dealer_email IS NOT NULL OR dealer_id IS NOT NULL))<br>);<br><br>-- 3. dealer_alert_reminders: standing setup tokens & opt-out tracking<br>CREATE TABLE IF NOT EXISTS dealer_alert_reminders (<br>  id SERIAL PRIMARY KEY,<br>  email VARCHAR(255) NOT NULL UNIQUE,<br>  bank_id INTEGER REFERENCES banks(id),<br>  setup_token VARCHAR(64) NOT NULL UNIQUE,<br>  reminders_sent INTEGER NOT NULL DEFAULT 0,<br>  last_reminded_at TIMESTAMPTZ,<br>  link_opened_at TIMESTAMPTZ,<br>  opted_out BOOLEAN NOT NULL DEFAULT FALSE,<br>  created_at TIMESTAMPTZ DEFAULT now(),<br>  updated_at TIMESTAMPTZ,<br>  is_deleted BOOLEAN DEFAULT FALSE,<br>  deleted_at TIMESTAMPTZ<br>);<br>CREATE INDEX IF NOT EXISTS ix_dealer_alert_reminders_email ON dealer_alert_reminders (email);<br>CREATE INDEX IF NOT EXISTS ix_dealer_alert_reminders_setup_token ON dealer_alert_reminders (setup_token);<br>``` | ```sql<br>SELECT<br>(SELECT count(*) FROM information_schema.columns WHERE table_name = 'notification_deliveries' AND column_name IN ('dealer_email', 'dealer_id', 'payload_json', 'dedupe_key')) AS outbox_dealer_cols, -- expect 4<br>(SELECT count(*) FROM information_schema.tables WHERE table_name = 'dealer_alert_reminders') AS reminders_tbl, -- expect 1<br>(SELECT count(*) FROM pg_constraint WHERE conname = 'chk_push_sub_owner') AS owner_check; -- expect 1<br>``` |
 | **v2.6 (2026-10-26)<br>Notifications Q3** | **Web Push channel:** extend the existing `push_subscriptions` table (Phase 9, 2026-10-14) with owner customer, device label/platform and health fields; retire pre-Q3 subscriptions (made with other VAPID keys, can never be delivered); new `notification_deliveries` outbox. **Also set env vars `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` on the API server.** | `push_subscriptions`, `notification_deliveries` | Create-if-missing + add 9 columns + 2 indexes; one-time retire of legacy rows; create outbox table + 6 indexes | ```sql<br>CREATE TABLE IF NOT EXISTS push_subscriptions (<br>  id SERIAL PRIMARY KEY,<br>  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,<br>  endpoint TEXT NOT NULL UNIQUE,<br>  p256dh VARCHAR(255) NOT NULL,<br>  auth VARCHAR(255) NOT NULL,<br>  user_agent VARCHAR(500),<br>  device_type VARCHAR(50) NOT NULL DEFAULT 'web',<br>  is_active BOOLEAN NOT NULL DEFAULT TRUE,<br>  last_notified_at TIMESTAMP,<br>  dealer_id INTEGER REFERENCES quotation_bank_dealers(id),<br>  dealer_email VARCHAR(255),<br>  bank_id INTEGER REFERENCES banks(id),<br>  created_at TIMESTAMPTZ DEFAULT now(),<br>  updated_at TIMESTAMPTZ,<br>  is_deleted BOOLEAN DEFAULT FALSE,<br>  deleted_at TIMESTAMPTZ<br>);<br>CREATE INDEX IF NOT EXISTS ix_push_subscriptions_user_id ON push_subscriptions (user_id);<br>CREATE INDEX IF NOT EXISTS ix_push_subscriptions_is_active ON push_subscriptions (is_active);<br><br>ALTER TABLE push_subscriptions<br>ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,<br>ADD COLUMN IF NOT EXISTS device_id VARCHAR(64),<br>ADD COLUMN IF NOT EXISTS device_label VARCHAR(120),<br>ADD COLUMN IF NOT EXISTS platform VARCHAR(20),<br>ADD COLUMN IF NOT EXISTS revoked_reason VARCHAR(32),<br>ADD COLUMN IF NOT EXISTS failure_count INTEGER NOT NULL DEFAULT 0,<br>ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ,<br>ADD COLUMN IF NOT EXISTS last_failure_at TIMESTAMPTZ,<br>ADD COLUMN IF NOT EXISTS last_error VARCHAR(255);<br>CREATE INDEX IF NOT EXISTS ix_push_subscriptions_customer_id ON push_subscriptions (customer_id);<br>CREATE INDEX IF NOT EXISTS ix_push_subscriptions_device_id ON push_subscriptions (device_id);<br><br>-- one-time: pre-Q3 rows used other VAPID keys<br>UPDATE push_subscriptions<br>SET is_active = FALSE, revoked_reason = 'LEGACY_KEYS'<br>WHERE revoked_reason IS NULL AND customer_id IS NULL<br>AND failure_count = 0 AND last_success_at IS NULL;<br><br>CREATE TABLE IF NOT EXISTS notification_deliveries (<br>  id SERIAL PRIMARY KEY,<br>  notification_id INTEGER NOT NULL REFERENCES user_notifications(id) ON DELETE CASCADE,<br>  subscription_id INTEGER NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,<br>  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,<br>  channel VARCHAR(16) NOT NULL DEFAULT 'PUSH',<br>  status VARCHAR(16) NOT NULL DEFAULT 'PENDING',<br>  attempts INTEGER NOT NULL DEFAULT 0,<br>  next_attempt_at TIMESTAMPTZ NOT NULL,<br>  expires_at TIMESTAMPTZ,<br>  sent_at TIMESTAMPTZ,<br>  last_error VARCHAR(255),<br>  created_at TIMESTAMPTZ DEFAULT now(),<br>  updated_at TIMESTAMPTZ,<br>  is_deleted BOOLEAN DEFAULT FALSE,<br>  deleted_at TIMESTAMPTZ<br>);<br>CREATE UNIQUE INDEX IF NOT EXISTS uq_notification_delivery_pair ON notification_deliveries (notification_id, subscription_id);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_due ON notification_deliveries (status, next_attempt_at);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_notification_id ON notification_deliveries (notification_id);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_subscription_id ON notification_deliveries (subscription_id);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_user_id ON notification_deliveries (user_id);<br>CREATE INDEX IF NOT EXISTS ix_notification_deliveries_is_deleted ON notification_deliveries (is_deleted);<br>``` | ```sql<br>SELECT<br>(SELECT count(*) FROM information_schema.columns<br> WHERE table_name = 'push_subscriptions'<br> AND column_name IN ('customer_id','device_id','device_label','platform','revoked_reason',<br> 'failure_count','last_success_at','last_failure_at','last_error')) AS new_cols, -- expect 9<br>(SELECT count(*) FROM information_schema.tables<br> WHERE table_name = 'notification_deliveries') AS outbox, -- expect 1<br>(SELECT count(*) FROM push_subscriptions WHERE is_active) AS active_subs; -- expect 0 right after migration<br>``` |
 | **v2.5 (2026-10-26)<br>Notifications Q1** | **Quotation notification core:** string reference for RFQ UUIDs (`reference_id` is INTEGER), urgency (mirrors Web Push `Urgency`), and stale-after time for per-user notifications. | `user_notifications` | Add columns `reference_key`, `urgency`, `expires_at` + index | ```sql<br>ALTER TABLE user_notifications<br>ADD COLUMN IF NOT EXISTS reference_key VARCHAR(64),<br>ADD COLUMN IF NOT EXISTS urgency VARCHAR(10) NOT NULL DEFAULT 'normal',<br>ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;<br>CREATE INDEX IF NOT EXISTS ix_user_notifications_reference_key<br>ON user_notifications (reference_key);<br>``` | ```sql<br>SELECT column_name, data_type, column_default<br>FROM information_schema.columns<br>WHERE table_name = 'user_notifications'<br>AND column_name IN ('reference_key', 'urgency', 'expires_at');<br>``` |
@@ -690,6 +695,33 @@ All controls operate identically whether an RFQ has 1 leg or 10 legs:
 
 ---
 
+#### 📌 Phase 6.8: Real-Time Twelve Data FX Feed, Multi-Currency Batching & T-10s Window-Close Snapshotting (Completed & Verified ✅)
+*Scope: Upgrade market benchmark feed from 24-hour delayed open feed to real-time intraday spot via Twelve Data, batch multi-leg currency pairs in a single HTTP call, and trigger automated T-10s / window-close snapshotting to eliminate decision-maker modal latency.*
+
+- **Context & Operational Rationale**:
+  - The previous open-access FX endpoint (`open.er-api.com`) updated only once every 24 hours (00:00 UTC), failing to capture intraday interbank currency movements, central bank announcements, or bank desk adjustments during the Egyptian trading session.
+  - Making periodic polling calls unnecessarily burns API quotas. Tenders only require an accurate market reference rate at the critical moment of bidding closure so corporate decision-makers can compare incoming bank quotes against current market reality.
+  - Multi-currency basket RFQs with multiple legs must not spawn multiple sequential API requests.
+- **Architectural & Security Enhancements**:
+  - **Twelve Data Real-Time FX Provider**:
+    - Integrated authenticated Twelve Data API (`TWELVE_DATA_API_KEY` in `.env`) providing real-time intraday spot rates for `USD/EGP`, `EUR/EGP`, and global crosses.
+    - Configured multi-tier fallback: `TWELVE_DATA_REALTIME` -> `INTERBANK_LIVE_FEED` (`open.er-api.com`) -> `CBE_OFFICIAL_FIXING` (Local DB) -> `SYSTEM_DEFAULT_FALLBACK`.
+  - **Single-Request Multi-Currency Batching**:
+    - Implemented `fetch_twelve_data_rates()` in [`live_market_service.py`](file:///c:/Grow/app/services/live_market_service.py) supporting comma-separated symbol batching (`symbol=USD/EGP,EUR/EGP`).
+    - Consumes exactly **1 API request per tender** regardless of how many legs or currency pairs are present in the basket.
+  - **T-10s & Window-Close Pre-Fetch Hook**:
+    - Wired `snapshot_rfq_market_benchmarks()` directly into [`compute_rfq_standings()`](file:///c:/Grow/app/api/v1/endpoints/quotations_endpoints.py).
+    - When an RFQ window closes (or enters the final 10 seconds of countdown), all distinct currency pairs across the root RFQ and all legs are batch-fetched in one call and permanently frozen into `rfq.market_benchmark_snapshot` and `leg.market_benchmark_snapshot`.
+    - Guarantees **0 ms modal open delay** for corporate treasurers during time-sensitive 30-second acceptance windows.
+  - **Micro-Cache Guard**:
+    - Implemented a 30-second in-memory cache (`_TWELVE_DATA_CACHE`) with a 2.0-second network timeout. If multiple participants observe the closing tender simultaneously, duplicate external API requests are blocked.
+- **Verification Proof**:
+  - Live query verified returning real-time `USD/EGP` spot rate (`56.1018`) with automated CBE drift calculation (+313.1 bps vs CBE fixing).
+  - Automated test suite `tests/test_privacy_preserving_analytics.py` passed 100% (2/2) verifying empirical references resolve with `Source: TWELVE_DATA_REALTIME`.
+  - Zero DDL alterations required; leverages existing `market_benchmark_snapshot` JSONB columns.
+
+---
+
 ## 8. Phase 7: Platform Owner Diagnostics Console & Dealer Voice System
 
 ---
@@ -1104,7 +1136,7 @@ To balance operational cost during early growth with Tier-1 bank procurement rea
 
 ---
 
-#### 📌 Sub-Phase 8.7B: Cross-Module Universal Storage-at-Rest Encryption & Zero-Buffer Streaming ("The Bytes Method") (Ready for 1-Click Implementation 🚀)
+#### 📌 Sub-Phase 8.7B: Cross-Module Universal Storage-at-Rest Encryption & Zero-Buffer Streaming ("The Bytes Method") (Completed & Fully Verified ✅)
 *Scope: Expanding the 64 KB STREAM V2 authenticated encryption and zero-heap streaming gateway across LG Custody, LG Issuance, Credit Facilities, and Customer Onboarding, guaranteeing 100% platform-wide zero-knowledge storage at rest with strictly bounded RAM consumption (< 128 KB).*
 
 - **1. Strategic Objective & Problem Statement**:
@@ -1536,10 +1568,13 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
 | **N2** | Installable PWA shell: manifest, icons, minimal SW (push/click/subscription-change only, no caching) | None | Planned |
 | **N3** | Web Push for internal users: env-only VAPID (fail fast), `push_subscriptions` tied to `user_devices`, scoped endpoints, push adapter, logout/revoke teardown | New `push_subscriptions` | Planned |
 | **N4** | Onboarding UX: Mobile Alerts page, device list + test, soft-ask, iOS guide, 4 category toggles, app badge, deep-link return after login | New `user_notification_preferences` | Planned |
-| **N5** | Event coverage: 5a Issuance, 5b Quotation (internal), 5c LG/facility/SLA deadlines | — | Planned |
+| **N5b** | Quotation internal event coverage (instant + timed window/attendance/auto-resolve alerts) | — | ✅ Done (Q1 + Q4) |
+| **N5c** | **LG Custody Smart Mobile Alerts** ('Middle Management' escalation engine, dormant letter alerts, Day 0 cutoff, Maker-Checker hooks, strict lock-screen masking) | None (No DDL) | ✅ Done (see post-flight below) |
+| **N5a** | Outbound LG Issuance & Facility threshold mobile alerts | — | Planned |
 | **N6** | System Owner console: enable/disable, templates, channels, urgency, role audiences, test-on-my-device, delivery dashboard; rules seeded at startup | New `notification_event_rules` | Planned |
 | **N7a** | Bank dealer push (flagged): dealer enables from the RFQ bank-offer link (no login); one enable per phone covers **all** RFQs from **all** customers that invite him; recipients via assignment → customer `quotation_banks` → contacts ∩ enrolled dealers; cross-customer isolation test mandatory | `push_subscriptions.dealer_id` + CHECK | ✅ Done (see post-flight below) |
 | **N7b** | Dealer alert reminder email (Grow-branded) to dealers without phone alerts, with a standing setup link | New reminder-tracking table (`dealer_alert_reminders`) | ✅ Done (see post-flight below) |
+| **N7c** | Trading Desk Alerts & Audio Redesign (3-Channel Hub: Audio Chimes, Windows PC Push, Mobile QR Pairing; Strict Platform Isolation; Zero In-Page Clutter) | None (No DDL) | ✅ Done (see post-flight below) |
 | N8 (backlog) | Quiet hours, batching, morning briefing, real-time bell (SSE) | — | Backlog |
 
 **Dealer alert decisions (2026-10-26):**
@@ -1585,6 +1620,86 @@ To eliminate the operational friction of 24-hour expiring quote links and slow e
   * `tests/test_notifications_push_q3.py`: 6/6 checks PASS.
   * `tests/test_notifications_quotation_q1.py`: 9/9 checks PASS.
   * Frontend production build: `$env:CI="false"; npm run build` compiles cleanly with exit code 0 (`build/static/js/main.b254e425.js`).
+
+#### N7c Post-Flight (2026-10-28) — 3-Channel Trading Desk Alerts & Multi-Device Isolation Hardening ✅ (no DDL)
+* **Work Actually Done:**
+  1. [`DealerMobileAlertsBanner.jsx`](file:///c:/Grow/frontend/src/components/DealerMobileAlertsBanner.jsx):
+     * Refactored the alert modal into a clean, 3-Channel Trading Desk Alert Center:
+       * **Channel 1 (Audio):** Trading Desk Chimes with 1-click audio toggle and instant sound preview upon unmuting (`tradingAudio.playWindowOpened()`). Removed redundant "Test Chime" button.
+       * **Channel 2 (Windows PC):** Windows Desktop Notifications with strict device status (`ACTIVE ON THIS PC` / `INACTIVE ON THIS PC`) and single 1-click `[ Activate on this PC ]` / `[ Deactivate PC Alert ]` action.
+       * **Channel 3 (Mobile Phone):** Mobile Smartphone Push with strict phone status (`CONNECTED: iPhone / Android` / `NO PHONE LINKED`) and clean `[ Pair Phone via QR ]` / `[ Deactivate / Unlink Phone ]` action.
+     * Header Chip: Pulsing amber beacon button `[ 🔔 Turn On RFQ Alerts ]` when alerts are inactive to draw trader attention without cluttering the page; calm steady green badge when active.
+     * Removed all competing in-page alert banners, tip prompts, and floating tags from the trading console to ensure 100% clean bidding space.
+  2. [`QuotationBankOfferPage.js`](file:///c:/Grow/frontend/src/pages/Public/QuotationBankOfferPage.js):
+     * Added quick-mute speaker button `[ 🔊 Sound: On ]` / `[ 🔇 Muted ]` directly in the top navbar.
+     * Purged redundant body alert cards, obsolete states (`isAnyAlertActive`), and unneeded UI clutter.
+     * 100% preserved the 8 trophy milestone circles and seasonal festive icons.
+  3. [`public_quotations.py`](file:///c:/Grow/app/api/v1/endpoints/public_quotations.py):
+     * Introduced `_is_phone_sub_filter(PushSubscription)`: strict SQLAlchemy clause distinguishing mobile phone subscriptions (`platform in ('ios', 'android', 'mobile')` or phone user agents) from Windows desktop subscriptions (`platform = 'desktop'`).
+     * Fixed critical bug where activating Windows PC alerts caused `generate_dealer_qr_pair` and `get_dealer_qr_status` to evaluate `is_paired = True`, prematurely showing "Phone Paired Successfully" and hiding the QR code.
+     * Fixed critical bug in `unsubscribe_dealer_push` where unlinking a phone inadvertently deactivated the desktop PC subscription. Desktop and mobile channels are now 100% independent and isolated.
+* **Technical Findings & Gotchas:**
+  * **Device Entanglement in Shared Tables**: When a single user/email has multiple device subscriptions in `push_subscriptions`, queries without explicit platform/device-type filtering inadvertently treat desktop browsers as mobile phones. Enforcing `_is_phone_sub_filter` ensures desktop and mobile state transitions never cross-pollinate.
+  * **Zero In-Page Clutter Principle**: Institutional bank dealers are distracted by multi-layer banners or instructional cards inside their quoting blotters. Consolidating all channels into a single top navbar modal provides maximum accessibility with zero screen real estate sacrifice.
+* **Verification Proof:**
+  * Backend syntax check passed with exit code 0 (`py_compile app/api/v1/endpoints/public_quotations.py`).
+  * Frontend ESLint checks on `DealerMobileAlertsBanner.jsx` and `QuotationBankOfferPage.js` pass with 0 errors.
+  * SQL verification: verified `MATCHED PHONE SUBS: 0` for desktop-only rows, confirming strict isolation.
+
+#### N7d Post-Flight (2026-10-29) — Institutional Dealer QR Security & Obsidian Titanium Alert Styling ✅ (ledger v2.8)
+* **Work Actually Done:**
+  1. **Ephemeral QR Pairing Architecture ([`models_push.py`](file:///c:/Grow/app/models/models_push.py), [`public_quotations.py`](file:///c:/Grow/app/api/v1/endpoints/public_quotations.py)):**
+     * Replaced permanent `DealerAlertReminder` reuse on the Trading Desk with dedicated ephemeral 15-minute `DealerMobilePairToken` records (`user_mobile_pair_tokens` for internal users and `dealer_mobile_pair_tokens` for bank dealers).
+     * Cryptographic OTP hardening: 6-digit verification codes are salted and hashed via `hash_otp_code` / `verify_otp_code` (HMAC-SHA256, `otp_security.py`) — zero plaintext OTPs stored on disk.
+     * Enforced a strict **60-second resend cooldown** (`last_otp_sent_at`) returning HTTP `429` on rapid re-requests, and a **3-failed-attempt circuit breaker** that immediately burns the OTP (`otp_code = None`, `otp_expires_at = None`) and forces a fresh code request.
+     * Added `send_only=True` on dealer OTP emails so ephemeral verification codes never clutter shared corporate "Sent Items" mailboxes.
+     * Hardened `unsubscribe_dealer_push` to require verification that the `endpoint` belongs to the authenticated RFQ assignment's `bank_id` and `dealer_email`.
+  2. **Obsidian Titanium Alert Badge ([`DealerMobileAlertsBanner.jsx`](file:///c:/Grow/frontend/src/components/DealerMobileAlertsBanner.jsx)):**
+     * Locked in the **Obsidian Titanium** theme for the inactive alert state: dark slate-950 core (`bg-slate-950 text-slate-100 border-2 border-slate-300/85`), pulsing metallic white/slate outer aura (`from-slate-200 via-white to-slate-400 opacity-75 blur-xs animate-pulse`), and crisp white radar ping dot.
+     * Active state transitions to a calm, distraction-free emerald badge (`bg-emerald-50 text-emerald-800 border-emerald-300`) with zero pulsing aura.
+     * Removed all temporary theme comparison drawers and state hooks.
+* **Verification Proof:**
+  * Backend compilation (`py_compile`) passed with exit code 0.
+  * Frontend production build (`npm.cmd run build`) succeeded with exit code 0.
+
+#### N5c Post-Flight (2026-10-29) — LG Custody Smart Mobile Alerts ("Middle Management" Escalation Engine) ✅ (no DDL)
+* **Work Actually Done:**
+  1. **Confidentiality Masking Engine ([`lg_custody_masking.py`](file:///c:/Grow/app/services/notifications/lg_custody_masking.py)):**
+     * `mask_lg_number()`: masks guarantee serial numbers to their last 4 characters (`...8412`).
+     * `mask_issuer_name()`: preserves the first word and masks subsequent words to first-letter initials (`Hassan A*** C***`, `شركة ح*** أ*** ل***`, `Sie***`).
+     * **Zero Financial Leakage**: All LG Custody push templates strictly exclude amounts, currencies, and credit figures.
+  2. **Catalog, Role Audiences & Emitter ([`catalog.py`](file:///c:/Grow/app/services/notifications/catalog.py), [`audiences.py`](file:///c:/Grow/app/services/notifications/audiences.py), [`emit.py`](file:///c:/Grow/app/services/notifications/emit.py)):**
+     * Registered 8 LG Custody event specs under `module="CUSTODY"`, `category="LG_CUSTODY"`:
+       * **Corporate Admin (Management by Exception):**
+         1. `LG_CUSTODY_INACTION_ESCALATION` (HIGH): End user took no renewal/release action at $\le 14$d and $\le 5$d before expiry.
+         2. `LG_CUSTODY_UNDELIVERED_LETTER` (HIGH): Extension/claim instruction generated on desktop but `delivery_date` / `sent_to_bank` not recorded with $\le 5$d to expiry.
+         3. `LG_CUSTODY_APPROVAL_REQUIRED` (HIGH): End user submitted a Release or Liquidation request requiring Admin authorization.
+         4. `LG_CUSTODY_DAY_ZERO` (HIGH): Final morning cutoff alert on maturity date (`days_left == 0`) with no extension or claim on file.
+         5. `LG_CUSTODY_BANK_DEFECT` (HIGH): Bank reply recorded with an objection or AI-flagged discrepancy.
+       * **End User / Internal Owner (Actionable Desktop Prompts):**
+         6. `LG_USER_EXPIRY_ACTION_NOTICE` (NORMAL): 30-day advisory directing the user to their desktop terminal to prepare and print formal paperwork (no 1-click mobile execution, preserving physical signature/paperwork governance).
+         7. `LG_USER_PRE_ESCALATION_WARNING` (HIGH): 16-day warning (48h grace period before Corporate Admin escalation).
+         8. `LG_USER_REQUEST_DECIDED` (NORMAL): Instant update when Corporate Admin approves or rejects their Custody request.
+     * Added `AudienceKey.CUSTOMER_END_USERS` (resolves strictly to active `END_USER` operators with entity access to `lg_record.beneficiary_corporate_id` — never treating `InternalOwnerContact` directory records as system users), `AudienceKey.LG_ACTION_MAKER`, and `LG_CUSTODY_PORTFOLIO_BURST_DIGEST` (anti-spam burst consolidation when $> 3$ LGs trigger the same daily event, emitting the top 2 individual alerts + 1 consolidated summary).
+     * Added **Auto-Resolve Stale Alerts (`resolve_stale_custody_notifications`)** across `crud_lg_instruction.py` and `crud_approval_request.py` (clears unread escalations/approval alerts when an instruction is created, delivered, replied, or withdrawn), plus **Self-Healing Background Push Rotation (`POST /api/v1/notifications/push/rotate` & `sw.js`)**.
+     * Added `emit_lg()` in `emit.py` which automatically injects `masked_lg_no` and `masked_issuer`, stages `UserNotification` rows, and calls `enqueue_push(db, rows)` — using the **exact same device activation/deactivation subscription lifecycle** (`PushSubscription` / `MobileAlertsControl.jsx`) as the Quotation module.
+  3. **Autonomous Daily Sweep & Maker-Checker Hooks ([`lg_custody_service.py`](file:///c:/Grow/app/services/notifications/lg_custody_service.py), [`background_tasks.py`](file:///c:/Grow/app/core/background_tasks.py), [`crud_approval_request.py`](file:///c:/Grow/app/crud/crud_approval_request.py)):**
+     * Built `run_lg_custody_mobile_alerts_sweep(db)` with multi-day idempotency (`was_event_sent_recently`) and wired it as an isolated `try...except` block (Feature 3) inside `run_daily_renewal_reminders`.
+     * Wired `notify_custody_approval_required` and `notify_custody_request_decided` into `crud_approval_request.py` (`create_approval_request`, `approve_request`, `reject_request`) inside non-blocking `try...except` guards.
+     * Mapped all 8 event codes to semantic icons in [`NotificationCenter.jsx`](file:///c:/Grow/frontend/src/components/NotificationCenter.jsx) and updated [`MobileAlertsControl.jsx`](file:///c:/Grow/frontend/src/components/MobileAlertsControl.jsx).
+* **Verification Proof:**
+  * `tests/test_lg_custody_notifications.py`: 5/5 unit & integration checks PASS (`0.47s`).
+  * `tests/test_notifications_quotation_q1.py`: 9/9 checks PASS (zero regression on quotation alerts).
+  * Live scheduler dry-run against local PostgreSQL completed cleanly (`Staged notifications: 2`, exit code 0).
+
+#### Next Up on Custody AI Track — Smart Document Verification Enhancements (Queued 🚀)
+To be reviewed and merged from `feature/smart-lg-custody-ai` (`app/services/document_verification_service.py`) in the next phase:
+1. **Bank Expiry Date Tolerance Alignment ($\pm 2$ to $3$ Calendar Days):**
+   * Handle calendar-quarter vs. 90-day extension conventions and weekend/holiday shifts gracefully as `DATE_CONVENTION_VARIANCE` rather than hard failures.
+   * Present an explicit user acceptance prompt to align the system's LG expiry date with the bank's confirmed date and log the confirmation in `AuditLog`.
+2. **Multi-Instruction Bank Reply Disambiguation (Preventing Misfiled Replies):**
+   * Cross-check AI-extracted document purpose, bank reference, and cited dates against all open instructions for that `lg_record_id`.
+   * If a user attempts to upload an Extension reply onto a Release instruction (or Instruction #1 instead of Instruction #2), alert the user and offer a 1-click **"Switch & Record to Instruction #&#123;matched_seq&#125;"** redirection.
 
 #### N0 Post-Flight (2026-10-26) — Bell Display Fixes ✅
 * **Work Actually Done:**
@@ -2223,8 +2338,240 @@ To maintain 100% non-breaking backwards compatibility with existing database rec
 
 ---
 
+## 15. Phase 13: UI De-Noising — Eliminate Competing Deal Acceptance UI & Fake Ticker Metrics
 
-## 15. Master Implementation Status: What We Have vs. What Still Needs to Be Done
+### 15.1 Problem Statement
+1. **Competing Deal Acceptance Surfaces**: When a tender window closes (`status === 'EVALUATING'`, `acceptance_status === 'PENDING'`), both `GlobalDealAcceptanceModal.js` (mounted globally via `ProtectedLayout.js`) and the inline acceptance banner inside `ResultsView.js` (lines 1185–1330) render simultaneously when the user is viewing the RFQ results page. Each runs its own countdown timer and triggers independent API calls, creating visual duplication and race conditions.
+2. **Hardcoded / Synthetic Ticker Metrics**: Several live ticker banners display fabricated placeholder strings (such as hardcoded `"2.4s AVG SPEED"` or synthetic volatility badges) rather than strictly computed telemetry from real tender execution data.
+
+### 15.2 Approved Architecture & Scope
+- **Single Authoritative Acceptance Surface**:
+  - `GlobalDealAcceptanceModal.js` serves as the single interactive modal for binding deal acceptance, partial leg selection, delegation, and two-step deal decline while the modal is expanded.
+  - When `GlobalDealAcceptanceModal.js` is actively open on screen, `ResultsView.js` suppresses its duplicate inline Accept/Decline action buttons and displays a clean synchronized status indicator (`"Decision modal active — or minimize modal to inspect full table"`), only revealing inline execution controls if the user explicitly minimizes the global modal.
+- **Strictly Authentic Telemetry**:
+  - Remove hardcoded/fake ticker badges (`"2.4s AVG SPEED"`, synthetic market noise) from `QuotationRequestDashboard.js` and `QuotationBankOfferPage.js`.
+  - Keep only real, verifiable data points (actual live spot benchmarks from Twelve Data / CBE, actual active tender counts, and real response times).
+- **Preserved Features (Explicitly Retained)**:
+  - All gamification elements, post-deal celebration trophies, audio chimes (`tradingAudio.js`), bank card fee/tariff controls, and multi-step security/OTP ceremonies remain 100% intact.
+
+---
+
+## 16. Phase 14: Instrument Expansion — FX Forwards, NDFs, FX Swaps & Money Market Deposits (Deep Product & Variable Analysis)
+
+### 16.1 Strategic Objective
+Expand the Grow Quotation Engine beyond `FX_SPOT` and `TBILL` to cover the four core corporate treasury hedging and liquidity instruments—**Outright FX Forwards (`FX_FORWARD`)**, **Non-Deliverable Forwards (`FX_NDF`)**, **FX Swaps (`FX_SWAP`)**, and **Money Market Deposits / Loans (`MM_DEPOSIT`)**—while reusing the existing multi-leg architecture (`QuotationLeg`), Zero-Knowledge AES-256-GCM envelope encryption, and counterparty governance workflows.
+
+### 16.2 Deep Variable, Quoting & Evaluation Matrix by Product
+
+#### A. Outright FX Forward (`FX_FORWARD`) — Deliverable Forward Hedging
+- **Use Case**: Locking in a binding exchange rate today for physical delivery on a future settlement date beyond Spot ($T+2$), matched to confirmed import LCs, capex payments, or export receivables.
+- **Corporate Request Variables (RFQ Input)**:
+  - `direction`: `"Buy"` or `"Sell"` (applied to `buy_currency` / Base Currency).
+  - `buy_currency` & `sell_currency`: ISO 4217 pair (e.g., `USD/EGP`, `EUR/USD`).
+  - `amount`: Notional amount and `notional_currency` (supports specifying exact Base or Quote currency notional).
+  - `delivery_type`:
+    - `OUTRIGHT_DATE`: Fixed future value date (`maturity_date`).
+    - `WINDOW_OPTION` (Time-Option Forward): Delivery window (`window_delivery_start` to `window_delivery_end`) during which the corporate can draw down partial or full amounts.
+  - `tenor_bucket`: Standard tenors (`1W`, `2W`, `1M`, `2M`, `3M`, `6M`, `9M`, `12M`) or `BROKEN_DATE` (exact custom calendar date).
+  - `spot_reference_mode`: `"BANK_QUOTED"` (each bank supplies its own Spot + Forward Points) or `"SYNCHRONIZED_SPOT"` (corporate locks/provides reference Spot or evaluates purely on Forward Points + All-In Outright Rate).
+- **Bank Counterparty Quoting Variables (Encrypted in Zero-Knowledge)**:
+  - `spot_reference_rate`: Underlying spot rate at quote time (e.g., `50.1500`).
+  - `forward_points`: Swap points in pips or decimal (e.g., `+2.3500` EGP for 3M USD/EGP).
+  - `outright_forward_rate`: Computed automatically as $\text{Spot} + \text{Forward Points}$ (validated server-side so dealers cannot submit mismatched arithmetic).
+  - `implied_yield_diff_pct`: Annualized implied interest rate differential (% p.a.) for transparency.
+- **Evaluation & Winner Ranking Formula**:
+  - Incorporate bilateral bank fees (`cost_percent`, `cost_flat`, `cost_min`, `cost_max`) into the **All-In Outright Forward Rate**.
+  - If banks quote slightly different broken value dates (when date tolerance is enabled), normalize to the target `maturity_date` using the Exact Interest Rate Parity (IRP) differential:
+    $$\text{Forward}_{\text{norm}} = \text{Outright Rate} \times \frac{1 + r_{\text{quote}} \cdot \frac{\Delta d}{\text{Basis}_{\text{quote}}}}{1 + r_{\text{base}} \cdot \frac{\Delta d}{\text{Basis}_{\text{base}}}}$$
+  - **Winner Rule**: Lowest All-In Outright Rate for `Buy`; Highest All-In Outright Rate for `Sell`.
+
+#### B. Non-Deliverable Forward (`FX_NDF`) — Cash-Settled Offshore / Restricted Currency Hedging
+- **Use Case**: Hedging FX exposure where physical offshore delivery of the restricted currency (e.g., `EGP`, `INR`, `BRL`, `CNY`, `NGN`) is not permitted or where the corporate wants pure cash-settled P&L protection in a settlement currency (`USD` or `EUR`).
+- **Corporate Request Variables (RFQ Input)**:
+  - `direction`: `"Buy"` or `"Sell"` notional exposure.
+  - `reference_pair`: Restricted currency pair (e.g., `USD/EGP`).
+  - `notional_amount` & `notional_currency`: Usually `USD` (e.g., `5,000,000 USD`).
+  - `settlement_currency`: Cash settlement currency (e.g., `USD` or `EUR`).
+  - `fixing_date` (Valuation Date): Date on which the official central bank / benchmark fixing rate is observed (typically $T-2$ business days before `settlement_date`, e.g., EMTA / CBE Official Fixing).
+  - `settlement_date` (Maturity / Value Date): Date net cash settlement is paid.
+  - `fixing_source_benchmark`: Standardized rate source code (e.g., `CBE_OFFICIAL_MID`, `EMTA_EGP01`, `WM_REUTERS_4PM`, `ECB_FIXING`).
+- **Bank Counterparty Quoting Variables (Encrypted in Zero-Knowledge)**:
+  - `ndf_contract_rate` (Agreed Outright NDF Rate): e.g., `52.8000`.
+  - `spot_reference_rate` & `ndf_points` (optional breakdown).
+  - `implied_ndf_yield_pct`: Implied offshore yield (% p.a.).
+- **Settlement Cashflow Formula (Tracked Post-Trade Through Fixing Date)**:
+  $$\text{Net Cash Settlement (in USD)} = \text{Notional}_{\text{USD}} \times \left(1 - \frac{\text{NDF Contract Rate}}{\text{Official Fixing Rate at } T_{\text{fix}}}\right)$$
+- **Evaluation & Winner Ranking Formula**:
+  - All-In NDF Contract Rate after bank charges. Lowest rate wins on `Buy USD`; highest rate wins on `Sell USD`.
+
+#### C. FX Swap (`FX_SWAP`) — Two-Leg Near/Far Liquidity & Roll-Over Engine
+- **Use Case**: Rolling an existing FX hedge forward, or temporarily swapping surplus liquidity in Currency A into Currency B for a defined period (`Spot-to-Forward`, `Tom-Next`, `Overnight`, or `Forward-to-Forward`) without creating open net FX spot exposure.
+- **Corporate Request Variables (RFQ Input — Stored as Linked 2-Leg Package in `QuotationLeg`)**:
+  - `swap_direction`: `"Buy/Sell"` (Buy Base on Near Leg, Sell Base on Far Leg) or `"Sell/Buy"` (Sell Base on Near Leg, Buy Base on Far Leg).
+  - `base_currency` & `quote_currency`: e.g., `USD/EGP`.
+  - `near_leg_value_date` & `near_leg_amount`: e.g., Spot ($T+2$), `2,000,000 USD`.
+  - `far_leg_value_date` & `far_leg_amount`: e.g., `3M` ($T+92$), `2,000,000 USD` (supports uneven/mismatched notionals if requested).
+  - `day_count_convention`: `ACT/360` (USD/EUR standard) vs. `ACT/365` (GBP/EGP standard).
+- **Bank Counterparty Quoting Variables (Encrypted in Zero-Knowledge)**:
+  - `swap_points`: Signed forward points (Far Rate minus Near Rate), quoted in pips/decimals.
+  - `near_leg_rate`: Agreed Spot/Near exchange rate.
+  - `far_leg_rate`: Automatically locked as $\text{Near Rate} + \text{Swap Points}$.
+  - `net_funding_cost_pct`: Implied annualized cost/yield of the swap.
+- **Evaluation & Winner Ranking Formula**:
+  - Because an FX Swap is an atomic package with a single counterparty, ranking is evaluated strictly on **Net Swap Points / All-In Cost of Carry**:
+    - In a `"Sell/Buy"` Base Currency swap (corporate sells USD Spot to raise EGP now, buys USD back Forward), the corporate wants the **lowest** Swap Points (`far_leg_rate - near_leg_rate`).
+    - In a `"Buy/Sell"` Base Currency swap (corporate buys USD Spot now, sells USD back Forward), the corporate wants the **highest** Swap Points received.
+
+#### D. Money Market Deposits & Short-Term Placements (`MM_DEPOSIT`)
+- **Use Case**: Competitive tender across relationship banks for placing corporate cash surpluses (Time Deposits / Wakala / Call Accounts) or pricing short-term working capital drawdowns.
+- **Corporate Request Variables (RFQ Input)**:
+  - `direction`: `"Placement"` (Corporate lends/deposits cash) or `"Borrowing"` (Corporate borrows cash).
+  - `currency`: Deposit currency (`EGP`, `USD`, `EUR`, `AED`, `SAR`).
+  - `principal_amount`: e.g., `50,000,000 EGP`.
+  - `value_date` (Start Date) & `maturity_date` (End Date).
+  - `day_count_convention`: Auto-defaulted by currency (`ACT/365` for EGP/GBP; `ACT/360` for USD/EUR/SAR/AED) with explicit override.
+  - `interest_payment_frequency`: `"AT_MATURITY"` (bullet), `"MONTHLY"`, or `"QUARTERLY"`.
+  - `early_redemption_terms`: `"NON_BREAKABLE"`, `"BREAKABLE_WITH_PENALTY"`, or `"FULL_LIQUIDITY"`.
+  - `withholding_tax_rate_pct`: Applicable tax on interest (e.g., `0%` for standard corporate bank deposits vs. `20%` on T-Bills, enabling direct **Deposit vs. T-Bill Net-of-Tax Yield Comparison**!).
+- **Bank Counterparty Quoting Variables (Encrypted in Zero-Knowledge)**:
+  - `annual_interest_rate_pct`: Gross nominal interest rate (% p.a.).
+  - `early_break_penalty_bps`: Optional penalty or break rate if redeemed early.
+  - `min_amount` / `max_amount`: Minimum or maximum placement size the bank will accept at that rate.
+- **Evaluation & Winner Ranking Formula**:
+  $$\text{Net Maturity Interest} = \text{Principal} \times \left(\frac{r_{\text{gross}}}{100}\right) \times \left(1 - \frac{\text{WHT}\%}{100}\right) \times \frac{\text{Days}}{\text{DayCountBasis}} - \text{Fees}$$
+  - **Winner Rule**: Highest Net Maturity Interest / Effective Annual Yield for `"Placement"`; Lowest All-In Interest Cost for `"Borrowing"`.
+
+---
+
+## 17. Phase 15: Partial Fill & Tiered Multi-Bank Allocation on T-Bills & Large FX Orders
+
+### 17.1 Problem Statement
+In Egyptian T-Bill auctions (`TBILL`) and large corporate FX tenders (`FX_SPOT` / `FX_FORWARD`), a corporate frequently requests a large notional (e.g., `100,000,000 EGP` in T-Bills or `10,000,000 USD` in FX) where individual banks quote their best rate up to a maximum capacity (`max_amount`, e.g., Bank A offers `26.50%` for up to `40M EGP`, Bank B offers `26.35%` for up to `50M EGP`, Bank C offers `26.10%` for up to `100M EGP`). Currently, the award engine selects a single winner (`winner_bank_id`) for the entire ticket, ignoring `max_amount` capacity constraints.
+
+### 17.2 Architectural Design: Greedy Best-Execution Waterfall & Manual Tranche Override
+1. **Bank Quoting Capacity (`min_ticket_amount` & `max_amount`)**:
+   - On `TBILL`, each `QuotationTBillOffer` already captures `max_amount` (now fully encrypted/decrypted via `tenant_key_service.resolve_tbill_max_amount`).
+   - Extend `QuotationOffer` (`FX_SPOT` / `FX_FORWARD`) with optional `encrypted_max_amount` and `encrypted_min_amount` so dealers can quote either *"Full Amount"* or *"Partial Fill up to X"* (or tiered volume bands).
+2. **Automated Best-Execution Waterfall Solver (`allocation_waterfall_service.py`)**:
+   - Ranks all valid `Execution` offers from best effective score/rate to worst.
+   - Iteratively allocates the corporate's target notional across the top-ranked offers up to each offer's `max_amount` until 100% of `rfq.amount` is filled (or until all available liquidity is exhausted).
+   - Computes the **Volume-Weighted Average Rate (VWAR)** and total blended savings across all allocated tranches.
+3. **Interactive Treasury Allocation Tranche Table (`GlobalDealAcceptanceModal.js` & `ResultsView.js`)**:
+   - Pre-populates the optimal waterfall split (e.g., `40M EGP @ 26.50% to Bank A` + `50M EGP @ 26.35% to Bank B` + `10M EGP @ 26.10% to Bank C`).
+   - Allows the authorized treasury user to accept the automated split with 1 click or adjust individual bank tranche amounts before clicking **Accept Allocation**.
+4. **Scoped Per-Tranche Deal Receipts (`QuotationAllocationTranche`)**:
+   - Each winning bank receives an HMAC-SHA256 non-repudiation deal receipt and confirmation email strictly scoped to its allocated tranche amount and rate—never exposing other banks' tranches or the blended VWAR.
+
+---
+
+## 18. Phase 16: Outbound Email Governance & Multi-Tier Sender Identity Architecture (Planned 🚀)
+
+### 18.1 Executive Summary & Problem Statement
+Currently, all outbound email delivery is orchestrated by `app/core/email_service.py` using two primary entry points:
+1. **`get_global_email_settings()` + `get_global_fallback_email_settings()`**: Dispatches via the primary platform relay (Resend) and secondary backup relay (Brevo) using `lg_custody@growbusinessdevelopment.com`.
+2. **`get_customer_email_settings(db, customer_id, allow_platform_fallback=...)`**: Uses the customer's active custom SMTP/Exchange EWS configuration if available; otherwise (when `allow_platform_fallback=True`), falls back to the platform relay (`lg_custody@growbusinessdevelopment.com`) with Display Name `{Customer Name} via Grow Treasury` and `Reply-To: {customer_email}`.
+
+Across the ~45 email call sites in the codebase, the selection between `get_global_email_settings()`, `get_customer_email_settings(..., allow_platform_fallback=True)`, and `get_customer_email_settings(..., allow_platform_fallback=False)` evolved organically, resulting in:
+- Some external bank-facing flows still permitting platform relay fallback if a customer's SMTP server hiccups.
+- Core platform security/authentication flows (MFA codes, Password Resets, Account Activations) and SaaS Subscription billing notices attempting to send through the customer's own SMTP server first—which creates a **circular lockout risk** (if a customer's corporate SMTP password expires, their Corporate Admin cannot receive the MFA or Password Reset email needed to log in and update the SMTP password).
+- Every platform-dispatched email across Quotations, Dealer Auth, Security, and Subscriptions originating from the single module-named address `lg_custody@growbusinessdevelopment.com`.
+
+---
+
+### 18.2 Classification of All Outgoing Emails (The 3-Tier Routing Matrix)
+
+Every outbound email across the platform is classified into one of three strict routing tiers:
+
+#### Tier A: Strict Customer Side (`CUSTOMER_ONLY` — Mandatory Custom Email, No Platform Fallback)
+- **Governance Rule**: External business, trading, and governance communications from the corporate customer to their external relationship banks **must never** be sent from `@growbusinessdevelopment.com` (`allow_platform_fallback=False`). If custom SMTP is not configured or fails, email dispatch must be suppressed/reported.
+
+| Module | Email Flow | Recipient | Current Behavior | Planned Action |
+| :--- | :--- | :--- | :--- | :--- |
+| **Quotations** | RFQ Invitation / Bank Approval Request / Heads-Up (`corporate_admin.py`, `quotations_endpoints.py`, `quotation_release_scheduler.py`) | Bank Dealers / Approvers | `allow_platform_fallback=False` | ✅ Already compliant |
+| **Quotations** | RFQ 15-Min Window Reminder (`quotation_reminder_service.py`) | Bank Dealers / Approvers | `allow_platform_fallback=False` | ✅ Already compliant |
+| **Quotations** | Bank Approver Approved/Declined Notice (`public_quotations.py`) | Bank Execution Desk | `allow_platform_fallback=False` | ✅ Already compliant |
+| **Quotations** | RFQ Cancelled / Withdrawn Notice (`corporate_admin.py`) | Bank Dealers | `allow_platform_fallback=False` | ✅ Already compliant |
+| **Quotations** | Manual Resend RFQ Invite (`quotations_endpoints.py`) | Bank Dealers | `allow_platform_fallback=False` | ✅ Already compliant |
+| **Quotations** | **Trade Execution Winner & Regret Emails** (`quotations_endpoints.py:4492`) | Bank Dealers | Uses `allow_platform_fallback=True` | 🔒 Lock down to `CUSTOMER_ONLY` (`allow_platform_fallback=False`) |
+| **Quotations** | **Bank Roster Audit Governance Report** (`quotations_endpoints.py:875`) | Bank Governance Officer | Uses `allow_platform_fallback=True` | 🔒 Lock down to `CUSTOMER_ONLY` (`allow_platform_fallback=False`) |
+| **Quotations** | **Bank Dealer Onboarding Handshake Invite** (`quotations_endpoints.py:822, 1072, 1185`) | Bank Dealer | Uses `allow_platform_fallback=True` | 🔒 Lock down to `CUSTOMER_ONLY` (`allow_platform_fallback=False`) |
+| **Reconciliation / Inbox** | **Outbound Bank LG Position Request** (`inbox_outbound_service.py:158`) | Bank Trade Finance Desk | Uses `allow_platform_fallback=True` | 🔒 Lock down to `CUSTOMER_ONLY` so bank replies return to the customer's polled IMAP inbox |
+
+#### Tier B: Strict Platform Side (`PLATFORM_ONLY` — Always Sent by Grow Platform)
+- **Governance Rule**: Emails where **Grow Business Development** speaks as the SaaS platform regarding authentication, security, onboarding, or subscription status **must always** route through the platform relays (Resend primary → Brevo secondary) and **never** use a customer's Exchange/SMTP server.
+
+| Module | Email Flow | Recipient | Current Behavior | Planned Action |
+| :--- | :--- | :--- | :--- | :--- |
+| **Auth / Security** | **MFA Login Verification Code (OTP)** (`auth_v2/services.py:984`) | Platform User | Uses `get_customer_email_settings` | 🔄 Switch to `PLATFORM_ONLY` (`SECURITY` persona) to eliminate circular login lockout risk |
+| **Auth / Security** | **Password Reset Link** (`auth_v2/services.py:570`) | Platform User | Uses `get_customer_email_settings` | 🔄 Switch to `PLATFORM_ONLY` (`SECURITY` persona) |
+| **Onboarding** | **New User / Corporate Admin Account Activation** (`customer_onboarding_service.py:70`) | New Customer User | Uses `get_customer_email_settings` | 🔄 Switch to `PLATFORM_ONLY` (`SECURITY` persona) |
+| **Trial & System** | Free Trial Registration Confirmation (`public.py:218`) | Prospect Admin | `get_global_email_settings()` | ✅ Keep `PLATFORM_ONLY` (`SUPPORT_BILLING` persona) |
+| **Trial & System** | Trial Registration Approved + Quick Start PDF (`system_owner.py:3715`) | Customer Admin | `get_global_email_settings()` | ✅ Keep `PLATFORM_ONLY` (`SUPPORT_BILLING` persona) |
+| **Subscriptions** | **Subscription Expiry (30d, 7d), Grace Period, Expired** (`background_tasks.py:630`, `subscription_tasks.py:63`) | Corporate Admins | Uses `get_customer_email_settings` | 🔄 Switch to `PLATFORM_ONLY` (`SUPPORT_BILLING` persona) |
+| **Global Config** | Global Policy Auto-Adjustment Notice (`background_tasks.py:317`) | Corporate Admins | Uses `get_customer_email_settings` | 🔄 Switch to `PLATFORM_ONLY` (`SUPPORT_BILLING` persona) |
+| **Dealer Portal** | Bank Dealer 2FA Enrolment / Recovery / Admin Reset (`bank_dealer_endpoints.py:323, 639`, `system_owner.py:2984`) | Bank Dealer | `get_customer_email_settings(db, None)` | 🔄 Standardize on `PLATFORM_ONLY` (`TRADING_DESK` persona) |
+| **Dealer Portal** | Dealer Mobile Push Setup OTP & Quiet-Times Reminder (`public_quotations.py:3713`, `dealer_alert_reminder_service.py:175`) | Bank Dealer | `get_global_email_settings()` | ✅ Keep `PLATFORM_ONLY` (`TRADING_DESK` persona) |
+| **Dealer Portal** | **RFQ Bidding OTP & Handshake OTP** (`public_quotations.py:815, 3011`) | Bank Dealer | Uses `get_customer_email_settings` | 🔄 Switch to `PLATFORM_ONLY` (`TRADING_DESK` persona) for instant <1s OTP delivery during live FX windows |
+| **Public Issuance** | External Requestor Portal OTP (`public_issuance.py:145`) | Customer Employee | `get_global_email_settings()` | ✅ Keep `PLATFORM_ONLY` (`SECURITY` persona) |
+
+#### Tier C: Neutral / Internal Workflow (`CUSTOMER_PREFERRED` — Customer SMTP with Platform Branded Fallback)
+- **Governance Rule**: Internal operational notifications to the customer's own staff (End Users, Checkers, Corporate Admins, Internal LG Owners). Uses customer SMTP when active; seamlessly falls back to the platform relay as `{Customer Name} via Grow Treasury` with `Reply-To` set to the customer desk.
+
+| Module | Email Flow | Current Behavior | Planned Action |
+| :--- | :--- | :--- | :--- |
+| **Quotations (Internal)** | Maker submits RFQ -> Admin approval email; Admin requests revision / approves -> Maker email (`quotations_endpoints.py:1689`, `quotation_approval_notifications.py:86, 168, 240`) | `get_customer_email_settings` (with fallback) | ✅ Keep as Tier C (`CUSTOMER_PREFERRED`) |
+| **LG Custody** | LG Created, Extended, Released, Liquidated, Decreased, Amended, Activated, Print Reminders, Renewal Reminders, Owner Handover, Approval Request Submitted/Approved (`crud_lg_record.py`, `crud_approval_request.py`, `crud_lg_owner.py`, `end_user.py`, `background_tasks.py`) | `get_customer_email_settings` (with fallback) | ✅ Keep as Tier C (`CUSTOMER_PREFERRED`) |
+| **LG Issuance** | Internal Request Submitted/Approved/Rejected, Public Portal Invite & Submission to Approvers, Facility Reservation TTL, SLA Breach, Maintenance Letters, Reconciliation Summary & Overdue Reminders (`issuance_notifications.py`, `issuance/base.py`, `issuance/workflow.py`, `issuance/post_issuance.py`, `public_issuance.py`) | Mostly `get_customer_email_settings`, except `public_issuance.py:318, 489, 704` which hardcoded `get_global_email_settings()` | 🔄 Standardize all internal Issuance notifications to Tier C (`CUSTOMER_PREFERRED`) |
+
+---
+
+### 18.3 Platform Sender Identity Strategy: Single Address vs. Multiple Addresses on Resend & Brevo
+
+#### Technical Provider Behavior
+1. **Resend (Domain-Level Authentication)**: Once `@growbusinessdevelopment.com` is verified via DKIM/SPF in Resend, **Resend permits sending from ANY `@growbusinessdevelopment.com` address automatically** using the existing SMTP API key with zero extra setup or mailbox cost.
+2. **Brevo (Sender-Level Registration)**: While domain DKIM/SPF covers `@growbusinessdevelopment.com`, **Brevo requires each distinct `From` email address** (e.g., `security@growbusinessdevelopment.com`, `notifications@growbusinessdevelopment.com`, `trading@growbusinessdevelopment.com`, `support@growbusinessdevelopment.com`) to be registered under **Brevo Dashboard → Senders & IP → Senders** so the secondary backup relay does not reject or rewrite the `From` header during failover.
+
+#### Planned `PlatformEmailPersona` Architecture (Zero-Risk Configurable Rollout)
+Introduce `PlatformEmailPersona` in `app/core/email_service.py`:
+
+| Persona | Default Display Name | Optional `.env` Address Override | Safe Fallback Address (Out-of-the-Box) |
+| :--- | :--- | :--- | :--- |
+| **`SECURITY`** (OTPs, MFA, Password Reset, Activation) | `Grow Treasury Security` | `EMAIL_SENDER_SECURITY` (e.g., `security@growbusinessdevelopment.com`) | `EMAIL_SENDER_EMAIL` (`lg_custody@growbusinessdevelopment.com`) |
+| **`TRADING_DESK`** (Dealer alerts, Quotation OTPs, 2FA) | `Grow Treasury Trading Desk` | `EMAIL_SENDER_TRADING` (e.g., `trading@growbusinessdevelopment.com`) | `EMAIL_SENDER_EMAIL` (`lg_custody@growbusinessdevelopment.com`) |
+| **`NOTIFICATIONS`** (Workflow fallback, Custody/Issuance alerts) | `{Customer} via Grow Treasury` or `Grow Treasury Notifications` | `EMAIL_SENDER_NOTIFICATIONS` (e.g., `notifications@growbusinessdevelopment.com`) | `EMAIL_SENDER_EMAIL` (`lg_custody@growbusinessdevelopment.com`) |
+| **`SUPPORT_BILLING`** (Trials, Subscriptions, System Notices) | `Grow Business Development` | `EMAIL_SENDER_SUPPORT` (e.g., `support@growbusinessdevelopment.com`) | `EMAIL_SENDER_EMAIL` (`lg_custody@growbusinessdevelopment.com`) |
+
+- **Zero-Disruption Guarantee**: Until dedicated addresses are added to Brevo's Senders list and set in `.env`, every persona automatically defaults to `EMAIL_SENDER_EMAIL` (`lg_custody@growbusinessdevelopment.com`) while applying the context-appropriate **Display Name**. Once registered in Brevo, setting the `.env` variables activates multi-address sending without any code changes.
+
+---
+
+### 18.4 Pre-Refactor Latent Email Bugs Fixed & Verified (2026-10-31 ✅)
+
+Before implementing the routing tier changes in §18.2–18.3, all **8 latent email bugs** discovered during the codebase audit were fixed in isolation (with zero changes to routing behavior):
+
+1. **`EmailSendResult(tuple)` Truthiness Fix (`app/core/email_service.py`)**:
+   `send_email()` previously returned a raw 2-tuple `(bool, Optional[str])`. In 10+ call sites (`auth_v2/services.py`, `subscription_tasks.py`, `background_tasks.py`, `crud_approval_request.py`, `crud_lg_record.py`, `end_user.py`), callers assigned `sent = await send_email(...)` and checked `if sent:`. Because a non-empty tuple `(False, "SMTP Error")` is always truthy in Python, failed emails were falsely logged as `NOTIFICATION_SENT`. `send_email()` now returns `EmailSendResult(tuple)`, which unpacks identically as a 2-tuple (`ok, err = await send_email(...)`) AND evaluates `bool(res)` to `res[0]` (`False` on failure, `True` on success).
+2. **RFC 5322 `Date` and `Message-ID` Headers (`app/core/email_service.py`)**:
+   Added explicit `Date` (`formatdate(localtime=True)`) and domain-scoped `Message-ID` (`make_msgid(domain=sender_domain)`) headers to `send_email()` to prevent strict enterprise spam filters (Mimecast, Proofpoint, Office 365) from penalizing outbound messages.
+3. **Account Activation Fallback `TypeError` Fix (`app/services/customer_onboarding_service.py:72`)**:
+   Fixed `email_settings, _ = get_global_email_settings()` (which crashed with `TypeError: cannot unpack non-iterable EmailSettings object`) to `email_settings = get_global_email_settings()`.
+4. **Password Reset Fallback `TypeError` Fix (`app/auth_v2/services.py:573`)**:
+   Fixed `email_settings, email_config_source = get_global_email_settings()` to assign `email_settings = get_global_email_settings()` and `email_config_source = "global"`, and unpacked `send_success, _ = await send_email(...)`.
+5. **Dealer Quiet-Times Reminder Crash Fix (`app/services/dealer_alert_reminder_service.py:175-181`)**:
+   Fixed `get_global_email_settings(db)` (`TypeError: takes 0 positional arguments but 1 was given`) and `platform_settings.mail_server` (`AttributeError: 'EmailSettings' object has no attribute 'mail_server'`) to `get_global_email_settings()` and `platform_settings.smtp_host`.
+6. **System Owner Dealer 2FA Reset `ModuleNotFoundError` Fix (`app/api/v1/endpoints/system_owner.py:2964-2965`)**:
+   Fixed non-existent imports `from app.services.email_service import send_email` and `from app.services.customer_email_settings_service import get_customer_email_settings` to `from app.core.email_service import send_email, get_customer_email_settings`.
+7. **Missing `await` on Owner Change Notification (`app/crud/crud_lg_owner.py:221`)**:
+   Fixed unawaited coroutine `email_sent_successfully = send_email(...)` to `email_sent_successfully, _ = await send_email(...)`.
+8. **Exchange EWS (Port 443) Support in Outbound Position Requests (`app/services/inbox_outbound_service.py:185`)**:
+   Added Port 443 Exchange EWS SOAP/NTLM dispatch alongside `smtplib` so customers using Exchange Web Services can dispatch outbound LG Position Requests.
+9. **Removed OTP Code from Handshake Email Subject Line (`app/services/unified_email_builder.py:1710`)**:
+   Removed `{otp_code}` from the `Subject` and `<title>` of `build_dealer_handshake_otp_email` (`"Your Grow Treasury Verification Code (Valid {valid_minutes}m)"`) so the single-use OTP is never exposed in email subject headers, SMTP relay logs, or desktop/phone lock-screen subject previews.
+
+---
+
+
+## 19. Master Implementation Status: What We Have vs. What Still Needs to Be Done
 
 This matrix serves as the authoritative ground truth comparing active production code against upcoming deliverables:
 
@@ -2269,9 +2616,11 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Counterparty Security** | Automated Domain DNS/MX Enrichment (Phase 2.6) | ⏸️ **Intentionally Deferred** | Design specs in Phase 2.6 | Whitelist and official domain matching already deliver 100% protection against personal webmail. |
 | **Host-Blind Vault (Tier 2)** | Client-Side WebCrypto Bidding Engine | ⏸️ **Intentionally Deferred** | Section 10.2 | Deferred in favor of Tier 1 Envelope Encryption. Client-only decryption breaks automated background execution (AUTO_ACCEPT timeouts) and offline PDF report generation. |
 | **Enterprise BYOK (Tier 3)** | Cloud KMS Hardware Security Plug-in | ⏸️ **Deferred for Enterprise Mandates** | `security_crypto.py:CloudKmsKeyProvider` | Architectural abstraction complete. Deferred until a corporate client signs an enterprise cloud contract requiring dedicated Google Cloud KMS / AWS KMS provisioning ($5–$15/mo). |
-| **Mobile Experience** | **PWA Web App Shell & Standalone Manifest (Phase 9)** | ⏸️ **Prototype — On Hold (WIP branch)** | `manifest.json`, `index.html`, `MobileAlertModal.jsx` | Reusable as-is; ships together with the redesigned dispatch layer (§12.7). |
-| **Mobile Experience** | **Lock-Screen Web Push Dispatcher (Phase 9)** | ⏸️ **Prototype — On Hold (WIP branch)** | `sw.js`, `vapid_security.py`, `notification_service.py`, `pushNotificationService.js` | Missing deps, keys regenerate, sync sending, no logout teardown (§11.8 #1, #3, #6, #9). Rebuild per §12.7. |
-| **Dealer Experience** | **Bank Dealer Push Notification Enrollment (Phase 9.2)** | 🔴 **Blocked — Redesign Required** | `DealerPushNotificationBanner.jsx`, `QuotationBankOfferPage.js`, `/notifications/dealer-push-subscribe`, `notify_dealers_via_push` | Unauthenticated enrolment + global `bank_id` fan-out = cross-customer leak (§11.8 #4, #5). |
+| **Mobile Experience** | **PWA Web App Shell & Standalone Manifest (Q2)** | ✅ **Completed & Verified** | `manifest.webmanifest`, `sw.js`, `index.html`, `MobileAlertsControl.jsx` | Installable standalone PWA shell; deep-link preservation across login (`?next=`). |
+| **Mobile Experience** | **Lock-Screen Web Push Dispatcher & QR Pairing (Q1–Q5)** | ✅ **Completed & Verified** | `catalog.py`, `audiences.py`, `emit.py`, `push_channel.py`, `PushPairQrModal.jsx`, `MobilePairPage.jsx` | Transactional outbox (`notification_deliveries`), 30s background worker, SSRF allowlist, password-verified QR pairing, and multi-device management. |
+| **Dealer Experience** | **Bank Dealer 3-Channel Alerts & Institutional QR OTP Security (N7a–N7d)** | ✅ **Completed & Verified** | `DealerMobileAlertsBanner.jsx`, `DealerMobilePairPage.jsx`, `public_quotations.py`, `dealer_alert_reminder_service.py` | Ephemeral 15m `DealerMobilePairToken`, HMAC-SHA256 OTP, 60s resend cooldown, 3-attempt burn, strict desktop/mobile isolation, and **Obsidian Titanium** inactive alert badge. |
+| **LG Custody Alerts** | **Smart 'Middle Management' Mobile Escalation Engine (N5c)** | ✅ **Completed & Verified** | `lg_custody_service.py`, `lg_custody_masking.py`, `catalog.py`, `background_tasks.py`, `crud_approval_request.py` | Autonomous 14d/5d inaction escalations, dormant undelivered letter alerts, Day 0 cutoff, Maker-Checker hooks, and strict confidentiality masking (`...8412`, `Hassan A*** C***`, zero amounts). |
+| **Custody Document AI** | **Bank Expiry Date Tolerance (±2–3d) & Multi-Instruction Disambiguation** | 🚀 **Planned / Next Up** | `document_verification_service.py` (`feature/smart-lg-custody-ai`), `end_user.py` | Align calendar-vs-90d bank expiry variance (≤3d) with user acceptance modal; detect and re-route bank replies uploaded to the wrong instruction card. |
 | **Team Alerts** | **1-Click Smart Laptop Onboarding Banner (Phase 9.2)** | ⏸️ **Prototype — On Hold (WIP branch)** | `PushNotificationOnboardingBanner.jsx`, `AdminQuotationDashboard.js`, `QuotationRequestDashboard.js` | UI reusable; depends on §12.7. |
 | **Automated Notifications** | **Event-Driven Notification Policy Engine & Governance Console (Phase 10 Core)** | ⏸️ **Prototype — On Hold (WIP branch)** | `notification_event_engine.py`, `NotificationGovernance/`, `notification_event_rules` | Broken event contracts, double sends, scratch-script seeding (§11.8 #3, #7, #8). |
 | **LG Issuance** | **Public Form AI Document Verification Fix** | 🟡 **Fixed — Awaiting Release** | `PublicIssuanceForm.js`, `public_issuance.py`, `ai_integration.py` | Production bug. On `safe/2026-10-15-reviewed-fixes`. Needs manual UI test before merge. |
@@ -2287,15 +2636,23 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Window Governance** | **Lead-Time Guardrail & 5-Min Push Protocol (Phase 11)** | 🚀 **Planned / Queued** | `CorporateAdminDashboard.js`, `quotations_endpoints.py:approve_rfq` | Enforces 3-min approval cutoff; prompts 5-minute dynamic window push calculated from confirmation timestamp. |
 | **Lifecycle Transparency** | **Granular Sub-Status Matrix (Phase 11)** | 🚀 **Planned / Queued** | `quotations_endpoints.py`, `deal_acceptance_service.py`, `ResultsView.js` | Disambiguates `TRADED`, `USER_DECLINED`, `AUTO_REJECT_TIMEOUT`, `NO_QUOTES`, `ADMIN_REJECTED`, and `APPROVAL_EXPIRED`. |
 | **Exposure Analytics** | **Retrospective Historical Position Classifier (Phase 11)** | 🚀 **Planned / Queued** | `quotations_endpoints.py:resolve_rfq_sub_status`, `QuotationHistoryDashboard.js` | Reconstructs true historical position for all past tenders using pre-existing DB columns without data loss. |
+| **UX De-Noising** | **Eliminate Competing Deal Acceptance UI & Fake Ticker Metrics (Phase 13)** | 🚀 **Planned / Queued** | `GlobalDealAcceptanceModal.js`, `ResultsView.js`, `QuotationRequestDashboard.js`, `QuotationBankOfferPage.js` | Suppresses duplicate inline acceptance actions while global modal is expanded; removes synthetic ticker metrics (`2.4s AVG SPEED`). |
+| **Instrument Expansion** | **FX Forwards, NDFs, FX Swaps & Money Market Deposits (Phase 14)** | 🚀 **Planned / Queued** | `models_quotation.py`, `quotations_endpoints.py`, `public_quotations.py`, `QuotationRequestDashboard.js`, `QuotationBankOfferPage.js` | Full variable schema, Zero-Knowledge encryption, IRP/NDF/Swap-Point/Net-of-WHT evaluation engines. Deep specs in Section 16. |
+| **Multi-Bank Execution** | **Partial Fill & Tiered Allocation Waterfall for T-Bills & Large FX (Phase 15)** | 🚀 **Planned / Queued** | `allocation_waterfall_service.py`, `quotations_endpoints.py`, `GlobalDealAcceptanceModal.js`, `ResultsView.js` | Automated best-execution waterfall solver respecting `max_amount` caps, VWAR computation, manual tranche override, and per-tranche receipts. |
+| **Email Infrastructure** | **Latent Email Bug Fixes & `EmailSendResult` Hardening (Phase 16.4)** | ✅ **Completed & Verified** | `email_service.py`, `customer_onboarding_service.py`, `auth_v2/services.py`, `dealer_alert_reminder_service.py`, `system_owner.py`, `crud_lg_owner.py`, `inbox_outbound_service.py` | Fixed 8 latent bugs (`EmailSendResult(tuple)` truthiness, RFC 5322 `Date`/`Message-ID` headers, `TypeError` unpack crashes, broken imports, missing `await`, and Port 443 Exchange EWS outbound support) with zero changes to routing behavior. |
+| **Email Governance** | **3-Tier Outbound Email Routing & `PlatformEmailPersona` Architecture (Phase 16.1–16.3)** | 🚀 **Planned / Queued** | `email_service.py` + 45 call sites across Quotations, Auth, Onboarding, Subscriptions, Custody, Issuance | Classify all emails into `CUSTOMER_ONLY` (Tier A), `PLATFORM_ONLY` (Tier B), and `CUSTOMER_PREFERRED` (Tier C), and introduce `PlatformEmailPersona` (`SECURITY`, `TRADING_DESK`, `NOTIFICATIONS`, `SUPPORT_BILLING`). Full specs in Section 18. |
 
 ---
 
-## 16. Production Database Migration Ledger (Audit & Compliance Log)
+## 20. Production Database Migration Ledger (Audit & Compliance Log)
 
 This ledger tracks all production database schema states, DDL operations, and migration audits across the roadmap implementation:
 
 | Timestamp (UTC) | Phase | Target Table(s) | Column(s) / Constraints | Migration Type | Status & Operational Impact |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **2026-10-29** | **Phase N7d & N5c (Zero-Trust QR Pairing, Dealer OTP Hardening & LG Custody Smart Mobile Alerts)** | `user_mobile_pair_tokens`, `dealer_mobile_pair_tokens`, `dealer_alert_reminders`, `user_notifications` | New tables `user_mobile_pair_tokens` & `dealer_mobile_pair_tokens`; `dealer_alert_reminders` OTP columns (`otp_code`, `otp_expires_at`, `otp_failed_attempts`); 8 `LG_CUSTODY` catalog events (Zero DDL for Custody events) | **New Tables DDL & Additive Service Layer** | ✅ **Active & Verified**<br>Ephemeral 15m QR pairing with HMAC-SHA256 OTP, 60s resend cooldown, and 3-attempt burn. Locked in Obsidian Titanium inactive alert badge. Added 'Middle Management' LG Custody mobile notification sweep & Maker-Checker hooks using the shared Web Push activation/deactivation channel with strict lock-screen masking (`...8412`, `Hassan A*** C***`, zero amounts). Verified 5/5 in `test_lg_custody_notifications.py` and 9/9 in `test_notifications_quotation_q1.py`. |
+| **2026-10-28** | **Phase N7c (Trading Desk Multi-Device Isolation & 3-Channel Alert Hub)** | `push_subscriptions` | None (No DDL Required) | **Logic & Query Isolation Hardening** | ✅ **Active & Verified**<br>Implemented strict SQL-level separation (`_is_phone_sub_filter`) distinguishing desktop browsers from mobile smartphone subscriptions. Resolved bug where Windows PC alerts masked QR pairing. Fixed unlinking logic so phone unsubscription strictly leaves desktop sessions active. Streamlined trading desk into a 3-channel hub (Audio chimes, Windows PC, Mobile Phone). |
+| **2026-10-27** | **Phase 6.8 (Twelve Data Real-Time FX Feed & T-10s Batch Snapshotting)** | `quotation_rfqs`, `quotation_legs` | None (No DDL Required) | **Live Feed Integration & Pre-Fetch Hook** | ✅ **Active & Verified**<br>Integrated Twelve Data real-time FX spot provider via `.env`. Single-request multi-currency batch query for basket tenders. Automated T-10s countdown & window-close snapshotting into `market_benchmark_snapshot` eliminates decision modal latency (0ms). Verified with `USD/EGP` live rate `56.1018` (+313.1 bps drift vs CBE fixing). |
 | **2026-10-26** | **Phase N7 (Bank Dealer Push & Standing Reminders)** | `notification_deliveries`, `push_subscriptions`, `dealer_alert_reminders` | `notification_deliveries`: `notification_id` & `user_id` NULLABLE, `dealer_email`, `dealer_id`, `payload_json`, `dedupe_key` (Unique index). `push_subscriptions`: constraint `chk_push_sub_owner`. `dealer_alert_reminders`: new table. | **DDL Alterations & New Table** | ✅ **Active & Verified**<br>Decoupled dealer push alerts from internal user accounts. Multi-customer coverage: single dealer phone enrollment receives RFQ alerts across all inviting customers. Strict lock-screen redaction (no trade amounts or customer names). Standing setup links with platform relay exception. Full test suite (7/7) passed. |
 | **2026-10-18** | **Phase 6.7 (Multi-Leg Acceptance & Trade Execution Gate)** | `quotations_rfqs`, `quotation_legs` | None (No DDL Required) | **Code Hardening & Logic Enforcement** | ✅ **Active & Verified**<br>Package-wide `has_any_winner` evaluation in `compute_rfq_standings()`. Strict execution gate in `get_public_rfq_result()` preventing premature trade execution confirmations before corporate treasury acceptance. Enhanced uncontested advisory phrasing. Zero DDL alterations / zero downtime. |
 | **2026-10-15** | **Release Candidate (`safe/2026-10-15-reviewed-fixes`)** | — | — | **No DDL Required** | 🟡 **Awaiting Release**<br>Reviewed fixes use only existing production columns. Open decision: make `ai_usage_logs.user_id` nullable to track public-form AI usage (currently skipped). |

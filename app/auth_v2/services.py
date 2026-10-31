@@ -568,9 +568,10 @@ class AuthService:
         try:
             # MODIFIED: Removed 'await' here
             email_settings, email_config_source = get_customer_email_settings(db, user.customer_id)
-        except HTTPException: # If customer settings are problematic, fallback to global
+        except Exception: # If customer settings are problematic, fallback to global
             # MODIFIED: Removed 'await' here
-            email_settings, email_config_source = get_global_email_settings()
+            email_settings = get_global_email_settings()
+            email_config_source = "global"
         
         email_subject = "Password Reset Request"
         email_body = build_security_email_html(
@@ -581,7 +582,7 @@ class AuthService:
             action_text="Reset Password Now"
         )
 
-        send_success = await send_email(
+        send_success, _ = await send_email(
             db=db,
             to_emails=[user.email],
             subject_template=email_subject,

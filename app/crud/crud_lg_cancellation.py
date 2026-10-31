@@ -54,10 +54,11 @@ class CRUDLGCancellation(CRUDBase):
         if not db_lg_record:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Associated LG Record not found or not accessible.")
 
-        # 3. Check if this is the last instruction for the LG
+        # 3. Check if this is the last non-canceled instruction for the LG
         last_instruction = db.query(self.model).filter(
             self.model.lg_record_id == db_lg_record.id,
-            self.model.is_deleted == False
+            self.model.is_deleted == False,
+            self.model.status != "Canceled"
         ).order_by(self.model.created_at.desc()).first()
         
         if not last_instruction or last_instruction.id != db_instruction.id:
@@ -97,7 +98,10 @@ class CRUDLGCancellation(CRUDBase):
 
         # 7. Update instruction status and details
         db_instruction.status = "Canceled"
+        existing_details = dict(db_instruction.details or {})
+        existing_details.pop("pending_cancellation_request_id", None)
         db_instruction.details = {
+            **existing_details,
             "cancellation_details": {
                 "reason": cancel_in.reason,
                 "declaration_confirmed": cancel_in.declaration_confirmed,
@@ -105,7 +109,6 @@ class CRUDLGCancellation(CRUDBase):
                 # FIX: Make datetime.now() timezone-aware
                 "canceled_at": datetime.now(timezone.utc).isoformat(),
             },
-            **(db_instruction.details or {})
         }
         db.add(db_instruction)
         db.flush()
@@ -147,44 +150,42 @@ class CRUDLGCancellation(CRUDBase):
         # A simplified approach for direct cancellation is to reconstruct the old state from the instruction details.
         # This assumes the instruction.details field contains all necessary information to reverse the action.
         
-        if instruction.instruction_type == "LG_EXTENSION":
+        if instruction.instruction_type in ("LG_EXTENSION", "EXTENSION"):
             # Reverse extension: change expiry date back to old_expiry_date
             old_expiry_date = instruction.details.get("old_expiry_date")
             if old_expiry_date:
-                # FIX: Change from datetime.strptime to date.fromisoformat, it's safer
-                lg_record.expiry_date = datetime.combine(date.fromisoformat(old_expiry_date), datetime.min.time())
+                lg_record.expiry_date = datetime.combine(date.fromisoformat(str(old_expiry_date)[:10]), datetime.min.time())
                 db.add(lg_record)
                 db.flush()
-        elif instruction.instruction_type == "LG_RELEASE":
+        elif instruction.instruction_type in ("LG_RELEASE", "RELEASE"):
             # Reverse release: change status back to VALID
             lg_record.lg_status_id = LgStatusEnum.VALID.value
             db.add(lg_record)
             db.flush()
-        elif instruction.instruction_type == "LG_LIQUIDATION":
-            liquidation_type = instruction.details.get("liquidation_type")
+        elif instruction.instruction_type in ("LG_LIQUIDATE", "LG_LIQUIDATION", "LIQUIDATION", "LIQUIDATE"):
+            liquidation_type = (instruction.details.get("liquidation_type") or "").strip().lower()
+            old_amount = instruction.details.get("original_lg_amount") or instruction.details.get("old_amount")
             if liquidation_type == "full":
                 # Reverse full liquidation: change amount back to old_amount and status to VALID
-                old_amount = instruction.details.get("original_lg_amount")
-                if old_amount:
+                if old_amount is not None:
                     lg_record.lg_amount = Decimal(str(old_amount))
-                    lg_record.lg_status_id = LgStatusEnum.VALID.value
-                    db.add(lg_record)
-                    db.flush()
+                lg_record.lg_status_id = LgStatusEnum.VALID.value
+                db.add(lg_record)
+                db.flush()
             elif liquidation_type == "partial":
                 # Reverse partial liquidation: change amount back to old_amount and status remains VALID
-                old_amount = instruction.details.get("original_lg_amount")
-                if old_amount:
+                if old_amount is not None:
                     lg_record.lg_amount = Decimal(str(old_amount))
                     db.add(lg_record)
                     db.flush()
-        elif instruction.instruction_type == "LG_DECREASE_AMOUNT":
+        elif instruction.instruction_type in ("LG_DECREASE_AMOUNT", "DECREASE_AMOUNT"):
             # Reverse decrease amount: change amount back to old_amount
-            old_amount = instruction.details.get("original_lg_amount")
-            if old_amount:
+            old_amount = instruction.details.get("original_lg_amount") or instruction.details.get("old_amount")
+            if old_amount is not None:
                 lg_record.lg_amount = Decimal(str(old_amount))
                 db.add(lg_record)
                 db.flush()
-        elif instruction.instruction_type == "LG_ACTIVATE_NON_OPERATIVE":
+        elif instruction.instruction_type in ("LG_ACTIVATE_NON_OPERATIVE", "ACTIVATE"):
             # Reverse activation: change operational status back to NON_OPERATIVE
             lg_record.lg_operational_status_id = models.LgOperationalStatusEnum.NON_OPERATIVE.value
             db.add(lg_record)

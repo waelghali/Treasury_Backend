@@ -41,7 +41,7 @@ class InboxOutboundService:
     ) -> Tuple[str, str]:
         """Generates subject and bilingual HTML body for LG position request with unique reference number."""
         date_str = position_date.strftime("%d/%m/%Y")
-        subject = f"[Ref: {request_reference}] [LG Position Request] {customer_name} — Position as of {date_str}"
+        subject = f"[Ref: {request_reference}] LG Position Request · {date_str}"
 
         notes_html = f"<p style='margin-top:10px; color:#4b5563;'><strong>Notes:</strong> {custom_notes}</p>" if custom_notes else ""
 
@@ -181,19 +181,57 @@ class InboxOutboundService:
         elif not email_settings.smtp_host or email_settings.smtp_host in ("smtp.example.com", "localhost", "dummy"):
             logger.info(f"Outbound email delivery simulated: SMTP host not configured for live delivery.")
         else:
-            # Send via SMTP
+            # Send via SMTP or Exchange EWS (Port 443)
             try:
-                if email_settings.smtp_port == 465:
+                if int(email_settings.smtp_port) == 443:
+                    from requests_ntlm import HttpNtlmAuth
+                    import requests
+                    from xml.sax.saxutils import escape
+
+                    auth = HttpNtlmAuth(email_settings.smtp_username, email_settings.smtp_password)
+                    url = f"https://{email_settings.smtp_host}/ews/exchange.asmx"
+                    to_recipients_xml = "".join([f"<t:Mailbox><t:EmailAddress>{escape(addr)}</t:EmailAddress></t:Mailbox>" for addr in deliverable_recipients])
+                    soap_payload = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" 
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types" 
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <t:RequestServerVersion Version="Exchange2016" />
+  </soap:Header>
+  <soap:Body>
+    <m:CreateItem MessageDisposition="SendAndSaveCopy">
+      <m:SavedItemFolderId>
+        <t:DistinguishedFolderId Id="sentitems" />
+      </m:SavedItemFolderId>
+      <m:Items>
+        <t:Message>
+          <t:ItemClass>IPM.Note</t:ItemClass>
+          <t:Subject>{escape(subject)}</t:Subject>
+          <t:Body BodyType="HTML">{escape(html_body)}</t:Body>
+          <t:ToRecipients>{to_recipients_xml}</t:ToRecipients>
+        </t:Message>
+      </m:Items>
+    </m:CreateItem>
+  </soap:Body>
+</soap:Envelope>"""
+                    resp = requests.post(url, data=soap_payload.encode("utf-8"), auth=auth, headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=20)
+                    if resp.status_code != 200 or "NoError" not in resp.text:
+                        raise RuntimeError(f"Exchange EWS dispatch failed (HTTP {resp.status_code}): {resp.text[:250]}")
+                elif int(email_settings.smtp_port) == 465:
                     server = smtplib.SMTP_SSL(email_settings.smtp_host, email_settings.smtp_port, timeout=15)
+                    if email_settings.smtp_username and email_settings.smtp_password:
+                        server.login(email_settings.smtp_username, email_settings.smtp_password)
+                    server.sendmail(email_settings.sender_email, deliverable_recipients, msg.as_string())
+                    server.quit()
                 else:
                     server = smtplib.SMTP(email_settings.smtp_host, email_settings.smtp_port, timeout=15)
                     server.starttls()
+                    if email_settings.smtp_username and email_settings.smtp_password:
+                        server.login(email_settings.smtp_username, email_settings.smtp_password)
+                    server.sendmail(email_settings.sender_email, deliverable_recipients, msg.as_string())
+                    server.quit()
 
-                if email_settings.smtp_username and email_settings.smtp_password:
-                    server.login(email_settings.smtp_username, email_settings.smtp_password)
-
-                server.sendmail(email_settings.sender_email, deliverable_recipients, msg.as_string())
-                server.quit()
                 logger.info(f"Sent LG position request to {deliverable_recipients} for bank {bank.name}")
 
             except Exception as e:

@@ -5,4 +5,6 @@ from .models_reconciliation import *
 from .models_reconciliation_v2 import *
 from .models_inbox import *
 
+from .models_notification import *
+from .models_push import *
 from app.models.models_feedback import UserFeedback, FeedbackType, FeedbackSentiment, FeedbackStatus

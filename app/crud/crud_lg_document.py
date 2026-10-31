@@ -1,9 +1,11 @@
 # app/crud/crud_lg_document.py
 import json
+import hashlib
 import os
 import uuid
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Type, Tuple
+import io
+from typing import Any, Dict, List, Optional, Type, Tuple, BinaryIO
 from fastapi import HTTPException, status, UploadFile
 from sqlalchemy import func, desc, exists, and_
 from sqlalchemy.orm import Session, selectinload
@@ -80,12 +82,15 @@ class CRUDLGDocument(CRUDBase):
         self,
         db: Session,
         obj_in: LGDocumentCreate, 
-        file_content: bytes,
-        lg_record_id: int,
-        uploaded_by_user_id: int,
+        file_content: Optional[bytes] = None,
+        lg_record_id: int = 0,
+        uploaded_by_user_id: int = 0,
         original_instruction_serial: Optional[str] = None,
         lg_record_details: Optional[Dict[str, Any]] = None, 
-        bucket_name: str = GCS_BUCKET_NAME      
+        bucket_name: str = GCS_BUCKET_NAME,
+        source_stream: Optional[BinaryIO] = None,
+        file_data: Optional[bytes] = None,
+        **kwargs: Any
     ) -> LGDocument:
         logger.debug(f"[CRUDLGDocument.create_document] START. lg_record_id={lg_record_id}, doc_type={obj_in.document_type}, orig_filename={obj_in.file_name}") 
 
@@ -152,16 +157,30 @@ class CRUDLGDocument(CRUDBase):
         # ---------------------------------
             
         try:
-            # 4. Upload to GCS using the new hierarchical blob path
-            stored_gcs_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, obj_in.mime_type)
+            # 4. Stream-encrypt directly to GCS under Customer Tenant DEK using 64 KB STREAM V2 AEAD
+            from app.services.tenant_key_service import tenant_key_service
+            from app.core.storage_service import upload_stream_to_gcs_encrypted
+
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+            effective_data = file_content if file_content is not None else file_data
+            stream_to_upload = source_stream or io.BytesIO(effective_data or b"")
+
+            stored_gcs_uri, _ = upload_stream_to_gcs_encrypted(
+                source_stream=stream_to_upload,
+                blob_name=blob_path,
+                dek=tenant_dek,
+                content_type=obj_in.mime_type or "application/octet-stream",
+                bucket_name=bucket_name,
+                context="lg_custody_doc"
+            )
             if not stored_gcs_uri:
-                raise Exception("GCS upload returned no URI.")
-            logger.info(f"Document uploaded to GCS: {stored_gcs_uri}")
+                raise Exception("GCS encrypted upload returned no URI.")
+            logger.info(f"Encrypted document uploaded to GCS: {stored_gcs_uri}")
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Failed to upload document {blob_path} to GCS: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store document file in cloud storage: {e}")
+            logger.error(f"Failed to upload encrypted document {blob_path} to GCS: {e}", exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to store encrypted document file in cloud storage: {e}")
 
         # 5. Save Metadata to DB
         document_data = obj_in.model_dump()
@@ -179,6 +198,13 @@ class CRUDLGDocument(CRUDBase):
         db.add(db_document)
         db.flush()
 
+        file_sha256 = None
+        if effective_data:
+            try:
+                file_sha256 = hashlib.sha256(effective_data).hexdigest()
+            except Exception:
+                file_sha256 = None
+
         log_action(
             db,
             user_id=uploaded_by_user_id,
@@ -190,7 +216,8 @@ class CRUDLGDocument(CRUDBase):
                 "lg_instruction_id": obj_in.lg_instruction_id, 
                 "document_type": obj_in.document_type,
                 "file_name": unique_filename, 
-                "stored_path": stored_gcs_uri 
+                "stored_path": stored_gcs_uri,
+                "file_sha256": file_sha256,
             },
             customer_id=customer_id,
             lg_record_id=lg_record_id,

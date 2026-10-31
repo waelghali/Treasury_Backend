@@ -2961,10 +2961,10 @@ def reset_dealer_credentials(
 
     # Dispatch notification email to trader
     try:
-        from app.services.email_service import send_email
-        from app.services.customer_email_settings_service import get_customer_email_settings
+        from app.core.email_service import send_email, get_customer_email_settings
         bank_name = dealer.bank.name if dealer.bank else "Partner Bank"
-        subject = f"Grow Treasury - Trading Desk Credentials & 2FA Reset ({bank_name})"
+        bank_short = (dealer.bank.short_name or dealer.bank.name) if dealer.bank else "Partner Bank"
+        subject = f"Trading Desk 2FA Reset · {bank_short}"
         body = f"""
         <div style="font-family: sans-serif; background-color: #0f172a; padding: 24px; color: #f8fafc;">
             <div style="max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 24px; border: 1px solid #334155;">

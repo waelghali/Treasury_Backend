@@ -979,7 +979,7 @@ class LGActivateNonOperativeRequest(BaseModel):
     payment_method: str = Field(..., description="Payment method used (e.g., 'Wire', 'Check')")
     currency_id: int = Field(..., description="ID of the Currency for the payment.")
     amount: float = Field(..., gt=0, description="The payment amount.")
-    payment_reference: str = Field(..., max_length=100, description="Wire reference or check number.")
+    payment_reference: Optional[str] = Field("N/A", max_length=100, description="Wire reference or check number.")
     issuing_bank_id: int = Field(..., description="ID of the Issuing Bank related to the payment.")
     payment_date: date = Field(..., description="Date the payment was made (DD/MM/YYYY).")
     notes: Optional[str] = Field(None, description="Additional notes for the activation.")
@@ -1167,6 +1167,8 @@ class LGLifecycleEventOut(BaseModel):
     timestamp: datetime
     action_type: str
     user_email: Optional[EmailStr] = None
+    entity_type: Optional[str] = None
+    entity_id: Optional[int] = None
     details: Dict[str, Any]
 
     class Config:

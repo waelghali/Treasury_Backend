@@ -271,7 +271,8 @@ async def initiate_dealer_enrollment(
     db.refresh(dealer)
 
     # Dispatch Verification Email (SendOnly - save_copy=False)
-    subject = f"Grow Treasury - Bank Dealer 2FA Enrolment Code ({bank.name})"
+    bank_short = bank.short_name or bank.name
+    subject = f"2FA Enrolment Code · {bank_short}"
     body = f"""
     <!DOCTYPE html>
     <html>
@@ -323,7 +324,7 @@ async def initiate_dealer_enrollment(
     email_settings, source = get_customer_email_settings(db, None)
     background_tasks.add_task(
         send_email,
-        db=db,
+        db=None,
         to_emails=[clean_email],
         subject_template=subject,
         body_template=body,
@@ -587,7 +588,8 @@ async def initiate_dealer_recovery(
     bank_name = dealer.bank.name if dealer.bank else "Partner Bank"
 
     # Dispatch Recovery Verification Email
-    subject = f"Grow Treasury - Trading Desk Account Recovery & 2FA Reset ({bank_name})"
+    bank_short = (dealer.bank.short_name or dealer.bank.name) if dealer.bank else "Partner Bank"
+    subject = f"2FA Recovery Code · {bank_short}"
     body = f"""
     <!DOCTYPE html>
     <html>
@@ -639,7 +641,7 @@ async def initiate_dealer_recovery(
     email_settings, source = get_customer_email_settings(db, None)
     background_tasks.add_task(
         send_email,
-        db=db,
+        db=None,
         to_emails=[clean_email],
         subject_template=subject,
         body_template=body,
@@ -965,14 +967,24 @@ async def get_live_rfq_blotter(
                 is_passed = bool(cfg and cfg.is_passed)
 
                 pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
+                eff_leg_vdate = str(getattr(cfg, 'value_date', None) or getattr(asgn, 'value_date', None) or leg.value_date or rfq.value_date or "Spot (T+2)").split('T')[0]
+                eff_leg_alt = bool(
+                    getattr(cfg, 'allow_alternative_value_date', None)
+                    if (cfg and getattr(cfg, 'allow_alternative_value_date', None) is not None)
+                    else (
+                        asgn.allow_alternative_value_date
+                        if getattr(asgn, 'allow_alternative_value_date', None) is not None
+                        else leg.allow_alternative_value_date
+                    )
+                )
                 visible_legs.append({
                     "leg_id": l_id,
                     "currency_pair": pair_str,
                     "direction": leg.direction or "BUY",
                     "amount": float(leg.amount or 0),
                     "currency": leg.buy_currency,
-                    "value_date": getattr(cfg, 'value_date', None) or leg.value_date or "Spot (T+2)",
-                    "allow_alternative_value_date": bool(getattr(cfg, 'allow_alternative_value_date', None) if (cfg and getattr(cfg, 'allow_alternative_value_date', None) is not None) else leg.allow_alternative_value_date),
+                    "value_date": eff_leg_vdate,
+                    "allow_alternative_value_date": eff_leg_alt,
                     "has_quote": leg_offer is not None,
                     "is_passed": is_passed
                 })
@@ -991,7 +1003,8 @@ async def get_live_rfq_blotter(
                 summary_currency = None
 
             summary_direction = visible_legs[0]["direction"] if len(visible_legs) == 1 else "PACKAGE"
-            summary_value_date = visible_legs[0]["value_date"] if len(visible_legs) == 1 else "Multiple Dates"
+            distinct_leg_dates = list(dict.fromkeys(l["value_date"] for l in visible_legs if l.get("value_date")))
+            summary_value_date = distinct_leg_dates[0] if len(distinct_leg_dates) == 1 else "Multiple Dates"
             all_quoted = all(l["has_quote"] or l["is_passed"] for l in visible_legs) and any(l["has_quote"] for l in visible_legs)
             all_passed = all(l["is_passed"] for l in visible_legs)
         else:
@@ -1006,7 +1019,7 @@ async def get_live_rfq_blotter(
             summary_pair = f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")
             summary_amount = float(rfq.amount or 0)
             summary_direction = rfq.direction or "BUY"
-            summary_value_date = rfq.value_date or "Spot (T+2)"
+            summary_value_date = str(getattr(asgn, 'value_date', None) or rfq.value_date or "Spot (T+2)").split('T')[0]
             all_quoted = has_offer
             all_passed = False
 
@@ -1047,7 +1060,7 @@ async def get_live_rfq_blotter(
             "rfq_id": str(rfq.id),
             "ref_no": rfq.ref_no,
             "type": rfq.type or "FX_SPOT",
-            "quotation_base": rfq.quotation_base or "Execution",
+            "quotation_base": getattr(asgn, 'quotation_base', None) or rfq.quotation_base or "Execution",
             "customer_name": customer_name,
             "entity_name": entity_name,
             "status": timing_status,
@@ -1061,7 +1074,11 @@ async def get_live_rfq_blotter(
             "summary_amount": summary_amount,
             "summary_direction": summary_direction,
             "summary_value_date": summary_value_date,
-            "allow_alternative_value_date": bool(rfq.allow_alternative_value_date),
+            "allow_alternative_value_date": (
+                any(l["allow_alternative_value_date"] for l in visible_legs)
+                if is_multi_leg
+                else bool(asgn.allow_alternative_value_date if getattr(asgn, 'allow_alternative_value_date', None) is not None else rfq.allow_alternative_value_date)
+            ),
             "has_quoted": all_quoted,
             "has_passed": all_passed,
             "desk_lock": desk_lock,
@@ -1131,7 +1148,16 @@ async def get_historical_trades_blotter(
         
         # Summary trading attributes
         if is_multi_leg:
-            valid_legs = [l for l in rfq.legs if not l.is_deleted]
+            valid_legs = []
+            for l in rfq.legs:
+                if l.is_deleted:
+                    continue
+                cfg_l = asgn.get_config_for_leg(str(l.id)) if hasattr(asgn, 'get_config_for_leg') else None
+                if cfg_l and cfg_l.is_invited is False:
+                    continue
+                valid_legs.append(l)
+            if not valid_legs:
+                valid_legs = [l for l in rfq.legs if not l.is_deleted]
             summary_pair = f"{len(valid_legs)} Legs Package" if len(valid_legs) > 1 else (valid_legs[0].currency_pair or "FX Package")
             summary_direction = "PACKAGE"
             distinct_currencies = list(dict.fromkeys(l.buy_currency for l in valid_legs if l.buy_currency))
@@ -1141,14 +1167,19 @@ async def get_historical_trades_blotter(
             else:
                 summary_amount = None
                 summary_currency = None
-            summary_value_date = "Multiple Dates" if len(set(l.value_date for l in valid_legs if l.value_date)) > 1 else (valid_legs[0].value_date or "Spot (T+2)")
+            leg_dates = []
+            for l in valid_legs:
+                cfg_l = asgn.get_config_for_leg(str(l.id)) if hasattr(asgn, 'get_config_for_leg') else None
+                ld = str(getattr(cfg_l, 'value_date', None) or getattr(asgn, 'value_date', None) or l.value_date or rfq.value_date or "Spot (T+2)").split('T')[0]
+                leg_dates.append(ld)
+            summary_value_date = "Multiple Dates" if len(set(leg_dates)) > 1 else (leg_dates[0] if leg_dates else "Spot (T+2)")
         else:
             distinct_pairs = [f"{rfq.buy_currency}/{rfq.sell_currency}" if (rfq.buy_currency and rfq.sell_currency) else (rfq.type or "FX_SPOT")]
             summary_pair = distinct_pairs[0]
             summary_direction = rfq.direction or "BUY"
             summary_amount = float(rfq.amount or 0)
             summary_currency = rfq.buy_currency or "USD"
-            summary_value_date = rfq.value_date or "Spot (T+2)"
+            summary_value_date = str(getattr(asgn, 'value_date', None) or rfq.value_date or "Spot (T+2)").split('T')[0]
 
         # Check Dealer's own submitted quote on this RFQ
         dealer_offers = [o for o in asgn.offers if not o.is_deleted]
@@ -1197,12 +1228,23 @@ async def get_historical_trades_blotter(
             for idx, leg in enumerate(rfq.legs, 1):
                 if leg.is_deleted:
                     continue
+                cfg_leg = asgn.get_config_for_leg(str(leg.id)) if hasattr(asgn, 'get_config_for_leg') else None
+                if cfg_leg and cfg_leg.is_invited is False:
+                    continue
                 pair_str = leg.currency_pair or f"{leg.buy_currency}/{leg.sell_currency}"
                 leg_offer = next((o for o in dealer_offers if str(o.leg_id or '') == str(leg.id)), None)
                 my_leg_rate = tenant_key_service.resolve_offer_price(leg_offer, tenant_dek) if leg_offer else None
+                eff_hist_vdate = str(
+                    getattr(leg_offer, 'offered_value_date', None)
+                    or getattr(cfg_leg, 'value_date', None)
+                    or getattr(asgn, 'value_date', None)
+                    or leg.value_date
+                    or rfq.value_date
+                    or "Spot (T+2)"
+                ).split('T')[0]
                 
                 leg_is_won = (leg.winner_bank_id == current_dealer.bank_id)
-                leg_win_rate = float(leg.winner_rate or leg.eval_rate or 0) if (leg.winner_rate or leg.eval_rate) else None
+                leg_win_rate = float(leg.winner_rate) if leg.winner_rate is not None else (float(my_leg_rate) if (leg_is_won and my_leg_rate is not None) else None)
                 
                 leg_data = {
                     "leg_index": idx,
@@ -1211,7 +1253,7 @@ async def get_historical_trades_blotter(
                     "direction": leg.direction or "BUY",
                     "amount": float(leg.amount or 0),
                     "currency": leg.buy_currency or "USD",
-                    "value_date": leg.value_date or "Spot (T+2)",
+                    "value_date": eff_hist_vdate,
                     "my_rate": my_leg_rate,
                     "winning_rate": leg_win_rate,
                     "winning_bank_name": (current_dealer.bank.name if current_dealer.bank else "This Bank") if leg_is_won else leg.winner_bank_name,
@@ -1229,7 +1271,7 @@ async def get_historical_trades_blotter(
                         "amount": float(leg.amount or 0),
                         "currency": leg.buy_currency or "USD",
                         "rate": leg_win_rate or my_leg_rate or 0.0,
-                        "value_date": leg.value_date or "Spot (T+2)"
+                        "value_date": eff_hist_vdate
                     })
 
             is_won = len(won_legs) > 0
@@ -1241,10 +1283,14 @@ async def get_historical_trades_blotter(
             primary_leg = rfq.legs[0] if (rfq.legs and len(rfq.legs) > 0) else None
             if primary_leg and primary_leg.winner_bank_id:
                 is_won = bool(primary_leg.winner_bank_id == current_dealer.bank_id and rfq.status == "COMPLETED")
-                winning_rate = float(primary_leg.winner_rate or primary_leg.eval_rate or 0) if (primary_leg.winner_rate or primary_leg.eval_rate) else None
-                winning_bank_name = primary_leg.winner_bank_name
-            elif rfq.eval_rate:
-                winning_rate = float(rfq.eval_rate)
+                winning_rate = float(primary_leg.winner_rate) if primary_leg.winner_rate is not None else (float(rfq.winner_rate) if rfq.winner_rate is not None else (float(dealer_rate) if (is_won and dealer_rate is not None) else None))
+                winning_bank_name = primary_leg.winner_bank_name or rfq.winner_bank_name
+            elif rfq.winner_bank_id:
+                is_won = bool(rfq.winner_bank_id == current_dealer.bank_id and rfq.status == "COMPLETED")
+                winning_rate = float(rfq.winner_rate) if rfq.winner_rate is not None else (float(dealer_rate) if (is_won and dealer_rate is not None) else None)
+                winning_bank_name = rfq.winner_bank_name
+            elif rfq.winner_rate is not None:
+                winning_rate = float(rfq.winner_rate)
                 if dealer_rate and abs(dealer_rate - winning_rate) < 0.00001 and rfq.status == "COMPLETED":
                     is_won = True
 
@@ -1407,7 +1453,20 @@ async def claim_rfq_desk_lock(
     Claims active exclusive trader control of an RFQ quotation desk ticket.
     Integrates directly with desk_session_service concurrency manager.
     """
+    from app.models.models_quotation import QuotationBankAssignment
     from app.services.desk_session_service import desk_session_service
+
+    assignment = db.query(QuotationBankAssignment).join(
+        QuotationBank, QuotationBankAssignment.quotation_bank_id == QuotationBank.id
+    ).filter(
+        QuotationBankAssignment.id == req.assignment_id,
+        QuotationBank.bank_id == current_dealer.bank_id
+    ).first()
+    if not assignment:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You can only claim desk control for RFQs assigned to your institution."
+        )
 
     status_data = desk_session_service.get_or_claim_desk(
         assignment_id=req.assignment_id,

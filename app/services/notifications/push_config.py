@@ -34,8 +34,19 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-@lru_cache(maxsize=1)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_cached_vapid_config: Optional[VapidConfig] = None
+
+
 def get_vapid_config() -> Optional[VapidConfig]:
+    global _cached_vapid_config
+    if _cached_vapid_config is not None:
+        return _cached_vapid_config
+
+    load_dotenv()
     public_key = (os.getenv("VAPID_PUBLIC_KEY") or "").strip()
     private_key = (os.getenv("VAPID_PRIVATE_KEY") or "").strip()
     subject = (os.getenv("VAPID_SUBJECT") or "").strip()
@@ -65,7 +76,8 @@ def get_vapid_config() -> Optional[VapidConfig]:
     if derived_raw != raw_public:
         raise RuntimeError("Web Push: VAPID_PRIVATE_KEY does not match VAPID_PUBLIC_KEY.")
 
-    return VapidConfig(public_key=public_key, private_key=private_key, subject=subject)
+    _cached_vapid_config = VapidConfig(public_key=public_key, private_key=private_key, subject=subject)
+    return _cached_vapid_config
 
 
 def push_enabled() -> bool:

@@ -822,7 +822,7 @@ def create_quotation_bank(
                     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
                     background_tasks.add_task(
                         send_email,
-                        db,
+                        None,
                         [c_email],
                         subj,
                         email_html,
@@ -874,7 +874,44 @@ def send_bank_roster_report(
     bank_name = bank.bank.name if bank.bank else f"Bank {bank.bank_id}"
     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
 
-    contacts_list = list(bank.contacts) if bank.contacts else []
+    # Combine active contacts and staged (Pending / Locked) handshake invitations for full governance visibility
+    staged_invitations = db.query(QuotationBankContactInvitation).filter(
+        QuotationBankContactInvitation.customer_id == current_user.customer_id,
+        QuotationBankContactInvitation.bank_id == bank.bank_id,
+        QuotationBankContactInvitation.status.in_(["PENDING", "LOCKED"])
+    ).order_by(QuotationBankContactInvitation.created_at.asc()).all()
+
+    staged_by_email = {}
+    for inv in staged_invitations:
+        inv_email = (inv.get_email(db) or inv.email or "").strip().lower()
+        if inv_email:
+            staged_by_email[inv_email] = {
+                "email": inv_email,
+                "name": inv.title or "",
+                "title": inv.title or "",
+                "role": (inv.role or "EXECUTION").upper(),
+                "status": (inv.status or "PENDING").upper()
+            }
+
+    contacts_list = []
+    seen_emails = set()
+    for c in (list(bank.contacts) if bank.contacts else []):
+        c_email = (c.get("email") or "").strip().lower()
+        if not c_email or c_email in seen_emails:
+            continue
+        seen_emails.add(c_email)
+        staged_entry = staged_by_email.get(c_email)
+        contacts_list.append({
+            **c,
+            "email": c_email,
+            "status": staged_entry["status"] if staged_entry else "ACTIVE"
+        })
+
+    for inv_email, inv_data in staged_by_email.items():
+        if inv_email not in seen_emails:
+            seen_emails.add(inv_email)
+            contacts_list.append(inv_data)
+
     subj, body = build_bank_roster_governance_email(
         customer_branding=customer_name,
         bank_name=bank_name,
@@ -886,13 +923,34 @@ def send_bank_roster_report(
 
     background_tasks.add_task(
         send_email,
-        db,
+        None,
         [bank.authorized_contact_email],
         subj,
         body,
         {},
         email_settings
     )
+
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_BANK_ROSTER_REPORT_SENT",
+        entity_type="QuotationBank",
+        entity_id=bank.id,
+        details={
+            "bank_id": bank.bank_id,
+            "bank_name": bank_name,
+            "recipient_email": bank.authorized_contact_email,
+            "total_contacts": len(contacts_list)
+        },
+        customer_id=current_user.customer_id
+    )
+
+    return {
+        "status": "success",
+        "message": f"Official roster audit report successfully sent to {bank.authorized_contact_email}.",
+        "recipient": bank.authorized_contact_email
+    }
 
 
 # --- Staged Dealer Contact Invitations & Handshake Management ---
@@ -1051,7 +1109,7 @@ def invite_bank_contact(
         email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
         background_tasks.add_task(
             send_email,
-            db,
+            None,
             [clean_email],
             subj,
             email_html,
@@ -1164,7 +1222,7 @@ def resend_contact_invitation(
     email_settings, _ = get_customer_email_settings(db, current_user.customer_id)
     background_tasks.add_task(
         send_email,
-        db,
+        None,
         [clean_email],
         subj,
         email_html,
@@ -1207,27 +1265,6 @@ def revoke_contact_invitation(
     db.delete(inv)
     db.commit()
     return {"status": "success", "message": "Invitation cancelled."}
-
-    log_action(
-        db,
-        user_id=current_user.user_id,
-        action_type="QUOTATION_BANK_ROSTER_REPORT_SENT",
-        entity_type="QuotationBank",
-        entity_id=bank.id,
-        details={
-            "bank_id": bank.bank_id,
-            "bank_name": bank_name,
-            "recipient_email": bank.authorized_contact_email,
-            "total_contacts": len(contacts_list)
-        },
-        customer_id=current_user.customer_id
-    )
-
-    return {
-        "status": "success",
-        "message": f"Official roster audit report successfully sent to {bank.authorized_contact_email}.",
-        "recipient": bank.authorized_contact_email
-    }
 
 @router.delete("/banks/{bank_id}")
 def delete_quotation_bank(
@@ -1415,19 +1452,34 @@ def get_bank_recommendations(
 
     # Exclude banks where all registered contacts are pending dealer handshake
     from app.models.models_quotation import QuotationBankContactInvitation
+    from app.core.security_crypto import compute_email_blind_index
     pending_invs = db.query(QuotationBankContactInvitation).filter(
         QuotationBankContactInvitation.customer_id == current_user.customer_id,
         QuotationBankContactInvitation.status == "PENDING"
     ).all()
-    pending_by_bank = {}
+    pending_emails_by_bank = {}
+    pending_blinds_by_bank = {}
     for pinv in pending_invs:
-        pending_by_bank.setdefault(pinv.bank_id, set()).add((pinv.email or "").strip().lower())
+        resolved_email = (pinv.get_email(db) or pinv.email or "").strip().lower()
+        if resolved_email:
+            pending_emails_by_bank.setdefault(pinv.bank_id, set()).add(resolved_email)
+        if getattr(pinv, "email_blind_index", None):
+            pending_blinds_by_bank.setdefault(pinv.bank_id, set()).add(pinv.email_blind_index)
 
     customer_banks = []
     for qb in all_customer_banks:
         q_contacts = list(qb.contacts) if qb.contacts else []
-        pending_set = pending_by_bank.get(qb.bank_id, set())
-        has_active = any((c.get("email") or "").strip().lower() not in pending_set for c in q_contacts)
+        pending_set = pending_emails_by_bank.get(qb.bank_id, set())
+        pending_blinds = pending_blinds_by_bank.get(qb.bank_id, set())
+        has_active = False
+        for c in q_contacts:
+            c_email = (c.get("email") or "").strip().lower()
+            if not c_email:
+                continue
+            c_blind = compute_email_blind_index(c_email)
+            if c_email not in pending_set and c_blind not in pending_blinds:
+                has_active = True
+                break
         if q_contacts and has_active:
             customer_banks.append(qb)
 
@@ -1771,7 +1823,7 @@ def _dispatch_quotation_submission_email(
         action_label = "Re-Tender" if is_retender else "Quotation"
         multi_label = f" ({len(legs_list)} Pairs)" if len(legs_list) > 1 else ""
         if requires_approval:
-            subject = f"ACTION REQUIRED: {action_label} Request {rfq.ref_no}{multi_label} Awaiting Approval"
+            subject = f"RFQ {rfq.ref_no} · Approval Required"
             title = f"🔔 {action_label} Awaiting Approval"
             summary_text = (
                 f"A new {action_label.lower()} request ({rfq.ref_no}){f' for {len(legs_list)} currency pairs' if len(legs_list) > 1 else ''} has been submitted by {submitter_display} "
@@ -1785,7 +1837,7 @@ def _dispatch_quotation_submission_email(
             if not has_custom_smtp_sub:
                 kv["Bank Email Dispatch"] = "Suppressed (No Custom SMTP Configured)"
 
-            subject = f"NOTIFICATION: New {action_label} Request {rfq.ref_no}{multi_label} Submitted"
+            subject = f"RFQ {rfq.ref_no} · {'Re-Tender ' if is_retender else ''}Submitted"
             title = f"{action_label} Request Submitted"
             if has_custom_smtp_sub:
                 summary_text = (
@@ -1815,7 +1867,7 @@ def _dispatch_quotation_submission_email(
 
         background_tasks.add_task(
             send_email,
-            db,
+            None,
             to_recipients,
             subject,
             body,
@@ -2022,7 +2074,7 @@ def create_rfq(
                             link=approver_link,
                             email_purpose="BANK_APPROVAL_REQUIRED"
                         )
-                        background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
+                        background_tasks.add_task(send_email, None, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
 
                     # Phase 1b: Email EXECUTION + VIEW_ONLY contacts with heads-up (NO link) ALL TOGETHER in ONE email
                     if non_approver_emails:
@@ -2035,7 +2087,7 @@ def create_rfq(
                             link="",
                             email_purpose="BANK_HEADS_UP"
                         )
-                        background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+                        background_tasks.add_task(send_email, None, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
                 else:
                     # --- STANDARD FLOW (No bank-level approval needed: Indicative, or No Approver, or Approver without Execution role) ---
                     if db_assignment and db_assignment.approval_status == 'PENDING':
@@ -2055,7 +2107,7 @@ def create_rfq(
                         )
                         background_tasks.add_task(
                             send_email,
-                            db,
+                            None,
                             all_bank_emails,
                             subject,
                             body,
@@ -2164,8 +2216,15 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             db.commit()
         elif rfq.acceptance_status == 'NO_QUOTES':
             rfq.status = 'COMPLETED'
-            db.commit()
-        
+    # Phase 6.7: Pre-fetch or freeze real-time market benchmark at window close or T-10s countdown
+    is_closing_soon = bool(w_end and (w_end - now).total_seconds() <= 10) and not is_scheduled
+    if (is_closed or is_closing_soon) and (getattr(rfq, 'type', None) or 'FX_SPOT') == 'FX_SPOT' and not rfq.market_benchmark_snapshot:
+        try:
+            from app.services.live_market_service import live_market_service
+            live_market_service.snapshot_rfq_market_benchmarks(db, rfq)
+        except Exception as snap_err:
+            logger.warning(f"Error snapshotting market benchmarks for RFQ {rfq.id}: {snap_err}")
+
     assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
     
     # Gate live market benchmark evaluation: only run when live tender bidding or acceptance window is open
@@ -2183,6 +2242,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     has_execution_banks = False
     is_uncontested = False
     uncontested_reason = None
+    legs_data = []
+    valid_results = []
     
     from app.services.tenant_key_service import tenant_key_service
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
@@ -2200,7 +2261,9 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "settlement_date": o.settlement_date,
                     "maturity_date": o.maturity_date,
                     "discount_rate": tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek),
-                    "max_amount": o.max_amount,
+                    "max_amount": tenant_key_service.resolve_tbill_max_amount(o, tenant_dek),
+                    "notes": o.notes,
+                    "submitted_by_email": o.submitted_by_email,
                     "submitted_at": o.submitted_at
                 })
 
@@ -2244,6 +2307,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             return {
                 "rfq": rfq,
                 "results": results,
+                "legs": [],
                 "winner_bank_id": None,
                 "is_inconclusive": is_closed and not is_scheduled,
                 "inconclusive_reason": "Quotation window closed without receiving any offers from counterparties." if (is_closed and not is_scheduled) else None,
@@ -2274,17 +2338,17 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             except Exception:
                 continue
 
-        # Calculate scores
+        # Calculate scores (Egyptian T-Bill standard: Actual/365 day-count basis)
         for o in parsed_offers:
             days = (o['m_dt'] - o['s_dt']).days
-            price = 100.0 * (1.0 - (o['discount_rate'] / 100.0) * (days / 360.0))
+            price = 100.0 * (1.0 - (o['discount_rate'] / 100.0) * (days / 365.0))
             
             if is_buy:
                 delta_s = (o['s_dt'] - s_min).days
                 delta_m = (m_max - o['m_dt']).days
-                m_accrual_factor = 1.0 + (eval_rate * (delta_m / 360.0))
+                m_accrual_factor = 1.0 + (eval_rate * (delta_m / 365.0))
                 scaled_price = price / m_accrual_factor
-                s_discount_factor = 1.0 - (eval_rate * (delta_s / 360.0))
+                s_discount_factor = 1.0 - (eval_rate * (delta_s / 365.0))
                 normalized_price = scaled_price * s_discount_factor
                 o['score'] = normalized_price
             else:
@@ -2331,6 +2395,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
 
         results.sort(key=lambda x: (x['best_score'] is None, x['best_score']))
         exec_results = [r for r in results if (r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity')]
+        has_execution_banks = len(exec_results) > 0
+        valid_results = [r for r in results if r.get('best_score') is not None and not r.get('is_cross_entity')]
         valid_exec_tbills = [r for r in exec_results if r.get('best_score') is not None]
         if len(valid_exec_tbills) == 1:
             is_uncontested = True
@@ -2637,21 +2703,31 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             if leg_winner_bank_id and not leg_is_inconclusive and valid_leg_results:
                 winner_res = next((r for r in valid_leg_results if r['bank_id'] == leg_winner_bank_id), None)
                 if winner_res:
-                    rates = [r['finalPrice'] for r in valid_leg_results if r.get('finalPrice') is not None]
+                    def _eval_price(item):
+                        return item.get('normalized_price') if item.get('normalized_price') is not None else item.get('finalPrice')
+
+                    exec_rates = [_eval_price(r) for r in execution_bids if _eval_price(r) is not None]
+                    all_leg_rates = [_eval_price(r) for r in valid_leg_results if _eval_price(r) is not None]
+                    # Conditional Option 1: strictly use Execution quotes when >1 Execution bank quoted; fallback to all quotes when only 1 Execution bank quoted
+                    rates = exec_rates if len(exec_rates) > 1 else all_leg_rates
                     if len(rates) >= 1:
-                        win_rate = winner_res.get('finalPrice') or rates[0]
+                        win_raw_rate = winner_res.get('finalPrice') if winner_res.get('finalPrice') is not None else rates[0]
+                        win_eval_rate = _eval_price(winner_res) if _eval_price(winner_res) is not None else win_raw_rate
                         avg_rate = sum(rates) / len(rates)
                         worst_rate = max(rates) if not is_sell else min(rates)
                         if not is_sell:
-                            s_vs_avg = max(0.0, (avg_rate - win_rate) * leg_amount)
-                            s_vs_worst = max(0.0, (worst_rate - win_rate) * leg_amount)
+                            s_vs_avg = max(0.0, (avg_rate - win_eval_rate) * leg_amount)
+                            s_vs_worst = max(0.0, (worst_rate - win_eval_rate) * leg_amount)
                         else:
-                            s_vs_avg = max(0.0, (win_rate - avg_rate) * leg_amount)
-                            s_vs_worst = max(0.0, (win_rate - worst_rate) * leg_amount)
+                            s_vs_avg = max(0.0, (win_eval_rate - avg_rate) * leg_amount)
+                            s_vs_worst = max(0.0, (win_eval_rate - worst_rate) * leg_amount)
 
                         leg_savings_summary = {
                             "winner_bank_name": winner_res.get('bank_name'),
-                            "winner_rate": round(win_rate, 4),
+                            "winner_rate": round(win_raw_rate, 4),
+                            "winner_normalized_rate": round(win_eval_rate, 4),
+                            "winner_value_date": winner_res.get('offered_value_date') or winner_res.get('assigned_value_date'),
+                            "is_tvm_adjusted": bool(abs(win_eval_rate - win_raw_rate) > 1e-6),
                             "avg_rate": round(avg_rate, 4),
                             "worst_rate": round(worst_rate, 4),
                             "currency": leg.sell_currency,
@@ -2793,23 +2869,35 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         winner_res = next((r for r in results if r['bank_id'] == winner_bank_id), None)
         if winner_res:
             if rfq.type == 'FX_SPOT' and valid_results:
-                rates = [r['finalPrice'] for r in valid_results if r.get('finalPrice') is not None]
+                def _root_eval_price(item):
+                    return item.get('normalized_price') if item.get('normalized_price') is not None else item.get('finalPrice')
+
+                exec_only_rates = [
+                    _root_eval_price(r) for r in valid_results
+                    if _root_eval_price(r) is not None and (r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity')
+                ]
+                all_root_rates = [_root_eval_price(r) for r in valid_results if _root_eval_price(r) is not None]
+                rates = exec_only_rates if len(exec_only_rates) > 1 else all_root_rates
                 if len(rates) >= 1:
-                    win_rate = winner_res.get('finalPrice') or rates[0]
+                    win_raw_rate = winner_res.get('finalPrice') if winner_res.get('finalPrice') is not None else rates[0]
+                    win_eval_rate = _root_eval_price(winner_res) if _root_eval_price(winner_res) is not None else win_raw_rate
                     avg_rate = sum(rates) / len(rates)
                     worst_rate = max(rates) if not is_sell else min(rates)
                     amount = float(rfq.amount or 1.0)
                     
                     if not is_sell:
-                        saved_vs_avg = max(0.0, (avg_rate - win_rate) * amount)
-                        saved_vs_worst = max(0.0, (worst_rate - win_rate) * amount)
+                        saved_vs_avg = max(0.0, (avg_rate - win_eval_rate) * amount)
+                        saved_vs_worst = max(0.0, (worst_rate - win_eval_rate) * amount)
                     else:
-                        saved_vs_avg = max(0.0, (win_rate - avg_rate) * amount)
-                        saved_vs_worst = max(0.0, (win_rate - worst_rate) * amount)
+                        saved_vs_avg = max(0.0, (win_eval_rate - avg_rate) * amount)
+                        saved_vs_worst = max(0.0, (win_eval_rate - worst_rate) * amount)
 
                     savings_summary = {
                         "winner_bank_name": winner_res.get('bank_name'),
-                        "winner_rate": round(win_rate, 4),
+                        "winner_rate": round(win_raw_rate, 4),
+                        "winner_normalized_rate": round(win_eval_rate, 4),
+                        "winner_value_date": winner_res.get('offered_value_date') or winner_res.get('assigned_value_date'),
+                        "is_tvm_adjusted": bool(abs(win_eval_rate - win_raw_rate) > 1e-6),
                         "avg_rate": round(avg_rate, 4),
                         "worst_rate": round(worst_rate, 4),
                         "currency": rfq.sell_currency,
@@ -2818,18 +2906,35 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "total_quotes": len(rates)
                     }
             elif rfq.type == 'TBILL' and valid_results:
-                scores = [r['best_score'] for r in valid_results if r.get('best_score') is not None]
+                exec_tbill_scores = [
+                    r['best_score'] for r in valid_results
+                    if r.get('best_score') is not None and (r.get('quotation_base') or 'Execution').lower() == 'execution' and not r.get('is_cross_entity')
+                ]
+                all_tbill_scores = [r['best_score'] for r in valid_results if r.get('best_score') is not None]
+                scores = exec_tbill_scores if len(exec_tbill_scores) > 1 else all_tbill_scores
                 if len(scores) >= 1:
-                    win_score = winner_res.get('best_score') or scores[0]
+                    win_score = winner_res.get('best_score') if winner_res.get('best_score') is not None else scores[0]
                     avg_score = sum(scores) / len(scores)
+                    worst_score = max(scores)  # In both Buy (price per 100 par) and Sell (discount rate %), lower score is better and max(scores) is worst
+                    face_val = float(rfq.amount or 0.0)
+                    if is_buy:
+                        # score is normalized price per 100 par
+                        saved_vs_avg_val = max(0.0, (avg_score - win_score) * (face_val / 100.0))
+                        saved_vs_worst_val = max(0.0, (worst_score - win_score) * (face_val / 100.0))
+                    else:
+                        # score is discount rate %
+                        win_offers = winner_res.get('offers') or []
+                        win_days = (win_offers[0]['m_dt'] - win_offers[0]['s_dt']).days if (win_offers and 'm_dt' in win_offers[0] and 's_dt' in win_offers[0]) else 91
+                        saved_vs_avg_val = max(0.0, ((avg_score - win_score) / 100.0) * (win_days / 365.0) * face_val)
+                        saved_vs_worst_val = max(0.0, ((worst_score - win_score) / 100.0) * (win_days / 365.0) * face_val)
                     savings_summary = {
                         "winner_bank_name": winner_res.get('bank_name'),
                         "winner_rate": round(win_score, 4),
                         "avg_rate": round(avg_score, 4),
-                        "worst_rate": round(max(scores) if is_buy else min(scores), 4),
+                        "worst_rate": round(worst_score, 4),
                         "currency": "EGP",
-                        "saved_vs_avg": round(abs(avg_score - win_score) * 1000, 2),
-                        "saved_vs_worst": round(abs(max(scores) - min(scores)) * 1000, 2),
+                        "saved_vs_avg": round(saved_vs_avg_val, 2),
+                        "saved_vs_worst": round(saved_vs_worst_val, 2),
                         "total_quotes": len(scores)
                     }
 
@@ -3116,18 +3221,36 @@ def get_rfq_history(
                     changed = True
                     status_changed = True
                 elif not has_winner and not is_acc_open:
-                    r.status = 'COMPLETED'
-                    r.acceptance_status = 'NO_QUOTES'
-                    r.acceptance_deadline = None
-                    r.acceptance_resolved_at = None
-                    r.acceptance_resolved_by_user_id = None
+                    has_quotes = (
+                        r.status == 'EVALUATING' or 
+                        r.acceptance_status == 'PENDING' or 
+                        any(len(getattr(asgn, 'offers', [])) > 0 for asgn in (r.assignments or []))
+                    )
+                    if has_quotes:
+                        if r.acceptance_timeout_action == "AUTO_ACCEPT":
+                            compute_rfq_standings(r, db, dispatch_emails=False)
+                        else:
+                            r.status = 'REJECTED'
+                            r.acceptance_status = 'AUTO_REJECTED'
+                            r.acceptance_resolved_at = acc_deadline_val or now
+                            r.admin_revision_notes = "Quotation auto-rejected: corporate acceptance window expired with default action AUTO_REJECT."
+                            for leg in (r.legs or []):
+                                if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                                    leg.status = 'REJECTED'
+                                    leg.rejection_reason = "Auto-rejected on acceptance timeout"
+                    else:
+                        r.status = 'COMPLETED'
+                        r.acceptance_status = 'NO_QUOTES'
+                        r.acceptance_deadline = None
+                        r.acceptance_resolved_at = None
+                        r.acceptance_resolved_by_user_id = None
+                        for leg in (r.legs or []):
+                            if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                                leg.status = 'COMPLETED'
+                                leg.winner_bank_id = None
+                                leg.winner_bank_name = None
                     changed = True
                     status_changed = True
-                    for leg in (r.legs or []):
-                        if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                            leg.status = 'COMPLETED'
-                            leg.winner_bank_id = None
-                            leg.winner_bank_name = None
             elif r.status == 'PENDING_APPROVAL':
                 r.status = 'REJECTED'
                 changed = True
@@ -3737,7 +3860,7 @@ def retender_quotation(
                         link=approver_link,
                         email_purpose="BANK_APPROVAL_REQUIRED"
                     )
-                    background_tasks.add_task(send_email, db, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
+                    background_tasks.add_task(send_email, None, [app_email], subject, body, {}, email_settings, allow_platform_fallback=False)
 
                 # Phase 1b: EXECUTION + VIEW_ONLY with heads-up (NO link) ALL TOGETHER in ONE email
                 if non_approver_emails:
@@ -3750,7 +3873,7 @@ def retender_quotation(
                         link="",
                         email_purpose="BANK_HEADS_UP"
                     )
-                    background_tasks.add_task(send_email, db, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
+                    background_tasks.add_task(send_email, None, non_approver_emails, subject, body, {}, email_settings, allow_platform_fallback=False)
             else:
                 # --- STANDARD FLOW (no bank-level approval needed, e.g. Indicative or Execution without Approver) ---
                 if new_assignment and getattr(new_assignment, 'approval_status', None) == 'PENDING':
@@ -3770,7 +3893,7 @@ def retender_quotation(
                     )
                     background_tasks.add_task(
                         send_email,
-                        db,
+                        None,
                         all_bank_emails,
                         subject,
                         body,
@@ -4464,11 +4587,11 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         remain_str = f"The remaining {len(lost_legs)} unselected pair(s) closed without execution (inconclusive / exceeded tolerance limits)."
                     else:
                         remain_str = f"The remaining {len(lost_legs)} unselected pair(s) were concluded and awarded to competing counterparties."
-                    subject = f"TRADE EXECUTION (PARTIAL): RFQ {ref_no} ({customer_name}) - Awarded {len(won_legs)} of {len(legs_data)} Legs"
+                    subject = f"RFQ {ref_no} · Partial Trade Confirmed ({customer_name})"
                     alloc_str = f"<span style='color: #16a34a; font-weight: 700;'>Partially Awarded ({len(won_legs)} of {len(legs_data)} Currency Pairs)</span>"
                     summary_text = f"We are pleased to confirm the execution of <strong>{len(won_legs)} of {len(legs_data)} currency pairs</strong> with <strong>{customer_name}</strong> based on your winning quotes. {remain_str}"
                 else:
-                    subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - Full Multi-Currency Package ({len(won_legs)} Legs)"
+                    subject = f"RFQ {ref_no} · Trade Confirmed ({customer_name})"
                     alloc_str = f"<span style='color: #16a34a; font-weight: 700;'>100% Package Awarded ({len(won_legs)} of {len(legs_data)} Pairs)</span>"
                     summary_text = f"We are pleased to confirm the execution of all {len(won_legs)} currency pair trades in this package with <strong>{customer_name}</strong> based on your winning quotes."
 
@@ -4562,7 +4685,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                 )
             elif lost_legs:
                 # Regret notification email
-                subject = f"RFQ Outcome Notification: RFQ {ref_no} ({customer_name}) - Multi-Currency Package"
+                subject = f"RFQ {ref_no} · Concluded ({customer_name})"
                 key_vals = {
                     "RFQ Reference": ref_no,
                     "Requesting Legal Entity": customer_name,
@@ -4675,7 +4798,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                         f"<div style='margin-top: 4px; color: #64748b; font-size: 11px;'>Documents are encrypted at rest and accessible via your authenticated desk session.</div>"
                     )
 
-                subject = f"TRADE EXECUTION CONFIRMED: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
+                subject = f"RFQ {ref_no} · Trade Confirmed ({customer_name})"
                 body = build_transaction_email_html(
                     customer_name=customer_name,
                     title="📈 Trade Execution Confirmation",
@@ -4686,7 +4809,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
                     recipient_name=f"{bank_res['bank_name']} Treasury Desk"
                 )
             else:
-                subject = f"RFQ Outcome Notification: RFQ {ref_no} ({customer_name}) - {rfq.buy_currency}/{rfq.sell_currency}"
+                subject = f"RFQ {ref_no} · Concluded ({customer_name})"
                 quote_display = f"{bank_res['price']:.5f}" if bank_res.get('price') is not None else "No Quote Submitted"
                 body = build_transaction_email_html(
                     customer_name=customer_name,
@@ -4814,7 +4937,10 @@ async def send_rfq_results(
     current_user: TokenData = Depends(get_current_active_user)
 ):
     """Sends or resends winner/regret emails to assigned Execution banks for a completed RFQ."""
-    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
 
@@ -4895,7 +5021,7 @@ async def resend_rfq_bank_invite(
     )
     background_tasks.add_task(
         send_email,
-        db,
+        None,
         bank_emails,
         subject,
         body,
@@ -4968,7 +5094,7 @@ def export_quotations_csv(
     
     for rfq in rfqs:
         try:
-            res_data = get_rfq_results(rfq.id, db, current_user)
+            res_data = compute_rfq_standings(rfq, db, dispatch_emails=False)
             results = res_data.get("results", [])
             winner_bank_id = res_data.get("winner_bank_id")
             creator_name = (rfq.creator.email.split('@')[0] if (rfq.creator and rfq.creator.email) else getattr(rfq, 'creator_name', 'End User')) or "End User"
@@ -5152,11 +5278,13 @@ async def decline_quotation_deal_enduser(
             body = {}
 
     reason = body.get("reason", "Declined by corporate treasury desk")
+    update_reason_only = bool(body.get("update_reason_only", False))
     return await execute_shared_deal_decline(
         rfq_id=rfq_id,
         user_id=current_user.user_id,
         reason=reason,
-        db=db
+        db=db,
+        update_reason_only=update_reason_only
     )
 
 

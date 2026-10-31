@@ -1,4 +1,7 @@
 # c:\Grow\app\main.py
+from dotenv import load_dotenv
+load_dotenv()
+
 import sys
 import os
 import re
@@ -302,6 +305,14 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_comments BOOLEAN NOT NULL DEFAULT TRUE;",
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_feedback BOOLEAN NOT NULL DEFAULT TRUE;",
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_mobile_alerts BOOLEAN NOT NULL DEFAULT TRUE;",
+                    "ALTER TABLE dealer_alert_reminders ADD COLUMN IF NOT EXISTS otp_code VARCHAR(255);",
+                    "ALTER TABLE dealer_alert_reminders ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ;",
+                    "ALTER TABLE dealer_alert_reminders ADD COLUMN IF NOT EXISTS otp_failed_attempts INTEGER NOT NULL DEFAULT 0;",
+                    "ALTER TABLE user_notifications ADD COLUMN IF NOT EXISTS reference_key VARCHAR(64);",
+                    "ALTER TABLE user_notifications ADD COLUMN IF NOT EXISTS urgency VARCHAR(10) NOT NULL DEFAULT 'normal';",
+                    "ALTER TABLE user_notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+                    "CREATE INDEX IF NOT EXISTS ix_user_notifications_reference_key ON user_notifications (reference_key);",
+                    "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'AUTO_ACCEPT_SINGLE_QUOTE';",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS encrypted_email TEXT;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS email_blind_index VARCHAR(64);",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);",
@@ -315,7 +326,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS attachment_column_signature VARCHAR;",
                     "ALTER TABLE email_classification_history ADD COLUMN IF NOT EXISTS confidence_score INTEGER;",
                     "ALTER TABLE email_classification_history ALTER COLUMN confidence DROP NOT NULL;",
-                    "UPDATE quotation_rfqs SET status = 'COMPLETED', acceptance_status = 'NO_QUOTES', acceptance_deadline = NULL, acceptance_resolved_at = NULL, acceptance_resolved_by_user_id = NULL WHERE status = 'EVALUATING' AND window_end < NOW() AND (winner_bank_name IS NULL OR winner_bank_name = '') AND (acceptance_status IS NULL OR acceptance_status = 'PENDING');",
+                    "UPDATE quotation_rfqs SET status = 'COMPLETED', acceptance_status = 'NO_QUOTES', acceptance_deadline = NULL, acceptance_resolved_at = NULL, acceptance_resolved_by_user_id = NULL WHERE status = 'EVALUATING' AND window_end < NOW() AND (acceptance_deadline IS NULL OR acceptance_deadline < NOW()) AND NOT EXISTS (SELECT 1 FROM quotation_offers qo JOIN quotation_bank_assignments qba ON qo.assignment_id = qba.id WHERE qba.rfq_id = quotation_rfqs.id);",
                     "UPDATE quotation_rfqs SET status = 'COMPLETED' WHERE status = 'INCONCLUSIVE';",
                     "UPDATE quotation_legs SET status = 'COMPLETED' WHERE status = 'INCONCLUSIVE';",
                 ]
@@ -714,6 +725,14 @@ def configure_app_instance(fastapi_app: FastAPI):
                 "name": "Daily Off-Peak Memory Maintenance",
                 "hours": [3],
                 "minute": 15,
+                "args": []
+            },
+            {
+                "func": app_background_tasks.run_quiet_times_dealer_mobile_reminders,
+                "id": "quiet_times_dealer_mobile_reminders_job",
+                "name": "Quiet-Times Dealer Mobile Alert Reminders",
+                "hours": [16],
+                "minute": 30,
                 "args": []
             }
         ]

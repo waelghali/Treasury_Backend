@@ -4,23 +4,28 @@ General-purpose notification API.
 Serves UserNotification records for the bell icon across all modules.
 """
 
+import secrets
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, or_, func
 
 from app.database import get_db
 from app.core.security import get_current_active_user, TokenData
 from app.models.models_notification import UserNotification
-from app.models.models_push import PushSubscription
+from app.models.models_push import PushSubscription, UserMobilePairToken
 from app.services.notifications.push_channel import (
     MAX_SUBSCRIPTIONS_PER_USER,
     endpoint_fingerprint,
     is_allowed_endpoint,
 )
 from app.services.notifications.push_config import get_vapid_config
+from app.core.routing import get_frontend_base_url
+from app.core.hashing import verify_password
+from app.services.dealer_auth_service import generate_qr_code_base64
 
 router = APIRouter()
 
@@ -125,7 +130,7 @@ def _active_subs_query(db: Session, user_id: int):
 
 
 @router.get("/push/public-key")
-def get_push_public_key(current_user: TokenData = Depends(get_current_active_user)):
+def get_push_public_key():
     """VAPID public key the browser needs to subscribe. enabled=false if push is off on this server."""
     config = get_vapid_config()
     return {"enabled": config is not None, "public_key": config.public_key if config else None}
@@ -147,9 +152,16 @@ def subscribe_push(
     platform = platform if platform in _PLATFORMS else None
     sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
 
+    is_already_active = (
+        sub is not None
+        and sub.user_id == current_user.user_id
+        and sub.is_active
+        and not sub.is_deleted
+    )
+    if not is_already_active and _active_subs_query(db, current_user.user_id).count() >= MAX_SUBSCRIPTIONS_PER_USER:
+        raise HTTPException(status_code=409, detail="Too many devices. Remove an old device first.")
+
     if sub is None:
-        if _active_subs_query(db, current_user.user_id).count() >= MAX_SUBSCRIPTIONS_PER_USER:
-            raise HTTPException(status_code=409, detail="Too many devices. Remove an old device first.")
         sub = PushSubscription(endpoint=payload.endpoint)
         db.add(sub)
     elif sub.user_id != current_user.user_id:
@@ -159,6 +171,9 @@ def subscribe_push(
 
     sub.user_id = current_user.user_id
     sub.customer_id = current_user.customer_id
+    sub.dealer_email = None
+    sub.dealer_id = None
+    sub.bank_id = None
     sub.p256dh = payload.keys.p256dh
     sub.auth = payload.keys.auth
     sub.device_id = payload.device_id
@@ -189,6 +204,51 @@ def unsubscribe_push(
     return {"message": "Mobile alerts turned off for this device"}
 
 
+class PushRotateIn(BaseModel):
+    old_endpoint: str = Field(..., max_length=1024)
+    new_endpoint: str = Field(..., max_length=1024)
+    keys: PushKeys
+
+
+@router.post("/push/rotate")
+def rotate_push_subscription(
+    payload: PushRotateIn,
+    db: Session = Depends(get_db),
+):
+    """
+    Self-healing background token rotation triggered by Service Worker 'pushsubscriptionchange'.
+    Verifies possession of the active old_endpoint and updates it to the rotated new_endpoint + keys.
+    Works for both logged-in browsers and QR-paired mobile devices.
+    """
+    if not is_allowed_endpoint(payload.new_endpoint):
+        raise HTTPException(status_code=400, detail="Unsupported push service.")
+
+    sub = db.query(PushSubscription).filter(
+        PushSubscription.endpoint == payload.old_endpoint,
+        PushSubscription.is_active == True,  # noqa: E712
+        PushSubscription.is_deleted == False,  # noqa: E712
+    ).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Active subscription not found for rotation.")
+
+    # Check if new_endpoint already exists to avoid unique constraint collision
+    existing_new = db.query(PushSubscription).filter(
+        PushSubscription.endpoint == payload.new_endpoint,
+        PushSubscription.id != sub.id,
+    ).first()
+    if existing_new:
+        db.delete(existing_new)
+        db.flush()
+
+    sub.endpoint = payload.new_endpoint
+    sub.p256dh = payload.keys.p256dh
+    sub.auth = payload.keys.auth
+    sub.failure_count = 0
+    sub.last_error = None
+    db.commit()
+    return {"rotated": True, "fingerprint": endpoint_fingerprint(sub.endpoint)}
+
+
 @router.get("/push/devices")
 def list_push_devices(
     db: Session = Depends(get_db),
@@ -212,3 +272,212 @@ def remove_push_device(
     sub.revoked_reason = "USER_REMOVED"
     db.commit()
     return {"message": "Device removed"}
+
+
+# ── Desktop-to-Mobile QR Pairing with Password Verification (Zero-Trust) ────────
+
+class MobilePairInitiateOut(BaseModel):
+    pairing_token: str
+    setup_url: str
+    qr_code_base64: str
+    expires_in_seconds: int
+
+
+class MobilePairAuthorizeIn(BaseModel):
+    password: str = Field(..., min_length=1)
+    endpoint: str = Field(..., max_length=1024)
+    keys: PushKeys
+    device_label: Optional[str] = Field(None, max_length=120)
+    platform: Optional[str] = Field(None, max_length=20)
+
+
+@router.post("/push/mobile-pair/initiate", response_model=MobilePairInitiateOut)
+def initiate_user_mobile_pair(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user),
+):
+    """
+    Generates a secure 15-minute QR pairing session for an End User or Corporate Admin.
+    """
+    token_str = secrets.token_hex(24)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=15)
+
+    pair_rec = UserMobilePairToken(
+        pairing_token=token_str,
+        user_id=current_user.user_id,
+        expires_at=expires_at,
+        is_paired=False,
+    )
+    db.add(pair_rec)
+    db.commit()
+
+    base_url = get_frontend_base_url(request=request).rstrip("/")
+    setup_url = f"{base_url}/mobile-pair?token={token_str}"
+    qr_b64 = generate_qr_code_base64(setup_url)
+
+    return {
+        "pairing_token": token_str,
+        "setup_url": setup_url,
+        "qr_code_base64": qr_b64,
+        "expires_in_seconds": 900,
+    }
+
+
+@router.get("/push/mobile-pair/status/{pairing_token}")
+def get_user_mobile_pair_status(
+    pairing_token: str,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user),
+):
+    """Live status check polled by desktop QR modal while waiting for phone authorization."""
+    clean_token = (pairing_token or "").strip().replace(" ", "")
+    pair_rec = db.query(UserMobilePairToken).filter(
+        or_(
+            UserMobilePairToken.pairing_token == clean_token,
+            func.lower(UserMobilePairToken.pairing_token) == func.lower(clean_token),
+        ),
+        UserMobilePairToken.user_id == current_user.user_id,
+    ).first()
+    if not pair_rec:
+        raise HTTPException(status_code=404, detail="Pairing session not found.")
+
+    return {
+        "is_paired": bool(pair_rec.is_paired),
+        "device_label": pair_rec.device_label,
+        "platform": pair_rec.platform,
+    }
+
+
+@router.get("/push/mobile-pair/{pairing_token}/info")
+def get_user_mobile_pair_info(
+    pairing_token: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Public info endpoint called by phone browser after scanning the desktop QR code.
+    Identifies the user account without returning sensitive data or secrets.
+    """
+    clean_token = (pairing_token or "").strip().replace(" ", "")
+    now = datetime.now(timezone.utc)
+    pair_rec = db.query(UserMobilePairToken).filter(
+        or_(
+            UserMobilePairToken.pairing_token == clean_token,
+            func.lower(UserMobilePairToken.pairing_token) == func.lower(clean_token),
+        ),
+        UserMobilePairToken.expires_at > now,
+    ).first()
+    if not pair_rec:
+        raise HTTPException(status_code=404, detail="This pairing QR code has expired or is invalid. Please generate a fresh QR code on your computer.")
+
+    from app.models import User
+    user = db.query(User).filter(User.id == pair_rec.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    company_name = user.customer.name if getattr(user, "customer", None) else "Grow Treasury"
+    full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or user.email
+    vapid_cfg = get_vapid_config()
+
+    return {
+        "email": user.email,
+        "full_name": full_name,
+        "company_name": company_name,
+        "is_paired": bool(pair_rec.is_paired),
+        "vapid_public_key": vapid_cfg.public_key if vapid_cfg else None,
+    }
+
+
+@router.post("/push/mobile-pair/{pairing_token}/authorize")
+def authorize_user_mobile_pair(
+    pairing_token: str,
+    payload: MobilePairAuthorizeIn,
+    db: Session = Depends(get_db),
+):
+    """
+    Public authorization endpoint called by phone when user enters password.
+    Blocks the 'unlocked laptop' threat: only the actual account holder knowing the password can pair.
+    """
+    clean_token = (pairing_token or "").strip().replace(" ", "")
+    now = datetime.now(timezone.utc)
+    pair_rec = db.query(UserMobilePairToken).filter(
+        or_(
+            UserMobilePairToken.pairing_token == clean_token,
+            func.lower(UserMobilePairToken.pairing_token) == func.lower(clean_token),
+        ),
+        UserMobilePairToken.expires_at > now,
+    ).first()
+    if not pair_rec:
+        raise HTTPException(status_code=404, detail="This pairing QR code has expired or is invalid. Please generate a fresh QR code on your computer.")
+
+    if not is_allowed_endpoint(payload.endpoint):
+        raise HTTPException(status_code=400, detail="Unsupported push endpoint.")
+
+    from app.models import User
+    user = db.query(User).filter(User.id == pair_rec.user_id).first()
+    pwd_hash = getattr(user, "password_hash", None) or getattr(user, "hashed_password", None)
+    if not user or not pwd_hash:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # PASSWORD VERIFICATION: Prevents unauthorized physical walk-up
+    if not verify_password(payload.password, pwd_hash):
+        raise HTTPException(status_code=401, detail="Incorrect password. Please enter your Grow corporate password to authorize this device.")
+
+    platform = (payload.platform or "").lower()
+    platform = platform if platform in _PLATFORMS else "desktop"
+
+    # Locate existing subscription by endpoint globally (to prevent unique constraint violation)
+    sub = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
+
+    # Enforce device limit per user if this subscription is not already active for this user
+    is_already_active_for_user = (
+        sub is not None
+        and sub.user_id == user.id
+        and sub.is_active
+        and not sub.is_deleted
+    )
+    if not is_already_active_for_user:
+        active_subs = _active_subs_query(db, user.id).order_by(PushSubscription.created_at.asc()).all()
+        if len(active_subs) >= MAX_SUBSCRIPTIONS_PER_USER:
+            oldest = active_subs[0]
+            oldest.is_active = False
+            oldest.revoked_reason = "ADMIN_REVOKED"
+
+    if sub is None:
+        sub = PushSubscription(endpoint=payload.endpoint)
+        db.add(sub)
+    elif sub.user_id != user.id:
+        sub.revoked_reason = "REASSIGNED"
+
+    sub.user_id = user.id
+    sub.customer_id = user.customer_id
+    sub.dealer_email = None
+    sub.dealer_id = None
+    sub.bank_id = None
+    sub.p256dh = payload.keys.p256dh
+    sub.auth = payload.keys.auth
+    sub.device_label = payload.device_label or f"{platform.capitalize()} Device"
+    sub.platform = platform
+    sub.device_type = platform
+    sub.is_active = True
+    sub.is_deleted = False
+    sub.revoked_reason = None
+    sub.failure_count = 0
+    sub.last_error = None
+
+    pair_rec.is_paired = True
+    pair_rec.paired_at = now
+    pair_rec.device_label = sub.device_label
+    pair_rec.platform = platform
+    db.commit()
+
+    return {
+        "success": True,
+        "message": f"Device authorized successfully! Phone alerts are now active for {user.email}.",
+        "user_email": user.email,
+        "device_label": sub.device_label,
+    }
+
+
+

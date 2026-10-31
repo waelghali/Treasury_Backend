@@ -209,7 +209,7 @@ class CRUDLGOwner(CRUDBase):
                 template_data["lg_number_single"] = lg_records[0].lg_number
                 template_data["lg_amount_formatted"] = f"{lg_records[0].lg_currency.symbol} {float(lg_records[0].lg_amount):,.2f}"
 
-            email_subject = notification_template.subject if notification_template.subject else f"LG Owner Change Notification - {{scope}} for {{lg_numbers}}"
+            email_subject = f"LG Handover · {len(lg_records)} Guarantee(s) Assigned"
             email_body_html = notification_template.content
             
             for key, value in template_data.items():
@@ -218,7 +218,7 @@ class CRUDLGOwner(CRUDBase):
                 email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
 
             logger.debug(f"[{self.__class__.__name__}._handle_lg_owner_change_notifications_and_instructions] Attempting to send email to: {to_emails}, CC: {cc_emails}, Subject: {email_subject}")
-            email_sent_successfully = send_email(
+            email_sent_successfully, _ = await send_email(
                 db=db,
                 to_emails=to_emails,
                 cc_emails=cc_emails,

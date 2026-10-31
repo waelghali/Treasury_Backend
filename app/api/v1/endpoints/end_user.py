@@ -7,10 +7,13 @@ import base64
 from datetime import date, datetime, timedelta
 import logging
 import decimal
+import hashlib
 import json
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, UploadFile, File, Body, Form, BackgroundTasks
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from app.services.document_verification_service import document_verification_service
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func, and_
 from typing import List, Optional, Any, Dict, Tuple
 import asyncio
@@ -541,9 +544,85 @@ async def scan_lg_file(
         all_customer_entities = crud_customer_entity.get_all_for_customer(db, end_user_context.customer_id)
         valid_beneficiary_names_with_ids = [{"name": entity.entity_name, "id": entity.id} for entity in all_customer_entities]
         all_banks = crud_bank.get_all(db)
-        valid_bank_names_with_ids = [{"name": bank.name, "id": bank.id} for bank in all_banks]
         all_lg_types = crud_lg_type.get_all(db)
         valid_lg_types_with_ids = [{"name": lg_type.name, "id": lg_type.id} for lg_type in all_lg_types]
+        all_rules = crud_rule.get_all(db)
+        valid_rules_with_ids = [{"name": rule.name, "id": rule.id} for rule in all_rules]
+        all_op_statuses = crud_lg_operational_status.get_all(db)
+
+        import re
+
+        def _normalize_bank_str(val: str) -> str:
+            if not val:
+                return ""
+            s = val.lower().replace("alahli", "al ahli").replace("al-ahli", "al ahli")
+            s = re.sub(r"[(),.\-/]", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        def _match_local_bank(raw_name: str):
+            """Matches a bank name against local banks using name, short_name, former_names, and common aliases."""
+            if not raw_name or not raw_name.strip():
+                return None
+            norm_input = _normalize_bank_str(raw_name)
+            best_bank = None
+            best_score = -1
+
+            # Common full-name aliases for Egyptian banks whose DB name uses the abbreviation
+            bank_aliases = {
+                "QNB": ["qatar national bank", "qatar national bank al ahli", "qnb al ahli", "qnb bebasata", "qnb egypt"],
+                "CIB": ["commercial international bank"],
+                "NBE": ["national bank of egypt", "al ahly bank"],
+                "AAIB": ["arab african international bank"],
+                "HSBC": ["hsbc bank egypt", "hongkong and shanghai banking corporation"],
+                "FAB": ["first abu dhabi bank", "fabmisr", "fab misr"],
+                "NBK": ["national bank of kuwait"],
+                "ADIB": ["abu dhabi islamic bank"],
+                "ADCB": ["abu dhabi commercial bank"],
+                "CAE": ["credit agricole", "crédit agricole"],
+                "SAIB": ["societe arabe internationale de banque", "société arabe"],
+            }
+
+            for bank in all_banks:
+                if not bank.name or bank.name.strip().lower() == "foreign bank":
+                    continue
+                score = 0
+                norm_db_name = _normalize_bank_str(bank.name)
+                if norm_input == norm_db_name:
+                    score = 100
+                else:
+                    score = fuzz.token_set_ratio(norm_input, norm_db_name)
+
+                # Check short_name as a distinct token or exact match
+                if bank.short_name and bank.short_name.strip().upper() != "OTHER":
+                    sn = bank.short_name.strip().lower()
+                    if norm_input == sn:
+                        score = max(score, 100)
+                    elif len(sn) >= 3 and re.search(r"\b" + re.escape(sn) + r"\b", norm_input):
+                        score = max(score, 95)
+                    elif len(sn) == 2 and re.search(r"\b" + re.escape(sn) + r"\b", norm_input):
+                        score = max(score, 85)
+
+                # Check former_names
+                former_list = []
+                if isinstance(bank.former_names, list):
+                    former_list = bank.former_names
+                elif isinstance(bank.former_names, str) and bank.former_names.strip():
+                    former_list = [x.strip() for x in bank.former_names.split("-") if x.strip()]
+                for fn in former_list:
+                    fn_norm = _normalize_bank_str(str(fn))
+                    if fn_norm:
+                        score = max(score, fuzz.token_set_ratio(norm_input, fn_norm))
+
+                # Check known aliases by short_name
+                if bank.short_name and bank.short_name.strip().upper() in bank_aliases:
+                    for alias in bank_aliases[bank.short_name.strip().upper()]:
+                        score = max(score, fuzz.token_set_ratio(norm_input, alias))
+
+                if score > best_score and score >= 70:
+                    best_score = score
+                    best_bank = bank
+
+            return best_bank
 
         mapped_data = {}
         extracted_beneficiary_name = extracted_ai_data.get("beneficiaryName")
@@ -558,24 +637,136 @@ async def scan_lg_file(
             currency = crud_currency.get_by_iso_code(db, extracted_ai_data["currency"])
             if currency:
                 mapped_data["lg_currency_id"] = currency.id
+                mapped_data["lg_payable_currency_id"] = currency.id
             else:
                 logger.warning(f"LG Currency '{extracted_ai_data['currency']}' not found in DB.")
 
-        extracted_lg_type_name = extracted_ai_data.get("lgType")
+        extracted_lg_type_name = (extracted_ai_data.get("lgType") or "").strip()
         if extracted_lg_type_name:
-            lg_type_id = find_best_match(extracted_lg_type_name, valid_lg_types_with_ids)
-            if lg_type_id:
-                mapped_data["lg_type_id"] = lg_type_id
+            lg_type_lower = extracted_lg_type_name.lower()
+            if "advance" in lg_type_lower or "apg" in lg_type_lower or "دفعة مقدمة" in lg_type_lower:
+                mapped_data["lg_type_id"] = LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value
+            elif "performance" in lg_type_lower or "final" in lg_type_lower or "نهائي" in lg_type_lower or "أداء" in lg_type_lower:
+                mapped_data["lg_type_id"] = LgTypeEnum.PERFORMANCE_GUARANTEE.value
+            elif "bid" in lg_type_lower or "tender" in lg_type_lower or "ابتدائي" in lg_type_lower:
+                mapped_data["lg_type_id"] = LgTypeEnum.BID_BOND.value
             else:
-                logger.warning(f"No good fuzzy match found for LG Type '{extracted_lg_type_name}'.")
+                lg_type_id = find_best_match(extracted_lg_type_name, valid_lg_types_with_ids)
+                if lg_type_id:
+                    mapped_data["lg_type_id"] = lg_type_id
+                else:
+                    logger.warning(f"No good fuzzy match found for LG Type '{extracted_lg_type_name}'.")
 
-        extracted_issuing_bank_name = extracted_ai_data.get("issuingBankName")
-        if extracted_issuing_bank_name:
-            issuing_bank_id = find_best_match(extracted_issuing_bank_name, valid_bank_names_with_ids)
-            if issuing_bank_id:
-                mapped_data["issuing_bank_id"] = issuing_bank_id
+        # Map Operational Status & Payment Conditions (only applicable for Advance Payment LG)
+        if mapped_data.get("lg_type_id") == LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value:
+            raw_op_status = (extracted_ai_data.get("operationalStatus") or "").strip().lower()
+            raw_pay_cond = (extracted_ai_data.get("paymentConditions") or "").strip()
+            other_conds = extracted_ai_data.get("otherConditions") or []
+            other_conds_text = " ".join(other_conds) if isinstance(other_conds, list) else str(other_conds)
+            combined_cond_check = f"{raw_op_status} {raw_pay_cond} {other_conds_text}".lower()
+
+            is_non_operative = (
+                "non-operative" in raw_op_status
+                or "non operative" in raw_op_status
+                or "none operative" in raw_op_status
+                or ("conditional" in raw_op_status and "unconditional" not in raw_op_status)
+                or ("مشروط" in raw_op_status and "غير مشروط" not in raw_op_status)
+                or "non-operative" in combined_cond_check
+                or "non operative" in combined_cond_check
+            )
+            if is_non_operative:
+                non_op_obj = next((s for s in all_op_statuses if "non" in s.name.lower() or "none" in s.name.lower()), None)
+                mapped_data["lg_operational_status_id"] = non_op_obj.id if non_op_obj else LgOperationalStatusEnum.NON_OPERATIVE.value
+                if raw_pay_cond:
+                    mapped_data["payment_conditions"] = raw_pay_cond
+                elif other_conds_text.strip():
+                    mapped_data["payment_conditions"] = other_conds_text.strip()[:1024]
+                else:
+                    mapped_data["payment_conditions"] = (extracted_ai_data.get("purpose") or "Subject to receipt of advance payment.")[:1024]
             else:
-                logger.warning(f"No good fuzzy match found for Issuing Bank '{extracted_issuing_bank_name}'.")
+                op_obj = next((s for s in all_op_statuses if s.name.strip().lower() == "operative"), None)
+                mapped_data["lg_operational_status_id"] = op_obj.id if op_obj else LgOperationalStatusEnum.OPERATIVE.value
+                mapped_data["payment_conditions"] = None
+
+        # Map Applicable Rule
+        extracted_rule_name = (extracted_ai_data.get("applicableRule") or "").strip()
+        if extracted_rule_name:
+            rule_lower = extracted_rule_name.lower()
+            if "758" in rule_lower or "urdg" in rule_lower:
+                urdg = next((r for r in all_rules if "758" in r.name.lower() or "urdg" in r.name.lower()), None)
+                if urdg:
+                    mapped_data["applicable_rule_id"] = urdg.id
+            elif "isp" in rule_lower or "98" in rule_lower:
+                isp = next((r for r in all_rules if "isp" in r.name.lower()), None)
+                if isp:
+                    mapped_data["applicable_rule_id"] = isp.id
+            elif "522" in rule_lower or "urc" in rule_lower:
+                urc = next((r for r in all_rules if "522" in r.name.lower() or "urc" in r.name.lower()), None)
+                if urc:
+                    mapped_data["applicable_rule_id"] = urc.id
+            else:
+                rule_id = find_best_match(extracted_rule_name, valid_rules_with_ids)
+                if rule_id:
+                    mapped_data["applicable_rule_id"] = rule_id
+                else:
+                    other_rule = next((r for r in all_rules if r.name.strip().lower() == "other"), None)
+                    if other_rule:
+                        mapped_data["applicable_rule_id"] = other_rule.id
+                        mapped_data["applicable_rules_text"] = extracted_rule_name[:64]
+
+        # Map Issuing Bank (Local vs Foreign / Advised)
+        extracted_issuing_bank_name = (extracted_ai_data.get("issuingBankName") or "").strip()
+        extracted_foreign_bank_name = (extracted_ai_data.get("foreign_bank_name") or "").strip()
+        extracted_bank_country = (extracted_ai_data.get("foreign_bank_country") or extracted_ai_data.get("issuingBankCountry") or "").strip()
+        extracted_advising_bank_name = (extracted_ai_data.get("advisingBankName") or "").strip()
+
+        foreign_bank_record = next((b for b in all_banks if b.name.strip().lower() == "foreign bank"), None)
+        matched_issuing_local_bank = _match_local_bank(extracted_issuing_bank_name) if extracted_issuing_bank_name else None
+        matched_foreign_field_local_bank = _match_local_bank(extracted_foreign_bank_name) if extracted_foreign_bank_name else None
+
+        is_country_foreign = bool(
+            extracted_bank_country
+            and extracted_bank_country.lower() not in ["egypt", "مصر", "arab republic of egypt", "are", "eg"]
+        )
+        has_true_foreign_bank_name = bool(extracted_foreign_bank_name and not matched_foreign_field_local_bank)
+
+        if has_true_foreign_bank_name or is_country_foreign or (extracted_issuing_bank_name and not matched_issuing_local_bank):
+            # Foreign Bank Guarantee!
+            if foreign_bank_record:
+                mapped_data["issuing_bank_id"] = foreign_bank_record.id
+            effective_foreign_name = (
+                extracted_foreign_bank_name
+                if has_true_foreign_bank_name
+                else extracted_issuing_bank_name
+            )
+            mapped_data["foreign_bank_name"] = effective_foreign_name
+            mapped_data["foreign_bank_country"] = extracted_bank_country if is_country_foreign else (extracted_ai_data.get("foreign_bank_country") or "")
+            mapped_data["foreign_bank_address"] = (extracted_ai_data.get("foreign_bank_address") or "").strip()
+            mapped_data["foreign_bank_swift_code"] = (extracted_ai_data.get("foreign_bank_swift_code") or "").strip()
+
+            # Determine Advising / Confirming Bank if present
+            advising_candidate = extracted_advising_bank_name
+            if not advising_candidate and matched_issuing_local_bank and has_true_foreign_bank_name:
+                # In case AI placed the local advising bank letterhead in issuingBankName and the foreign bank in foreign_bank_name
+                advising_candidate = extracted_issuing_bank_name
+
+            if advising_candidate:
+                matched_comm_bank = _match_local_bank(advising_candidate)
+                raw_adv_status = (extracted_ai_data.get("advisingStatus") or "").strip().lower()
+                if "confirm" in raw_adv_status and "without" not in raw_adv_status and "not" not in raw_adv_status and "unconfirm" not in raw_adv_status:
+                    mapped_data["advising_status"] = "Confirmed"
+                else:
+                    mapped_data["advising_status"] = "Advised"
+                if matched_comm_bank:
+                    mapped_data["communication_bank_id"] = matched_comm_bank.id
+            else:
+                mapped_data["advising_status"] = "Not Advised"
+                mapped_data["communication_bank_id"] = None
+        elif matched_issuing_local_bank:
+            mapped_data["issuing_bank_id"] = matched_issuing_local_bank.id
+            mapped_data["issuing_bank_address"] = matched_issuing_local_bank.address or ""
+            mapped_data["issuing_bank_phone"] = matched_issuing_local_bank.phone_number or ""
+            mapped_data["issuing_bank_fax"] = matched_issuing_local_bank.fax or ""
 
         response_data = {
             "issuer_name": extracted_ai_data.get("issuerName"),
@@ -594,6 +785,12 @@ async def scan_lg_file(
             "issuing_bank_address": None,
             "issuing_bank_phone": None,
             "issuing_bank_fax": None,
+            "foreign_bank_name": None,
+            "foreign_bank_country": None,
+            "foreign_bank_address": None,
+            "foreign_bank_swift_code": None,
+            "advising_status": "Not Advised",
+            "communication_bank_id": None,
             "issuing_method_id": None,
             "applicable_rule_id": None,
             "applicable_rules_text": None,
@@ -754,6 +951,7 @@ async def list_internal_owner_contacts_with_lg_count(
 )
 async def view_lg_document_securely(
     document_id: int,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_end_user_context),
     valid_for_seconds: int = Query(900, description="Duration in seconds the signed URL is valid (default 15 mins)")
@@ -781,38 +979,39 @@ async def view_lg_document_securely(
         logger.warning(f"Unauthorized access attempt for document ID {document_id} by user from customer {current_user.customer_id}. Document belongs to customer {db_document.lg_record.customer_id if db_document.lg_record else 'N/A'}.")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Document not accessible to your organization.")
 
-    # 3. Generate the signed URL using the helper from ai_integration.py
-    signed_url = await generate_signed_gcs_url(db_document.file_path, valid_for_seconds)
+    # 3. Mint an ephemeral 15-minute cryptographically signed download ticket
+    import time
+    from app.core.security_crypto import generate_download_ticket
+    from app.core.routing import get_backend_base_url
 
-    if not signed_url:
-        logger.error(f"Failed to generate signed URL for document ID {document_id} (GCS path: {db_document.file_path}).")
-        log_action(
-            db,
-            user_id=current_user.user_id,
-            action_type="DOCUMENT_VIEW_FAILED",
-            entity_type="LGDocument",
-            entity_id=document_id,
-            details={"file_name": db_document.file_name, "reason": "Failed to generate signed URL"},
-            customer_id=current_user.customer_id,
-            lg_record_id=db_document.lg_record_id
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate a secure viewing link for the document. Please try again later."
-        )
+    backend_base = get_backend_base_url(request)
+    ticket_payload = {
+        "gcs_uri": db_document.file_path,
+        "customer_id": current_user.customer_id,
+        "user_id": current_user.user_id,
+        "caller_desc": f"Corporate User {current_user.email} (Custody View)",
+        "module": "lg_custody",
+        "doc_id": document_id,
+        "context": "lg_custody_doc",
+        "original_filename": db_document.file_name,
+        "created_at": int(time.time())
+    }
+    expiry_mins = max(1, valid_for_seconds // 60)
+    ticket = generate_download_ticket(ticket_payload, expiry_minutes=expiry_mins)
+    streaming_url = f"{backend_base}/api/v1/documents/download?ticket={ticket}"
 
-    logger.info(f"Successfully generated signed URL for document ID {document_id}.")
+    logger.info(f"Successfully generated streaming ticket for document ID {document_id}.")
     log_action(
         db,
         user_id=current_user.user_id,
         action_type="DOCUMENT_VIEWED_SECURELY",
         entity_type="LGDocument",
         entity_id=document_id,
-        details={"file_name": db_document.file_name, "signed_url_valid_for_seconds": valid_for_seconds},
+        details={"file_name": db_document.file_name, "signed_url_valid_for_seconds": valid_for_seconds, "is_streaming": True},
         customer_id=current_user.customer_id,
         lg_record_id=db_document.lg_record_id
     )
-    return {"signed_url": signed_url}
+    return {"signed_url": streaming_url, "download_url": streaming_url}
 
 @router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
 async def list_lg_records(
@@ -1555,7 +1754,7 @@ async def activate_non_operative_lg_record(
     payment_method: str = Form(..., description="Payment method used (e.g., 'Wire', 'Check')"),
     currency_id: int = Form(..., description="ID of the Currency for the payment."),
     amount: float = Form(..., gt=0, description="The payment amount."),
-    payment_reference: str = Form(..., max_length=100, description="Wire reference or check number."),
+    payment_reference: Optional[str] = Form("N/A", max_length=100, description="Wire reference or check number."),
     issuing_bank_id: int = Form(..., description="ID of the Issuing Bank related to the payment."), # NEW: Add this line
     payment_date: date = Form(..., description="Date the payment was made (DD/MM/YYYY)."),
     notes: Optional[str] = Form(None, description="Additional notes for the action."),
@@ -1574,7 +1773,7 @@ async def activate_non_operative_lg_record(
         payment_method=payment_method,
         currency_id=currency_id,
         amount=amount,
-        payment_reference=payment_reference,
+        payment_reference=payment_reference or "N/A",
         issuing_bank_id=issuing_bank_id,
         payment_date=payment_date,
         notes=notes
@@ -2215,31 +2414,163 @@ async def change_lg_owner_api(
                 detail=f"An unexpected error occurred during direct change: {e}"
             )
             
+def _collect_alternate_bank_names(lg_record: Optional[models.LGRecord]) -> List[str]:
+    """Return advising/communication bank and foreign bank names for AI counterparty matching."""
+    if not lg_record:
+        return []
+    names: List[str] = []
+    comm_bank = getattr(lg_record, "communication_bank", None)
+    if comm_bank:
+        if getattr(comm_bank, "name", None):
+            names.append(comm_bank.name)
+        if getattr(comm_bank, "short_name", None):
+            names.append(comm_bank.short_name)
+    if getattr(lg_record, "foreign_bank_name", None):
+        names.append(lg_record.foreign_bank_name)
+    return [n for n in names if n]
+
+
+def _collect_lg_document_hashes(db: Session, lg_record: Optional[models.LGRecord]) -> List[Dict[str, Any]]:
+    """Collect existing SHA-256 document hashes across all instructions and uploaded documents of an LG."""
+    if not lg_record:
+        return []
+    hashes: List[Dict[str, Any]] = []
+    seen = set()
+
+    inst_map = {getattr(i, "id", None): i for i in (getattr(lg_record, "instructions", None) or [])}
+    for inst in (getattr(lg_record, "instructions", None) or []):
+        if getattr(inst, "is_deleted", False):
+            continue
+        inst_details = inst.details or {}
+        inst_type_str = getattr(inst, "instruction_type", "") or ""
+        deliv_ai = inst_details.get("delivery_ai_verification")
+        if isinstance(deliv_ai, dict) and deliv_ai.get("file_sha256"):
+            h = deliv_ai["file_sha256"]
+            key = (h, inst.id, "DELIVERY_PROOF")
+            if key not in seen:
+                seen.add(key)
+                hashes.append({
+                    "file_sha256": h,
+                    "document_type": "DELIVERY_PROOF",
+                    "document_type_label": "Delivery Proof",
+                    "instruction_id": inst.id,
+                    "instruction_serial": inst.serial_number,
+                    "instruction_type": inst_type_str,
+                    "instruction_seq": inst.global_seq_per_lg or inst.id,
+                })
+        reply_ai = inst_details.get("bank_reply_ai_verification")
+        if isinstance(reply_ai, dict) and reply_ai.get("file_sha256"):
+            h = reply_ai["file_sha256"]
+            key = (h, inst.id, "BANK_REPLY")
+            if key not in seen:
+                seen.add(key)
+                hashes.append({
+                    "file_sha256": h,
+                    "document_type": "BANK_REPLY",
+                    "document_type_label": "Bank Reply",
+                    "instruction_id": inst.id,
+                    "instruction_serial": inst.serial_number,
+                    "instruction_type": inst_type_str,
+                    "instruction_seq": inst.global_seq_per_lg or inst.id,
+                })
+
+    try:
+        upload_logs = db.query(models.AuditLog).filter(
+            models.AuditLog.lg_record_id == lg_record.id,
+            models.AuditLog.action_type == "DOCUMENT_UPLOADED",
+        ).all()
+        for log_row in upload_logs:
+            log_details = log_row.details or {}
+            h = log_details.get("file_sha256")
+            if h:
+                doc_type = log_details.get("document_type") or "LGDocument"
+                inst_id = log_details.get("lg_instruction_id")
+                matched_inst = inst_map.get(inst_id) if inst_id else None
+                key = (h, inst_id, doc_type)
+                if key not in seen:
+                    seen.add(key)
+                    hashes.append({
+                        "file_sha256": h,
+                        "document_type": doc_type,
+                        "document_type_label": doc_type.replace("_", " ").title(),
+                        "instruction_id": inst_id,
+                        "instruction_serial": getattr(matched_inst, "serial_number", None),
+                        "instruction_type": getattr(matched_inst, "instruction_type", None),
+                        "instruction_seq": getattr(matched_inst, "global_seq_per_lg", None) or inst_id,
+                    })
+    except Exception:
+        pass
+
+    return hashes
+
+
+def _notify_corporate_admins_of_custody_event(
+    db: Session,
+    customer_id: int,
+    lg_record: Optional[models.LGRecord],
+    content: str,
+    notification_type: str = "LG_CUSTODY_ADMIN_ALERT",
+    actor_user_id: Optional[int] = None,
+    emit_mobile_defect: bool = False,
+) -> None:
+    """
+    Sends an in-app SystemNotification to Corporate Admins of the customer (visible in the
+    Corporate Admin Dashboard) and optionally emits mobile push/smart alert.
+    """
+    try:
+        from app.schemas.all_schemas import SystemNotificationCreate
+        from app.crud.crud import crud_system_notification
+
+        now_utc = datetime.utcnow()
+        link_path = f"/corporate-admin/lg-records/{lg_record.id}" if lg_record else "/corporate-admin/lg-records"
+        notif_in = SystemNotificationCreate(
+            content=content,
+            notification_type=notification_type,
+            target_roles=["CORPORATE_ADMIN"],
+            target_customer_ids=[customer_id],
+            start_date=now_utc - timedelta(minutes=1),
+            end_date=now_utc + timedelta(days=14),
+            is_active=True,
+            link=link_path,
+        )
+        crud_system_notification.create(db, obj_in=notif_in, user_id=actor_user_id or 1)
+    except Exception as sys_notif_err:
+        logger.warning(f"Failed to create SystemNotification for Corporate Admin: {sys_notif_err}")
+
+    if emit_mobile_defect and lg_record:
+        try:
+            from app.services.notifications.lg_custody_service import notify_custody_bank_defect
+            notify_custody_bank_defect(db, lg_record, actor_user_id=actor_user_id)
+        except Exception as mob_err:
+            logger.warning(f"Failed to emit LG_CUSTODY_BANK_DEFECT notification: {mob_err}")
+
+
 @router.post(
     "/lg-records/instructions/{instruction_id}/record-delivery",
-    response_model=LGInstructionOut,
-    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)], # ADDED dependency
-    summary="Record the delivery of an LG instruction to the bank"
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
+    summary="Record the delivery of an LG instruction to the bank with AI verification"
 )
 async def record_instruction_delivery_api(
     instruction_id: int,
-    # FIX: Expect delivery_document_metadata as a Form string, and file as a File
     delivery_date: date = Form(..., description="The date the instruction was physically delivered to the bank."),
     delivery_document_metadata: Optional[str] = Form(None, description="JSON string of optional document metadata."),
     delivery_document_file: Optional[UploadFile] = File(None, description="Optional document proving delivery."),
+    force_override: bool = Form(False, description="Whether to proceed anyway despite AI verification mismatches."),
+    override_reason: Optional[str] = Form(None, description="Reason for proceeding anyway if overridden."),
+    ai_verification_json: Optional[str] = Form(None, description="Cached AI verification result from previous check."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
     request: Request = None
 ):
     """
     Records the delivery details for a specific LG instruction.
-    Allows specifying delivery date and an optional supporting document.
+    Runs AI verification on the uploaded delivery evidence (detecting bank receiving stamp, chronology, bank match, stamp date alignment, and duplicate scan SHA-256).
     """
     client_host = get_client_ip(request) if request else None
 
-    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    # --- ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
     is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
-        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RECORD_DELIVERY # <--- NEW KEY
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RECORD_DELIVERY
     )
     is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
 
@@ -2248,88 +2579,261 @@ async def record_instruction_delivery_api(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Supporting delivery document is mandatory for Recording Delivery as per Corporate Admin settings."
         )
-    # --- END NEW ENFORCEMENT LOGIC ---
 
-    # Manually create the LGInstructionRecordDelivery object
+    db_instruction = db.query(models.LGInstruction).options(
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.instructions),
+    ).filter(
+        models.LGInstruction.id == instruction_id,
+        models.LGInstruction.is_deleted == False
+    ).first()
+
+    if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != end_user_context.customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
+
     file_bytes = None
+    file_sha256 = None
     delivery_document_data = None
+    ai_verification = None
 
-    if delivery_document_file:
-        file_bytes = await delivery_document_file.read()
-
-        if delivery_document_metadata:
-            try:
-                parsed_metadata = json.loads(delivery_document_metadata)
-                # Ensure LGDocumentCreate fields are correctly parsed, and overwrite if needed
-                # CRITICAL FIX: Ensure lg_instruction_id is set from path param, not from parsed metadata
-                delivery_document_data = LGDocumentCreate(
-                    document_type=parsed_metadata.get("document_type", "DELIVERY_PROOF"),
-                    file_name=delivery_document_file.filename,
-                    file_path="", # This will be populated by crud function
-                    mime_type=delivery_document_file.content_type,
-                    lg_instruction_id=instruction_id # FIX: Set lg_instruction_id here from path parameter
-                )
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON for delivery document metadata.")
-        else:
-            # If no metadata string, create default metadata with instruction_id
-            delivery_document_data = LGDocumentCreate(
-                document_type="DELIVERY_PROOF",
-                file_name=delivery_document_file.filename,
-                file_path="",
-                mime_type=delivery_document_file.content_type,
-                lg_instruction_id=instruction_id # FIX: Set lg_instruction_id here from path parameter
-            )
-    
-    delivery_in = LGInstructionRecordDelivery(
-        delivery_date=delivery_date,
-        delivery_document_file=delivery_document_data
-    )
+    if ai_verification_json:
+        try:
+            parsed_ai_ver = json.loads(ai_verification_json)
+            if force_override or (isinstance(parsed_ai_ver, dict) and parsed_ai_ver.get("status") == "verified"):
+                ai_verification = parsed_ai_ver
+        except Exception:
+            pass
 
     try:
-        updated_instruction = await crud_lg_instruction.record_instruction_delivery(
-            db,
-            instruction_id=instruction_id,
-            obj_in=delivery_in,
-            user_id=end_user_context.user_id,
-            customer_id=end_user_context.customer_id,
-            file_content=file_bytes
-        )
-        return updated_instruction
-    except HTTPException as e:
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_RECORD_DELIVERY_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": str(e.detail)}, customer_id=end_user_context.customer_id, lg_record_id=instruction_id)
-        raise
-    except Exception as e:
-        logger.error(f"An unexpected error occurred in record_instruction_delivery_api: {e}", exc_info=True)
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_RECORD_DELIVERY_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=end_user_context.customer_id, lg_record_id=instruction_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred: {e}"
-        )
+        if delivery_document_file:
+            file_bytes = await delivery_document_file.read()
+            if file_bytes:
+                file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+            if delivery_document_metadata:
+                try:
+                    parsed_metadata = json.loads(delivery_document_metadata)
+                    delivery_document_data = LGDocumentCreate(
+                        document_type=parsed_metadata.get("document_type", "DELIVERY_PROOF"),
+                        file_name=delivery_document_file.filename,
+                        file_path="",
+                        mime_type=delivery_document_file.content_type,
+                        lg_instruction_id=instruction_id
+                    )
+                except json.JSONDecodeError:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON for delivery document metadata.")
+            else:
+                delivery_document_data = LGDocumentCreate(
+                    document_type="DELIVERY_PROOF",
+                    file_name=delivery_document_file.filename,
+                    file_path="",
+                    mime_type=delivery_document_file.content_type,
+                    lg_instruction_id=instruction_id
+                )
+
+            # Run AI Verification on Delivery Proof (unless already cached or force_override)
+            if not ai_verification and not force_override:
+                try:
+                    raw_text = document_verification_service.extract_text(
+                        file_bytes, delivery_document_file.content_type, delivery_document_file.filename
+                    )
+                    issuing_bank = db_instruction.lg_record.issuing_bank if db_instruction.lg_record else None
+                    expected_bank = issuing_bank.name if issuing_bank else ""
+                    expected_short = issuing_bank.short_name if issuing_bank else None
+                    inst_date = db_instruction.instruction_date.date() if db_instruction.instruction_date else date.today()
+                    existing_hashes = _collect_lg_document_hashes(db, db_instruction.lg_record)
+                    alt_bank_names = _collect_alternate_bank_names(db_instruction.lg_record)
+
+                    ai_verification = document_verification_service.verify_delivery_evidence(
+                        raw_text=raw_text,
+                        expected_bank_name=expected_bank,
+                        expected_bank_short_name=expected_short,
+                        instruction_issue_date=inst_date,
+                        instruction_serial=db_instruction.serial_number,
+                        lg_number=db_instruction.lg_record.lg_number if db_instruction.lg_record else "",
+                        user_delivery_date=delivery_date,
+                        file_sha256=file_sha256,
+                        existing_doc_hashes=existing_hashes,
+                        alternate_bank_names=alt_bank_names,
+                    )
+
+                    if ai_verification.get("status") == "mismatch":
+                        logger.info(f"AI Delivery Verification flagged mismatch for instruction {instruction_id}: {ai_verification['mismatches']}")
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content={
+                                "status": "mismatch",
+                                "ai_verification": ai_verification,
+                                "delivery_date_variance": ai_verification.get("delivery_date_variance"),
+                                "detected_stamp_date": ai_verification.get("detected_stamp_date"),
+                                "duplicate_scan_detected": ai_verification.get("duplicate_scan_detected"),
+                                "instruction_id": instruction_id,
+                                "message": "AI verification detected discrepancies in the delivery document. Please review."
+                            }
+                        )
+                except Exception as ai_err:
+                    logger.warning(f"Delivery AI verification exception (bypassing): {ai_err}")
+
+        try:
+            delivery_in = LGInstructionRecordDelivery(
+                delivery_date=delivery_date,
+                delivery_document_file=delivery_document_data
+            )
+        except ValueError as ve:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid delivery date ({delivery_date}): Delivery date cannot be in the future."
+            )
+
+        try:
+            updated_instruction = await crud_lg_instruction.record_instruction_delivery(
+                db,
+                instruction_id=instruction_id,
+                obj_in=delivery_in,
+                user_id=end_user_context.user_id,
+                customer_id=end_user_context.customer_id,
+                file_content=file_bytes
+            )
+
+            details = dict(updated_instruction.details or {})
+            if ai_verification:
+                if file_sha256 and not ai_verification.get("file_sha256"):
+                    ai_verification["file_sha256"] = file_sha256
+                details["delivery_ai_verification"] = ai_verification
+                if ai_verification.get("detected_stamp_date"):
+                    details["detected_stamp_date"] = ai_verification["detected_stamp_date"]
+            elif file_sha256:
+                details["delivery_ai_verification"] = {"file_sha256": file_sha256}
+            if force_override:
+                details["delivery_override"] = {
+                    "status": "OVERRIDDEN_BY_USER",
+                    "reason": override_reason or "User proceeded despite AI mismatch",
+                    "user_id": end_user_context.user_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                log_action(
+                    db,
+                    user_id=end_user_context.user_id,
+                    action_type="LG_RECORD_DELIVERY_OVERRIDDEN",
+                    entity_type="LGInstruction",
+                    entity_id=instruction_id,
+                    details={
+                        "lg_number": db_instruction.lg_record.lg_number,
+                        "serial_number": db_instruction.serial_number,
+                        "override_reason": override_reason or "User proceeded despite AI mismatch",
+                        "delivery_date": str(delivery_date)
+                    },
+                    customer_id=end_user_context.customer_id,
+                    lg_record_id=db_instruction.lg_record.id,
+                )
+                _notify_corporate_admins_of_custody_event(
+                    db=db,
+                    customer_id=end_user_context.customer_id,
+                    lg_record=db_instruction.lg_record,
+                    content=(
+                        f"AI Verification Override on Delivery: End User recorded delivery for LG "
+                        f"{db_instruction.lg_record.lg_number} (Instruction {db_instruction.serial_number}) "
+                        f"with override note: '{override_reason or 'User proceeded despite AI mismatch'}'."
+                    ),
+                    notification_type="LG_DELIVERY_AI_OVERRIDDEN",
+                    actor_user_id=end_user_context.user_id,
+                    emit_mobile_defect=True,
+                )
+            updated_instruction.details = details
+            db.add(updated_instruction)
+            db.commit()
+            db.refresh(updated_instruction)
+
+            return LGInstructionOut.model_validate(updated_instruction)
+        except HTTPException as e:
+            log_action(db, user_id=end_user_context.user_id, action_type="LG_RECORD_DELIVERY_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": str(e.detail)}, customer_id=end_user_context.customer_id, lg_record_id=db_instruction.lg_record_id if db_instruction else None)
+            raise
+        except Exception as e:
+            logger.error(f"An unexpected error occurred in record_instruction_delivery_api: {e}", exc_info=True)
+            log_action(db, user_id=end_user_context.user_id, action_type="LG_RECORD_DELIVERY_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=end_user_context.customer_id, lg_record_id=db_instruction.lg_record_id if db_instruction else None)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"An unexpected error occurred: {e}"
+            )
+    finally:
+        del file_bytes
+        import gc
+        gc.collect()
+
+
+@router.post(
+    "/lg-records/instructions/{instruction_id}/confirm-delivery",
+    response_model=LGInstructionOut,
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
+    summary="Confirm delivery of an LG instruction following AI verification review (Proceed Anyway)"
+)
+async def confirm_instruction_delivery_api(
+    instruction_id: int,
+    override_reason: Optional[str] = Form(None, description="Reason for proceeding despite AI discrepancies."),
+    delivery_date: Optional[date] = Form(None),
+    delivery_document_metadata: Optional[str] = Form(None),
+    delivery_document_file: Optional[UploadFile] = File(None),
+    ai_verification_json: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+    request: Request = None
+):
+    """Maker/Checker confirms delivery despite AI verification mismatches (Proceed Anyway) - saves attached file."""
+    return await record_instruction_delivery_api(
+        instruction_id=instruction_id,
+        delivery_date=delivery_date or date.today(),
+        delivery_document_metadata=delivery_document_metadata,
+        delivery_document_file=delivery_document_file,
+        force_override=True,
+        override_reason=override_reason or "User confirmed delivery despite AI discrepancies",
+        ai_verification_json=ai_verification_json,
+        db=db,
+        end_user_context=end_user_context,
+        request=request
+    )
+
+
+@router.post(
+    "/lg-records/instructions/{instruction_id}/cancel-delivery",
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
+    summary="Cancel pending delivery recording to re-upload document"
+)
+async def cancel_instruction_delivery_api(
+    instruction_id: int,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    return {"status": "cancelled", "instruction_id": instruction_id, "message": "Delivery recording cancelled. You can re-upload."}
 
 # IMPORTANT: Apply similar changes to record_bank_reply_api as well
 @router.post(
     "/lg-records/instructions/{instruction_id}/record-bank-reply",
-    response_model=LGInstructionOut,
-    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)], # ADDED dependency
-    summary="Record the bank's reply to an LG instruction"
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
+    summary="Record the bank's reply to an LG instruction with AI verification, calendar tolerance alignment, multi-instruction disambiguation, and Maker-Checker admin terms approval"
 )
 async def record_bank_reply_api(
     instruction_id: int,
     bank_reply_date: date = Form(..., description="The date the bank's reply was received."),
     reply_details: Optional[str] = Form(None, description="Details or notes from the bank's reply."),
-    bank_reply_document_metadata: Optional[str] = Form(None, description="JSON string of optional document metadata."), # NEW PARAM
+    bank_reply_document_metadata: Optional[str] = Form(None, description="JSON string of optional document metadata."),
     bank_reply_document_file: Optional[UploadFile] = File(None, description="Optional document proving the bank's reply."),
+    force_override: bool = Form(False, description="Whether to proceed anyway despite AI verification mismatches."),
+    override_reason: Optional[str] = Form(None, description="Reason for proceeding anyway if overridden."),
+    ai_verification_json: Optional[str] = Form(None, description="Cached AI verification result from previous check."),
+    accept_date_alignment: bool = Form(False, description="Whether the user accepted aligning LG expiry date to the bank's confirmed date (DATE_CONVENTION_VARIANCE)."),
+    aligned_expiry_date: Optional[date] = Form(None, description="The bank-confirmed expiry date accepted by the user."),
+    switched_from_instruction_id: Optional[int] = Form(None, description="Original instruction ID if redirected via 1-click multi-instruction disambiguation."),
+    request_admin_terms_approval: bool = Form(False, description="Whether the user is submitting bank-modified terms (>3 days date variance or amount difference) for Corporate Admin Maker-Checker approval."),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
     request: Request = None
 ):
     client_host = get_client_ip(request) if request else None
 
-
-    # --- NEW ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
+    # --- ENFORCEMENT LOGIC: Check if supporting document is mandatory ---
     is_doc_mandatory_config = crud_customer_configuration.get_customer_config_or_global_fallback(
-        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RECORD_BANK_REPLY # <--- NEW KEY
+        db, end_user_context.customer_id, GlobalConfigKey.DOC_MANDATORY_RECORD_BANK_REPLY
     )
     is_doc_mandatory = is_doc_mandatory_config.get('effective_value', 'False').lower() == 'true'
 
@@ -2338,61 +2842,516 @@ async def record_bank_reply_api(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Supporting bank reply document is mandatory for Recording Bank Reply as per Corporate Admin settings."
         )
-    # --- END NEW ENFORCEMENT LOGIC ---
+
+    db_instruction = db.query(models.LGInstruction).options(
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.instructions),
+    ).filter(
+        models.LGInstruction.id == instruction_id,
+        models.LGInstruction.is_deleted == False
+    ).first()
+
+    if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != end_user_context.customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
 
     file_bytes = None
+    file_sha256 = None
     bank_reply_document_data = None
+    ai_verification = None
 
-    if bank_reply_document_file:
-        file_bytes = await bank_reply_document_file.read()
+    if ai_verification_json:
+        try:
+            parsed_ai = json.loads(ai_verification_json)
+            if (
+                force_override
+                or accept_date_alignment
+                or request_admin_terms_approval
+                or switched_from_instruction_id is not None
+                or parsed_ai.get("status") == "verified"
+            ):
+                ai_verification = parsed_ai
+        except Exception:
+            pass
 
-        if bank_reply_document_metadata:
-            try:
-                parsed_metadata = json.loads(bank_reply_document_metadata)
+    try:
+        if bank_reply_document_file:
+            file_bytes = await bank_reply_document_file.read()
+            if file_bytes:
+                file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+            if bank_reply_document_metadata:
+                try:
+                    parsed_metadata = json.loads(bank_reply_document_metadata)
+                    bank_reply_document_data = LGDocumentCreate(
+                        document_type=parsed_metadata.get("document_type", "BANK_REPLY"),
+                        file_name=bank_reply_document_file.filename,
+                        file_path="",
+                        mime_type=bank_reply_document_file.content_type,
+                        lg_instruction_id=instruction_id
+                    )
+                except json.JSONDecodeError:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON for bank reply document metadata.")
+            else:
                 bank_reply_document_data = LGDocumentCreate(
-                    document_type=parsed_metadata.get("document_type", "BANK_REPLY"),
+                    document_type="BANK_REPLY",
                     file_name=bank_reply_document_file.filename,
                     file_path="",
                     mime_type=bank_reply_document_file.content_type,
-                    lg_instruction_id=instruction_id # FIX: Set lg_instruction_id here from path parameter
+                    lg_instruction_id=instruction_id
                 )
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON for bank reply document metadata.")
-        else:
-            bank_reply_document_data = LGDocumentCreate(
-                document_type="BANK_REPLY",
-                file_name=bank_reply_document_file.filename,
-                file_path="",
-                mime_type=bank_reply_document_file.content_type,
-                lg_instruction_id=instruction_id # FIX: Set lg_instruction_id here from path parameter
+
+            # Run AI Verification on Bank Reply (unless already cached via override, date alignment, or admin terms approval submission)
+            if not ai_verification and not force_override and not accept_date_alignment and not request_admin_terms_approval:
+                try:
+                    raw_text = document_verification_service.extract_text(
+                        file_bytes, bank_reply_document_file.content_type, bank_reply_document_file.filename
+                    )
+                    issuing_bank = db_instruction.lg_record.issuing_bank if db_instruction.lg_record else None
+                    expected_bank = issuing_bank.name if issuing_bank else ""
+                    expected_short = issuing_bank.short_name if issuing_bank else None
+
+                    inst_details = db_instruction.details or {}
+                    exp_new_expiry = (
+                        inst_details.get("new_expiry_date")
+                        or inst_details.get("requested_expiry_date")
+                        or (
+                            db_instruction.lg_record.expiry_date.date().isoformat()
+                            if db_instruction.lg_record and db_instruction.lg_record.expiry_date
+                            else None
+                        )
+                    )
+                    exp_new_amount = (
+                        inst_details.get("new_amount")
+                        or inst_details.get("new_lg_amount")
+                        or inst_details.get("requested_amount")
+                    )
+                    if exp_new_amount is not None:
+                        try:
+                            exp_new_amount = float(exp_new_amount)
+                        except Exception:
+                            exp_new_amount = None
+
+                    # Gather all pending/open instructions on this LG for Multi-Instruction Disambiguation (Item 2)
+                    def _serialize_inst_for_ai(inst_obj: models.LGInstruction) -> Dict[str, Any]:
+                        return {
+                            "id": inst_obj.id,
+                            "serial_number": inst_obj.serial_number,
+                            "instruction_type": inst_obj.instruction_type,
+                            "global_seq_per_lg": inst_obj.global_seq_per_lg,
+                            "type_seq_per_lg": inst_obj.type_seq_per_lg,
+                            "status": inst_obj.status,
+                            "instruction_date": inst_obj.instruction_date.date().isoformat() if inst_obj.instruction_date else None,
+                            "delivery_date": inst_obj.delivery_date.date().isoformat() if inst_obj.delivery_date else None,
+                            "details": inst_obj.details or {},
+                        }
+
+                    open_instructions = [
+                        i for i in (db_instruction.lg_record.instructions or [])
+                        if not i.is_deleted
+                        and i.status not in ("Canceled", "Confirmed by Bank")
+                        and i.bank_reply_date is None
+                    ]
+                    open_instructions.sort(key=lambda x: (x.global_seq_per_lg or 0, x.id or 0))
+                    pending_inst_dicts = [_serialize_inst_for_ai(i) for i in open_instructions]
+                    target_inst_dict = _serialize_inst_for_ai(db_instruction)
+                    existing_hashes = _collect_lg_document_hashes(db, db_instruction.lg_record)
+                    alt_bank_names = _collect_alternate_bank_names(db_instruction.lg_record)
+
+                    ai_verification = document_verification_service.verify_bank_reply(
+                        raw_text=raw_text,
+                        expected_bank_name=expected_bank,
+                        expected_bank_short_name=expected_short,
+                        action_type=db_instruction.instruction_type,
+                        expected_new_expiry=exp_new_expiry,
+                        expected_new_amount=exp_new_amount,
+                        lg_number=db_instruction.lg_record.lg_number if db_instruction.lg_record else "",
+                        target_instruction=target_inst_dict,
+                        pending_instructions=pending_inst_dicts,
+                        user_reply_date=bank_reply_date,
+                        file_sha256=file_sha256,
+                        existing_doc_hashes=existing_hashes,
+                        alternate_bank_names=alt_bank_names,
+                    )
+
+                    if ai_verification.get("status") == "date_variance":
+                        variance_info = ai_verification.get("date_convention_variance") or {}
+                        logger.info(
+                            f"AI Bank Reply Verification detected DATE_CONVENTION_VARIANCE for instruction {instruction_id}: "
+                            f"{variance_info.get('prompt_message')}"
+                        )
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content={
+                                "status": "date_variance",
+                                "ai_verification": ai_verification,
+                                "date_convention_variance": variance_info,
+                                "bank_reply_letter_date": ai_verification.get("bank_reply_letter_date"),
+                                "instruction_id": instruction_id,
+                                "message": variance_info.get("prompt_message") or "Bank confirmed expiry date with minor calendar convention variance.",
+                            }
+                        )
+
+                    if ai_verification.get("status") == "mismatch":
+                        disambig_info = ai_verification.get("instruction_disambiguation")
+                        mod_info = ai_verification.get("bank_terms_modification")
+                        logger.info(f"AI Bank Reply Verification flagged mismatch for instruction {instruction_id}: {ai_verification['mismatches']}")
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content={
+                                "status": "mismatch",
+                                "ai_verification": ai_verification,
+                                "date_convention_variance": ai_verification.get("date_convention_variance"),
+                                "instruction_disambiguation": disambig_info,
+                                "bank_terms_modification": mod_info,
+                                "bank_reply_letter_date": ai_verification.get("bank_reply_letter_date"),
+                                "duplicate_scan_detected": ai_verification.get("duplicate_scan_detected"),
+                                "instruction_id": instruction_id,
+                                "message": (
+                                    disambig_info["prompt_message"]
+                                    if disambig_info
+                                    else "AI verification detected discrepancies in the bank reply document. Please review."
+                                )
+                            }
+                        )
+                except Exception as ai_err:
+                    logger.warning(f"Bank reply AI verification exception (bypassing): {ai_err}")
+
+        if (
+            ai_verification
+            and ai_verification.get("bank_terms_modification")
+            and not ai_verification.get("instruction_disambiguation")
+            and force_override
+            and not request_admin_terms_approval
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Bank-modified core terms require Corporate Admin approval and cannot be overridden directly."
             )
 
-    bank_reply_in = LGInstructionRecordBankReply(
-        bank_reply_date=bank_reply_date,
+        try:
+            bank_reply_in = LGInstructionRecordBankReply(
+                bank_reply_date=bank_reply_date,
+                reply_details=reply_details,
+                bank_reply_document_file=bank_reply_document_data
+            )
+        except ValueError as ve:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid bank reply date ({bank_reply_date}): Bank reply date cannot be in the future."
+            )
+
+        try:
+            updated_instruction = await crud_lg_instruction.record_bank_reply(
+                db,
+                instruction_id=instruction_id,
+                obj_in=bank_reply_in,
+                user_id=end_user_context.user_id,
+                customer_id=end_user_context.customer_id,
+                file_content=file_bytes
+            )
+
+            details = dict(updated_instruction.details or {})
+            if ai_verification:
+                if file_sha256 and not ai_verification.get("file_sha256"):
+                    ai_verification["file_sha256"] = file_sha256
+                details["bank_reply_ai_verification"] = ai_verification
+                letter_dt = (
+                    ai_verification.get("bank_reply_letter_date")
+                    or (ai_verification.get("extracted_data") or {}).get("cited_effective_date")
+                )
+                if letter_dt:
+                    details["bank_reply_letter_date"] = letter_dt
+            elif file_sha256:
+                details["bank_reply_ai_verification"] = {"file_sha256": file_sha256}
+
+            # Item 1: User Accepted Bank Expiry Date Tolerance Alignment
+            if accept_date_alignment:
+                variance_obj = (ai_verification or {}).get("date_convention_variance") or {}
+                confirmed_date_val = aligned_expiry_date
+                if not confirmed_date_val:
+                    raw_confirmed = (
+                        variance_obj.get("bank_confirmed_expiry_date")
+                        or (ai_verification or {}).get("extracted_data", {}).get("amended_expiry_date")
+                    )
+                    if raw_confirmed:
+                        try:
+                            confirmed_date_val = datetime.strptime(str(raw_confirmed)[:10], "%Y-%m-%d").date()
+                        except Exception:
+                            confirmed_date_val = None
+
+                if confirmed_date_val and updated_instruction.lg_record:
+                    lg_rec = updated_instruction.lg_record
+                    requested_expiry_str = (
+                        variance_obj.get("requested_expiry_date")
+                        or details.get("new_expiry_date")
+                        or (lg_rec.expiry_date.date().isoformat() if lg_rec.expiry_date else None)
+                    )
+                    lg_rec.expiry_date = datetime.combine(confirmed_date_val, datetime.min.time())
+                    db.add(lg_rec)
+
+                    var_days = variance_obj.get("variance_days")
+                    is_favorable_further = bool(var_days is not None and int(var_days) > 3)
+                    classification_str = "FAVORABLE_EXTENDED_EXPIRY" if is_favorable_further else "DATE_CONVENTION_VARIANCE"
+
+                    details["date_convention_alignment"] = {
+                        "classification": classification_str,
+                        "status": "ACCEPTED_BY_USER",
+                        "requested_expiry_date": requested_expiry_str,
+                        "previous_expiry_date": requested_expiry_str,
+                        "bank_confirmed_expiry_date": confirmed_date_val.isoformat(),
+                        "aligned_expiry_date": confirmed_date_val.isoformat(),
+                        "variance_days": var_days,
+                        "user_id": end_user_context.user_id,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    details["new_expiry_date"] = confirmed_date_val.isoformat()
+                    if isinstance(details.get("bank_reply_ai_verification"), dict):
+                        details["bank_reply_ai_verification"]["status"] = "verified"
+
+                    log_action(
+                        db,
+                        user_id=end_user_context.user_id,
+                        action_type="LG_EXPIRY_ALIGNED_TO_BANK_CONVENTION",
+                        entity_type="LGRecord",
+                        entity_id=lg_rec.id,
+                        details={
+                            "lg_number": lg_rec.lg_number,
+                            "instruction_id": instruction_id,
+                            "instruction_serial": updated_instruction.serial_number,
+                            "requested_expiry_date": requested_expiry_str,
+                            "bank_confirmed_expiry_date": confirmed_date_val.isoformat(),
+                            "variance_days": var_days,
+                            "classification": classification_str,
+                            "user_accepted_alignment": True,
+                        },
+                        customer_id=end_user_context.customer_id,
+                        lg_record_id=lg_rec.id,
+                    )
+                    if is_favorable_further:
+                        _notify_corporate_admins_of_custody_event(
+                            db=db,
+                            customer_id=end_user_context.customer_id,
+                            lg_record=lg_rec,
+                            content=(
+                                f"Favorable Extended Expiry Accepted: End User aligned LG {lg_rec.lg_number} "
+                                f"(Instruction {updated_instruction.serial_number}) to bank's further expiry date "
+                                f"{confirmed_date_val.isoformat()} (+{var_days} days extra coverage beyond {requested_expiry_str})."
+                            ),
+                            notification_type="LG_FAVORABLE_EXPIRY_ALIGNED",
+                            actor_user_id=end_user_context.user_id,
+                            emit_mobile_defect=False,
+                        )
+
+            # Enhancement A: Submit Bank-Modified Terms (>3 days date variance or amount difference) for Corporate Admin Maker-Checker Approval
+            if request_admin_terms_approval and updated_instruction.lg_record:
+                mod_obj = (ai_verification or {}).get("bank_terms_modification") or {}
+                amendment_details = dict(mod_obj.get("amendment_details") or {})
+                if not amendment_details:
+                    extracted = (ai_verification or {}).get("extracted_data") or {}
+                    if extracted.get("amended_expiry_date"):
+                        amendment_details["expiry_date"] = str(extracted["amended_expiry_date"])[:10]
+                    if extracted.get("amended_amount") is not None:
+                        try:
+                            amendment_details["lg_amount"] = float(extracted["amended_amount"])
+                        except Exception:
+                            pass
+
+                if amendment_details:
+                    reply_doc = db.query(models.LGDocument).filter(
+                        models.LGDocument.lg_instruction_id == instruction_id,
+                        models.LGDocument.document_type == "BANK_REPLY",
+                        models.LGDocument.is_deleted == False,
+                    ).order_by(models.LGDocument.id.desc()).first()
+
+                    lg_rec_full = (
+                        crud_lg_record.get_lg_record_with_relations(
+                            db, db_instruction.lg_record_id, end_user_context.customer_id
+                        )
+                        or updated_instruction.lg_record
+                    )
+                    lg_snapshot = crud_approval_request._get_lg_record_snapshot(lg_rec_full)
+                    approval_reason = (
+                        override_reason
+                        or mod_obj.get("prompt_message")
+                        or f"Sync LG terms to bank's actual reply on Instruction {updated_instruction.serial_number}"
+                    )
+                    approval_request_in = ApprovalRequestCreate(
+                        entity_type="LGRecord",
+                        entity_id=db_instruction.lg_record_id,
+                        action_type=ACTION_TYPE_LG_AMEND,
+                        request_details={
+                            "amendment_details": amendment_details,
+                            "reason": approval_reason,
+                            "amendment_document_id": reply_doc.id if reply_doc else None,
+                            "source_instruction_id": instruction_id,
+                            "source_instruction_serial": updated_instruction.serial_number,
+                            "classification": "BANK_MODIFIED_TERMS_APPROVAL_REQUIRED",
+                        },
+                        lg_record_snapshot=lg_snapshot,
+                    )
+                    db_approval_request = await crud_approval_request.create_approval_request(
+                        db,
+                        approval_request_in,
+                        end_user_context.user_id,
+                        end_user_context.customer_id,
+                        lg_record=lg_rec_full,
+                    )
+                    details["bank_terms_admin_approval"] = {
+                        "status": "PENDING_ADMIN_APPROVAL",
+                        "approval_request_id": db_approval_request.id,
+                        "amendment_details": amendment_details,
+                        "reason": approval_reason,
+                        "requested_by_user_id": end_user_context.user_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+
+            # Item 2: Audit Trail for 1-Click Multi-Instruction Disambiguation Redirection
+            if switched_from_instruction_id and switched_from_instruction_id != instruction_id:
+                details["disambiguation_redirect"] = {
+                    "switched_from_instruction_id": switched_from_instruction_id,
+                    "matched_instruction_id": instruction_id,
+                    "user_id": end_user_context.user_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                log_action(
+                    db,
+                    user_id=end_user_context.user_id,
+                    action_type="LG_BANK_REPLY_REDIRECTED_BY_AI",
+                    entity_type="LGInstruction",
+                    entity_id=instruction_id,
+                    details={
+                        "lg_number": updated_instruction.lg_record.lg_number if updated_instruction.lg_record else None,
+                        "switched_from_instruction_id": switched_from_instruction_id,
+                        "target_instruction_id": instruction_id,
+                        "instruction_serial": updated_instruction.serial_number,
+                    },
+                    customer_id=end_user_context.customer_id,
+                    lg_record_id=updated_instruction.lg_record.id if updated_instruction.lg_record else None,
+                )
+
+            if force_override:
+                details["bank_reply_override"] = {
+                    "status": "OVERRIDDEN_BY_USER",
+                    "reason": override_reason or "User proceeded despite AI mismatch",
+                    "user_id": end_user_context.user_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                log_action(
+                    db,
+                    user_id=end_user_context.user_id,
+                    action_type="LG_BANK_REPLY_OVERRIDDEN",
+                    entity_type="LGInstruction",
+                    entity_id=instruction_id,
+                    details={
+                        "lg_number": updated_instruction.lg_record.lg_number if updated_instruction.lg_record else None,
+                        "serial_number": updated_instruction.serial_number,
+                        "override_reason": override_reason or "User proceeded despite AI mismatch",
+                        "bank_reply_date": str(bank_reply_date)
+                    },
+                    customer_id=end_user_context.customer_id,
+                    lg_record_id=updated_instruction.lg_record.id if updated_instruction.lg_record else None,
+                )
+                _notify_corporate_admins_of_custody_event(
+                    db=db,
+                    customer_id=end_user_context.customer_id,
+                    lg_record=updated_instruction.lg_record,
+                    content=(
+                        f"AI Verification Override on Bank Reply: End User recorded bank reply for LG "
+                        f"{updated_instruction.lg_record.lg_number if updated_instruction.lg_record else 'N/A'} "
+                        f"(Instruction {updated_instruction.serial_number}) with override note: "
+                        f"'{override_reason or 'User proceeded despite AI mismatch'}'."
+                    ),
+                    notification_type="LG_BANK_REPLY_AI_OVERRIDDEN",
+                    actor_user_id=end_user_context.user_id,
+                    emit_mobile_defect=True,
+                )
+
+            if not request_admin_terms_approval and isinstance(details.get("bank_terms_admin_approval"), dict):
+                prev_admin_approval = details["bank_terms_admin_approval"]
+                if prev_admin_approval.get("status") == "REJECTED_BY_ADMIN":
+                    details["bank_terms_admin_approval"] = {
+                        **prev_admin_approval,
+                        "status": "RESOLVED_BY_CORRECTED_REPLY",
+                        "resolved_at": datetime.utcnow().isoformat(),
+                        "discrepancy_letter_ready": False,
+                    }
+
+            updated_instruction.details = details
+            db.add(updated_instruction)
+            db.commit()
+            db.refresh(updated_instruction)
+
+            return LGInstructionOut.model_validate(updated_instruction)
+        except HTTPException as e:
+            log_action(db, user_id=end_user_context.user_id, action_type="LG_BANK_REPLY_RECORDED_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": str(e.detail)}, customer_id=end_user_context.customer_id, lg_record_id=db_instruction.lg_record_id if db_instruction else None)
+            raise
+        except Exception as e:
+            logger.error(f"An unexpected error occurred in record_bank_reply_api: {e}", exc_info=True)
+            log_action(db, user_id=end_user_context.user_id, action_type="LG_BANK_REPLY_RECORDED_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=end_user_context.customer_id, lg_record_id=db_instruction.lg_record_id if db_instruction else None)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"An unexpected error occurred: {e}"
+            )
+    finally:
+        del file_bytes
+        import gc
+        gc.collect()
+
+
+@router.post(
+    "/lg-records/instructions/{instruction_id}/confirm-bank-reply",
+    response_model=LGInstructionOut,
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
+    summary="Confirm bank reply for an LG instruction following AI verification review (Proceed Anyway)"
+)
+async def confirm_bank_reply_api(
+    instruction_id: int,
+    override_reason: Optional[str] = Form(None, description="Reason for proceeding despite AI discrepancies."),
+    bank_reply_date: Optional[date] = Form(None),
+    reply_details: Optional[str] = Form(None),
+    bank_reply_document_metadata: Optional[str] = Form(None),
+    bank_reply_document_file: Optional[UploadFile] = File(None),
+    ai_verification_json: Optional[str] = Form(None),
+    accept_date_alignment: bool = Form(False),
+    aligned_expiry_date: Optional[date] = Form(None),
+    switched_from_instruction_id: Optional[int] = Form(None),
+    request_admin_terms_approval: bool = Form(False),
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+    request: Request = None
+):
+    """Maker/Checker confirms bank reply despite AI verification mismatches (Proceed Anyway) - saves attached file."""
+    return await record_bank_reply_api(
+        instruction_id=instruction_id,
+        bank_reply_date=bank_reply_date or date.today(),
         reply_details=reply_details,
-        bank_reply_document_file=bank_reply_document_data
+        bank_reply_document_metadata=bank_reply_document_metadata,
+        bank_reply_document_file=bank_reply_document_file,
+        force_override=not accept_date_alignment and not request_admin_terms_approval,
+        override_reason=override_reason or "User confirmed bank reply despite AI discrepancies",
+        ai_verification_json=ai_verification_json,
+        accept_date_alignment=accept_date_alignment,
+        aligned_expiry_date=aligned_expiry_date,
+        switched_from_instruction_id=switched_from_instruction_id,
+        request_admin_terms_approval=request_admin_terms_approval,
+        db=db,
+        end_user_context=end_user_context,
+        request=request
     )
 
-    try:
-        updated_instruction = await crud_lg_instruction.record_bank_reply(
-            db,
-            instruction_id=instruction_id,
-            obj_in=bank_reply_in,
-            user_id=end_user_context.user_id,
-            customer_id=end_user_context.customer_id,
-            file_content=file_bytes
-        )
-        return updated_instruction
-    except HTTPException as e:
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_BANK_REPLY_RECORDED_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": str(e.detail)}, customer_id=end_user_context.customer_id, lg_record_id=instruction_id)
-        raise
-    except Exception as e:
-        logger.error(f"An unexpected error occurred in record_bank_reply_api: {e}", exc_info=True)
-        log_action(db, user_id=end_user_context.user_id, action_type="LG_BANK_REPLY_RECORDED_FAILED", entity_type="LGInstruction", entity_id=instruction_id, details={"reason": f"An unexpected error occurred: {e}"}, customer_id=end_user_context.customer_id, lg_record_id=instruction_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred: {e}"
-        )
+
+@router.post(
+    "/lg-records/instructions/{instruction_id}/cancel-bank-reply",
+    dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
+    summary="Cancel pending bank reply recording to re-upload document"
+)
+async def cancel_bank_reply_api(
+    instruction_id: int,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    return {"status": "cancelled", "instruction_id": instruction_id, "message": "Bank reply recording cancelled. You can re-upload."}
 
 # NEW ENDPOINT: Maker withdraws pending approval request
 @router.post(
@@ -2470,7 +3429,8 @@ async def view_lg_instruction_letter(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:view_own")),
     end_user_context: TokenData = Depends(get_current_end_user_context),
-    print_flag: bool = Query(False, alias="print", description="If true, attempts to trigger print dialog.")
+    print_flag: bool = Query(False, alias="print", description="If true, attempts to trigger print dialog."),
+    raw_pdf: bool = Query(False, description="If true, streams raw PDF bytes without HTML print toolbar.")
 ):
     """
     Generates and returns an LG Instruction letter as a PDF for viewing or printing.
@@ -2559,39 +3519,316 @@ async def view_lg_instruction_letter(
         logger.error(f"Exception during PDF generation for instruction ID {instruction_id}: {e}", exc_info=True)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate PDF document due to an internal error: {e}")
 
-    if print_flag:
-        import base64
-        pdf_base64 = base64.b64encode(generated_pdf_bytes).decode('utf-8')
-
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Print LG Instruction</title>
-            <style>
-                body {{ margin: 0; overflow: hidden; }}
-                embed {{ width: 100vw; height: 100vh; border: none; }}
-            </style>
-        </head>
-        <body>
-            <embed src="data:application/pdf;base64,{pdf_base64}" type="application/pdf" width="100%" height="100%">
-            <script>
-                window.onload = function() {{
-                    setTimeout(function() {{
-                        window.print();
-                        # window.close(); // Automatically close the new window/tab after printing
-                    }}, 500);
-                }};
-            </script>
-        </body>
-        </html>
-        """
-        logger.info(f"Returning HTML response to trigger print dialog for instruction ID {instruction_id}.")
-        return HTMLResponse(content=html_content, status_code=status.HTTP_200_OK)
-    else:
+    if raw_pdf:
         headers = {'Content-Disposition': f'inline; filename="{db_instruction.serial_number}.pdf"'}
-        logger.info(f"Successfully generated and streaming PDF for instruction ID {instruction_id}.")
+        logger.info(f"Successfully generated and streaming raw PDF for instruction ID {instruction_id}.")
         return StreamingResponse(io.BytesIO(generated_pdf_bytes), media_type="application/pdf", headers=headers)
+
+    import base64
+    pdf_base64 = base64.b64encode(generated_pdf_bytes).decode('utf-8')
+    lg_num_display = lg_record_for_template.lg_number if lg_record_for_template else "N/A"
+    action_label = (db_instruction.instruction_type or "Instruction").replace("LG_", "").replace("_", " ").title()
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Instruction Letter - {db_instruction.serial_number}</title>
+        <style>
+            body {{ margin: 0; padding: 0; overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif; background: #1e293b; }}
+            .toolbar {{ background: #1e293b; color: white; height: 54px; padding: 0 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; box-sizing: border-box; }}
+            .toolbar-actions {{ display: flex; gap: 10px; align-items: center; }}
+            .btn-print {{ background: #e11d48; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }}
+            .btn-print:hover {{ background: #be123c; }}
+            .btn-download {{ background: #334155; color: #f8fafc; border: 1px solid #475569; padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; text-decoration: none; }}
+            .btn-download:hover {{ background: #475569; }}
+            #pdfFrame {{ width: 100vw; height: calc(100vh - 54px); border: none; background: #f3f4f6; display: block; }}
+            @media print {{
+                .toolbar {{ display: none !important; }}
+                #pdfFrame {{ height: 100vh; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="toolbar">
+            <div style="font-size: 14px;">
+                <strong>Bank Instruction Letter ({action_label})</strong> — LG: {lg_num_display} (Instruction: {db_instruction.serial_number})
+            </div>
+            <div class="toolbar-actions">
+                <a id="downloadLink" class="btn-download" download="{db_instruction.serial_number}.pdf">⬇️ Download PDF</a>
+                <button class="btn-print" onclick="triggerPrint()">🖨️ Print Instruction Letter</button>
+            </div>
+        </div>
+        <iframe id="pdfFrame" title="LG Instruction PDF"></iframe>
+        <script>
+            var b64 = "{pdf_base64}";
+            var bin = atob(b64);
+            var len = bin.length;
+            var bytes = new Uint8Array(len);
+            for (var i = 0; i < len; i++) {{
+                bytes[i] = bin.charCodeAt(i);
+            }}
+            var blob = new Blob([bytes], {{ type: "application/pdf" }});
+            var blobUrl = URL.createObjectURL(blob);
+            var frame = document.getElementById("pdfFrame");
+            frame.src = blobUrl;
+            document.getElementById("downloadLink").href = blobUrl;
+
+            function triggerPrint() {{
+                try {{
+                    if (frame && frame.contentWindow) {{
+                        frame.contentWindow.focus();
+                        frame.contentWindow.print();
+                        return;
+                    }}
+                }} catch (e) {{}}
+                window.print();
+            }}
+            {"window.onload = function() { setTimeout(function() { triggerPrint(); }, 600); };" if print_flag else ""}
+        </script>
+    </body>
+    </html>
+    """
+    logger.info(f"Returning HTML viewer with print toolbar for instruction ID {instruction_id}.")
+    return HTMLResponse(content=html_content, status_code=status.HTTP_200_OK)
+
+
+@router.get(
+    "/lg-records/instructions/{instruction_id}/view-discrepancy-letter",
+    response_class=HTMLResponse,
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
+    summary="Generate and view/print a formal Bank Reply Discrepancy Notice letter after Corporate Admin rejects bank-modified terms"
+)
+async def view_bank_reply_discrepancy_letter(
+    instruction_id: int,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+    print_flag: bool = Query(False, alias="print", description="If true, triggers print dialog."),
+):
+    db_instruction = db.query(models.LGInstruction).options(
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_type),
+    ).filter(
+        models.LGInstruction.id == instruction_id,
+        models.LGInstruction.is_deleted == False,
+    ).first()
+
+    if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != end_user_context.customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
+
+    lg = db_instruction.lg_record
+    inst_details = db_instruction.details or {}
+    approval_info = inst_details.get("bank_terms_admin_approval") or {}
+    amendment_details = approval_info.get("amendment_details") or {}
+    rejection_reason = approval_info.get("rejection_reason") or "Bank-modified terms do not match the corporate instruction."
+
+    bank_name = lg.issuing_bank.name if lg.issuing_bank else (lg.foreign_bank_name or "Issuing Bank")
+    bank_address = lg.issuing_bank.address if lg.issuing_bank and getattr(lg.issuing_bank, "address", None) else "Trade Finance / Letter of Guarantee Department"
+    customer_name = (
+        lg.beneficiary_corporate.entity_name
+        if lg.beneficiary_corporate and getattr(lg.beneficiary_corporate, "entity_name", None)
+        else (lg.customer.name if lg.customer else "Corporate Treasury")
+    )
+    def _fmt_full_date(val: Any, fallback: str = "N/A") -> str:
+        if not val:
+            return fallback
+        if hasattr(val, "strftime"):
+            return val.strftime("%B %d, %Y")
+        s = str(val).strip()
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(s[:10] if fmt.startswith("%Y") or fmt.startswith("%d") else s, fmt).strftime("%B %d, %Y")
+            except Exception:
+                continue
+        return s
+
+    currency_code = lg.lg_currency.iso_code if lg.lg_currency else "EGP"
+    current_date_str = _fmt_full_date(datetime.now())
+    inst_date_str = _fmt_full_date(db_instruction.instruction_date, current_date_str)
+    delivery_date_str = _fmt_full_date(db_instruction.delivery_date, "N/A")
+    raw_bank_reply_date = (
+        inst_details.get("bank_reply_letter_date")
+        or approval_info.get("rejected_bank_reply_date")
+        or db_instruction.bank_reply_date
+    )
+    bank_reply_date_str = _fmt_full_date(raw_bank_reply_date, "Recent Advice")
+    action_label = (db_instruction.instruction_type or "Instruction").replace("LG_", "").replace("_", " ").title()
+
+    rows_html = ""
+    if "expiry_date" in amendment_details:
+        raw_req_exp = (
+            inst_details.get("new_expiry_date")
+            or inst_details.get("requested_expiry_date")
+            or lg.expiry_date
+        )
+        req_exp = _fmt_full_date(raw_req_exp, "As Instructed")
+        bank_exp = _fmt_full_date(amendment_details.get("expiry_date"), "As Advised")
+        rows_html += f"""
+        <tr>
+            <td><strong>Amended Expiry Date</strong></td>
+            <td>{req_exp}</td>
+            <td style="color: #b91c1c; font-weight: 700;">{bank_exp}</td>
+        </tr>
+        """
+    if "lg_amount" in amendment_details:
+        req_amt = inst_details.get("new_amount") or inst_details.get("new_lg_amount") or float(lg.lg_amount or 0)
+        try:
+            req_amt_fmt = f"{currency_code} {float(req_amt):,.2f}"
+        except Exception:
+            req_amt_fmt = str(req_amt)
+        try:
+            bank_amt_fmt = f"{currency_code} {float(amendment_details['lg_amount']):,.2f}"
+        except Exception:
+            bank_amt_fmt = str(amendment_details["lg_amount"])
+        rows_html += f"""
+        <tr>
+            <td><strong>Amended LG Amount</strong></td>
+            <td>{req_amt_fmt}</td>
+            <td style="color: #b91c1c; font-weight: 700;">{bank_amt_fmt}</td>
+        </tr>
+        """
+    if not rows_html:
+        rows_html = f"""
+        <tr>
+            <td><strong>Instruction Terms ({action_label})</strong></td>
+            <td>Per Instruction {db_instruction.serial_number}</td>
+            <td style="color: #b91c1c; font-weight: 700;">{approval_info.get('reason') or 'Modified Terms in Bank Advice'}</td>
+        </tr>
+        """
+
+    discrepancy_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Discrepancy Notice - {db_instruction.serial_number}</title>
+        <style>
+            @page {{ size: A4; margin: 20mm; }}
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; color: #111827; line-height: 1.6; margin: 0; padding: 0; background: #f3f4f6; }}
+            .toolbar {{ background: #1e293b; color: white; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }}
+            .toolbar button {{ background: #e11d48; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }}
+            .toolbar button:hover {{ background: #be123c; }}
+            .page {{ max-width: 210mm; margin: 24px auto; background: white; padding: 22mm; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-radius: 4px; box-sizing: border-box; }}
+            .header {{ border-bottom: 2px solid #1e3a8a; padding-bottom: 14px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: flex-start; }}
+            .corp-title {{ font-size: 18px; font-weight: 700; color: #1e3a8a; }}
+            .doc-badge {{ background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; text-transform: uppercase; }}
+            .meta-block {{ margin-bottom: 20px; font-size: 14px; }}
+            .subject-box {{ background: #f8fafc; border-left: 4px solid #b91c1c; padding: 12px 16px; margin: 20px 0; font-weight: 700; font-size: 14px; color: #111827; }}
+            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13.5px; }}
+            th, td {{ border: 1px solid #d1d5db; padding: 10px 12px; text-align: left; }}
+            th {{ background: #f1f5f9; font-weight: 700; color: #334155; }}
+            .signatures {{ margin-top: 48px; display: flex; justify-content: space-between; }}
+            .sig-line {{ width: 42%; border-top: 1px solid #374151; padding-top: 8px; font-size: 13px; color: #4b5563; }}
+            @media print {{
+                body {{ background: white; }}
+                .toolbar {{ display: none !important; }}
+                .page {{ margin: 0; padding: 0; box-shadow: none; max-width: 100%; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="toolbar">
+            <div>
+                <strong>Bank Reply Discrepancy Notice</strong> — LG: {lg.lg_number} (Instruction: {db_instruction.serial_number})
+            </div>
+            <button onclick="window.print()">🖨️ Print Discrepancy Letter</button>
+        </div>
+        <div class="page">
+            <div class="header">
+                <div>
+                    <div class="corp-title">{customer_name}</div>
+                    <div style="font-size: 12px; color: #6b7280;">Letter of Guarantee Operations</div>
+                </div>
+                <div style="text-align: right;">
+                    <div class="doc-badge">Discrepancy &amp; Correction Notice</div>
+                    <div style="font-size: 12px; color: #4b5563; margin-top: 6px;"><strong>Date:</strong> {current_date_str}</div>
+                    <div style="font-size: 12px; color: #4b5563;"><strong>Ref:</strong> {db_instruction.serial_number}/DISC</div>
+                </div>
+            </div>
+
+            <div class="meta-block">
+                <div><strong>To:</strong> {bank_name}</div>
+                <div><strong>Address:</strong> {bank_address}</div>
+            </div>
+
+            <div class="subject-box">
+                SUBJECT: Notice of Discrepancy &amp; Non-Acceptance of Bank Amendment — Letter of Guarantee No. {lg.lg_number}<br/>
+                <span style="font-weight: 500; font-size: 13px; color: #4b5563;">
+                    Our Instruction Ref: <strong>{db_instruction.serial_number}</strong> ({action_label}) dated {inst_date_str} (Delivered: {delivery_date_str})
+                </span>
+            </div>
+
+            <p style="font-size: 14px;">Dear Trade Finance Team,</p>
+            <p style="font-size: 14px;">
+                We refer to our official corporate instruction ref. <strong>{db_instruction.serial_number}</strong> dated <strong>{inst_date_str}</strong> regarding
+                Letter of Guarantee No. <strong>{lg.lg_number}</strong>, and to your subsequent bank advice dated <strong>{bank_reply_date_str}</strong>.
+            </p>
+            <p style="font-size: 14px;">
+                Upon review of your advice, we noted a discrepancy between the terms requested in our instruction
+                and the terms stated in your bank advice, as detailed below:
+            </p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Our Instructed Terms ({db_instruction.serial_number})</th>
+                        <th>Terms Stated in Bank Advice ({bank_reply_date_str})</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+
+            <p style="font-size: 14px;">
+                Please be formally advised that <strong>we do not accept the modified amendment terms</strong> stated in your bank advice dated <strong>{bank_reply_date_str}</strong>,
+                as they deviate from our authorized instruction ref. <strong>{db_instruction.serial_number}</strong>.
+            </p>
+
+            <p style="font-size: 14px;">
+                Accordingly, we request that you rectify this discrepancy immediately and issue a <strong>corrected Amendment Advice</strong> for Letter of Guarantee No. <strong>{lg.lg_number}</strong>
+                strictly reflecting the exact terms instructed in our reference <strong>{db_instruction.serial_number}</strong>, and provide us with the revised confirmation at your earliest convenience.
+            </p>
+
+            <p style="font-size: 14px;">Yours faithfully,<br/><strong>For and on behalf of {customer_name}</strong></p>
+
+            <div class="signatures">
+                <div class="sig-line">Authorized Signatory (1)<br/>Name &amp; Title:</div>
+                <div class="sig-line">Authorized Signatory (2)<br/>Name &amp; Title:</div>
+            </div>
+        </div>
+        {"<script>window.onload = function() { setTimeout(function() { window.print(); }, 400); };</script>" if print_flag else ""}
+    </body>
+    </html>
+    """
+    if print_flag and isinstance(inst_details.get("bank_terms_admin_approval"), dict):
+        updated_inst_details = dict(inst_details)
+        updated_approval_info = dict(updated_inst_details.get("bank_terms_admin_approval") or {})
+        updated_approval_info["discrepancy_letter_printed"] = True
+        updated_approval_info["discrepancy_letter_printed_at"] = datetime.utcnow().isoformat()
+        updated_inst_details["bank_terms_admin_approval"] = updated_approval_info
+        db_instruction.details = updated_inst_details
+        flag_modified(db_instruction, "details")
+        db.add(db_instruction)
+        db.commit()
+
+    log_action(
+        db,
+        user_id=end_user_context.user_id,
+        action_type="DISCREPANCY_LETTER_GENERATED",
+        entity_type="LGInstruction",
+        entity_id=db_instruction.id,
+        details={"serial_number": db_instruction.serial_number, "lg_record_id": lg.id},
+        customer_id=end_user_context.customer_id,
+        lg_record_id=lg.id,
+    )
+    return HTMLResponse(content=discrepancy_html, status_code=status.HTTP_200_OK)
+
         
 @router.post(
     "/lg-records/instructions/{instruction_id}/mark-as-accessed-for-print",
@@ -2841,6 +4078,8 @@ async def get_lg_record_lifecycle_history(
                 timestamp=event.timestamp,
                 action_type=event.action_type,
                 user_email=user_email,
+                entity_type=event.entity_type,
+                entity_id=event.entity_id,
                 details=event.details if event.details else {},
             )
         )
@@ -3096,26 +4335,69 @@ async def send_reminder_to_bank_api(
             logger.error(f"PDF bytes were not generated for reminder for original instruction ID {original_instruction_id}.")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate reminder PDF.")
 
-        # 3. Return the PDF for printing
+        # 3. Return the PDF for printing with the unified top toolbar
         pdf_base64 = base64.b64encode(generated_pdf_bytes).decode('utf-8')
+        lg_num_display = lg_record.lg_number if lg_record else "N/A"
+        serial_display = db_instruction.serial_number or f"INST-{original_instruction_id}"
 
         html_content = f"""
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Print LG Bank Reminder</title>
+            <meta charset="utf-8" />
+            <title>Print LG Bank Reminder - {serial_display}</title>
             <style>
-                body {{ margin: 0; overflow: hidden; }}
-                embed {{ width: 100vw; height: 100vh; border: none; }}
+                body {{ margin: 0; padding: 0; overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif; background: #1e293b; }}
+                .toolbar {{ background: #1e293b; color: white; height: 54px; padding: 0 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; box-sizing: border-box; }}
+                .toolbar-actions {{ display: flex; gap: 10px; align-items: center; }}
+                .btn-print {{ background: #e11d48; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }}
+                .btn-print:hover {{ background: #be123c; }}
+                .btn-download {{ background: #334155; color: #f8fafc; border: 1px solid #475569; padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; text-decoration: none; }}
+                .btn-download:hover {{ background: #475569; }}
+                #pdfFrame {{ width: 100vw; height: calc(100vh - 54px); border: none; background: #f3f4f6; display: block; }}
+                @media print {{
+                    .toolbar {{ display: none !important; }}
+                    #pdfFrame {{ height: 100vh; }}
+                }}
             </style>
         </head>
         <body>
-            <embed src="data:application/pdf;base64,{pdf_base64}" type="application/pdf" width="100%" height="100%">
+            <div class="toolbar">
+                <div style="font-size: 14px;">
+                    <strong>Bank Reminder Notice</strong> — LG: {lg_num_display} (Original Instruction: {serial_display})
+                </div>
+                <div class="toolbar-actions">
+                    <a id="downloadLink" class="btn-download" download="Reminder_{serial_display}.pdf">⬇️ Download PDF</a>
+                    <button class="btn-print" onclick="triggerPrint()">🖨️ Print Reminder Letter</button>
+                </div>
+            </div>
+            <iframe id="pdfFrame" title="LG Bank Reminder PDF"></iframe>
             <script>
+                var b64 = "{pdf_base64}";
+                var bin = atob(b64);
+                var len = bin.length;
+                var bytes = new Uint8Array(len);
+                for (var i = 0; i < len; i++) {{
+                    bytes[i] = bin.charCodeAt(i);
+                }}
+                var blob = new Blob([bytes], {{ type: "application/pdf" }});
+                var blobUrl = URL.createObjectURL(blob);
+                var frame = document.getElementById("pdfFrame");
+                frame.src = blobUrl;
+                document.getElementById("downloadLink").href = blobUrl;
+
+                function triggerPrint() {{
+                    try {{
+                        if (frame && frame.contentWindow) {{
+                            frame.contentWindow.focus();
+                            frame.contentWindow.print();
+                            return;
+                        }}
+                    }} catch (e) {{}}
+                    window.print();
+                }}
                 window.onload = function() {{
-                    setTimeout(function() {{
-                        window.print();
-                    }}, 500);
+                    setTimeout(function() {{ triggerPrint(); }}, 600);
                 }};
             </script>
         </body>
@@ -3352,6 +4634,58 @@ async def get_approved_requests_pending_print(
 
     return pending_print_requests[skip : skip + limit]
 
+
+@router.get(
+    "/action-center/discrepancy-letters-pending-print",
+    response_model=List[LGInstructionOut],
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
+    summary="Get LG instructions where bank-modified terms were rejected by Corporate Admin and a Discrepancy Notice letter is ready to print"
+)
+async def get_discrepancy_letters_pending_print(
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    instructions = db.query(models.LGInstruction).join(
+        models.LGRecord, models.LGInstruction.lg_record_id == models.LGRecord.id
+    ).options(
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_status),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.instructions),
+        selectinload(models.LGInstruction.maker_user),
+    ).filter(
+        models.LGRecord.customer_id == end_user_context.customer_id,
+        models.LGRecord.is_deleted == False,
+        models.LGRecord.lg_status_id == LgStatusEnum.VALID.value,
+        models.LGInstruction.is_deleted == False,
+        models.LGInstruction.status != "Canceled",
+        models.LGInstruction.bank_reply_date.is_(None),
+        models.LGInstruction.details['bank_terms_admin_approval']['status'].astext == 'REJECTED_BY_ADMIN',
+    ).order_by(models.LGInstruction.updated_at.desc()).all()
+
+    results = []
+    allowed_ids_set = set(allowed_ids) if not has_all else set()
+    for inst in instructions:
+        if not has_all and inst.lg_record and inst.lg_record.beneficiary_corporate_id not in allowed_ids_set:
+            continue
+        approval_info = (inst.details or {}).get("bank_terms_admin_approval") or {}
+        if approval_info.get("discrepancy_letter_printed") is True:
+            continue
+        # Drop if a newer operational instruction has already been created on the same LG
+        sibling_insts = (inst.lg_record.instructions or []) if inst.lg_record else []
+        has_newer_operational_inst = any(
+            s.id > inst.id
+            and not s.is_deleted
+            and s.status != "Canceled"
+            and s.instruction_type != ACTION_TYPE_LG_REMINDER_TO_BANKS
+            for s in sibling_insts
+        )
+        if has_newer_operational_inst:
+            continue
+        results.append(inst)
+    return results
+
 @router.get(
     "/users/me_dashboard_info",
     response_model=Dict[str, Any],
@@ -3570,6 +4904,20 @@ async def cancel_lg_instruction(
     action_type = ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION
 
     if is_maker_checker_enabled:
+        # Guard against duplicate pending cancellation requests for the same LG / instruction
+        existing_pending_cancel = db.query(models.ApprovalRequest).filter(
+            models.ApprovalRequest.customer_id == end_user_context.customer_id,
+            models.ApprovalRequest.entity_type == "LGRecord",
+            models.ApprovalRequest.entity_id == lg_record_id,
+            models.ApprovalRequest.action_type == action_type,
+            models.ApprovalRequest.status == ApprovalRequestStatusEnum.PENDING,
+        ).first()
+        if existing_pending_cancel:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"A cancellation request (#{existing_pending_cancel.id}) for instruction '{db_instruction.serial_number}' is already pending Corporate Admin approval."
+            )
+
         # Maker-Checker flow: Create an ApprovalRequest
         try:
             lg_record_for_snapshot = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
@@ -3578,13 +4926,19 @@ async def cancel_lg_instruction(
             
             lg_snapshot = crud_approval_request._get_lg_record_snapshot(lg_record_for_snapshot)
             
+            inst_meta = db_instruction.details if isinstance(db_instruction.details, dict) else {}
             approval_request_in = ApprovalRequestCreate(
                 entity_type="LGRecord",
                 entity_id=lg_record_id,
                 action_type=action_type,
                 request_details={
                     "instruction_id": instruction_id,
-                    "reason": cancel_in.reason,
+                    "instruction_serial": db_instruction.serial_number,
+                    "instruction_type": db_instruction.instruction_type,
+                    "instruction_status": db_instruction.status,
+                    "old_expiry_date": inst_meta.get("old_expiry_date"),
+                    "new_expiry_date": inst_meta.get("new_expiry_date"),
+                    "reason": (cancel_in.reason or "").strip(),
                     "declaration_confirmed": cancel_in.declaration_confirmed,
                 },
                 lg_record_snapshot=lg_snapshot,
@@ -3598,24 +4952,14 @@ async def cancel_lg_instruction(
                 end_user_context.customer_id,
                 lg_record=lg_record_for_snapshot,
             )
-            
-            # Log submission
-            log_action(
-                db,
-                user_id=end_user_context.user_id,
-                action_type="APPROVAL_REQUEST_SUBMITTED",
-                entity_type="ApprovalRequest",
-                entity_id=db_approval_request.id,
-                details={
-                    "lg_record_id": lg_record_id,
-                    "action_type": action_type,
-                    "status": db_approval_request.status.value,
-                    "maker_email": end_user_context.email,
-                    "reason_for_cancellation": cancel_in.reason,
-                },
-                customer_id=end_user_context.customer_id,
-                lg_record_id=lg_record_id,
-            )
+
+            inst_details = dict(db_instruction.details or {})
+            inst_details["pending_cancellation_request_id"] = db_approval_request.id
+            db_instruction.details = inst_details
+            flag_modified(db_instruction, "details")
+            db.add(db_instruction)
+            db.commit()
+            db.refresh(db_instruction)
 
             return {
                 "message": f"Cancellation request for instruction '{db_instruction.serial_number}' submitted for approval.",
@@ -3769,4 +5113,4 @@ async def force_issuance_handover(
 
     db.commit()
 
-    return {"message": "Force handover request submitted for approval", "approval_request_id": approval_request.id}
+    return {"message": "Force handover request submitted for approval", "approval_request_id": approval_request.id}

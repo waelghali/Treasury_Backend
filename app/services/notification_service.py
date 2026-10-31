@@ -47,16 +47,37 @@ def notify(
 
     # Deduplicate and filter out None/invalid
     unique_ids = list(set(uid for uid in user_ids if uid))
+    if not unique_ids:
+        return
+
+    # Query user roles to tailor the link path between /corporate-admin/ and /end-user/
+    from app.models import User
+    user_roles = {}
+    try:
+        user_rows = db.query(User.id, User.role).filter(User.id.in_(unique_ids)).all()
+        user_roles = {u[0]: (u[1] or "").lower() for u in user_rows}
+    except Exception:
+        pass
     
     notifications = []
     for uid in unique_ids:
+        role = user_roles.get(uid, "end_user")
+        role_path = "corporate-admin" if role in ("corporate_admin", "admin", "checker") else "end-user"
+        
+        user_link = link
+        if user_link:
+            if role_path == "end-user" and user_link.startswith("/corporate-admin/"):
+                user_link = user_link.replace("/corporate-admin/", "/end-user/", 1)
+            elif role_path == "corporate-admin" and user_link.startswith("/end-user/"):
+                user_link = user_link.replace("/end-user/", "/corporate-admin/", 1)
+
         notif = UserNotification(
             user_id=uid,
             module=module,
             event_type=event_type,
             title=title,
             message=message,
-            link=link,
+            link=user_link,
             actor_user_id=actor_user_id,
             reference_id=reference_id,
             reference_type=reference_type,
@@ -82,7 +103,7 @@ def notify_request_submitted(db: Session, approver_user_ids: List[int], request_
         event_type="REQUEST_SUBMITTED",
         title="New Issuance Request",
         message=f"{requestor_name} submitted issuance request {request_serial} for your approval.",
-        link=f"/corporate-admin/issuance/requests",
+        link=f"/corporate-admin/issuance/requests?request_id={request_id}",
         actor_user_id=actor_user_id,
         reference_id=request_id,
         reference_type="IssuanceRequest",
@@ -105,7 +126,7 @@ def notify_request_approved(db: Session, recipient_user_ids: List[int], request_
         event_type="REQUEST_FULLY_APPROVED" if is_fully_approved else "REQUEST_STEP_APPROVED",
         title=title,
         message=message,
-        link=f"/corporate-admin/issuance/requests",
+        link=f"/corporate-admin/issuance/requests?request_id={request_id}",
         actor_user_id=actor_user_id,
         reference_id=request_id,
         reference_type="IssuanceRequest",
@@ -120,7 +141,7 @@ def notify_request_rejected(db: Session, recipient_user_ids: List[int], request_
         event_type="REQUEST_REJECTED",
         title="Request Rejected",
         message=f"{rejector_name} rejected issuance request {request_serial}. Reason: {reason}",
-        link=f"/corporate-admin/issuance/requests",
+        link=f"/corporate-admin/issuance/requests?request_id={request_id}",
         actor_user_id=actor_user_id,
         reference_id=request_id,
         reference_type="IssuanceRequest",

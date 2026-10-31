@@ -136,35 +136,74 @@ class CRUDQuotation:
             auth_name = getattr(obj_in, 'authorized_contact_name', None)
 
             if existing:
+                from app.models.models_quotation import QuotationBankContactInvitation
+                from app.core.security_crypto import compute_email_blind_index
+
+                # Find currently PENDING invitations for this bank so pending contacts aren't stored as active
+                pending_invs = db.query(QuotationBankContactInvitation).filter(
+                    QuotationBankContactInvitation.customer_id == customer_id,
+                    QuotationBankContactInvitation.bank_id == obj_in.bank_id,
+                    QuotationBankContactInvitation.status == "PENDING"
+                ).all()
+                pending_email_set = set()
+                pending_blind_set = set()
+                for pinv in pending_invs:
+                    pe = (pinv.get_email(db) if hasattr(pinv, "get_email") else (pinv.email or "")).strip().lower()
+                    if pe:
+                        pending_email_set.add(pe)
+                    if pinv.email_blind_index:
+                        pending_blind_set.add(pinv.email_blind_index)
+
                 # If explicit target_id was passed, user explicitly managed contacts (including removals)
                 # If target_id was NOT passed, user is adding contacts to an existing bank -> merge without loss
                 if target_id:
-                    final_contacts = contacts_data
+                    final_contacts = [
+                        {k: v for k, v in c.items() if k not in ("is_pending", "invitation_status")}
+                        for c in contacts_data
+                        if not c.get("is_pending")
+                        and c.get("invitation_status") != "PENDING"
+                        and (c.get("email") or "").strip().lower() not in pending_email_set
+                        and compute_email_blind_index((c.get("email") or "").strip().lower()) not in pending_blind_set
+                    ]
+                    # If any previously active contact was removed, mark their old ACCEPTED invitation rows as REVOKED
+                    new_active_emails = {(c.get("email") or "").strip().lower() for c in final_contacts if c.get("email")}
+                    accepted_invs = db.query(QuotationBankContactInvitation).filter(
+                        QuotationBankContactInvitation.customer_id == customer_id,
+                        QuotationBankContactInvitation.bank_id == obj_in.bank_id,
+                        QuotationBankContactInvitation.status == "ACCEPTED"
+                    ).all()
+                    for ainv in accepted_invs:
+                        ae = (ainv.get_email(db) if hasattr(ainv, "get_email") else (ainv.email or "")).strip().lower()
+                        if ae and ae not in new_active_emails:
+                            ainv.status = "REVOKED"
                 else:
                     existing_contacts = list(existing.contacts or [])
-                    contact_map = {c.get("email", "").strip().lower(): dict(c) for c in existing_contacts if c.get("email")}
+                    contact_map = {
+                        c.get("email", "").strip().lower(): {k: v for k, v in dict(c).items() if k not in ("is_pending", "invitation_status")}
+                        for c in existing_contacts
+                        if c.get("email") and not c.get("is_pending") and c.get("invitation_status") != "PENDING"
+                    }
                     for nc in contacts_data:
                         e_low = nc.get("email", "").strip().lower()
-                        if not e_low:
+                        if not e_low or e_low in pending_email_set or compute_email_blind_index(e_low) in pending_blind_set:
                             continue
+                        clean_nc = {k: v for k, v in dict(nc).items() if k not in ("is_pending", "invitation_status")}
                         if e_low in contact_map:
-                            if nc.get("role"):
-                                contact_map[e_low]["role"] = nc["role"]
-                            if nc.get("name"):
-                                contact_map[e_low]["name"] = nc["name"]
-                            if nc.get("title"):
-                                contact_map[e_low]["title"] = nc["title"]
+                            if clean_nc.get("role"):
+                                contact_map[e_low]["role"] = clean_nc["role"]
+                            if clean_nc.get("name"):
+                                contact_map[e_low]["name"] = clean_nc["name"]
+                            if clean_nc.get("title"):
+                                contact_map[e_low]["title"] = clean_nc["title"]
                         else:
-                            contact_map[e_low] = nc
+                            contact_map[e_low] = clean_nc
                     final_contacts = list(contact_map.values())
 
                 existing.contacts = final_contacts
                 existing.emails = ", ".join([c["email"].strip() for c in final_contacts if c.get("email")])
                 existing.entity_scope = entity_scope
-                if auth_email:
-                    existing.authorized_contact_email = auth_email.strip()
-                if auth_name:
-                    existing.authorized_contact_name = auth_name.strip()
+                existing.authorized_contact_email = auth_email.strip() if auth_email else None
+                existing.authorized_contact_name = auth_name.strip() if auth_name else None
                 if obj_in.trade_type:
                     existing.trade_type = obj_in.trade_type
 
@@ -221,32 +260,51 @@ class CRUDQuotation:
         from app.crud.crud_config import crud_customer_configuration
         from app.constants import GlobalConfigKey
 
-        # Query all staged invitations for this customer to determine contact handshake status
+        # Query all staged invitations for this customer ordered chronologically so latest status wins
         invitations = db.query(QuotationBankContactInvitation).filter(
             QuotationBankContactInvitation.customer_id == customer_id,
             QuotationBankContactInvitation.status.in_(["PENDING", "ACCEPTED"])
-        ).all()
+        ).order_by(QuotationBankContactInvitation.id.asc()).all()
         inv_map = {}
+        pending_invs_by_bank = {}
         for inv in invitations:
             decrypted_email = (inv.get_email(db) if hasattr(inv, "get_email") else (inv.email or "")).strip().lower()
             if decrypted_email:
                 key_email = (inv.bank_id, decrypted_email)
-                if key_email not in inv_map or inv.status == "ACCEPTED":
-                    inv_map[key_email] = inv.status
+                inv_map[key_email] = inv.status
             if inv.email_blind_index:
                 key_blind = (inv.bank_id, inv.email_blind_index)
-                if key_blind not in inv_map or inv.status == "ACCEPTED":
-                    inv_map[key_blind] = inv.status
+                inv_map[key_blind] = inv.status
+
+        for inv in invitations:
+            if inv.status != "PENDING":
+                continue
+            decrypted_email = (inv.get_email(db) if hasattr(inv, "get_email") else (inv.email or "")).strip().lower()
+            if decrypted_email and inv_map.get((inv.bank_id, decrypted_email)) == "PENDING":
+                pending_invs_by_bank.setdefault(inv.bank_id, []).append({
+                    "email": decrypted_email,
+                    "name": inv.title or "",
+                    "title": inv.title or "",
+                    "role": (inv.role or "EXECUTION").upper(),
+                    "invitation_status": "PENDING",
+                    "is_pending": True
+                })
 
         def enrich_bank(b):
+            _ = b.bank  # Eagerly load relationship before expunging from session
             assoc_ids = [assoc.entity_id for assoc in b.entity_associations] if b.entity_associations else []
-            b.entity_ids = assoc_ids
             raw_contacts = list(b.contacts) if b.contacts else []
             if not raw_contacts and b.emails:
                 emails_list = [e.strip() for e in b.emails.split(",") if e.strip()]
                 raw_contacts = [{"email": e, "name": "", "role": "EXECUTION"} for e in emails_list]
 
+            # Detach from SQLAlchemy session so display-only enrichment never mutates DB column on commit
+            if b in db:
+                db.expunge(b)
+            b.entity_ids = assoc_ids
+
             enriched_contacts = []
+            seen_emails = set()
             pending_count = 0
             accepted_count = 0
 
@@ -255,6 +313,8 @@ class CRUDQuotation:
             for c in raw_contacts:
                 c_item = dict(c)
                 c_email = (c_item.get("email") or "").strip().lower()
+                if c_email:
+                    seen_emails.add(c_email)
                 inv_status = inv_map.get((b.bank_id, c_email))
                 if not inv_status and c_email:
                     inv_status = inv_map.get((b.bank_id, compute_email_blind_index(c_email)))
@@ -273,6 +333,14 @@ class CRUDQuotation:
                     c_item["is_pending"] = False
                     accepted_count += 1
                 enriched_contacts.append(c_item)
+
+            # Also include staged PENDING invitations that haven't been promoted into b.contacts yet
+            for p_inv in pending_invs_by_bank.get(b.bank_id, []):
+                p_email = p_inv["email"]
+                if p_email not in seen_emails:
+                    seen_emails.add(p_email)
+                    enriched_contacts.append(dict(p_inv))
+                    pending_count += 1
 
             b.contacts = enriched_contacts
             total_contacts = len(enriched_contacts)
@@ -575,15 +643,15 @@ class CRUDQuotation:
                 id=leg_id,
                 rfq_id=rfq_id,
                 leg_index=1,
-                type=obj_in.type,
-                direction=obj_in.direction,
+                type=p_type,
+                direction=p_direction,
                 buy_currency=obj_in.buyCurrency,
                 sell_currency=obj_in.sellCurrency,
                 amount=obj_in.amount,
                 min_ticket_amount=obj_in.minTicketAmount,
                 value_date=str(obj_in.valueDate) if obj_in.valueDate else None,
                 allow_alternative_value_date=allow_alt_master,
-                quotation_base=obj_in.quotationBase,
+                quotation_base=obj_in.quotationBase or p_base,
                 max_tolerance_percent=obj_in.maxTolerancePercent,
                 document_path=json.dumps(leg_docs) if leg_docs else db_rfq.document_path,
                 status=initial_status,
@@ -637,17 +705,29 @@ class CRUDQuotation:
 
                 # Ensure bank has at least one active (accepted) contact to quote
                 from app.models.models_quotation import QuotationBankContactInvitation
+                from app.core.security_crypto import compute_email_blind_index
                 pending_invs = db.query(QuotationBankContactInvitation).filter(
                     QuotationBankContactInvitation.customer_id == customer_id,
                     QuotationBankContactInvitation.bank_id == raw_bank_id,
                     QuotationBankContactInvitation.status == "PENDING"
                 ).all()
-                pending_emails = {(inv.email or "").strip().lower() for inv in pending_invs}
+                pending_emails = set()
+                pending_blind_indices = set()
+                for inv in pending_invs:
+                    resolved_inv_email = (inv.get_email(db) or inv.email or "").strip().lower()
+                    if resolved_inv_email:
+                        pending_emails.add(resolved_inv_email)
+                    if getattr(inv, "email_blind_index", None):
+                        pending_blind_indices.add(inv.email_blind_index)
                 bank_contacts = list(q_bank.contacts) if q_bank.contacts else []
-                active_contacts = [
-                    c for c in bank_contacts
-                    if (c.get("email") or "").strip().lower() not in pending_emails
-                ]
+                active_contacts = []
+                for c in bank_contacts:
+                    c_email = (c.get("email") or "").strip().lower()
+                    if not c_email:
+                        continue
+                    c_blind = compute_email_blind_index(c_email)
+                    if c_email not in pending_emails and c_blind not in pending_blind_indices:
+                        active_contacts.append(c)
                 if bank_contacts and len(active_contacts) == 0:
                     db.rollback()
                     b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
@@ -687,14 +767,28 @@ class CRUDQuotation:
                                 detail=f"Cross-entity quotation is disabled. Bank {b_name} does not belong to the selected legal entity."
                             )
 
-                    # Compute order-independent quotation base across ALL legs for this bank
+                    # Compute order-independent quotation base & assignment attributes across ALL invited legs for this bank
+                    bank_legs = bank_legs_catalog.get(raw_bank_id, [{'leg_obj': leg_obj, 'b_data': b_data}])
+                    invited_bank_legs = []
+                    for item in bank_legs:
+                        l_b_data = item['b_data']
+                        l_leg_obj = item['leg_obj']
+                        raw_b = l_b_data.get('quotationBase') or (root_bank_info.get('quotationBase') if root_bank_info else None) or l_leg_obj.quotation_base or p_base or 'Execution'
+                        is_inv = l_b_data.get('isInvited', l_b_data.get('is_invited', True)) is not False and str(raw_b).strip().lower() not in ('invisible', 'skipped', 'excluded')
+                        if is_inv:
+                            invited_bank_legs.append(item)
+
+                    effective_bank_legs = invited_bank_legs if invited_bank_legs else bank_legs
+                    primary_item = effective_bank_legs[0]
+                    primary_b_data = primary_item['b_data']
+                    primary_leg_obj = primary_item['leg_obj']
+
                     if is_cross_bank:
                         bank_overall_base = "Indicative"
                         has_any_exec = False
                     else:
-                        bank_legs = bank_legs_catalog.get(raw_bank_id, [{'leg_obj': leg_obj, 'b_data': b_data}])
                         leg_bases = []
-                        for item in bank_legs:
+                        for item in effective_bank_legs:
                             l_b_data = item['b_data']
                             l_leg_obj = item['leg_obj']
                             base_val = l_b_data.get('quotationBase') or (root_bank_info.get('quotationBase') if root_bank_info else None) or l_leg_obj.quotation_base or p_base
@@ -715,20 +809,27 @@ class CRUDQuotation:
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
                     bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec and not is_cross_bank) else None
 
-                    b_val_d = _parse_date_only(b_data.get('valueDate') or leg_obj.value_date)
-                    b_allow_alt = b_data.get('allowAlternativeValueDate')
+                    b_val_d = _parse_date_only(primary_b_data.get('valueDate') or primary_leg_obj.value_date)
+                    b_allow_alt = any(
+                        bool(it['b_data'].get('allowAlternativeValueDate') if it['b_data'].get('allowAlternativeValueDate') is not None else it['leg_obj'].allow_alternative_value_date)
+                        for it in effective_bank_legs
+                    ) if len(effective_bank_legs) > 1 else primary_b_data.get('allowAlternativeValueDate')
+                    b_doc_vis = False if is_cross_bank else any(
+                        it['b_data'].get('isDocumentVisible', True) is not False
+                        for it in effective_bank_legs
+                    )
 
                     db_assignment = QuotationBankAssignment(
                         id=assign_id,
                         rfq_id=rfq_id,
                         quotation_bank_id=q_bank.id,
                         token=token,
-                        cost_min=b_data.get('costMin', 0.0),
-                        cost_percent=b_data.get('costPercent', 0.0),
-                        cost_max=b_data.get('costMax', 0.0),
-                        cost_flat=b_data.get('costFlat', 0.0),
+                        cost_min=primary_b_data.get('costMin', 0.0),
+                        cost_percent=primary_b_data.get('costPercent', 0.0),
+                        cost_max=primary_b_data.get('costMax', 0.0),
+                        cost_flat=primary_b_data.get('costFlat', 0.0),
                         quotation_base=bank_overall_base,
-                        is_document_visible=b_data.get('isDocumentVisible', True),
+                        is_document_visible=b_doc_vis,
                         value_date=b_val_d,
                         allow_alternative_value_date=b_allow_alt,
                         approval_status=bank_approval_status

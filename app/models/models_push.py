@@ -97,6 +97,49 @@ class DealerAlertReminder(BaseModel):
     last_reminded_at = Column(DateTime(timezone=True), nullable=True)
     link_opened_at = Column(DateTime(timezone=True), nullable=True)
     opted_out = Column(Boolean, nullable=False, default=False, server_default="false")
+    otp_code = Column(String(255), nullable=True)
+    otp_expires_at = Column(DateTime(timezone=True), nullable=True)
+    otp_failed_attempts = Column(Integer, nullable=False, default=0, server_default="0")
 
     bank = relationship("Bank")
+
+
+class UserMobilePairToken(BaseModel):
+    """
+    Tracks one-time QR pairing tokens used to link a mobile device
+    to an End User or Corporate Admin account with password verification.
+    """
+    __tablename__ = "user_mobile_pair_tokens"
+
+    pairing_token = Column(String(64), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    is_paired = Column(Boolean, nullable=False, default=False, server_default="false")
+    paired_at = Column(DateTime(timezone=True), nullable=True)
+    device_label = Column(String(120), nullable=True)
+    platform = Column(String(20), nullable=True)
+
+
+class DealerMobilePairToken(BaseModel):
+    """
+    N7: Ephemeral 15-minute QR pairing sessions for Bank Dealers.
+    Generated dynamically on the Trading Desk screen. Zero persistent attack surface.
+    """
+    __tablename__ = "dealer_mobile_pair_tokens"
+
+    pairing_token = Column(String(64), nullable=False, unique=True, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    bank_id = Column(Integer, ForeignKey("banks.id", ondelete="SET NULL"), nullable=True, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    is_paired = Column(Boolean, nullable=False, default=False, server_default="false")
+    paired_at = Column(DateTime(timezone=True), nullable=True)
+    device_label = Column(String(120), nullable=True)
+    platform = Column(String(20), nullable=True)
+    otp_code = Column(String(255), nullable=True)
+    otp_expires_at = Column(DateTime(timezone=True), nullable=True)
+    otp_failed_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    last_otp_sent_at = Column(DateTime(timezone=True), nullable=True)
+
+    bank = relationship("Bank")
+
 

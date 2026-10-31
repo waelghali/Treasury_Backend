@@ -7,6 +7,67 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from dateutil import parser
+import re
+
+
+_KNOWN_BANK_SHORT_NAMES = {
+    "commercial international bank": "CIB",
+    "national bank of egypt": "NBE",
+    "arab african international bank": "AAIB",
+    "banque misr": "BM",
+    "banque du caire": "BDC",
+    "kuwait finance house": "KFH",
+    "kuwait finance house - egypt": "KFH",
+    "arab international bank": "ARIB",
+    "bank of alexandria": "ALEX",
+    "bank nxt": "NXT",
+    "qnb alahli": "QNB",
+    "qatar national bank": "QNB",
+    "hsbc bank egypt": "HSBC",
+    "credit agricole egypt": "CAE",
+    "faisal islamic bank": "FIB",
+    "abu dhabi islamic bank": "ADIB",
+    "first abu dhabi bank": "FAB",
+    "emirates nbd": "ENBD",
+}
+
+
+def get_bank_short_label(bank_or_name: Any, bank_short_name: Optional[str] = None) -> str:
+    """
+    Returns a concise bank code/short name (e.g. 'CIB' instead of 'Commercial International Bank (CIB)')
+    for clean, mobile-friendly email subjects.
+    Accepts either a Bank ORM instance or a bank name string.
+    """
+    if bank_short_name and str(bank_short_name).strip():
+        return str(bank_short_name).strip()
+
+    if bank_or_name is None:
+        return "Bank"
+
+    if not isinstance(bank_or_name, str):
+        short_attr = getattr(bank_or_name, "short_name", None)
+        if short_attr and str(short_attr).strip():
+            return str(short_attr).strip()
+        name_attr = getattr(bank_or_name, "name", None)
+        bank_str = str(name_attr).strip() if name_attr else "Bank"
+    else:
+        bank_str = bank_or_name.strip()
+
+    if not bank_str:
+        return "Bank"
+
+    # 1. Check if there is a parenthesized acronym like "Commercial International Bank (CIB)"
+    m = re.search(r"\(([A-Za-z0-9&\-\s]{2,10})\)\s*$", bank_str)
+    if m:
+        return m.group(1).strip()
+
+    # 2. Check known bank name dictionary (case-insensitive)
+    lower_name = bank_str.lower()
+    for full_k, code_v in _KNOWN_BANK_SHORT_NAMES.items():
+        if full_k in lower_name:
+            return code_v
+
+    return bank_str
 
 
 def build_standard_email_html(
@@ -527,12 +588,18 @@ def build_quotation_rfq_bank_email(
         visible_legs = []
         for l in legs:
             cfg = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == l.id), None)
-            if cfg and getattr(cfg, 'is_invited', True) is False:
+            if cfg and (
+                getattr(cfg, 'is_invited', True) is False
+                or str(getattr(cfg, 'quotation_base', '') or '').strip().lower() in ('invisible', 'excluded', 'skipped')
+            ):
                 continue
             visible_legs.append(l)
         legs = visible_legs
 
     is_multi_pair = len(legs) > 1 and rfq_type == "FX_SPOT"
+
+    # Quotation Base & Multi-Leg Mixed Package Detection
+    q_base = (assignment.quotation_base if assignment and getattr(assignment, "quotation_base", None) else getattr(rfq, "quotation_base", None)) or "Indicative"
 
     # If reduced to a single visible leg, align single-pair values with that leg
     if len(legs) == 1 and rfq_type == "FX_SPOT":
@@ -546,7 +613,7 @@ def build_quotation_rfq_bank_email(
             except Exception:
                 pass
         cfg_s = next((c for c in getattr(assignment, "leg_configs", []) if c.leg_id == s_leg.id), None) if assignment else None
-        s_val_date = (cfg_s.value_date if cfg_s and getattr(cfg_s, "value_date", None) else getattr(s_leg, "value_date", None))
+        s_val_date = (cfg_s.value_date if cfg_s and getattr(cfg_s, "value_date", None) else (getattr(assignment, "value_date", None) if assignment else None) or getattr(s_leg, "value_date", None))
         if s_val_date:
             clean_vd = str(s_val_date).strip().split("T")[0]
             try:
@@ -556,11 +623,21 @@ def build_quotation_rfq_bank_email(
                 value_date_display = clean_vd
         if cfg_s and getattr(cfg_s, "allow_alternative_value_date", None) is not None:
             is_alt_allowed = bool(cfg_s.allow_alternative_value_date)
+        elif assignment and getattr(assignment, "allow_alternative_value_date", None) is not None:
+            is_alt_allowed = bool(assignment.allow_alternative_value_date)
         elif getattr(s_leg, "allow_alternative_value_date", None) is not None:
             is_alt_allowed = bool(s_leg.allow_alternative_value_date)
+        if cfg_s and getattr(cfg_s, "quotation_base", None):
+            q_base = cfg_s.quotation_base
+        elif getattr(s_leg, "quotation_base", None) and str(q_base).lower() == "mixed":
+            q_base = s_leg.quotation_base
 
-    # Quotation Base & Multi-Leg Mixed Package Detection
-    q_base = (assignment.quotation_base if assignment and getattr(assignment, "quotation_base", None) else getattr(rfq, "quotation_base", None)) or "Indicative"
+        if is_alt_allowed:
+            alt_date_badge = """<span style="background-color: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block;">&#10004; Alternative Date Permitted</span>"""
+            alt_date_desc = "Your desk is permitted to submit an alternative settlement date if necessary."
+        else:
+            alt_date_badge = """<span style="background-color: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block;">Fixed Date Only</span>"""
+            alt_date_desc = "Quotations must settle strictly on the specified value date (Alternative dates not permitted)."
     leg_bases = []
     if is_multi_pair:
         for l in legs:
@@ -645,7 +722,7 @@ def build_quotation_rfq_bank_email(
     rfq_kind_str = "Mixed Package" if is_mixed else ("Firm Execution" if (q_base or '').lower() != "indicative" else "Indicative")
 
     if email_purpose == "RE_TENDER":
-        subject = f"ACTION REQUIRED: Re-Tender RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
+        subject = f"RFQ {ref_no} · Re-Tender ({customer_branding})"
         banner_title = "Re-Tender Request for Quotation"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"You have received a <strong>re-tendered</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
@@ -654,7 +731,7 @@ def build_quotation_rfq_bank_email(
         else:
             instruction_text = f"Please review the updated trade specifications below and access the live portal to enter your quotation. Submission closes at <strong>{deadline_cairo_str}</strong>. Allocation decisions will be announced within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "REMINDER":
-        subject = f"REMINDER: RFQ Submission Pending - {customer_branding} - {pair_str} - {ref_no}"
+        subject = f"RFQ {ref_no} · Quote Reminder ({customer_branding})"
         banner_title = "Quotation Submission Reminder"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"This is a reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> for <strong>{customer_branding}</strong> is currently pending your submission."
@@ -663,7 +740,7 @@ def build_quotation_rfq_bank_email(
         else:
             instruction_text = f"Please review the required trade specifications below and submit your quote before the window closes at <strong>{deadline_cairo_str}</strong>. Expected result announcement: within <strong>{result_window_str}</strong> after window close."
     elif email_purpose == "BANK_APPROVAL_REQUIRED":
-        subject = f"APPROVAL REQUIRED: RFQ {ref_no} ({customer_branding}) - {pair_str}"
+        subject = f"RFQ {ref_no} · Approval Required ({customer_branding})"
         banner_title = "Bank Approval Required &bull; RFQ Authorization"
         salutation = f"Dear <strong>{bank_name} Authorized Approver</strong>,"
         intro_text = f"Your bank has been invited to participate in a new <strong>{rfq_kind_str}</strong> Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
@@ -672,7 +749,7 @@ def build_quotation_rfq_bank_email(
         else:
             instruction_text = f"In accordance with institutional governance, your bank's designated approver must authorize participation before execution dealers can enter binding quotes. Once authorized, your desk will receive immediate access to quote. The window closes at <strong>{deadline_cairo_str}</strong>, with trade results announced within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "BANK_HEADS_UP":
-        subject = f"HEADS UP: New RFQ Pending Bank Approval ({customer_branding}) - {ref_no}"
+        subject = f"RFQ {ref_no} · Pending Bank Approval ({customer_branding})"
         banner_title = "RFQ Pending Bank Approval"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"A new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong> has been received by your institution and is currently <strong>pending authorization from your bank's designated approver</strong>."
@@ -681,7 +758,7 @@ def build_quotation_rfq_bank_email(
         else:
             instruction_text = f"Please review the trade specifications below. You will receive an invitation email with a direct access link as soon as your bank's approver authorizes participation. The submission window closes at <strong>{deadline_cairo_str}</strong>, with trade results expected within <strong>{result_window_str}</strong> of closure."
     elif email_purpose == "APPROVED_BY_BANK":
-        subject = f"ACTION REQUIRED: RFQ {ref_no} Authorized - Submit Your Quote ({customer_branding})"
+        subject = f"RFQ {ref_no} · Authorized to Quote ({customer_branding})"
         banner_title = "RFQ Authorized for Desk Submission"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"Your bank's authorized approver has <strong>approved participation</strong> for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong>."
@@ -690,7 +767,7 @@ def build_quotation_rfq_bank_email(
         else:
             instruction_text = f"Your live quotation portal is now active. Please review the trade specifications below and access the live portal to enter your quotation before <strong>{deadline_cairo_str}</strong>. Trade outcome and allocation results will appear within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "WINDOW_START_REMINDER_APPROVER":
-        subject = f"URGENT: RFQ {ref_no} Opens in 15 Minutes - Authorization Pending ({customer_branding})"
+        subject = f"RFQ {ref_no} · Opens in 15m (Approval Pending)"
         banner_title = "Urgent: RFQ Window Opens in 15 Minutes &bull; Approval Required"
         salutation = f"Dear <strong>{bank_name} Authorized Approver</strong>,"
         intro_text = f"This is an urgent reminder that Request for Quotation (RFQ) <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong> will open for live quotation in <strong>15 minutes</strong>, but your bank's authorization is still <strong>pending</strong>."
@@ -699,7 +776,7 @@ def build_quotation_rfq_bank_email(
         else:
             instruction_text = f"Please authorize your bank's participation immediately via the secure link below so your execution desk can submit quotes as soon as the window opens. Submission deadline: <strong>{deadline_cairo_str}</strong>; trade results expected within <strong>{result_window_str}</strong> of window close."
     elif email_purpose == "WINDOW_START_REMINDER_EXECUTION":
-        subject = f"REMINDER: RFQ {ref_no} Opens in 15 Minutes - Prepare Your Quotation ({customer_branding})"
+        subject = f"RFQ {ref_no} · Opens in 15m"
         banner_title = "Quotation Window Opens in 15 Minutes"
         salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
         intro_text = f"This is a reminder that the live quotation window for RFQ <strong>{ref_no}</strong> on behalf of <strong>{customer_branding}</strong> will open in <strong>15 minutes</strong>."
@@ -709,13 +786,13 @@ def build_quotation_rfq_bank_email(
             instruction_text = f"Please access the quotation portal below to review terms and be ready to submit your quote when the window opens. Window closes at <strong>{deadline_cairo_str}</strong>. Trade results are announced within <strong>{result_window_str}</strong> following window close."
     else:
         if is_cross_entity_bank:
-            subject = f"INDICATIVE BENCHMARK: Group Market Quotation Request from {customer_branding} - {pair_str} - {ref_no}"
+            subject = f"RFQ {ref_no} · Indicative Request ({customer_branding})"
             banner_title = "Group Indicative Market Quotation"
             salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
             intro_text = f"You have received a <strong>non-binding indicative quotation request</strong> from <strong>{customer_branding} Group Treasury</strong> for comparative market price benchmarking."
             instruction_text = f"Please review the indicative trade specifications below and enter your quote via the secure link before <strong>{deadline_cairo_str}</strong>. This quotation request is strictly indicative for group price discovery and does not constitute a firm trade commitment."
         else:
-            subject = f"ACTION REQUIRED: New RFQ Request from {customer_branding} - {pair_str} - {ref_no}"
+            subject = f"RFQ {ref_no} · Quote Request ({customer_branding})"
             banner_title = "New Request for Quotation"
             salutation = f"Dear <strong>{bank_name} FX &amp; Treasury Desk</strong>,"
             intro_text = f"You have received a new Request for Quotation (RFQ) on behalf of <strong>{customer_branding}</strong>."
@@ -1163,7 +1240,7 @@ def build_quotation_withdrawn_bank_email(
     pair_str = f"{buy_curr}/{sell_curr}" if buy_curr and sell_curr else (buy_curr or sell_curr or rfq_type)
     amount_str = f"{float(raw_amount):,.2f}" if raw_amount is not None else "N/A"
 
-    subject = f"NOTICE OF WITHDRAWAL: RFQ {ref_no} Cancelled - {customer_branding}"
+    subject = f"RFQ {ref_no} · Cancelled ({customer_branding})"
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M EEST")
 
     html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -1316,14 +1393,15 @@ def build_bank_roster_governance_email(
     current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
     recipient_greeting = f"Hello <strong>{authorized_contact_name}</strong>," if authorized_contact_name else f"Hello <strong>{bank_name} Desk Contact</strong>,"
 
-    subject = f"[Roster Report] {bank_name} Trading Contacts – {customer_branding}"
+    bank_short = get_bank_short_label(bank_name)
+    subject = f"Trading Roster Audit · {bank_short} ({customer_branding})"
     title = "📋 Trading Contacts Report"
     intro_badge = "ROSTER REPORT"
     badge_color = "#38bdf8"
     badge_bg = "#1e293b"
-    headline = "Current Active Trading Representatives & Roles"
+    headline = "Registered & Pending Trading Representatives"
     intro_text = f"""
-    Below is the current list of authorized trading contacts registered for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform as of <strong>{current_time_str}</strong>.
+    Below is the current governance roster of active and pending trading representatives registered for <strong>{bank_name}</strong> on <strong>{customer_branding}</strong>'s Treasury Platform as of <strong>{current_time_str}</strong>.
     """
 
     # Build contacts table rows
@@ -1334,6 +1412,7 @@ def build_bank_roster_governance_email(
             continue
         c_name = (c.get("title") or c.get("name") or "—").strip()
         c_role = (c.get("role") or "EXECUTION").upper()
+        c_status = (c.get("status") or "ACTIVE").upper()
         if c_role == "EXECUTION":
             role_badge = '<span style="background: #ecfdf5; color: #047857; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 11px; border: 1px solid #a7f3d0;">⚡ Execution Dealer (Firm Bidding)</span>'
         elif c_role == "APPROVER":
@@ -1341,12 +1420,19 @@ def build_bank_roster_governance_email(
         else:
             role_badge = '<span style="background: #f1f5f9; color: #475569; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 11px; border: 1px solid #cbd5e1;">👁️ View Only</span>'
 
+        if c_status == "PENDING":
+            status_badge = '<span style="background: #fffbeb; color: #b45309; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 11px; border: 1px solid #fde68a;">⏳ Pending Handshake</span>'
+        elif c_status == "LOCKED":
+            status_badge = '<span style="background: #fef2f2; color: #be123c; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 11px; border: 1px solid #fecdd3;">🔒 Locked (OTP Exceeded)</span>'
+        else:
+            status_badge = '<span style="background: #ecfdf5; color: #047857; font-weight: 700; padding: 4px 10px; border-radius: 6px; font-size: 11px; border: 1px solid #a7f3d0;">● Active</span>'
+
         rows_html.append(f"""
         <tr style="border-bottom: 1px solid #e2e8f0;">
             <td style="padding: 12px 14px; font-family: monospace; font-size: 13px; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0;">{c_email}</td>
             <td style="padding: 12px 14px; font-size: 13px; color: #334155; border-bottom: 1px solid #e2e8f0;">{c_name}</td>
             <td style="padding: 12px 14px; font-size: 12px; border-bottom: 1px solid #e2e8f0;">{role_badge}</td>
-            <td style="padding: 12px 14px; font-size: 12px; font-weight: 700; color: #10b981; border-bottom: 1px solid #e2e8f0;">Active</td>
+            <td style="padding: 12px 14px; font-size: 12px; border-bottom: 1px solid #e2e8f0;">{status_badge}</td>
         </tr>
         """)
 
@@ -1541,7 +1627,8 @@ def build_dealer_invitation_email(
         </tr>
         """
 
-    subject = f"Invitation: Join {bank_name} Trading Desk for {customer_branding}"
+    bank_short = get_bank_short_label(bank_name)
+    subject = f"Trading Desk Invite · {bank_short} ({customer_branding})"
 
     html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" lang="en">
@@ -1707,7 +1794,7 @@ def build_dealer_handshake_otp_email(
     """
     now = datetime.now()
     current_time_str = now.strftime("%Y-%m-%d %H:%M EEST")
-    subject = f"Your Grow Treasury Verification Code: {otp_code} (Valid {valid_minutes}m)"
+    subject = f"Your Grow Treasury Verification Code (Valid {valid_minutes}m)"
 
     html_body = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" lang="en">

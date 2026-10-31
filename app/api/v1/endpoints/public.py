@@ -138,7 +138,12 @@ async def register_free_trial(
     Handles a new free trial registration from a public user.
     """
     # Perimeter Anti-Bot Honeypot Defense (§2.8)
-    await verify_honeypot(website_url, request=request, context="free_trial_registration")
+    await verify_honeypot(
+        website_url,
+        request=request,
+        context="free_trial_registration",
+        legitimate_values=[admin_email, contact_admin_name, organization_name, contact_phone]
+    )
 
     if accepted_terms.lower() != 'true':
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Terms and Conditions must be accepted.")

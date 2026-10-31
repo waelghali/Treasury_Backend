@@ -970,31 +970,20 @@ async def upload_request_document(
     if not request:
         raise HTTPException(status_code=404, detail="Request not found")
     
-    # Read file
-    file_content = await file.read()
-    file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
-    
-    # Generate unique filename
-    unique_filename = f"{document_type}_{dt.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{file_extension}"
-    
-    # Construct GCS path: {env}/customer_{customer_id}/issuance/requests/req_{request_id}/{doc_type_slug}/{unique_filename}
-    from app.core.storage_service import build_customer_blob_path
-    doc_type_slug = _slugify_doc_type(document_type)
-    blob_path = build_customer_blob_path(current_user.customer_id, "issuance/requests", f"req_{request_id}/{doc_type_slug}/{unique_filename}")
-    
-    # Get customer-specific bucket or fallback
-    from app.crud import crud_customer_configuration
-    bucket_name = GCS_BUCKET_NAME
-    bucket_config = crud_customer_configuration.get_customer_config_or_global_fallback(
-        db, current_user.customer_id, "STORAGE_BUCKET_NAME"
+    from app.services.tenant_key_service import tenant_key_service
+    from app.core.storage_service import upload_stream_to_gcs_encrypted
+
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+    stored_uri, _ = upload_stream_to_gcs_encrypted(
+        source_stream=file.file,
+        blob_name=blob_path,
+        dek=tenant_dek,
+        content_type=file.content_type or "application/octet-stream",
+        bucket_name=bucket_name,
+        context="lg_issuance_doc"
     )
-    if bucket_config and bucket_config.get('effective_value'):
-        bucket_name = bucket_config['effective_value']
-    
-    # Upload
-    stored_uri = await _upload_to_gcs(bucket_name, blob_path, file_content, file.content_type)
     if not stored_uri:
-        raise HTTPException(status_code=500, detail="Failed to upload document")
+        raise HTTPException(status_code=500, detail="Failed to upload encrypted document")
     
     # Save metadata — use systematic filename for discoverability
     doc_display_name = _make_doc_filename(document_type, f"REQ-{request_id}", file.filename)

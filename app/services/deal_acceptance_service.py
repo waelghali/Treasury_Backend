@@ -269,11 +269,14 @@ async def execute_shared_deal_decline(
     rfq_id: str,
     user_id: int,
     reason: Optional[str] = "Declined by corporate treasury desk",
-    db: Session = None
+    db: Session = None,
+    update_reason_only: bool = False
 ) -> dict:
     """
     Manually declines/rejects the deal outcome.
     Supports Maker, Corporate Admin, and Delegated Colleague.
+    When update_reason_only=True (or if the deal was already rejected in Step 1),
+    updates only the decline reason without re-triggering counterparty emails.
     """
     rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
     if not rfq:
@@ -284,6 +287,38 @@ async def execute_shared_deal_decline(
         raise HTTPException(status_code=401, detail="User not authenticated.")
 
     check_deal_authority(rfq, user, action_name="decline")
+
+    already_rejected = (rfq.acceptance_status == 'REJECTED' or rfq.status == 'REJECTED')
+
+    if update_reason_only or already_rejected:
+        rfq.admin_revision_notes = reason
+        for leg in (rfq.legs or []):
+            if leg.status == 'REJECTED':
+                leg.rejection_reason = reason
+        db.commit()
+
+        log_action(
+            db=db,
+            user_id=user.id,
+            action_type="QUOTATION_DEAL_DECLINE_REASON_UPDATED",
+            entity_type="QuotationRequest",
+            entity_id=None,
+            details={
+                "rfq_id": rfq.id,
+                "ref_no": rfq.ref_no,
+                "reason": reason,
+                "message": f"Decline reason updated by {user.email} for RFQ {rfq.ref_no}."
+            },
+            customer_id=rfq.customer_id
+        )
+
+        return {
+            "status": "success",
+            "message": f"Decline reason recorded for RFQ {rfq.ref_no}.",
+            "rfq_id": rfq.id,
+            "rfq_status": rfq.status,
+            "acceptance_status": rfq.acceptance_status
+        }
 
     now_utc = datetime.now(timezone.utc)
     rfq.status = 'REJECTED'

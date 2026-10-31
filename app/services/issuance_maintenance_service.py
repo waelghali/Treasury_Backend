@@ -458,13 +458,17 @@ class IssuanceMaintenanceService:
                     if bucket_cfg and bucket_cfg.get("effective_value"):
                         bucket = bucket_cfg["effective_value"]
 
-                loop = asyncio.new_event_loop()
-                try:
-                    gcs_uri = loop.run_until_complete(
-                        _upload_to_gcs(bucket, blob_path, delivery_document_bytes, delivery_document_mime_type)
-                    )
-                finally:
-                    loop.close()
+                import io
+                from app.services.tenant_key_service import tenant_key_service
+                from app.core.storage_service import upload_stream_to_gcs_encrypted
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, cust_id)
+                gcs_uri = upload_stream_to_gcs_encrypted(
+                    source_stream=io.BytesIO(delivery_document_bytes),
+                    destination_blob_name=blob_path,
+                    tenant_dek=tenant_dek,
+                    content_type=delivery_document_mime_type or "application/pdf",
+                    context="lg_issuance_doc"
+                )
                 if gcs_uri:
                     action.delivery_document_path = gcs_uri
                     logger.info(f"Delivery document uploaded for action {action.id}: {gcs_uri}")
@@ -555,13 +559,17 @@ class IssuanceMaintenanceService:
                     if bucket_cfg and bucket_cfg.get("effective_value"):
                         bucket = bucket_cfg["effective_value"]
 
-                loop = asyncio.new_event_loop()
-                try:
-                    gcs_uri = loop.run_until_complete(
-                        _upload_to_gcs(bucket, blob_path, bank_reply_file_bytes, bank_reply_mime_type)
-                    )
-                finally:
-                    loop.close()
+                import io
+                from app.services.tenant_key_service import tenant_key_service
+                from app.core.storage_service import upload_stream_to_gcs_encrypted
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, cust_id)
+                gcs_uri = upload_stream_to_gcs_encrypted(
+                    source_stream=io.BytesIO(bank_reply_file_bytes),
+                    destination_blob_name=blob_path,
+                    tenant_dek=tenant_dek,
+                    content_type=bank_reply_mime_type or "application/pdf",
+                    context="lg_issuance_doc"
+                )
                 if gcs_uri:
                     action.bank_reply_document_path = gcs_uri
                     logger.info(f"Bank reply document uploaded for action {action.id}: {gcs_uri}")
@@ -1290,10 +1298,18 @@ class IssuanceMaintenanceService:
         if not raw_text:
             raise HTTPException(status_code=400, detail="Could not extract text from bank letter. Please try a clearer scan.")
 
-        # Upload original to GCS for permanent storage
+        # Upload original to GCS for permanent storage encrypted
+        import io
+        from app.services.tenant_key_service import tenant_key_service
+        from app.core.storage_service import upload_stream_to_gcs_encrypted
+        tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, lg.customer_id)
         doc_blob = f"issuance/bank_initiated/{lg.lg_ref_number}_{session_id}.{mime_type.split('/')[-1]}"
-        doc_gcs_uri = asyncio.get_event_loop().run_until_complete(
-            _upload_to_gcs(target_bucket, doc_blob, file_bytes, mime_type)
+        doc_gcs_uri = upload_stream_to_gcs_encrypted(
+            source_stream=io.BytesIO(file_bytes),
+            destination_blob_name=doc_blob,
+            tenant_dek=tenant_dek,
+            content_type=mime_type or "application/pdf",
+            context="lg_issuance_doc"
         )
 
         # AI extraction — tell it this is a bank-initiated change

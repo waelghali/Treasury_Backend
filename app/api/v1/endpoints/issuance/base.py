@@ -236,6 +236,7 @@ def _make_doc_filename(doc_type: str, ref: str, original_filename: str) -> str:
 async def download_request_document(
     request_id: int,
     document_id: int,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context)
 ):
@@ -243,6 +244,7 @@ async def download_request_document(
     import os
     from app.models.models_issuance import IssuanceRequestDocument
     from fastapi.responses import FileResponse
+    from app.core.routing import get_backend_base_url
 
     doc = db.query(IssuanceRequestDocument).filter(
         IssuanceRequestDocument.id == document_id,
@@ -255,15 +257,23 @@ async def download_request_document(
     file_path = doc.file_path or ""
 
     if file_path.startswith("gs://"):
-        # Cloud Storage path — generate a signed URL
-        from app.core.ai_integration import generate_signed_gcs_url
-        signed_url = await generate_signed_gcs_url(file_path, expiration=3600)
-        if not signed_url:
-            raise HTTPException(status_code=500, detail="Could not generate download link. File may not be accessible.")
+        # Cloud Storage path — generate streaming download ticket
+        from app.api.v1.endpoints.document_streaming import generate_download_ticket
+        ticket = generate_download_ticket(
+            file_path=file_path,
+            customer_id=current_user.customer_id,
+            context="lg_issuance_doc",
+            original_filename=doc.file_name or "document.pdf",
+            mime_type="application/pdf",
+            ttl_seconds=900
+        )
+        backend_base = get_backend_base_url(request)
+        streaming_url = f"{backend_base}/api/v1/documents/download?ticket={ticket}"
         return {
             "file_name": doc.file_name,
             "document_type": doc.document_type,
-            "download_url": signed_url
+            "download_url": streaming_url,
+            "signed_url": streaming_url,
         }
     else:
         # Local file path — serve directly
@@ -408,10 +418,17 @@ async def record_handover(
             )
             
             # Organized path: {env}/customer_{customer_id}/issuance/issued_lgs/issued_{lg_id}/delivery_proofs/{file}
-            from app.core.storage_service import build_customer_blob_path
+            from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+            from app.services.tenant_key_service import tenant_key_service
             gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg_id}/delivery_proofs/{handover_display_name}")
-            file_content = await signed_copy_file.read()
-            stored_uri = await _upload_to_gcs(bucket_name, gcs_path, file_content, signed_copy_file.content_type)
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+            stored_uri = upload_stream_to_gcs_encrypted(
+                source_stream=signed_copy_file.file,
+                destination_blob_name=gcs_path,
+                tenant_dek=tenant_dek,
+                content_type=signed_copy_file.content_type or "application/pdf",
+                context="lg_issuance_doc"
+            )
             if stored_uri:
                 lg.handover_signed_copy_path = stored_uri
                 # Also save as an IssuanceRequestDocument for Documents tab visibility
@@ -463,7 +480,7 @@ async def record_handover(
 
     email_recipients = [e for e in email_recipients if e]  # Remove None/empty
 
-    subject = f"📦 LG Handover Confirmed — {lg.lg_ref_number}"
+    subject = f"LG {lg.lg_ref_number} · Handover Confirmed"
     body = f"""
     <html>
     <body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f5f5f5; padding: 20px;">
@@ -535,7 +552,7 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
 
     # Handover Ready / Verified event
     if event_type in ("VERIFIED", "HANDOVER_READY", "LG_ISSUED") and lg:
-        subject = f"🎉 Ready for Handover: LG {lg.lg_ref_number or request.serial_number} is Ready"
+        subject = f"LG {lg.lg_ref_number or request.serial_number} · Ready for Handover"
         bank_name = "—"
         if getattr(lg, 'bank', None) and getattr(lg.bank, 'name', None):
             bank_name = lg.bank.name
@@ -565,7 +582,7 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
             recipient_name=request.requestor_name or "Requestor"
         )
     elif event_type == "APPROVED_INTERNAL":
-        subject = f"✅ Approved: LG Request {request.serial_number} Fully Approved"
+        subject = f"LG Request {request.serial_number} · Approved"
         key_vals = {
             "Request Serial": request.serial_number,
             "Beneficiary": request.beneficiary_name or "—",
@@ -583,7 +600,7 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
             recipient_name=request.requestor_name or "Requestor"
         )
     elif event_type == "REVISION_REQUIRED":
-        subject = f"🔄 Action Required: Revision Requested for LG {request.serial_number}"
+        subject = f"LG Request {request.serial_number} · Revision Requested"
         key_vals = {
             "Request Serial": request.serial_number,
             "Beneficiary": request.beneficiary_name or "—",
@@ -601,7 +618,7 @@ def _send_requestor_status_notification(db, background_tasks, request, event_typ
             recipient_name=request.requestor_name or "Requestor"
         )
     elif event_type == "REQUEST_REJECTED":
-        subject = f"❌ Declined: LG Request {request.serial_number}"
+        subject = f"LG Request {request.serial_number} · Declined"
         key_vals = {
             "Request Serial": request.serial_number,
             "Beneficiary": request.beneficiary_name or "—",
@@ -681,11 +698,19 @@ async def extract_lg_copy(
                 file.filename or "scan"
             )
 
-            # Upload to GCS
-            from app.core.ai_integration import _upload_to_gcs, GCS_BUCKET_NAME
-            from app.core.storage_service import build_customer_blob_path
+            # Upload to GCS encrypted
+            import io
+            from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+            from app.services.tenant_key_service import tenant_key_service
             gcs_path = build_customer_blob_path(current_user.customer_id, "issuance/issued_lgs", f"issued_{lg_id}/bank_lg_copies/{bank_lg_copy_display_name}")
-            gcs_uri = await _upload_to_gcs(GCS_BUCKET_NAME, gcs_path, file_bytes, file.content_type or "application/octet-stream")
+            tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+            gcs_uri = upload_stream_to_gcs_encrypted(
+                source_stream=io.BytesIO(file_bytes),
+                destination_blob_name=gcs_path,
+                tenant_dek=tenant_dek,
+                content_type=file.content_type or "application/octet-stream",
+                context="lg_issuance_doc"
+            )
             if not gcs_uri:
                 raise HTTPException(status_code=500, detail="Failed to upload Bank LG Copy to cloud storage")
             file_path = gcs_uri

@@ -162,6 +162,7 @@ def run_bank_position_reconciliation(
 async def get_maintenance_document_url(
     action_id: int,
     doc_type: str,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_treasury_context),
 ):
@@ -234,13 +235,21 @@ async def get_maintenance_document_url(
             headers={"Content-Disposition": f'inline; filename="{doc_type}_{action_id}.{ext}"'}
         )
 
-    # GCS path — generate signed URL
-    from app.core.ai_integration import generate_signed_gcs_url
-    signed_url = await generate_signed_gcs_url(gcs_path, expiration=3600)
-    if not signed_url:
-        raise HTTPException(status_code=500, detail="Could not generate download URL")
+    # GCS path — generate streaming download ticket
+    from app.api.v1.endpoints.document_streaming import generate_download_ticket
+    from app.core.routing import get_backend_base_url
 
-    return {"download_url": signed_url, "doc_type": doc_type}
+    ticket = generate_download_ticket(
+        file_path=gcs_path,
+        customer_id=current_user.customer_id,
+        context="lg_issuance_doc",
+        original_filename=f"{doc_type}_{action_id}.pdf",
+        mime_type="application/pdf",
+        ttl_seconds=900
+    )
+    backend_base = get_backend_base_url(request)
+    streaming_url = f"{backend_base}/api/v1/documents/download?ticket={ticket}"
+    return {"download_url": streaming_url, "signed_url": streaming_url, "doc_type": doc_type}
 
 
 @router.get("/maintenance/{action_id}/serve-letter")
