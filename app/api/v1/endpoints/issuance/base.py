@@ -233,7 +233,7 @@ def _make_doc_filename(doc_type: str, ref: str, original_filename: str) -> str:
     return f"{doc_slug}_{clean_ref}_{today}_{clean_base}.{ext.lower()}"
 
 @router.get("/requests/{request_id}/documents/{document_id}/download")
-async def download_request_document(
+def download_request_document(
     request_id: int,
     document_id: int,
     request: Request = None,

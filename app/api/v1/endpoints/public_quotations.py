@@ -101,7 +101,7 @@ def _validate_rfq_accessible_for_dealers(rfq):
         )
 
 @router.get("/{token}")
-async def get_rfq_by_token(token: str, request: Request, db: Session = Depends(get_db)):
+def get_rfq_by_token(token: str, request: Request, db: Session = Depends(get_db)):
     """Fetch RFQ details securely using token."""
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
@@ -2036,7 +2036,7 @@ def get_dealer_achievements_endpoint(
     )
 
 @router.post("/{token}/approve")
-async def approve_rfq_for_bank(
+def approve_rfq_for_bank(
     token: str,
     action_in: BankApprovalActionCreate,
     background_tasks: BackgroundTasks,
@@ -2397,7 +2397,7 @@ def get_bank_quotation_history(
     }
 
 @router.get("/{token}/result")
-async def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
+def get_public_rfq_result(token: str, db: Session = Depends(get_db)):
     assignment = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.token == token).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Invalid token")

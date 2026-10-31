@@ -96,7 +96,7 @@ def verify_access_token(token: str) -> Dict[str, Any]:
 # --- Dependencies ---
 
 
-async def get_current_user(
+def get_current_user(
     request: Request,
     response: Response,
     token: Optional[str] = Depends(oauth2_scheme),
@@ -189,7 +189,7 @@ async def get_current_user(
     return token_data
 
 
-async def get_current_active_user(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+def get_current_active_user(current_user: TokenData = Depends(get_current_user)) -> TokenData:
     """Ensures user is authenticated and enforces password change policy."""
     if current_user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
@@ -228,7 +228,7 @@ def check_for_read_only_mode(current_user: TokenData = Depends(check_subscriptio
     return current_user
 
 
-async def get_current_system_owner(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+def get_current_system_owner(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
     """Restricts access to System Owners only."""
     if current_user.role != UserRole.SYSTEM_OWNER:
         raise HTTPException(
@@ -238,7 +238,7 @@ async def get_current_system_owner(current_user: TokenData = Depends(get_current
     return current_user
 
 
-async def get_current_corporate_admin_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def get_current_corporate_admin_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Restricts access to Corporate Admins and ensures data integrity."""
     if current_user.role != UserRole.CORPORATE_ADMIN:
         raise HTTPException(
@@ -253,7 +253,7 @@ async def get_current_corporate_admin_context(current_user: TokenData = Depends(
     return current_user
 
 
-async def get_current_approver_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def get_current_approver_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Allows Corporate Admins and Checkers to perform approval actions on issuance requests."""
     allowed_roles = [UserRole.CORPORATE_ADMIN, UserRole.CHECKER]
     if current_user.role not in allowed_roles:
@@ -269,7 +269,7 @@ async def get_current_approver_context(current_user: TokenData = Depends(check_s
     return current_user
 
 
-async def get_current_treasury_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def get_current_treasury_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Restricts execution actions (reserve, issue, release, submit, cancel) to End Users only.
     Corporate Admins are managers who view and approve but do not execute."""
     if current_user.role != UserRole.END_USER:
@@ -285,7 +285,7 @@ async def get_current_treasury_context(current_user: TokenData = Depends(check_s
     return current_user
 
 
-async def get_issuance_read_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def get_issuance_read_context(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Allows End Users, Corporate Admins, and Checkers to view issuance data (read-only access)."""
     allowed_roles = [UserRole.END_USER, UserRole.CORPORATE_ADMIN, UserRole.CHECKER]
     if current_user.role not in allowed_roles:
@@ -301,7 +301,7 @@ async def get_issuance_read_context(current_user: TokenData = Depends(check_subs
     return current_user
 
 
-async def get_verified_user(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+def get_verified_user(current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
     """Ensures user has completed MFA if required."""
     if not current_user.is_mfa_verified:
         raise HTTPException(
@@ -315,7 +315,7 @@ class HasPermission:
     def __init__(self, permission_name: str):
         self.permission_name = permission_name
 
-    async def __call__(self, current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+    def __call__(self, current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
         if self.permission_name not in current_user.permissions:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -326,7 +326,7 @@ class HasPermission:
 
 # --- Module Access Guards ---
 
-async def require_issuance_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def require_issuance_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Blocks access if the customer's subscription does not include the LG Issuance module."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user
@@ -338,7 +338,7 @@ async def require_issuance_module(current_user: TokenData = Depends(check_subscr
     return current_user
 
 
-async def require_custody_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def require_custody_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Blocks access if the customer's subscription does not include the LG Custody module."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user
@@ -350,7 +350,7 @@ async def require_custody_module(current_user: TokenData = Depends(check_subscri
     return current_user
 
 
-async def require_issuance_or_custody_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def require_issuance_or_custody_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Allows access if the customer has EITHER the Issuance or Custody module.
     Used as the router-level guard for shared endpoints (Approval Center, change requests, etc.)."""
     if current_user.role == UserRole.SYSTEM_OWNER:
@@ -363,7 +363,7 @@ async def require_issuance_or_custody_module(current_user: TokenData = Depends(c
     return current_user
 
 
-async def require_quotation_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def require_quotation_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Blocks access if the customer's subscription does not include the Quotations module."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user
@@ -375,7 +375,7 @@ async def require_quotation_module(current_user: TokenData = Depends(check_subsc
     return current_user
 
 
-async def require_reconciliation_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def require_reconciliation_module(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Blocks access if the customer's subscription does not include the Bank Reconciliation module."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user
@@ -387,7 +387,7 @@ async def require_reconciliation_module(current_user: TokenData = Depends(check_
     return current_user
 
 
-async def require_email_inbox_feature(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
+def require_email_inbox_feature(current_user: TokenData = Depends(check_subscription_status)) -> TokenData:
     """Blocks access if the customer's subscription does not include the Smart Inbox feature."""
     if current_user.role == UserRole.SYSTEM_OWNER:
         return current_user

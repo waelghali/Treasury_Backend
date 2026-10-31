@@ -52,7 +52,7 @@ class AIQueryResponse(BaseModel):
 
 
 @router.post("/chat", response_model=AIQueryResponse)
-async def query_ai_assistant(
+def query_ai_assistant(
     payload: AIQueryRequest,
     current_user: TokenData = Depends(get_current_active_user),
     db: Session = Depends(get_db)

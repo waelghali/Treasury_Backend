@@ -202,7 +202,7 @@ def create_document_download_ticket(
 
 
 @router.get("/download")
-async def download_document_stream(
+def download_document_stream(
     gcs_uri: Optional[str] = Query(None, description="GCS URI of the document"),
     ticket: Optional[str] = Query(None, description="15-minute signed ephemeral ticket"),
     auth_token: Optional[str] = Query(None, description="Corporate User JWT (query param fallback)"),

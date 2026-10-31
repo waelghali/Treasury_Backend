@@ -2113,7 +2113,7 @@ def get_pending_maintenance_actions(
 
 
 @router.post("/maintenance/upload-document")
-async def upload_maintenance_document(
+def upload_maintenance_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_treasury_context),

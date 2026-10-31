@@ -119,7 +119,7 @@ def restore_facility(
     return crud_facility.restore(db, facility_id=facility_id, user_id=current_user.user_id)
 
 @router.post("/upload-attachment")
-async def upload_facility_attachment(
+def upload_facility_attachment(
     file: UploadFile = File(...),
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):

@@ -1043,7 +1043,7 @@ Return ONLY the JSON, no markdown formatting or explanation."""
 # ==============================================================================
 
 @router.get("/staged", status_code=status.HTTP_200_OK)
-async def get_staged_issuance_records(
+def get_staged_issuance_records(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
     status_filter: Optional[str] = None,
@@ -1096,7 +1096,7 @@ async def get_staged_issuance_records(
 
 
 @router.put("/staged/{record_id}", status_code=status.HTTP_200_OK)
-async def update_staged_issuance_record(
+def update_staged_issuance_record(
     record_id: int,
     updated_data: Dict[str, Any],
     current_user: TokenData = Depends(get_current_corporate_admin_context),
@@ -1156,7 +1156,7 @@ async def update_staged_issuance_record(
 
 
 @router.delete("/staged/{record_id}", status_code=status.HTTP_200_OK)
-async def delete_staged_issuance_record(
+def delete_staged_issuance_record(
     record_id: int,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1178,7 +1178,7 @@ async def delete_staged_issuance_record(
 
 
 @router.post("/staged/delete-multiple", status_code=status.HTTP_200_OK)
-async def delete_multiple_staged_issuance_records(
+def delete_multiple_staged_issuance_records(
     body: DeleteRecordsRequest,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1196,7 +1196,7 @@ async def delete_multiple_staged_issuance_records(
 
 
 @router.post("/staged/re-validate-multiple", status_code=status.HTTP_200_OK)
-async def revalidate_multiple_issuance_records(
+def revalidate_multiple_issuance_records(
     body: RevalidateRequest,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1222,7 +1222,7 @@ async def revalidate_multiple_issuance_records(
 
 
 @router.post("/staged/bulk-edit", status_code=status.HTTP_200_OK)
-async def bulk_edit_staged_issuance_records(
+def bulk_edit_staged_issuance_records(
     body: BulkEditRequest,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1274,7 +1274,7 @@ async def bulk_edit_staged_issuance_records(
 # ==============================================================================
 
 @router.post("/preview-history", status_code=status.HTTP_200_OK)
-async def preview_history(
+def preview_history(
     body: HistoryPreviewRequest,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1346,7 +1346,7 @@ async def preview_history(
 # ==============================================================================
 
 @router.post("/import-ready", status_code=status.HTTP_200_OK)
-async def import_ready_issuance_records(
+def import_ready_issuance_records(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
 ):
@@ -1561,7 +1561,7 @@ async def import_ready_issuance_records(
 # ==============================================================================
 
 @router.get("/report", status_code=status.HTTP_200_OK)
-async def get_issuance_migration_report(
+def get_issuance_migration_report(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
 ):

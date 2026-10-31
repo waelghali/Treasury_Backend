@@ -85,7 +85,7 @@ class DealerRecoveryVerifyEmailRequest(BaseModel):
 # AUTH DEPENDENCY
 # ==============================================================================
 
-async def get_current_dealer(
+def get_current_dealer(
     request: Request,
     db: Session = Depends(get_db)
 ) -> QuotationBankDealer:
@@ -152,7 +152,7 @@ async def get_current_dealer(
 # ==============================================================================
 
 @router.post("/auth/enroll/initiate")
-async def initiate_dealer_enrollment(
+def initiate_dealer_enrollment(
     req: DealerEnrollInitiateRequest,
     background_tasks: BackgroundTasks,
     request: Request,
@@ -346,7 +346,7 @@ async def initiate_dealer_enrollment(
 
 
 @router.post("/auth/enroll/verify-email")
-async def verify_dealer_email_otp(
+def verify_dealer_email_otp(
     req: DealerEnrollVerifyEmailRequest,
     db: Session = Depends(get_db)
 ):
@@ -437,7 +437,7 @@ async def verify_dealer_email_otp(
 
 
 @router.post("/auth/enroll/confirm-totp")
-async def confirm_dealer_totp_and_activate(
+def confirm_dealer_totp_and_activate(
     req: DealerEnrollConfirmTotpRequest,
     db: Session = Depends(get_db)
 ):
@@ -533,7 +533,7 @@ async def confirm_dealer_totp_and_activate(
 # ==============================================================================
 
 @router.post("/auth/recovery/initiate")
-async def initiate_dealer_recovery(
+def initiate_dealer_recovery(
     req: DealerRecoveryInitiateRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
@@ -660,7 +660,7 @@ async def initiate_dealer_recovery(
 
 
 @router.post("/auth/recovery/verify-email")
-async def verify_dealer_recovery_otp(
+def verify_dealer_recovery_otp(
     req: DealerRecoveryVerifyEmailRequest,
     db: Session = Depends(get_db)
 ):
@@ -754,7 +754,7 @@ async def verify_dealer_recovery_otp(
 # ==============================================================================
 
 @router.post("/auth/login")
-async def dealer_login(
+def dealer_login(
     req: DealerLoginRequest,
     db: Session = Depends(get_db)
 ):
@@ -869,7 +869,7 @@ async def dealer_login(
 # ==============================================================================
 
 @router.get("/auth/me")
-async def get_dealer_profile(
+def get_dealer_profile(
     current_dealer: QuotationBankDealer = Depends(get_current_dealer)
 ):
     """
@@ -890,7 +890,7 @@ class ClaimDeskRequest(BaseModel):
 
 
 @router.get("/blotter/live-rfqs")
-async def get_live_rfq_blotter(
+def get_live_rfq_blotter(
     current_dealer: QuotationBankDealer = Depends(get_current_dealer),
     db: Session = Depends(get_db)
 ):
@@ -1104,7 +1104,7 @@ async def get_live_rfq_blotter(
 
 
 @router.get("/blotter/history")
-async def get_historical_trades_blotter(
+def get_historical_trades_blotter(
     current_dealer: QuotationBankDealer = Depends(get_current_dealer),
     db: Session = Depends(get_db)
 ):
@@ -1444,7 +1444,7 @@ async def get_historical_trades_blotter(
 
 
 @router.post("/blotter/claim-desk")
-async def claim_rfq_desk_lock(
+def claim_rfq_desk_lock(
     req: ClaimDeskRequest,
     current_dealer: QuotationBankDealer = Depends(get_current_dealer),
     db: Session = Depends(get_db)
@@ -1482,7 +1482,7 @@ async def claim_rfq_desk_lock(
 
 
 @router.get("/achievements")
-async def get_dealer_desk_achievements(
+def get_dealer_desk_achievements(
     current_dealer: QuotationBankDealer = Depends(get_current_dealer),
     db: Session = Depends(get_db)
 ):

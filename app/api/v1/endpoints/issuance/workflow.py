@@ -1098,7 +1098,7 @@ async def record_bank_reply(
 # ── Cancellation Notice Endpoints ─────────────────────────────────────
 
 @router.get("/lg-records/{lg_id}/cancellation-notice-pdf")
-async def download_cancellation_notice_pdf(
+def download_cancellation_notice_pdf(
     lg_id: int,
     request: Request = None,
     db: Session = Depends(get_db),

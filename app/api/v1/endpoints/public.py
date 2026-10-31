@@ -238,7 +238,7 @@ async def register_free_trial(
 
 
 @router.get("/documents/", tags=["Public"], response_class=FileResponse)
-async def serve_document(
+def serve_document(
     file_path: str = Query(..., description="The path to the document to be served."),
     db: Session = Depends(get_db)
 ):

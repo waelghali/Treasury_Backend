@@ -180,7 +180,7 @@ async def check_and_handle_document(
 
 # --- UPDATED: get_current_end_user_context dependency now checks subscription status ---
 
-async def get_current_end_user_context(
+def get_current_end_user_context(
     current_user: TokenData = Depends(check_subscription_status)
 ) -> TokenData:
     """
@@ -270,7 +270,7 @@ INSTRUCTION_TYPES_REQUIRING_PRINTING = [
     dependencies=[Depends(HasPermission("lg_record:extend")), Depends(check_subscription_status)],
     summary="Get candidates and suggested dates for auto and forced renewal preview"
 )
-async def get_auto_renewal_preview_endpoint(
+def get_auto_renewal_preview_endpoint(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -346,7 +346,7 @@ async def run_auto_renewal_endpoint(
 
 
 @router.get("/status", dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_end_user_status(
+def get_end_user_status(
     current_user: TokenData = Depends(get_current_end_user_context)
 ):
     """
@@ -905,7 +905,7 @@ async def scan_amendment_letter_file(
             detail="An error occurred during AI analysis. Please try again or proceed manually."
         )
 @router.get("/internal-owner-contacts/lookup-by-email/", response_model=Optional[InternalOwnerContactOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def lookup_internal_owner_by_email(
+def lookup_internal_owner_by_email(
     email: str = Query(..., description="Email of the internal owner contact to lookup"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
@@ -929,7 +929,7 @@ async def lookup_internal_owner_by_email(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
     summary="Retrieve all internal owner contacts for the current customer with LG count"
 )
-async def list_internal_owner_contacts_with_lg_count(
+def list_internal_owner_contacts_with_lg_count(
     db: Session = Depends(get_db),
     current_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -949,7 +949,7 @@ async def list_internal_owner_contacts_with_lg_count(
     dependencies=[Depends(HasPermission("lg_document:view")), Depends(check_subscription_status)], # ADDED dependency
     summary="Retrieve a time-limited signed URL for viewing a private LG document"
 )
-async def view_lg_document_securely(
+def view_lg_document_securely(
     document_id: int,
     request: Request = None,
     db: Session = Depends(get_db),
@@ -1014,7 +1014,7 @@ async def view_lg_document_securely(
     return {"signed_url": streaming_url, "download_url": streaming_url}
 
 @router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
-async def list_lg_records(
+def list_lg_records(
     skip: int = 0,
     limit: Optional[int] = Query(None, description="Filter limit. Defaults to None (fetches all records)."),
     internal_owner_contact_id: Optional[int] = Query(None, description="Filter LG records by the ID of the internal owner contact"),
@@ -1057,7 +1057,7 @@ async def list_lg_records(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Retrieve a single LG record by ID"
 )
-async def get_lg_record_by_id(
+def get_lg_record_by_id(
     lg_record_id: int,
     db: Session = Depends(get_db),
     current_user_context: TokenData = Depends(get_current_end_user_context)
@@ -2799,7 +2799,7 @@ async def confirm_instruction_delivery_api(
     dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
     summary="Cancel pending delivery recording to re-upload document"
 )
-async def cancel_instruction_delivery_api(
+def cancel_instruction_delivery_api(
     instruction_id: int,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -3346,7 +3346,7 @@ async def confirm_bank_reply_api(
     dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_for_read_only_mode)],
     summary="Cancel pending bank reply recording to re-upload document"
 )
-async def cancel_bank_reply_api(
+def cancel_bank_reply_api(
     instruction_id: int,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -3360,7 +3360,7 @@ async def cancel_bank_reply_api(
     dependencies=[Depends(HasPermission("lg_record:create")), Depends(check_for_read_only_mode)], # ADDED dependency
     summary="Maker withdraws a pending approval request"
 )
-async def withdraw_approval_request(
+def withdraw_approval_request(
     request_id: int,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -3403,7 +3403,7 @@ async def withdraw_approval_request(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
     summary="Retrieve current user's pending approval requests"
 )
-async def get_my_pending_approval_requests(
+def get_my_pending_approval_requests(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
     skip: int = 0,
@@ -3600,7 +3600,7 @@ async def view_lg_instruction_letter(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Generate and view/print a formal Bank Reply Discrepancy Notice letter after Corporate Admin rejects bank-modified terms"
 )
-async def view_bank_reply_discrepancy_letter(
+def view_bank_reply_discrepancy_letter(
     instruction_id: int,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -4053,7 +4053,7 @@ async def mark_instruction_as_accessed_for_print(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
     summary="Retrieve lifecycle history for a specific LG record"
 )
-async def get_lg_record_lifecycle_history(
+def get_lg_record_lifecycle_history(
     lg_record_id: int,
     db: Session = Depends(get_db),
     current_user_context: TokenData = Depends(get_current_end_user_context),
@@ -4091,7 +4091,7 @@ async def get_lg_record_lifecycle_history(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
     summary="Retrieve a specific effective customer configuration by key"
 )
-async def get_customer_configuration_for_end_user(
+def get_customer_configuration_for_end_user(
     config_key: GlobalConfigKey, # Use the Enum for validation
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -4112,7 +4112,7 @@ async def get_customer_configuration_for_end_user(
     return CustomerConfigurationOut(**config)
 
 @router.get("/users/lookup-by-email/", response_model=Optional[UserOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def lookup_system_user_by_email(
+def lookup_system_user_by_email(
     email: str = Query(..., description="Email of the system user to lookup"),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
@@ -4131,7 +4131,7 @@ async def lookup_system_user_by_email(
     return user
 
 @router.get("/customer-entities/", response_model=List[CustomerEntityOut], dependencies=[Depends(check_subscription_status)])
-async def get_customer_entities_for_end_user(
+def get_customer_entities_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -4158,7 +4158,7 @@ async def get_customer_entities_for_end_user(
 
 
 @router.get("/currencies/", response_model=List[CurrencyOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_currencies_for_end_user(
+def get_currencies_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4169,7 +4169,7 @@ async def get_currencies_for_end_user(
     return currencies
 
 @router.get("/lg-types/", response_model=List[LgTypeOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_lg_types_for_end_user(
+def get_lg_types_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4180,7 +4180,7 @@ async def get_lg_types_for_end_user(
     return lg_types
 
 @router.get("/banks/", response_model=List[BankOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_banks_for_end_user(
+def get_banks_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4191,7 +4191,7 @@ async def get_banks_for_end_user(
     return banks
 
 @router.get("/issuing-methods/", response_model=List[IssuingMethodOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_issuing_methods_for_end_user(
+def get_issuing_methods_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4202,7 +4202,7 @@ async def get_issuing_methods_for_end_user(
     return issuing_methods
 
 @router.get("/rules/", response_model=List[RuleOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_rules_for_end_user(
+def get_rules_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4213,7 +4213,7 @@ async def get_rules_for_end_user(
     return rules
 
 @router.get("/lg-statuses/", response_model=List[LgStatusOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_lg_statuses_for_end_user(
+def get_lg_statuses_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4224,7 +4224,7 @@ async def get_lg_statuses_for_end_user(
     return lg_statuses
 
 @router.get("/lg-operational-statuses/", response_model=List[LgOperationalStatusOut], dependencies=[Depends(check_subscription_status)]) # ADDED dependency
-async def get_lg_operational_statuses_for_end_user(
+def get_lg_operational_statuses_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     skip: int = 0,
@@ -4235,7 +4235,7 @@ async def get_lg_operational_statuses_for_end_user(
     return lg_operational_statuses
 
 @router.get("/lg-categories/", response_model=List[LGCategoryOut], dependencies=[Depends(check_subscription_status)])
-async def get_lg_categories_for_end_user(
+def get_lg_categories_for_end_user(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("lg_record:create")),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -4478,7 +4478,7 @@ async def generate_all_eligible_bank_reminders_pdf_api(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Get LG Records approaching expiry/renewal for Action Center"
 )
-async def get_action_center_lg_for_renewal(
+def get_action_center_lg_for_renewal(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -4500,7 +4500,7 @@ async def get_action_center_lg_for_renewal(
     dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_subscription_status)],
     summary="Get LG Instructions awaiting delivery confirmation for Action Center"
 )
-async def get_action_center_instructions_undelivered(
+def get_action_center_instructions_undelivered(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -4535,7 +4535,7 @@ async def get_action_center_instructions_undelivered(
     dependencies=[Depends(HasPermission("lg_instruction:update_status")), Depends(check_subscription_status)],
     summary="Get LG Instructions awaiting bank reply for Action Center"
 )
-async def get_action_center_instructions_awaiting_reply(
+def get_action_center_instructions_awaiting_reply(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -4579,7 +4579,7 @@ async def get_action_center_instructions_awaiting_reply(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
     summary="Get approved LG record actions that require printing and are not yet printed"
 )
-async def get_approved_requests_pending_print(
+def get_approved_requests_pending_print(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
     skip: int = 0,
@@ -4641,7 +4641,7 @@ async def get_approved_requests_pending_print(
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
     summary="Get LG instructions where bank-modified terms were rejected by Corporate Admin and a Discrepancy Notice letter is ready to print"
 )
-async def get_discrepancy_letters_pending_print(
+def get_discrepancy_letters_pending_print(
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
 ):
@@ -4692,7 +4692,7 @@ async def get_discrepancy_letters_pending_print(
     dependencies=[Depends(check_subscription_status)],
     summary="Get current user's dashboard information"
 )
-async def get_current_user_dashboard_info(
+def get_current_user_dashboard_info(
     db: Session = Depends(get_db),
     current_user_token: TokenData = Depends(get_current_active_user),
 ):

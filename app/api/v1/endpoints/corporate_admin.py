@@ -126,7 +126,7 @@ def check_for_read_only_mode(
 
 # --- Corporate Admin API Status ---
 @router.get("/status", dependencies=[Depends(check_subscription_status)])
-async def get_corporate_admin_status(
+def get_corporate_admin_status(
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
@@ -1765,7 +1765,7 @@ async def approve_approval_request(
     dependencies=[Depends(check_for_read_only_mode)],
     summary="Reject a pending approval request"
 )
-async def reject_approval_request(
+def reject_approval_request(
     request_id: int,
     reason: str = Body(..., embed=True, description="Reason for rejecting the approval request"),
     db: Session = Depends(get_db),

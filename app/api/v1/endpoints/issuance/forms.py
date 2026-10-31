@@ -1141,7 +1141,7 @@ def _find_best_matching_bank_form(
 
 
 @router.post("/bank-forms/auto-fill/{request_id}")
-async def auto_fill_bank_form(
+def auto_fill_bank_form(
     request_id: int,
     bank_id: int = Query(..., description="The bank to find forms for"),
     form_role: str = Query("PRIMARY_ISSUER", description="PRIMARY_ISSUER / THIRD_PARTY_INDEMNITY"),

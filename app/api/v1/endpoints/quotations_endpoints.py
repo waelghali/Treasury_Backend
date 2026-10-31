@@ -87,7 +87,7 @@ async def upload_quotation_documents(
 
 
 @router.post("/documents/ticket", response_model=DocumentTicketOut)
-async def create_document_download_ticket(
+def create_document_download_ticket(
     req: DocumentTicketRequest,
     request: Request,
     db: Session = Depends(get_db)
@@ -306,7 +306,7 @@ async def create_document_download_ticket(
 
 
 @router.get("/documents/download")
-async def download_quotation_document(
+def download_quotation_document(
     gcs_uri: Optional[str] = Query(None, description="GCS URI of the document to download"),
     ticket: Optional[str] = Query(None, description="15-minute signed ephemeral download ticket"),
     token: Optional[str] = Query(None, description="Bank Dealer invitation token"),
@@ -4953,7 +4953,7 @@ async def send_rfq_results(
     return {"message": f"Result emails sent to participating banks ({res.get('dispatched_count', 0)} emails sent)."}
 
 @router.post("/{rfq_id}/resend-invite/{quotation_bank_id}")
-async def resend_rfq_bank_invite(
+def resend_rfq_bank_invite(
     rfq_id: str,
     quotation_bank_id: int,
     background_tasks: BackgroundTasks,

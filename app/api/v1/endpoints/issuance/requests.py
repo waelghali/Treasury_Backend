@@ -485,7 +485,7 @@ async def generate_issuance_letter(
     )
 
 @router.get("/requests/{request_id}/letter-fields-check")
-async def check_letter_fields(
+def check_letter_fields(
     request_id: int,
     bank_id: Optional[int] = Query(None, description="Selected bank for resolving bank account info"),
     db: Session = Depends(get_db),
@@ -949,7 +949,7 @@ def beneficiary_nearmatch(
 from fastapi import UploadFile, File
 
 @router.post("/requests/{request_id}/documents")
-async def upload_request_document(
+def upload_request_document(
     request_id: int,
     document_type: str = Query(..., description="CONTRACT, PURCHASE_ORDER, THIRD_PARTY, SPECIAL_WORDING, OTHER"),
     file: UploadFile = File(...),

@@ -426,6 +426,9 @@ def configure_app_instance(fastapi_app: FastAPI):
                             logger.info("Template auto-sync: all templates up-to-date.")
             except Exception as tpl_err:
                 logger.warning(f"Template auto-sync skipped: {tpl_err}")
+            finally:
+                # Dispose connections opened in the master process before Gunicorn forks workers
+                engine.dispose()
         else:
             logger.critical("FATAL: No SQLAlchemy models registered. Tables cannot be created.")
             sys.exit(1)

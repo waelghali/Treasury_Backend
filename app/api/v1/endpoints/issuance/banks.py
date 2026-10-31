@@ -128,7 +128,7 @@ from app.models.models_issuance import BankFormTemplate
 
 
 @router.post("/bank-forms/{form_id}/fill/{request_id}")
-async def fill_bank_form(
+def fill_bank_form(
     form_id: int,
     request_id: int,
     db: Session = Depends(get_db),

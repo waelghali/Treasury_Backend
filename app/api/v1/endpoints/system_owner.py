@@ -267,7 +267,7 @@ def get_system_notification_analytics(
     return crud_system_notification.get_analytics(db, notification_id=notification_id)
 
 @router.get("/system-notifications-types", response_model=List[str])
-async def read_system_notification_types(
+def read_system_notification_types(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_notification:view"))
 ):
@@ -400,7 +400,7 @@ def restore_system_notification(
     return crud_system_notification.restore(db, db_obj=db_notification, user_id=current_user.user_id)
 
 @router.get("/status")
-async def get_system_status():
+def get_system_status():
     """
     Checks the status of the System Owner API.
     This endpoint does not require authentication or specific permissions.
@@ -3581,7 +3581,7 @@ def read_trial_registrations(
     return [TrialRegistrationOut.model_validate(reg) for reg in registrations]
 
 @trial_router.post("/trial-registrations/{registration_id}/approve", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
-async def approve_trial_registration(
+def approve_trial_registration(
     registration_id: int,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_owner:approve_trial_registration")),

@@ -177,7 +177,7 @@ def public_verify_domain(
     return {"message": "Verification code sent."}
 
 @router.post("/verify-otp")
-async def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
+def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
     email = payload.get("email", "").lower()
     otp_code = payload.get("otp", "")
 
@@ -1142,7 +1142,7 @@ def public_beneficiary_suggest(
 # --- DOCUMENT UPLOAD (PUBLIC PORTAL) ---
 
 @router.post("/requests/{request_id}/documents")
-async def public_upload_document(
+def public_upload_document(
     request_id: int,
     token: str = Query(...),
     document_type: str = Query(..., description="CONTRACT, PURCHASE_ORDER, THIRD_PARTY, SPECIAL_WORDING, OTHER"),
@@ -1479,7 +1479,7 @@ def public_get_my_issued_lgs(
 
 
 @router.post("/maintenance/upload-document")
-async def public_upload_maintenance_document(
+def public_upload_maintenance_document(
     token: str = Query(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),

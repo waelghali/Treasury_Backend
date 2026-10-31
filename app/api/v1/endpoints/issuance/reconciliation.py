@@ -253,7 +253,7 @@ async def get_maintenance_document_url(
 
 
 @router.get("/maintenance/{action_id}/serve-letter")
-async def serve_maintenance_letter(
+def serve_maintenance_letter(
     action_id: int,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_treasury_context),

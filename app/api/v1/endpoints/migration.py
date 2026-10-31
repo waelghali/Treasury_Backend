@@ -606,7 +606,7 @@ async def upload_structured_file_for_staging(
 
 
 @router.post("/manual-entry", status_code=status.HTTP_201_CREATED, response_model=LGMigrationStagingOut)
-async def manual_entry_staged_record(
+def manual_entry_staged_record(
     record_in: LGMigrationStagingIn,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -683,7 +683,7 @@ async def manual_entry_staged_record(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create manual staged record: {e}")
 
 @router.post("/process-staged", response_model=ProcessingSummaryOut, status_code=status.HTTP_200_OK)
-async def process_staged_records_endpoint(
+def process_staged_records_endpoint(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
 ):
@@ -693,7 +693,7 @@ async def process_staged_records_endpoint(
     )
 
 @router.post("/staged/{record_id}/re-validate", response_model=LGMigrationStagingOut, status_code=status.HTTP_200_OK)
-async def re_validate_staged_record(
+def re_validate_staged_record(
     record_id: int,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -714,7 +714,7 @@ async def re_validate_staged_record(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Re-validation failed: {e}")
 
 @router.post("/staged/re-validate-multiple", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
-async def re_validate_multiple_staged_records(
+def re_validate_multiple_staged_records(
     revalidate_in: RevalidateRecordsIn,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -979,7 +979,7 @@ async def import_historical_records(
     }
 
 @router.get("/report", response_model=MigrationReportOut, status_code=status.HTTP_200_OK)
-async def get_migration_report(
+def get_migration_report(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
 ):
@@ -1007,7 +1007,7 @@ async def get_migration_report(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate migration report: {e}")
 
 @router.get("/batches", response_model=List[MigrationBatchOut], status_code=status.HTTP_200_OK)
-async def get_migration_batches(
+def get_migration_batches(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
     skip: int = 0,
@@ -1172,7 +1172,7 @@ class DeleteRecordsIn(BaseModel):
     ids: List[int]
 
 @router.delete("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=Dict[str, str])
-async def delete_staged_record(
+def delete_staged_record(
     record_id: int,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1192,7 +1192,7 @@ async def delete_staged_record(
 
 
 @router.post("/staged/delete-multiple", status_code=status.HTTP_200_OK, response_model=Dict[str, int])
-async def delete_multiple_staged_records(
+def delete_multiple_staged_records(
     delete_in: DeleteRecordsIn,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
@@ -1206,7 +1206,7 @@ async def delete_multiple_staged_records(
     return {"deleted_count": deleted_count}
 
 @router.post("/upload-unstructured", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any])
-async def upload_unstructured_file_for_staging(
+def upload_unstructured_file_for_staging(
     file: UploadFile = File(...),
     current_user: TokenData = Depends(get_current_corporate_admin_context),
 ):
@@ -1218,7 +1218,7 @@ async def upload_unstructured_file_for_staging(
 
 
 @router.get("/staged", status_code=status.HTTP_200_OK, response_model=List[LGMigrationStagingOut])
-async def get_staged_records(
+def get_staged_records(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
     db: Session = Depends(get_db),
     status_filter: Optional[MigrationRecordStatusEnum] = None,
@@ -1252,7 +1252,7 @@ async def audit_staged_data(
     return results
 
 @router.put("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=LGMigrationStagingOut)
-async def update_staged_record(
+def update_staged_record(
     record_id: int,
     complete_record_data: Dict[str, Any],
     current_user: TokenData = Depends(get_current_corporate_admin_context),
@@ -1273,7 +1273,7 @@ async def update_staged_record(
     return record
 
 @router.post("/import/{record_id}", status_code=status.HTTP_201_CREATED, response_model=Dict[str, str])
-async def import_staged_record(
+def import_staged_record(
     record_id: int,
     current_user: TokenData = Depends(get_current_corporate_admin_context),
 ):

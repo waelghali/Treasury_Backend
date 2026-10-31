@@ -56,7 +56,7 @@ except Exception as e:
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
 # FIX: Refactor to a self-contained dependency to avoid injection issues
-async def get_current_report_user_context(
+def get_current_report_user_context(
     current_user_active: TokenData = Depends(get_current_active_user)
 ) -> Dict[str, Any]:
     """
@@ -167,7 +167,7 @@ def _export_to_csv(data: List[Dict[str, Any]], filename: str) -> Response:
 
 # FIX: Remove the redundant /reports prefix from all endpoint decorators.
 @router.get("/system-owner/system-usage-overview", response_model=SystemUsageOverviewReportOut)
-async def get_system_usage_overview(
+def get_system_usage_overview(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
     export_format: Optional[str] = Query(None, description="Set to 'csv' to export as CSV. Default: JSON."),
@@ -263,7 +263,7 @@ def get_bank_market_share(
 
 # FIX: Remove the redundant /reports prefix from all endpoint decorators.
 @router.get("/corporate-admin/lg-performance", response_model=CustomerLGPerformanceReportOut)
-async def get_customer_lg_performance(
+def get_customer_lg_performance(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
     export_format: Optional[str] = Query(None, description="Set to 'csv' to export as CSV. Default: JSON."),
@@ -295,7 +295,7 @@ async def get_customer_lg_performance(
 
 # FIX: Remove the redundant /reports prefix from all endpoint decorators.
 @router.get("/end-user/my-lg-dashboard", response_model=MyLGDashboardReportOut)
-async def get_my_lg_dashboard(
+def get_my_lg_dashboard(
     db: Session = Depends(get_db),
     user_context: Dict[str, Any] = Depends(get_current_report_user_context),
     export_format: Optional[str] = Query(None, description="Set to 'csv' to export as CSV. Default: JSON."),
@@ -430,7 +430,7 @@ async def submit_demo_request(
 
 # Add a simple, authenticated endpoint to retrieve the data
 @router.get("/demo-requests", summary="Retrieve all demo requests (Admin only)")
-async def get_all_demo_requests(
+def get_all_demo_requests(
     current_user: TokenData = Depends(HasPermission("system_owner:view_dashboard")), # Protect with a relevant permission
     request: Request = None
 ):

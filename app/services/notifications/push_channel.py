@@ -392,8 +392,8 @@ def _record_result(db: Session, delivery: NotificationDelivery, result: str, err
     logger.warning("Web Push: delivery %s will retry at %s (%s)", delivery.id, next_at.isoformat(), error)
 
 
-async def dispatch_once(db: Session, sender=send_web_push) -> dict:
-    """One dispatcher pass. `sender` is injectable for tests."""
+def _dispatch_once_sync(db: Session, sender=send_web_push) -> dict:
+    """Synchronous implementation of one dispatcher pass."""
     stats = {"claimed": 0, "sent": 0, "retry": 0, "failed": 0, "gone": 0}
     if not push_enabled():
         return stats
@@ -429,8 +429,8 @@ async def dispatch_once(db: Session, sender=send_web_push) -> dict:
 
         expires = _as_utc(delivery.expires_at)
         ttl = DEFAULT_TTL_SECONDS if not expires else max(0, min(MAX_TTL_SECONDS, int((expires - _now()).total_seconds())))
-        result, error = await asyncio.to_thread(
-            sender, sub, payload, ttl, payload.get("urgency", "normal"), _topic_for(payload.get("tag"))
+        result, error = sender(
+            sub, payload, ttl, payload.get("urgency", "normal"), _topic_for(payload.get("tag"))
         )
         _record_result(db, delivery, result, error, _now())
         db.commit()
@@ -446,13 +446,17 @@ async def dispatch_once(db: Session, sender=send_web_push) -> dict:
     return stats
 
 
-async def run_push_dispatch() -> None:
-    """Scheduler entry point (sweep + nudge)."""
+async def dispatch_once(db: Session, sender=send_web_push) -> dict:
+    """One dispatcher pass. `sender` is injectable for tests."""
+    return await asyncio.to_thread(_dispatch_once_sync, db, sender)
+
+
+def _run_push_dispatch_in_thread() -> None:
     if _session_factory is None:
         return
     db = _session_factory()
     try:
-        stats = await dispatch_once(db)
+        stats = _dispatch_once_sync(db)
         if stats["claimed"]:
             logger.info("Web Push dispatch: %s", stats)
     except Exception:
@@ -460,3 +464,8 @@ async def run_push_dispatch() -> None:
         logger.exception("Web Push dispatcher pass failed")
     finally:
         db.close()
+
+
+async def run_push_dispatch() -> None:
+    """Scheduler entry point (sweep + nudge). Runs in worker thread so DB & network I/O never block the event loop."""
+    await asyncio.to_thread(_run_push_dispatch_in_thread)
