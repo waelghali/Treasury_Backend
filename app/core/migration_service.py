@@ -99,14 +99,61 @@ def _apply_defaults_and_autofill(
         email_input = existing_owner_id
         record_data["internal_owner_contact_id"] = None # Clear invalid ID
     
-    # Now run the lookup if we have an email but no valid numeric ID
-    if not isinstance(existing_owner_id, int) and email_input:
-        clean_email = str(email_input).strip()
+    # Now run the lookup or auto-create if we have an email
+    if email_input:
+        clean_email = str(email_input).strip().lower()
         owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, clean_email)
+        if not owner and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", clean_email):
+            from app.schemas.all_schemas import InternalOwnerContactCreate
+            raw_phone = record_data.get("internal_owner_phone")
+            if raw_phone is not None and not isinstance(raw_phone, str):
+                phone_str = str(int(raw_phone)).strip() if isinstance(raw_phone, float) and raw_phone.is_integer() else str(raw_phone).strip()
+            else:
+                phone_str = str(raw_phone).strip() if raw_phone else ""
+            if not phone_str or phone_str.upper() in ("NAN", "NONE", "N/A"):
+                phone_str = "0000000000"
+
+            raw_mgr = record_data.get("manager_email") or record_data.get("internal_owner_manager_email")
+            mgr_str = str(raw_mgr).strip().lower() if raw_mgr else ""
+            if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", mgr_str):
+                mgr_str = clean_email
+
+            raw_int_id = record_data.get("internal_owner_id")
+            if raw_int_id is not None and not isinstance(raw_int_id, str):
+                int_id_str = str(int(raw_int_id)).strip() if isinstance(raw_int_id, float) and raw_int_id.is_integer() else str(raw_int_id).strip()
+            else:
+                int_id_str = str(raw_int_id).strip() if raw_int_id else None
+            if int_id_str and int_id_str.upper() in ("NAN", "NONE", "N/A"):
+                int_id_str = None
+            if int_id_str:
+                int_id_str = int_id_str[:10]
+
+            try:
+                owner = crud_internal_owner_contact.create_or_get(
+                    db,
+                    obj_in=InternalOwnerContactCreate(
+                        email=clean_email,
+                        phone_number=phone_str,
+                        internal_id=int_id_str,
+                        manager_email=mgr_str,
+                    ),
+                    customer_id=customer_id,
+                    user_id=None,
+                )
+                logger.info(f"Auto-created internal_owner_contact_id: {owner.id} for {clean_email}")
+            except Exception as e:
+                logger.warning(f"Failed to auto-create internal owner for '{clean_email}': {e}")
+
         if owner:
             record_data["internal_owner_contact_id"] = owner.id
             record_data["internal_owner_email"] = owner.email 
+            if not record_data.get("internal_owner_phone"):
+                record_data["internal_owner_phone"] = owner.phone_number
+            if not record_data.get("manager_email"):
+                record_data["manager_email"] = owner.manager_email
             logger.debug(f"Autofilled internal_owner_contact_id: {owner.id}")
+        else:
+            record_data["internal_owner_contact_id"] = None
 
     # --- Step 2: Resolve Operational Status (NEW FIX) ---
     op_status_val = record_data.get("lg_operational_status_id")
@@ -125,6 +172,18 @@ def _apply_defaults_and_autofill(
             # Default to Operative (ID 1) if unknown string provided
             record_data["lg_operational_status_id"] = 1
 
+    # Normalize lg_number and string fields if parsed as numeric by Excel/JSON
+    if record_data.get("lg_number") is not None and not isinstance(record_data.get("lg_number"), str):
+        val = record_data["lg_number"]
+        record_data["lg_number"] = str(int(val)).strip() if isinstance(val, float) and val.is_integer() else str(val).strip()
+    elif isinstance(record_data.get("lg_number"), str):
+        record_data["lg_number"] = record_data["lg_number"].strip()
+
+    for str_field in ["issuing_bank_phone", "issuing_bank_fax", "internal_contract_project_id", "notes"]:
+        if record_data.get(str_field) is not None and not isinstance(record_data.get(str_field), str):
+            val = record_data[str_field]
+            record_data[str_field] = str(int(val)).strip() if isinstance(val, float) and val.is_integer() else str(val).strip()
+
     # --- Step 3: Generic Lookups (LG Type, Issuing Method, Rules) ---
     lookup_map = {
         "lg_type_id": (crud_lg_type, "lg_type"),
@@ -138,7 +197,20 @@ def _apply_defaults_and_autofill(
         if not isinstance(val, int):
             lookup_val = val if val else record_data.get(name_field)
             if lookup_val and isinstance(lookup_val, str):
-                obj = crud_obj.get_by_name(db, lookup_val.strip())
+                clean_val = lookup_val.strip()
+                obj = crud_obj.get_by_name(db, clean_val)
+                if not obj and id_field == "lg_type_id" and clean_val:
+                    obj = (
+                        db.query(LgType)
+                        .filter(LgType.is_deleted == False, func.lower(LgType.name) == clean_val.lower())
+                        .first()
+                        or db.query(LgType)
+                        .filter(LgType.is_deleted == False, func.lower(LgType.name).like(f"{clean_val.lower()}%"))
+                        .first()
+                        or db.query(LgType)
+                        .filter(LgType.is_deleted == False, func.lower(LgType.name).like(f"%{clean_val.lower()}%"))
+                        .first()
+                    )
                 if obj:
                     record_data[id_field] = obj.id
 
@@ -186,18 +258,29 @@ def _apply_defaults_and_autofill(
 
     # --- Step 6: LG Category (Customer Specific vs Universal) ---
     cat_val = record_data.get("lg_category_id")
-    if isinstance(cat_val, str):
+    cat_obj = None
+    if isinstance(cat_val, str) and cat_val.strip():
         clean_cat = cat_val.strip()
         # Try Customer Category -> Try Universal Category
-        cat_obj = crud_lg_category.get_by_name(db, clean_cat, customer_id) or \
-                  crud_lg_category.get_by_name(db, clean_cat, None)
-        
-        if cat_obj:
-            record_data["lg_category_id"] = cat_obj.id
-        else:
-            # Force Default Category (usually ID 1)
-            default_cat = crud_lg_category.get_default_category(db, None)
-            record_data["lg_category_id"] = default_cat.id if default_cat else None
+        cat_obj = (
+            crud_lg_category.get_by_code(db, clean_cat, customer_id)
+            or crud_lg_category.get_by_name(db, clean_cat, customer_id)
+            or crud_lg_category.get_by_code(db, clean_cat, None)
+            or crud_lg_category.get_by_name(db, clean_cat, None)
+        )
+    elif isinstance(cat_val, int):
+        cat_obj = crud_lg_category.get(db, cat_val)
+
+    if cat_obj:
+        record_data["lg_category_id"] = cat_obj.id
+    else:
+        default_cat = (
+            crud_lg_category.get_default_category(db, None)
+            or crud_lg_category.get_default_category(db, customer_id)
+            or db.query(LGCategory).filter(LGCategory.customer_id.is_(None), LGCategory.is_deleted == False).order_by(LGCategory.id.asc()).first()
+            or db.query(LGCategory).filter(LGCategory.customer_id == customer_id, LGCategory.is_deleted == False).order_by(LGCategory.id.asc()).first()
+        )
+        record_data["lg_category_id"] = default_cat.id if default_cat else None
 
     # --- Step 7: Currencies ---
     for cur_field in ["lg_currency_id", "lg_payable_currency_id"]:
@@ -445,6 +528,10 @@ class MigrationService:
         logger.debug("============================================")
 
         lg_number = source_data.get("lg_number")
+        if lg_number is not None and not isinstance(lg_number, str):
+            lg_number = str(int(lg_number)).strip() if isinstance(lg_number, float) and lg_number.is_integer() else str(lg_number).strip()
+        elif isinstance(lg_number, str):
+            lg_number = lg_number.strip()
 
         if lg_number and crud_lg_record.get_by_lg_number(db, lg_number):
             raise HTTPException(
@@ -577,9 +664,14 @@ class MigrationService:
         Migrates a single staged LG instruction into the production LGInstruction table.
         """
         from app.crud.crud import crud_lg_record, crud_lg_instruction, crud_internal_owner_contact
-        source_data = staged_record.source_data_json or {}
+        source_data = staged_instruction.source_data_json or {}
 
         lg_number = source_data.get("lg_number")
+        if lg_number is not None and not isinstance(lg_number, str):
+            lg_number = str(int(lg_number)).strip() if isinstance(lg_number, float) and lg_number.is_integer() else str(lg_number).strip()
+        elif isinstance(lg_number, str):
+            lg_number = lg_number.strip()
+
         if not lg_number:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="LG Number missing for instruction record.")
 
@@ -587,6 +679,7 @@ class MigrationService:
         if not production_lg_record or production_lg_record.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"LG Record '{lg_number}' not found in production for instruction import.")
 
+        staged_id = getattr(staged_instruction, 'id', None)
         try:
             instruction_type = source_data.get('instruction_type', 'LG_AMEND')
             maker_user_email = source_data.get('maker_user_email') or 'migration_system_user@example.com'
@@ -609,7 +702,7 @@ class MigrationService:
             }
             instruction_create_payload = LGInstructionCreate(**payload_data)
         except ValidationError as e:
-            logger.error(f"Pydantic validation failed for staged instruction {staged_instruction.get('id')}: {e}", exc_info=True)
+            logger.error(f"Pydantic validation failed for staged instruction {staged_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Data validation error for instruction: {e}")
 
         try:
@@ -623,10 +716,10 @@ class MigrationService:
                 sub_instruction_code_enum=sub_instruction_code_enum
             )
         except HTTPException as e:
-            logger.error(f"Failed to create new LG instruction from staged data {staged_instruction.get('id')}: {e.detail}")
+            logger.error(f"Failed to create new LG instruction from staged data {staged_id}: {e.detail}")
             raise e
         except Exception as e:
-            logger.error(f"Unexpected error creating new LG instruction from staged data {staged_instruction.get('id')}: {e}", exc_info=True)
+            logger.error(f"Unexpected error creating new LG instruction from staged data {staged_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal error occurred during instruction migration.")
 
         attachment_url = source_data.get("attachment_url")

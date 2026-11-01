@@ -193,9 +193,10 @@ class CRUDLGMigration(CRUDBase):
         lg_number = db_record.source_data_json.get("lg_number")
         is_duplicate = False
         if not validation_errors and lg_number:
+            lg_num_str = str(lg_number).strip()
             # CHECK 1: Check against production LGRecord table
             existing_lg_in_prod = db.query(LGRecord).filter(
-                func.lower(LGRecord.lg_number) == func.lower(lg_number),
+                func.lower(LGRecord.lg_number) == func.lower(lg_num_str),
                 LGRecord.customer_id == customer_id
             ).first()
             if existing_lg_in_prod:
@@ -206,7 +207,7 @@ class CRUDLGMigration(CRUDBase):
             if not is_duplicate:
                 latest_record = db.query(self.model).filter(
                     self.model.customer_id == customer_id,
-                    func.lower(self.model.source_data_json['lg_number'].astext) == func.lower(lg_number),
+                    func.lower(self.model.source_data_json['lg_number'].astext) == func.lower(lg_num_str),
                     self.model.id != db_record.id,
                     self.model.record_status.in_([
                         MigrationRecordStatusEnum.READY_FOR_IMPORT,
@@ -358,14 +359,15 @@ class CRUDLGMigration(CRUDBase):
 
         # Pre-flight check for duplicates against live production LGs
         existing_lg_numbers = {
-            lg.lg_number.lower()
+            str(lg.lg_number).lower()
             for lg in db.query(models.LGRecord.lg_number).all()
+            if lg.lg_number is not None
         }
         
         # Pre-populate map with errors for records that clash with production
         for record in records:
             lg_number = record.source_data_json.get("lg_number")
-            if lg_number and lg_number.lower() in existing_lg_numbers and record.migration_type == MigrationTypeEnum.RECORD:
+            if lg_number and str(lg_number).strip().lower() in existing_lg_numbers and record.migration_type == MigrationTypeEnum.RECORD:
                 record.record_status = MigrationRecordStatusEnum.DUPLICATE
                 record.validation_log = {"lg_number": lg_validation_service._get_enhanced_error("lg_number", "LG already exists in production table. Skipping.")}
                 processed_ids["duplicates"].append(record.id)

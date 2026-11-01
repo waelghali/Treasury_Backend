@@ -24,6 +24,7 @@ from app.schemas.all_schemas import (
     LGRecordCreate, LGRecordOut, LGDocumentOut,
     CustomerEntityOut, CurrencyOut, LgTypeOut, RuleOut, IssuingMethodOut,
     LgStatusOut, LgOperationalStatusOut, BankOut, LGCategoryOut, UserOut,
+    InternalOwnerContactCreate,
     InternalOwnerContactOut,
     LGInstructionOut,
     LGLifecycleEventOut,
@@ -908,7 +909,6 @@ async def scan_amendment_letter_file(
 def lookup_internal_owner_by_email(
     email: str = Query(..., description="Email of the internal owner contact to lookup"),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("lg_record:create")),
     end_user_context: TokenData = Depends(get_current_end_user_context)
 ):
     """
@@ -926,7 +926,7 @@ def lookup_internal_owner_by_email(
 @router.get(
     "/internal-owner-contacts/with-lg-count",
     response_model=List[InternalOwnerContactOut],
-    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)], # ADDED dependency
+    dependencies=[Depends(check_subscription_status)],
     summary="Retrieve all internal owner contacts for the current customer with LG count"
 )
 def list_internal_owner_contacts_with_lg_count(
@@ -942,6 +942,70 @@ def list_internal_owner_contacts_with_lg_count(
         customer_id=current_user_context.customer_id,
     )
     return internal_owners
+
+@router.post(
+    "/internal-owner-contacts",
+    response_model=InternalOwnerContactOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(check_for_read_only_mode)],
+    summary="Create a new Internal Owner Contact for the current customer"
+)
+@router.post(
+    "/internal-owner-contacts/",
+    response_model=InternalOwnerContactOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(check_for_read_only_mode)],
+    include_in_schema=False,
+)
+def create_internal_owner_contact_api(
+    owner_in: InternalOwnerContactCreate,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    """
+    Creates a new Internal Owner Contact (or restores a soft-deleted one) for the current customer.
+    """
+    existing_active = crud_internal_owner_contact.get_by_email_for_customer(
+        db, end_user_context.customer_id, owner_in.email.strip()
+    )
+    if existing_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"An internal owner contact with email '{owner_in.email.strip()}' already exists."
+        )
+    db_owner = crud_internal_owner_contact.create_or_get(
+        db,
+        obj_in=owner_in,
+        customer_id=end_user_context.customer_id,
+        user_id=end_user_context.user_id,
+    )
+    db.commit()
+    db.refresh(db_owner)
+    return db_owner
+
+@router.delete(
+    "/internal-owner-contacts/{owner_id}",
+    response_model=Dict[str, str],
+    dependencies=[Depends(check_for_read_only_mode)],
+    summary="Soft-delete an Internal Owner Contact if not assigned to active LGs"
+)
+def delete_internal_owner_contact_api(
+    owner_id: int,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    """
+    Soft-deletes an Internal Owner Contact if they do not own any active LG records.
+    """
+    db_owner_contact = crud_internal_owner_contact.get(db, owner_id)
+    if not db_owner_contact or db_owner_contact.customer_id != end_user_context.customer_id or db_owner_contact.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Internal Owner Contact not found or not accessible."
+        )
+    crud_internal_owner_contact.soft_delete(db, db_owner_contact, end_user_context.user_id)
+    db.commit()
+    return {"message": f"Internal Owner Contact '{db_owner_contact.email}' deleted successfully."}
 
 @router.get(
     "/lg-documents/{document_id}/view",

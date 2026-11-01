@@ -43,9 +43,15 @@ class CRUDInternalOwnerContact(CRUDBase):
             .all()
         )
 
-    def create_or_get(self, db: Session, obj_in: InternalOwnerContactCreate, customer_id: int, user_id: int) -> InternalOwnerContact:
-        existing_contact = self.get_by_email_for_customer(
-            db, customer_id, obj_in.email
+    def create_or_get(self, db: Session, obj_in: InternalOwnerContactCreate, customer_id: int, user_id: Optional[int] = None) -> InternalOwnerContact:
+        clean_email = obj_in.email.strip()
+        existing_contact = (
+            db.query(self.model)
+            .filter(
+                self.model.customer_id == customer_id,
+                func.lower(self.model.email) == func.lower(clean_email),
+            )
+            .first()
         )
         if existing_contact:
             # If already exists and is active, return it.
@@ -71,6 +77,7 @@ class CRUDInternalOwnerContact(CRUDBase):
 
         # No active or deleted contact, create a new one.
         internal_owner_data = obj_in.model_dump()
+        internal_owner_data["email"] = clean_email
         db_obj = self.model(customer_id=customer_id, **internal_owner_data)
         db.add(db_obj)
         db.flush()

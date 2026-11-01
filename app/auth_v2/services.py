@@ -535,6 +535,35 @@ class AuthService:
         policy_config = await self._get_password_policy_config(db)
         token_expiry_minutes = policy_config.get(GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES.value, 15)
 
+        # Enforce 60-second cooldown so rapid re-requests do not invalidate an email link in flight
+        cooldown_seconds = 60
+        now_utc = datetime.now(timezone.utc)
+        recent_token = (
+            db.query(models.PasswordResetToken)
+            .filter(
+                models.PasswordResetToken.user_id == user.id,
+                models.PasswordResetToken.is_used == False,
+                models.PasswordResetToken.expires_at > func.now(),
+            )
+            .order_by(models.PasswordResetToken.created_at.desc())
+            .first()
+        )
+        if recent_token and recent_token.created_at:
+            token_created = recent_token.created_at
+            if token_created.tzinfo is None:
+                token_created = token_created.replace(tzinfo=timezone.utc)
+            elapsed = (now_utc - token_created).total_seconds()
+            if elapsed < cooldown_seconds:
+                remaining = max(1, int(cooldown_seconds - elapsed))
+                logger.info(
+                    f"Password reset cooldown active for user id={user.id} ({remaining}s remaining). "
+                    f"Preserving existing token id={recent_token.id}."
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"A password reset link was recently sent. Please wait {remaining} seconds before requesting another one."
+                )
+
         # Invalidate any existing tokens for this user
         db.query(models.PasswordResetToken).filter(
             models.PasswordResetToken.user_id == user.id,
@@ -582,20 +611,24 @@ class AuthService:
             action_text="Reset Password Now"
         )
 
-        send_success, _ = await send_email(
+        send_success, send_err = await send_email(
             db=db,
             to_emails=[user.email],
             subject_template=email_subject,
             body_template=email_body,
             template_data={"reset_link": reset_link, "expiry_minutes": token_expiry_minutes},
             email_settings=email_settings,
-            cc_emails=[] # No CC for password reset
+            cc_emails=[], # No CC for password reset
+            save_copy=False
         )
 
 
         log_details = {"email": user.email, "token_id": new_reset_token.id, "email_sent": send_success}
         if not send_success:
-            log_details["reason"] = "Email sending failed"
+            log_details["reason"] = f"Email sending failed: {send_err}"
+            logger.error(f"Password reset email failed for user id={user.id} ({user.email}): {send_err}")
+        else:
+            logger.info(f"Password reset email dispatched for user id={user.id}")
 
         # MODIFIED: Call log_action utility
         log_action(

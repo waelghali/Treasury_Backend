@@ -77,7 +77,11 @@ class MigrationHistoryService:
             query = query.filter(func.lower(LGMigrationStaging.source_data_json['lg_number'].astext) == func.lower(lg_number))
         
         if only_ready:
-            query = query.filter(LGMigrationStaging.record_status == MigrationRecordStatusEnum.READY_FOR_IMPORT)
+            query = query.filter(LGMigrationStaging.record_status.in_([
+                MigrationRecordStatusEnum.READY_FOR_IMPORT,
+                MigrationRecordStatusEnum.EXPIRED,
+                MigrationRecordStatusEnum.DUPLICATE,
+            ]))
 
         all_snapshots = query.all()
         

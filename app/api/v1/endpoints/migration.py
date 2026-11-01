@@ -183,6 +183,15 @@ column_mapping = {
     "Owner Email": "internal_owner_email",
     "Contact Email": "internal_owner_email",
     "Internal Contact": "internal_owner_email",
+    "Internal_Owner_Phone": "internal_owner_phone",
+    "Owner Phone": "internal_owner_phone",
+    "Owner_Phone": "internal_owner_phone",
+    "Contact Phone": "internal_owner_phone",
+    "Manager_Email": "manager_email",
+    "Manager Email": "manager_email",
+    "Internal_Owner_Manager_Email": "manager_email",
+    "Internal_Owner_ID": "internal_owner_id",
+    "Owner ID": "internal_owner_id",
 
     "Category": "lg_category_id",
     "LG Category": "lg_category_id",
@@ -284,23 +293,78 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
         email_input = existing_owner_id
         record_data["internal_owner_contact_id"] = None
 
-    # B. Logic to lookup by Email if ID is missing
-    if not isinstance(existing_owner_id, int) and email_input:
-        
-        # FIX: Force lowercase and remove spaces to ensure match
+    # B. Logic to lookup or auto-create by Email
+    if email_input:
+        # Force lowercase and remove spaces to ensure match
         clean_email = str(email_input).strip().lower()
-        
         logger.info(f"🔍 Looking up Internal Owner for email: '{clean_email}' (Customer {customer_id})")
         
         owner = crud_internal_owner_contact.get_by_email_for_customer(db, customer_id, clean_email)
-        
+        if not owner and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", clean_email):
+            from app.schemas.all_schemas import InternalOwnerContactCreate
+            raw_phone = record_data.get("internal_owner_phone")
+            if raw_phone is not None and not isinstance(raw_phone, str):
+                phone_str = str(int(raw_phone)).strip() if isinstance(raw_phone, float) and raw_phone.is_integer() else str(raw_phone).strip()
+            else:
+                phone_str = str(raw_phone).strip() if raw_phone else ""
+            if not phone_str or phone_str.upper() in ("NAN", "NONE", "N/A"):
+                phone_str = "0000000000"
+
+            raw_mgr = record_data.get("manager_email") or record_data.get("internal_owner_manager_email")
+            mgr_str = str(raw_mgr).strip().lower() if raw_mgr else ""
+            if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", mgr_str):
+                mgr_str = clean_email
+
+            raw_int_id = record_data.get("internal_owner_id")
+            if raw_int_id is not None and not isinstance(raw_int_id, str):
+                int_id_str = str(int(raw_int_id)).strip() if isinstance(raw_int_id, float) and raw_int_id.is_integer() else str(raw_int_id).strip()
+            else:
+                int_id_str = str(raw_int_id).strip() if raw_int_id else None
+            if int_id_str and int_id_str.upper() in ("NAN", "NONE", "N/A"):
+                int_id_str = None
+            if int_id_str:
+                int_id_str = int_id_str[:10]
+
+            try:
+                owner = crud_internal_owner_contact.create_or_get(
+                    db,
+                    obj_in=InternalOwnerContactCreate(
+                        email=clean_email,
+                        phone_number=phone_str,
+                        internal_id=int_id_str,
+                        manager_email=mgr_str,
+                    ),
+                    customer_id=customer_id,
+                    user_id=None,
+                )
+                logger.info(f"✨ AUTO-CREATED Internal Owner: {clean_email} -> ID: {owner.id}")
+            except Exception as e:
+                logger.warning(f"Failed to auto-create internal owner for '{clean_email}': {e}")
+
         if owner:
             record_data["internal_owner_contact_id"] = owner.id
             record_data["internal_owner_email"] = owner.email
-            logger.info(f"✅ FOUND Owner: {clean_email} -> ID: {owner.id}")
+            if not record_data.get("internal_owner_phone"):
+                record_data["internal_owner_phone"] = owner.phone_number
+            if not record_data.get("manager_email"):
+                record_data["manager_email"] = owner.manager_email
+            logger.info(f"✅ FOUND/RESOLVED Owner: {clean_email} -> ID: {owner.id}")
         else:
+            record_data["internal_owner_contact_id"] = None
             logger.warning(f"❌ OWNER NOT FOUND: No internal owner found with email '{clean_email}' for Customer {customer_id}")
             # This will result in 'Missing Internal Owner' validation error
+
+    # Normalize lg_number and string fields if parsed as numeric by Excel/JSON
+    if record_data.get("lg_number") is not None and not isinstance(record_data.get("lg_number"), str):
+        val = record_data["lg_number"]
+        record_data["lg_number"] = str(int(val)).strip() if isinstance(val, float) and val.is_integer() else str(val).strip()
+    elif isinstance(record_data.get("lg_number"), str):
+        record_data["lg_number"] = record_data["lg_number"].strip()
+
+    for str_field in ["issuing_bank_phone", "issuing_bank_fax", "internal_contract_project_id", "notes"]:
+        if record_data.get(str_field) is not None and not isinstance(record_data.get(str_field), str):
+            val = record_data[str_field]
+            record_data[str_field] = str(int(val)).strip() if isinstance(val, float) and val.is_integer() else str(val).strip()
 
     # --- Step 2: Autofill other IDs from names/codes ---
     # This block is the core of the fix. It uses a single, consistent loop
@@ -314,7 +378,21 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     for field, (crud_obj, lookup_attr) in lookup_map.items():
         value = record_data.get(field)
         if isinstance(value, str):
-            lookup_obj = crud_obj.get_by_name(db, value)
+            clean_val = value.strip()
+            lookup_obj = crud_obj.get_by_name(db, clean_val)
+            if not lookup_obj and field == "lg_type_id" and clean_val:
+                # Case-insensitive or prefix/substring match (e.g. 'Performance' -> 'Performance LG')
+                lookup_obj = (
+                    db.query(models.LgType)
+                    .filter(models.LgType.is_deleted == False, func.lower(models.LgType.name) == clean_val.lower())
+                    .first()
+                    or db.query(models.LgType)
+                    .filter(models.LgType.is_deleted == False, func.lower(models.LgType.name).like(f"{clean_val.lower()}%"))
+                    .first()
+                    or db.query(models.LgType)
+                    .filter(models.LgType.is_deleted == False, func.lower(models.LgType.name).like(f"%{clean_val.lower()}%"))
+                    .first()
+                )
             if lookup_obj:
                 record_data[field] = lookup_obj.id
                 logger.debug(f"Autofilled {field} ID from name '{value}' to: {lookup_obj.id}")
@@ -367,11 +445,16 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
         record_data["lg_category_id"] = resolved_category.id
         logger.debug(f"Autofilled lg_category_id from input '{lg_category_input}' to: {resolved_category.id}")
     else:
-        # Fallback to the default universal category if no input or no match
-        default_category = crud_lg_category.get_default_category(db, None)
+        # Fallback to the default universal/customer category or first available active category
+        default_category = (
+            crud_lg_category.get_default_category(db, None)
+            or crud_lg_category.get_default_category(db, customer_id)
+            or db.query(models.LGCategory).filter(models.LGCategory.customer_id.is_(None), models.LGCategory.is_deleted == False).order_by(models.LGCategory.id.asc()).first()
+            or db.query(models.LGCategory).filter(models.LGCategory.customer_id == customer_id, models.LGCategory.is_deleted == False).order_by(models.LGCategory.id.asc()).first()
+        )
         if default_category:
             record_data["lg_category_id"] = default_category.id
-            logger.warning(f"Could not find a matching ID for lg_category_id with value: '{lg_category_input}'. Defaulting to universal category ID {default_category.id}.")
+            logger.warning(f"Could not find a matching ID for lg_category_id with value: '{lg_category_input}'. Defaulting to category ID {default_category.id}.")
         else:
             # This case indicates a critical system configuration error.
             logger.error("No default universal category configured. Cannot autofill.")
@@ -502,6 +585,12 @@ async def upload_structured_file_for_staging(
                     df['lg_amount'].astype(str).str.strip().str.replace(',', ''),
                     errors='coerce' # If it's still not a number, make it (None)
                 )
+
+            if 'lg_number' in df.columns:
+                df['lg_number'] = df['lg_number'].apply(
+                    lambda x: str(int(x)).strip() if isinstance(x, float) and x.is_integer()
+                    else (str(x).strip() if pd.notna(x) and str(x).strip() != '' else None)
+                )
             
             for col in ['issuance_date', 'expiry_date']:
                 if col in df.columns:
@@ -523,6 +612,11 @@ async def upload_structured_file_for_staging(
         for key, value in record.items():
             if isinstance(value, date):
                 record[key] = value.isoformat()
+        if record.get("lg_number") is not None and not isinstance(record.get("lg_number"), str):
+            val = record["lg_number"]
+            record["lg_number"] = str(int(val)).strip() if isinstance(val, float) and val.is_integer() else str(val).strip()
+        elif isinstance(record.get("lg_number"), str):
+            record["lg_number"] = record["lg_number"].strip()
             
     
     staged_records = []
@@ -549,10 +643,11 @@ async def upload_structured_file_for_staging(
                 is_duplicate = False
                 lg_number = enhanced_record_data.get("lg_number")
                 if lg_number:
+                    lg_num_str = str(lg_number).strip()
                     if migration_type == MigrationTypeEnum.RECORD:
                         latest_record = db.query(models.LGMigrationStaging).filter(
                             models.LGMigrationStaging.customer_id == current_user.customer_id,
-                            func.lower(models.LGMigrationStaging.source_data_json['lg_number'].astext) == func.lower(lg_number),
+                            func.lower(models.LGMigrationStaging.source_data_json['lg_number'].astext) == func.lower(lg_num_str),
                             models.LGMigrationStaging.record_status.in_([
                                 MigrationRecordStatusEnum.READY_FOR_IMPORT,
                                 MigrationRecordStatusEnum.PENDING,
@@ -641,10 +736,11 @@ def manual_entry_staged_record(
             is_duplicate = False
             lg_number = enhanced_record_data.get("lg_number")
             if lg_number:
+                lg_num_str = str(lg_number).strip()
                 if record_in.migration_type == MigrationTypeEnum.RECORD:
                     latest_record = db.query(models.LGMigrationStaging).filter(
                         models.LGMigrationStaging.customer_id == current_user.customer_id,
-                        func.lower(models.LGMigrationStaging.source_data_json['lg_number'].astext) == func.lower(lg_number),
+                        func.lower(models.LGMigrationStaging.source_data_json['lg_number'].astext) == func.lower(lg_num_str),
                         models.LGMigrationStaging.record_status.in_([
                             MigrationRecordStatusEnum.READY_FOR_IMPORT,
                             MigrationRecordStatusEnum.PENDING,
@@ -783,7 +879,9 @@ async def import_historical_records(
     all_snapshots = query.filter(models.LGMigrationStaging.record_status.in_([
         MigrationRecordStatusEnum.READY_FOR_IMPORT,
         MigrationRecordStatusEnum.PENDING,
-        MigrationRecordStatusEnum.ERROR
+        MigrationRecordStatusEnum.ERROR,
+        MigrationRecordStatusEnum.EXPIRED,
+        MigrationRecordStatusEnum.DUPLICATE,
     ])).all()
     
     if not all_snapshots:

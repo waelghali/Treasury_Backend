@@ -266,15 +266,23 @@ class LGValidationService:
         """
         raw_errors = {}
         
+        lg_num_val = record_data.get("lg_number")
+        if lg_num_val is not None and not isinstance(lg_num_val, str):
+            lg_num_val = str(int(lg_num_val)).strip() if isinstance(lg_num_val, float) and lg_num_val.is_integer() else str(lg_num_val).strip()
+            record_data["lg_number"] = lg_num_val
+        elif isinstance(lg_num_val, str):
+            lg_num_val = lg_num_val.strip()
+            record_data["lg_number"] = lg_num_val
+
         # Instruction-specific validation rules
-        if not record_data.get("lg_number"):
+        if not lg_num_val:
             raw_errors["lg_number"] = "Missing or empty field."
 
         # Check if the LG number exists in the production database
-        if db and record_data.get("lg_number"):
+        if db and lg_num_val:
             from app.models import LGRecord
             existing_lg = db.query(LGRecord).filter(
-                func.lower(LGRecord.lg_number) == func.lower(record_data["lg_number"]),
+                func.lower(LGRecord.lg_number) == func.lower(str(lg_num_val)),
                 LGRecord.customer_id == customer_id,
                 LGRecord.is_deleted == False
             ).first()

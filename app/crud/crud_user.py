@@ -19,9 +19,12 @@ from app.constants import UserRole
 # =====================================================================================
 class CRUDUser(CRUDBase):
     def get_by_email(self, db: Session, email: str) -> Optional[User]:
+        if not email:
+            return None
+        clean_email = str(email).strip()
         return (
             db.query(self.model)
-            .filter(self.model.email == email, self.model.is_deleted == False)
+            .filter(func.lower(self.model.email) == func.lower(clean_email), self.model.is_deleted == False)
             .first()
         )
 
