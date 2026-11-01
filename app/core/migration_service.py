@@ -392,10 +392,10 @@ class MigrationService:
                         decrypted_bytes = b"".join(decrypt_stream_generator(f, tenant_dek, context="migration_staging"))
                     else:
                         decrypted_bytes = f.read()
-                logger.info(f"Loaded migration file '{file_name}' ({len(decrypted_bytes)} bytes) from staged/local path: {final_path}")
+                logger.info(f"Loaded encrypted migration attachment ({len(decrypted_bytes)} bytes) from local/staged storage for customer {customer_id}")
                 return decrypted_bytes, resolved_mime
             except Exception as e:
-                logger.warning(f"Local/staged read failed for '{final_path}': {e}")
+                logger.warning(f"Local/staged read failed for customer {customer_id}: {e}")
 
         # --- STRATEGY 2: Direct HTTP/HTTPS URL ---
         if clean_url.lower().startswith(("http://", "https://")):
@@ -404,10 +404,10 @@ class MigrationService:
                 resp = await asyncio.to_thread(requests.get, clean_url, timeout=20)
                 if resp.status_code == 200 and resp.content:
                     content_type = resp.headers.get("Content-Type") or resolved_mime
-                    logger.info(f"Downloaded migration file '{file_name}' from URL: {clean_url}")
+                    logger.info(f"Downloaded migration attachment ({len(resp.content)} bytes) via HTTPS for customer {customer_id}")
                     return resp.content, content_type
             except Exception as http_err:
-                logger.warning(f"HTTP fetch failed for '{clean_url}': {http_err}")
+                logger.warning(f"HTTP fetch failed for customer {customer_id}: {http_err}")
 
         # --- STRATEGY 3: Check Google Cloud Storage (GCS) ---
         try:
@@ -439,7 +439,7 @@ class MigrationService:
                     for blob_path in candidate_blobs:
                         blob = bucket.blob(blob_path)
                         if blob.exists():
-                            logger.info(f"Found '{file_name}' in GCS bucket '{bucket_name}' at '{blob_path}'.")
+                            logger.info(f"Found migration attachment in cloud staging for customer {customer_id}.")
                             raw_bytes = blob.download_as_bytes()
                             if tenant_dek:
                                 try:
@@ -462,7 +462,7 @@ class MigrationService:
         except Exception as e:
             logger.error(f"GCS Fetch Error: {e}")
 
-        logger.warning(f"File not found in staged uploads, local disk, or GCS: '{file_name}' (from '{clean_url}')")
+        logger.warning(f"Migration attachment not found in staged uploads, local disk, or cloud for customer {customer_id}")
         return None, None
 
     def _cleanup_migration_staging_file(
@@ -491,9 +491,9 @@ class MigrationService:
                 if os.path.exists(candidate):
                     try:
                         os.remove(candidate)
-                        logger.info(f"Cleaned up temporary staged migration file: {candidate}")
+                        logger.info(f"Cleaned up temporary staged migration file for customer {customer_id}")
                     except Exception as rm_err:
-                        logger.warning(f"Failed to remove temporary staged file '{candidate}': {rm_err}")
+                        logger.warning(f"Failed to remove temporary staged file for customer {customer_id}: {rm_err}")
 
             # 2. Remove temporary GCS migration_staging blob if present
             bucket_name = os.getenv("GCS_BUCKET_NAME")
@@ -523,11 +523,11 @@ class MigrationService:
                             blob = bucket.blob(blob_path)
                             if blob.exists():
                                 blob.delete()
-                                logger.info(f"Cleaned up temporary GCS migration staging blob: gs://{bucket_name}/{blob_path}")
+                                logger.info(f"Cleaned up temporary GCS migration staging blob for customer {customer_id}")
                         except Exception:
                             pass
         except Exception as e:
-            logger.warning(f"Non-fatal error during migration staging cleanup for '{url}': {e}")
+            logger.warning(f"Non-fatal error during migration staging cleanup for customer {customer_id}: {e}")
 
     async def _create_document_from_url(
         self,
@@ -557,7 +557,7 @@ class MigrationService:
             cust_id = lg_rec.customer_id if lg_rec else None
             file_content, mime_type = await self._fetch_file_content(url, customer_id=cust_id, db=db)
             if not file_content:
-                logger.error(f"Failed to fetch file content from URL: {url}")
+                logger.error(f"Failed to fetch file content for lg_record_id={lg_record_id}")
                 return None
 
             file_name = os.path.basename(str(url).replace("\\", "/"))
@@ -594,7 +594,7 @@ class MigrationService:
 
             return db_document.id
         except Exception as e:
-            logger.error(f"Error creating document from URL '{url}': {e}", exc_info=True)
+            logger.error(f"Error creating document for lg_record_id={lg_record_id}: {e}", exc_info=True)
             return None
 
     async def _apply_migration_amendment(self, db: Session, lg_record_id: int, updates: Dict[str, Any], user_id: int, staged_record_id: int):
@@ -995,10 +995,19 @@ class MigrationService:
         def clean_date(val):
             if not val:
                 return ""
+            if isinstance(val, (date, datetime)):
+                return val.strftime("%Y-%m-%d")
             s = str(val).strip()
-            if "T" in s:
-                return s.split("T")[0]
-            return s
+            # Match YYYY-MM-DD or YYYY/MM/DD at start (ignoring any trailing T..., _..., space, time, or Z)
+            m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+            if m_iso:
+                return f"{m_iso.group(1)}-{int(m_iso.group(2)):02d}-{int(m_iso.group(3)):02d}"
+            # Match DD-MM-YYYY or DD/MM/YYYY at start
+            m_dmy = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})", s)
+            if m_dmy:
+                return f"{m_dmy.group(3)}-{int(m_dmy.group(2)):02d}-{int(m_dmy.group(1)):02d}"
+            # Fallback: split on T, underscore, or space
+            return re.split(r"[T_\s]", s)[0]
 
         def norm(val):
             return str(val).strip().upper().replace(",", "").replace(".", "").replace("  ", " ")
@@ -1012,9 +1021,9 @@ class MigrationService:
 
         for lg_num, group in grouped_records.items():
             group.sort(key=lambda x: x.id)
-            logger.info(f"[AUDIT] Checking LG '{lg_num}' (first staged record id={group[0].id if group else 'N/A'})")
             first_rec = group[0]
             last_rec = group[-1]
+            logger.info(f"[AUDIT] Checking staged LG group (first_record_id={first_rec.id}, count={len(group)})")
             discrepancies = []
             was_scanned = False
             skip_reasons = []
@@ -1023,18 +1032,15 @@ class MigrationService:
             json_data = first_rec.source_data_json or {}
             first_url = _extract_attachment_url(json_data)
 
-            logger.info(f"Record {first_rec.id} (LG {lg_num}) -> Resolved Attachment Path: '{first_url}'")
-
             if first_url:
                 clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                 fname = os.path.basename(clean_url.replace("\\", "/"))
-                logger.info(f"   -> Fetching content for: '{clean_url}'")
                 content, mime = await self._fetch_file_content(clean_url, customer_id=customer_id, db=db)
 
                 if content:
                     files_scanned += 1
                     was_scanned = True
-                    logger.info(f"   -> AI Scanning Original Document for LG '{lg_num}'...")
+                    logger.info(f"   -> AI Scanning Original Document for staged record id={first_rec.id}...")
                     ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=str(lg_num))
 
                     if ai_data:
@@ -1045,7 +1051,7 @@ class MigrationService:
                         if norm(lg_num) != norm(ai_lg_num):
                             err = f"LG Number Mismatch: Excel='{lg_num}' vs AI='{ai_lg_num}'"
                             discrepancies.append(err)
-                            logger.info(f"      ❌ {err}")
+                            logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=lg_number")
 
                         # B. Amount
                         try:
@@ -1054,7 +1060,7 @@ class MigrationService:
                             if abs(val_excel - val_ai) > 1.0:
                                 err = f"Amount Mismatch: Excel='{val_excel:,.2f}' vs AI='{val_ai:,.2f}'"
                                 discrepancies.append(err)
-                                logger.info(f"      ❌ {err}")
+                                logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=lg_amount")
                         except Exception:
                             pass
 
@@ -1065,7 +1071,7 @@ class MigrationService:
                         if norm(excel_curr_code) != norm(ai_curr):
                             err = f"Currency Mismatch: Excel='{excel_curr_code}' vs AI='{ai_curr}'"
                             discrepancies.append(err)
-                            logger.info(f"      ❌ {err}")
+                            logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=currency")
 
                         # D. Issuing Bank
                         excel_bank_id = src.get('issuing_bank_id')
@@ -1075,7 +1081,7 @@ class MigrationService:
                             if norm(excel_bank_name) not in norm(ai_bank) and norm(ai_bank) not in norm(excel_bank_name):
                                 err = f"Bank Mismatch: Excel='{excel_bank_name}' vs AI='{ai_bank}'"
                                 discrepancies.append(err)
-                                logger.info(f"      ❌ {err}")
+                                logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=issuing_bank")
 
                         # E. Dates (Issuance & Expiry)
                         excel_date = clean_date(src.get('issuance_date'))
@@ -1083,21 +1089,21 @@ class MigrationService:
                         if excel_date != ai_date:
                             err = f"Issuance Date Mismatch: Excel='{excel_date}' vs AI='{ai_date}'"
                             discrepancies.append(err)
-                            logger.info(f"      ❌ {err}")
+                            logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=issuance_date")
 
                         excel_exp = clean_date(src.get('expiry_date'))
                         ai_exp = clean_date(ai_data.get('expiryDate'))
                         if excel_exp != ai_exp:
                             err = f"Expiry Date Mismatch: Excel='{excel_exp}' vs AI='{ai_exp}'"
                             discrepancies.append(err)
-                            logger.info(f"      ❌ {err}")
+                            logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=expiry_date")
                     else:
                         skip_reasons.append(f"AI could not extract text from '{fname}'")
-                        logger.warning(f"   ⚠️ AI returned NO data for LG '{lg_num}'.")
+                        logger.warning(f"   ⚠️ AI returned NO data for staged record id={first_rec.id}.")
                 else:
                     missing_files.append(f"LG {lg_num}: '{fname}'")
                     skip_reasons.append(f"File '{fname}' not uploaded/found on server")
-                    logger.warning(f"   ❌ File not found (Checked Staged Uploads, Local & Cloud): {clean_url}")
+                    logger.warning(f"   ❌ Attachment file not found for staged record id={first_rec.id}")
             else:
                 skip_reasons.append("No attachment path in Excel")
 
@@ -1108,13 +1114,12 @@ class MigrationService:
                     clean_url_last = str(last_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                     fname_last = os.path.basename(clean_url_last.replace("\\", "/"))
 
-                    logger.info(f"   -> Fetching Amendment content for: '{clean_url_last}'")
                     content, mime = await self._fetch_file_content(clean_url_last, customer_id=customer_id, db=db)
 
                     if content:
                         files_scanned += 1
                         was_scanned = True
-                        logger.info(f"   -> AI Scanning Amendment for LG '{lg_num}'...")
+                        logger.info(f"   -> AI Scanning Amendment for staged record id={last_rec.id}...")
                         context = {"lg_record_details": {"lgNumber": str(lg_num)}}
                         ai_amend, _ = await process_amendment_with_ai(content, mime, context)
 
@@ -1128,7 +1133,7 @@ class MigrationService:
                                 if val_excel != val_ai:
                                     err = f"Latest Expiry Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
                                     discrepancies.append(err)
-                                    logger.info(f"      ❌ {err}")
+                                    logger.info(f"      [Audit Mismatch] record_id={last_rec.id} field=latest_expiry_date")
 
                             if "lgAmount" in changes:
                                 try:
@@ -1137,27 +1142,42 @@ class MigrationService:
                                     if abs(val_excel - val_ai) > 1.0:
                                         err = f"Latest Amount Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
                                         discrepancies.append(err)
-                                        logger.info(f"      ❌ {err}")
+                                        logger.info(f"      [Audit Mismatch] record_id={last_rec.id} field=latest_lg_amount")
                                 except Exception:
                                     pass
                     else:
                         missing_files.append(f"LG {lg_num} (Amendment): '{fname_last}'")
                         skip_reasons.append(f"Amendment file '{fname_last}' not uploaded/found")
-                        logger.warning(f"   ❌ Amendment file not found: {clean_url_last}")
+                        logger.warning(f"   ❌ Amendment attachment not found for staged record id={last_rec.id}")
 
             first_rec.validation_log = dict(first_rec.validation_log or {})
+            ignored_issues = first_rec.validation_log.get('ignored_ai_issues') or []
+            if isinstance(ignored_issues, list) and ("*" in ignored_issues or ignored_issues):
+                if "*" in ignored_issues:
+                    discrepancies = []
+                else:
+                    discrepancies = [d for d in discrepancies if d not in ignored_issues]
+
             if discrepancies:
-                audit_report.append({"lg_number": lg_num, "issues": discrepancies})
+                audit_report.append({"record_id": first_rec.id, "lg_number": lg_num, "issues": discrepancies})
                 first_rec.validation_log['ai_warning'] = " | ".join(discrepancies)
                 first_rec.validation_log['ai_audit_status'] = f"MISMATCH: {' | '.join(discrepancies)}"
-                first_rec.record_status = MigrationRecordStatusEnum.NEEDS_REVIEW
+                if first_rec.record_status == MigrationRecordStatusEnum.READY_FOR_IMPORT:
+                    first_rec.record_status = MigrationRecordStatusEnum.NEEDS_REVIEW
             elif was_scanned and not skip_reasons:
-                audited_passed.append({"lg_number": lg_num, "message": "Verified against PDF scan — No discrepancies found."})
+                msg = "Reviewed & approved by user" if ignored_issues else "Verified against PDF scan — No discrepancies found."
+                audited_passed.append({"record_id": first_rec.id, "lg_number": lg_num, "message": msg})
                 first_rec.validation_log.pop('ai_warning', None)
-                first_rec.validation_log['ai_audit_status'] = "AUDITED_PASSED: Verified against PDF scan"
+                first_rec.validation_log['ai_audit_status'] = f"AUDITED_PASSED: {msg}"
+                non_ai_errors = [
+                    k for k in first_rec.validation_log.keys()
+                    if k not in ('ai_warning', 'ai_audit_status', 'ignored_ai_issues')
+                ]
+                if not non_ai_errors and first_rec.record_status == MigrationRecordStatusEnum.NEEDS_REVIEW:
+                    first_rec.record_status = MigrationRecordStatusEnum.READY_FOR_IMPORT
             else:
                 reason_str = "; ".join(skip_reasons) if skip_reasons else "Skipped"
-                skipped_records.append({"lg_number": lg_num, "reason": reason_str})
+                skipped_records.append({"record_id": first_rec.id, "lg_number": lg_num, "reason": reason_str})
                 first_rec.validation_log['ai_audit_status'] = f"SKIPPED: {reason_str}"
 
             flag_modified(first_rec, "validation_log")

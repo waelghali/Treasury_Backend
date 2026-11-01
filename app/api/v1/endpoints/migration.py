@@ -1592,6 +1592,75 @@ async def audit_staged_data(
     results = await migration_service.audit_staged_records(db, current_user.customer_id)
     return results
 
+
+class DismissAiAuditIn(BaseModel):
+    issue: Optional[str] = None
+
+
+@router.post("/staged/{record_id}/dismiss-ai-audit", status_code=status.HTTP_200_OK, response_model=LGMigrationStagingOut)
+def dismiss_ai_audit_discrepancy(
+    record_id: int,
+    payload: Optional[DismissAiAuditIn] = Body(default=None),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Allows the user to skip/ignore/approve a specific AI audit discrepancy (or all AI discrepancies)
+    on a staged record so it can proceed to final migration as READY_FOR_IMPORT.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models import LGMigrationStaging
+
+    record = db.query(LGMigrationStaging).filter(
+        LGMigrationStaging.id == record_id,
+        LGMigrationStaging.customer_id == current_user.customer_id,
+    ).first()
+
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staged record not found.")
+
+    val_log = dict(record.validation_log or {})
+    ignored_list = list(val_log.get("ignored_ai_issues") or [])
+    specific_issue = payload.issue.strip() if (payload and payload.issue) else None
+
+    current_warning_str = str(val_log.get("ai_warning") or "")
+    current_issues = [s.strip() for s in current_warning_str.split(" | ") if s.strip()]
+
+    if specific_issue:
+        if specific_issue not in ignored_list:
+            ignored_list.append(specific_issue)
+        remaining_issues = [iss for iss in current_issues if iss != specific_issue]
+    else:
+        for iss in current_issues:
+            if iss not in ignored_list:
+                ignored_list.append(iss)
+        if "*" not in ignored_list:
+            ignored_list.append("*")
+        remaining_issues = []
+
+    val_log["ignored_ai_issues"] = ignored_list
+
+    if remaining_issues:
+        val_log["ai_warning"] = " | ".join(remaining_issues)
+        val_log["ai_audit_status"] = f"MISMATCH: {' | '.join(remaining_issues)}"
+    else:
+        val_log.pop("ai_warning", None)
+        val_log["ai_audit_status"] = "AUDITED_PASSED: Reviewed & approved by user"
+        non_ai_errors = [
+            k for k in val_log.keys()
+            if k not in ("ai_warning", "ai_audit_status", "ignored_ai_issues")
+        ]
+        if not non_ai_errors and record.record_status == MigrationRecordStatusEnum.NEEDS_REVIEW:
+            record.record_status = MigrationRecordStatusEnum.READY_FOR_IMPORT
+
+    record.validation_log = val_log
+    flag_modified(record, "validation_log")
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    logger.info(f"AI audit discrepancy dismissed for staged record id={record.id} (customer {current_user.customer_id}).")
+    return record
+
 @router.post("/upload-attachments", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
 async def upload_migration_attachments(
     files: List[UploadFile] = File(...),
@@ -1668,12 +1737,13 @@ async def upload_migration_attachments(
                     context="migration_staging",
                 )
             except Exception as gcs_err:
-                logger.warning(f"GCS encrypted staging skipped for '{safe_name}': {gcs_err}")
+                logger.warning(f"GCS encrypted staging skipped for customer {customer_id}: {gcs_err}")
 
         saved_files.append(safe_name)
-        logger.info(
-            f"Encrypted & staged migration attachment '{safe_name}' ({len(content)} bytes) for customer {customer_id}"
-        )
+
+    logger.info(
+        f"Encrypted & staged {len(saved_files)} migration attachment file(s) for customer {customer_id}"
+    )
 
     return {
         "message": f"Successfully encrypted and staged {len(saved_files)} attachment file(s).",

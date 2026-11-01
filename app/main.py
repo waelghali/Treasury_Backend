@@ -158,6 +158,18 @@ class SensitiveDataFilter(logging.Filter):
             r"\1***@\2",
         ))
 
+        # 11. Audit comparison values (Excel='...' / AI='...') if ever logged
+        self._patterns.append((
+            re.compile(r"\b(Excel|AI)='[^']*'"),
+            r"\1='[REDACTED]'",
+        ))
+
+        # 12. Migration staging paths
+        self._patterns.append((
+            re.compile(r"(migration_(?:staging|attachments)[/\\])[^\s\"']+"),
+            r"\1[REDACTED_FILE]",
+        ))
+
     @staticmethod
     def _mask(value: str) -> str:
         """Keep only the last 4 characters of an identifier."""

@@ -883,7 +883,7 @@ async def extract_structured_data_with_gemini(text_content: str, unique_file_id:
                     "properties": {
                         "lgAmount": { "type": "NUMBER", "description": "New LG amount."},
                         "currency": { "type": "STRING", "description": "New currency."},
-                        "expiryDate": { "type": "STRING", "format": "date-time", "description": "New expiry date in YYYY-MM-DD format."},
+                        "expiryDate": { "type": "STRING", "description": "New expiry date in YYYY-MM-DD format (date only, no time)."},
                         "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "New or amended conditions."}
                     },
                 }
@@ -933,8 +933,8 @@ Document Text:
                 "currency": { "type": "STRING" },
                 "lgType": { "type": "STRING" },
                 "purpose": { "type": "STRING" },
-                "issuanceDate": { "type": "STRING", "format": "date-time" }, 
-                "expiryDate": { "type": "STRING", "format": "date-time" },   
+                "issuanceDate": { "type": "STRING", "description": "Date the LG was issued in YYYY-MM-DD format (date only, no time)." }, 
+                "expiryDate": { "type": "STRING", "description": "Date the LG expires in YYYY-MM-DD format (date only, no time)." },   
                 "otherConditions": { "type": "ARRAY", "items": { "type": "STRING" } },
                 "issuingBankCountry": { "type": "STRING", "description": "The country of the issuing bank. Use 'Egypt' if from a local Egyptian bank."},
                 "advisingBankName": { "type": "STRING", "description": "The name of the advising or confirming bank, if present."},
@@ -1077,9 +1077,6 @@ Document Text:
             client=client, model=GEMINI_MODEL_NAME, contents=prompt, config=config
         )
         extracted_data_str = response.text
-        logger.debug(f"--- FULL GEMINI JSON RESPONSE START ---")
-        logger.debug(extracted_data_str)
-        logger.debug(f"--- FULL GEMINI JSON RESPONSE END ---")
         
         usage_metadata = None
         if response.usage_metadata:
@@ -1100,6 +1097,22 @@ Document Text:
             logger.info(f"Gemini output saved (file_id={sanitized_file_id})")
 
         extracted_data = json.loads(extracted_data_str)
+        if isinstance(extracted_data, dict):
+            def _norm_ai_date(val):
+                if not val or not isinstance(val, str):
+                    return val
+                s = val.strip()
+                m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+                if m:
+                    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+                return re.split(r"[T_\s]", s)[0]
+
+            for d_key in ("issuanceDate", "expiryDate"):
+                if d_key in extracted_data and extracted_data[d_key]:
+                    extracted_data[d_key] = _norm_ai_date(extracted_data[d_key])
+            if isinstance(extracted_data.get("amendedFields"), dict) and extracted_data["amendedFields"].get("expiryDate"):
+                extracted_data["amendedFields"]["expiryDate"] = _norm_ai_date(extracted_data["amendedFields"]["expiryDate"])
+
         logger.info("Gemini AI extraction successful.")
         return extracted_data, usage_metadata
     except json.JSONDecodeError as e:
