@@ -1122,18 +1122,77 @@ Document Text:
         logger.error(f"Error during Gemini AI extraction: {e}. Raw response length: {len(extracted_data_str or '') if 'extracted_data_str' in locals() else 'N/A'}", exc_info=True)
         raise
 
-async def process_lg_document_with_ai(
-    file_bytes: bytes, 
-    mime_type: str, 
-    lg_number_hint: str = "unknown_lg", 
-    customer_bucket_name: Optional[str] = None,
-    # --- ADDED AS OPTIONAL AT THE END ---
-    db: Optional[Session] = None, 
-    current_user: Optional["User"] = None,
-    file_name: str = "unknown_file"
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+def _execute_in_forked_worker_sync(coro_fn, args):
+    """
+    Runs an async AI/PDF/OCR coroutine in a disposable forked child process on Linux.
+    When the child exits via os._exit(0), the Linux kernel immediately reclaims 100%
+    of the ~90MB of PyMuPDF (fitz), Google Vision, Google GenAI, and GCS client memory,
+    keeping the main Uvicorn worker process completely free of heavy SDK bloat.
+    """
+    import pickle
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r_fd)
+        except Exception:
+            pass
+        try:
+            global _GCS_CLIENT, _VISION_CLIENT, _DOCAI_CLIENT, _GENAI_CLIENT
+            _GCS_CLIENT = None
+            _VISION_CLIENT = None
+            _DOCAI_CLIENT = None
+            _GENAI_CLIENT = None
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                res = loop.run_until_complete(coro_fn(*args))
+            finally:
+                loop.close()
+            data_bytes = pickle.dumps(("ok", res))
+        except Exception as e:
+            logger.error(f"Isolated AI worker error: {e}", exc_info=True)
+            data_bytes = pickle.dumps(("err", str(e)))
+        try:
+            with os.fdopen(w_fd, "wb") as wf:
+                wf.write(data_bytes)
+                wf.flush()
+        except Exception:
+            pass
+        os._exit(0)
+    else:
+        os.close(w_fd)
+        try:
+            with os.fdopen(r_fd, "rb") as rf:
+                raw = rf.read()
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except Exception:
+                pass
+        if not raw:
+            return None, None
+        status_flag, payload = pickle.loads(raw)
+        if status_flag == "err":
+            return None, None
+        return payload
 
-    
+
+async def _run_coro_in_isolated_fork(coro_fn, *args):
+    if hasattr(os, "fork") and os.getenv("DISABLE_ISOLATED_AI_FORK", "0") != "1":
+        try:
+            return await asyncio.to_thread(_execute_in_forked_worker_sync, coro_fn, args)
+        except OSError as fork_err:
+            logger.warning(f"os.fork() unavailable ({fork_err}); falling back to in-process AI execution.")
+    return await coro_fn(*args)
+
+
+async def _process_lg_document_with_ai_core(
+    file_bytes: bytes,
+    mime_type: str,
+    lg_number_hint: str = "unknown_lg",
+    customer_bucket_name: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     logger.info(f"Starting AI processing for MIME type: {mime_type}, LG Hint provided: {bool(lg_number_hint)}")
     target_bucket_name = customer_bucket_name if customer_bucket_name else GCS_BUCKET_NAME
     
@@ -1201,16 +1260,8 @@ async def process_lg_document_with_ai(
             total_usage_metadata["gemini_prompt_tokens"] = gemini_usage_metadata.get("prompt_tokens", 0)
             total_usage_metadata["gemini_completion_tokens"] = gemini_usage_metadata.get("completion_tokens", 0)
 
-        if db and current_user:
-            await _log_ai_usage_to_db(db, current_user, file_name, total_usage_metadata)
-        else:
-            # Use info or debug instead of warning if this is a common/expected state
-            logger.info("Usage not logged: DB session or user missing.")
-
-        # 2. Validate Results (Core logic)
         if not structured_data:
             logger.error("Gemini AI structured data extraction failed.")
-            # Return early or raise an exception here if the rest of the app expects data
             return None, total_usage_metadata 
 
         logger.info("AI processing completed successfully.")
@@ -1224,18 +1275,40 @@ async def process_lg_document_with_ai(
             await _cleanup_gcs_files(target_bucket_name, f"lg_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS files: {unique_file_id}")
         _reclaim_system_memory()
-# NEW FUNCTION: For amendment-specific AI processing
 
-async def process_amendment_with_ai(
+
+async def process_lg_document_with_ai(
     file_bytes: bytes, 
     mime_type: str, 
-    lg_record_details: Dict[str, Any], 
-    file_name: str = "amendment_file", 
+    lg_number_hint: str = "unknown_lg", 
+    customer_bucket_name: Optional[str] = None,
+    # --- ADDED AS OPTIONAL AT THE END ---
     db: Optional[Session] = None, 
     current_user: Optional["User"] = None,
-    customer_bucket_name: Optional[str] = None
+    file_name: str = "unknown_file"
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
-    
+    structured_data, total_usage_metadata = await _run_coro_in_isolated_fork(
+        _process_lg_document_with_ai_core,
+        file_bytes,
+        mime_type,
+        lg_number_hint,
+        customer_bucket_name,
+    )
+    if db and current_user and total_usage_metadata:
+        await _log_ai_usage_to_db(db, current_user, file_name, total_usage_metadata)
+    else:
+        logger.info("Usage not logged: DB session or user missing.")
+    _reclaim_system_memory()
+    return structured_data, total_usage_metadata
+
+
+# NEW FUNCTION: For amendment-specific AI processing
+async def _process_amendment_with_ai_core(
+    file_bytes: bytes,
+    mime_type: str,
+    lg_record_details: Dict[str, Any],
+    customer_bucket_name: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     lg_number_hint = lg_record_details.get("lgNumber", "unknown_amendment")
     logger.info(f"Starting AI processing for LG amendment. LG Hint provided: {bool(lg_number_hint)}")
     target_bucket_name = customer_bucket_name if customer_bucket_name else GCS_BUCKET_NAME
@@ -1284,20 +1357,11 @@ async def process_amendment_with_ai(
         if gemini_usage_metadata:
             total_usage_metadata["gemini_prompt_tokens"] = gemini_usage_metadata.get("prompt_tokens", 0)
             total_usage_metadata["gemini_completion_tokens"] = gemini_usage_metadata.get("completion_tokens", 0)
-        # 1. Safe DB Logging
-        if db and current_user:
-            await _log_ai_usage_to_db(db, current_user, file_name, total_usage_metadata)
-        else:
-            logger.warning("Skipping DB usage log: Missing database session or user.")
 
-        # 2. Strict Validation
         if not structured_data:
-            # Raising an exception stops execution; only do this if the caller
-            # is prepared to catch it (e.g., in a try/except block or FastAPI handler)
             logger.error("Gemini AI structured data extraction failed.")
             raise Exception("Gemini AI structured data extraction failed.")
 
-        # 3. Success Path
         logger.info("AI amendment processing completed successfully.")
         return structured_data, total_usage_metadata
 
@@ -1309,6 +1373,30 @@ async def process_amendment_with_ai(
             await _cleanup_gcs_files(target_bucket_name, f"lg_amendment_scans_temp/{unique_file_id}/")
             logger.info(f"Cleaned up temporary GCS amendment files for session: {unique_file_id}")
         _reclaim_system_memory()
+
+
+async def process_amendment_with_ai(
+    file_bytes: bytes, 
+    mime_type: str, 
+    lg_record_details: Dict[str, Any], 
+    file_name: str = "amendment_file", 
+    db: Optional[Session] = None, 
+    current_user: Optional["User"] = None,
+    customer_bucket_name: Optional[str] = None
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+    structured_data, total_usage_metadata = await _run_coro_in_isolated_fork(
+        _process_amendment_with_ai_core,
+        file_bytes,
+        mime_type,
+        lg_record_details,
+        customer_bucket_name,
+    )
+    if db and current_user and total_usage_metadata:
+        await _log_ai_usage_to_db(db, current_user, file_name, total_usage_metadata)
+    else:
+        logger.warning("Skipping DB usage log: Missing database session or user.")
+    _reclaim_system_memory()
+    return structured_data, total_usage_metadata
 
 # ==============================================================================
 # Supporting Document AI Analysis (for Issuance Request Verification)

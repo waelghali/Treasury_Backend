@@ -68,9 +68,17 @@ def _ensure_openpyxl_styles():
     if openpyxl is not None:
         return
 
-    import openpyxl as _openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter as _get_column_letter
+    import sys as _sys
+    _had_np = "numpy" in _sys.modules
+    if not _had_np:
+        _sys.modules["numpy"] = None
+    try:
+        import openpyxl as _openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter as _get_column_letter
+    finally:
+        if not _had_np and _sys.modules.get("numpy") is None:
+            _sys.modules.pop("numpy", None)
 
     openpyxl = _openpyxl
     get_column_letter = _get_column_letter

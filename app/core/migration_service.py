@@ -495,24 +495,24 @@ class MigrationService:
                     except Exception as rm_err:
                         logger.warning(f"Failed to remove temporary staged file for customer {customer_id}: {rm_err}")
 
-            # 2. Remove temporary GCS migration_staging blob if present
-            bucket_name = os.getenv("GCS_BUCKET_NAME")
-            if not bucket_name and db:
-                try:
-                    from app.crud.crud import crud_customer_configuration
-                    from app.constants import GlobalConfigKey
-                    cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
-                        db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
-                    )
-                    if cfg and cfg.get("effective_value"):
-                        bucket_name = cfg["effective_value"]
-                except Exception:
-                    pass
+            # 2. Only check GCS if _GCS_CLIENT is already active in this process
+            import app.core.ai_integration as _ai_mod
+            if getattr(_ai_mod, "_GCS_CLIENT", None) is not None:
+                bucket_name = os.getenv("GCS_BUCKET_NAME")
+                if not bucket_name and db:
+                    try:
+                        from app.crud.crud import crud_customer_configuration
+                        from app.constants import GlobalConfigKey
+                        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                            db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+                        )
+                        if cfg and cfg.get("effective_value"):
+                            bucket_name = cfg["effective_value"]
+                    except Exception:
+                        pass
 
-            if bucket_name:
-                from app.core.ai_integration import _get_gcs_client
-                client = _get_gcs_client()
-                if client:
+                if bucket_name:
+                    client = _ai_mod._GCS_CLIENT
                     bucket = client.bucket(bucket_name)
                     for blob_path in (
                         build_customer_blob_path(customer_id, "migration_staging", file_name),
@@ -1042,6 +1042,7 @@ class MigrationService:
                     was_scanned = True
                     logger.info(f"   -> AI Scanning Original Document for staged record id={first_rec.id}...")
                     ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=str(lg_num))
+                    del content
 
                     if ai_data:
                         src = first_rec.source_data_json
@@ -1122,6 +1123,7 @@ class MigrationService:
                         logger.info(f"   -> AI Scanning Amendment for staged record id={last_rec.id}...")
                         context = {"lg_record_details": {"lgNumber": str(lg_num)}}
                         ai_amend, _ = await process_amendment_with_ai(content, mime, context)
+                        del content
 
                         if ai_amend and ai_amend.get('is_relevant_amendment'):
                             changes = ai_amend.get('amendedFields', {})
@@ -1184,6 +1186,8 @@ class MigrationService:
             db.add(first_rec)
 
         db.commit()
+        from app.core.ai_integration import _reclaim_system_memory
+        _reclaim_system_memory()
         logger.info("=======================================================")
         logger.info(
             f"🕵️ AUDIT FINISHED. LGs checked: {len(grouped_records)}, Files scanned: {files_scanned}, "

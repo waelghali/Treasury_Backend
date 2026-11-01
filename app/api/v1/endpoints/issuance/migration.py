@@ -660,33 +660,79 @@ async def upload_issuance_migration_file(
     # Calculate hash for dedup
     file_hash = hashlib.sha256(content).hexdigest()
 
-    # Parse file
+    # Parse file without loading pandas (+65MB)
     try:
-        import pandas as pd
+        import csv
+        from app.core.ai_integration import _reclaim_system_memory
+
+        raw_rows: List[List[Any]] = []
         if ext == "csv":
-            df = pd.read_csv(io.BytesIO(content))
+            try:
+                text_data = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text_data = content.decode("latin-1", errors="replace")
+            raw_rows = list(csv.reader(io.StringIO(text_data)))
         else:
-            df = pd.read_excel(io.BytesIO(content))
+            import sys as _sys
+            _had_np = "numpy" in _sys.modules
+            if not _had_np:
+                _sys.modules["numpy"] = None
+            try:
+                import openpyxl
+            finally:
+                if not _had_np and _sys.modules.get("numpy") is None:
+                    _sys.modules.pop("numpy", None)
+            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                if ws is not None:
+                    for r in ws.iter_rows(values_only=True):
+                        raw_rows.append(list(r))
+            finally:
+                wb.close()
+        del content
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
 
-    if df.empty:
+    if len(raw_rows) < 2:
         raise HTTPException(status_code=400, detail="File contains no data rows.")
 
-    # Remove completely empty rows
-    df = df.dropna(how="all").reset_index(drop=True)
-    if df.empty:
+    # Map headers
+    raw_headers = [str(c or "").strip() for c in raw_rows[0]]
+    mapped_cols: List[str] = []
+    for col in raw_headers:
+        normalized = col.lower()
+        if normalized in ISSUANCE_COLUMN_MAPPING:
+            mapped_cols.append(ISSUANCE_COLUMN_MAPPING[normalized])
+        else:
+            mapped_cols.append(normalized.replace(" ", "_"))
+
+    # Build non-empty row dicts
+    parsed_rows: List[Dict[str, Any]] = []
+    for raw_r in raw_rows[1:]:
+        if not any(_clean_value(v) is not None for v in raw_r):
+            continue
+        row_d: Dict[str, Any] = {}
+        for c_idx, c_name in enumerate(mapped_cols):
+            if not c_name:
+                continue
+            val = raw_r[c_idx] if c_idx < len(raw_r) else None
+            if c_name not in row_d or row_d[c_name] is None:
+                row_d[c_name] = val
+        parsed_rows.append(row_d)
+
+    del raw_rows
+    _reclaim_system_memory()
+
+    if not parsed_rows:
         raise HTTPException(status_code=400, detail="File contains no valid data rows after cleanup.")
 
-    # Map columns
-    df = _map_columns(df)
-
     # Check we have at least some recognized columns
-    recognized = set(df.columns) & set(ALL_ISSUANCE_FIELDS)
+    recognized = set(mapped_cols) & set(ALL_ISSUANCE_FIELDS)
     if not recognized:
         raise HTTPException(
             status_code=400,
-            detail=f"No recognized columns found. Expected columns like: LG Number, Beneficiary, Amount, Currency, Bank, Status. Found: {list(df.columns)}"
+            detail=f"No recognized columns found. Expected columns like: LG Number, Beneficiary, Amount, Currency, Bank, Status. Found: {mapped_cols}"
         )
 
     # Get existing LG numbers for dedup
@@ -716,10 +762,10 @@ async def upload_issuance_migration_file(
     results = {"staged": 0, "duplicates": 0, "errors": 0, "warnings": 0, "records": []}
     seen_in_batch = {}
 
-    for idx, row in df.iterrows():
+    for idx, row in enumerate(parsed_rows):
         record_data = {}
         for field in ALL_ISSUANCE_FIELDS:
-            if field in df.columns:
+            if field in mapped_cols:
                 record_data[field] = _clean_value(row.get(field))
 
         # Clean specific fields

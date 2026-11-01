@@ -795,37 +795,104 @@ async def upload_structured_file_for_staging(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     ]:
         try:
-            import pandas as pd
-            import numpy as np
+            import math
+            from dateutil import parser as dateutil_parser
             from app.core.ai_integration import _reclaim_system_memory
-            file_stream = io.BytesIO(file_content)
-            if file.content_type == "text/csv":
-                df = pd.read_csv(file_stream, dtype=str)
+
+            raw_rows: List[List[Any]] = []
+            if file.content_type == "text/csv" or (file.filename and file.filename.lower().endswith(".csv")):
+                try:
+                    text_data = file_content.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text_data = file_content.decode("latin-1", errors="replace")
+                reader = csv.reader(io.StringIO(text_data))
+                raw_rows = list(reader)
             else:
-                df = pd.read_excel(file_stream, engine='openpyxl')
-            
-            df = _normalize_df_columns(df)
+                import sys as _sys
+                _had_np = "numpy" in _sys.modules
+                if not _had_np:
+                    _sys.modules["numpy"] = None
+                try:
+                    import openpyxl
+                finally:
+                    if not _had_np and _sys.modules.get("numpy") is None:
+                        _sys.modules.pop("numpy", None)
+                wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=True, data_only=True)
+                try:
+                    ws = wb.active
+                    if ws is not None:
+                        for row in ws.iter_rows(values_only=True):
+                            raw_rows.append(list(row))
+                finally:
+                    wb.close()
 
-            if 'lg_amount' in df.columns:
-                df['lg_amount'] = pd.to_numeric(
-                    df['lg_amount'].astype(str).str.strip().str.replace(',', ''),
-                    errors='coerce' # If it's still not a number, make it (None)
-                )
+            if raw_rows:
+                mapped_headers = [map_column_header(c) for c in raw_rows[0]]
 
-            if 'lg_number' in df.columns:
-                df['lg_number'] = df['lg_number'].apply(
-                    lambda x: str(int(x)).strip() if isinstance(x, float) and x.is_integer()
-                    else (str(x).strip() if pd.notna(x) and str(x).strip() != '' else None)
-                )
-            
-            for col in ['issuance_date', 'expiry_date']:
-                if col in df.columns:
-                    parsed_dates = pd.to_datetime(df[col], errors='coerce').dt.date
-                    df[col] = parsed_dates.where(pd.notna(parsed_dates), None)
+                def _clean_cell(val: Any) -> Any:
+                    if val is None:
+                        return None
+                    if isinstance(val, float) and math.isnan(val):
+                        return None
+                    if isinstance(val, str):
+                        s = val.strip()
+                        if s == "" or s.upper() in ("NAN", "NONE", "NULL"):
+                            return None
+                        return val
+                    return val
 
-            df = df.replace({np.nan: None})
-            records_to_stage = df.to_dict('records')
-            del df
+                def _coerce_date_cell(val: Any) -> Optional[date]:
+                    if val is None:
+                        return None
+                    if isinstance(val, datetime):
+                        return val.date()
+                    if isinstance(val, date):
+                        return val
+                    s = str(val).strip()
+                    if not s or s.upper() in ("NAN", "NONE", "NULL", "N/A", "NAT"):
+                        return None
+                    try:
+                        return dateutil_parser.parse(s).date()
+                    except Exception:
+                        return None
+
+                for raw_row in raw_rows[1:]:
+                    if not any(_clean_cell(v) is not None for v in raw_row):
+                        continue
+                    row_dict: Dict[str, Any] = {}
+                    for col_idx, col_name in enumerate(mapped_headers):
+                        if not col_name:
+                            continue
+                        cell_val = _clean_cell(raw_row[col_idx]) if col_idx < len(raw_row) else None
+                        if col_name not in row_dict or row_dict[col_name] is None:
+                            row_dict[col_name] = cell_val
+
+                    if "lg_amount" in row_dict:
+                        amt_val = row_dict["lg_amount"]
+                        if amt_val is not None:
+                            try:
+                                row_dict["lg_amount"] = float(str(amt_val).strip().replace(",", ""))
+                            except (ValueError, TypeError):
+                                row_dict["lg_amount"] = None
+
+                    if "lg_number" in row_dict:
+                        lgn = row_dict["lg_number"]
+                        if isinstance(lgn, float) and lgn.is_integer():
+                            row_dict["lg_number"] = str(int(lgn)).strip()
+                        elif lgn is not None and str(lgn).strip() != "":
+                            row_dict["lg_number"] = str(lgn).strip()
+                        else:
+                            row_dict["lg_number"] = None
+
+                    for d_col in ("issuance_date", "expiry_date"):
+                        if d_col in row_dict:
+                            row_dict[d_col] = _coerce_date_cell(row_dict[d_col])
+
+                    records_to_stage.append(row_dict)
+
+            del raw_rows
+            del file_content
+            await file.close()
             _reclaim_system_memory()
             
         except Exception as e:
@@ -1505,9 +1572,15 @@ def delete_staged_record(
     db: Session = Depends(get_db),
 ):
     """
-    Deletes a single staged record for the current customer.
+    Deletes a single staged record for the current customer and cleans up any unreferenced staged attachment.
     """
     logger.info(f"Delete staged record {record_id} endpoint hit for customer {current_user.customer_id}.")
+    rec = db.query(models.LGMigrationStaging).filter(
+        models.LGMigrationStaging.id == record_id,
+        models.LGMigrationStaging.customer_id == current_user.customer_id,
+    ).first()
+    att_url = (rec.source_data_json or {}).get("attachment_url") if rec and isinstance(rec.source_data_json, dict) else None
+
     crud_lg_migration.delete_staging_record(
         db=db,
         record_id=record_id,
@@ -1515,6 +1588,10 @@ def delete_staged_record(
         user_id=current_user.user_id
     )
     db.commit()
+
+    if att_url:
+        migration_service._cleanup_migration_staging_file(str(att_url), current_user.customer_id, db=None)
+
     return {"message": f"Staged record {record_id} deleted successfully."}
 
 
@@ -1525,11 +1602,25 @@ def delete_multiple_staged_records(
     db: Session = Depends(get_db),
 ):
     """
-    Deletes multiple staged records for the current customer by their IDs.
+    Deletes multiple staged records for the current customer by their IDs and cleans up staged attachments.
     """
     logger.info(f"Delete multiple staged records endpoint hit for customer {current_user.customer_id}.")
+    recs_to_del = db.query(models.LGMigrationStaging).filter(
+        models.LGMigrationStaging.customer_id == current_user.customer_id,
+        models.LGMigrationStaging.id.in_(delete_in.ids),
+    ).all()
+    att_urls = [
+        (r.source_data_json or {}).get("attachment_url")
+        for r in recs_to_del
+        if isinstance(r.source_data_json, dict) and (r.source_data_json or {}).get("attachment_url")
+    ]
+
     deleted_count = crud_lg_migration.delete_multiple_records(db, current_user.customer_id, delete_in.ids, current_user.user_id)
     db.commit()
+
+    for att_url in set(att_urls):
+        migration_service._cleanup_migration_staging_file(str(att_url), current_user.customer_id, db=None)
+
     return {"deleted_count": deleted_count}
 
 @router.post("/upload-unstructured", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any])
@@ -1676,7 +1767,7 @@ async def upload_migration_attachments(
     import tempfile
     from app.services.tenant_key_service import tenant_key_service
     from app.core.security_crypto import encrypt_stream_generator
-    from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+    from app.core.ai_integration import _reclaim_system_memory
 
     customer_id = current_user.customer_id
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
@@ -1684,63 +1775,43 @@ async def upload_migration_attachments(
     base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{customer_id}")
     os.makedirs(base_dir, exist_ok=True)
 
-    # Resolve optional GCS bucket for resilient encrypted staging
-    bucket_name = os.getenv("GCS_BUCKET_NAME")
-    if not bucket_name:
-        try:
-            from app.crud.crud import crud_customer_configuration
-            from app.constants import GlobalConfigKey
-            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
-                db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
-            )
-            if cfg and cfg.get("effective_value"):
-                bucket_name = cfg["effective_value"]
-        except Exception:
-            pass
-
     saved_files = []
     for upload in files:
-        if not upload.filename:
-            continue
-        safe_name = os.path.basename(upload.filename.replace("\\", "/")).strip()
-        if not safe_name:
-            continue
+        try:
+            if not upload.filename:
+                continue
+            safe_name = os.path.basename(upload.filename.replace("\\", "/")).strip()
+            if not safe_name:
+                continue
 
-        content = await upload.read()
-        if not content:
-            continue
+            content = await upload.read()
+            if not content:
+                continue
 
-        # 1. Write encrypted STREAM V2 AEAD file to local ephemeral staging (.enc)
-        enc_dest_path = os.path.join(base_dir, f"{safe_name}.enc")
-        with open(enc_dest_path, "wb") as f_out:
-            for enc_chunk in encrypt_stream_generator(io.BytesIO(content), tenant_dek, context="migration_staging"):
-                f_out.write(enc_chunk)
+            # Write encrypted STREAM V2 AEAD file to local ephemeral staging (.enc)
+            enc_dest_path = os.path.join(base_dir, f"{safe_name}.enc")
+            with open(enc_dest_path, "wb") as f_out:
+                for enc_chunk in encrypt_stream_generator(io.BytesIO(content), tenant_dek, context="migration_staging"):
+                    f_out.write(enc_chunk)
 
-        # Remove any legacy plaintext file if it existed
-        raw_legacy_path = os.path.join(base_dir, safe_name)
-        if os.path.exists(raw_legacy_path):
+            del content
+
+            # Remove any legacy plaintext file if it existed
+            raw_legacy_path = os.path.join(base_dir, safe_name)
+            if os.path.exists(raw_legacy_path):
+                try:
+                    os.remove(raw_legacy_path)
+                except Exception:
+                    pass
+
+            saved_files.append(safe_name)
+        finally:
             try:
-                os.remove(raw_legacy_path)
+                await upload.close()
             except Exception:
                 pass
 
-        # 2. Also stream-encrypt to GCS migration_staging folder if bucket is available
-        if bucket_name:
-            try:
-                blob_path = build_customer_blob_path(customer_id, "migration_staging", safe_name)
-                upload_stream_to_gcs_encrypted(
-                    source_stream=io.BytesIO(content),
-                    blob_name=blob_path,
-                    dek=tenant_dek,
-                    content_type=upload.content_type or "application/pdf",
-                    bucket_name=bucket_name,
-                    context="migration_staging",
-                )
-            except Exception as gcs_err:
-                logger.warning(f"GCS encrypted staging skipped for customer {customer_id}: {gcs_err}")
-
-        saved_files.append(safe_name)
-
+    _reclaim_system_memory()
     logger.info(
         f"Encrypted & staged {len(saved_files)} migration attachment file(s) for customer {customer_id}"
     )
@@ -1758,10 +1829,10 @@ def list_uploaded_migration_attachments(
 ):
     """
     Returns the list of encrypted attachment filenames currently staged for this customer.
+    Reads local staging directory directly without eagerly initializing Google Cloud Storage SDKs on page load.
     """
     import os
     import tempfile
-    from app.core.storage_service import build_customer_blob_path
 
     customer_id = current_user.customer_id
     staged_names = set()
@@ -1769,33 +1840,12 @@ def list_uploaded_migration_attachments(
     base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{customer_id}")
     if os.path.exists(base_dir):
         for fname in os.listdir(base_dir):
+            if fname.startswith("."):
+                continue
             full_p = os.path.join(base_dir, fname)
             if os.path.isfile(full_p):
                 clean_name = fname[:-4] if fname.endswith(".enc") else fname
                 staged_names.add(clean_name)
-
-    # Also check GCS migration_staging prefix if local /tmp was reset
-    try:
-        bucket_name = os.getenv("GCS_BUCKET_NAME")
-        if not bucket_name:
-            from app.crud.crud import crud_customer_configuration
-            from app.constants import GlobalConfigKey
-            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
-                db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
-            )
-            if cfg and cfg.get("effective_value"):
-                bucket_name = cfg["effective_value"]
-        if bucket_name:
-            from app.core.ai_integration import _get_gcs_client
-            client = _get_gcs_client()
-            if client:
-                prefix = build_customer_blob_path(customer_id, "migration_staging", "")
-                for blob in client.bucket(bucket_name).list_blobs(prefix=prefix):
-                    bname = os.path.basename(blob.name)
-                    if bname:
-                        staged_names.add(bname[:-4] if bname.endswith(".enc") else bname)
-    except Exception:
-        pass
 
     files = sorted(staged_names)
     return {"uploaded_files": files, "files": files}

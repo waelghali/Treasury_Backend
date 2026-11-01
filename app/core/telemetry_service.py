@@ -133,7 +133,7 @@ def get_process_memory_stats() -> Dict[str, Any]:
         "status_message": status_message,
         "badge": badge,
         "engine": engine_type,
-        "pid": PROCESS_PID
+        "pid": os.getpid()
     }
 
 
@@ -249,6 +249,8 @@ def record_startup_watchdog(db: Session) -> None:
         is_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
         env_name = "Render Cloud" if is_render else f"{platform.system()} Host"
 
+        current_pid = os.getpid()
+
         # If the last recorded event was a STARTUP without a corresponding SHUTDOWN,
         # it indicates the previous instance was abruptly terminated (e.g. OOM or SIGKILL).
         is_unexpected_restart = False
@@ -278,7 +280,7 @@ def record_startup_watchdog(db: Session) -> None:
                     customer_id=None,
                     action_type="SYSTEM_UNEXPECTED_REBOOT_DETECTED",
                     entity_type="HostProcess",
-                    entity_id=PROCESS_PID,
+                    entity_id=current_pid,
                     details=reboot_details,
                     timestamp=datetime.utcnow()
                 )
@@ -288,7 +290,7 @@ def record_startup_watchdog(db: Session) -> None:
 
         # Log clean boot event
         startup_details = {
-            "pid": PROCESS_PID,
+            "pid": current_pid,
             "boot_time_utc": PROCESS_BOOT_TIME.isoformat(),
             "environment": env_name,
             "python_version": platform.python_version(),
@@ -301,13 +303,13 @@ def record_startup_watchdog(db: Session) -> None:
             customer_id=None,
             action_type="SYSTEM_SERVER_STARTUP",
             entity_type="HostProcess",
-            entity_id=PROCESS_PID,
+            entity_id=current_pid,
             details=startup_details,
             timestamp=datetime.utcnow()
         )
         db.add(startup_log)
         db.commit()
-        logger.info(f"Server startup watchdog logged [PID {PROCESS_PID}, Initial RAM {mem_stats['current_mb']}MB].")
+        logger.info(f"Server startup watchdog logged [PID {current_pid}, Initial RAM {mem_stats['current_mb']}MB].")
 
     except Exception as e:
         logger.warning(f"Could not record startup watchdog log: {e}")
