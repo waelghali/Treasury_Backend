@@ -1,6 +1,6 @@
 # app/services/quotation_benchmark_service.py
 import hashlib
-import numpy as np
+import statistics
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 from sqlalchemy.orm import Session
@@ -219,13 +219,23 @@ def get_market_benchmarks(
     if not spreads:
         spreads = [8.5] # Default baseline if newly initialized
 
-    latencies = [r.response_duration_seconds / 60.0 for r in records if r.response_duration_seconds is not None]
-    avg_latency = round(float(np.mean(latencies)), 1) if latencies else 11.5
-    median_spread = round(float(np.median(spreads)), 1)
-    p25_spread = round(float(np.percentile(spreads, 25)), 1)
-    p75_spread = round(float(np.percentile(spreads, 75)), 1)
+    def _percentile(vals: List[float], q: float) -> float:
+        s = sorted(vals)
+        if len(s) == 1:
+            return float(s[0])
+        pos = (len(s) - 1) * (q / 100.0)
+        lo = int(pos)
+        hi = min(lo + 1, len(s) - 1)
+        frac = pos - lo
+        return float(s[lo] + frac * (s[hi] - s[lo]))
 
-    avg_desks = round(float(np.mean([r.num_participating_banks for r in records])), 1) if records else 3.5
+    latencies = [r.response_duration_seconds / 60.0 for r in records if r.response_duration_seconds is not None]
+    avg_latency = round(float(statistics.mean(latencies)), 1) if latencies else 11.5
+    median_spread = round(float(statistics.median(spreads)), 1)
+    p25_spread = round(_percentile(spreads, 25), 1)
+    p75_spread = round(_percentile(spreads, 75), 1)
+
+    avg_desks = round(float(statistics.mean([r.num_participating_banks for r in records])), 1) if records else 3.5
 
     return {
         "insufficient_sample": False,

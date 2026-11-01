@@ -23,7 +23,6 @@ from app.core.honeypot import verify_honeypot
 
 # *** FIXED: Use storage.Client() inside function (not at module level) ***
 import logging
-from google.cloud import storage as gcs_storage
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -31,6 +30,7 @@ logger = logging.getLogger(__name__)
 async def upload_file_to_gcs(file: UploadFile, folder_name: str) -> str:
     """Uploads file to GCS. Client is created per-call to avoid module-level crashes."""
     import asyncio
+    from google.cloud import storage as gcs_storage
 
     await file.seek(0)
     file_content = await file.read()

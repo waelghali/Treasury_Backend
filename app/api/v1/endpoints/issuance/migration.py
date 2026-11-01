@@ -11,12 +11,10 @@ import hashlib
 import logging
 import os
 import io
+import math
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 from decimal import Decimal, InvalidOperation
-
-import pandas as pd
-import numpy as np
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
@@ -271,7 +269,7 @@ class HistoryPreviewRequest(BaseModel):
 # HELPER FUNCTIONS
 # ==============================================================================
 
-def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _map_columns(df: Any) -> Any:
     """Map Excel column headers to internal field names."""
     mapped_columns = {}
     for col in df.columns:
@@ -286,18 +284,28 @@ def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _clean_value(val):
     """Clean a cell value for JSON serialization."""
-    if pd.isna(val) or val is None:
+    if val is None:
         return None
-    if isinstance(val, (pd.Timestamp, datetime)):
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    try:
+        # Handle pandas NA / NaT if pandas is loaded
+        if type(val).__name__ in ("NAType", "NaTType"):
+            return None
+    except Exception:
+        pass
+    if isinstance(val, datetime):
         return val.strftime("%Y-%m-%d")
     if isinstance(val, date):
         return val.isoformat()
     if isinstance(val, Decimal):
         return float(val)
-    if isinstance(val, (np.integer,)):
-        return int(val)
-    if isinstance(val, (np.floating,)):
-        return float(val)
+    if hasattr(val, "item") and callable(getattr(val, "item", None)):
+        # Unwrap numpy scalar (np.integer, np.floating)
+        val = val.item()
+        if isinstance(val, float) and math.isnan(val):
+            return None
+        return val
     if isinstance(val, str):
         val = val.strip()
         if val.upper() in ("N/A", "NA", "NONE", "NULL", "-", ""):
@@ -329,9 +337,9 @@ def _parse_amount(val) -> Optional[float]:
 
 def _parse_date(val) -> Optional[str]:
     """Parse a date value to YYYY-MM-DD string."""
-    if val is None:
+    if val is None or type(val).__name__ in ("NAType", "NaTType"):
         return None
-    if isinstance(val, (pd.Timestamp, datetime)):
+    if isinstance(val, datetime):
         return val.strftime("%Y-%m-%d")
     if isinstance(val, date):
         return val.isoformat()
@@ -654,6 +662,7 @@ async def upload_issuance_migration_file(
 
     # Parse file
     try:
+        import pandas as pd
         if ext == "csv":
             df = pd.read_csv(io.BytesIO(content))
         else:

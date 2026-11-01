@@ -11,7 +11,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
-import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, desc
 
@@ -79,6 +78,7 @@ class InboxClassificationService:
         file_type = (file_type or "").lower()
         df = None
         try:
+            import pandas as pd
             if file_type in ("xlsx", "xls"):
                 # Read top 10 rows
                 df = pd.read_excel(file_path, nrows=10)

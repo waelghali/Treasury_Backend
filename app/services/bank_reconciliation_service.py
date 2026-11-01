@@ -1,4 +1,5 @@
-import pandas as pd
+from app.core.ai_integration import _LazyModule, _reclaim_system_memory
+pd = _LazyModule("pandas")
 import io
 import re
 from typing import List, Dict, Any, Optional, Tuple
@@ -225,7 +226,7 @@ class BankReconciliationService:
 
         return dt
 
-    def _detect_column_mapping(self, df: pd.DataFrame) -> Dict[str, str]:
+    def _detect_column_mapping(self, df: Any) -> Dict[str, str]:
         """
         Heuristically identifies columns for Date, Amount, and Description.
         Handles sparse Excel files where headers might be missing or 'Unnamed'.
@@ -394,7 +395,7 @@ class BankReconciliationService:
         # Keyword-based detection was sufficient; return what was found
         return mapping
 
-    def _detect_metadata(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _detect_metadata(self, df: Any) -> Dict[str, Any]:
         """
         Scans top and bottom rows for balance keywords (English & Arabic).
         """
@@ -693,6 +694,8 @@ class BankReconciliationService:
             metadata["start_date"] = sorted_txns[0]["booking_date"]
             metadata["end_date"] = sorted_txns[-1]["booking_date"]
 
+        del df
+        _reclaim_system_memory()
         return transactions, metadata
 
 
@@ -936,6 +939,7 @@ class BankReconciliationService:
                 matched_count += 1
 
         db.commit()
+        _reclaim_system_memory()
         return {
             "matched_count": matched_count,
             "relationships": rel_result,
@@ -1227,6 +1231,7 @@ class BankReconciliationService:
                     matched_count += 1
 
         db.commit()
+        _reclaim_system_memory()
         return {"matched_count": matched_count, "status": f"Concept engine classified {matched_count} transactions."}
 
     def _match_collaborative_patterns(self, db: Session, customer_id: int, statement_id: Optional[int] = None) -> int:
@@ -1773,6 +1778,7 @@ class BankReconciliationService:
             imported_count += 1
 
         db.commit()
+        _reclaim_system_memory()
         return {
             "imported_count": imported_count,
             "total_rows_processed": len(df),
@@ -1827,6 +1833,7 @@ class BankReconciliationService:
             imported_count += 1
 
         db.commit()
+        _reclaim_system_memory()
         return {
             "imported_count": imported_count,
             "total_rows_processed": len(records_data),

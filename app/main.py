@@ -540,6 +540,8 @@ def configure_app_instance(fastapi_app: FastAPI):
             logger.error(f"Error in scheduled task {task_func.__name__}: {e}", exc_info=True)
         finally:
             db_session.close()
+            from app.core.ai_integration import _reclaim_system_memory
+            _reclaim_system_memory()
 
     @fastapi_app.on_event("startup")
     async def start_scheduler():
@@ -803,6 +805,9 @@ def configure_app_instance(fastapi_app: FastAPI):
         except Exception as rel_err:
             logger.warning(f"Startup sync of scheduled RFQ releases encountered error: {rel_err}")
 
+        from app.core.ai_integration import _reclaim_system_memory
+        _reclaim_system_memory()
+
     @fastapi_app.on_event("shutdown")
     async def shutdown_scheduler():
         try:
@@ -821,3 +826,5 @@ def configure_app_instance(fastapi_app: FastAPI):
 
 # Call the configuration
 configure_app_instance(app)
+from app.core.ai_integration import _reclaim_system_memory as _boot_reclaim_memory
+_boot_reclaim_memory()

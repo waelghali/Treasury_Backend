@@ -16,7 +16,9 @@ from pydantic import EmailStr
 from app.schemas.all_schemas import SystemNotificationCreate
 from app.crud.crud import crud_system_notification
 import requests
-from bs4 import BeautifulSoup
+def BeautifulSoup(*args, **kwargs):
+    from bs4 import BeautifulSoup as _BS
+    return _BS(*args, **kwargs)
 from urllib.parse import urljoin
 
 # Application Imports

@@ -16,8 +16,6 @@ from app.schemas.migration_schemas import (
 )
 from app.models import LGMigrationStaging, LGRecord
 from datetime import date, datetime
-import pandas as pd
-import numpy as np
 from app.crud.base import log_action
 from sqlalchemy.orm.attributes import flag_modified
 

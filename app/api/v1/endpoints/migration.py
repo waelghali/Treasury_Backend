@@ -2,11 +2,9 @@
 import csv
 import io
 import json
-import pandas as pd
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
-import numpy as np
 from sqlalchemy import func, or_, cast
 from pydantic import BaseModel
 from dateutil.relativedelta import relativedelta
@@ -214,7 +212,7 @@ column_mapping = {
 }
 
 
-def _normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_df_columns(df: Any) -> Any:
     """Converts DataFrame columns to snake_case for consistency."""
     df.columns = df.columns.str.strip().str.replace(' ', '_').str.lower()
     return df
@@ -480,6 +478,9 @@ async def upload_structured_file_for_staging(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     ]:
         try:
+            import pandas as pd
+            import numpy as np
+            from app.core.ai_integration import _reclaim_system_memory
             file_stream = io.BytesIO(file_content)
             if file.content_type == "text/csv":
                 df = pd.read_csv(file_stream, dtype=str)
@@ -509,6 +510,8 @@ async def upload_structured_file_for_staging(
 
             df = df.replace({np.nan: None})
             records_to_stage = df.to_dict('records')
+            del df
+            _reclaim_system_memory()
             
         except Exception as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to parse CSV/Excel file: {e}")

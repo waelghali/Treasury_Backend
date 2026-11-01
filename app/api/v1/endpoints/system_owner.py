@@ -64,31 +64,14 @@ from app.core.document_generator import generate_pdf_from_html # NEW IMPORT
 import logging
 logger = logging.getLogger(__name__)
 
-try:
-    current_file_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(current_file_dir, '..', '..', '..'))
-
-    security_module_path = os.path.join(project_root, 'core', 'security.py')
-
-    if not os.path.exists(security_module_path):
-        raise FileNotFoundError(f"Expected core/security.py at {security_module_path} but it was not found.")
-    
-    spec = importlib.util.spec_from_file_location("app.core.security", security_module_path)
-    core_security = importlib.util.module_from_spec(spec)
-    sys.modules["app.core.security"] = core_security
-    spec.loader.exec_module(core_security)
-    from app.core.security import (
-        get_current_user,
-        get_current_system_owner,
-        HasPermission,
-        TokenData, get_client_ip
-    )
-    from apscheduler.triggers.cron import CronTrigger
-    from apscheduler.triggers.date import DateTrigger
-
-except Exception as e:
-    print(f"FATAL ERROR (system_owner.py): Could not import core.security module directly. Error: {e}")
-    raise
+from app.core.security import (
+    get_current_user,
+    get_current_system_owner,
+    HasPermission,
+    TokenData, get_client_ip
+)
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 
 from app.constants import UserRole, LegalArtifactType, GlobalConfigKey

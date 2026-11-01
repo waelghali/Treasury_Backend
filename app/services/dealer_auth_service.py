@@ -14,7 +14,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 import pyotp
-import qrcode
 from jose import jwt, JWTError
 
 from app.core.hashing import verify_password, get_password_hash
@@ -48,6 +47,7 @@ def generate_totp_uri(secret: str, email: str, bank_name: str) -> str:
 
 def generate_qr_code_base64(uri: str) -> str:
     """Renders the otpauth URI as a base64-encoded PNG image data URL."""
+    import qrcode
     qr = qrcode.make(uri)
     buf = io.BytesIO()
     qr.save(buf, format="PNG")

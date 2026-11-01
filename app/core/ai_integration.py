@@ -3,7 +3,7 @@ import os
 import io
 from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
 import json
-import fitz # PyMuPDF
+import importlib, importlib.util
 from dotenv import load_dotenv
 import re
 import asyncio
@@ -44,29 +44,53 @@ GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME')
 if not GCS_BUCKET_NAME:
     logger.warning("Warning: GCS_BUCKET_NAME environment variable not set. GCS integration will be limited.")
 
-# Try to import Google Cloud Vision
-try:
-    from google.cloud import vision_v1p3beta1 as vision
-    from google.cloud import storage
-    from google.oauth2 import service_account
-    from google.api_core.exceptions import GoogleAPIError # Import GoogleAPIError for specific exception handling
-    GOOGLE_CLOUD_LIBRARIES_AVAILABLE = True
-except ImportError:
+class _LazyModule:
+    """Lightweight lazy module loader that defers heavy imports until first attribute access."""
+    def __init__(self, module_name: str):
+        self._module_name = module_name
+        self._mod = None
+
+    def _load(self):
+        if self._mod is None:
+            self._mod = importlib.import_module(self._module_name)
+        return self._mod
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+    def __bool__(self):
+        try:
+            return self._load() is not None
+        except ImportError:
+            return False
+
+
+fitz = _LazyModule("fitz") if importlib.util.find_spec("fitz") else None
+
+# Lazy-check Google Cloud Vision & Storage availability without importing gRPC/protobuf at boot
+GOOGLE_CLOUD_LIBRARIES_AVAILABLE = bool(
+    importlib.util.find_spec("google.cloud.vision_v1p3beta1")
+    and importlib.util.find_spec("google.cloud.storage")
+)
+if GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
+    vision = _LazyModule("google.cloud.vision_v1p3beta1")
+    storage = _LazyModule("google.cloud.storage")
+    service_account = _LazyModule("google.oauth2.service_account")
+    GoogleAPIError = Exception  # Promoted to google.api_core.exceptions.GoogleAPIError when client initializes
+else:
     logger.warning("Warning: google-cloud-vision or google-cloud-storage library not found. AI OCR/GCS functionality will be limited.")
-    GOOGLE_CLOUD_LIBRARIES_AVAILABLE = False
     vision = None
     storage = None
     service_account = None
     GoogleAPIError = Exception # Define dummy for type hinting if not available
 
-# Try to import Google GenAI SDK (unified Vertex AI client)
-try:
-    from google import genai
-    from google.genai import types as genai_types
-    GEMINI_AVAILABLE = True
-except ImportError:
+# Lazy-check Google GenAI SDK (unified Vertex AI client)
+GEMINI_AVAILABLE = bool(importlib.util.find_spec("google.genai"))
+if GEMINI_AVAILABLE:
+    genai = _LazyModule("google.genai")
+    genai_types = _LazyModule("google.genai.types")
+else:
     logger.warning("google-genai library not found. Gemini AI functionality will be limited.")
-    GEMINI_AVAILABLE = False
     genai = None
     genai_types = None
 
@@ -215,12 +239,11 @@ def _safe_generate_content_sync(client, model: str, contents, config=None):
         raise last_err
 
 
-try:
-    from google.cloud import documentai_v1 as documentai
-    DOCUMENT_AI_AVAILABLE = True
-except ImportError:
+DOCUMENT_AI_AVAILABLE = bool(importlib.util.find_spec("google.cloud.documentai_v1"))
+if DOCUMENT_AI_AVAILABLE:
+    documentai = _LazyModule("google.cloud.documentai_v1")
+else:
     logger.warning("Warning: google-cloud-documentai library not found. Document AI form parsing will be disabled.")
-    DOCUMENT_AI_AVAILABLE = False
     documentai = None
 
 # --- Global Client/Credentials Instantiation ---
@@ -246,9 +269,15 @@ else:
 
 @lru_cache(maxsize=1)
 def _get_google_credentials():
-    global _google_credentials
+    global _google_credentials, GoogleAPIError
     if not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
         return None
+    if GoogleAPIError is Exception:
+        try:
+            from google.api_core.exceptions import GoogleAPIError as _GAE
+            GoogleAPIError = _GAE
+        except ImportError:
+            pass
     if _google_credentials is None and "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
         try:
             credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"].strip('\'"')
@@ -351,11 +380,13 @@ def _get_genai_client():
             _genai_client_global = None
     return _genai_client_global
 
-# Initial client setup
-_get_google_credentials()
-_get_gcs_client()
-_get_vision_client()
-_get_genai_client()
+# Clients are initialized lazily on first call via @lru_cache getters above.
+
+
+def __getattr__(name: str):
+    if name == "storage_client":
+        return _get_gcs_client()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 # --- Document AI Configuration ---
 DOCUMENT_AI_PROJECT_ID = os.environ.get('DOCUMENT_AI_PROJECT_ID', '')

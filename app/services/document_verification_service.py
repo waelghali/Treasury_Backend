@@ -7,11 +7,10 @@ from typing import Dict, Any, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-try:
-    import fitz  # PyMuPDF
-    FITZ_AVAILABLE = True
-except ImportError:
-    FITZ_AVAILABLE = False
+import importlib.util
+
+FITZ_AVAILABLE = bool(importlib.util.find_spec("fitz"))
+if not FITZ_AVAILABLE:
     logger.warning("PyMuPDF (fitz) is not installed. PDF text extraction will fall back to OCR.")
 
 # Default calendar convention tolerance window in days (e.g. 90-day vs 3-month calendar quarter / weekend bump)
@@ -194,6 +193,7 @@ class DocumentVerificationService:
         if mime_type == "application/pdf" and FITZ_AVAILABLE:
             doc = None
             try:
+                import fitz
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 pages_text = [page.get_text() for page in doc]
                 extracted = "\n".join(pages_text).strip()

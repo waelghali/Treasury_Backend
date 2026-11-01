@@ -3,9 +3,6 @@ import json
 from datetime import date, datetime, timezone
 from typing import List, Dict, Any, Optional
 
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 from sqlalchemy.orm import Session
 
 from app.models.models import User, Bank, Currency, Customer, CustomerEntity
@@ -18,7 +15,7 @@ from app.models.models_issuance import (
 )
 
 # ==============================================================================
-# STYLE PALETTES & THEMES (Enterprise Financial Grade)
+# STYLE PALETTES & THEMES (Enterprise Financial Grade — Lazy Initialized)
 # ==============================================================================
 COLOR_PRIMARY_NAVY = "1E3A8A"      # Deep Royal Navy
 COLOR_SECONDARY_SLATE = "334155"   # Slate 700
@@ -33,48 +30,93 @@ COLOR_TOTAL_ROW = "E2E8F0"         # Slate 200
 
 FONT_NAME = "Segoe UI"
 
-FONT_COMPANY = Font(name=FONT_NAME, size=15, bold=True, color=COLOR_PRIMARY_NAVY)
-FONT_REPORT_TITLE = Font(name=FONT_NAME, size=12, bold=True, color=COLOR_SECONDARY_SLATE)
-FONT_METADATA = Font(name=FONT_NAME, size=9, color=COLOR_TEXT_MUTED)
-FONT_KPI_LABEL = Font(name=FONT_NAME, size=8, bold=True, color=COLOR_TEXT_MUTED)
-FONT_KPI_VAL = Font(name=FONT_NAME, size=10.5, bold=True, color=COLOR_PRIMARY_NAVY)
-FONT_HEADER = Font(name=FONT_NAME, size=10, bold=True, color=COLOR_HEADER_TEXT)
-FONT_DATA = Font(name=FONT_NAME, size=9.5, color=COLOR_TEXT_MAIN)
-FONT_DATA_BOLD = Font(name=FONT_NAME, size=9.5, bold=True, color=COLOR_TEXT_MAIN)
-FONT_TOTAL = Font(name=FONT_NAME, size=10, bold=True, color=COLOR_PRIMARY_NAVY)
+openpyxl = None
+get_column_letter = None
+FONT_COMPANY = None
+FONT_REPORT_TITLE = None
+FONT_METADATA = None
+FONT_KPI_LABEL = None
+FONT_KPI_VAL = None
+FONT_HEADER = None
+FONT_DATA = None
+FONT_DATA_BOLD = None
+FONT_TOTAL = None
+FILL_HEADER = None
+FILL_HEADER_ALT = None
+FILL_ZEBRA = None
+FILL_WHITE = None
+FILL_KPI = None
+FILL_TOTAL = None
+BORDER_THIN = None
+BORDER_TOTAL = None
+BORDER_KPI = None
+ALIGN_LEFT = None
+ALIGN_CENTER = None
+ALIGN_RIGHT = None
+ALIGN_HEADER = None
 
-FILL_HEADER = PatternFill(start_color=COLOR_PRIMARY_NAVY, end_color=COLOR_PRIMARY_NAVY, fill_type="solid")
-FILL_HEADER_ALT = PatternFill(start_color=COLOR_SECONDARY_SLATE, end_color=COLOR_SECONDARY_SLATE, fill_type="solid")
-FILL_ZEBRA = PatternFill(start_color=COLOR_ZEBRA_ROW, end_color=COLOR_ZEBRA_ROW, fill_type="solid")
-FILL_WHITE = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-FILL_KPI = PatternFill(start_color=COLOR_KPI_BG, end_color=COLOR_KPI_BG, fill_type="solid")
-FILL_TOTAL = PatternFill(start_color=COLOR_TOTAL_ROW, end_color=COLOR_TOTAL_ROW, fill_type="solid")
 
-BORDER_THIN = Border(
-    left=Side(style="thin", color=COLOR_BORDER),
-    right=Side(style="thin", color=COLOR_BORDER),
-    top=Side(style="thin", color=COLOR_BORDER),
-    bottom=Side(style="thin", color=COLOR_BORDER),
-)
+def _ensure_openpyxl_styles():
+    """Lazily imports openpyxl and initializes style singletons on first export."""
+    global openpyxl, get_column_letter
+    global FONT_COMPANY, FONT_REPORT_TITLE, FONT_METADATA, FONT_KPI_LABEL, FONT_KPI_VAL
+    global FONT_HEADER, FONT_DATA, FONT_DATA_BOLD, FONT_TOTAL
+    global FILL_HEADER, FILL_HEADER_ALT, FILL_ZEBRA, FILL_WHITE, FILL_KPI, FILL_TOTAL
+    global BORDER_THIN, BORDER_TOTAL, BORDER_KPI
+    global ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT, ALIGN_HEADER
 
-BORDER_TOTAL = Border(
-    left=Side(style="thin", color=COLOR_BORDER),
-    right=Side(style="thin", color=COLOR_BORDER),
-    top=Side(style="thin", color=COLOR_BORDER),
-    bottom=Side(style="double", color=COLOR_PRIMARY_NAVY),
-)
+    if openpyxl is not None:
+        return
 
-BORDER_KPI = Border(
-    left=Side(style="thin", color=COLOR_KPI_BORDER),
-    right=Side(style="thin", color=COLOR_KPI_BORDER),
-    top=Side(style="thin", color=COLOR_KPI_BORDER),
-    bottom=Side(style="thin", color=COLOR_KPI_BORDER),
-)
+    import openpyxl as _openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter as _get_column_letter
 
-ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
-ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-ALIGN_RIGHT = Alignment(horizontal="right", vertical="center")
-ALIGN_HEADER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    openpyxl = _openpyxl
+    get_column_letter = _get_column_letter
+
+    FONT_COMPANY = Font(name=FONT_NAME, size=15, bold=True, color=COLOR_PRIMARY_NAVY)
+    FONT_REPORT_TITLE = Font(name=FONT_NAME, size=12, bold=True, color=COLOR_SECONDARY_SLATE)
+    FONT_METADATA = Font(name=FONT_NAME, size=9, color=COLOR_TEXT_MUTED)
+    FONT_KPI_LABEL = Font(name=FONT_NAME, size=8, bold=True, color=COLOR_TEXT_MUTED)
+    FONT_KPI_VAL = Font(name=FONT_NAME, size=10.5, bold=True, color=COLOR_PRIMARY_NAVY)
+    FONT_HEADER = Font(name=FONT_NAME, size=10, bold=True, color=COLOR_HEADER_TEXT)
+    FONT_DATA = Font(name=FONT_NAME, size=9.5, color=COLOR_TEXT_MAIN)
+    FONT_DATA_BOLD = Font(name=FONT_NAME, size=9.5, bold=True, color=COLOR_TEXT_MAIN)
+    FONT_TOTAL = Font(name=FONT_NAME, size=10, bold=True, color=COLOR_PRIMARY_NAVY)
+
+    FILL_HEADER = PatternFill(start_color=COLOR_PRIMARY_NAVY, end_color=COLOR_PRIMARY_NAVY, fill_type="solid")
+    FILL_HEADER_ALT = PatternFill(start_color=COLOR_SECONDARY_SLATE, end_color=COLOR_SECONDARY_SLATE, fill_type="solid")
+    FILL_ZEBRA = PatternFill(start_color=COLOR_ZEBRA_ROW, end_color=COLOR_ZEBRA_ROW, fill_type="solid")
+    FILL_WHITE = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    FILL_KPI = PatternFill(start_color=COLOR_KPI_BG, end_color=COLOR_KPI_BG, fill_type="solid")
+    FILL_TOTAL = PatternFill(start_color=COLOR_TOTAL_ROW, end_color=COLOR_TOTAL_ROW, fill_type="solid")
+
+    BORDER_THIN = Border(
+        left=Side(style="thin", color=COLOR_BORDER),
+        right=Side(style="thin", color=COLOR_BORDER),
+        top=Side(style="thin", color=COLOR_BORDER),
+        bottom=Side(style="thin", color=COLOR_BORDER),
+    )
+
+    BORDER_TOTAL = Border(
+        left=Side(style="thin", color=COLOR_BORDER),
+        right=Side(style="thin", color=COLOR_BORDER),
+        top=Side(style="thin", color=COLOR_BORDER),
+        bottom=Side(style="double", color=COLOR_PRIMARY_NAVY),
+    )
+
+    BORDER_KPI = Border(
+        left=Side(style="thin", color=COLOR_KPI_BORDER),
+        right=Side(style="thin", color=COLOR_KPI_BORDER),
+        top=Side(style="thin", color=COLOR_KPI_BORDER),
+        bottom=Side(style="thin", color=COLOR_KPI_BORDER),
+    )
+
+    ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ALIGN_RIGHT = Alignment(horizontal="right", vertical="center")
+    ALIGN_HEADER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 # ==============================================================================
 # MASTER COLUMN REGISTRY (Select & Arrange)
@@ -341,6 +383,7 @@ class IssuanceExportService:
             include_approvals = True
 
         # 4. Create Workbook
+        _ensure_openpyxl_styles()
         wb = openpyxl.Workbook()
         wb.remove(wb.active)  # Remove default blank sheet
 
@@ -375,6 +418,10 @@ class IssuanceExportService:
 
         buf = io.BytesIO()
         wb.save(buf)
+        wb.close()
+        del wb
+        from app.core.ai_integration import _reclaim_system_memory
+        _reclaim_system_memory()
         buf.seek(0)
         return buf
 

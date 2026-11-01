@@ -33,8 +33,8 @@ def sqlalchemy_json_serializer(obj):
 engine = create_engine(
     DATABASE_URL, 
     pool_pre_ping=True,
-    pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
-    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
+    pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
     pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
     pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
     # This now handles Decimals AND Dates for the audit log JSONB column
