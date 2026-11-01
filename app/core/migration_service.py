@@ -84,6 +84,11 @@ def _apply_defaults_and_autofill(
     Returns the updated record_data dictionary.
     """
     logger.debug("Autofill started for record.")
+    try:
+        from app.api.v1.endpoints.migration import normalize_record_keys
+        normalize_record_keys(record_data)
+    except Exception:
+        pass
     
     # --- Step 1: Autofill Internal Owner Contact (FIXED) ---
     existing_owner_id = record_data.get("internal_owner_contact_id")
@@ -824,9 +829,23 @@ class MigrationService:
             e_name = getattr(e, 'name', getattr(e, 'entity_name', getattr(e, 'company_name', 'Unknown')))
             entity_map[e.id] = e_name
 
+        from sqlalchemy.orm.attributes import flag_modified
+        try:
+            from app.api.v1.endpoints.migration import normalize_record_keys
+        except Exception:
+            normalize_record_keys = None
+
         grouped_records = {}
         for r in records:
             data = r.source_data_json or {}
+            if normalize_record_keys and isinstance(data, dict):
+                before_keys = set(data.keys())
+                before_att = data.get("attachment_url")
+                normalize_record_keys(data)
+                if set(data.keys()) != before_keys or data.get("attachment_url") != before_att:
+                    r.source_data_json = data
+                    flag_modified(r, "source_data_json")
+                    db.add(r)
             lg_num = data.get('lg_number')
             if not lg_num:
                 continue
@@ -834,7 +853,6 @@ class MigrationService:
                 grouped_records[lg_num] = []
             grouped_records[lg_num].append(r)
 
-        from sqlalchemy.orm.attributes import flag_modified
         audit_report = []
         audited_passed = []
         skipped_records = []

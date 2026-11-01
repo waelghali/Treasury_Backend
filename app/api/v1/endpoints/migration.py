@@ -55,41 +55,150 @@ router = APIRouter(
 )
 
 column_mapping = {
-    # Core Fields
+    # Core Fields - LG Number
     "LG_ID": "lg_number",
     "LG No": "lg_number",
-    "Guarantee No": "lg_number",
-    "Guarantee_ID": "lg_number",
+    "LG No.": "lg_number",
+    "LG_No": "lg_number",
     "LG Number": "lg_number",
+    "LG_Number": "lg_number",
+    "LG Num": "lg_number",
+    "LG #": "lg_number",
+    "LG": "lg_number",
+    "LG Ref": "lg_number",
+    "LG Reference": "lg_number",
+    "Guarantee No": "lg_number",
+    "Guarantee No.": "lg_number",
+    "Guarantee Number": "lg_number",
+    "Guarantee_ID": "lg_number",
+    "Guarantee Ref": "lg_number",
+    "Bond No": "lg_number",
+    "Bond Number": "lg_number",
+    "Ref No": "lg_number",
+    "Reference No": "lg_number",
+    "Reference Number": "lg_number",
+
+    # Attachment / Document / File / PDF / Scan / URL Variations
     "ATTACHMENT": "attachment_url",
+    "ATTACHMENTS": "attachment_url",
     "ATTACHEMENT": "attachment_url",
+    "ATTACHEMENTS": "attachment_url",
+    "ATTCHMENT": "attachment_url",
+    "ATTACH": "attachment_url",
     "Attachment": "attachment_url",
+    "Attachments": "attachment_url",
     "Attachement": "attachment_url",
+    "Attachements": "attachment_url",
     "Attachment_URL": "attachment_url",
     "Attachment URL": "attachment_url",
+    "Attachement_URL": "attachment_url",
+    "Attachement URL": "attachment_url",
+    "Attachments_URL": "attachment_url",
+    "Attachment_Link": "attachment_url",
+    "Attachement_Link": "attachment_url",
+    "Attachment_Path": "attachment_url",
+    "Attachement_Path": "attachment_url",
+    "Attached_File": "attachment_url",
+    "Attached_Files": "attachment_url",
+    "Attached_Document": "attachment_url",
+    "Attached_PDF": "attachment_url",
+    "URL": "attachment_url",
+    "URLs": "attachment_url",
+    "Link": "attachment_url",
+    "Links": "attachment_url",
+    "File": "attachment_url",
+    "Files": "attachment_url",
+    "File_URL": "attachment_url",
+    "File URL": "attachment_url",
+    "File_Link": "attachment_url",
     "File_Path": "attachment_url",
     "File Path": "attachment_url",
+    "Filepath": "attachment_url",
+    "Files_Path": "attachment_url",
+    "File_Name": "attachment_url",
+    "File Name": "attachment_url",
+    "Filename": "attachment_url",
+    "Filenames": "attachment_url",
+    "Path": "attachment_url",
+    "Paths": "attachment_url",
+    "Local_Path": "attachment_url",
+    "Folder_Path": "attachment_url",
     "Document": "attachment_url",
+    "Documents": "attachment_url",
+    "Document_URL": "attachment_url",
+    "Document_Path": "attachment_url",
+    "Document_Link": "attachment_url",
+    "Doc": "attachment_url",
+    "Docs": "attachment_url",
+    "Doc_URL": "attachment_url",
+    "Doc_Path": "attachment_url",
+    "Doc_File": "attachment_url",
+    "LG_Doc": "attachment_url",
+    "LG_Document": "attachment_url",
     "PDF": "attachment_url",
+    "PDFs": "attachment_url",
+    "PDF_File": "attachment_url",
+    "PDF_Files": "attachment_url",
+    "PDF_URL": "attachment_url",
+    "PDF_Path": "attachment_url",
+    "PDF_Link": "attachment_url",
+    "PDF_Scan": "attachment_url",
+    "PDF_Copy": "attachment_url",
+    "LG_PDF": "attachment_url",
     "Scan": "attachment_url",
+    "Scans": "attachment_url",
+    "Scan_File": "attachment_url",
+    "Scan_Files": "attachment_url",
+    "Scan_URL": "attachment_url",
+    "Scan_Path": "attachment_url",
+    "Scan_Link": "attachment_url",
+    "Scanned_Copy": "attachment_url",
+    "Scanned_File": "attachment_url",
+    "Scan_Copy": "attachment_url",
+    "LG_Scan": "attachment_url",
+    "Copy": "attachment_url",
+    "LG_Copy": "attachment_url",
+    "Soft_Copy": "attachment_url",
+    "Softcopy": "attachment_url",
+    "Image": "attachment_url",
+    "Images": "attachment_url",
+    "Source_File": "attachment_url",
 
+    # Amount
     "Amount": "lg_amount",
     "LG Amount": "lg_amount",
+    "LG_Amount": "lg_amount",
+    "Ammount": "lg_amount",
+    "LG_Ammount": "lg_amount",
     "Value": "lg_amount",
+    "LG_Value": "lg_amount",
     "Guarantee Amount": "lg_amount",
+    "Guarantee_Amount": "lg_amount",
+    "Guarantee_Value": "lg_amount",
     "Amt": "lg_amount",
+    "Face_Value": "lg_amount",
+    "Principal_Amount": "lg_amount",
 
+    # Currency
     "Currency": "lg_currency_id",
     "Curr": "lg_currency_id",
+    "CCY": "lg_currency_id",
+    "Curreny": "lg_currency_id",
+    "Curency": "lg_currency_id",
     "LG Currency": "lg_currency_id",
     "Guarantee Currency": "lg_currency_id",
     "LG_Currency": "lg_currency_id",
+    "Currency_Code": "lg_currency_id",
 
+    # Payable Currency
     "Payable_Currency": "lg_payable_currency_id",
     "Pay Currency": "lg_payable_currency_id",
     "Settlement Currency": "lg_payable_currency_id",
     "Payout Currency": "lg_payable_currency_id",
+    "Payable_CCY": "lg_payable_currency_id",
+    "Settlement_CCY": "lg_payable_currency_id",
 
+    # Issuance Date
     "Issuance_Date": "issuance_date",
     "Issuance Date": "issuance_date",
     "issue_date": "issuance_date",
@@ -98,37 +207,61 @@ column_mapping = {
     "Opening Date": "issuance_date",
     "Issuing Date": "issuance_date",
     "Issued Date": "issuance_date",
+    "Effective_Date": "issuance_date",
+    "Date_of_Issue": "issuance_date",
+    "Date_Issued": "issuance_date",
+    "Issuance": "issuance_date",
 
+    # Expiry Date
     "Expiry_Date": "expiry_date",
     "Expiry Date": "expiry_date",
     "Maturity Date": "expiry_date",
     "End Date": "expiry_date",
     "Valid Until": "expiry_date",
+    "Validity_Date": "expiry_date",
     "Expiry": "expiry_date",
+    "Expiration": "expiry_date",
     "Expiration Date": "expiry_date",
     "Exp Date": "expiry_date",
+    "Exp_Date": "expiry_date",
+    "Expire_Date": "expiry_date",
+    "Due_Date": "expiry_date",
 
+    # Auto Renewal
     "Auto_Renewal": "auto_renewal",
+    "Auto_Renew": "auto_renewal",
+    "Autorenewal": "auto_renewal",
+    "Autorenew": "auto_renewal",
     "Renewal": "auto_renewal",
     "Auto Renewal": "auto_renewal",
     "Renewable": "auto_renewal",
+    "Is_Renewable": "auto_renewal",
 
+    # LG Type
     "Type": "lg_type_id",
     "LG_Type": "lg_type_id",
     "LG Type": "lg_type_id",
     "Guarantee Type": "lg_type_id",
     "Type of LG": "lg_type_id",
     "Guarantee_Type": "lg_type_id",
+    "Bond_Type": "lg_type_id",
 
+    # Operational Status
     "Operational_Status": "lg_operational_status_id",
     "Op Status": "lg_operational_status_id",
     "LG O.Status": "lg_operational_status_id",
+    "LG_O_Status": "lg_operational_status_id",
+    "Status": "lg_operational_status_id",
+    "LG_Status": "lg_operational_status_id",
+    "Operative_Status": "lg_operational_status_id",
 
+    # Payment Conditions
     "Payment_Conditions": "payment_conditions",
     "Payment Terms": "payment_conditions",
     "Conditions of Payment": "payment_conditions",
     "Payment_Terms": "payment_conditions",
 
+    # Description / Purpose
     "Description_Purpose": "description_purpose",
     "Purpose": "description_purpose",
     "Desc": "description_purpose",
@@ -136,11 +269,20 @@ column_mapping = {
     "description": "description_purpose",
     "Description": "description_purpose",
     "LG_Purpose": "description_purpose",
+    "Project_Description": "description_purpose",
+    "Subject": "description_purpose",
 
+    # Beneficiary Corporate (Internal Entity)
     "Beneficiary": "beneficiary_corporate_id",
     "beneficiary_name": "beneficiary_corporate_id",
     "Beneficiary Name": "beneficiary_corporate_id",
+    "Beneficiary_Corporate": "beneficiary_corporate_id",
+    "Beneficary": "beneficiary_corporate_id",
+    "Benefeciary": "beneficiary_corporate_id",
     "Company Name": "beneficiary_corporate_id",
+    "Company": "beneficiary_corporate_id",
+    "Entity": "beneficiary_corporate_id",
+    "Entity_Name": "beneficiary_corporate_id",
     "Beneficiary_Name": "beneficiary_corporate_id",
 
     # Bank Fields
@@ -148,12 +290,16 @@ column_mapping = {
     "Bank": "issuing_bank_id",
     "Issuer Bank": "issuing_bank_id",
     "Issuing Bank": "issuing_bank_id",
+    "Issuing_Bank": "issuing_bank_id",
     "Bank Name": "issuing_bank_id",
+    "Bank_Name": "issuing_bank_id",
+    "Guarantor_Bank": "issuing_bank_id",
 
     "Bank_Address": "issuing_bank_address",
     "Bank Addr": "issuing_bank_address",
     "Bank Location": "issuing_bank_address",
     "Branch Address": "issuing_bank_address",
+    "Branch": "issuing_bank_address",
 
     "Bank_Phone": "issuing_bank_phone",
     "Tel": "issuing_bank_phone",
@@ -185,45 +331,68 @@ column_mapping = {
     "Other Terms": "other_conditions",
     "Additional Conditions": "other_conditions",
 
-    # Internal Fields
+    # Internal Owner Fields
     "Internal_Owner_Email": "internal_owner_email",
+    "Internal_Owner": "internal_owner_email",
     "responsible": "internal_owner_email",
     "responsible person": "internal_owner_email",
+    "Responsible_Email": "internal_owner_email",
     "Owner": "internal_owner_email",
     "Owner Email": "internal_owner_email",
+    "Owner_Email": "internal_owner_email",
+    "Owner_Mail": "internal_owner_email",
     "Contact Email": "internal_owner_email",
     "Internal Contact": "internal_owner_email",
+    "PIC": "internal_owner_email",
+    "PIC_Email": "internal_owner_email",
     "Internal_Owner_Phone": "internal_owner_phone",
     "Owner Phone": "internal_owner_phone",
     "Owner_Phone": "internal_owner_phone",
     "Contact Phone": "internal_owner_phone",
+    "Owner_Mobile": "internal_owner_phone",
     "Manager_Email": "manager_email",
     "Manager Email": "manager_email",
+    "Manager": "manager_email",
+    "Manager_Mail": "manager_email",
     "Internal_Owner_Manager_Email": "manager_email",
     "Internal_Owner_ID": "internal_owner_id",
     "Owner ID": "internal_owner_id",
+    "Employee_ID": "internal_owner_id",
 
+    # Category, Contract/Project, Notes, Issuer
     "Category": "lg_category_id",
     "LG Category": "lg_category_id",
     "Category ID": "lg_category_id",
     "LG_Category": "lg_category_id",
+    "Department": "lg_category_id",
 
     "Contract_ID": "internal_contract_project_id",
     "Project": "internal_contract_project_id",
     "Contract": "internal_contract_project_id",
     "Contract Ref": "internal_contract_project_id",
+    "Contract_No": "internal_contract_project_id",
+    "Contract_Number": "internal_contract_project_id",
+    "PO_Number": "internal_contract_project_id",
+    "PO_No": "internal_contract_project_id",
     "Project ID": "internal_contract_project_id",
     "Project_ID": "internal_contract_project_id",
 
     "Notes": "notes",
+    "Note": "notes",
     "Remarks": "notes",
+    "Remark": "notes",
     "Comments": "notes",
+    "Comment": "notes",
     "Additional Notes": "notes",
 
     "Issuer_Name": "issuer_name",
     "Issuer": "issuer_name",
     "Supplier": "supplier_name",
     "Contractor": "contractor_name",
+    "Vendor": "issuer_name",
+    "Vendor_Name": "issuer_name",
+    "Client": "issuer_name",
+    "Counterparty": "issuer_name",
     "Issuer Company": "issuer_name",
     "Applicant_Name": "issuer_name",
     "Applicant": "issuer_name",
@@ -231,9 +400,62 @@ column_mapping = {
 }
 
 
+def _clean_col_key(col_name: Any) -> str:
+    """Normalizes any column header into lowercase snake_case without punctuation."""
+    return re.sub(r"[\s\-\./\(\)\[\]]+", "_", str(col_name or "").strip()).strip("_").lower()
+
+
+NORMALIZED_COLUMN_MAPPING: Dict[str, str] = {
+    _clean_col_key(k): v for k, v in column_mapping.items()
+}
+
+
+def map_column_header(col_name: Any) -> str:
+    """
+    Maps any user-provided Excel/CSV/JSON column header to the canonical LG field name.
+    Uses exact normalized lookup first, then falls back to keyword pattern matching
+    for common attachment/file/PDF/scan/URL column variations.
+    """
+    cleaned = _clean_col_key(col_name)
+    if not cleaned:
+        return ""
+    if cleaned in NORMALIZED_COLUMN_MAPPING:
+        return NORMALIZED_COLUMN_MAPPING[cleaned]
+
+    # Smart pattern fallback for attachment / document / PDF / scan / URL columns
+    attachment_keywords = (
+        "attach", "attache", "attch", "pdf", "scan", "softcopy", "soft_copy",
+        "file_path", "filepath", "file_url", "file_link", "doc_url", "doc_path",
+        "document_url", "document_path", "lg_copy", "scanned",
+    )
+    if any(kw in cleaned for kw in attachment_keywords):
+        return "attachment_url"
+    if cleaned in ("file", "files", "url", "urls", "link", "links", "path", "paths", "doc", "docs", "document", "documents", "copy"):
+        return "attachment_url"
+
+    return cleaned
+
+
+def normalize_record_keys(record_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensures any unmapped alias keys in a record dictionary (e.g. 'attachement', 'files', 'pdf', 'scan', 'url')
+    are mapped to their canonical field names without overwriting existing non-empty canonical values.
+    """
+    if not isinstance(record_data, dict):
+        return record_data
+    for raw_key in list(record_data.keys()):
+        target_key = map_column_header(raw_key)
+        if target_key and target_key != raw_key:
+            val = record_data.get(raw_key)
+            if not record_data.get(target_key) and val is not None and str(val).strip() != "":
+                record_data[target_key] = str(val).strip() if target_key == "attachment_url" else val
+            record_data.pop(raw_key, None)
+    return record_data
+
+
 def _normalize_df_columns(df: Any) -> Any:
-    """Converts DataFrame columns to snake_case for consistency."""
-    df.columns = df.columns.str.strip().str.replace(' ', '_').str.lower()
+    """Converts DataFrame columns to canonical LG field names using map_column_header."""
+    df.columns = [map_column_header(c) for c in df.columns]
     return df
     
 def _get_id_from_code(db: Session, model: Any, code: str, code_column: str = 'iso_code') -> Optional[int]:
@@ -289,6 +511,7 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     Returns the updated record_data dictionary.
     """
     logger.debug("Autofill started for record.")
+    normalize_record_keys(record_data)
     logger.debug(f"Initial record fields: {list(record_data.keys())}")
     # --- Step 1: Autofill Internal Owner Contact (FINAL) ---
     existing_owner_id = record_data.get("internal_owner_contact_id")
@@ -556,19 +779,12 @@ async def upload_structured_file_for_staging(
             detail=f"This file has already been uploaded and processed. Batch ID: {existing_batch.id}."
         )
 
-    normalized_mapping = {v: k for k, v in column_mapping.items()}
-    def norm_keys(d):
-        return {
-            normalized_mapping.get(k.replace(" ", "_").lower(), k.replace(" ", "_").lower()): v
-            for k, v in d.items()
-        }
-
     if file.content_type == "application/json":
         try:
             data = json.loads(file_content)
             if not isinstance(data, list):
                 data = [data]
-            records_to_stage = [norm_keys(item) for item in data]
+            records_to_stage = [normalize_record_keys(dict(item)) for item in data]
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid JSON format: {e}")
             
@@ -588,14 +804,6 @@ async def upload_structured_file_for_staging(
                 df = pd.read_excel(file_stream, engine='openpyxl')
             
             df = _normalize_df_columns(df)
-
-            # Build a map of {normalized_header: new_name}
-            # e.g., {"lg_type": "lg_type_id", "issue_date": "issuance_date"}
-            normalized_rename_map = {
-                k.strip().replace(' ', '_').lower(): v 
-                for k, v in column_mapping.items()
-            }
-            df.rename(columns=normalized_rename_map, inplace=True)
 
             if 'lg_amount' in df.columns:
                 df['lg_amount'] = pd.to_numeric(
@@ -1355,6 +1563,19 @@ def get_staged_records(
         skip=skip,
         limit=limit
     )
+    dirty = False
+    for rec in records:
+        if isinstance(rec.source_data_json, dict):
+            before_keys = set(rec.source_data_json.keys())
+            before_att = rec.source_data_json.get("attachment_url")
+            normalize_record_keys(rec.source_data_json)
+            if set(rec.source_data_json.keys()) != before_keys or rec.source_data_json.get("attachment_url") != before_att:
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(rec, "source_data_json")
+                db.add(rec)
+                dirty = True
+    if dirty:
+        db.commit()
     return records
 
 @router.post("/staged/audit", response_model=Dict[str, Any])
@@ -1416,9 +1637,9 @@ def list_uploaded_migration_attachments(
 
     base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{current_user.customer_id}")
     if not os.path.exists(base_dir):
-        return {"uploaded_files": []}
+        return {"uploaded_files": [], "files": []}
     files = sorted([f for f in os.listdir(base_dir) if os.path.isfile(os.path.join(base_dir, f))])
-    return {"uploaded_files": files}
+    return {"uploaded_files": files, "files": files}
 
 @router.put("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=LGMigrationStagingOut)
 def update_staged_record(
