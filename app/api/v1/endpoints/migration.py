@@ -62,6 +62,16 @@ column_mapping = {
     "Guarantee_ID": "lg_number",
     "LG Number": "lg_number",
     "ATTACHMENT": "attachment_url",
+    "ATTACHEMENT": "attachment_url",
+    "Attachment": "attachment_url",
+    "Attachement": "attachment_url",
+    "Attachment_URL": "attachment_url",
+    "Attachment URL": "attachment_url",
+    "File_Path": "attachment_url",
+    "File Path": "attachment_url",
+    "Document": "attachment_url",
+    "PDF": "attachment_url",
+    "Scan": "attachment_url",
 
     "Amount": "lg_amount",
     "LG Amount": "lg_amount",
@@ -353,6 +363,13 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
             record_data["internal_owner_contact_id"] = None
             logger.warning(f"❌ OWNER NOT FOUND: No internal owner found with email '{clean_email}' for Customer {customer_id}")
             # This will result in 'Missing Internal Owner' validation error
+
+    # Normalize attachment alias keys if present
+    if not record_data.get("attachment_url"):
+        for alias in ("attachement", "attachment", "file_path", "document", "pdf", "scan"):
+            if record_data.get(alias):
+                record_data["attachment_url"] = str(record_data.pop(alias)).strip()
+                break
 
     # Normalize lg_number and string fields if parsed as numeric by Excel/JSON
     if record_data.get("lg_number") is not None and not isinstance(record_data.get("lg_number"), str):
@@ -1349,8 +1366,59 @@ async def audit_staged_data(
     """
     Triggers the AI Auditor to check the First and Last records of staged groups.
     """
+    logger.info(f"AI Audit requested for customer {current_user.customer_id} by {current_user.email}.")
     results = await migration_service.audit_staged_records(db, current_user.customer_id)
     return results
+
+@router.post("/upload-attachments", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
+async def upload_migration_attachments(
+    files: List[UploadFile] = File(...),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """
+    Uploads one or more PDF/image scan files from the user's browser into a server staging directory
+    so they can be matched by filename against the ATTACHMENT column during AI Audit and Final Import.
+    """
+    import os
+    import tempfile
+
+    base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{current_user.customer_id}")
+    os.makedirs(base_dir, exist_ok=True)
+
+    saved_files = []
+    for upload in files:
+        if not upload.filename:
+            continue
+        safe_name = os.path.basename(upload.filename.replace("\\", "/")).strip()
+        if not safe_name:
+            continue
+        dest_path = os.path.join(base_dir, safe_name)
+        content = await upload.read()
+        with open(dest_path, "wb") as f:
+            f.write(content)
+        saved_files.append(safe_name)
+        logger.info(f"Saved migration attachment '{safe_name}' ({len(content)} bytes) for customer {current_user.customer_id} at {dest_path}")
+
+    return {
+        "message": f"Successfully uploaded {len(saved_files)} attachment file(s).",
+        "uploaded_files": saved_files,
+    }
+
+@router.get("/uploaded-attachments", status_code=status.HTTP_200_OK, response_model=Dict[str, List[str]])
+def list_uploaded_migration_attachments(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """
+    Returns the list of attachment filenames currently staged on the server for this customer.
+    """
+    import os
+    import tempfile
+
+    base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{current_user.customer_id}")
+    if not os.path.exists(base_dir):
+        return {"uploaded_files": []}
+    files = sorted([f for f in os.listdir(base_dir) if os.path.isfile(os.path.join(base_dir, f))])
+    return {"uploaded_files": files}
 
 @router.put("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=LGMigrationStagingOut)
 def update_staged_record(
