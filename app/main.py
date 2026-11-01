@@ -10,6 +10,18 @@ import logging
 import pytz
 from datetime import datetime, timedelta
 
+# Apply Linux glibc memory allocator tuning early so >=64KB buffers use mmap
+# and are returned to the OS immediately when freed.
+if sys.platform.startswith("linux"):
+    try:
+        import ctypes as _ctypes
+        _libc = _ctypes.CDLL("libc.so.6")
+        _libc.mallopt(-1, 65536)  # M_TRIM_THRESHOLD = 64KB
+        _libc.mallopt(-3, 65536)  # M_MMAP_THRESHOLD = 64KB
+        _libc.mallopt(-8, 2)      # M_ARENA_MAX = 2
+    except Exception:
+        pass
+
 # FastAPI imports
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
