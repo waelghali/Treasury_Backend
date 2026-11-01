@@ -1596,16 +1596,38 @@ async def audit_staged_data(
 async def upload_migration_attachments(
     files: List[UploadFile] = File(...),
     current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
 ):
     """
-    Uploads one or more PDF/image scan files from the user's browser into a server staging directory
-    so they can be matched by filename against the ATTACHMENT column during AI Audit and Final Import.
+    Streams and encrypts one or more PDF/image scan files from the user's browser using the
+    Customer Tenant DEK (64 KB STREAM V2 AEAD) into isolated staging storage so they can be
+    matched by filename during AI Audit and moved/cleaned upon Final Import.
     """
     import os
     import tempfile
+    from app.services.tenant_key_service import tenant_key_service
+    from app.core.security_crypto import encrypt_stream_generator
+    from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
 
-    base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{current_user.customer_id}")
+    customer_id = current_user.customer_id
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+
+    base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{customer_id}")
     os.makedirs(base_dir, exist_ok=True)
+
+    # Resolve optional GCS bucket for resilient encrypted staging
+    bucket_name = os.getenv("GCS_BUCKET_NAME")
+    if not bucket_name:
+        try:
+            from app.crud.crud import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+            )
+            if cfg and cfg.get("effective_value"):
+                bucket_name = cfg["effective_value"]
+        except Exception:
+            pass
 
     saved_files = []
     for upload in files:
@@ -1614,32 +1636,98 @@ async def upload_migration_attachments(
         safe_name = os.path.basename(upload.filename.replace("\\", "/")).strip()
         if not safe_name:
             continue
-        dest_path = os.path.join(base_dir, safe_name)
+
         content = await upload.read()
-        with open(dest_path, "wb") as f:
-            f.write(content)
+        if not content:
+            continue
+
+        # 1. Write encrypted STREAM V2 AEAD file to local ephemeral staging (.enc)
+        enc_dest_path = os.path.join(base_dir, f"{safe_name}.enc")
+        with open(enc_dest_path, "wb") as f_out:
+            for enc_chunk in encrypt_stream_generator(io.BytesIO(content), tenant_dek, context="migration_staging"):
+                f_out.write(enc_chunk)
+
+        # Remove any legacy plaintext file if it existed
+        raw_legacy_path = os.path.join(base_dir, safe_name)
+        if os.path.exists(raw_legacy_path):
+            try:
+                os.remove(raw_legacy_path)
+            except Exception:
+                pass
+
+        # 2. Also stream-encrypt to GCS migration_staging folder if bucket is available
+        if bucket_name:
+            try:
+                blob_path = build_customer_blob_path(customer_id, "migration_staging", safe_name)
+                upload_stream_to_gcs_encrypted(
+                    source_stream=io.BytesIO(content),
+                    blob_name=blob_path,
+                    dek=tenant_dek,
+                    content_type=upload.content_type or "application/pdf",
+                    bucket_name=bucket_name,
+                    context="migration_staging",
+                )
+            except Exception as gcs_err:
+                logger.warning(f"GCS encrypted staging skipped for '{safe_name}': {gcs_err}")
+
         saved_files.append(safe_name)
-        logger.info(f"Saved migration attachment '{safe_name}' ({len(content)} bytes) for customer {current_user.customer_id} at {dest_path}")
+        logger.info(
+            f"Encrypted & staged migration attachment '{safe_name}' ({len(content)} bytes) for customer {customer_id}"
+        )
 
     return {
-        "message": f"Successfully uploaded {len(saved_files)} attachment file(s).",
+        "message": f"Successfully encrypted and staged {len(saved_files)} attachment file(s).",
         "uploaded_files": saved_files,
+        "files": saved_files,
     }
 
 @router.get("/uploaded-attachments", status_code=status.HTTP_200_OK, response_model=Dict[str, List[str]])
 def list_uploaded_migration_attachments(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
 ):
     """
-    Returns the list of attachment filenames currently staged on the server for this customer.
+    Returns the list of encrypted attachment filenames currently staged for this customer.
     """
     import os
     import tempfile
+    from app.core.storage_service import build_customer_blob_path
 
-    base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{current_user.customer_id}")
-    if not os.path.exists(base_dir):
-        return {"uploaded_files": [], "files": []}
-    files = sorted([f for f in os.listdir(base_dir) if os.path.isfile(os.path.join(base_dir, f))])
+    customer_id = current_user.customer_id
+    staged_names = set()
+
+    base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{customer_id}")
+    if os.path.exists(base_dir):
+        for fname in os.listdir(base_dir):
+            full_p = os.path.join(base_dir, fname)
+            if os.path.isfile(full_p):
+                clean_name = fname[:-4] if fname.endswith(".enc") else fname
+                staged_names.add(clean_name)
+
+    # Also check GCS migration_staging prefix if local /tmp was reset
+    try:
+        bucket_name = os.getenv("GCS_BUCKET_NAME")
+        if not bucket_name:
+            from app.crud.crud import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+            )
+            if cfg and cfg.get("effective_value"):
+                bucket_name = cfg["effective_value"]
+        if bucket_name:
+            from app.core.ai_integration import _get_gcs_client
+            client = _get_gcs_client()
+            if client:
+                prefix = build_customer_blob_path(customer_id, "migration_staging", "")
+                for blob in client.bucket(bucket_name).list_blobs(prefix=prefix):
+                    bname = os.path.basename(blob.name)
+                    if bname:
+                        staged_names.add(bname[:-4] if bname.endswith(".enc") else bname)
+    except Exception:
+        pass
+
+    files = sorted(staged_names)
     return {"uploaded_files": files, "files": files}
 
 @router.put("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=LGMigrationStagingOut)

@@ -339,30 +339,45 @@ class MigrationService:
         db: Optional[Session] = None,
     ) -> Tuple[Optional[bytes], Optional[str]]:
         """
-        Fetches file content from Server Staging (/tmp/migration_attachments), Local Disk,
-        or Google Cloud Storage (GCS).
+        Fetches and decrypts (if encrypted in staging) file content from:
+        1. Encrypted Server Staging (/tmp/migration_attachments/customer_{id}/{file}.enc)
+        2. Local Disk (if running locally)
+        3. HTTP/HTTPS URL (if shared web URL)
+        4. Google Cloud Storage (encrypted migration_staging or legacy migration folder)
         """
         import mimetypes
         import os
         import tempfile
         import glob
+        from app.core.security_crypto import decrypt_stream_generator
+        from app.services.tenant_key_service import tenant_key_service
+        from app.core.storage_service import build_customer_blob_path
 
-        # 1. Clean the input path and normalize Windows backslashes so basename works on Linux/Render
         clean_url = str(url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
         normalized_url = clean_url.replace("\\", "/")
         file_name = os.path.basename(normalized_url)
+        mime_type, _ = mimetypes.guess_type(file_name)
+        resolved_mime = mime_type or "application/pdf"
 
+        tenant_dek = None
+        if db is not None and customer_id is not None:
+            try:
+                tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+            except Exception as dek_err:
+                logger.warning(f"Could not load tenant DEK for customer {customer_id}: {dek_err}")
+
+        # --- STRATEGY 1: Check Encrypted Staged Uploads (.enc) & Local Disk ---
         candidate_paths = []
         temp_base = os.path.join(tempfile.gettempdir(), "migration_attachments")
         if customer_id is not None:
+            candidate_paths.append(os.path.join(temp_base, f"customer_{customer_id}", f"{file_name}.enc"))
             candidate_paths.append(os.path.join(temp_base, f"customer_{customer_id}", file_name))
         if os.path.exists(temp_base):
-            for match in glob.glob(os.path.join(temp_base, "*", file_name)):
+            for match in glob.glob(os.path.join(temp_base, "*", f"{file_name}.enc")) + glob.glob(os.path.join(temp_base, "*", file_name)):
                 if match not in candidate_paths:
                     candidate_paths.append(match)
         candidate_paths.extend([clean_url, file_name])
 
-        # --- STRATEGY 1: Check Staged Uploads & Local Disk (Fastest) ---
         final_path = None
         for p in candidate_paths:
             if p and os.path.exists(p) and os.path.isfile(p):
@@ -371,14 +386,30 @@ class MigrationService:
 
         if final_path:
             try:
-                mime_type, _ = mimetypes.guess_type(final_path)
                 with open(final_path, "rb") as f:
-                    logger.info(f"Loaded migration file '{file_name}' from local/staged path: {final_path}")
-                    return f.read(), (mime_type or "application/pdf")
+                    if tenant_dek:
+                        # decrypt_stream_generator is dual-read safe (decrypts STREAM V2 or passes plaintext through)
+                        decrypted_bytes = b"".join(decrypt_stream_generator(f, tenant_dek, context="migration_staging"))
+                    else:
+                        decrypted_bytes = f.read()
+                logger.info(f"Loaded migration file '{file_name}' ({len(decrypted_bytes)} bytes) from staged/local path: {final_path}")
+                return decrypted_bytes, resolved_mime
             except Exception as e:
-                logger.warning(f"Local read failed for '{final_path}': {e}")
+                logger.warning(f"Local/staged read failed for '{final_path}': {e}")
 
-        # --- STRATEGY 2: Check Google Cloud Storage (GCS) ---
+        # --- STRATEGY 2: Direct HTTP/HTTPS URL ---
+        if clean_url.lower().startswith(("http://", "https://")):
+            try:
+                import asyncio
+                resp = await asyncio.to_thread(requests.get, clean_url, timeout=20)
+                if resp.status_code == 200 and resp.content:
+                    content_type = resp.headers.get("Content-Type") or resolved_mime
+                    logger.info(f"Downloaded migration file '{file_name}' from URL: {clean_url}")
+                    return resp.content, content_type
+            except Exception as http_err:
+                logger.warning(f"HTTP fetch failed for '{clean_url}': {http_err}")
+
+        # --- STRATEGY 3: Check Google Cloud Storage (GCS) ---
         try:
             bucket_name = os.getenv("GCS_BUCKET_NAME")
             if not bucket_name and db and customer_id:
@@ -399,19 +430,32 @@ class MigrationService:
                     client = _get_gcs_client()
                     bucket = client.bucket(bucket_name)
 
-                    for blob_path in (file_name, f"migration/{file_name}", f"customer_{customer_id}/migration/{file_name}"):
+                    candidate_blobs = []
+                    if customer_id is not None:
+                        candidate_blobs.append(build_customer_blob_path(customer_id, "migration_staging", file_name))
+                        candidate_blobs.append(f"customer_{customer_id}/migration/{file_name}")
+                    candidate_blobs.extend([f"migration/{file_name}", file_name])
+
+                    for blob_path in candidate_blobs:
                         blob = bucket.blob(blob_path)
                         if blob.exists():
                             logger.info(f"Found '{file_name}' in GCS bucket '{bucket_name}' at '{blob_path}'.")
-                            return blob.download_as_bytes()
+                            raw_bytes = blob.download_as_bytes()
+                            if tenant_dek:
+                                try:
+                                    return b"".join(
+                                        decrypt_stream_generator(io.BytesIO(raw_bytes), tenant_dek, context="migration_staging")
+                                    )
+                                except Exception:
+                                    return raw_bytes
+                            return raw_bytes
                     return None
 
                 import asyncio
                 content = await asyncio.to_thread(fetch_from_gcs)
 
                 if content:
-                    mime_type, _ = mimetypes.guess_type(file_name)
-                    return content, (mime_type or "application/pdf")
+                    return content, resolved_mime
 
         except ImportError:
             logger.error("google-cloud-storage library not installed.")
@@ -420,6 +464,70 @@ class MigrationService:
 
         logger.warning(f"File not found in staged uploads, local disk, or GCS: '{file_name}' (from '{clean_url}')")
         return None, None
+
+    def _cleanup_migration_staging_file(
+        self,
+        url: str,
+        customer_id: Optional[int],
+        db: Optional[Session] = None,
+    ) -> None:
+        """
+        Permanently removes temporary staged migration copies (local .enc and GCS migration_staging)
+        once the file has been encrypted and moved into its final lg_custody cloud folder.
+        """
+        import os
+        import tempfile
+        from app.core.storage_service import build_customer_blob_path
+
+        try:
+            clean_url = str(url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
+            file_name = os.path.basename(clean_url.replace("\\", "/"))
+            if not file_name or customer_id is None:
+                return
+
+            # 1. Remove local temporary staged files (.enc and raw)
+            base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{customer_id}")
+            for candidate in (os.path.join(base_dir, f"{file_name}.enc"), os.path.join(base_dir, file_name)):
+                if os.path.exists(candidate):
+                    try:
+                        os.remove(candidate)
+                        logger.info(f"Cleaned up temporary staged migration file: {candidate}")
+                    except Exception as rm_err:
+                        logger.warning(f"Failed to remove temporary staged file '{candidate}': {rm_err}")
+
+            # 2. Remove temporary GCS migration_staging blob if present
+            bucket_name = os.getenv("GCS_BUCKET_NAME")
+            if not bucket_name and db:
+                try:
+                    from app.crud.crud import crud_customer_configuration
+                    from app.constants import GlobalConfigKey
+                    cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                        db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+                    )
+                    if cfg and cfg.get("effective_value"):
+                        bucket_name = cfg["effective_value"]
+                except Exception:
+                    pass
+
+            if bucket_name:
+                from app.core.ai_integration import _get_gcs_client
+                client = _get_gcs_client()
+                if client:
+                    bucket = client.bucket(bucket_name)
+                    for blob_path in (
+                        build_customer_blob_path(customer_id, "migration_staging", file_name),
+                        f"customer_{customer_id}/migration/{file_name}",
+                        f"migration/{file_name}",
+                    ):
+                        try:
+                            blob = bucket.blob(blob_path)
+                            if blob.exists():
+                                blob.delete()
+                                logger.info(f"Cleaned up temporary GCS migration staging blob: gs://{bucket_name}/{blob_path}")
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"Non-fatal error during migration staging cleanup for '{url}': {e}")
 
     async def _create_document_from_url(
         self,
@@ -431,13 +539,22 @@ class MigrationService:
         original_instruction_serial: Optional[str] = None
     ) -> Optional[int]:
         """
-        Fetches file content from a URL and calls the existing crud_lg_document.create_document
-        to store it and create a database entry.
+        Fetches file content from staging/URL, calls crud_lg_document.create_document
+        to encrypt and store it in the permanent lg_custody cloud folder, and cleans up
+        the temporary migration staging copy.
         """
         try:
             from app.crud.crud import crud_lg_document
             from app.models import LGRecord
-            cust_id = db.query(LGRecord.customer_id).filter(LGRecord.id == lg_record_id).scalar()
+            from sqlalchemy.orm import selectinload
+
+            lg_rec = (
+                db.query(LGRecord)
+                .options(selectinload(LGRecord.beneficiary_corporate), selectinload(LGRecord.lg_category))
+                .filter(LGRecord.id == lg_record_id)
+                .first()
+            )
+            cust_id = lg_rec.customer_id if lg_rec else None
             file_content, mime_type = await self._fetch_file_content(url, customer_id=cust_id, db=db)
             if not file_content:
                 logger.error(f"Failed to fetch file content from URL: {url}")
@@ -453,14 +570,28 @@ class MigrationService:
                 lg_instruction_id=None
             )
 
+            lg_record_details = None
+            if lg_rec:
+                lg_record_details = {
+                    "beneficiary_corporate_code": getattr(lg_rec.beneficiary_corporate, "code", "ENTITY") if lg_rec.beneficiary_corporate else "ENTITY",
+                    "lg_category_code": getattr(lg_rec.lg_category, "code", "CAT") if lg_rec.lg_category else "CAT",
+                    "lg_number": lg_rec.lg_number,
+                }
+
             db_document = await crud_lg_document.create_document(
                 db=db,
                 obj_in=doc_metadata,
                 file_content=file_content,
                 lg_record_id=lg_record_id,
                 uploaded_by_user_id=uploaded_by_user_id,
-                original_instruction_serial=original_instruction_serial
+                original_instruction_serial=original_instruction_serial,
+                lg_record_details=lg_record_details,
             )
+
+            # Once encrypted and stored in the permanent lg_custody cloud folder, clean up temporary migration files
+            if db_document and db_document.id:
+                self._cleanup_migration_staging_file(url, cust_id, db)
+
             return db_document.id
         except Exception as e:
             logger.error(f"Error creating document from URL '{url}': {e}", exc_info=True)
