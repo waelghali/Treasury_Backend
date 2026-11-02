@@ -143,3 +143,31 @@ class DealerMobilePairToken(BaseModel):
     bank = relationship("Bank")
 
 
+class UserWebAuthnCredential(BaseModel):
+    """
+    Stores WebAuthn / Passkey public keys (Face ID, Touch ID, Android Fingerprint)
+    for permanent platform users (End Users, Corporate Admins, Checkers, System Owners).
+    Enables instant biometric login when opening mobile push notifications.
+    """
+    __tablename__ = "user_webauthn_credentials"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=True, index=True)
+    credential_id = Column(String(512), nullable=False, unique=True, index=True,
+                           comment="Base64URL-encoded WebAuthn credential ID")
+    public_key_spki = Column(Text, nullable=False,
+                             comment="Base64URL-encoded SubjectPublicKeyInfo (DER) public key")
+    algorithm = Column(Integer, nullable=False, default=-7, server_default="-7",
+                       comment="COSE algorithm (-7 for ES256/P-256, -257 for RS256)")
+    sign_count = Column(Integer, nullable=False, default=0, server_default="0")
+    device_id = Column(String(64), nullable=True, index=True,
+                       comment="Frontend device UUID matching user_devices.device_id")
+    device_label = Column(String(120), nullable=True)
+    platform = Column(String(20), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true", index=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+

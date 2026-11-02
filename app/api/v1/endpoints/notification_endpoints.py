@@ -14,9 +14,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc, or_, func
 
 from app.database import get_db
-from app.core.security import get_current_active_user, TokenData
+from app.core.security import get_current_active_user, get_client_ip, TokenData
 from app.models.models_notification import UserNotification
-from app.models.models_push import PushSubscription, UserMobilePairToken
+from app.models.models_push import PushSubscription, UserMobilePairToken, UserWebAuthnCredential
+from app.core.webauthn_service import build_registration_options, resolve_rp_id
 from app.services.notifications.push_channel import (
     MAX_SUBSCRIPTIONS_PER_USER,
     endpoint_fingerprint,
@@ -109,12 +110,14 @@ class PushUnsubscribeIn(BaseModel):
     endpoint: str = Field(..., max_length=1024)
 
 
-def _device_out(sub: PushSubscription) -> dict:
+def _device_out(sub: PushSubscription, has_biometric: bool = False) -> dict:
     return {
         "id": sub.id,
+        "device_id": sub.device_id,
         "device_label": sub.device_label,
         "platform": sub.platform,
         "fingerprint": endpoint_fingerprint(sub.endpoint),
+        "has_biometric": has_biometric,
         "created_at": sub.created_at,
         "last_success_at": sub.last_success_at,
         "last_failure_at": sub.last_failure_at,
@@ -255,7 +258,16 @@ def list_push_devices(
     current_user: TokenData = Depends(get_current_active_user),
 ):
     subs = _active_subs_query(db, current_user.user_id).order_by(desc(PushSubscription.created_at)).all()
-    return [_device_out(s) for s in subs]
+    bio_device_ids = {
+        c.device_id
+        for c in db.query(UserWebAuthnCredential).filter(
+            UserWebAuthnCredential.user_id == current_user.user_id,
+            UserWebAuthnCredential.is_active == True,  # noqa: E712
+            UserWebAuthnCredential.is_deleted == False,  # noqa: E712
+            UserWebAuthnCredential.device_id.isnot(None),
+        ).all()
+    }
+    return [_device_out(s, has_biometric=bool(s.device_id and s.device_id in bio_device_ids)) for s in subs]
 
 
 @router.delete("/push/devices/{device_id}")
@@ -264,12 +276,18 @@ def remove_push_device(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_active_user),
 ):
-    """Removes one of the caller's devices (e.g. a lost phone)."""
+    """Removes one of the caller's devices (e.g. a lost phone) and revokes any linked biometric login."""
     sub = _active_subs_query(db, current_user.user_id).filter(PushSubscription.id == device_id).first()
     if not sub:
         raise HTTPException(status_code=404, detail="Device not found")
     sub.is_active = False
     sub.revoked_reason = "USER_REMOVED"
+    if sub.device_id:
+        db.query(UserWebAuthnCredential).filter(
+            UserWebAuthnCredential.user_id == current_user.user_id,
+            UserWebAuthnCredential.device_id == sub.device_id,
+            UserWebAuthnCredential.is_active == True,  # noqa: E712
+        ).update({"is_active": False}, synchronize_session=False)
     db.commit()
     return {"message": "Device removed"}
 
@@ -287,8 +305,10 @@ class MobilePairAuthorizeIn(BaseModel):
     password: str = Field(..., min_length=1)
     endpoint: str = Field(..., max_length=1024)
     keys: PushKeys
+    device_id: Optional[str] = Field(None, max_length=64)
     device_label: Optional[str] = Field(None, max_length=120)
     platform: Optional[str] = Field(None, max_length=20)
+    rp_id: Optional[str] = Field(None, max_length=255)
 
 
 @router.post("/push/mobile-pair/initiate", response_model=MobilePairInitiateOut)
@@ -393,11 +413,13 @@ def get_user_mobile_pair_info(
 def authorize_user_mobile_pair(
     pairing_token: str,
     payload: MobilePairAuthorizeIn,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """
     Public authorization endpoint called by phone when user enters password.
     Blocks the 'unlocked laptop' threat: only the actual account holder knowing the password can pair.
+    Also marks the mobile device as trusted and returns WebAuthn biometric registration options.
     """
     clean_token = (pairing_token or "").strip().replace(" ", "")
     now = datetime.now(timezone.utc)
@@ -414,7 +436,7 @@ def authorize_user_mobile_pair(
     if not is_allowed_endpoint(payload.endpoint):
         raise HTTPException(status_code=400, detail="Unsupported push endpoint.")
 
-    from app.models import User
+    from app.models import User, UserDevice
     user = db.query(User).filter(User.id == pair_rec.user_id).first()
     pwd_hash = getattr(user, "password_hash", None) or getattr(user, "hashed_password", None)
     if not user or not pwd_hash:
@@ -457,6 +479,7 @@ def authorize_user_mobile_pair(
     sub.bank_id = None
     sub.p256dh = payload.keys.p256dh
     sub.auth = payload.keys.auth
+    sub.device_id = payload.device_id
     sub.device_label = payload.device_label or f"{platform.capitalize()} Device"
     sub.platform = platform
     sub.device_type = platform
@@ -466,17 +489,58 @@ def authorize_user_mobile_pair(
     sub.failure_count = 0
     sub.last_error = None
 
+    # Trust this mobile device for MFA since the user verified their password on the paired phone
+    if payload.device_id:
+        device_rec = db.query(UserDevice).filter(
+            UserDevice.user_id == user.id,
+            UserDevice.device_id == payload.device_id,
+        ).first()
+        if not device_rec:
+            device_rec = UserDevice(
+                user_id=user.id,
+                device_id=payload.device_id,
+                device_name=sub.device_label,
+                is_trusted=True,
+                last_ip=get_client_ip(request),
+            )
+            db.add(device_rec)
+        else:
+            device_rec.is_trusted = True
+            device_rec.device_name = sub.device_label
+            device_rec.last_ip = get_client_ip(request)
+
     pair_rec.is_paired = True
     pair_rec.paired_at = now
     pair_rec.device_label = sub.device_label
     pair_rec.platform = platform
     db.commit()
 
+    # Pre-generate WebAuthn registration options so the phone can enroll Face ID / Fingerprint in one tap
+    rp_id = resolve_rp_id(request, payload.rp_id)
+    existing_creds = [
+        c.credential_id
+        for c in db.query(UserWebAuthnCredential).filter(
+            UserWebAuthnCredential.user_id == user.id,
+            UserWebAuthnCredential.is_active == True,  # noqa: E712
+            UserWebAuthnCredential.is_deleted == False,  # noqa: E712
+        ).all()
+    ]
+    full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or user.email
+    webauthn_options = build_registration_options(
+        user_id=user.id,
+        user_email=user.email,
+        user_display_name=full_name,
+        rp_id=rp_id,
+        existing_credential_ids=existing_creds,
+    )
+
     return {
         "success": True,
         "message": f"Device authorized successfully! Phone alerts are now active for {user.email}.",
+        "user_id": user.id,
         "user_email": user.email,
         "device_label": sub.device_label,
+        "webauthn_registration": webauthn_options,
     }
 
 

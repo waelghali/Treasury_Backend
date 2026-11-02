@@ -411,3 +411,340 @@ async def resend_mfa_code(
     await auth_service.trigger_mfa_flow(db, user)
     
     return {"message": "A new verification code has been sent to your email."}
+
+
+# ── WebAuthn Biometric Authentication (Face ID / Touch ID / Fingerprint) ───────
+# For Permanent Platform Users (End Users, Corporate Admins, Checkers, System Owners).
+
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.orm import selectinload
+from app.models.models_push import UserWebAuthnCredential
+from app.core.webauthn_service import (
+    build_registration_options,
+    build_authentication_options,
+    verify_registration_response,
+    verify_authentication_assertion,
+    resolve_rp_id,
+)
+from app.crud.crud import log_action
+from app.constants import AUDIT_ACTION_TYPE_LOGIN_SUCCESS, AUDIT_ACTION_TYPE_UPDATE
+
+
+class WebAuthnRegisterOptionsIn(BaseModel):
+    rp_id: Optional[str] = Field(None, max_length=255)
+
+
+class WebAuthnRegisterVerifyIn(BaseModel):
+    challenge_token: str
+    credential_id: str = Field(..., max_length=512)
+    client_data_json: str
+    attestation_object: Optional[str] = None
+    authenticator_data: Optional[str] = None
+    public_key_spki: Optional[str] = None
+    public_key_alg: Optional[int] = -7
+    device_id: Optional[str] = Field(None, max_length=64)
+    device_label: Optional[str] = Field(None, max_length=120)
+    platform: Optional[str] = Field(None, max_length=20)
+
+
+class WebAuthnAuthOptionsIn(BaseModel):
+    email: Optional[str] = Field(None, max_length=255)
+    credential_id: Optional[str] = Field(None, max_length=512)
+    device_id: Optional[str] = Field(None, max_length=64)
+    rp_id: Optional[str] = Field(None, max_length=255)
+
+
+class WebAuthnAuthVerifyIn(BaseModel):
+    challenge_token: str
+    credential_id: str = Field(..., max_length=512)
+    client_data_json: str
+    authenticator_data: str
+    signature: str
+    device_id: Optional[str] = Field(None, max_length=64)
+
+
+@router.post("/webauthn/register/options", status_code=status.HTTP_200_OK)
+async def webauthn_register_options(
+    request: Request,
+    payload: WebAuthnRegisterOptionsIn,
+    current_user: security.TokenData = Depends(security.get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Generates WebAuthn registration options for an authenticated permanent user."""
+    from app.models import User
+    user = db.query(User).filter(User.id == current_user.user_id, User.is_deleted == False).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    rp_id = resolve_rp_id(request, payload.rp_id)
+    existing_creds = [
+        c.credential_id
+        for c in db.query(UserWebAuthnCredential).filter(
+            UserWebAuthnCredential.user_id == user.id,
+            UserWebAuthnCredential.is_active == True,
+            UserWebAuthnCredential.is_deleted == False,
+        ).all()
+    ]
+    full_name = getattr(user, "full_name", None) or getattr(user, "name", None) or user.email
+    return build_registration_options(
+        user_id=user.id,
+        user_email=user.email,
+        user_display_name=full_name,
+        rp_id=rp_id,
+        existing_credential_ids=existing_creds,
+    )
+
+
+@router.post("/webauthn/register/verify", status_code=status.HTTP_200_OK)
+async def webauthn_register_verify(
+    request: Request,
+    payload: WebAuthnRegisterVerifyIn,
+    db: Session = Depends(get_db),
+):
+    """
+    Verifies and stores a newly created WebAuthn biometric credential (Face ID / Fingerprint).
+    Authorized by the signed challenge_token issued during QR pairing or authenticated setup.
+    """
+    from app.models import User, UserDevice
+
+    verified = verify_registration_response(
+        challenge_token=payload.challenge_token,
+        credential_id=payload.credential_id,
+        client_data_json_b64=payload.client_data_json,
+        attestation_object_b64=payload.attestation_object,
+        authenticator_data_b64=payload.authenticator_data,
+        public_key_spki_b64=payload.public_key_spki,
+        public_key_alg=payload.public_key_alg,
+    )
+
+    user = db.query(User).filter(User.id == verified["user_id"], User.is_deleted == False).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    cred_id = verified["credential_id"]
+    cred = db.query(UserWebAuthnCredential).filter(
+        UserWebAuthnCredential.credential_id == cred_id
+    ).first()
+
+    platform = (payload.platform or "mobile").lower()[:20]
+    label = payload.device_label or "Smartphone Biometrics (Face ID / Fingerprint)"
+
+    if cred is None:
+        cred = UserWebAuthnCredential(credential_id=cred_id, user_id=user.id, public_key_spki=verified["public_key_spki"])
+        db.add(cred)
+
+    cred.user_id = user.id
+    cred.customer_id = user.customer_id
+    cred.public_key_spki = verified["public_key_spki"]
+    cred.algorithm = verified["algorithm"]
+    cred.sign_count = verified["sign_count"]
+    cred.device_id = payload.device_id
+    cred.device_label = label
+    cred.platform = platform
+    cred.is_active = True
+    cred.is_deleted = False
+    cred.last_used_at = datetime.now(timezone.utc)
+
+    # Ensure the device is marked as trusted for MFA
+    if payload.device_id:
+        device_rec = db.query(UserDevice).filter(
+            UserDevice.user_id == user.id,
+            UserDevice.device_id == payload.device_id,
+        ).first()
+        if not device_rec:
+            device_rec = UserDevice(
+                user_id=user.id,
+                device_id=payload.device_id,
+                device_name=label,
+                is_trusted=True,
+                last_ip=get_client_ip(request),
+            )
+            db.add(device_rec)
+        else:
+            device_rec.is_trusted = True
+            device_rec.last_ip = get_client_ip(request)
+
+    db.commit()
+
+    log_action(
+        db,
+        user_id=user.id,
+        action_type=AUDIT_ACTION_TYPE_UPDATE,
+        entity_type="UserWebAuthnCredential",
+        entity_id=cred.id,
+        details={"email": user.email, "action": "Biometric credential enrolled", "device_label": label},
+        ip_address=get_client_ip(request),
+        customer_id=user.customer_id,
+    )
+
+    return {
+        "success": True,
+        "credential_id": cred_id,
+        "user_email": user.email,
+        "device_label": label,
+    }
+
+
+@router.post("/webauthn/authenticate/options", status_code=status.HTTP_200_OK)
+async def webauthn_authenticate_options(
+    request: Request,
+    payload: WebAuthnAuthOptionsIn,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a WebAuthn assertion challenge for Face ID / Fingerprint login on LoginPage.
+    Matches credentials by credential_id, device_id, or email, and also supports discoverable passkeys.
+    """
+    from app.models import User
+
+    rp_id = resolve_rp_id(request, payload.rp_id)
+    allowed_ids: List[str] = []
+    matched_email: Optional[str] = None
+
+    base_q = db.query(UserWebAuthnCredential).join(
+        User, User.id == UserWebAuthnCredential.user_id
+    ).filter(
+        UserWebAuthnCredential.is_active == True,
+        UserWebAuthnCredential.is_deleted == False,
+        User.is_deleted == False,
+    )
+
+    if payload.credential_id:
+        cred = base_q.filter(UserWebAuthnCredential.credential_id == payload.credential_id.strip()).first()
+        if cred:
+            allowed_ids.append(cred.credential_id)
+            if cred.user:
+                matched_email = cred.user.email
+
+    if not allowed_ids and payload.device_id:
+        creds = base_q.filter(UserWebAuthnCredential.device_id == payload.device_id.strip()).all()
+        for c in creds:
+            if c.credential_id not in allowed_ids:
+                allowed_ids.append(c.credential_id)
+            if not matched_email and c.user:
+                matched_email = c.user.email
+
+    if payload.email and not allowed_ids:
+        creds = base_q.filter(func.lower(User.email) == payload.email.strip().lower()).all()
+        for c in creds:
+            if c.credential_id not in allowed_ids:
+                allowed_ids.append(c.credential_id)
+            if not matched_email and c.user:
+                matched_email = c.user.email
+
+    options = build_authentication_options(rp_id=rp_id, allowed_credential_ids=allowed_ids)
+    options["has_registered_credentials"] = len(allowed_ids) > 0
+    options["user_email"] = matched_email
+    return options
+
+
+@router.post("/webauthn/authenticate/verify", status_code=status.HTTP_200_OK)
+async def webauthn_authenticate_verify(
+    request: Request,
+    payload: WebAuthnAuthVerifyIn,
+    db: Session = Depends(get_db),
+):
+    """
+    Verifies a Face ID / Touch ID / Fingerprint assertion and issues a full JWT access token
+    for permanent users (End Users, Corporate Admins, Checkers, System Owners).
+    """
+    from app.models import User, Customer, UserDevice
+
+    cred = db.query(UserWebAuthnCredential).filter(
+        UserWebAuthnCredential.credential_id == payload.credential_id.strip(),
+        UserWebAuthnCredential.is_active == True,
+        UserWebAuthnCredential.is_deleted == False,
+    ).first()
+    if not cred:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This biometric credential is not recognized or has been revoked. Please sign in with your password.",
+        )
+
+    user = db.query(User).options(
+        selectinload(User.customer).selectinload(Customer.subscription_plan),
+        selectinload(User.entity_associations),
+    ).filter(
+        User.id == cred.user_id,
+        User.is_deleted == False,
+    ).first()
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User account is inactive or deleted.")
+
+    now = datetime.now(timezone.utc)
+    if user.locked_until and user.locked_until > now:
+        time_remaining = user.locked_until - now
+        minutes, seconds = divmod(time_remaining.total_seconds(), 60)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Account is locked. Please try again after {int(minutes)} minutes and {int(seconds)} seconds.",
+        )
+
+    new_sign_count = verify_authentication_assertion(
+        challenge_token=payload.challenge_token,
+        client_data_json_b64=payload.client_data_json,
+        authenticator_data_b64=payload.authenticator_data,
+        signature_b64=payload.signature,
+        public_key_spki_b64=cred.public_key_spki,
+        stored_sign_count=cred.sign_count or 0,
+    )
+
+    cred.sign_count = new_sign_count
+    cred.last_used_at = now
+    if payload.device_id and not cred.device_id:
+        cred.device_id = payload.device_id
+
+    user.failed_login_attempts = 0
+    user.locked_until = None
+
+    eff_device_id = payload.device_id or cred.device_id
+    if eff_device_id:
+        device_rec = db.query(UserDevice).filter(
+            UserDevice.user_id == user.id,
+            UserDevice.device_id == eff_device_id,
+        ).first()
+        if not device_rec:
+            device_rec = UserDevice(
+                user_id=user.id,
+                device_id=eff_device_id,
+                device_name=cred.device_label or "Biometric Mobile Device",
+                is_trusted=True,
+                last_ip=get_client_ip(request),
+            )
+            db.add(device_rec)
+        else:
+            device_rec.is_trusted = True
+            device_rec.last_ip = get_client_ip(request)
+
+    db.commit()
+
+    token_data = await auth_service.build_user_token_data(db, user)
+    access_token = create_fresh_access_token(data=token_data)
+
+    log_action(
+        db,
+        user_id=user.id,
+        action_type=AUDIT_ACTION_TYPE_LOGIN_SUCCESS,
+        entity_type="User",
+        entity_id=user.id,
+        details={"email": user.email, "method": "biometric_webauthn", "device_label": cred.device_label},
+        ip_address=get_client_ip(request),
+        customer_id=user.customer_id,
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "must_accept_policies": token_data.get("must_accept_policies", False),
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "role": token_data["role"],
+            "customer_id": user.customer_id,
+            "subscription_status": token_data.get("subscription_status"),
+            "subscription_end_date": token_data.get("subscription_end_date"),
+        },
+    }
