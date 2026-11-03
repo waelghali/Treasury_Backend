@@ -326,3 +326,6 @@ class MigrationHistoryService:
             "totals": batch_results,
             "batch_id": batch.id
         }
+
+
+migration_history_service = MigrationHistoryService()

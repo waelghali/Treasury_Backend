@@ -1109,7 +1109,8 @@ class MigrationService:
             process_batch_migration_documents_with_ai,
             _reclaim_system_memory,
         )
-        from app.core.migration_history import migration_history_service
+        from app.core.migration_history import MigrationHistoryService
+        migration_history_service = MigrationHistoryService()
         from sqlalchemy import func
         import os
 
