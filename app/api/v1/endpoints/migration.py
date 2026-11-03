@@ -1162,6 +1162,44 @@ async def preview_historical_reconstruction(
         logger.error(f"Failed to generate history preview: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate history preview: {e}")
 
+def _purge_migrated_lg_record(db: Session, lg_record: models.LGRecord) -> None:
+    """
+    Cleanly removes a previously migrated LGRecord and its migration-generated child records
+    (LGChangeLog, LGDocument, LGInstruction, AuditLog) while unlinking LGMigrationStaging FKs,
+    allowing a clean re-import.
+    """
+    lg_id = lg_record.id
+    # 1. Unlink staging records referencing this production LG
+    db.query(models.LGMigrationStaging).filter(
+        models.LGMigrationStaging.production_lg_id == lg_id
+    ).update({"production_lg_id": None}, synchronize_session=False)
+
+    # 2. Unlink self-reference to staging record
+    lg_record.migrated_from_staging_id = None
+    db.add(lg_record)
+    db.flush()
+
+    # 3. Delete change logs, documents, instructions, and audit logs for this LG
+    db.query(models.LGChangeLog).filter(models.LGChangeLog.lg_id == lg_id).delete(synchronize_session=False)
+    db.query(models.LGDocument).filter(models.LGDocument.lg_record_id == lg_id).delete(synchronize_session=False)
+    db.query(models.LGInstruction).filter(models.LGInstruction.lg_record_id == lg_id).delete(synchronize_session=False)
+    db.query(models.AuditLog).filter(
+        (models.AuditLog.lg_record_id == lg_id)
+        | ((models.AuditLog.entity_type == "LGRecord") & (models.AuditLog.entity_id == lg_id))
+    ).delete(synchronize_session=False)
+
+    try:
+        from app.models.models_campaign import CampaignEntry
+        db.query(CampaignEntry).filter(CampaignEntry.lg_record_id == lg_id).update(
+            {"lg_record_id": None}, synchronize_session=False
+        )
+    except Exception:
+        pass
+
+    db.delete(lg_record)
+    db.flush()
+
+
 @router.post("/import-history", status_code=status.HTTP_200_OK)
 async def import_historical_records(
     import_in: ImportHistoryIn,
@@ -1180,6 +1218,7 @@ async def import_historical_records(
         MigrationRecordStatusEnum.ERROR,
         MigrationRecordStatusEnum.EXPIRED,
         MigrationRecordStatusEnum.DUPLICATE,
+        MigrationRecordStatusEnum.IMPORTED,
     ])).order_by(models.LGMigrationStaging.id.asc()).all()
     
     if not all_snapshots:
@@ -1208,15 +1247,26 @@ async def import_historical_records(
                 sorted_snapshots = sorted(snapshots, key=lambda s: migration_history_service._get_snapshot_sort_key(s))
                 first_snapshot = sorted_snapshots[0]
                 
-                existing_lg_in_prod = crud_lg_record.get_by_lg_number(db, lg_num)
+                existing_lg_in_prod = db.query(models.LGRecord).filter(
+                    func.lower(models.LGRecord.lg_number) == func.lower(str(lg_num).strip()),
+                    models.LGRecord.customer_id == current_user.customer_id,
+                ).first()
                 if existing_lg_in_prod:
-                    logger.warning(f"LG already exists in production (LG id={existing_lg_in_prod.id}). Skipping import.")
-                    for snap in snapshots:
-                        snap.record_status = MigrationRecordStatusEnum.ERROR
-                        snap.validation_log = snap.validation_log or {}
-                        snap.validation_log['import_error'] = 'LG already exists in production table. Skipping.'
-                    batch_results['skipped_exists'] += 1
-                    continue
+                    if existing_lg_in_prod.migration_source in ("LEGACY", "MIGRATION") or any(
+                        s.production_lg_id == existing_lg_in_prod.id for s in snapshots
+                    ):
+                        logger.info(
+                            f"Purging previously migrated LG id={existing_lg_in_prod.id} ({lg_num}) to perform clean historical re-import."
+                        )
+                        _purge_migrated_lg_record(db, existing_lg_in_prod)
+                    else:
+                        logger.warning(f"LG already exists in production (LG id={existing_lg_in_prod.id}). Skipping import.")
+                        for snap in snapshots:
+                            snap.record_status = MigrationRecordStatusEnum.ERROR
+                            snap.validation_log = snap.validation_log or {}
+                            snap.validation_log['import_error'] = 'LG already exists in production table. Skipping.'
+                        batch_results['skipped_exists'] += 1
+                        continue
                 
                 # --- FIX START: Sanitize and Enrich Data ---
                 from app.core.migration_service import _coerce_auto_renewal_bool
@@ -1656,6 +1706,115 @@ def delete_multiple_staged_records(
         migration_service._cleanup_migration_staging_file(str(att_url), current_user.customer_id, db=None)
 
     return {"deleted_count": deleted_count}
+
+
+@router.delete("/staged/delete-all", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
+def delete_all_staged_records(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Deletes all staged records for the current customer, unlinking any references first.
+    """
+    customer_id = current_user.customer_id
+    staged_ids = [
+        r.id for r in db.query(models.LGMigrationStaging.id).filter(
+            models.LGMigrationStaging.customer_id == customer_id
+        ).all()
+    ]
+    if not staged_ids:
+        return {"deleted_count": 0, "message": "No staged records found."}
+
+    db.query(models.LGRecord).filter(
+        models.LGRecord.customer_id == customer_id,
+        models.LGRecord.migrated_from_staging_id.in_(staged_ids),
+    ).update({"migrated_from_staging_id": None}, synchronize_session=False)
+
+    db.query(models.LGChangeLog).filter(
+        models.LGChangeLog.staging_id.in_(staged_ids)
+    ).update({"staging_id": None}, synchronize_session=False)
+
+    deleted_count = db.query(models.LGMigrationStaging).filter(
+        models.LGMigrationStaging.customer_id == customer_id
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted_count": deleted_count, "message": f"Deleted {deleted_count} staged records."}
+
+
+@router.post("/reset-migrated", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
+def reset_migrated_records_for_clean_reimport(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Purges previously migrated LGRecord entries (and their incomplete history/documents) for the
+    current customer and resets all staged LGMigrationStaging records back to Ready/Expired/Duplicate
+    so a clean migration can be executed immediately without re-uploading the Excel sheet.
+    """
+    customer_id = current_user.customer_id
+    all_staged = db.query(models.LGMigrationStaging).filter(
+        models.LGMigrationStaging.customer_id == customer_id
+    ).order_by(models.LGMigrationStaging.id.asc()).all()
+
+    linked_prod_ids = {s.production_lg_id for s in all_staged if s.production_lg_id}
+    staged_lg_numbers = {
+        str((s.source_data_json or {}).get("lg_number") or "").strip().lower()
+        for s in all_staged
+        if (s.source_data_json or {}).get("lg_number")
+    }
+
+    migrated_lgs = db.query(models.LGRecord).filter(
+        models.LGRecord.customer_id == customer_id,
+        (
+            models.LGRecord.migration_source.in_(["LEGACY", "MIGRATION"])
+            | (models.LGRecord.id.in_(linked_prod_ids) if linked_prod_ids else False)
+            | (func.lower(models.LGRecord.lg_number).in_(staged_lg_numbers) if staged_lg_numbers else False)
+        ),
+    ).all()
+
+    purged_lg_numbers = []
+    for lg_rec in migrated_lgs:
+        purged_lg_numbers.append(lg_rec.lg_number)
+        _purge_migrated_lg_record(db, lg_rec)
+
+    # Reset staged records back to READY_FOR_IMPORT / EXPIRED / DUPLICATE
+    seen_lg_nums = set()
+    reset_count = 0
+    today = date.today()
+    for snap in all_staged:
+        snap.production_lg_id = None
+        src = snap.source_data_json or {}
+        if isinstance(snap.validation_log, dict):
+            cleaned_vlog = {k: v for k, v in snap.validation_log.items() if k not in ("import_error", "lg_number", "expiry_date")}
+        else:
+            cleaned_vlog = {}
+
+        lg_num_key = str(src.get("lg_number") or "").strip().lower()
+        exp_dt = migration_history_service._parse_sort_datetime(src.get("expiry_date"))
+        is_expired = exp_dt != datetime.min and exp_dt.date() < today
+
+        if is_expired:
+            snap.record_status = MigrationRecordStatusEnum.EXPIRED
+        elif lg_num_key in seen_lg_nums:
+            snap.record_status = MigrationRecordStatusEnum.DUPLICATE
+        else:
+            snap.record_status = MigrationRecordStatusEnum.READY_FOR_IMPORT
+        if lg_num_key:
+            seen_lg_nums.add(lg_num_key)
+        snap.validation_log = cleaned_vlog
+        db.add(snap)
+        reset_count += 1
+
+    db.commit()
+    logger.info(
+        f"Reset migrated records for customer {customer_id}: purged {len(purged_lg_numbers)} production LGs, reset {reset_count} staged records."
+    )
+    return {
+        "message": f"Purged {len(purged_lg_numbers)} migrated LG(s) from production and reset {reset_count} staged records for a clean import.",
+        "purged_lg_count": len(purged_lg_numbers),
+        "purged_lg_numbers": purged_lg_numbers,
+        "reset_staged_count": reset_count,
+    }
 
 @router.post("/upload-unstructured", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any])
 def upload_unstructured_file_for_staging(
