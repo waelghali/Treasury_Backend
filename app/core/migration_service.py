@@ -1103,7 +1103,13 @@ class MigrationService:
         Returns a report of discrepancies.
         """
         from app.models import LGMigrationStaging, Currency, CustomerEntity, Bank
-        from app.core.ai_integration import process_lg_document_with_ai, process_amendment_with_ai
+        from app.core.ai_integration import (
+            process_lg_document_with_ai,
+            process_amendment_with_ai,
+            process_batch_migration_documents_with_ai,
+            _reclaim_system_memory,
+        )
+        from app.core.migration_history import migration_history_service
         from sqlalchemy import func
         import os
 
@@ -1208,33 +1214,138 @@ class MigrationService:
                     return str(val).strip()
             return None
 
+        # --- STEP 1: Sort each LG group chronologically & collect audit document tasks ---
+        group_audit_plans = []
+        pending_doc_tasks = []  # List of dicts: {key, clean_url, fname, doc_role, lg_num, rec_id}
+
         for lg_num, group in grouped_records.items():
-            group.sort(key=lambda x: x.id)
+            group.sort(key=migration_history_service._get_snapshot_sort_key)
             first_rec = group[0]
             last_rec = group[-1]
-            logger.info(f"[AUDIT] Checking staged LG group (first_record_id={first_rec.id}, count={len(group)})")
+
+            first_url = _extract_attachment_url(first_rec.source_data_json or {})
+            first_clean_url = None
+            first_fname = None
+            first_key = None
+            if first_url:
+                first_clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
+                first_fname = os.path.basename(first_clean_url.replace("\\", "/"))
+                first_key = f"creation_{first_rec.id}"
+                pending_doc_tasks.append({
+                    "key": first_key,
+                    "clean_url": first_clean_url,
+                    "fname": first_fname,
+                    "doc_role": "CREATION",
+                    "lg_num": str(lg_num),
+                    "rec_id": first_rec.id,
+                })
+
+            last_clean_url = None
+            last_fname = None
+            last_key = None
+            if last_rec.id != first_rec.id:
+                last_url = _extract_attachment_url(last_rec.source_data_json or {})
+                if last_url:
+                    last_clean_url = str(last_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
+                    last_fname = os.path.basename(last_clean_url.replace("\\", "/"))
+                    last_key = f"amendment_{last_rec.id}"
+                    pending_doc_tasks.append({
+                        "key": last_key,
+                        "clean_url": last_clean_url,
+                        "fname": last_fname,
+                        "doc_role": "AMENDMENT",
+                        "lg_num": str(lg_num),
+                        "rec_id": last_rec.id,
+                    })
+
+            group_audit_plans.append({
+                "lg_num": lg_num,
+                "group": group,
+                "first_rec": first_rec,
+                "last_rec": last_rec,
+                "first_key": first_key,
+                "first_fname": first_fname,
+                "last_key": last_key,
+                "last_fname": last_fname,
+            })
+
+        # --- STEP 2: Fetch & Process PDFs in Memory-Safe Multi-Document Batches (up to 6 PDFs per Gemini call) ---
+        BATCH_MAX_DOCS = 6
+        BATCH_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per batch to stay well within Vertex payload & RAM limits
+        ai_results_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
+        file_found_by_key: Dict[str, bool] = {}
+
+        current_batch_items: List[Dict[str, Any]] = []
+        current_batch_bytes = 0
+
+        async def _flush_batch(batch_to_run: List[Dict[str, Any]]):
+            if not batch_to_run:
+                return
+            logger.info(
+                f"🚀 [BATCH AI AUDIT] Sending {len(batch_to_run)} PDFs in a single multimodal Gemini batch "
+                f"(keys={[b['key'] for b in batch_to_run]})..."
+            )
+            batch_res = await process_batch_migration_documents_with_ai(batch_to_run)
+            for b_item in batch_to_run:
+                k = b_item["key"]
+                ai_results_by_key[k] = batch_res.get(k)
+            batch_to_run.clear()
+            _reclaim_system_memory()
+
+        for task in pending_doc_tasks:
+            t_key = task["key"]
+            content, mime = await self._fetch_file_content(task["clean_url"], customer_id=customer_id, db=db)
+            if not content:
+                file_found_by_key[t_key] = False
+                continue
+
+            file_found_by_key[t_key] = True
+            files_scanned += 1
+            doc_size = len(content)
+
+            if current_batch_items and (
+                len(current_batch_items) >= BATCH_MAX_DOCS
+                or (current_batch_bytes + doc_size > BATCH_MAX_BYTES)
+            ):
+                await _flush_batch(current_batch_items)
+                current_batch_bytes = 0
+
+            current_batch_items.append({
+                "key": t_key,
+                "file_bytes": content,
+                "mime_type": mime,
+                "doc_role": task["doc_role"],
+                "lg_number_hint": task["lg_num"],
+            })
+            current_batch_bytes += doc_size
+            del content
+
+        if current_batch_items:
+            await _flush_batch(current_batch_items)
+
+        # --- STEP 3: Evaluate Audit Discrepancies per LG Group ---
+        for plan in group_audit_plans:
+            lg_num = plan["lg_num"]
+            group = plan["group"]
+            first_rec = plan["first_rec"]
+            last_rec = plan["last_rec"]
+            first_key = plan["first_key"]
+            first_fname = plan["first_fname"]
+            last_key = plan["last_key"]
+            last_fname = plan["last_fname"]
+
+            logger.info(f"[AUDIT] Evaluating staged LG group (first_record_id={first_rec.id}, count={len(group)})")
             discrepancies = []
             was_scanned = False
             skip_reasons = []
 
             # --- 1. AUDIT CREATION (First Record) ---
-            json_data = first_rec.source_data_json or {}
-            first_url = _extract_attachment_url(json_data)
-
-            if first_url:
-                clean_url = str(first_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
-                fname = os.path.basename(clean_url.replace("\\", "/"))
-                content, mime = await self._fetch_file_content(clean_url, customer_id=customer_id, db=db)
-
-                if content:
-                    files_scanned += 1
+            if first_key:
+                if file_found_by_key.get(first_key):
                     was_scanned = True
-                    logger.info(f"   -> AI Scanning Original Document for staged record id={first_rec.id}...")
-                    ai_data, _ = await process_lg_document_with_ai(content, mime, lg_number_hint=str(lg_num))
-                    del content
-
+                    ai_data = ai_results_by_key.get(first_key)
                     if ai_data:
-                        src = first_rec.source_data_json
+                        src = first_rec.source_data_json or {}
 
                         # A. LG Number
                         ai_lg_num = ai_data.get('lgNumber', '')
@@ -1288,58 +1399,46 @@ class MigrationService:
                             discrepancies.append(err)
                             logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=expiry_date")
                     else:
-                        skip_reasons.append(f"AI could not extract text from '{fname}'")
+                        skip_reasons.append(f"AI could not extract text from '{first_fname}'")
                         logger.warning(f"   ⚠️ AI returned NO data for staged record id={first_rec.id}.")
                 else:
-                    missing_files.append(f"LG {lg_num}: '{fname}'")
-                    skip_reasons.append(f"File '{fname}' not uploaded/found on server")
+                    missing_files.append(f"LG {lg_num}: '{first_fname}'")
+                    skip_reasons.append(f"File '{first_fname}' not uploaded/found on server")
                     logger.warning(f"   ❌ Attachment file not found for staged record id={first_rec.id}")
             else:
                 skip_reasons.append("No attachment path in Excel")
 
             # --- 2. AUDIT LATEST STATUS (Last Record) ---
-            if last_rec.id != first_rec.id:
-                last_url = _extract_attachment_url(last_rec.source_data_json or {})
-                if last_url:
-                    clean_url_last = str(last_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
-                    fname_last = os.path.basename(clean_url_last.replace("\\", "/"))
+            if last_rec.id != first_rec.id and last_key:
+                if file_found_by_key.get(last_key):
+                    was_scanned = True
+                    ai_amend = ai_results_by_key.get(last_key)
+                    if ai_amend and ai_amend.get('is_relevant_amendment'):
+                        changes = ai_amend.get('amendedFields') or {}
+                        src = last_rec.source_data_json or {}
 
-                    content, mime = await self._fetch_file_content(clean_url_last, customer_id=customer_id, db=db)
+                        if "expiryDate" in changes and changes["expiryDate"]:
+                            val_excel = clean_date(src.get('expiry_date'))
+                            val_ai = clean_date(changes['expiryDate'])
+                            if val_excel != val_ai:
+                                err = f"Latest Expiry Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
+                                discrepancies.append(err)
+                                logger.info(f"      [Audit Mismatch] record_id={last_rec.id} field=latest_expiry_date")
 
-                    if content:
-                        files_scanned += 1
-                        was_scanned = True
-                        logger.info(f"   -> AI Scanning Amendment for staged record id={last_rec.id}...")
-                        context = {"lg_record_details": {"lgNumber": str(lg_num)}}
-                        ai_amend, _ = await process_amendment_with_ai(content, mime, context)
-                        del content
-
-                        if ai_amend and ai_amend.get('is_relevant_amendment'):
-                            changes = ai_amend.get('amendedFields', {})
-                            src = last_rec.source_data_json
-
-                            if "expiryDate" in changes:
-                                val_excel = clean_date(src.get('expiry_date'))
-                                val_ai = clean_date(changes['expiryDate'])
-                                if val_excel != val_ai:
-                                    err = f"Latest Expiry Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
+                        if "lgAmount" in changes and changes["lgAmount"] is not None:
+                            try:
+                                val_excel = float(src.get('lg_amount', 0))
+                                val_ai = float(changes['lgAmount'])
+                                if abs(val_excel - val_ai) > 1.0:
+                                    err = f"Latest Amount Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
                                     discrepancies.append(err)
-                                    logger.info(f"      [Audit Mismatch] record_id={last_rec.id} field=latest_expiry_date")
-
-                            if "lgAmount" in changes:
-                                try:
-                                    val_excel = float(src.get('lg_amount', 0))
-                                    val_ai = float(changes['lgAmount'])
-                                    if abs(val_excel - val_ai) > 1.0:
-                                        err = f"Latest Amount Mismatch: Excel='{val_excel}' vs AI='{val_ai}'"
-                                        discrepancies.append(err)
-                                        logger.info(f"      [Audit Mismatch] record_id={last_rec.id} field=latest_lg_amount")
-                                except Exception:
-                                    pass
-                    else:
-                        missing_files.append(f"LG {lg_num} (Amendment): '{fname_last}'")
-                        skip_reasons.append(f"Amendment file '{fname_last}' not uploaded/found")
-                        logger.warning(f"   ❌ Amendment attachment not found for staged record id={last_rec.id}")
+                                    logger.info(f"      [Audit Mismatch] record_id={last_rec.id} field=latest_lg_amount")
+                            except Exception:
+                                pass
+                else:
+                    missing_files.append(f"LG {lg_num} (Amendment): '{last_fname}'")
+                    skip_reasons.append(f"Amendment file '{last_fname}' not uploaded/found")
+                    logger.warning(f"   ❌ Amendment attachment not found for staged record id={last_rec.id}")
 
             first_rec.validation_log = dict(first_rec.validation_log or {})
             ignored_issues = first_rec.validation_log.get('ignored_ai_issues') or []
@@ -1375,7 +1474,6 @@ class MigrationService:
             db.add(first_rec)
 
         db.commit()
-        from app.core.ai_integration import _reclaim_system_memory
         _reclaim_system_memory()
         logger.info("=======================================================")
         logger.info(

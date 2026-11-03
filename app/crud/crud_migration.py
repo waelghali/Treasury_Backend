@@ -116,7 +116,7 @@ class CRUDLGMigration(CRUDBase):
         lg_number_filter: Optional[str] = None, # NEW
         file_name_filter: Optional[str] = None, # NEW
         skip: int = 0,
-        limit: int = 100,
+        limit: Optional[int] = None,
     ) -> List[LGMigrationStaging]:
         query = db.query(self.model).filter(self.model.customer_id == customer_id)
         if status_filter:
@@ -127,7 +127,12 @@ class CRUDLGMigration(CRUDBase):
         if file_name_filter:
             query = query.filter(func.lower(self.model.file_name).like(func.lower(f"%{file_name_filter}%")))
 
-        return query.order_by(self.model.created_at.desc()).offset(skip).limit(limit).all()
+        query = query.order_by(self.model.id.asc())
+        if skip and skip > 0:
+            query = query.offset(skip)
+        if limit is not None and limit > 0:
+            query = query.limit(limit)
+        return query.all()
 
     def get_migration_report(self, db: Session, customer_id: int) -> MigrationReportSummary:
         results = db.query(

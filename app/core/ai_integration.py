@@ -117,25 +117,19 @@ def _get_api_genai_client():
 
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
-    Optimized Cascade: Instant Response First, High-Context Second:
-    1. gemini-2.5-flash: Enterprise Vertex AI active bridge (instant 200 OK)
-    2. gemini-3.5-flash: Generation 3 document intelligence
-    3. gemini-3.8-flash: High-context vision backup
-    4. gemini-3.6-flash: Fast generation 3 alternative
-    5. gemini-3.7-flash: Fast generation 3 alternative
-    6. gemini-3.5-flash-lite: High-speed lightweight fallback
-    7. gemini-2.5-pro: Heavyweight reasoning safety net
+    Production Model Cascade across active Vertex AI & Gemini model tiers:
+    1. gemini-2.5-flash: Primary high-speed multimodal model
+    2. gemini-2.5-flash-lite: Independent high-throughput quota pool
+    3. gemini-2.0-flash: Proven fast fallback with separate quota pool
+    4. gemini-2.5-pro: Heavyweight reasoning fallback
     """
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
     candidates = [
         primary,
         "gemini-2.5-flash",
-        "gemini-3.5-flash",
-        "gemini-3.8-flash",
-        "gemini-3.6-flash",
-        "gemini-3.7-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-2.5-pro"
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-pro",
     ]
     seen = set()
     result = []
@@ -154,86 +148,168 @@ def _is_model_unavailable_error(exc: Exception) -> bool:
         "invalid model", "bad request", "400"
     ])
 
+def _is_rate_limit_or_transient_error(exc: Exception) -> bool:
+    """Checks if the exception is a 429 RESOURCE_EXHAUSTED, quota, or transient 503/500 error."""
+    err_str = str(exc).lower()
+    return any(keyword in err_str for keyword in [
+        "429", "resource_exhausted", "resource exhausted", "quota", "rate limit",
+        "too many requests", "503", "service unavailable", "unavailable",
+        "overloaded", "deadline_exceeded", "500", "internal error", "connection reset"
+    ])
+
+_vertex_location_clients: Dict[str, Any] = {}
+
+def _get_vertex_genai_client_for_location(location: str):
+    """Returns a cached Vertex AI GenAI client for a specific region/location (e.g. 'us-central1', 'global', 'europe-west1')."""
+    if not GEMINI_AVAILABLE or not VERTEX_AI_PROJECT_ID:
+        return None
+    if location in _vertex_location_clients:
+        return _vertex_location_clients[location]
+    try:
+        credentials = _get_google_credentials()
+        c = genai.Client(
+            vertexai=True,
+            project=VERTEX_AI_PROJECT_ID,
+            location=location,
+            credentials=credentials,
+        )
+        _vertex_location_clients[location] = c
+        return c
+    except Exception as e:
+        logger.warning(f"Could not initialize Vertex AI client for location '{location}': {e}")
+        return None
+
+def _get_candidate_clients(primary_client) -> List[Tuple[str, Any]]:
+    """
+    Builds an ordered list of (client_label, client) across:
+    1. Primary client (e.g. Vertex AI us-central1)
+    2. Vertex AI 'global' endpoint (dynamic global routing pool to avoid regional 429s)
+    3. Vertex AI 'europe-west1' & 'us-east4' regional pools
+    4. Google AI Studio API client (if GEMINI_API_KEY / GOOGLE_API_KEY is configured)
+    """
+    candidates: List[Tuple[str, Any]] = []
+    seen_ids = set()
+
+    if primary_client is not None:
+        candidates.append((f"vertex:{VERTEX_AI_LOCATION}", primary_client))
+        seen_ids.add(id(primary_client))
+
+    for loc in ("global", "europe-west1", "us-east4"):
+        if loc == VERTEX_AI_LOCATION and primary_client is not None:
+            continue
+        loc_client = _get_vertex_genai_client_for_location(loc)
+        if loc_client is not None and id(loc_client) not in seen_ids:
+            candidates.append((f"vertex:{loc}", loc_client))
+            seen_ids.add(id(loc_client))
+
+    api_client = _get_api_genai_client()
+    if api_client is not None and id(api_client) not in seen_ids:
+        candidates.append(("ai_studio", api_client))
+        seen_ids.add(id(api_client))
+
+    return candidates
+
 async def _safe_generate_content_async(client, model: str, contents, config=None):
     """
-    Safely executes an async generate_content call with dual-client (Vertex AI + Google AI API)
-    and full multi-model cascade across Gen 2.5 and Gen 3 models.
+    Safely executes an async generate_content call with:
+    - Multi-region Vertex AI failover (primary -> global -> europe-west1 -> us-east4)
+    - Multi-model cascade (gemini-2.5-flash -> gemini-2.5-flash-lite -> gemini-2.0-flash -> gemini-2.5-pro)
+    - Google AI Studio fallback client
+    - Automatic exponential backoff + jitter on 429 RESOURCE_EXHAUSTED / 503 transient errors
     """
+    import random
     cascade = _get_model_cascade(model)
+    candidate_clients = _get_candidate_clients(client)
     last_err = None
-    
-    # 1. Attempt with primary client (Vertex AI or provided client)
-    if client:
-        for attempt_model in cascade:
-            try:
-                return await client.aio.models.generate_content(
-                    model=attempt_model,
-                    contents=contents,
-                    config=config
-                )
-            except Exception as e:
-                last_err = e
-                if _is_model_unavailable_error(e):
-                    continue
-                raise e
+    max_rounds = 3
 
-    # 2. Seamless Fallback to Google AI API Studio Client
-    api_client = _get_api_genai_client()
-    if api_client and api_client != client:
-        for attempt_model in cascade:
-            try:
-                return await api_client.aio.models.generate_content(
-                    model=attempt_model,
-                    contents=contents,
-                    config=config
-                )
-            except Exception as e:
-                last_err = e
-                if _is_model_unavailable_error(e):
-                    continue
-                raise e
+    for round_idx in range(max_rounds):
+        hit_rate_limit_in_round = False
+        for client_label, active_client in candidate_clients:
+            for attempt_model in cascade:
+                # Google AI Studio does not support Vertex-only global routing quirks, but supports standard Gemini models
+                try:
+                    return await active_client.aio.models.generate_content(
+                        model=attempt_model,
+                        contents=contents,
+                        config=config
+                    )
+                except Exception as e:
+                    last_err = e
+                    if _is_model_unavailable_error(e):
+                        continue
+                    if _is_rate_limit_or_transient_error(e):
+                        hit_rate_limit_in_round = True
+                        logger.warning(
+                            f"[AI Retry] 429/Transient error on {client_label}/{attempt_model} "
+                            f"(round {round_idx + 1}/{max_rounds}): {e}. Failing over..."
+                        )
+                        # Brief pause before hitting next model/region
+                        await asyncio.sleep(0.4 + random.uniform(0.1, 0.4))
+                        continue
+                    raise e
+
+        if hit_rate_limit_in_round and round_idx < max_rounds - 1:
+            backoff_sec = (2.5 ** (round_idx + 1)) + random.uniform(0.5, 2.0)
+            logger.warning(
+                f"[AI Backoff] All candidate endpoints hit rate limits in round {round_idx + 1}. "
+                f"Sleeping {backoff_sec:.1f}s before retry round {round_idx + 2}..."
+            )
+            await asyncio.sleep(backoff_sec)
+        else:
+            break
 
     if last_err:
         raise last_err
 
 def _safe_generate_content_sync(client, model: str, contents, config=None):
     """
-    Safely executes a sync generate_content call with dual-client (Vertex AI + Google AI API)
-    and full multi-model cascade across Gen 2.5 and Gen 3 models.
+    Safely executes a sync generate_content call with:
+    - Multi-region Vertex AI failover (primary -> global -> europe-west1 -> us-east4)
+    - Multi-model cascade
+    - Google AI Studio fallback client
+    - Automatic exponential backoff + jitter on 429 RESOURCE_EXHAUSTED / 503 transient errors
     """
+    import time
+    import random
     cascade = _get_model_cascade(model)
+    candidate_clients = _get_candidate_clients(client)
     last_err = None
+    max_rounds = 3
 
-    # 1. Attempt with primary client (Vertex AI or provided client)
-    if client:
-        for attempt_model in cascade:
-            try:
-                return client.models.generate_content(
-                    model=attempt_model,
-                    contents=contents,
-                    config=config
-                )
-            except Exception as e:
-                last_err = e
-                if _is_model_unavailable_error(e):
-                    continue
-                raise e
+    for round_idx in range(max_rounds):
+        hit_rate_limit_in_round = False
+        for client_label, active_client in candidate_clients:
+            for attempt_model in cascade:
+                try:
+                    return active_client.models.generate_content(
+                        model=attempt_model,
+                        contents=contents,
+                        config=config
+                    )
+                except Exception as e:
+                    last_err = e
+                    if _is_model_unavailable_error(e):
+                        continue
+                    if _is_rate_limit_or_transient_error(e):
+                        hit_rate_limit_in_round = True
+                        logger.warning(
+                            f"[AI Sync Retry] 429/Transient error on {client_label}/{attempt_model} "
+                            f"(round {round_idx + 1}/{max_rounds}): {e}. Failing over..."
+                        )
+                        time.sleep(0.4 + random.uniform(0.1, 0.4))
+                        continue
+                    raise e
 
-    # 2. Seamless Fallback to Google AI API Studio Client
-    api_client = _get_api_genai_client()
-    if api_client and api_client != client:
-        for attempt_model in cascade:
-            try:
-                return api_client.models.generate_content(
-                    model=attempt_model,
-                    contents=contents,
-                    config=config
-                )
-            except Exception as e:
-                last_err = e
-                if _is_model_unavailable_error(e):
-                    continue
-                raise e
+        if hit_rate_limit_in_round and round_idx < max_rounds - 1:
+            backoff_sec = (2.5 ** (round_idx + 1)) + random.uniform(0.5, 2.0)
+            logger.warning(
+                f"[AI Sync Backoff] All candidate endpoints hit rate limits in round {round_idx + 1}. "
+                f"Sleeping {backoff_sec:.1f}s before retry round {round_idx + 2}..."
+            )
+            time.sleep(backoff_sec)
+        else:
+            break
 
     if last_err:
         raise last_err
@@ -1138,11 +1214,16 @@ def _execute_in_forked_worker_sync(coro_fn, args):
         except Exception:
             pass
         try:
-            global _GCS_CLIENT, _VISION_CLIENT, _DOCAI_CLIENT, _GENAI_CLIENT
-            _GCS_CLIENT = None
-            _VISION_CLIENT = None
-            _DOCAI_CLIENT = None
-            _GENAI_CLIENT = None
+            global _gcs_client, _vision_client, _docai_client, _genai_client_global, _genai_api_client_global
+            _gcs_client = None
+            _vision_client = None
+            _docai_client = None
+            _genai_client_global = None
+            _genai_api_client_global = None
+            _vertex_location_clients.clear()
+            for cached_fn in (_get_gcs_client, _get_vision_client, _get_genai_client):
+                if hasattr(cached_fn, "cache_clear"):
+                    cached_fn.cache_clear()
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -1397,6 +1478,289 @@ async def process_amendment_with_ai(
         logger.warning("Skipping DB usage log: Missing database session or user.")
     _reclaim_system_memory()
     return structured_data, total_usage_metadata
+
+
+# ==============================================================================
+# Batched Multi-Document AI Extraction for Migration Audit
+# ==============================================================================
+
+def _normalize_batch_ai_date(val: Any) -> str:
+    if not val or not isinstance(val, str):
+        return ""
+    s = val.strip()
+    m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m_iso:
+        return f"{m_iso.group(1)}-{int(m_iso.group(2)):02d}-{int(m_iso.group(3)):02d}"
+    m_dmy = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})", s)
+    if m_dmy:
+        return f"{m_dmy.group(3)}-{int(m_dmy.group(2)):02d}-{int(m_dmy.group(1)):02d}"
+    return re.split(r"[T_\s]", s)[0]
+
+
+def _prepare_multimodal_parts_for_doc(file_bytes: bytes, mime_type: str) -> Tuple[List[Any], int]:
+    """
+    Converts a PDF or image in-memory into compact Gemini Part objects without uploading
+    temporary files to GCS or making Google Cloud Vision OCR calls per page.
+    Returns (parts_list, pages_processed).
+    """
+    parts: List[Any] = []
+    pages_processed = 1
+
+    if not file_bytes or not genai_types:
+        return parts, 0
+
+    if mime_type == "application/pdf":
+        if fitz:
+            pdf_doc = None
+            try:
+                pdf_doc = fitz.open(stream=io.BytesIO(file_bytes), filetype="pdf")
+                num_pages = len(pdf_doc)
+                max_pages = min(num_pages, 4)
+                pages_processed = max(max_pages, 1)
+
+                # If PDF is compact (<= 4 pages and <= 2.5 MB), send native PDF bytes directly to Gemini
+                if num_pages <= 4 and len(file_bytes) <= int(2.5 * 1024 * 1024):
+                    parts.append(genai_types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+                else:
+                    # Render up to first 4 pages as compact JPEG buffers in memory
+                    for page_idx in range(max_pages):
+                        page = pdf_doc.load_page(page_idx)
+                        max_dim = max(float(page.rect.width), float(page.rect.height))
+                        zoom = min(1600.0 / max_dim, 2.0) if max_dim > 0 else 1.0
+                        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                        img_bytes = pix.tobytes("jpeg", jpg_quality=80)
+                        parts.append(genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+                        del pix
+                        del img_bytes
+                        del page
+            except Exception as e:
+                logger.warning(f"PyMuPDF inspection failed, falling back to raw PDF part: {e}")
+                if not parts and len(file_bytes) <= 8 * 1024 * 1024:
+                    parts.append(genai_types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+            finally:
+                if pdf_doc:
+                    pdf_doc.close()
+        else:
+            parts.append(genai_types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+    elif mime_type.startswith("image/"):
+        parts.append(genai_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
+    else:
+        parts.append(genai_types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+
+    return parts, pages_processed
+
+
+async def _process_batch_migration_documents_with_ai_core(
+    items: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """
+    Processes a batch of up to 6 LG / Amendment PDFs or images in a SINGLE multimodal Gemini request.
+    Each item in `items` has:
+        - key: str (unique identifier for this document in the batch)
+        - file_bytes: bytes
+        - mime_type: str
+        - doc_role: "CREATION" | "AMENDMENT"
+        - lg_number_hint: str
+    Returns (results_by_key, usage_metadata).
+    """
+    results_by_key: Dict[str, Dict[str, Any]] = {}
+    usage_meta = {
+        "ocr_characters": 0,
+        "gemini_prompt_tokens": 0,
+        "gemini_completion_tokens": 0,
+        "total_pages_processed": 0,
+    }
+
+    client = _get_genai_client() or _get_api_genai_client()
+    if not client or not items:
+        return results_by_key, usage_meta
+
+    contents: List[Any] = []
+    valid_items: List[Dict[str, Any]] = []
+
+    intro_prompt = """You are an expert financial document analyst auditing a batch of bank Letters of Guarantee (LG) and LG Amendment documents (which may be in English, Arabic, or bilingual).
+Below you are given multiple documents in a single batch. Each document starts with a clear delimiter header of the form:
+`=== DOCUMENT_START | key="<KEY>" | role="<CREATION_OR_AMENDMENT>" | expected_lg_number="<LG_HINT>" ===`
+followed immediately by that document's PDF/image pages, and ends with `=== DOCUMENT_END | key="<KEY>" ===`.
+
+For EVERY document in the batch, extract its structured data independently and return it in the `documents` array with its exact `key`:
+1. `key`: Exact `key` string from the document header.
+2. `lgNumber`: The LG reference number as written on the document.
+3. `lgAmount`: The guarantee amount (or new amended guarantee amount) as a plain float without commas.
+4. `currency`: 3-letter ISO currency code (e.g. EGP, USD, EUR, SAR, AED, GBP).
+5. `issuingBankName`: The formal English name of the issuing bank (e.g. Commercial International Bank, National Bank of Egypt, Banque Misr, QNB Alahli, HSBC, Arab African International Bank, etc.).
+6. `issuanceDate`: Date the LG was issued in `YYYY-MM-DD` format.
+7. `expiryDate`: Date the LG expires (or new amended expiry date) in `YYYY-MM-DD` format.
+8. `is_relevant_amendment`: Boolean (`true` if the document refers to `expected_lg_number` or amends/extends it).
+9. `amendedFields`: For `AMENDMENT` documents (or if the document amends an LG), include an object with any amended fields (`expiryDate` in `YYYY-MM-DD` format, `lgAmount` as a plain float, `currency` as 3-letter ISO code).
+
+Important Rules:
+- Do NOT mix data between different documents in the batch.
+- Format all dates strictly as `YYYY-MM-DD`.
+- Format all amounts strictly as plain numbers (no commas or currency symbols).
+"""
+    contents.append(intro_prompt)
+
+    for item in items:
+        doc_key = str(item.get("key", ""))
+        file_bytes = item.get("file_bytes")
+        mime_type = item.get("mime_type") or "application/pdf"
+        doc_role = item.get("doc_role") or "CREATION"
+        lg_hint = str(item.get("lg_number_hint") or "")
+
+        doc_parts, pages_cnt = _prepare_multimodal_parts_for_doc(file_bytes, mime_type)
+        if not doc_parts:
+            continue
+
+        usage_meta["total_pages_processed"] += pages_cnt
+        valid_items.append(item)
+
+        contents.append(
+            f'\n=== DOCUMENT_START | key="{doc_key}" | role="{doc_role}" | expected_lg_number="{lg_hint}" ===\n'
+        )
+        contents.extend(doc_parts)
+        contents.append(f'\n=== DOCUMENT_END | key="{doc_key}" ===\n')
+
+    if not valid_items:
+        return results_by_key, usage_meta
+
+    batch_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "documents": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "key": {"type": "STRING"},
+                        "lgNumber": {"type": "STRING"},
+                        "lgAmount": {"type": "NUMBER"},
+                        "currency": {"type": "STRING"},
+                        "issuingBankName": {"type": "STRING"},
+                        "issuanceDate": {"type": "STRING"},
+                        "expiryDate": {"type": "STRING"},
+                        "is_relevant_amendment": {"type": "BOOLEAN"},
+                        "amendedFields": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "lgAmount": {"type": "NUMBER"},
+                                "currency": {"type": "STRING"},
+                                "expiryDate": {"type": "STRING"},
+                            },
+                        },
+                    },
+                    "required": ["key"],
+                },
+            }
+        },
+        "required": ["documents"],
+    }
+
+    try:
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=batch_schema,
+            temperature=0.0,
+        )
+        response = await _safe_generate_content_async(
+            client=client,
+            model=GEMINI_MODEL_NAME,
+            contents=contents,
+            config=config,
+        )
+        if response and response.usage_metadata:
+            usage_meta["gemini_prompt_tokens"] += getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            usage_meta["gemini_completion_tokens"] += getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+
+        parsed = json.loads(response.text or "{}")
+        docs_list = parsed.get("documents") or []
+        item_by_key = {str(it.get("key")): it for it in valid_items}
+
+        for doc_obj in docs_list:
+            if not isinstance(doc_obj, dict):
+                continue
+            k = str(doc_obj.get("key") or "")
+            if not k:
+                continue
+
+            for d_field in ("issuanceDate", "expiryDate"):
+                if doc_obj.get(d_field):
+                    doc_obj[d_field] = _normalize_batch_ai_date(doc_obj[d_field])
+
+            amended = doc_obj.get("amendedFields")
+            if not isinstance(amended, dict):
+                amended = {}
+            if amended.get("expiryDate"):
+                amended["expiryDate"] = _normalize_batch_ai_date(amended["expiryDate"])
+
+            # Ensure AMENDMENT role documents populate amendedFields from top-level fields if Gemini placed them at top level
+            orig_item = item_by_key.get(k, {})
+            if orig_item.get("doc_role") == "AMENDMENT":
+                if not amended.get("expiryDate") and doc_obj.get("expiryDate"):
+                    amended["expiryDate"] = doc_obj["expiryDate"]
+                if amended.get("lgAmount") is None and doc_obj.get("lgAmount") is not None:
+                    amended["lgAmount"] = doc_obj["lgAmount"]
+                if doc_obj.get("is_relevant_amendment") is None:
+                    doc_obj["is_relevant_amendment"] = bool(doc_obj.get("lgNumber") or amended)
+            doc_obj["amendedFields"] = amended
+            results_by_key[k] = doc_obj
+
+    except Exception as e:
+        logger.error(f"Batch multimodal Gemini extraction failed for batch of {len(valid_items)} docs: {e}", exc_info=True)
+    finally:
+        del contents
+        _reclaim_system_memory()
+
+    return results_by_key, usage_meta
+
+
+async def process_batch_migration_documents_with_ai(
+    items: List[Dict[str, Any]],
+    customer_bucket_name: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Runs batched multi-document extraction inside an isolated worker fork, and automatically
+    falls back to single-document extraction for any item that was missed or failed in the batch.
+    """
+    if not items:
+        return {}
+
+    batch_results, _ = await _run_coro_in_isolated_fork(
+        _process_batch_migration_documents_with_ai_core,
+        items,
+    )
+    if not isinstance(batch_results, dict):
+        batch_results = {}
+
+    # Fallback for any item in the batch that did not yield a result
+    for item in items:
+        k = str(item.get("key", ""))
+        if k and k not in batch_results:
+            logger.info(f"[Batch AI Fallback] Retrying single document key='{k}' individually...")
+            single_res, _ = await _run_coro_in_isolated_fork(
+                _process_batch_migration_documents_with_ai_core,
+                [item],
+            )
+            if isinstance(single_res, dict) and k in single_res:
+                batch_results[k] = single_res[k]
+            else:
+                # Final fallback to legacy OCR + Gemini pipeline if direct multimodal failed
+                f_bytes = item.get("file_bytes")
+                f_mime = item.get("mime_type") or "application/pdf"
+                lg_hint = str(item.get("lg_number_hint") or "unknown_lg")
+                if item.get("doc_role") == "AMENDMENT":
+                    legacy_data, _ = await process_amendment_with_ai(
+                        f_bytes, f_mime, {"lgNumber": lg_hint}, customer_bucket_name=customer_bucket_name
+                    )
+                else:
+                    legacy_data, _ = await process_lg_document_with_ai(
+                        f_bytes, f_mime, lg_number_hint=lg_hint, customer_bucket_name=customer_bucket_name
+                    )
+                if legacy_data:
+                    batch_results[k] = legacy_data
+
+    _reclaim_system_memory()
+    return batch_results
 
 # ==============================================================================
 # Supporting Document AI Analysis (for Issuance Request Verification)

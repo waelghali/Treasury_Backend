@@ -1836,7 +1836,7 @@ def get_staged_records(
     lg_number: Optional[str] = None,
     file_name: Optional[str] = None,
     skip: int = 0,
-    limit: int = 100,
+    limit: Optional[int] = Query(None, description="Max records to return; omit or pass 0 for all records"),
 ):
     logger.info(f"Get staged records endpoint hit for customer {current_user.customer_id}.")
     records = crud_lg_migration.get_staging_records(
