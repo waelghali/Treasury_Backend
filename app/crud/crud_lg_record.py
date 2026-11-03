@@ -61,7 +61,7 @@ from app.services.unified_email_builder import build_transaction_email_html, bui
 
 
 from app.core.email_service import EmailSettings, EmailAttachment, get_global_email_settings, send_email, get_customer_email_settings
-from app.core.document_generator import generate_pdf_from_html
+from app.core.document_generator import generate_pdf_from_html, generate_merged_pdf_from_html_list
 from app.core.ai_integration import process_lg_document_with_ai, GCS_BUCKET_NAME
 
 # --- REMOVED tenacity imports from here as retry logic is moved to crud_lg_instruction.create ---
@@ -2660,22 +2660,12 @@ class CRUDLGRecord(CRUDBase):
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs were successfully renewed for customer {customer_id}.")
             return 0, None
 
-        # Combine all generated instruction HTMLs into a single document with page breaks
-        consolidated_html_content = []
-        for html_segment in all_generated_instruction_htmls:
-            consolidated_html_content.append(html_segment)
-            consolidated_html_content.append('<div style="page-break-after: always;"></div>')
-
-        if consolidated_html_content and consolidated_html_content[-1].startswith('<div style="page-break-after:'):
-            consolidated_html_content.pop()
-
-        final_consolidated_html = "".join(consolidated_html_content)
-
-        # Generate the combined PDF
+        # Render each letter as an independent PDF (preserving its own @page headers, footers, and serial number)
+        # and merge the resulting PDFs into a single print batch PDF.
         combined_pdf_bytes: Optional[bytes] = None
         try:
-            combined_pdf_bytes = await generate_pdf_from_html(
-                final_consolidated_html,
+            combined_pdf_bytes = await generate_merged_pdf_from_html_list(
+                all_generated_instruction_htmls,
                 f"bulk_lg_renewal_customer_{customer_id}_{date.today().isoformat()}"
             )
             if not combined_pdf_bytes:

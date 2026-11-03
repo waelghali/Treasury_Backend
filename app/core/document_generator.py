@@ -4,7 +4,7 @@ import io
 import os
 import gc
 import ctypes
-from typing import Optional
+from typing import Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,40 @@ def _render_pdf_worker(html_content: str) -> Optional[bytes]:
         gc.collect()
         try:
             # On Linux (Docker/Kubernetes containers), force glibc to release free arenas back to the OS
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+def _render_and_merge_pdfs_worker(html_segments: List[str]) -> Optional[bytes]:
+    """
+    Renders each HTML segment as an independent PDF (so each letter has its own @page headers,
+    footers, and independent Page 1 of 1 numbering) and merges the resulting PDFs into a single PDF stream.
+    """
+    try:
+        from weasyprint import HTML
+        from pypdf import PdfReader, PdfWriter
+
+        writer = PdfWriter()
+        for segment in html_segments:
+            if not segment or not segment.strip():
+                continue
+            html_obj = HTML(string=segment)
+            seg_bytes = html_obj.write_pdf()
+            del html_obj
+            if seg_bytes:
+                reader = PdfReader(io.BytesIO(seg_bytes))
+                for page in reader.pages:
+                    writer.add_page(page)
+
+        if len(writer.pages) == 0:
+            return None
+
+        out_stream = io.BytesIO()
+        writer.write(out_stream)
+        return out_stream.getvalue()
+    finally:
+        gc.collect()
+        try:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
@@ -50,3 +84,24 @@ async def generate_pdf_from_html(html_content: str, filename_hint: str = "docume
         except Exception:
             pass
 
+async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_hint: str = "consolidated_documents") -> Optional[bytes]:
+    """
+    Renders a list of independent HTML documents into individual PDFs and merges them into one PDF,
+    preserving isolated @page counters and headers/footers per letter.
+    """
+    logger.debug(f"generate_merged_pdf_from_html_list: Rendering and merging {len(html_segments)} letters for '{filename_hint}'.")
+    try:
+        pdf_bytes = await asyncio.to_thread(_render_and_merge_pdfs_worker, html_segments)
+        if pdf_bytes:
+            logger.info(f"generate_merged_pdf_from_html_list: Successfully generated merged PDF for '{filename_hint}' ({len(html_segments)} letters, size: {len(pdf_bytes)} bytes).")
+            return pdf_bytes
+        return None
+    except Exception as e:
+        logger.error(f"generate_merged_pdf_from_html_list: Error generating merged PDF for '{filename_hint}': {e}", exc_info=True)
+        return None
+    finally:
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass

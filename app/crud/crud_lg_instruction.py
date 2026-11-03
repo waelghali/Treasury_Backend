@@ -27,7 +27,7 @@ from app.constants import (
 )
 
 from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
-from app.core.document_generator import generate_pdf_from_html
+from app.core.document_generator import generate_pdf_from_html, generate_merged_pdf_from_html_list
 
 import logging
 logger = logging.getLogger(__name__)
@@ -893,7 +893,6 @@ class CRUDLGInstruction(CRUDBase):
                 generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
             
             consolidated_html_content.append(generated_html)
-            consolidated_html_content.append('<div style="page-break-after: always;"></div>')
             
             new_reminder_instruction = await self.create(
                 db,
@@ -944,18 +943,14 @@ class CRUDLGInstruction(CRUDBase):
             generated_instruction_ids.append(new_reminder_instruction.id)
             logger.debug(f"Generated reminder {new_reminder_instruction.serial_number} for original instruction {original_instruction.serial_number}.")
 
-        # 5. Final PDF Assembly
-        if consolidated_html_content and consolidated_html_content[-1].startswith('<div style="page-break-after:'):
-            consolidated_html_content.pop()
-        
+        # 5. Final PDF Assembly — render each reminder letter independently and merge PDFs
         if not consolidated_html_content:
             logger.info(f"No actual reminders generated after filtering for customer {customer_id}.")
             return None, 0, []
         
-        final_consolidated_html = "".join(consolidated_html_content)
         try:
-            consolidated_pdf_bytes = await generate_pdf_from_html(
-                final_consolidated_html,
+            consolidated_pdf_bytes = await generate_merged_pdf_from_html_list(
+                consolidated_html_content,
                 f"consolidated_bank_reminders_customer_{customer_id}_{date.today().isoformat()}"
             )
         except Exception as e:
