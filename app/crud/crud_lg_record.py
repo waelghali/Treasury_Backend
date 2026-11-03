@@ -2023,7 +2023,8 @@ class CRUDLGRecord(CRUDBase):
                        customer_id: int,
                        approval_request_id: Optional[int],
                        existing_document_id: Optional[int] = None,
-                       is_migration: bool = False
+                       is_migration: bool = False,
+                       extra_audit_details: Optional[Dict[str, Any]] = None
                        ) -> models.LGRecord:
         """
         Applies amendments to an LG record based on bank amendment letter.
@@ -2174,15 +2175,31 @@ class CRUDLGRecord(CRUDBase):
             else:
                 json_serializable_amended_fields[k] = v
 
+        amended_fields_with_diff = {}
+        for k, new_v in json_serializable_amended_fields.items():
+            old_v = old_values_for_log.get(k)
+            if old_v != new_v:
+                amended_fields_with_diff[k] = {"old": old_v, "new": new_v}
+        if not amended_fields_with_diff:
+            for k, new_v in json_serializable_amended_fields.items():
+                amended_fields_with_diff[k] = {"old": old_values_for_log.get(k), "new": new_v}
+
+        audit_details_payload = {
+            "lg_number": updated_lg_record.lg_number,
+            "amended_fields": amended_fields_with_diff,
+            "old_values": old_values_for_log,
+            "amendment_document_id": document_id_for_log,
+            "approved_by_user_id": acting_user_id
+        }
+        if "expiry_date" in amended_fields_with_diff:
+            audit_details_payload["old_expiry_date"] = amended_fields_with_diff["expiry_date"].get("old")
+            audit_details_payload["new_expiry_date"] = amended_fields_with_diff["expiry_date"].get("new")
+        if extra_audit_details:
+            audit_details_payload.update(extra_audit_details)
+
         log_action(
             db, acting_user_id, AUDIT_ACTION_TYPE_LG_AMENDED, "LGRecord", updated_lg_record.id,
-            {
-                "lg_number": updated_lg_record.lg_number,
-                "amended_fields": json_serializable_amended_fields,
-                "old_values": old_values_for_log,
-                "amendment_document_id": document_id_for_log,
-                "approved_by_user_id": acting_user_id
-            },
+            audit_details_payload,
             updated_lg_record.customer_id, updated_lg_record.id
         )
         if approval_request_id is None and not is_migration:
@@ -3676,7 +3693,9 @@ class CRUDLGRecord(CRUDBase):
         migration_source: str, 
         migrated_from_staging_id: int,
         # NEW ARGUMENT: We accept the ID explicitly to guarantee it is saved
-        internal_owner_contact_id: Optional[int] = None 
+        internal_owner_contact_id: Optional[int] = None,
+        final_lg_status_id: Optional[int] = None,
+        extra_audit_details: Optional[Dict[str, Any]] = None
     ) -> models.LGRecord:
         
         # 1. Check for duplicate LG Number
@@ -3741,6 +3760,8 @@ class CRUDLGRecord(CRUDBase):
         lg_record_data["lg_sequence_number"] = next_lg_sequence
         lg_record_data["migration_source"] = migration_source
         lg_record_data["migrated_from_staging_id"] = migrated_from_staging_id
+        if final_lg_status_id is not None:
+            lg_record_data["lg_status_id"] = final_lg_status_id
         
         # 5. Insert into Database
         db_lg_record = self.model(**lg_record_data)
@@ -3749,18 +3770,48 @@ class CRUDLGRecord(CRUDBase):
         db.refresh(db_lg_record)
         
         # 6. Audit Log
+        currency_code = None
+        if getattr(db_lg_record, "lg_currency", None):
+            currency_code = db_lg_record.lg_currency.iso_code
+        elif db_lg_record.lg_currency_id:
+            curr_obj = db.query(models.Currency).filter(models.Currency.id == db_lg_record.lg_currency_id).first()
+            if curr_obj:
+                currency_code = curr_obj.iso_code
+
+        init_issuance = (
+            db_lg_record.issuance_date.isoformat()
+            if isinstance(db_lg_record.issuance_date, (date, datetime))
+            else str(db_lg_record.issuance_date or "")
+        )
+        init_expiry = (
+            db_lg_record.expiry_date.isoformat()
+            if isinstance(db_lg_record.expiry_date, (date, datetime))
+            else str(db_lg_record.expiry_date or "")
+        )
+        init_amount = float(db_lg_record.lg_amount) if db_lg_record.lg_amount is not None else None
+
+        audit_details = {
+            "lg_number": db_lg_record.lg_number,
+            "customer_id": customer_id,
+            "staged_record_id": migrated_from_staging_id,
+            "internal_owner_id": internal_owner_contact_id,
+            "initial_values": {
+                "issuance_date": init_issuance,
+                "expiry_date": init_expiry,
+                "amount": init_amount,
+                "currency": currency_code,
+            },
+        }
+        if extra_audit_details:
+            audit_details.update(extra_audit_details)
+
         log_action(
             db,
             user_id=user_id,
             action_type="MIGRATION_IMPORT_RECORD",
             entity_type="LGRecord",
             entity_id=db_lg_record.id,
-            details={
-                "lg_number": db_lg_record.lg_number,
-                "customer_id": customer_id,
-                "staged_record_id": migrated_from_staging_id,
-                "internal_owner_id": internal_owner_contact_id 
-            },
+            details=audit_details,
             customer_id=customer_id,
             lg_record_id=db_lg_record.id,
         )

@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import io
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Type
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -388,8 +388,18 @@ class MigrationService:
         candidate_paths = []
         temp_base = os.path.join(tempfile.gettempdir(), "migration_attachments")
         if customer_id is not None:
-            candidate_paths.append(os.path.join(temp_base, f"customer_{customer_id}", f"{file_name}.enc"))
-            candidate_paths.append(os.path.join(temp_base, f"customer_{customer_id}", file_name))
+            cust_dir = os.path.join(temp_base, f"customer_{customer_id}")
+            candidate_paths.append(os.path.join(cust_dir, f"{file_name}.enc"))
+            candidate_paths.append(os.path.join(cust_dir, file_name))
+            # Case-insensitive match in customer directory
+            if os.path.exists(cust_dir):
+                target_lower = file_name.lower()
+                for entry in os.listdir(cust_dir):
+                    entry_clean = entry[:-4] if entry.lower().endswith(".enc") else entry
+                    if entry_clean.lower() == target_lower:
+                        full_entry = os.path.join(cust_dir, entry)
+                        if full_entry not in candidate_paths:
+                            candidate_paths.append(full_entry)
         if os.path.exists(temp_base):
             for match in glob.glob(os.path.join(temp_base, "*", f"{file_name}.enc")) + glob.glob(os.path.join(temp_base, "*", file_name)):
                 if match not in candidate_paths:
@@ -451,6 +461,7 @@ class MigrationService:
                     candidate_blobs = []
                     if customer_id is not None:
                         candidate_blobs.append(build_customer_blob_path(customer_id, "migration_staging", file_name))
+                        candidate_blobs.append(build_customer_blob_path(customer_id, "migration_staging", f"{file_name}.enc"))
                         candidate_blobs.append(f"customer_{customer_id}/migration/{file_name}")
                     candidate_blobs.extend([f"migration/{file_name}", file_name])
 
@@ -467,6 +478,24 @@ class MigrationService:
                                 except Exception:
                                     return raw_bytes
                             return raw_bytes
+
+                    # Case-insensitive fallback scan inside customer's migration_staging prefix
+                    if customer_id is not None:
+                        staging_prefix = build_customer_blob_path(customer_id, "migration_staging", "")
+                        target_lower = file_name.lower()
+                        for b_item in bucket.list_blobs(prefix=staging_prefix):
+                            leaf = os.path.basename(b_item.name)
+                            leaf_clean = leaf[:-4] if leaf.lower().endswith(".enc") else leaf
+                            if leaf_clean.lower() == target_lower:
+                                raw_bytes = b_item.download_as_bytes()
+                                if tenant_dek:
+                                    try:
+                                        return b"".join(
+                                            decrypt_stream_generator(io.BytesIO(raw_bytes), tenant_dek, context="migration_staging")
+                                        )
+                                    except Exception:
+                                        return raw_bytes
+                                return raw_bytes
                     return None
 
                 import asyncio
@@ -488,10 +517,13 @@ class MigrationService:
         url: str,
         customer_id: Optional[int],
         db: Optional[Session] = None,
+        delete_cloud_staging: bool = False,
     ) -> None:
         """
-        Permanently removes temporary staged migration copies (local .enc and GCS migration_staging)
+        Removes local /tmp staged migration copies (.enc and raw) to free container RAM
         once the file has been encrypted and moved into its final lg_custody cloud folder.
+        Cloud staging copies in GCS migration_staging are preserved by default so retries or
+        re-imports do not lose uploaded attachments unless delete_cloud_staging=True.
         """
         import os
         import tempfile
@@ -503,19 +535,19 @@ class MigrationService:
             if not file_name or customer_id is None:
                 return
 
-            # 1. Remove local temporary staged files (.enc and raw)
+            # 1. Remove local temporary staged files (.enc and raw) to reclaim container RAM
             base_dir = os.path.join(tempfile.gettempdir(), "migration_attachments", f"customer_{customer_id}")
             for candidate in (os.path.join(base_dir, f"{file_name}.enc"), os.path.join(base_dir, file_name)):
                 if os.path.exists(candidate):
                     try:
                         os.remove(candidate)
-                        logger.info(f"Cleaned up temporary staged migration file for customer {customer_id}")
+                        logger.info(f"Cleaned up temporary local staged migration file for customer {customer_id}")
                     except Exception as rm_err:
                         logger.warning(f"Failed to remove temporary staged file for customer {customer_id}: {rm_err}")
 
-            # 2. Only check GCS if _GCS_CLIENT is already active in this process
+            # 2. Only delete GCS migration_staging blobs if explicitly requested
             import app.core.ai_integration as _ai_mod
-            if getattr(_ai_mod, "_GCS_CLIENT", None) is not None:
+            if delete_cloud_staging and getattr(_ai_mod, "_GCS_CLIENT", None) is not None:
                 bucket_name = os.getenv("GCS_BUCKET_NAME")
                 if not bucket_name and db:
                     try:
@@ -616,6 +648,77 @@ class MigrationService:
             logger.error(f"Error creating document for lg_record_id={lg_record_id}: {e}", exc_info=True)
             return None
 
+    def _format_migration_metadata_for_audit(
+        self,
+        snapshot_data: Optional[Dict[str, Any]] = None,
+        raw_updates: Optional[Dict[str, Any]] = None,
+        is_amendment: bool = True,
+    ) -> Dict[str, Any]:
+        """Extracts legacy log metadata (serial, entry_date, executed_by, delivery, original) for AuditLog details."""
+        src = snapshot_data or {}
+        upd = raw_updates or {}
+
+        def _pick(key: str) -> Any:
+            val = src.get(key)
+            if val is None or val == "":
+                val = upd.get(key)
+            return val
+
+        def _fmt_entry_date(val: Any) -> Optional[str]:
+            if val is None or val == "":
+                return None
+            if isinstance(val, datetime):
+                return val.strftime("%Y-%m-%d")
+            if isinstance(val, date):
+                return val.isoformat()
+            if isinstance(val, (int, float)):
+                try:
+                    if 20000 <= int(val) <= 80000:
+                        return (datetime(1899, 12, 30) + timedelta(days=int(val))).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+                return str(val)
+            raw_s = str(val).strip()
+            if not raw_s:
+                return None
+            try:
+                num_v = float(raw_s)
+                if 20000 <= num_v <= 80000:
+                    return (datetime(1899, 12, 30) + timedelta(days=int(num_v))).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+            return raw_s.split("T")[0]
+
+        serial_val = _pick("serial")
+        serial_str = str(serial_val).strip() if serial_val not in (None, "") else None
+        entry_date_str = _fmt_entry_date(_pick("entry_date"))
+        executed_by = _pick("executed_by")
+        delivery = _fmt_entry_date(_pick("delivery"))
+        original = _fmt_entry_date(_pick("original"))
+
+        reason_parts = []
+        if entry_date_str:
+            reason_parts.append(f"Entry Date: {entry_date_str}")
+        if executed_by not in (None, ""):
+            reason_parts.append(f"Executed by: {str(executed_by).strip()}")
+        if delivery not in (None, ""):
+            reason_parts.append(f"Delivery: {delivery}")
+        if original not in (None, ""):
+            reason_parts.append(f"Original: {original}")
+
+        details: Dict[str, Any] = {}
+        if is_amendment:
+            details["note"] = "Applied historical amendment"
+        if serial_str:
+            details["instruction_serial"] = serial_str
+        if reason_parts:
+            details["reason"] = " | ".join(reason_parts)
+        if entry_date_str:
+            details["entry_date"] = entry_date_str
+        if executed_by not in (None, ""):
+            details["executed_by"] = str(executed_by).strip()
+        return details
+
     async def _apply_migration_amendment(
         self,
         db: Session,
@@ -625,15 +728,16 @@ class MigrationService:
         staged_record_id: int,
         cleanup_staging: bool = True,
         staged_urls_to_cleanup: Optional[List[str]] = None,
+        snapshot_data: Optional[Dict[str, Any]] = None,
     ):
         """
         Applies a single amendment to an existing LG record and logs the change.
         """
         try:
-            from app.crud.crud import crud_lg_record, crud_lg_change_log
+            from app.crud.crud import crud_lg_record, crud_lg_change_log, log_action
             from app.models import LGRecord, LGChangeLog
             from sqlalchemy import func
-            from app.constants import DOCUMENT_TYPE_INTERNAL_SUPPORTING
+            from app.constants import AUDIT_ACTION_TYPE_LG_AMENDED
 
             # --- Flatten the diff dictionary ---
             raw_updates = {}
@@ -642,27 +746,37 @@ class MigrationService:
                     raw_updates[key] = val['new']
                 else:
                     raw_updates[key] = val
-            
+
+            extra_audit_details = self._format_migration_metadata_for_audit(
+                snapshot_data=snapshot_data,
+                raw_updates=raw_updates,
+                is_amendment=True,
+            )
+            serial_for_doc = extra_audit_details.get("instruction_serial") or f"MIG-HIST-{staged_record_id}"
+
             # --- Intercept Attachment URL ---
-            if "attachment_url" in raw_updates:
-                new_url = raw_updates["attachment_url"]
-                
-                if new_url:
-                    clean_url = str(new_url).strip().strip("'").strip('"')
+            doc_id = None
+            attachment_candidate = raw_updates.pop("attachment_url", None)
+            if not attachment_candidate and snapshot_data and snapshot_data.get("attachment_url"):
+                # Also check if snapshot_data has an attachment_url that was in updates
+                if "attachment_url" in updates:
+                    attachment_candidate = snapshot_data.get("attachment_url")
+
+            if attachment_candidate:
+                clean_url = str(attachment_candidate).strip().strip("'").strip('"')
+                if clean_url:
                     doc_id = await self._create_document_from_url(
                         db=db,
                         lg_record_id=lg_record_id,
                         url=clean_url,
-                        document_type=DOCUMENT_TYPE_INTERNAL_SUPPORTING,
+                        document_type="AMENDMENT_LETTER",
                         uploaded_by_user_id=user_id,
-                        original_instruction_serial=f"MIG-HIST-{staged_record_id}",
+                        original_instruction_serial=serial_for_doc,
                         cleanup_staging=cleanup_staging,
                     )
                     if doc_id and not cleanup_staging and staged_urls_to_cleanup is not None:
                         staged_urls_to_cleanup.append(clean_url)
-                    logger.info(f"Created amendment document from {clean_url}")
-
-                del raw_updates["attachment_url"]
+                    logger.info(f"Created amendment document (doc_id={doc_id}) from {clean_url}")
 
             lg_obj = db.query(LGRecord).filter(LGRecord.id == lg_record_id).first()
             if not lg_obj:
@@ -702,7 +816,27 @@ class MigrationService:
                     user_id=user_id,
                     customer_id=lg_obj.customer_id,
                     approval_request_id=None,
+                    existing_document_id=doc_id,
                     is_migration=True,
+                    extra_audit_details=extra_audit_details,
+                )
+            elif doc_id or extra_audit_details.get("instruction_serial") or extra_audit_details.get("reason"):
+                # Even if no LGRecord column changed on this step, log the historical step/attachment in AuditLog
+                log_action(
+                    db,
+                    user_id,
+                    AUDIT_ACTION_TYPE_LG_AMENDED,
+                    "LGRecord",
+                    lg_obj.id,
+                    {
+                        "lg_number": lg_obj.lg_number,
+                        "amended_fields": {},
+                        "amendment_document_id": doc_id,
+                        "approved_by_user_id": user_id,
+                        **extra_audit_details,
+                    },
+                    lg_obj.customer_id,
+                    lg_obj.id,
                 )
 
             # Calculate Next Change Index

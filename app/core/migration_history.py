@@ -1,7 +1,7 @@
 # app/core/migration_history.py
 
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Type
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -25,29 +25,71 @@ class MigrationHistoryService:
     def __init__(self):
         pass
 
-    def _get_snapshot_sort_key(self, snapshot: LGMigrationStaging) -> Tuple:
-        """Determines the sorting key for a snapshot based on defined rules."""
-        sort_key_components = []
-        source_data = snapshot.source_data_json
-        
-        # 1. history_sequence (if present)
-        sort_key_components.append(snapshot.history_sequence if snapshot.history_sequence is not None else float('inf'))
-        
-        # 2. history_timestamp (if present)
-        sort_key_components.append(snapshot.history_timestamp if snapshot.history_timestamp is not None else datetime.min)
-        
-        # 3. issuance_date (if present in source_data)
-        issuance_date = source_data.get('issuance_date')
-        if isinstance(issuance_date, str):
+    def _parse_sort_datetime(self, val: Any) -> datetime:
+        """Parses date/datetime strings or Excel serial date numbers into datetime for deterministic sorting."""
+        if val is None or val == "":
+            return datetime.min
+        if isinstance(val, datetime):
+            return val
+        if isinstance(val, date):
+            return datetime.combine(val, datetime.min.time())
+        if isinstance(val, (int, float)):
             try:
-                sort_key_components.append(datetime.strptime(issuance_date, "%Y-%m-%d"))
+                if 20000 <= int(val) <= 80000:
+                    return datetime(1899, 12, 30) + timedelta(days=int(val))
+            except Exception:
+                pass
+            return datetime.min
+        if isinstance(val, str):
+            raw = val.strip()
+            if not raw:
+                return datetime.min
+            # Check if string is an Excel serial integer
+            try:
+                num_val = float(raw)
+                if 20000 <= num_val <= 80000:
+                    return datetime(1899, 12, 30) + timedelta(days=int(num_val))
             except (ValueError, TypeError):
-                sort_key_components.append(datetime.min)
-        else:
-            sort_key_components.append(datetime.min)
+                pass
+            date_part = raw.split("T")[0].split(" ")[0]
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+                try:
+                    return datetime.strptime(date_part, fmt)
+                except (ValueError, TypeError):
+                    continue
+        return datetime.min
 
-        # 4. created_at (as a last resort)
-        sort_key_components.append(snapshot.created_at)
+    def _get_snapshot_sort_key(self, snapshot: LGMigrationStaging) -> Tuple:
+        """Determines the chronological sorting key for a snapshot based on defined rules."""
+        sort_key_components = []
+        source_data = snapshot.source_data_json or {}
+
+        # 1. history_sequence (if present on row or in source_data)
+        seq = snapshot.history_sequence if snapshot.history_sequence is not None else source_data.get('history_sequence')
+        try:
+            sort_key_components.append(int(seq) if seq is not None else float('inf'))
+        except (ValueError, TypeError):
+            sort_key_components.append(float('inf'))
+
+        # 2. history_timestamp (if present on row or in source_data)
+        ts = snapshot.history_timestamp if snapshot.history_timestamp is not None else source_data.get('history_timestamp')
+        sort_key_components.append(self._parse_sort_datetime(ts))
+
+        # 3. issuance_date (if present in source_data)
+        sort_key_components.append(self._parse_sort_datetime(source_data.get('issuance_date')))
+
+        # 4. expiry_date (strictly orders historical extensions/renewals chronologically)
+        sort_key_components.append(self._parse_sort_datetime(source_data.get('expiry_date')))
+
+        # 5. entry_date (legacy log entry date if present)
+        sort_key_components.append(self._parse_sort_datetime(source_data.get('entry_date')))
+
+        # 6. serial (legacy instruction/record serial e.g. 00101A .. 00122A)
+        sort_key_components.append(str(source_data.get('serial') or '').strip())
+
+        # 7. created_at & staging id (preserves exact upload row order as tie-breaker)
+        sort_key_components.append(snapshot.created_at or datetime.min)
+        sort_key_components.append(snapshot.id if snapshot.id is not None else 0)
 
         return tuple(sort_key_components)
 
@@ -83,7 +125,7 @@ class MigrationHistoryService:
                 MigrationRecordStatusEnum.DUPLICATE,
             ]))
 
-        all_snapshots = query.all()
+        all_snapshots = query.order_by(LGMigrationStaging.id.asc()).all()
         
         if not all_snapshots:
             return []
@@ -111,7 +153,7 @@ class MigrationHistoryService:
                 if i > 0:
                     prev_snapshot = sorted_snapshots[i-1]
                     prev_snapshot_data = prev_snapshot.source_data_json
-                    if self._get_snapshot_sort_key(snapshot) == self._get_snapshot_sort_key(prev_snapshot):
+                    if self._get_snapshot_sort_key(snapshot)[:-1] == self._get_snapshot_sort_key(prev_snapshot)[:-1]:
                         for key, new_val in snapshot_data.items():
                             old_val = prev_snapshot_data.get(key)
                             if old_val != new_val:
@@ -158,7 +200,7 @@ class MigrationHistoryService:
         
         query = query.filter(LGMigrationStaging.record_status.in_([MigrationRecordStatusEnum.READY_FOR_IMPORT, MigrationRecordStatusEnum.PENDING, MigrationRecordStatusEnum.ERROR]))
         
-        all_snapshots = query.all()
+        all_snapshots = query.order_by(LGMigrationStaging.id.asc()).all()
         if not all_snapshots:
             return {"message": "No eligible records found for historical import.", "imported_count": 0, "failed_count": 0}
 
@@ -199,7 +241,7 @@ class MigrationHistoryService:
                     # Check for conflicts
                     conflict_found = False
                     for i in range(1, len(sorted_snapshots)):
-                        if self._get_snapshot_sort_key(sorted_snapshots[i]) == self._get_snapshot_sort_key(sorted_snapshots[i-1]):
+                        if self._get_snapshot_sort_key(sorted_snapshots[i])[:-1] == self._get_snapshot_sort_key(sorted_snapshots[i-1])[:-1]:
                             conflict_diff = self._get_diff(sorted_snapshots[i-1].source_data_json, sorted_snapshots[i].source_data_json)
                             if conflict_diff:
                                 conflict_found = True

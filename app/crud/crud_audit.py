@@ -127,7 +127,7 @@ class CRUDAuditLog(CRUDBase):
         return query.options(
             selectinload(AuditLog.user),
             selectinload(AuditLog.lg_record)
-        ).order_by(desc(self.model.timestamp)).all()
+        ).order_by(desc(self.model.timestamp), desc(self.model.id)).all()
 
 
 def enrich_audit_log(db: Session, log: AuditLog) -> "AuditLogOut":

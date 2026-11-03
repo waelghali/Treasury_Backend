@@ -1180,7 +1180,7 @@ async def import_historical_records(
         MigrationRecordStatusEnum.ERROR,
         MigrationRecordStatusEnum.EXPIRED,
         MigrationRecordStatusEnum.DUPLICATE,
-    ])).all()
+    ])).order_by(models.LGMigrationStaging.id.asc()).all()
     
     if not all_snapshots:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No eligible records found for historical import.")
@@ -1275,6 +1275,10 @@ async def import_historical_records(
                 lg_record_create_payload = LGRecordCreate(**first_snapshot_data)
                 
                 # 3. Create Record (Pass owner_id explicitly!)
+                initial_audit_meta = migration_service._format_migration_metadata_for_audit(
+                    snapshot_data=first_snapshot.source_data_json,
+                    is_amendment=False,
+                )
                 new_lg = await crud_lg_record.create_from_migration(
                     db=db,
                     obj_in=lg_record_create_payload,
@@ -1282,7 +1286,8 @@ async def import_historical_records(
                     user_id=current_user.user_id,
                     migration_source='LEGACY',
                     migrated_from_staging_id=first_snapshot.id,
-                    internal_owner_contact_id=owner_id # <--- THIS IS THE KEY
+                    internal_owner_contact_id=owner_id,
+                    extra_audit_details=initial_audit_meta,
                 )
                 
                 # --- FIX: INSERT FILE UPLOAD LOGIC HERE ---
@@ -1302,12 +1307,14 @@ async def import_historical_records(
                             from app.constants import DOCUMENT_TYPE_ORIGINAL_LG
                             
                             # Defer staging file cleanup until the entire LG group commits
+                            init_serial = str(first_data.get("serial") or "").strip() or None
                             doc_id = await migration_service._create_document_from_url(
                                 db=db,
                                 lg_record_id=new_lg.id,
                                 url=clean_url,
                                 document_type=DOCUMENT_TYPE_ORIGINAL_LG,
                                 uploaded_by_user_id=current_user.user_id,
+                                original_instruction_serial=init_serial,
                                 cleanup_staging=False,
                             )
                             if doc_id:
@@ -1333,32 +1340,39 @@ async def import_historical_records(
                                 current_snapshot.id,
                                 cleanup_staging=False,
                                 staged_urls_to_cleanup=staged_urls_to_cleanup,
+                                snapshot_data=current_snapshot_data,
                             )
 
                 # Reload the record from DB to get the latest expiry_date
 
-                # --- FIX: Force Status, Date, AND AMOUNT Refresh ---
+                # --- FIX: Force Status, Date, AND AMOUNT Refresh from sorted_snapshots[-1] ---
                 db.refresh(new_lg)
                 
-                # 1. Date Logic (Existing)
+                if sorted_snapshots:
+                    last_snapshot = sorted_snapshots[-1]
+                    last_data = last_snapshot.source_data_json or {}
+                    
+                    # 1. Sync final expiry_date from the latest chronological snapshot
+                    final_expiry_raw = last_data.get("expiry_date")
+                    if final_expiry_raw:
+                        parsed_final_exp = migration_history_service._parse_sort_datetime(final_expiry_raw)
+                        if parsed_final_exp != datetime.min:
+                            new_lg.expiry_date = parsed_final_exp
+
+                    # 2. Sync final lg_amount from the latest chronological snapshot
+                    final_amount = last_data.get("lg_amount")
+                    if final_amount is not None:
+                        new_lg.lg_amount = final_amount
+                        logger.info(f"Refreshed amount for LG id={new_lg.id} to {final_amount}")
+
                 expiry_check = new_lg.expiry_date
                 if isinstance(expiry_check, datetime):
                     expiry_check = expiry_check.date()
                     
                 if expiry_check and expiry_check >= date.today():
-                    new_lg.lg_status_id = 1 
-                    
-                # 2. NEW: Amount Logic
-                # We look at the LAST snapshot to see the final intended amount
-                if snapshots:
-                    last_snapshot = snapshots[-1]
-                    last_data = last_snapshot.source_data_json
-                    final_amount = last_data.get("lg_amount")
-                    
-                    # If the last snapshot has an amount, force the master record to match it
-                    if final_amount is not None:
-                        new_lg.lg_amount = final_amount
-                        logger.info(f"Refreshed amount for LG id={new_lg.id} to {final_amount}")
+                    new_lg.lg_status_id = models.LgStatusEnum.VALID.value
+                elif expiry_check:
+                    new_lg.lg_status_id = models.LgStatusEnum.EXPIRED.value
 
                 db.add(new_lg)
                 db.flush()
@@ -1810,11 +1824,39 @@ async def upload_migration_attachments(
 
             # Write encrypted STREAM V2 AEAD file to local ephemeral staging (.enc)
             enc_dest_path = os.path.join(base_dir, f"{safe_name}.enc")
+            encrypted_buffer = bytearray()
             with open(enc_dest_path, "wb") as f_out:
                 for enc_chunk in encrypt_stream_generator(io.BytesIO(content), tenant_dek, context="migration_staging"):
                     f_out.write(enc_chunk)
+                    encrypted_buffer.extend(enc_chunk)
 
             del content
+
+            # Also persist encrypted staging blob to GCS so container restarts/redeploys or retries never lose staged PDFs
+            try:
+                from app.core.storage_service import build_customer_blob_path
+                from app.core.ai_integration import _get_gcs_client, GCS_BUCKET_NAME
+                from app.crud.crud import crud_customer_configuration
+                from app.constants import GlobalConfigKey
+
+                bucket_name = os.getenv("GCS_BUCKET_NAME") or GCS_BUCKET_NAME
+                if not bucket_name:
+                    cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                        db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+                    )
+                    if cfg and cfg.get("effective_value"):
+                        bucket_name = cfg["effective_value"]
+                if bucket_name:
+                    gcs_client = _get_gcs_client()
+                    if gcs_client:
+                        blob_path = build_customer_blob_path(customer_id, "migration_staging", safe_name)
+                        bucket = gcs_client.bucket(bucket_name)
+                        blob = bucket.blob(blob_path)
+                        blob.upload_from_string(bytes(encrypted_buffer), content_type="application/octet-stream")
+            except Exception as gcs_stage_err:
+                logger.warning(f"Non-fatal: could not mirror staged attachment to GCS for customer {customer_id}: {gcs_stage_err}")
+            finally:
+                del encrypted_buffer
 
             # Remove any legacy plaintext file if it existed
             raw_legacy_path = os.path.join(base_dir, safe_name)
@@ -1866,6 +1908,34 @@ def list_uploaded_migration_attachments(
             if os.path.isfile(full_p):
                 clean_name = fname[:-4] if fname.endswith(".enc") else fname
                 staged_names.add(clean_name)
+
+    # Fallback: if local /tmp directory is empty (e.g. after container restart), check GCS migration_staging
+    if not staged_names:
+        try:
+            from app.core.storage_service import build_customer_blob_path
+            from app.core.ai_integration import _get_gcs_client, GCS_BUCKET_NAME
+            from app.crud.crud import crud_customer_configuration
+            from app.constants import GlobalConfigKey
+
+            bucket_name = os.getenv("GCS_BUCKET_NAME") or GCS_BUCKET_NAME
+            if not bucket_name:
+                cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                    db, customer_id, GlobalConfigKey.STORAGE_BUCKET_NAME
+                )
+                if cfg and cfg.get("effective_value"):
+                    bucket_name = cfg["effective_value"]
+            if bucket_name:
+                gcs_client = _get_gcs_client()
+                if gcs_client:
+                    staging_prefix = build_customer_blob_path(customer_id, "migration_staging", "")
+                    bucket = gcs_client.bucket(bucket_name)
+                    for b_item in bucket.list_blobs(prefix=staging_prefix):
+                        leaf = os.path.basename(b_item.name)
+                        if leaf and not leaf.startswith("."):
+                            clean_leaf = leaf[:-4] if leaf.endswith(".enc") else leaf
+                            staged_names.add(clean_leaf)
+        except Exception:
+            pass
 
     files = sorted(staged_names)
     return {"uploaded_files": files, "files": files}
