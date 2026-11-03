@@ -1933,6 +1933,9 @@ class IssuanceMaintenanceService:
             "lg_amount_formatted": f"{lg_with_rels.currency.symbol if lg_with_rels.currency and hasattr(lg_with_rels.currency, 'symbol') else currency_code} {current_amount:,.2f}",
             "lg_type": lg_with_rels.lg_type.name if lg_with_rels.lg_type else "N/A",
             "issue_date": str(lg_with_rels.issue_date) if lg_with_rels.issue_date else "N/A",
+            "issuance_date": str(lg_with_rels.issue_date) if lg_with_rels.issue_date else "N/A",
+            "maturity_date": str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A",
+            "instruction_serial": action.letter_serial_number or "",
             "expiry_date": str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A",
             "bank_name": lg_with_rels.bank.name if lg_with_rels.bank else "N/A",
             "issuing_bank_name": lg_with_rels.bank.name if lg_with_rels.bank else "N/A",
@@ -2039,13 +2042,14 @@ class IssuanceMaintenanceService:
             "CLOSE": "LG_CLOSE_REQUEST",
             "AMENDMENT": "LG_AMENDMENT_REQUEST",
             "ACTIVATE": "LG_ACTIVATE_REQUEST",
+            "CANCEL_LIQUIDATION": "LG_CANCEL_LIQUIDATION_REQUEST",
         }
 
         specific_action_type = TEMPLATE_MAP.get(action.action_type, f"LG_{action.action_type}_REQUEST")
 
         # Template resolution: action-specific customer → action-specific global → generic customer → generic global
         template = None
-        for action_type_key in [specific_action_type, "LG_MAINTENANCE_REQUEST"]:
+        for action_type_key in [specific_action_type, "LG_CANCEL_LIQUIDATION", "LG_MAINTENANCE_REQUEST"]:
             template = crud_template.get_single_template(
                 db,
                 action_type=action_type_key,
@@ -2114,6 +2118,9 @@ class IssuanceMaintenanceService:
             "currency_name": currency_name,
             "lg_type": lg_with_rels.lg_type.name if lg_with_rels.lg_type else "N/A",
             "issue_date": str(lg_with_rels.issue_date) if lg_with_rels.issue_date else "N/A",
+            "issuance_date": str(lg_with_rels.issue_date) if lg_with_rels.issue_date else "N/A",
+            "maturity_date": str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A",
+            "instruction_serial": action.letter_serial_number or "",
             "expiry_date": str(lg_with_rels.expiry_date) if lg_with_rels.expiry_date else "N/A",
 
             # Bank

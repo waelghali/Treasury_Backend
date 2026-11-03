@@ -34,6 +34,12 @@ class DeskState:
         self.last_quote_by: Optional[str] = None
         self.last_quote_at: Optional[datetime] = None
 
+        # Additive Zero-Knowledge interaction & presence proof (strictly booleans, counts, timestamps, latency)
+        self.first_seen_at: Optional[datetime] = None
+        self.last_seen_at: Optional[datetime] = None
+        self.total_heartbeats: int = 0
+        self.dealer_telemetry: Dict[str, Dict[str, Any]] = {}
+
     def clean_inactive_spectators(self, now: datetime):
         """Purges spectators that haven't sent a heartbeat within the timeout window or belong to the active dealer."""
         cutoff = now - timedelta(seconds=HEARTBEAT_TIMEOUT_SECONDS)
@@ -173,10 +179,211 @@ class DeskSessionService:
         email: str,
         name: Optional[str] = None,
         role: str = "EXECUTION",
-        session_token: Optional[str] = None
+        session_token: Optional[str] = None,
+        telemetry: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Refreshes heartbeat for dealer and returns latest desk state."""
-        return self.get_or_claim_desk(assignment_id, email, name, role, session_token=session_token)
+        """Refreshes heartbeat for dealer, records Zero-Knowledge interaction proof, and returns latest desk state."""
+        status_out = self.get_or_claim_desk(assignment_id, email, name, role, session_token=session_token)
+        new_milestones = self._record_dealer_telemetry(
+            assignment_id=assignment_id,
+            email=email,
+            name=name,
+            role=role,
+            telemetry=telemetry
+        )
+        if isinstance(status_out, dict) and new_milestones:
+            status_out["new_telemetry_milestones"] = new_milestones
+        return status_out
+
+    def _record_dealer_telemetry(
+        self,
+        assignment_id: str,
+        email: str,
+        name: Optional[str] = None,
+        role: str = "EXECUTION",
+        telemetry: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Records Zero-Knowledge boolean/counter interaction milestones per dealer and desk.
+        Never stores or accepts prices, rates, or comment text.
+        Returns newly triggered milestone events (debounced once per dealer per assignment) for AuditLog persistence.
+        """
+        if not email:
+            return []
+        with self._lock:
+            desk = self._get_or_create(str(assignment_id))
+            now = datetime.now(timezone.utc)
+            clean_email = email.strip().lower()
+            display_name = name or clean_email.split("@")[0]
+            clean_role = (role or "EXECUTION").strip().upper()
+
+            if not desk.first_seen_at:
+                desk.first_seen_at = now
+            desk.last_seen_at = now
+            desk.total_heartbeats += 1
+
+            rec = desk.dealer_telemetry.get(clean_email)
+            if not rec:
+                rec = {
+                    "email": clean_email,
+                    "name": display_name,
+                    "role": clean_role,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "heartbeat_count": 0,
+                    "latest_latency_ms": None,
+                    "min_latency_ms": None,
+                    "max_latency_ms": None,
+                    "avg_latency_ms": None,
+                    "latency_samples": 0,
+                    "currently_has_unsubmitted_input": False,
+                    "ever_typed_unsubmitted_input": False,
+                    "first_typed_input_at": None,
+                    "last_typed_input_at": None,
+                    "currently_has_unsubmitted_pass": False,
+                    "ever_toggled_unsubmitted_pass": False,
+                    "first_unsubmitted_pass_at": None,
+                    "currently_has_unsubmitted_update": False,
+                    "ever_typed_unsubmitted_update": False,
+                    "first_unsubmitted_update_at": None,
+                    "clicked_locked_comment_count": 0,
+                    "first_clicked_locked_comment_at": None,
+                    "disabled_submit_clicks": 0,
+                    "first_disabled_submit_at": None,
+                    "spectator_locked_clicks": 0,
+                    "first_spectator_locked_click_at": None,
+                    "ever_fat_finger_prompted": False,
+                    "first_fat_finger_at": None,
+                    "logged_milestones": set()
+                }
+                desk.dealer_telemetry[clean_email] = rec
+
+            rec["last_seen_at"] = now
+            rec["heartbeat_count"] += 1
+            if display_name:
+                rec["name"] = display_name
+            if clean_role:
+                rec["role"] = clean_role
+
+            new_milestones: List[Dict[str, Any]] = []
+            if not telemetry or not isinstance(telemetry, dict):
+                return new_milestones
+
+            # 1. Network Round-Trip Latency Proof
+            lat = telemetry.get("client_latency_ms")
+            if isinstance(lat, (int, float)) and 0 < lat < 60000:
+                lat_int = int(lat)
+                rec["latest_latency_ms"] = lat_int
+                rec["min_latency_ms"] = lat_int if rec["min_latency_ms"] is None else min(rec["min_latency_ms"], lat_int)
+                rec["max_latency_ms"] = lat_int if rec["max_latency_ms"] is None else max(rec["max_latency_ms"], lat_int)
+                prev_n = rec["latency_samples"]
+                prev_avg = rec["avg_latency_ms"] or 0.0
+                rec["latency_samples"] = prev_n + 1
+                rec["avg_latency_ms"] = int(round(((prev_avg * prev_n) + lat_int) / (prev_n + 1)))
+
+            # 2. Unsubmitted Rate Draft Typed
+            has_unsub_input = bool(telemetry.get("has_unsubmitted_input"))
+            rec["currently_has_unsubmitted_input"] = has_unsub_input
+            if has_unsub_input:
+                rec["ever_typed_unsubmitted_input"] = True
+                rec["last_typed_input_at"] = now
+                if not rec["first_typed_input_at"]:
+                    rec["first_typed_input_at"] = now
+                if "TYPED_DRAFT_RATE" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("TYPED_DRAFT_RATE")
+                    new_milestones.append({
+                        "milestone": "TYPED_DRAFT_RATE",
+                        "description": "Dealer entered a draft rate in the input field (not yet submitted).",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            # 3. Unsubmitted Pass Leg Toggled
+            has_unsub_pass = bool(telemetry.get("has_unsubmitted_pass"))
+            rec["currently_has_unsubmitted_pass"] = has_unsub_pass
+            if has_unsub_pass:
+                rec["ever_toggled_unsubmitted_pass"] = True
+                if not rec["first_unsubmitted_pass_at"]:
+                    rec["first_unsubmitted_pass_at"] = now
+                if "TOGGLED_DRAFT_PASS" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("TOGGLED_DRAFT_PASS")
+                    new_milestones.append({
+                        "milestone": "TOGGLED_DRAFT_PASS",
+                        "description": "Dealer toggled 'Pass Leg' locally (not yet submitted).",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            # 4. Unsaved Edit to Already-Submitted Quote
+            has_unsub_update = bool(telemetry.get("has_unsubmitted_update"))
+            rec["currently_has_unsubmitted_update"] = has_unsub_update
+            if has_unsub_update:
+                rec["ever_typed_unsubmitted_update"] = True
+                if not rec["first_unsubmitted_update_at"]:
+                    rec["first_unsubmitted_update_at"] = now
+                if "TYPED_UNSAVED_QUOTE_UPDATE" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("TYPED_UNSAVED_QUOTE_UPDATE")
+                    new_milestones.append({
+                        "milestone": "TYPED_UNSAVED_QUOTE_UPDATE",
+                        "description": "Dealer modified their already-submitted rate in the input box without clicking Update Quote.",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            # 5. Clicked Locked Comment Box Before Entering Rate / Pass
+            locked_comment_clicks = int(telemetry.get("clicked_locked_comment_count") or 0)
+            if locked_comment_clicks > 0:
+                rec["clicked_locked_comment_count"] = max(rec["clicked_locked_comment_count"], locked_comment_clicks)
+                if not rec["first_clicked_locked_comment_at"]:
+                    rec["first_clicked_locked_comment_at"] = now
+                if "CLICKED_LOCKED_COMMENT_BOX" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("CLICKED_LOCKED_COMMENT_BOX")
+                    new_milestones.append({
+                        "milestone": "CLICKED_LOCKED_COMMENT_BOX",
+                        "description": "Dealer clicked the locked Comment field before entering a rate or passing leg (auto-focused to Rate input).",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            # 6. Clicked Disabled Submit Button While Required Rate/Pass/Amount Missing
+            disabled_clicks = int(telemetry.get("disabled_submit_clicks") or 0)
+            if disabled_clicks > 0:
+                rec["disabled_submit_clicks"] = max(rec["disabled_submit_clicks"], disabled_clicks)
+                if not rec["first_disabled_submit_at"]:
+                    rec["first_disabled_submit_at"] = now
+                if "CLICKED_DISABLED_SUBMIT" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("CLICKED_DISABLED_SUBMIT")
+                    new_milestones.append({
+                        "milestone": "CLICKED_DISABLED_SUBMIT",
+                        "description": "Dealer clicked the Submit button while required rate/pass/amount fields were still incomplete.",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            # 7. Clicked Locked Input While in Spectator / Multi-Tab Lock Mode
+            spec_clicks = int(telemetry.get("spectator_locked_clicks") or 0)
+            if spec_clicks > 0:
+                rec["spectator_locked_clicks"] = max(rec["spectator_locked_clicks"], spec_clicks)
+                if not rec["first_spectator_locked_click_at"]:
+                    rec["first_spectator_locked_click_at"] = now
+                if "CLICKED_SPECTATOR_LOCKED_INPUT" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("CLICKED_SPECTATOR_LOCKED_INPUT")
+                    new_milestones.append({
+                        "milestone": "CLICKED_SPECTATOR_LOCKED_INPUT",
+                        "description": "Dealer clicked a locked input while in Spectator / Multi-Tab mode without clicking 'Take Over Desk'.",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            # 8. Fat-Finger Anomaly Modal Prompted
+            ff_prompted = bool(telemetry.get("fat_finger_prompted"))
+            if ff_prompted:
+                rec["ever_fat_finger_prompted"] = True
+                if not rec["first_fat_finger_at"]:
+                    rec["first_fat_finger_at"] = now
+                if "FAT_FINGER_MODAL_SHOWN" not in rec["logged_milestones"]:
+                    rec["logged_milestones"].add("FAT_FINGER_MODAL_SHOWN")
+                    new_milestones.append({
+                        "milestone": "FAT_FINGER_MODAL_SHOWN",
+                        "description": "Dealer triggered the Fat-Finger rate sanity confirmation dialog upon clicking Submit.",
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    })
+
+            return new_milestones
 
     def takeover_desk(
         self,
@@ -304,8 +511,15 @@ class DeskSessionService:
             desk.last_quote_legs = legs_quotes
             if passed_legs is not None:
                 desk.last_passed_legs = [str(p) for p in passed_legs]
-            desk.last_quote_by = email.strip().lower()
+            clean_email = email.strip().lower()
+            desk.last_quote_by = clean_email
             desk.last_quote_at = datetime.now(timezone.utc)
+            # Clear transient unsubmitted flags for this dealer upon confirmed submission
+            rec = desk.dealer_telemetry.get(clean_email)
+            if rec:
+                rec["currently_has_unsubmitted_input"] = False
+                rec["currently_has_unsubmitted_pass"] = False
+                rec["currently_has_unsubmitted_update"] = False
 
     def _build_status(
         self,
@@ -391,7 +605,7 @@ class DeskSessionService:
         do not suppress absence alerts.
         """
         with self._lock:
-            desk = self._desks.get(str(assignment_id))
+            desk = self._desks.get(str(assignment_id)) or self._desks.get(assignment_id)
             if not desk:
                 return False
             now = datetime.now(timezone.utc)
@@ -403,6 +617,80 @@ class DeskSessionService:
                 (spec.get("role") or "EXECUTION").upper() == "EXECUTION"
                 for spec in desk.spectators.values()
             )
+
+    def get_desk_proof_summary(self, assignment_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns a Zero-Knowledge interaction & connectivity proof summary for an assignment desk.
+        Strictly contains presence counts, latency metrics, and boolean UI milestone flags (no rate values).
+        """
+        with self._lock:
+            desk = self._desks.get(str(assignment_id)) or self._desks.get(assignment_id)
+            if not desk or desk.total_heartbeats == 0:
+                return None
+
+            dealers_list = []
+            any_unsubmitted_input = False
+            any_unsubmitted_pass = False
+            any_unsubmitted_update = False
+            total_locked_comment_clicks = 0
+            total_disabled_submit_clicks = 0
+            total_spectator_locked_clicks = 0
+            any_fat_finger_prompted = False
+            latencies = []
+
+            for email_key, rec in desk.dealer_telemetry.items():
+                if rec.get("avg_latency_ms") is not None:
+                    latencies.append(rec["avg_latency_ms"])
+                if rec.get("ever_typed_unsubmitted_input"):
+                    any_unsubmitted_input = True
+                if rec.get("ever_toggled_unsubmitted_pass"):
+                    any_unsubmitted_pass = True
+                if rec.get("ever_typed_unsubmitted_update"):
+                    any_unsubmitted_update = True
+                total_locked_comment_clicks += int(rec.get("clicked_locked_comment_count") or 0)
+                total_disabled_submit_clicks += int(rec.get("disabled_submit_clicks") or 0)
+                total_spectator_locked_clicks += int(rec.get("spectator_locked_clicks") or 0)
+                if rec.get("ever_fat_finger_prompted"):
+                    any_fat_finger_prompted = True
+
+                dealers_list.append({
+                    "email": rec.get("email"),
+                    "name": rec.get("name"),
+                    "role": rec.get("role"),
+                    "heartbeat_count": rec.get("heartbeat_count", 0),
+                    "first_seen_at": rec["first_seen_at"].isoformat() if rec.get("first_seen_at") else None,
+                    "last_seen_at": rec["last_seen_at"].isoformat() if rec.get("last_seen_at") else None,
+                    "avg_latency_ms": rec.get("avg_latency_ms"),
+                    "ever_typed_unsubmitted_input": bool(rec.get("ever_typed_unsubmitted_input")),
+                    "currently_has_unsubmitted_input": bool(rec.get("currently_has_unsubmitted_input")),
+                    "first_typed_input_at": rec["first_typed_input_at"].isoformat() if rec.get("first_typed_input_at") else None,
+                    "ever_toggled_unsubmitted_pass": bool(rec.get("ever_toggled_unsubmitted_pass")),
+                    "currently_has_unsubmitted_pass": bool(rec.get("currently_has_unsubmitted_pass")),
+                    "ever_typed_unsubmitted_update": bool(rec.get("ever_typed_unsubmitted_update")),
+                    "currently_has_unsubmitted_update": bool(rec.get("currently_has_unsubmitted_update")),
+                    "clicked_locked_comment_count": int(rec.get("clicked_locked_comment_count") or 0),
+                    "disabled_submit_clicks": int(rec.get("disabled_submit_clicks") or 0),
+                    "spectator_locked_clicks": int(rec.get("spectator_locked_clicks") or 0),
+                    "ever_fat_finger_prompted": bool(rec.get("ever_fat_finger_prompted"))
+                })
+
+            avg_desk_latency = int(round(sum(latencies) / len(latencies))) if latencies else None
+
+            return {
+                "connected": True,
+                "total_heartbeats": desk.total_heartbeats,
+                "first_seen_at": desk.first_seen_at.isoformat() if desk.first_seen_at else None,
+                "last_seen_at": desk.last_seen_at.isoformat() if desk.last_seen_at else None,
+                "avg_latency_ms": avg_desk_latency,
+                "ever_typed_unsubmitted_input": any_unsubmitted_input,
+                "ever_toggled_unsubmitted_pass": any_unsubmitted_pass,
+                "ever_typed_unsubmitted_update": any_unsubmitted_update,
+                "clicked_locked_comment_count": total_locked_comment_clicks,
+                "disabled_submit_clicks": total_disabled_submit_clicks,
+                "spectator_locked_clicks": total_spectator_locked_clicks,
+                "ever_fat_finger_prompted": any_fat_finger_prompted,
+                "dealers": dealers_list
+            }
 
 
 desk_session_service = DeskSessionService()

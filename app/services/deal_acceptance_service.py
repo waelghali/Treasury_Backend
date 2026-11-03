@@ -412,6 +412,115 @@ def _sanitize_offers_ladder(results_list, winner_id=None, is_sell=False):
     return offers
 
 
+def _compute_quotation_sidebar_status(
+    user_id: int,
+    customer_id: int,
+    user_role: str,
+    db: Session,
+    now_utc: datetime
+) -> dict:
+    """
+    Computes lightweight counts of Live and Pending-Approval RFQ quotations
+    for the Corporate Admin and End User sidebar indicators.
+    """
+    try:
+        is_admin = user_role in ["corporate_admin", "super_admin", "checker"]
+        active_statuses = [
+            'PENDING_APPROVAL',
+            'CANCEL_REQUESTED',
+            'NEEDS_REVISION',
+            'APPROVED_SCHEDULED',
+            'PENDING',
+            'OPEN',
+            'EVALUATING'
+        ]
+        q = db.query(QuotationRequest).filter(
+            QuotationRequest.customer_id == customer_id,
+            QuotationRequest.status.in_(active_statuses)
+        )
+
+        if not is_admin:
+            user = db.query(User).filter(User.id == user_id).first()
+            has_all = getattr(user, "has_all_entity_access", False) if user else False
+            if not has_all:
+                from sqlalchemy import or_
+                entity_ids = [assoc.customer_entity_id for assoc in getattr(user, "entity_associations", [])] if user else []
+                if entity_ids:
+                    q = q.filter(
+                        or_(
+                            QuotationRequest.entity_id.in_(entity_ids),
+                            QuotationRequest.entity_id.is_(None),
+                            QuotationRequest.created_by_user_id == user_id,
+                            QuotationRequest.delegated_to_user_id == user_id
+                        )
+                    )
+                else:
+                    q = q.filter(
+                        or_(
+                            QuotationRequest.entity_id.is_(None),
+                            QuotationRequest.created_by_user_id == user_id,
+                            QuotationRequest.delegated_to_user_id == user_id
+                        )
+                    )
+
+        rows = q.all()
+        live_count = 0
+        pending_approval_count = 0
+        needs_revision_count = 0
+        scheduled_count = 0
+        earliest_start = None
+        earliest_end = None
+
+        for r in rows:
+            st = r.status or ''
+            w_start = r.window_start.replace(tzinfo=timezone.utc) if (r.window_start and r.window_start.tzinfo is None) else r.window_start
+            w_end = r.window_end.replace(tzinfo=timezone.utc) if (r.window_end and r.window_end.tzinfo is None) else r.window_end
+            acc_dl = r.acceptance_deadline.replace(tzinfo=timezone.utc) if (r.acceptance_deadline and r.acceptance_deadline.tzinfo is None) else r.acceptance_deadline
+
+            if st in ('PENDING_APPROVAL', 'CANCEL_REQUESTED'):
+                pending_approval_count += 1
+            elif st == 'NEEDS_REVISION':
+                needs_revision_count += 1
+            elif st == 'APPROVED_SCHEDULED':
+                if not w_end or w_end > now_utc:
+                    scheduled_count += 1
+                    if w_start and w_start > now_utc:
+                        if earliest_start is None or w_start < earliest_start:
+                            earliest_start = w_start
+            elif st in ('PENDING', 'OPEN', 'EVALUATING'):
+                is_bidding_live = bool(w_start and w_end and w_start <= now_utc <= w_end)
+                is_acceptance_live = bool(r.acceptance_status == 'PENDING' and acc_dl and now_utc < acc_dl)
+                if is_bidding_live or is_acceptance_live:
+                    live_count += 1
+                    target_end = acc_dl if (is_acceptance_live and not is_bidding_live) else w_end
+                    if target_end and target_end > now_utc:
+                        if earliest_end is None or target_end < earliest_end:
+                            earliest_end = target_end
+                elif w_start and now_utc < w_start:
+                    scheduled_count += 1
+                    if earliest_start is None or w_start < earliest_start:
+                        earliest_start = w_start
+
+        return {
+            "live_count": live_count,
+            "pending_approval_count": pending_approval_count,
+            "needs_revision_count": needs_revision_count,
+            "scheduled_count": scheduled_count,
+            "earliest_window_start": earliest_start.isoformat() if earliest_start else None,
+            "earliest_window_end": earliest_end.isoformat() if earliest_end else None,
+        }
+    except Exception as err:
+        logger.warning(f"Error computing quotation sidebar status: {err}")
+        return {
+            "live_count": 0,
+            "pending_approval_count": 0,
+            "needs_revision_count": 0,
+            "scheduled_count": 0,
+            "earliest_window_start": None,
+            "earliest_window_end": None,
+        }
+
+
 def get_active_deal_awaiting_acceptance(
     user_id: int,
     customer_id: int,
@@ -445,6 +554,8 @@ def get_active_deal_awaiting_acceptance(
         except Exception as e:
             logger.warning(f"Error proactively computing standings for closed RFQ {unc.id}: {e}")
 
+    sidebar_status = _compute_quotation_sidebar_status(user_id, customer_id, user_role, db, now_utc)
+
     # Query for RFQs currently in active acceptance period
     query = db.query(QuotationRequest).filter(
         QuotationRequest.status.notin_(['CANCELLED', 'DRAFT', 'REJECTED']),
@@ -461,7 +572,7 @@ def get_active_deal_awaiting_acceptance(
 
     candidate_rfqs = query.all()
     if not candidate_rfqs:
-        return {"has_pending_deal": False, "deal": None, "total_pending": 0}
+        return {"has_pending_deal": False, "deal": None, "total_pending": 0, "sidebar_status": sidebar_status}
 
     is_admin = user_role in ["corporate_admin", "super_admin"]
 
@@ -584,7 +695,7 @@ def get_active_deal_awaiting_acceptance(
         })
 
     if not urgent_deals:
-        return {"has_pending_deal": False, "deal": None, "total_pending": 0}
+        return {"has_pending_deal": False, "deal": None, "total_pending": 0, "sidebar_status": sidebar_status}
 
     urgent_deals.sort(key=lambda d: d["seconds_remaining"])
 
@@ -592,6 +703,7 @@ def get_active_deal_awaiting_acceptance(
         "has_pending_deal": True,
         "deal": urgent_deals[0],
         "total_pending": len(urgent_deals),
-        "all_pending_deals": urgent_deals
+        "all_pending_deals": urgent_deals,
+        "sidebar_status": sidebar_status
     }
 

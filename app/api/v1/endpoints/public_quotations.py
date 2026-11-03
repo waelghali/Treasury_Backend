@@ -1215,15 +1215,58 @@ def desk_heartbeat(
 
     desk_role = "EXECUTION" if (resolved_role == "EXECUTION" or (resolved_role == "APPROVER" and can_approver_execute)) else resolved_role
 
+    telemetry_payload = {
+        "has_unsubmitted_input": bool(getattr(payload, "has_unsubmitted_input", False)),
+        "has_unsubmitted_pass": bool(getattr(payload, "has_unsubmitted_pass", False)),
+        "has_unsubmitted_update": bool(getattr(payload, "has_unsubmitted_update", False)),
+        "clicked_locked_comment_count": int(getattr(payload, "clicked_locked_comment_count", 0) or 0),
+        "disabled_submit_clicks": int(getattr(payload, "disabled_submit_clicks", 0) or 0),
+        "spectator_locked_clicks": int(getattr(payload, "spectator_locked_clicks", 0) or 0),
+        "fat_finger_prompted": bool(getattr(payload, "fat_finger_prompted", False)),
+        "client_latency_ms": getattr(payload, "client_latency_ms", None)
+    }
+
     res = desk_session_service.heartbeat(
         assignment_id=assignment.id,
         email=payload.email,
         name=payload.name,
         role=desk_role,
-        session_token=payload.session_token
+        session_token=payload.session_token,
+        telemetry=telemetry_payload
     )
-    if isinstance(res, dict) and rfq:
-        res["rfq_status"] = rfq.status
+    if isinstance(res, dict):
+        new_milestones = res.pop("new_telemetry_milestones", None)
+        if new_milestones and rfq:
+            try:
+                bank_name = q_bank.bank.name if (q_bank and q_bank.bank) else "Unknown Bank"
+                for m in new_milestones:
+                    # Clean non-sensitive audit log (Zero-Knowledge: strictly NO prices, rates, or comment text)
+                    log_action(
+                        db=db,
+                        user_id=None,
+                        action_type="QUOTATION_DESK_INTERACTION_PROOF",
+                        entity_type="QuotationRequest",
+                        entity_id=None,
+                        details={
+                            "rfq_id": str(rfq.id),
+                            "ref_no": rfq.ref_no,
+                            "assignment_id": str(assignment.id),
+                            "bank_name": bank_name,
+                            "dealer_email": (payload.email or "").strip().lower(),
+                            "dealer_role": resolved_role,
+                            "milestone": m.get("milestone"),
+                            "action_description": m.get("description"),
+                            "client_latency_ms": telemetry_payload.get("client_latency_ms"),
+                            "recorded_at": m.get("timestamp")
+                        },
+                        customer_id=rfq.customer_id
+                    )
+                db.commit()
+            except Exception as log_err:
+                db.rollback()
+                logger.warning(f"Non-blocking error logging desk interaction proof: {log_err}")
+        if rfq:
+            res["rfq_status"] = rfq.status
     return res
 
 @router.post("/{token}/desk-takeover")

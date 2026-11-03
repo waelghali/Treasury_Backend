@@ -642,31 +642,8 @@ class CRUDLGRecord(CRUDBase):
         updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
 
         # --- START TEMPLATE SEARCH ---
-        # 1. Try Customer-Specific
-        instruction_template = db.query(models.Template).filter(
-            models.Template.action_type == "LG_EXTENSION",
-            models.Template.customer_id == db_lg_record.customer_id,
-            models.Template.is_notification_template == False,
-            models.Template.is_deleted == False
-        ).first()
-
-        if instruction_template:
-            print(f"DEBUG: Found CUSTOMER template (ID: {instruction_template.id}) for Customer ID: {db_lg_record.customer_id}")
-        else:
-            # 2. Fallback to Global
-            print(f"DEBUG: No customer-specific template for Customer {db_lg_record.customer_id}. Checking Global...")
-            instruction_template = db.query(models.Template).filter(
-                models.Template.action_type == "LG_EXTENSION",
-                models.Template.is_global == True,
-                models.Template.is_notification_template == False,
-                models.Template.is_deleted == False
-            ).first()
-            
-            if instruction_template:
-                print(f"DEBUG: Using GLOBAL fallback template (ID: {instruction_template.id})")
-
+        instruction_template = self._resolve_instruction_template(db, "LG_EXTENSION", db_lg_record.customer_id)
         if not instruction_template:
-            print(f"ERROR: No template found at all for LG_EXTENSION (Customer: {db_lg_record.customer_id})")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="LG Extension Instruction template not found."
@@ -683,10 +660,18 @@ class CRUDLGRecord(CRUDBase):
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
         customer_name = customer.name if customer else "N/A"
         current_date_str = datetime.now().strftime("%Y-%m-%d")
+        issuance_date_str = db_lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(db_lg_record, "issuance_date", None) else "N/A"
+        old_expiry_date_obj = datetime.strptime(old_expiry_date_for_log, "%Y-%m-%d").date()
+        extension_period_str = self._format_extension_period(old_expiry_date_obj, new_expiry_date)
 
         instruction_details = {
             "old_expiry_date": old_expiry_date_for_log,
             "new_expiry_date": new_expiry_date.isoformat(),
+            "extension_period": extension_period_str,
+            "issuance_date": issuance_date_str,
+            "issue_date": issuance_date_str,
+            "expiry_date": old_expiry_date_for_log,
+            "maturity_date": old_expiry_date_for_log,
             "lg_number": db_lg_record.lg_number,
             "lg_amount": f"{float(db_lg_record.lg_amount):,.2f}",
             "lg_currency": db_lg_record.lg_currency.iso_code,
@@ -755,6 +740,11 @@ class CRUDLGRecord(CRUDBase):
             db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
             db.refresh(updated_lg_record)
             db.refresh(db_lg_instruction_in_current_session)
+            if getattr(db_lg_instruction_in_current_session, "serial_number", None):
+                instruction_details["instruction_serial"] = db_lg_instruction_in_current_session.serial_number
+                instruction_details["serial_number"] = db_lg_instruction_in_current_session.serial_number
+                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", db_lg_instruction_in_current_session.serial_number)
+                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", db_lg_instruction_in_current_session.serial_number)
 
         except Exception as e:
             db.rollback()
@@ -942,9 +932,9 @@ class CRUDLGRecord(CRUDBase):
         logger.debug(f"DEBUG: LG record {lg_record.id} status flushed to {lg_record.lg_status.name}.")
 
 
-        instruction_template = db.query(models.Template).filter(models.Template.action_type == "LG_RELEASE", models.Template.is_global == True, models.Template.is_notification_template == False, models.Template.is_deleted == False).first()
+        instruction_template = self._resolve_instruction_template(db, "LG_RELEASE", lg_record.customer_id)
         if not instruction_template:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LG Release Instruction template not found. Please ensure a global 'LG_RELEASE' template (non-notification) exists.")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LG Release Instruction template not found. Please ensure a 'LG_RELEASE' template (non-notification) exists.")
         
         customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
@@ -968,7 +958,13 @@ class CRUDLGRecord(CRUDBase):
 
         instruction_wording_documents = f"documents (Total: {total_original_documents})" if total_original_documents > 0 else "no documents"
         instruction_wording_replies = f"and there are {pending_replies_count} pending replies." if pending_replies_count > 0 else "and no pending replies."
-
+        enclosed_documents_clause = (
+            "Kindly find the original Letter of Guarantee attached herewith along with all its extension confirmation(s) received from your esteemed bank for your records and cancellation."
+            if pending_replies_count == 0
+            else "Kindly find the original Letter of Guarantee attached herewith; however, as we have not yet received all LG extension confirmation(s) from your esteemed bank, we hereby commit to return them back to the bank immediately upon receipt."
+        )
+        issuance_date_str = lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A"
+        expiry_date_str = lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A"
 
         instruction_details = {
             "lg_number": lg_record.lg_number,
@@ -977,6 +973,10 @@ class CRUDLGRecord(CRUDBase):
             "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
             "lg_issuer_name": lg_record.issuer_name,
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
+            "issuance_date": issuance_date_str,
+            "issue_date": issuance_date_str,
+            "expiry_date": expiry_date_str,
+            "maturity_date": expiry_date_str,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
             "customer_name": lg_record.customer.name,
             "customer_address": customer_address,
@@ -984,6 +984,9 @@ class CRUDLGRecord(CRUDBase):
             "internal_owner_email": lg_record.internal_owner_contact.email,
             "instruction_wording_documents": instruction_wording_documents,
             "instruction_wording_replies": instruction_wording_replies,
+            "enclosed_documents_clause": enclosed_documents_clause,
+            "total_documents_received": total_original_documents,
+            "pending_replies_count": pending_replies_count,
             "lg_serial_number": lg_record.lg_number,
             "recipient_name": recipient_name,
             "recipient_address": recipient_address,
@@ -1050,6 +1053,11 @@ class CRUDLGRecord(CRUDBase):
 
             db.refresh(lg_record)
             db.refresh(db_lg_instruction_in_current_session)
+            if getattr(db_lg_instruction_in_current_session, "serial_number", None):
+                instruction_details["instruction_serial"] = db_lg_instruction_in_current_session.serial_number
+                instruction_details["serial_number"] = db_lg_instruction_in_current_session.serial_number
+                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", db_lg_instruction_in_current_session.serial_number)
+                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", db_lg_instruction_in_current_session.serial_number)
 
         except Exception as e:
             db.rollback()
@@ -1211,9 +1219,9 @@ class CRUDLGRecord(CRUDBase):
         db.add(lg_record)
         db.flush()
 
-        instruction_template = db.query(models.Template).filter(models.Template.action_type == "LG_LIQUIDATE", models.Template.is_global == True, models.Template.is_notification_template == False, models.Template.is_deleted == False).first()
+        instruction_template = self._resolve_instruction_template(db, "LG_LIQUIDATE", lg_record.customer_id)
         if not instruction_template:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LG Liquidation Instruction template not found. Please ensure a global 'LG_LIQUIDATE' template (non-notification) exists.")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LG Liquidation Instruction template not found. Please ensure a 'LG_LIQUIDATE' template (non-notification) exists.")
 
         customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
         entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
@@ -1237,16 +1245,32 @@ class CRUDLGRecord(CRUDBase):
 
         instruction_wording_documents = f"documents (Total: {total_original_documents})" if total_original_documents > 0 else "no documents"
         instruction_wording_replies = f"and there are {pending_replies_count} pending replies." if pending_replies_count > 0 else "and no pending replies."
+        enclosed_documents_clause = (
+            "Kindly find the original Letter of Guarantee attached herewith along with all its extension confirmation(s) received from your esteemed bank."
+            if pending_replies_count == 0
+            else "Kindly find the original Letter of Guarantee attached herewith; however, as we have not yet received all LG extension confirmation(s) from your esteemed bank, we hereby commit to return them back to the bank immediately upon receipt."
+        )
+        issuance_date_str = lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A"
+        expiry_date_str = lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A"
+        liquidation_amount_val = float(original_amount) - float(lg_record.lg_amount)
 
         instruction_details = {
             "lg_number": lg_record.lg_number,
             "liquidation_type": liquidation_type.capitalize(),
             "original_lg_amount": float(original_amount),
             "new_lg_amount": float(lg_record.lg_amount),
+            "liquidation_amount": liquidation_amount_val,
+            "liquidation_amount_formatted": f"{lg_record.lg_currency.symbol} {liquidation_amount_val:,.2f}",
+            "lg_amount": float(original_amount),
+            "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}",
             "lg_currency": lg_record.lg_currency.iso_code,
             "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
             "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
             "lg_issuer_name": lg_record.issuer_name,
+            "issuance_date": issuance_date_str,
+            "issue_date": issuance_date_str,
+            "expiry_date": expiry_date_str,
+            "maturity_date": expiry_date_str,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
             "customer_name": lg_record.customer.name,
             "customer_address": customer_address,
@@ -1254,6 +1278,10 @@ class CRUDLGRecord(CRUDBase):
             "internal_owner_email": lg_record.internal_owner_contact.email,
             "instruction_wording_documents": instruction_wording_documents,
             "instruction_wording_replies": instruction_wording_replies,
+            "enclosed_documents_clause": enclosed_documents_clause,
+            "total_documents_received": total_original_documents,
+            "pending_replies_count": pending_replies_count,
+            "settlement_instruction": f"Kindly arrange to settle the proceeds of this guarantee by bank transfer or issuing a bank draft/cashier order payable to {lg_record.beneficiary_corporate.entity_name} ({lg_record.customer.name}), in accordance with our standing settlement instructions.",
             "lg_serial_number": lg_record.lg_number,
             "recipient_name": recipient_name,
             "recipient_address": recipient_address,
@@ -1339,6 +1367,11 @@ class CRUDLGRecord(CRUDBase):
 
             db.refresh(lg_record)
             db.refresh(db_lg_instruction_in_current_session)
+            if getattr(db_lg_instruction_in_current_session, "serial_number", None):
+                instruction_details["instruction_serial"] = db_lg_instruction_in_current_session.serial_number
+                instruction_details["serial_number"] = db_lg_instruction_in_current_session.serial_number
+                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", db_lg_instruction_in_current_session.serial_number)
+                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", db_lg_instruction_in_current_session.serial_number)
 
         except Exception as e:
             db.rollback()
@@ -1472,9 +1505,9 @@ class CRUDLGRecord(CRUDBase):
 
             logger.debug(f"LG {lg_record.id} amount updated in DB session to: {lg_record.lg_amount}. Proceeding with instruction and notification.")
 
-            instruction_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_DECREASE_AMOUNT, models.Template.is_global == True, models.Template.is_notification_template == False, models.Template.is_deleted == False).first()
+            instruction_template = self._resolve_instruction_template(db, ACTION_TYPE_LG_DECREASE_AMOUNT, lg_record.customer_id)
             if not instruction_template:
-                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"LG Decrease Amount Instruction template not found. Please ensure a global '{ACTION_TYPE_LG_DECREASE_AMOUNT}' template (non-notification) exists.")
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"LG Decrease Amount Instruction template not found. Please ensure a '{ACTION_TYPE_LG_DECREASE_AMOUNT}' template (non-notification) exists.")
             
             customer = db.query(models.Customer).filter(models.Customer.id == lg_record.customer_id).first()
             entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == lg_record.beneficiary_corporate_id).first()
@@ -1484,6 +1517,8 @@ class CRUDLGRecord(CRUDBase):
 
             customer_address = entity.address if entity.address else customer.address
             customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
+            issuance_date_str = lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A"
+            expiry_date_str = lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A"
 
             instruction_details = {
                 "lg_number": lg_record.lg_number,
@@ -1494,6 +1529,10 @@ class CRUDLGRecord(CRUDBase):
                 "issuing_bank_name": self._get_effective_issuing_bank_name(lg_record),
                 "lg_issuer_name": lg_record.issuer_name,
                 "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
+                "issuance_date": issuance_date_str,
+                "issue_date": issuance_date_str,
+                "expiry_date": expiry_date_str,
+                "maturity_date": expiry_date_str,
                 "current_date": datetime.now().strftime("%Y-%m-%d"),
                 "customer_name": lg_record.customer.name,
                 "customer_address": customer_address,
@@ -1567,6 +1606,11 @@ class CRUDLGRecord(CRUDBase):
 
                 db.refresh(lg_record)
                 db.refresh(db_lg_instruction_in_current_session)
+                if getattr(db_lg_instruction_in_current_session, "serial_number", None):
+                    instruction_details["instruction_serial"] = db_lg_instruction_in_current_session.serial_number
+                    instruction_details["serial_number"] = db_lg_instruction_in_current_session.serial_number
+                    generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", db_lg_instruction_in_current_session.serial_number)
+                    generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", db_lg_instruction_in_current_session.serial_number)
 
             except Exception as e:
                 db.rollback()
@@ -1721,9 +1765,9 @@ class CRUDLGRecord(CRUDBase):
         db.add(db_lg_record)
         db.flush()
 
-        instruction_template = db.query(models.Template).filter(models.Template.action_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, models.Template.is_global == True, models.Template.is_notification_template == False, models.Template.is_deleted == False).first()
+        instruction_template = self._resolve_instruction_template(db, ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, db_lg_record.customer_id)
         if not instruction_template:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"LG Activation Instruction template not found. Please ensure a global '{ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE}' template (non-notification) exists.")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"LG Activation Instruction template not found. Please ensure a '{ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE}' template (non-notification) exists.")
 
         payment_currency = db.query(models.Currency).filter(models.Currency.id == payment_details.currency_id).first()
         payment_bank = db.query(models.Bank).filter(models.Bank.id == payment_details.issuing_bank_id).first()
@@ -1736,6 +1780,8 @@ class CRUDLGRecord(CRUDBase):
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
+        issuance_date_str = db_lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(db_lg_record, "issuance_date", None) else "N/A"
+        expiry_date_str = db_lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(db_lg_record, "expiry_date", None) else "N/A"
 
         instruction_details = {
             "lg_number": db_lg_record.lg_number,
@@ -1744,6 +1790,10 @@ class CRUDLGRecord(CRUDBase):
             "issuing_bank_name": self._get_effective_issuing_bank_name(db_lg_record),
             "lg_beneficiary_name": db_lg_record.beneficiary_corporate.entity_name,
             "lg_issuer_name": db_lg_record.issuer_name,
+            "issuance_date": issuance_date_str,
+            "issue_date": issuance_date_str,
+            "expiry_date": expiry_date_str,
+            "maturity_date": expiry_date_str,
             "current_date": datetime.now().strftime("%Y-%m-%d"),
             "customer_name": db_lg_record.customer.name,
             "customer_address": customer_address,
@@ -1824,6 +1874,11 @@ class CRUDLGRecord(CRUDBase):
 
             db.refresh(db_lg_record)
             db.refresh(db_lg_instruction_in_current_session)
+            if getattr(db_lg_instruction_in_current_session, "serial_number", None):
+                instruction_details["instruction_serial"] = db_lg_instruction_in_current_session.serial_number
+                instruction_details["serial_number"] = db_lg_instruction_in_current_session.serial_number
+                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", db_lg_instruction_in_current_session.serial_number)
+                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", db_lg_instruction_in_current_session.serial_number)
 
         except Exception as e:
             db.rollback()
@@ -3774,3 +3829,50 @@ class CRUDLGRecord(CRUDBase):
             return recipient_name, recipient_address
             
         return "To Whom It May Concern", "N/A" # Final default fallback
+
+    def _resolve_instruction_template(self, db: Session, action_type: str, customer_id: Optional[int]) -> Optional[models.Template]:
+        """
+        Resolves a non-notification instruction template:
+        1. Customer-specific template (customer_id == customer_id, is_global == False)
+        2. Global fallback template (is_global == True)
+        """
+        if customer_id is not None:
+            customer_template = db.query(models.Template).filter(
+                models.Template.action_type == action_type,
+                models.Template.customer_id == customer_id,
+                models.Template.is_notification_template == False,
+                models.Template.is_deleted == False
+            ).order_by(models.Template.is_default.desc(), models.Template.id.desc()).first()
+            if customer_template:
+                logger.debug(f"Resolved customer-specific template ID {customer_template.id} for action {action_type} (Customer {customer_id})")
+                return customer_template
+
+        global_template = db.query(models.Template).filter(
+            models.Template.action_type == action_type,
+            models.Template.is_global == True,
+            models.Template.is_notification_template == False,
+            models.Template.is_deleted == False
+        ).order_by(models.Template.is_default.desc(), models.Template.id.desc()).first()
+        if global_template:
+            logger.debug(f"Resolved global fallback template ID {global_template.id} for action {action_type}")
+        return global_template
+
+    def _format_extension_period(self, old_date: date, new_date: date) -> str:
+        """
+        Calculates and formats the extension period between old_date and new_date.
+        Mirrors the customer's Excel logic: if it aligns with whole months, returns 'X Month(s)', else 'Y Days'.
+        """
+        try:
+            delta_days = (new_date - old_date).days
+            if delta_days <= 0:
+                return "0 Days"
+            rd = relativedelta(new_date, old_date)
+            total_months = rd.years * 12 + rd.months
+            if total_months > 0 and rd.days == 0:
+                return f"{total_months} Month(s)"
+            approx_months = round(delta_days / 30)
+            if approx_months > 0 and (old_date + relativedelta(months=approx_months)) == new_date:
+                return f"{approx_months} Month(s)"
+            return f"{delta_days} Days"
+        except Exception:
+            return "N/A"

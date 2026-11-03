@@ -4,7 +4,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Type, TypeVar
 from fastapi import HTTPException, status, UploadFile
 import decimal
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import relationship, selectinload
 from sqlalchemy.orm import Session
 from app.models import BaseModel as SQLBaseModel, AuditLog
@@ -191,11 +191,20 @@ def log_action(
         # Phase 5: Cryptographic Hash-Chained WORM Linking
         from app.core.audit_crypto import compute_audit_hash, GENESIS_HASH
         from datetime import datetime, timezone
-        
+
+        # Acquire a transaction-level PostgreSQL advisory lock when supported
+        # so concurrent requests strictly serialize their AuditLog ID and hash-chain link.
+        try:
+            if db.bind and db.bind.dialect.name == "postgresql":
+                db.execute(text("SELECT pg_advisory_xact_lock(90421005)"))
+        except Exception:
+            pass
+
         last_log = (
             db.query(AuditLog.entry_hash)
             .filter(AuditLog.entry_hash.isnot(None))
             .order_by(AuditLog.id.desc())
+            .with_for_update()
             .first()
         )
         prev_hash = last_log[0] if (last_log and last_log[0]) else GENESIS_HASH

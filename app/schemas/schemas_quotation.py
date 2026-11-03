@@ -333,6 +333,15 @@ class DeskSessionActionRequest(BaseModel):
     name: Optional[str] = None
     role: Optional[str] = "EXECUTION"
     session_token: Optional[str] = None
+    # Additive Zero-Knowledge interaction telemetry (strictly booleans/counts/latency, NO rate or comment values)
+    has_unsubmitted_input: Optional[bool] = False
+    has_unsubmitted_pass: Optional[bool] = False
+    has_unsubmitted_update: Optional[bool] = False
+    clicked_locked_comment_count: Optional[int] = 0
+    disabled_submit_clicks: Optional[int] = 0
+    spectator_locked_clicks: Optional[int] = 0
+    fat_finger_prompted: Optional[bool] = False
+    client_latency_ms: Optional[int] = None
 
 class FXSpotOfferCreate(BaseModel):
     token: str
@@ -404,6 +413,7 @@ class QuotationResultItem(BaseModel):
     is_passed: Optional[bool] = False
     is_excluded: Optional[bool] = False
     is_cross_entity: Optional[bool] = False
+    desk_proof: Optional[dict] = None
 
 class QuotationResultsOut(BaseModel):
     rfq: QuotationRequestOut

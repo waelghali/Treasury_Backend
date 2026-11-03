@@ -3535,20 +3535,59 @@ async def view_lg_instruction_letter(
         
         # Determine the correct recipient details using the new helper
         recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record_for_template)
-        
+        issuance_date_str = lg_record_for_template.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "issuance_date", None) else "N/A"
+        expiry_date_str = lg_record_for_template.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "expiry_date", None) else "N/A"
+        customer_obj = lg_record_for_template.customer
+        entity_obj = lg_record_for_template.beneficiary_corporate
+        customer_address_val = (entity_obj.address if entity_obj and entity_obj.address else (customer_obj.address if customer_obj else "")) or ""
+        customer_email_val = (entity_obj.contact_email if entity_obj and entity_obj.contact_email else (customer_obj.contact_email if customer_obj else "")) or ""
+
         instruction_details.update({
             "lg_number": lg_record_for_template.lg_number,
+            "lg_serial_number": lg_record_for_template.lg_number,
+            "instruction_serial": db_instruction.serial_number or "",
+            "serial_number": db_instruction.serial_number or "",
             "lg_amount": float(lg_record_for_template.lg_amount),
             "lg_currency": lg_record_for_template.lg_currency.iso_code,
-            "issuing_bank_name": lg_record_for_template.issuing_bank.name,
+            "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record_for_template),
+            "lg_issuer_name": lg_record_for_template.issuer_name,
             "lg_beneficiary_name": lg_record_for_template.beneficiary_corporate.entity_name,
             "customer_name": lg_record_for_template.customer.name,
+            "customer_address": customer_address_val,
+            "customer_contact_email": customer_email_val,
             "internal_owner_email": lg_record_for_template.internal_owner_contact.email,
             "current_date": date.today().strftime("%Y-%m-%d"),
             "platform_name": "Treasury Management Platform",
             "recipient_name": recipient_name,
             "recipient_address": recipient_address,
         })
+        instruction_details.setdefault("issuance_date", issuance_date_str)
+        instruction_details.setdefault("issue_date", issuance_date_str)
+        instruction_details.setdefault("expiry_date", instruction_details.get("old_expiry_date") or expiry_date_str)
+        instruction_details.setdefault("maturity_date", instruction_details.get("old_expiry_date") or expiry_date_str)
+        instruction_details.setdefault("notes_section", "")
+
+        if "old_expiry_date" in instruction_details and "new_expiry_date" in instruction_details and "extension_period" not in instruction_details:
+            try:
+                old_d = datetime.strptime(str(instruction_details["old_expiry_date"])[:10], "%Y-%m-%d").date()
+                new_d = datetime.strptime(str(instruction_details["new_expiry_date"])[:10], "%Y-%m-%d").date()
+                instruction_details["extension_period"] = crud_lg_record._format_extension_period(old_d, new_d)
+            except Exception:
+                instruction_details["extension_period"] = "N/A"
+
+        if "enclosed_documents_clause" not in instruction_details:
+            pending_cnt = instruction_details.get("pending_replies_count", 0)
+            instruction_details["enclosed_documents_clause"] = (
+                "Kindly find the original Letter of Guarantee attached herewith along with all its extension confirmation(s) received from your esteemed bank for your records and cancellation."
+                if not pending_cnt
+                else "Kindly find the original Letter of Guarantee attached herewith; however, as we have not yet received all LG extension confirmation(s) from your esteemed bank, we hereby commit to return them back to the bank immediately upon receipt."
+            )
+
+        if "settlement_instruction" not in instruction_details:
+            instruction_details["settlement_instruction"] = (
+                f"Kindly arrange to settle the proceeds of this guarantee by bank transfer or issuing a bank draft/cashier order payable to {lg_record_for_template.beneficiary_corporate.entity_name} ({lg_record_for_template.customer.name}), in accordance with our standing settlement instructions."
+            )
+
         instruction_details["lg_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(lg_record_for_template.lg_amount):,.2f}"
         if "original_lg_amount" in instruction_details:
              instruction_details["original_lg_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(instruction_details['original_lg_amount']):,.2f}"
@@ -3556,6 +3595,10 @@ async def view_lg_instruction_letter(
              instruction_details["new_lg_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(instruction_details['new_lg_amount']):,.2f}"
         if "decrease_amount" in instruction_details:
              instruction_details["decrease_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(instruction_details['decrease_amount']):,.2f}"
+        if "original_lg_amount" in instruction_details and "new_lg_amount" in instruction_details and "liquidation_amount_formatted" not in instruction_details:
+             liq_amt = float(instruction_details["original_lg_amount"]) - float(instruction_details["new_lg_amount"])
+             instruction_details["liquidation_amount"] = liq_amt
+             instruction_details["liquidation_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {liq_amt:,.2f}"
 
         if db_instruction.instruction_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE and "payment_details" in instruction_details:
             payment_details = instruction_details["payment_details"]

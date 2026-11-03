@@ -194,3 +194,118 @@ def verify_audit_log_chain(
         "first_record_id": records[0].id,
         "last_record_id": records[-1].id
     }
+
+
+def reseal_audit_log_chain(
+    db: Session,
+    force_content_reseal: bool = False
+) -> Dict[str, Any]:
+    """
+    Repairs broken previous_hash continuity links caused by concurrent inserts
+    (or unchained watchdog records) across the WORM audit trail.
+
+    Safety guarantee:
+    Before re-linking any chained record, it verifies that the record's own payload
+    matches its originally recorded `entry_hash` (using its originally recorded
+    `previous_hash`). If a record's content was modified (`TAMPERED_RECORD_CONTENT`)
+    and `force_content_reseal` is False, the repair aborts and reports the tampered ID.
+    """
+    from app.models.models import AuditLog
+    from sqlalchemy import text
+
+    try:
+        if db.bind and db.bind.dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(90421005)"))
+    except Exception:
+        pass
+
+    first_chained = (
+        db.query(AuditLog.id)
+        .filter(AuditLog.entry_hash.isnot(None))
+        .order_by(AuditLog.id.asc())
+        .first()
+    )
+    if not first_chained:
+        return {
+            "is_valid": True,
+            "status": "NO_CHAINED_RECORDS",
+            "message": "No chained audit records found to re-seal.",
+            "records_verified": 0,
+            "records_resealed": 0
+        }
+
+    records: List[AuditLog] = (
+        db.query(AuditLog)
+        .filter(AuditLog.entry_hash.isnot(None))
+        .order_by(AuditLog.id.asc())
+        .all()
+    )
+
+    # Pass 1: Verify individual record payload authenticity against its recorded previous_hash
+    if not force_content_reseal:
+        for record in records:
+            self_hash = compute_audit_hash(
+                previous_hash=record.previous_hash,
+                timestamp=record.timestamp,
+                user_id=record.user_id,
+                action_type=record.action_type,
+                entity_type=record.entity_type,
+                entity_id=record.entity_id,
+                customer_id=record.customer_id,
+                lg_record_id=record.lg_record_id,
+                details=record.details,
+                ip_address=record.ip_address
+            )
+            if self_hash != (record.entry_hash or "").upper():
+                return {
+                    "is_valid": False,
+                    "status": "TAMPERED_RECORD_CONTENT",
+                    "message": (
+                        f"Cannot auto-repair chain: AuditLog ID {record.id} failed payload "
+                        f"authenticity check (expected {self_hash}, recorded {record.entry_hash})."
+                    ),
+                    "broken_at_id": record.id,
+                    "records_resealed": 0
+                }
+
+    # Pass 2: Sequentially re-link previous_hash and recompute entry_hash
+    expected_prev = (records[0].previous_hash or GENESIS_HASH).upper()
+    resealed_count = 0
+
+    for record in records:
+        new_entry_hash = compute_audit_hash(
+            previous_hash=expected_prev,
+            timestamp=record.timestamp,
+            user_id=record.user_id,
+            action_type=record.action_type,
+            entity_type=record.entity_type,
+            entity_id=record.entity_id,
+            customer_id=record.customer_id,
+            lg_record_id=record.lg_record_id,
+            details=record.details,
+            ip_address=record.ip_address
+        )
+        if (record.previous_hash or "").upper() != expected_prev or (record.entry_hash or "").upper() != new_entry_hash:
+            record.previous_hash = expected_prev
+            record.entry_hash = new_entry_hash
+            resealed_count += 1
+
+        expected_prev = new_entry_hash
+
+    db.commit()
+
+    return {
+        "is_valid": True,
+        "status": "RESEALED",
+        "message": (
+            f"Successfully verified payload authenticity and re-sealed {resealed_count} "
+            f"chain links across {len(records)} total records."
+        ),
+        "records_verified": len(records),
+        "records_resealed": resealed_count,
+        "broken_at_id": None,
+        "root_hash": records[0].previous_hash,
+        "latest_hash": records[-1].entry_hash,
+        "first_record_id": records[0].id,
+        "last_record_id": records[-1].id
+    }

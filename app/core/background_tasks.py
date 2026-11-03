@@ -955,55 +955,106 @@ async def run_daily_cbe_lending_rate_sync(db: Session):
       - Arithmetic Mid Corridor: 19.50%
     """
     logger.info("Starting Daily CBE Policy Rates (Lending, Deposit, Mid-Corridor) Sync...")
-    from sqlalchemy import cast, String
+    from sqlalchemy import cast, String, text
     from app.models import GlobalConfiguration
     from app.constants import GlobalConfigKey
 
-    url = "https://www.cbe.org.eg/en/monetary-policy/key-cbe-interest-rates"
+    urls = [
+        "https://www.cbe.org.eg/en/economic-research/statistics/overnight-deposit-and-lending-rate",
+        "https://www.cbe.org.eg/ar/economic-research/statistics/overnight-deposit-and-lending-rate",
+        "https://www.cbe.org.eg/en/monetary-policy/key-cbe-interest-rates",
+    ]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    def _parse_rate(text_val: str):
+        cand_clean = text_val.replace("%", "").replace("٪", "").strip()
+        try:
+            val = float(cand_clean)
+            if 5.0 <= val <= 45.0:
+                return val
+        except ValueError:
+            pass
+        return None
+
+    def _is_lending_label(txt: str) -> bool:
+        return "lending" in txt or "الإقراض" in txt or "الاقراض" in txt
+
+    def _is_deposit_label(txt: str) -> bool:
+        return "deposit" in txt or "الإيداع" in txt or "الايداع" in txt
+
     scraped_lending = None
     scraped_deposit = None
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, "html.parser")
-            tables = soup.find_all("table")
-            for table in tables:
-                text_content = table.get_text()
-                if any(w in text_content for w in ["Lending", "Deposit", "Overnight"]):
-                    for row in table.find_all("tr"):
-                        cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-                        row_text = " ".join(cols).lower()
-                        if "lending" in row_text and scraped_lending is None:
-                            for candidate in cols:
-                                cand_clean = candidate.replace("%", "").strip()
-                                try:
-                                    val = float(cand_clean)
-                                    if 5.0 <= val <= 45.0:
-                                        scraped_lending = val
-                                        break
-                                except ValueError:
-                                    continue
-                        if "deposit" in row_text and scraped_deposit is None:
-                            for candidate in cols:
-                                cand_clean = candidate.replace("%", "").strip()
-                                try:
-                                    val = float(cand_clean)
-                                    if 5.0 <= val <= 45.0:
-                                        scraped_deposit = val
-                                        break
-                                except ValueError:
-                                    continue
-                    if scraped_lending is not None and scraped_deposit is not None:
-                        break
-    except Exception as scrape_err:
-        logger.warning(f"CBE interest rate fetch attempt had warning: {scrape_err}")
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, "html.parser")
+                tables = soup.find_all("table")
+                for table in tables:
+                    text_content = table.get_text()
+                    if any(w in text_content for w in ["Lending", "Deposit", "Overnight", "الإيداع", "الإقراض"]):
+                        rows = table.find_all("tr")
+                        # 1. Column-based table structure (CBE official statistics page: headers in row 0, values in row 1)
+                        if len(rows) >= 2:
+                            header_cols = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th", "td"])]
+                            value_cols = [c.get_text(strip=True) for c in rows[1].find_all(["td", "th"])]
+                            for idx, h_text in enumerate(header_cols):
+                                if idx < len(value_cols):
+                                    parsed = _parse_rate(value_cols[idx])
+                                    if parsed is not None:
+                                        if _is_lending_label(h_text) and scraped_lending is None:
+                                            scraped_lending = parsed
+                                        elif _is_deposit_label(h_text) and scraped_deposit is None:
+                                            scraped_deposit = parsed
 
-    effective_lending = scraped_lending if scraped_lending is not None else 20.0
-    effective_deposit = scraped_deposit if scraped_deposit is not None else 19.0
+                        # 2. Fallback: Row-based table structure (label and value in same row)
+                        if scraped_lending is None or scraped_deposit is None:
+                            for row in rows:
+                                cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+                                row_text = " ".join(cols).lower()
+                                if _is_lending_label(row_text) and scraped_lending is None:
+                                    for candidate in cols:
+                                        parsed = _parse_rate(candidate)
+                                        if parsed is not None:
+                                            scraped_lending = parsed
+                                            break
+                                if _is_deposit_label(row_text) and scraped_deposit is None:
+                                    for candidate in cols:
+                                        parsed = _parse_rate(candidate)
+                                        if parsed is not None:
+                                            scraped_deposit = parsed
+                                            break
+                        if scraped_lending is not None and scraped_deposit is not None:
+                            break
+            if scraped_lending is not None and scraped_deposit is not None:
+                break
+        except Exception as scrape_err:
+            logger.warning(f"CBE interest rate fetch attempt ({url}) had warning: {scrape_err}")
+
+    # Preserve existing DB rate if CBE website is temporarily unreachable; only use hardcoded seed if DB is empty
+    existing_lending_val = None
+    existing_deposit_val = None
+    if scraped_lending is None or scraped_deposit is None:
+        try:
+            l_cfg = db.query(GlobalConfiguration).filter(
+                cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_LENDING_RATE.value,
+                GlobalConfiguration.is_deleted == False
+            ).first()
+            if l_cfg and l_cfg.value_default:
+                existing_lending_val = float(l_cfg.value_default)
+            d_cfg = db.query(GlobalConfiguration).filter(
+                cast(GlobalConfiguration.key, String) == GlobalConfigKey.CBE_OVERNIGHT_DEPOSIT_RATE.value,
+                GlobalConfiguration.is_deleted == False
+            ).first()
+            if d_cfg and d_cfg.value_default:
+                existing_deposit_val = float(d_cfg.value_default)
+        except Exception:
+            pass
+
+    effective_lending = scraped_lending if scraped_lending is not None else (existing_lending_val if existing_lending_val is not None else 21.0)
+    effective_deposit = scraped_deposit if scraped_deposit is not None else (existing_deposit_val if existing_deposit_val is not None else 20.0)
     effective_mid = round((effective_lending + effective_deposit) / 2.0, 4)
 
     # Persist all 3 rate benchmarks to global configurations
@@ -1024,7 +1075,21 @@ async def run_daily_cbe_lending_rate_sync(db: Session):
                 db.commit()
                 logger.info(f"{desc} updated to {val_num}%.")
             else:
-                logger.info(f"{desc} resolved as {val_num}% (config row not present yet).")
+                db.execute(text(f"ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS '{key_enum.value}';"))
+                db.commit()
+                new_cfg = GlobalConfiguration(
+                    key=key_enum,
+                    value_min="0",
+                    value_max="100",
+                    value_default=str(val_num),
+                    unit="percentage",
+                    description=desc,
+                    module_tags=["quotation", "quotations"],
+                    is_deleted=False,
+                )
+                db.add(new_cfg)
+                db.commit()
+                logger.info(f"{desc} created and set to {val_num}%.")
         except Exception as e:
             db.rollback()
             logger.error(f"Error persisting {key_enum.value}: {e}", exc_info=True)
@@ -1079,8 +1144,8 @@ def get_quotation_eval_rate_details(db: Session, customer_id: Optional[int] = No
     from app.crud.crud_config import crud_customer_configuration
 
     cbe_mid = None
-    lending = 20.0
-    deposit = 19.0
+    lending = 21.0
+    deposit = 20.0
 
     # 1. Try reading the arithmetic mid corridor rate directly
     try:

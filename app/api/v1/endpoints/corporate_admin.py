@@ -3366,9 +3366,9 @@ async def trigger_cbe_rates_sync(
         "message": "CBE policy interest rates synchronized successfully.",
         "latest_rate": {
             "rate_date": latest.rate_date.isoformat() if latest and latest.rate_date else None,
-            "lending_rate": latest.lending_rate if latest else 20.0,
-            "deposit_rate": latest.deposit_rate if latest else 19.0,
-            "mid_corridor_rate": latest.mid_corridor_rate if latest else 19.5,
+            "lending_rate": latest.lending_rate if latest else 21.0,
+            "deposit_rate": latest.deposit_rate if latest else 20.0,
+            "mid_corridor_rate": latest.mid_corridor_rate if latest else 20.5,
             "source": latest.source if latest else "CBE_PORTAL_SYNC"
         }
     }

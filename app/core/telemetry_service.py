@@ -275,16 +275,16 @@ def record_startup_watchdog(db: Session) -> None:
                     "limit_mb": mem_stats["limit_mb"],
                     "detected_at_utc": datetime.utcnow().isoformat()
                 }
-                reboot_log = AuditLog(
+                from app.crud.base import log_action
+                log_action(
+                    db=db,
                     user_id=None,
                     customer_id=None,
                     action_type="SYSTEM_UNEXPECTED_REBOOT_DETECTED",
                     entity_type="HostProcess",
                     entity_id=current_pid,
                     details=reboot_details,
-                    timestamp=datetime.utcnow()
                 )
-                db.add(reboot_log)
                 db.commit()
                 logger.warning("Watchdog detected previous ungraceful reboot/crash (OOM kill). Logged to audit trail.")
 
@@ -298,16 +298,16 @@ def record_startup_watchdog(db: Session) -> None:
             "limit_mb": mem_stats["limit_mb"],
             "is_post_crash_recovery": is_unexpected_restart
         }
-        startup_log = AuditLog(
+        from app.crud.base import log_action
+        log_action(
+            db=db,
             user_id=None,
             customer_id=None,
             action_type="SYSTEM_SERVER_STARTUP",
             entity_type="HostProcess",
             entity_id=current_pid,
             details=startup_details,
-            timestamp=datetime.utcnow()
         )
-        db.add(startup_log)
         db.commit()
         logger.info(f"Server startup watchdog logged [PID {current_pid}, Initial RAM {mem_stats['current_mb']}MB].")
 
@@ -322,7 +322,7 @@ def record_startup_watchdog(db: Session) -> None:
 def record_shutdown_watchdog(db: Session) -> None:
     """Invoked during graceful application shutdown."""
     try:
-        from app.models.models import AuditLog
+        from app.crud.base import log_action
         mem_stats = get_process_memory_stats()
         uptime_seconds = (datetime.utcnow() - PROCESS_BOOT_TIME).total_seconds()
 
@@ -334,16 +334,15 @@ def record_shutdown_watchdog(db: Session) -> None:
             "peak_rss_mb": mem_stats["peak_mb"],
             "shutdown_time_utc": datetime.utcnow().isoformat()
         }
-        shutdown_log = AuditLog(
+        log_action(
+            db=db,
             user_id=None,
             customer_id=None,
             action_type="SYSTEM_SERVER_SHUTDOWN",
             entity_type="HostProcess",
             entity_id=PROCESS_PID,
             details=shutdown_details,
-            timestamp=datetime.utcnow()
         )
-        db.add(shutdown_log)
         db.commit()
         logger.info("Graceful server shutdown watchdog logged.")
     except Exception as e:

@@ -337,6 +337,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE user_notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
                     "CREATE INDEX IF NOT EXISTS ix_user_notifications_reference_key ON user_notifications (reference_key);",
                     "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'AUTO_ACCEPT_SINGLE_QUOTE';",
+                    "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, is_deleted, created_at, updated_at) VALUES ('AUTO_ACCEPT_SINGLE_QUOTE', NULL, NULL, 'false', 'boolean', 'When Auto-Accept is active, controls whether uncontested single quotes can be auto-executed (true) or halted for manual corporate sign-off (false). Invariant: cannot be true if Default Action is Auto-Reject.', '[\"quotation\", \"quotations\"]'::jsonb, false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS encrypted_email TEXT;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS email_blind_index VARCHAR(64);",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);",
@@ -627,13 +628,10 @@ def configure_app_instance(fastapi_app: FastAPI):
             },
             {
                 "func": app_background_tasks.run_daily_cbe_lending_rate_sync,
-                "id": "cbe_lending_rate_weekly_job",
-                "name": "Weekly CBE Policy Interest Rates Sync (Thursdays 9PM)",
-                "cron_kwargs": {
-                    "day_of_week": "thu",
-                    "hour": "21",
-                    "minute": "0"
-                },
+                "id": "cbe_lending_rate_daily_job",
+                "name": "Daily CBE Policy Interest Rates Sync (9AM & 9PM)",
+                "hours": [9, 21],
+                "minute": 5,
                 "args": []
             },
             {

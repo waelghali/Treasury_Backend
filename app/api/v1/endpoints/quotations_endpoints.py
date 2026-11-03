@@ -2199,7 +2199,11 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     acc_deadline = _to_utc_dt(rfq.acceptance_deadline) or (w_end + timedelta(seconds=rfq.acceptance_timeout_seconds) if w_end else None)
 
     q_base_str = (rfq.quotation_base or "Execution").lower()
-    is_indicative_only = q_base_str == "indicative" and not getattr(rfq, "legs", [])
+    rfq_legs_list = getattr(rfq, "legs", []) or []
+    is_indicative_only = (
+        (q_base_str == "indicative" and not rfq_legs_list) or
+        (bool(rfq_legs_list) and all((getattr(l, "quotation_base", None) or rfq.quotation_base or "Execution").lower() == "indicative" for l in rfq_legs_list))
+    )
 
     if is_closed:
         if is_indicative_only:
@@ -2246,7 +2250,91 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
     valid_results = []
     
     from app.services.tenant_key_service import tenant_key_service
+    from app.services.desk_session_service import desk_session_service
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+
+    # Build Zero-Knowledge Desk Interaction & Presence Proof Map per assignment token
+    desk_proof_by_token = {}
+    try:
+        from app.models.models import AuditLog
+        interaction_logs = db.query(AuditLog).filter(
+            AuditLog.customer_id == rfq.customer_id,
+            AuditLog.action_type == "QUOTATION_DESK_INTERACTION_PROOF"
+        ).order_by(AuditLog.id.asc()).all()
+        logs_by_assignment = {}
+        for al in interaction_logs:
+            det = al.details or {}
+            if str(det.get("rfq_id")) == str(rfq.id) and det.get("assignment_id"):
+                aid = str(det.get("assignment_id"))
+                logs_by_assignment.setdefault(aid, []).append(det)
+
+        for a in assignments:
+            aid_str = str(a.id)
+            live_summary = desk_session_service.get_desk_proof_summary(aid_str)
+            persisted_events = logs_by_assignment.get(aid_str, [])
+            otp_rows = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == a.id).all()
+            otp_requested = len(otp_rows) > 0
+            otp_verified = any(bool(o.is_used) for o in otp_rows)
+
+            ever_unsub_input = bool(
+                (live_summary and live_summary.get("ever_typed_unsubmitted_input")) or
+                any(ev.get("milestone") == "TYPED_DRAFT_RATE" for ev in persisted_events)
+            )
+            ever_unsub_pass = bool(
+                (live_summary and live_summary.get("ever_toggled_unsubmitted_pass")) or
+                any(ev.get("milestone") == "TOGGLED_DRAFT_PASS" for ev in persisted_events)
+            )
+            ever_unsub_update = bool(
+                (live_summary and live_summary.get("ever_typed_unsubmitted_update")) or
+                any(ev.get("milestone") == "TYPED_UNSAVED_QUOTE_UPDATE" for ev in persisted_events)
+            )
+            clicked_locked_comment = max(
+                int((live_summary or {}).get("clicked_locked_comment_count") or 0),
+                sum(1 for ev in persisted_events if ev.get("milestone") == "CLICKED_LOCKED_COMMENT_BOX")
+            )
+            disabled_submit_clicks = max(
+                int((live_summary or {}).get("disabled_submit_clicks") or 0),
+                sum(1 for ev in persisted_events if ev.get("milestone") == "CLICKED_DISABLED_SUBMIT")
+            )
+            spectator_locked_clicks = max(
+                int((live_summary or {}).get("spectator_locked_clicks") or 0),
+                sum(1 for ev in persisted_events if ev.get("milestone") == "CLICKED_SPECTATOR_LOCKED_INPUT")
+            )
+            ever_fat_finger = bool(
+                (live_summary and live_summary.get("ever_fat_finger_prompted")) or
+                any(ev.get("milestone") == "FAT_FINGER_MODAL_SHOWN" for ev in persisted_events)
+            )
+            avg_lat = (live_summary or {}).get("avg_latency_ms")
+            if avg_lat is None and persisted_events:
+                ev_lats = [int(ev["client_latency_ms"]) for ev in persisted_events if isinstance(ev.get("client_latency_ms"), (int, float))]
+                if ev_lats:
+                    avg_lat = int(round(sum(ev_lats) / len(ev_lats)))
+
+            first_draft_ts = (live_summary or {}).get("first_seen_at")
+            for ev in persisted_events:
+                if ev.get("milestone") in ("TYPED_DRAFT_RATE", "TOGGLED_DRAFT_PASS") and ev.get("recorded_at"):
+                    first_draft_ts = ev.get("recorded_at")
+                    break
+
+            connected = bool((live_summary and live_summary.get("connected")) or otp_verified or len(persisted_events) > 0)
+            desk_proof_by_token[a.token] = {
+                "connected": connected,
+                "otp_requested": otp_requested,
+                "otp_verified": otp_verified,
+                "total_heartbeats": int((live_summary or {}).get("total_heartbeats") or 0),
+                "avg_latency_ms": avg_lat,
+                "ever_typed_unsubmitted_input": ever_unsub_input,
+                "currently_has_unsubmitted_input": bool(any(d.get("currently_has_unsubmitted_input") for d in ((live_summary or {}).get("dealers") or []))),
+                "ever_toggled_unsubmitted_pass": ever_unsub_pass,
+                "ever_typed_unsubmitted_update": ever_unsub_update,
+                "clicked_locked_comment_count": clicked_locked_comment,
+                "disabled_submit_clicks": disabled_submit_clicks,
+                "spectator_locked_clicks": spectator_locked_clicks,
+                "ever_fat_finger_prompted": ever_fat_finger,
+                "first_activity_at": first_draft_ts
+            }
+    except Exception as dp_err:
+        logger.warning(f"Non-blocking error building desk proof map for RFQ {rfq.id}: {dp_err}")
 
     if rfq.type == 'TBILL':
         all_tbill_offers = []
@@ -2278,6 +2366,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "offers": [],
                     "best_score": None,
                     "token": a.token,
+                    "desk_proof": desk_proof_by_token.get(a.token),
                     "quotation_base": a.quotation_base or rfq.quotation_base,
                     "is_cross_entity": bool(getattr(a, 'is_cross_entity', False)),
                     "is_document_visible": a.is_document_visible if a.is_document_visible is not None else True,
@@ -2757,9 +2846,10 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 tenant_key_service.apply_encrypted_leg_winner(leg, None, None, tenant_dek)
 
             if is_closed and hasattr(leg, 'id'):
+                leg_base_is_ind = (getattr(leg, 'quotation_base', None) or rfq.quotation_base or 'Execution').lower() == 'indicative'
                 if leg_is_inconclusive:
                     if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                        leg.status = 'COMPLETED'
+                        leg.status = 'COMPLETED' if (leg_base_is_ind and bool(valid_leg_results)) else 'INCONCLUSIVE'
                 elif leg.status in ('PENDING', 'PENDING_APPROVAL', 'EVALUATING', 'APPROVED_SCHEDULED'):
                     leg.status = 'COMPLETED'
 
@@ -2862,6 +2952,15 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         "approvals_cleared": approvals_cleared,
         "summary_text": f"{desks_active} of {total_invited} Desks Active • {quotes_locked} Quote{'s' if quotes_locked != 1 else ''} Locked In"
     }
+
+    # Attach Zero-Knowledge desk_proof to all counterparty result rows
+    for r_item in (results or []):
+        if isinstance(r_item, dict) and r_item.get("token"):
+            r_item["desk_proof"] = desk_proof_by_token.get(r_item["token"])
+    for leg_item in (legs_data or []):
+        for r_item in (leg_item.get("results") or []):
+            if isinstance(r_item, dict) and r_item.get("token"):
+                r_item["desk_proof"] = desk_proof_by_token.get(r_item["token"])
 
     # --- Savings Summary ---
     savings_summary = None
@@ -2999,7 +3098,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             rfq.saved_vs_avg = None
             for leg in (rfq.legs or []):
                 if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                    leg.status = 'COMPLETED'
+                    leg_base_is_ind = (getattr(leg, 'quotation_base', None) or rfq.quotation_base or 'Execution').lower() == 'indicative'
+                    leg.status = 'COMPLETED' if leg_base_is_ind else 'INCONCLUSIVE'
                     leg.winner_bank_id = None
                     leg.winner_bank_name = None
         elif not is_inconclusive and has_any_winner:
@@ -3221,12 +3321,24 @@ def get_rfq_history(
                     changed = True
                     status_changed = True
                 elif not has_winner and not is_acc_open:
+                    rfq_legs_list = getattr(r, "legs", []) or []
+                    is_ind_only = (
+                        ((r.quotation_base or "Execution").lower() == "indicative" and not rfq_legs_list) or
+                        (bool(rfq_legs_list) and all((getattr(l, "quotation_base", None) or r.quotation_base or "Execution").lower() == "indicative" for l in rfq_legs_list))
+                    )
                     has_quotes = (
                         r.status == 'EVALUATING' or 
                         r.acceptance_status == 'PENDING' or 
                         any(len(getattr(asgn, 'offers', [])) > 0 for asgn in (r.assignments or []))
                     )
-                    if has_quotes:
+                    if is_ind_only and has_quotes:
+                        r.status = 'COMPLETED'
+                        r.acceptance_status = 'INDICATIVE_COMPLETED'
+                        r.acceptance_deadline = None
+                        for leg in (r.legs or []):
+                            if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
+                                leg.status = 'COMPLETED'
+                    elif has_quotes:
                         if r.acceptance_timeout_action == "AUTO_ACCEPT":
                             compute_rfq_standings(r, db, dispatch_emails=False)
                         else:
@@ -3246,7 +3358,7 @@ def get_rfq_history(
                         r.acceptance_resolved_by_user_id = None
                         for leg in (r.legs or []):
                             if leg.status not in ('ACCEPTED', 'REJECTED', 'CANCELLED'):
-                                leg.status = 'COMPLETED'
+                                leg.status = 'INCONCLUSIVE'
                                 leg.winner_bank_id = None
                                 leg.winner_bank_name = None
                     changed = True

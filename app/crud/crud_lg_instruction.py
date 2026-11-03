@@ -551,10 +551,17 @@ class CRUDLGInstruction(CRUDBase):
             logger.debug(f"Instruction {original_instruction_id} is overdue by {days_overdue} days since issuance (no delivery date).")
         reminder_template = db.query(models.Template).filter(
             models.Template.action_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
-            models.Template.is_global == True,
+            models.Template.customer_id == customer_id,
             models.Template.is_notification_template == False,
             models.Template.is_deleted == False
-        ).first()
+        ).order_by(models.Template.is_default.desc(), models.Template.id.desc()).first()
+        if not reminder_template:
+            reminder_template = db.query(models.Template).filter(
+                models.Template.action_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
+                models.Template.is_global == True,
+                models.Template.is_notification_template == False,
+                models.Template.is_deleted == False
+            ).order_by(models.Template.is_default.desc(), models.Template.id.desc()).first()
         if not reminder_template:
             logger.error(f"LG Reminder to Banks template for action_type '{ACTION_TYPE_LG_REMINDER_TO_BANKS}' not found.")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"System configuration error: Reminder to Banks template not found.")
@@ -609,6 +616,14 @@ class CRUDLGInstruction(CRUDBase):
             "recipient_name": recipient_name,
             "recipient_address": recipient_address,
             "delivery_clause": delivery_clause_text, # Correctly added to template data
+            "instruction_serial": reminder_serial_number or "",
+            "serial_number": reminder_serial_number or "",
+            "lg_issuer_name": lg_record.issuer_name,
+            "issuance_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+            "issue_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+            "expiry_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+            "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+            "notes_section": "",
         }
         generated_html = reminder_template.content
         for key, value in template_data.items():
@@ -759,10 +774,17 @@ class CRUDLGInstruction(CRUDBase):
         
         reminder_template = db.query(models.Template).filter(
             models.Template.action_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
-            models.Template.is_global == True,
+            models.Template.customer_id == customer_id,
             models.Template.is_notification_template == False,
             models.Template.is_deleted == False
-        ).first()
+        ).order_by(models.Template.is_default.desc(), models.Template.id.desc()).first()
+        if not reminder_template:
+            reminder_template = db.query(models.Template).filter(
+                models.Template.action_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
+                models.Template.is_global == True,
+                models.Template.is_notification_template == False,
+                models.Template.is_deleted == False
+            ).order_by(models.Template.is_default.desc(), models.Template.id.desc()).first()
         
         if not reminder_template:
             logger.error(f"LG Reminder to Banks template for action_type '{ACTION_TYPE_LG_REMINDER_TO_BANKS}' not found.")
@@ -855,6 +877,14 @@ class CRUDLGInstruction(CRUDBase):
                 "recipient_name": recipient_name,
                 "recipient_address": recipient_address,
                 "delivery_clause": delivery_clause_text, # Passed to template
+                "instruction_serial": reminder_serial_number or "",
+                "serial_number": reminder_serial_number or "",
+                "lg_issuer_name": lg_record.issuer_name,
+                "issuance_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+                "issue_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+                "expiry_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+                "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+                "notes_section": "",
             }
             
             generated_html = reminder_template.content

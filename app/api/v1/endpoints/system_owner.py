@@ -628,15 +628,25 @@ def get_template_placeholders(
 
     if action_type and action_type.upper().startswith("LG_"):
         lg_placeholders = [
+            {"name": "{{lg_number}}", "description": "Letter of Guarantee number."},
             {"name": "{{lg_serial_number}}", "description": "Serial number of the Letter of Guarantee."},
+            {"name": "{{instruction_serial}}", "description": "Generated instruction reference/serial number."},
             {"name": "{{lg_amount}}", "description": "Amount of the Letter of Guarantee."},
-            {"name": "{{lg_currency}}", "description": "Currency of the Letter of Guarantee."},
+            {"name": "{{lg_amount_formatted}}", "description": "Formatted LG amount with currency symbol (e.g., EGP 100,000.00)."},
+            {"name": "{{lg_currency}}", "description": "Currency ISO code of the Letter of Guarantee."},
             {"name": "{{issuing_bank_name}}", "description": "Name of the LG's issuing bank."},
-            {"name": "{{issue_date}}", "description": "Issue date of the LG."},
-            {"name": "{{expiry_date}}", "description": "Expiry date of the LG."},
-            {"name": "{{lg_issuer_name}}", "description": "Name of the LG issuer/applicant."},
-            {"name": "{{lg_beneficiary_name}}", "description": "Name of the LG beneficiary."},
+            {"name": "{{recipient_name}}", "description": "Effective recipient bank name."},
+            {"name": "{{recipient_address}}", "description": "Effective recipient bank address."},
+            {"name": "{{issuance_date}}", "description": "Issuance date of the LG (YYYY-MM-DD)."},
+            {"name": "{{issue_date}}", "description": "Issue date of the LG (alias of issuance_date)."},
+            {"name": "{{expiry_date}}", "description": "Current expiry / maturity date of the LG."},
+            {"name": "{{maturity_date}}", "description": "Maturity date of the LG (alias of expiry_date)."},
+            {"name": "{{lg_issuer_name}}", "description": "Name of the LG issuer/applicant/supplier."},
+            {"name": "{{lg_beneficiary_name}}", "description": "Name of the LG beneficiary corporate entity."},
+            {"name": "{{customer_address}}", "description": "Address of the customer entity (falls back to customer address)."},
+            {"name": "{{customer_contact_email}}", "description": "Contact email of the customer entity (falls back to customer email)."},
             {"name": "{{internal_owner_email}}", "description": "Email of the internal owner."},
+            {"name": "{{notes_section}}", "description": "HTML block for additional notes and mandatory declarations."},
         ]
         placeholders.extend(lg_placeholders)
 
@@ -644,39 +654,72 @@ def get_template_placeholders(
         extension_placeholders = [
             {"name": "{{old_expiry_date}}", "description": "Original expiry date before extension."},
             {"name": "{{new_expiry_date}}", "description": "New expiry date after extension."},
+            {"name": "{{extension_period}}", "description": "Calculated extension period (e.g., '6 Month(s)' or '90 Days')."},
         ]
         placeholders.extend(extension_placeholders)
+    elif action_type == "LG_DECREASE_AMOUNT":
+        decrease_placeholders = [
+            {"name": "{{original_lg_amount_formatted}}", "description": "Original LG amount before decrease (formatted)."},
+            {"name": "{{decrease_amount_formatted}}", "description": "Amount decreased by (formatted)."},
+            {"name": "{{new_lg_amount_formatted}}", "description": "New amended/remaining LG amount after decrease (formatted)."},
+            {"name": "{{original_lg_amount}}", "description": "Original LG amount (numeric)."},
+            {"name": "{{decrease_amount}}", "description": "Amount decreased by (numeric)."},
+            {"name": "{{new_lg_amount}}", "description": "New amended LG amount (numeric)."},
+        ]
+        placeholders.extend(decrease_placeholders)
     elif action_type == "LG_AMENDMENT":
         amendment_placeholders = [
             {"name": "{{amendment_details}}", "description": "Specific details about the amendment."},
         ]
         placeholders.extend(amendment_placeholders)
-    elif action_type == "LG_LIQUIDATION":
+    elif action_type in ("LG_LIQUIDATE", "LG_LIQUIDATION"):
         liquidation_placeholders = [
-            {"name": "{{liquidation_amount}}", "description": "Amount being liquidated (for partial liquidation)."},
-            {"name": "{{remaining_amount}}", "description": "Remaining LG amount after partial liquidation."},
-        ]
-        placeholders.extend(liquidation_placeholders)
-    elif action_type == "LG_RELEASE" or action_type == "LG_LIQUIDATION":
-        release_liquidation_placeholders = [
+            {"name": "{{liquidation_type}}", "description": "Liquidation type ('Full' or 'Partial')."},
+            {"name": "{{original_lg_amount_formatted}}", "description": "Original LG amount before liquidation (formatted)."},
+            {"name": "{{liquidation_amount_formatted}}", "description": "Amount being liquidated (formatted)."},
+            {"name": "{{new_lg_amount_formatted}}", "description": "Remaining LG amount after liquidation (formatted)."},
+            {"name": "{{settlement_instruction}}", "description": "Configurable settlement / bank transfer instruction text."},
+            {"name": "{{enclosed_documents_clause}}", "description": "Dynamic clause stating whether original LG & all extensions are enclosed or pending."},
             {"name": "{{total_documents_received}}", "description": "Total original documents received from bank for this LG."},
             {"name": "{{pending_replies_count}}", "description": "Number of pending replies from the bank for this LG."},
         ]
-        placeholders.extend(release_liquidation_placeholders)
-    elif action_type == "ACTIVATION":
+        placeholders.extend(liquidation_placeholders)
+    elif action_type == "LG_RELEASE":
+        release_placeholders = [
+            {"name": "{{enclosed_documents_clause}}", "description": "Dynamic clause stating whether original LG & all extensions are enclosed or pending."},
+            {"name": "{{total_documents_received}}", "description": "Total original documents received from bank for this LG."},
+            {"name": "{{pending_replies_count}}", "description": "Number of pending replies from the bank for this LG."},
+        ]
+        placeholders.extend(release_placeholders)
+    elif action_type in ("LG_ACTIVATE_NON_OPERATIVE", "ACTIVATION"):
         activation_placeholders = [
-            {"name": "{{payment_details}}", "description": "Details of the activating payment (e.g., cheque number, transfer reference)."},
+            {"name": "{{payment_method}}", "description": "Payment method used to activate the guarantee."},
+            {"name": "{{payment_amount_formatted}}", "description": "Formatted payment amount with currency."},
+            {"name": "{{payment_date}}", "description": "Date of the activating payment."},
+            {"name": "{{payment_reference}}", "description": "Cheque number or wire transfer reference."},
+            {"name": "{{payment_issuing_bank_name}}", "description": "Bank from which the payment was issued."},
         ]
         placeholders.extend(activation_placeholders)
-    elif action_type == "REMINDER":
+    elif action_type in ("LG_REMINDER_TO_BANKS", "REMINDER"):
         reminder_placeholders = [
             {"name": "{{original_instruction_serial}}", "description": "Serial number of the instruction the reminder relates to."},
             {"name": "{{days_overdue}}", "description": "Number of days the instruction has been overdue."},
             {"name": "{{original_instruction_date}}", "description": "The date the original instruction was issued."},
             {"name": "{{original_instruction_delivery_date}}", "description": "The date the original instruction was delivered."},
             {"name": "{{original_instruction_type}}", "description": "Type of the original instruction."},
+            {"name": "{{delivery_clause}}", "description": "Clause indicating delivery date if delivered."},
         ]
         placeholders.extend(reminder_placeholders)
+    elif action_type == "LG_CANCEL_LIQUIDATION":
+        cancel_liq_placeholders = [
+            {"name": "{{liquidation_date}}", "description": "Date of the previous liquidation demand."},
+            {"name": "{{internal_ref}}", "description": "Internal reference of the guarantee."},
+            {"name": "{{original_lg_amount_formatted}}", "description": "Current guarantee amount (formatted)."},
+            {"name": "{{target_outcome_label}}", "description": "Target post-cancellation outcome (Re-Activate or Release)."},
+            {"name": "{{settlement_reference}}", "description": "Commercial settlement reference."},
+            {"name": "{{settlement_date}}", "description": "Commercial settlement date."},
+        ]
+        placeholders.extend(cancel_liq_placeholders)
     elif action_type == "LG_ISSUANCE_REQUEST":
         issuance_placeholders = [
             {"name": "{{beneficiary_name}}", "description": "Name of the LG beneficiary."},
@@ -3037,7 +3080,7 @@ def create_template(
     current_user: TokenData = Depends(HasPermission("template:create")),
     request: Request = None
 ):
-    """Create a new template."""
+    """Create a new template, or update an existing non-notification template for the same scope & action_type."""
     existing_template = crud_template.get_by_name_and_action_type(
         db,
         name=template_in.name,
@@ -3045,11 +3088,21 @@ def create_template(
         customer_id=template_in.customer_id,
         is_notification_template=template_in.is_notification_template
     )
-    if existing_template:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Template with name '{template_in.name}' and action type '{template_in.action_type}' already exists for this scope and purpose."
+    if not existing_template and not template_in.is_notification_template:
+        existing_template = crud_template.get_single_template(
+            db,
+            action_type=template_in.action_type,
+            is_global=template_in.is_global,
+            customer_id=template_in.customer_id,
+            is_notification_template=False
         )
+    if existing_template:
+        update_data = TemplateUpdate(**template_in.model_dump())
+        db_template = crud_template.update(db, db_obj=existing_template, obj_in=update_data)
+        client_host = get_client_ip(request) if request else None
+        log_action(db, user_id=current_user.user_id, action_type="UPDATE", entity_type="Template", entity_id=db_template.id, details={"name": db_template.name, "action_type": db_template.action_type, "is_global": db_template.is_global, "customer_id": db_template.customer_id, "is_notification_template": db_template.is_notification_template, "ip_address": client_host})
+        return db_template
+
     db_template = crud_template.create(db, obj_in=template_in)
     client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="CREATE", entity_type="Template", entity_id=db_template.id, details={"name": db_template.name, "action_type": db_template.action_type, "is_global": db_template.is_global, "customer_id": db_template.customer_id, "is_notification_template": db_template.is_notification_template, "ip_address": client_host})
@@ -3085,6 +3138,182 @@ def read_templates(
             tpl.customer_name = tpl.customer.name
     return templates
 
+@router.post("/templates/review")
+@router.post("/template-review")
+def review_and_validate_template(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("template:view"))
+):
+    """
+    Revises an uploaded or edited HTML template for a specific action_type:
+    - Extracts all {{...}} placeholders used in the HTML
+    - Checks against the official placeholder catalog for that action_type
+    - Identifies recognized, missing recommended, and unknown placeholders
+    - Checks HTML structural health (@page rule, tables, recipient/signature sections)
+    - Generates a realistic populated HTML preview with sample LG data so the admin can visually inspect it before approving.
+    """
+    import re
+    content = payload.get("content") or ""
+    action_type = payload.get("action_type") or "LG_EXTENSION"
+    customer_id = payload.get("customer_id")
+
+    # 1. Fetch official placeholders for this action_type
+    official_list = get_template_placeholders(
+        action_type=action_type, lg_record_id=None, db=db, current_user=current_user
+    )
+    official_map = {p["name"].strip("{}"): p["description"] for p in official_list}
+
+    # 2. Extract placeholders found in the template content
+    found_raw = re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", content)
+    found_unique = sorted(list(set(found_raw)))
+
+    recognized = [
+        {"placeholder": f"{{{{{k}}}}}", "description": official_map[k], "count": found_raw.count(k)}
+        for k in found_unique if k in official_map
+    ]
+    unknown = [
+        {"placeholder": f"{{{{{k}}}}}", "count": found_raw.count(k)}
+        for k in found_unique if k not in official_map
+    ]
+
+    # Essential placeholders per action_type
+    essential_by_action = {
+        "LG_EXTENSION": ["lg_number", "old_expiry_date", "new_expiry_date", "lg_amount_formatted"],
+        "LG_DECREASE_AMOUNT": ["lg_number", "original_lg_amount_formatted", "new_lg_amount_formatted"],
+        "LG_RELEASE": ["lg_number", "lg_amount_formatted", "lg_issuer_name"],
+        "LG_LIQUIDATE": ["lg_number", "original_lg_amount_formatted", "lg_issuer_name"],
+        "LG_ACTIVATE_NON_OPERATIVE": ["lg_number", "payment_amount_formatted", "payment_date", "payment_reference"],
+        "LG_REMINDER_TO_BANKS": ["lg_number", "original_instruction_serial", "days_overdue"],
+        "LG_CANCEL_LIQUIDATION": ["lg_number", "liquidation_date", "target_outcome_label"],
+    }
+    required_keys = essential_by_action.get(action_type, ["lg_number"])
+    missing_essential = [
+        {"placeholder": f"{{{{{k}}}}}", "description": official_map.get(k, "Core action field")}
+        for k in required_keys if k not in found_unique
+    ]
+
+    # 3. Structural & Print-Readiness Checks
+    checks = [
+        {
+            "id": "html_structure",
+            "label": "Valid HTML Document Structure (<html> & <body>)",
+            "passed": ("<html" in content.lower() and "<body" in content.lower()),
+        },
+        {
+            "id": "page_rule",
+            "label": "WeasyPrint A4 Print Page Rule (@page)",
+            "passed": ("@page" in content.lower()),
+        },
+        {
+            "id": "details_table",
+            "label": "Structured Specification Table (<table>)",
+            "passed": ("<table" in content.lower()),
+        },
+        {
+            "id": "essential_fields",
+            "label": f"All Core Action Placeholders Present ({len(required_keys) - len(missing_essential)}/{len(required_keys)})",
+            "passed": len(missing_essential) == 0,
+        },
+        {
+            "id": "no_unknown_fields",
+            "label": "No Unrecognized / Typo Placeholders",
+            "passed": len(unknown) == 0,
+        },
+    ]
+
+    customer_name_sample = "Orange Egypt for Telecommunications S.A.E."
+    customer_addr_sample = "Smart Village, KM 28 Cairo-Alexandria Desert Road, Giza, Egypt"
+    customer_email_sample = "treasury.lg@orange.com"
+    if customer_id:
+        cust = db.query(Customer).filter(Customer.id == int(customer_id)).first()
+        if cust:
+            customer_name_sample = cust.name
+            customer_addr_sample = cust.address or customer_addr_sample
+            customer_email_sample = cust.contact_email or customer_email_sample
+
+    # 4. Build realistic sample data to render preview
+    sample_data = {
+        "customer_name": customer_name_sample,
+        "company_name": customer_name_sample,
+        "entity_name": customer_name_sample,
+        "customer_address": customer_addr_sample,
+        "customer_contact_email": customer_email_sample,
+        "customer_phone": "+20 2 3535 0000",
+        "current_date": datetime.now().strftime("%Y-%m-%d"),
+        "platform_name": "Grow BD Treasury Management Platform",
+        "instruction_serial": "ORG-PF-0042-EXT-0001-001-O",
+        "serial_number": "ORG-PF-0042-EXT-0001-001-O",
+        "lg_number": "LG/2026/984120",
+        "lg_serial_number": "LG/2026/984120",
+        "lg_amount": "2,500,000.00",
+        "lg_amount_formatted": "EGP 2,500,000.00",
+        "lg_currency": "EGP",
+        "currency_code": "EGP",
+        "issuing_bank_name": "Commercial International Bank (CIB)",
+        "bank_name": "Commercial International Bank (CIB)",
+        "recipient_name": "Commercial International Bank (CIB) — Trade Finance & LG Dept.",
+        "recipient_address": "21/23 Charles De Gaulle St., Giza, Egypt",
+        "lg_beneficiary_name": customer_name_sample,
+        "beneficiary_name": customer_name_sample,
+        "lg_issuer_name": "Al-Futtaim Engineering & Technologies SAE",
+        "issuance_date": "2026-01-15",
+        "issue_date": "2026-01-15",
+        "expiry_date": "2026-12-31",
+        "maturity_date": "2026-12-31",
+        "old_expiry_date": "2026-12-31",
+        "new_expiry_date": "2027-06-30",
+        "extension_period": "6 Month(s)",
+        "original_lg_amount": "2,500,000.00",
+        "original_lg_amount_formatted": "EGP 2,500,000.00",
+        "decrease_amount": "500,000.00",
+        "decrease_amount_formatted": "EGP 500,000.00",
+        "new_lg_amount": "2,000,000.00",
+        "new_lg_amount_formatted": "EGP 2,000,000.00",
+        "liquidation_type": "Full",
+        "liquidation_amount": "2,500,000.00",
+        "liquidation_amount_formatted": "EGP 2,500,000.00",
+        "settlement_instruction": f"Kindly arrange to transfer the liquidated LG proceeds to our corporate account held under the name of {customer_name_sample}, in accordance with our standing banking instructions.",
+        "enclosed_documents_clause": "Kindly find the original Letter of Guarantee attached herewith along with all its extension confirmation(s) received from your esteemed bank for your records and cancellation.",
+        "total_documents_received": "1",
+        "pending_replies_count": "0",
+        "payment_method": "Wire Transfer",
+        "payment_amount": "2,500,000.00",
+        "payment_amount_formatted": "EGP 2,500,000.00",
+        "payment_currency_code": "EGP",
+        "payment_date": "2026-11-01",
+        "payment_reference": "TRX-994827104",
+        "payment_issuing_bank_name": "QNB ALAHLI",
+        "original_instruction_serial": "ORG-PF-0042-EXT-0001-001-O",
+        "original_instruction_date": "2026-10-15",
+        "original_instruction_delivery_date": "2026-10-17",
+        "original_instruction_type": "LG_EXTENSION",
+        "days_overdue": "17",
+        "delivery_clause": "(or delivered on 2026-10-17)",
+        "liquidation_date": "2026-10-20",
+        "internal_ref": "LG-INT-0042",
+        "target_outcome_label": "Re-Activate Guarantee (Active)",
+        "settlement_reference": "STL-2026-881",
+        "settlement_date": "2026-11-02",
+        "notes_section": "",
+    }
+
+    rendered_preview = content
+    for k, v in sample_data.items():
+        rendered_preview = re.sub(r"\{\{\s*" + re.escape(k) + r"\s*\}\}", str(v), rendered_preview)
+
+    is_ready = len(missing_essential) == 0 and ("<html" in content.lower() or "<table" in content.lower() or "<div" in content.lower())
+
+    return {
+        "is_ready": is_ready,
+        "action_type": action_type,
+        "recognized_placeholders": recognized,
+        "unknown_placeholders": unknown,
+        "missing_essential_placeholders": missing_essential,
+        "checks": checks,
+        "rendered_preview": rendered_preview,
+    }
+
 @router.get("/templates/{template_id}", response_model=TemplateOut)
 def read_template(
     template_id: int, 
@@ -3104,12 +3333,22 @@ def get_template_metadata(db: Session = Depends(get_db)):
     # 1. Get unique action types currently used in your DB
     distinct_actions = db.execute(select(Template.action_type).distinct()).scalars().all()
     
-    # 2. Ensure issuance-related action types always appear even before any templates are created
-    all_action_types = set(distinct_actions)
-    all_action_types.add("LG_ISSUANCE_REQUEST")  # Always available for issuance signed letters
+    # 2. Ensure core custody & issuance action types always appear
+    all_action_types = set(filter(None, distinct_actions))
+    all_action_types.update([
+        "LG_EXTENSION",
+        "LG_DECREASE_AMOUNT",
+        "LG_RELEASE",
+        "LG_LIQUIDATE",
+        "LG_ACTIVATE_NON_OPERATIVE",
+        "LG_REMINDER_TO_BANKS",
+        "LG_CANCEL_LIQUIDATION",
+        "LG_ISSUANCE_REQUEST",
+        "LG_BANK_COMPANION_LETTER",
+    ])
     
     return {
-        "template_types": ["EMAIL", "LETTER", "PDF_ATTACHMENT"],
+        "template_types": ["LETTER", "EMAIL", "PDF_ATTACHMENT"],
         "action_types": sorted(list(all_action_types)) 
     }
 
@@ -3224,6 +3463,18 @@ def verify_audit_chain(
     """
     from app.core.audit_crypto import verify_audit_log_chain
     return verify_audit_log_chain(db, start_id=start_id, limit=limit)
+
+@router.post("/audit-logs/reseal-chain")
+def reseal_audit_chain(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("audit_log:view"))
+):
+    """
+    Phase 5: Re-seals broken hash-chain continuity links caused by concurrent audit writes,
+    after first verifying that every record's payload matches its originally computed hash.
+    """
+    from app.core.audit_crypto import reseal_audit_log_chain
+    return reseal_audit_log_chain(db)
 
 @router.get("/audit-logs/", response_model=List[AuditLogOut])
 def read_audit_logs(
