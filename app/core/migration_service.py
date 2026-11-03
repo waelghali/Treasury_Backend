@@ -320,14 +320,32 @@ def _apply_defaults_and_autofill(
             logger.warning(f"Period calculation failed: {e}")
 
     # Set hard defaults if still missing
-    record_data["auto_renewal"] = record_data.get("auto_renewal", True)
+    record_data["auto_renewal"] = _coerce_auto_renewal_bool(record_data.get("auto_renewal"), True)
     
     # Ensure payable currency matches if not specified
     if not record_data.get("lg_payable_currency_id"):
         record_data["lg_payable_currency_id"] = record_data.get("lg_currency_id")
 
     return record_data
-    
+
+
+def _coerce_auto_renewal_bool(val: Any, default: bool = True) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("", "none", "null", "n/a", "nan"):
+            return default
+        if s in ("false", "no", "n", "0", "non-renewable", "not renewable"):
+            return False
+        return True
+    return bool(val)
+
+
 class MigrationService:
     def __init__(self):
         pass
@@ -536,7 +554,8 @@ class MigrationService:
         url: str,
         document_type: str,
         uploaded_by_user_id: int,
-        original_instruction_serial: Optional[str] = None
+        original_instruction_serial: Optional[str] = None,
+        cleanup_staging: bool = True,
     ) -> Optional[int]:
         """
         Fetches file content from staging/URL, calls crud_lg_document.create_document
@@ -589,7 +608,7 @@ class MigrationService:
             )
 
             # Once encrypted and stored in the permanent lg_custody cloud folder, clean up temporary migration files
-            if db_document and db_document.id:
+            if cleanup_staging and db_document and db_document.id:
                 self._cleanup_migration_staging_file(url, cust_id, db)
 
             return db_document.id
@@ -597,7 +616,16 @@ class MigrationService:
             logger.error(f"Error creating document for lg_record_id={lg_record_id}: {e}", exc_info=True)
             return None
 
-    async def _apply_migration_amendment(self, db: Session, lg_record_id: int, updates: Dict[str, Any], user_id: int, staged_record_id: int):
+    async def _apply_migration_amendment(
+        self,
+        db: Session,
+        lg_record_id: int,
+        updates: Dict[str, Any],
+        user_id: int,
+        staged_record_id: int,
+        cleanup_staging: bool = True,
+        staged_urls_to_cleanup: Optional[List[str]] = None,
+    ):
         """
         Applies a single amendment to an existing LG record and logs the change.
         """
@@ -608,34 +636,60 @@ class MigrationService:
             from app.constants import DOCUMENT_TYPE_INTERNAL_SUPPORTING
 
             # --- Flatten the diff dictionary ---
-            updates_to_apply = {}
+            raw_updates = {}
             for key, val in updates.items():
                 if isinstance(val, dict) and 'new' in val:
-                    updates_to_apply[key] = val['new']
+                    raw_updates[key] = val['new']
                 else:
-                    updates_to_apply[key] = val
+                    raw_updates[key] = val
             
             # --- Intercept Attachment URL ---
-            if "attachment_url" in updates_to_apply:
-                new_url = updates_to_apply["attachment_url"]
+            if "attachment_url" in raw_updates:
+                new_url = raw_updates["attachment_url"]
                 
                 if new_url:
                     clean_url = str(new_url).strip().strip("'").strip('"')
-                    await self._create_document_from_url(
+                    doc_id = await self._create_document_from_url(
                         db=db,
                         lg_record_id=lg_record_id,
                         url=clean_url,
                         document_type=DOCUMENT_TYPE_INTERNAL_SUPPORTING,
                         uploaded_by_user_id=user_id,
-                        original_instruction_serial=f"MIG-HIST-{staged_record_id}"
+                        original_instruction_serial=f"MIG-HIST-{staged_record_id}",
+                        cleanup_staging=cleanup_staging,
                     )
+                    if doc_id and not cleanup_staging and staged_urls_to_cleanup is not None:
+                        staged_urls_to_cleanup.append(clean_url)
                     logger.info(f"Created amendment document from {clean_url}")
 
-                del updates_to_apply["attachment_url"]
+                del raw_updates["attachment_url"]
 
             lg_obj = db.query(LGRecord).filter(LGRecord.id == lg_record_id).first()
             if not lg_obj:
                 raise ValueError(f"LG Record {lg_record_id} not found.")
+
+            updatable_fields = {
+                "lg_amount", "lg_currency_id", "lg_payable_currency_id", "issuance_date",
+                "expiry_date", "auto_renewal", "lg_type_id", "lg_status_id",
+                "lg_operational_status_id", "payment_conditions", "description_purpose",
+                "issuing_bank_id", "issuing_bank_address", "issuing_bank_phone",
+                "issuing_bank_fax", "issuing_method_id", "applicable_rule_id",
+                "applicable_rules_text", "other_conditions", "internal_owner_contact_id",
+                "lg_category_id", "additional_field_values", "internal_contract_project_id",
+                "notes", "lg_number", "beneficiary_corporate_id", "issuer_name", "issuer_id"
+            }
+
+            updates_to_apply = {}
+            for k, v in raw_updates.items():
+                if k not in updatable_fields:
+                    continue
+                if k == "auto_renewal":
+                    coerced_bool = _coerce_auto_renewal_bool(v, True)
+                    if getattr(lg_obj, "auto_renewal", None) == coerced_bool:
+                        continue
+                    updates_to_apply[k] = coerced_bool
+                else:
+                    updates_to_apply[k] = v
 
             updated_lg_record = lg_obj
             if updates_to_apply:
@@ -648,6 +702,7 @@ class MigrationService:
                     user_id=user_id,
                     customer_id=lg_obj.customer_id,
                     approval_request_id=None,
+                    is_migration=True,
                 )
 
             # Calculate Next Change Index
@@ -746,7 +801,7 @@ class MigrationService:
                 "lg_payable_currency_id": source_data.get("lg_payable_currency_id"),
                 "issuance_date": source_data.get("issuance_date"),
                 "expiry_date": source_data.get("expiry_date"),
-                "auto_renewal": source_data.get("auto_renewal", True),
+                "auto_renewal": _coerce_auto_renewal_bool(source_data.get("auto_renewal"), True),
                 "lg_type_id": source_data.get("lg_type_id"),
                 "lg_operational_status_id": source_data.get("lg_operational_status_id"),
                 "payment_conditions": source_data.get("payment_conditions"),

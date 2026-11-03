@@ -2022,7 +2022,8 @@ class CRUDLGRecord(CRUDBase):
                        user_id: int,
                        customer_id: int,
                        approval_request_id: Optional[int],
-                       existing_document_id: Optional[int] = None
+                       existing_document_id: Optional[int] = None,
+                       is_migration: bool = False
                        ) -> models.LGRecord:
         """
         Applies amendments to an LG record based on bank amendment letter.
@@ -2044,8 +2045,10 @@ class CRUDLGRecord(CRUDBase):
             and db_lg_record.expiry_date.date() >= thirty_days_ago
         )
 
-        if db_lg_record.is_deleted or (db_lg_record.lg_status_id not in [models.LgStatusEnum.VALID.value, models.LgStatusEnum.EXPIRED.value]) or (
-            db_lg_record.lg_status_id == models.LgStatusEnum.EXPIRED.value and not is_expired_within_grace_period
+        if not is_migration and (
+            db_lg_record.is_deleted
+            or (db_lg_record.lg_status_id not in [models.LgStatusEnum.VALID.value, models.LgStatusEnum.EXPIRED.value])
+            or (db_lg_record.lg_status_id == models.LgStatusEnum.EXPIRED.value and not is_expired_within_grace_period)
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -2123,6 +2126,9 @@ class CRUDLGRecord(CRUDBase):
                         updates_to_apply[key] = decimal.Decimal(str(value))
                     except (decimal.InvalidOperation, ValueError):
                         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid numeric format for {key}.")
+                elif key == "auto_renewal":
+                    from app.core.migration_service import _coerce_auto_renewal_bool
+                    updates_to_apply[key] = _coerce_auto_renewal_bool(value, True)
                 else:
                     updates_to_apply[key] = value
             else:
@@ -2179,7 +2185,7 @@ class CRUDLGRecord(CRUDBase):
             },
             updated_lg_record.customer_id, updated_lg_record.id
         )
-        if approval_request_id is None:
+        if approval_request_id is None and not is_migration:
             email_settings_to_use: EmailSettings
             email_method_for_log: str
             try:

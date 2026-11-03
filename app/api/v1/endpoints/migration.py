@@ -754,7 +754,8 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
     if urdg_rule and not record_data.get("applicable_rule_id"):
         record_data["applicable_rule_id"] = urdg_rule.id
     
-    record_data["auto_renewal"] = record_data.get("auto_renewal", True)
+    from app.core.migration_service import _coerce_auto_renewal_bool
+    record_data["auto_renewal"] = _coerce_auto_renewal_bool(record_data.get("auto_renewal"), True)
     
     logger.debug(f"Autofill process complete. Final fields: {list(record_data.keys())}")
     return record_data
@@ -887,6 +888,10 @@ async def upload_structured_file_for_staging(
                     for d_col in ("issuance_date", "expiry_date"):
                         if d_col in row_dict:
                             row_dict[d_col] = _coerce_date_cell(row_dict[d_col])
+
+                    if "auto_renewal" in row_dict:
+                        from app.core.migration_service import _coerce_auto_renewal_bool
+                        row_dict["auto_renewal"] = _coerce_auto_renewal_bool(row_dict["auto_renewal"], True)
 
                     records_to_stage.append(row_dict)
 
@@ -1214,20 +1219,22 @@ async def import_historical_records(
                     continue
                 
                 # --- FIX START: Sanitize and Enrich Data ---
+                from app.core.migration_service import _coerce_auto_renewal_bool
                 first_snapshot_data = first_snapshot.source_data_json.copy()
                 first_snapshot_data.pop('history_sequence', None)
                 first_snapshot_data.pop('history_timestamp', None)
+                first_snapshot_data["auto_renewal"] = _coerce_auto_renewal_bool(first_snapshot_data.get("auto_renewal"), True)
                 
                 # 1. Enrich Owner Details (Phone & Manager Email)
                 owner_id = first_snapshot_data.get("internal_owner_contact_id")
+                owner_obj = None
                 if owner_id:
-                    owner_obj = None
                     if isinstance(owner_id, int):
                         owner_obj = crud_internal_owner_contact.get(db, id=owner_id)
                     elif isinstance(owner_id, str):
                         clean_email = owner_id.strip()
                         if clean_email:
-                            owner = crud_internal_owner_contact.get_by_email_for_customer(db, current_user.customer_id, clean_email)
+                            owner_obj = crud_internal_owner_contact.get_by_email_for_customer(db, current_user.customer_id, clean_email)
                     if owner_obj:
                         # We inject these ONLY so the Validator is happy.
                         # The CRUD function will strip them out before saving to DB.
@@ -1280,6 +1287,7 @@ async def import_historical_records(
                 
                 # --- FIX: INSERT FILE UPLOAD LOGIC HERE ---
                 # We extract the URL from the FIRST snapshot's source data
+                staged_urls_to_cleanup: List[str] = []
                 if sorted_snapshots:
                     first_snapshot_for_upload = sorted_snapshots[0]
                     first_data = first_snapshot_for_upload.source_data_json or {}
@@ -1293,14 +1301,17 @@ async def import_historical_records(
                         try:
                             from app.constants import DOCUMENT_TYPE_ORIGINAL_LG
                             
-                            # We can reuse the service method since we have the service instance
-                            await migration_service._create_document_from_url(
+                            # Defer staging file cleanup until the entire LG group commits
+                            doc_id = await migration_service._create_document_from_url(
                                 db=db,
                                 lg_record_id=new_lg.id,
                                 url=clean_url,
                                 document_type=DOCUMENT_TYPE_ORIGINAL_LG,
-                                uploaded_by_user_id=current_user.user_id
+                                uploaded_by_user_id=current_user.user_id,
+                                cleanup_staging=False,
                             )
+                            if doc_id:
+                                staged_urls_to_cleanup.append(clean_url)
                         except Exception as e:
                             logger.error(f"Failed to upload initial document for LG id={new_lg.id}: {e}")
                 # ------------------------------------------------------------------
@@ -1315,7 +1326,13 @@ async def import_historical_records(
                         
                         if diff:
                             await migration_service._apply_migration_amendment(
-                                db, new_lg.id, diff, current_user.user_id, current_snapshot.id
+                                db,
+                                new_lg.id,
+                                diff,
+                                current_user.user_id,
+                                current_snapshot.id,
+                                cleanup_staging=False,
+                                staged_urls_to_cleanup=staged_urls_to_cleanup,
                             )
 
                 # Reload the record from DB to get the latest expiry_date
@@ -1350,6 +1367,9 @@ async def import_historical_records(
                     snap.record_status = MigrationRecordStatusEnum.IMPORTED
                     snap.production_lg_id = new_lg.id
                 
+                for clean_u in staged_urls_to_cleanup:
+                    migration_service._cleanup_migration_staging_file(clean_u, current_user.customer_id, db)
+
                 batch_results['imported'] += 1
             
             except Exception as e:
