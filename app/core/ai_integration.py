@@ -1580,24 +1580,31 @@ async def _process_batch_migration_documents_with_ai_core(
 
     intro_prompt = """You are an expert financial document analyst auditing a batch of bank Letters of Guarantee (LG) and LG Amendment documents (which may be in English, Arabic, or bilingual).
 Below you are given multiple documents in a single batch. Each document starts with a clear delimiter header of the form:
-`=== DOCUMENT_START | key="<KEY>" | role="<CREATION_OR_AMENDMENT>" | expected_lg_number="<LG_HINT>" ===`
+`=== DOCUMENT_START | key="<KEY>" | role="<CREATION_OR_AMENDMENT>" | expected_lg_number="<LG_HINT>" | expected_bank="<BANK_HINT>" | expected_amount="<AMOUNT_HINT>" | expected_currency="<CURR_HINT>" | expected_issuance_date="<ISS_DATE_HINT>" | expected_expiry_date="<EXP_DATE_HINT>" ===`
 followed immediately by that document's PDF/image pages, and ends with `=== DOCUMENT_END | key="<KEY>" ===`.
 
-For EVERY document in the batch, extract its structured data independently and return it in the `documents` array with its exact `key`:
+For EVERY document in the batch, inspect the actual document pages carefully and return its structured data in the `documents` array with its exact `key`:
 1. `key`: Exact `key` string from the document header.
-2. `lgNumber`: The LG reference number as written on the document.
-3. `lgAmount`: The guarantee amount (or new amended guarantee amount) as a plain float without commas.
-4. `currency`: 3-letter ISO currency code (e.g. EGP, USD, EUR, SAR, AED, GBP).
-5. `issuingBankName`: The formal English name of the issuing bank (e.g. Commercial International Bank, National Bank of Egypt, Banque Misr, QNB Alahli, HSBC, Arab African International Bank, etc.).
-6. `issuanceDate`: Date the LG was issued in `YYYY-MM-DD` format.
-7. `expiryDate`: Date the LG expires (or new amended expiry date) in `YYYY-MM-DD` format.
+2. `lgNumber`: The LG reference number on the document.
+   - CRITICAL (Arabic RTL / BiDi Ordering): In Arabic/bilingual PDFs, LG numbers with letters and dashes/slashes (e.g. `AB-12345` vs `12345-AB`, or `LG/2024/987` vs `987/2024/LG`) often appear visually reversed due to right-to-left text layout. If the document contains the same letter and digit segments as `expected_lg_number` (even if reversed around `-` or `/`), return `expected_lg_number` in its canonical order.
+3. `lgAmount`: The Letter of Guarantee amount (`مبلغ خطاب الضمان / بمبلغ وقدره`) as a plain float without commas.
+   - CRITICAL: Do NOT confuse the LG Guarantee Amount with:
+     (a) The total Contract / Tender / Purchase Order value (`قيمة العقد / العملية / أمر التوريد`), which is typically 10x–20x larger than the LG amount, OR
+     (b) The Bank's Authorized or Paid-up Capital (`رأس المال المرخص به / المصدر والمدفوع`) printed in the bank's letterhead or footer.
+   - If the document states both a previous LG amount and a new/current LG amount, extract the new/current LG amount.
+4. `currency`: 3-letter ISO currency code (`EGP` for `جنيه مصري / جم / L.E.`, `USD` for `دولار أمريكي / $`, `EUR` for `يورو / €`, `SAR`, `AED`, `GBP`).
+5. `issuingBankName`: The name of the bank that issued the LG.
+   - CRITICAL: If the bank on the document is the SAME institution as `expected_bank`—even if written as an acronym/short name (e.g. `CIB`, `QNB`, `QNB Alahli`, `NBE`, `BM`, `AAIB`, `CAE`, `FABMISR`, `Bank Audi`, `ADIB`, `ADCB`, `NBK`, `ABK`, `BDC`, `HDB`, `SCB`, `EGBANK`, `ALEXBANK`, `SAIB`, `EBE`, `AUB`, `HSBC`), or in Arabic (e.g. `البنك التجاري الدولي`, `بنك قطر الوطني`, `البنك الأهلي المصري`, `بنك مصر`, `البنك العربي الأفريقي الدولي`, `بنك القاهرة`, `كريدي أجريكول`, `بنك التعمير والإسكان`, `بنك قناة السويس`, `بنك الإسكندرية`, `المصرف المتحد`, `بنك فيصل الإسلامي`, `بنك البركة`), or with legal suffixes (`S.A.E.`, `Egypt`)—return the exact `expected_bank` string so false-positive bank name variances do not occur. Only return a different bank name if the document genuinely belongs to a different bank.
+6. `issuanceDate`: Date the LG was issued (`تاريخ الإصدار / تحريراً في`) in `YYYY-MM-DD` format.
+   - CRITICAL: Bank documents in Egypt/MENA/Europe use `DD/MM/YYYY` (Day first, Month second, Year third). Do NOT swap Day and Month when Day <= 12. Do NOT extract the underlying Contract Date (`تاريخ العقد / المناقصة`) instead of the LG Issuance Date.
+7. `expiryDate`: Date the LG expires (`تاريخ الانتهاء / ساري حتى / صالح لغاية`) in `YYYY-MM-DD` format.
+   - CRITICAL: If the document shows an extension/amendment mentioning both an old expiry date and a new extended expiry date (`مد صلاحية خطاب الضمان ليصبح ساري حتى...`), extract the NEW extended expiry date.
 8. `is_relevant_amendment`: Boolean (`true` if the document refers to `expected_lg_number` or amends/extends it).
 9. `amendedFields`: For `AMENDMENT` documents (or if the document amends an LG), include an object with any amended fields (`expiryDate` in `YYYY-MM-DD` format, `lgAmount` as a plain float, `currency` as 3-letter ISO code).
 
 Important Rules:
 - Do NOT mix data between different documents in the batch.
-- Format all dates strictly as `YYYY-MM-DD`.
-- Format all amounts strictly as plain numbers (no commas or currency symbols).
+- Never hallucinate: if a document genuinely shows a different amount, different expiry date, or different LG number from the expected hints, report the actual value from the document.
 """
     contents.append(intro_prompt)
 
@@ -1607,6 +1614,11 @@ Important Rules:
         mime_type = item.get("mime_type") or "application/pdf"
         doc_role = item.get("doc_role") or "CREATION"
         lg_hint = str(item.get("lg_number_hint") or "")
+        exp_bank = str(item.get("expected_bank") or "")
+        exp_amt = str(item.get("expected_amount") or "")
+        exp_curr = str(item.get("expected_currency") or "")
+        exp_iss_date = str(item.get("expected_issuance_date") or "")
+        exp_exp_date = str(item.get("expected_expiry_date") or "")
 
         doc_parts, pages_cnt = _prepare_multimodal_parts_for_doc(file_bytes, mime_type)
         if not doc_parts:
@@ -1616,7 +1628,10 @@ Important Rules:
         valid_items.append(item)
 
         contents.append(
-            f'\n=== DOCUMENT_START | key="{doc_key}" | role="{doc_role}" | expected_lg_number="{lg_hint}" ===\n'
+            f'\n=== DOCUMENT_START | key="{doc_key}" | role="{doc_role}" '
+            f'| expected_lg_number="{lg_hint}" | expected_bank="{exp_bank}" '
+            f'| expected_amount="{exp_amt}" | expected_currency="{exp_curr}" '
+            f'| expected_issuance_date="{exp_iss_date}" | expected_expiry_date="{exp_exp_date}" ===\n'
         )
         contents.extend(doc_parts)
         contents.append(f'\n=== DOCUMENT_END | key="{doc_key}" ===\n')

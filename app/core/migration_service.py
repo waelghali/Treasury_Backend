@@ -1147,7 +1147,9 @@ class MigrationService:
 
         # --- PRE-FETCH CACHES ---
         currency_map = {c.id: c.iso_code for c in db.query(Currency).all()}
-        bank_map = {b.id: b.name for b in db.query(Bank).all()}
+        all_banks = db.query(Bank).all()
+        bank_map = {b.id: b.name for b in all_banks}
+        bank_obj_map = {b.id: b for b in all_banks}
 
         # Entity Map (Safe Name Lookup)
         entities = db.query(CustomerEntity).filter(CustomerEntity.customer_id == customer_id).all()
@@ -1207,6 +1209,215 @@ class MigrationService:
         def norm(val):
             return str(val).strip().upper().replace(",", "").replace(".", "").replace("  ", " ")
 
+        _ARABIC_DIGITS_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+        def _lg_numbers_match(excel_lg: Any, ai_lg: Any) -> bool:
+            """
+            Smart LG Number comparison that eliminates false positives caused by:
+            - Separators (-, /, \\, _, ., spaces)
+            - Arabic RTL / BiDi token reversal (e.g. 'LG-45892' vs '45892-LG', 'MD/2024/105' vs '105/2024/MD')
+            - Leading zeros on numeric tokens ('LG-00458' vs 'LG-458')
+            - Common prefixes ('LG NO', 'REF', 'NO', 'خطاب ضمان رقم')
+            """
+            if not excel_lg or not ai_lg:
+                return False
+
+            def _clean_lg_str(v: Any) -> str:
+                s = str(v).translate(_ARABIC_DIGITS_MAP).strip().upper()
+                s = re.sub(r"^(LG\s*NO\.?|LG\s*#|REF\.?\s*NO\.?|REF\.?|NO\.?|خطاب\s*ضمان\s*رقم|ضمان\s*رقم|رقم)\s*[:\-]?\s*", "", s)
+                return s.strip()
+
+            s1 = _clean_lg_str(excel_lg)
+            s2 = _clean_lg_str(ai_lg)
+            if not s1 or not s2:
+                return False
+
+            # 1. Direct alphanumeric match ignoring all punctuation/separators
+            alnum1 = re.sub(r"[^A-Z0-9\u0621-\u064A]", "", s1)
+            alnum2 = re.sub(r"[^A-Z0-9\u0621-\u064A]", "", s2)
+            if alnum1 == alnum2:
+                return True
+            if alnum1.lstrip("0") == alnum2.lstrip("0") and alnum1.lstrip("0"):
+                return True
+
+            # 2. Token-level comparison (handles 'letters-dash-number' <-> 'number-dash-letters' RTL reversals)
+            def _extract_tokens(s: str) -> List[str]:
+                raw_tokens = re.findall(r"[A-Z\u0621-\u064A]+|\d+", s)
+                normalized = []
+                for t in raw_tokens:
+                    if t.isdigit():
+                        normalized.append(t.lstrip("0") or "0")
+                    else:
+                        normalized.append(t)
+                return normalized
+
+            t1 = _extract_tokens(s1)
+            t2 = _extract_tokens(s2)
+            if t1 and t2:
+                # Exact token sequence, reversed RTL sequence, or same token set (e.g. ['LG', '12345'] vs ['12345', 'LG'])
+                if t1 == t2 or t1 == t2[::-1] or sorted(t1) == sorted(t2):
+                    return True
+
+                # 3. Core numeric token match (when one side includes/omits a generic prefix like 'LG' or year suffix)
+                num_t1 = [t for t in t1 if t.isdigit() and len(t) >= 4]
+                num_t2 = [t for t in t2 if t.isdigit() and len(t) >= 4]
+                if num_t1 and num_t2 and num_t1 == num_t2:
+                    let_t1 = [t for t in t1 if not t.isdigit() and t not in ("LG", "REF", "NO")]
+                    let_t2 = [t for t in t2 if not t.isdigit() and t not in ("LG", "REF", "NO")]
+                    if not let_t1 or not let_t2 or set(let_t1) == set(let_t2):
+                        return True
+
+            # 4. OCR lookalike normalization (0<->O, 1<->I/L)
+            def _ocr_norm(s: str) -> str:
+                return s.replace("O", "0").replace("I", "1").replace("L", "1")
+
+            if len(alnum1) >= 4 and _ocr_norm(alnum1) == _ocr_norm(alnum2):
+                return True
+
+            return False
+
+        # Canonical Bank Equivalence Groups (English, Acronyms, Former Names, Arabic Names)
+        _CANONICAL_BANK_GROUPS = [
+            {"cib", "commercial international bank", "البنك التجاري الدولي", "التجاري الدولي", "comibc"},
+            {"nbe", "national bank of egypt", "البنك الاهلي المصري", "البنك الأهلي المصري", "الاهلي المصري", "الأهلي المصري", "nbeg"},
+            {"bm", "banque misr", "bank misr", "بنك مصر", "bmisr"},
+            {"qnb", "qnb alahli", "qnb al ahli", "qnb bebasata", "qatar national bank", "nsgb", "بنك قطر الوطني", "قطر الوطني الاهلي", "بنك قطر الوطني الأهلي"},
+            {"aaib", "arab african international bank", "البنك العربي الافريقي", "البنك العربي الأفريقي", "العربي الافريقي", "العربي الأفريقي"},
+            {"cae", "credit agricole", "crédit agricole", "eab", "egyptian american bank", "كريدي اجريكول", "كريدي أجريكول"},
+            {"bdc", "banque du caire", "bank of cairo", "cairo bank", "بنك القاهرة", "بنك القاهره"},
+            {"fab", "fabmisr", "fab misr", "first abu dhabi", "bank audi", "بنك ابوظبي الاول", "بنك أبوظبي الأول", "بنك عوده"},
+            {"adib", "abu dhabi islamic bank", "مصرف ابوظبي الاسلامي", "مصرف أبوظبي الإسلامي"},
+            {"adcb", "abu dhabi commercial bank", "unb", "union national bank", "بنك ابوظبي التجاري", "بنك أبوظبي التجاري"},
+            {"enbd", "emirates nbd", "bnp paribas", "بنك الامارات دبي الوطني", "بنك الإمارات دبي الوطني"},
+            {"hsbc", "hsbc bank", "اتش اس بي سي", "إتش إس بي سي"},
+            {"alexbank", "bank of alexandria", "alex bank", "intesa sanpaolo", "بنك الاسكندرية", "بنك الإسكندرية"},
+            {"hdb", "housing and development bank", "housing development bank", "بنك التعمير والاسكان", "بنك التعمير والإسكان"},
+            {"scb", "suez canal bank", "بنك قناة السويس"},
+            {"egbank", "eg bank", "egyptian gulf bank", "البنك المصري الخليجي"},
+            {"nbk", "national bank of kuwait", "al watany bank", "awb", "بنك الكويت الوطني", "البنك الوطني المصري"},
+            {"abk", "al ahli bank of kuwait", "piraeus", "البنك الاهلي الكويتي", "البنك الأهلي الكويتي"},
+            {"aub", "ahli united bank", "البنك الاهلي المتحد", "البنك الأهلي المتحد"},
+            {"saib", "societe arabe internationale de banque", "بنك الشركة المصرفية", "الشركة المصرفية العربية الدولية"},
+            {"ebank", "ebe", "export development bank", "البنك المصري لتنمية الصادرات", "تنمية الصادرات"},
+            {"al baraka", "albaraka", "baraka bank", "بنك البركة", "بنك البركه"},
+            {"faisal", "faisal islamic bank", "بنك فيصل الاسلامي", "بنك فيصل الإسلامي"},
+            {"united bank", "the united bank", "المصرف المتحد"},
+            {"midbank", "mid bank", "misr iran", "ميد بنك", "بنك مصر ايران"},
+            {"mashreq", "mashreq bank", "بنك المشرق"},
+            {"attijariwafa", "barclays", "التجاري وفا", "التجاري وفا بنك"},
+            {"arab bank", "البنك العربي", "arab bank plc"},
+            {"aibank", "ai bank", "arab investment bank", "بنك الاستثمار العربي"},
+            {"citi", "citibank", "سيتي بنك"},
+        ]
+
+        _BANK_STOP_WORDS = {
+            "bank", "banque", "of", "the", "egypt", "sae", "s", "a", "e", "al", "el",
+            "limited", "ltd", "plc", "corp", "corporation", "co", "company", "branch",
+            "بنك", "البنك", "مصرف", "المصرف", "مصر", "المصري", "ش", "م",
+        }
+
+        def _clean_bank_str(val: Any) -> str:
+            if not val:
+                return ""
+            s = str(val).strip().lower()
+            s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي")
+            s = s.replace("é", "e").replace("è", "e").replace("&", " and ")
+            s = re.sub(r"[^\w\s\u0621-\u064A]", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        def _get_canonical_group_indices(bank_str: str) -> set:
+            cleaned = _clean_bank_str(bank_str)
+            if not cleaned:
+                return set()
+            compact = cleaned.replace(" ", "")
+            words = set(cleaned.split())
+            matched_groups = set()
+            for idx, aliases in enumerate(_CANONICAL_BANK_GROUPS):
+                for alias in aliases:
+                    alias_clean = _clean_bank_str(alias)
+                    if not alias_clean:
+                        continue
+                    if len(alias_clean) <= 4:
+                        if alias_clean in words or compact == alias_clean:
+                            matched_groups.add(idx)
+                            break
+                    else:
+                        if alias_clean in cleaned or cleaned in alias_clean:
+                            matched_groups.add(idx)
+                            break
+            return matched_groups
+
+        def _banks_match(excel_bank_id: Any, excel_bank_name: str, ai_bank_name: str) -> bool:
+            if not excel_bank_name or excel_bank_name == "Unknown" or not ai_bank_name:
+                return True
+
+            # Collect all known names/aliases for the Excel bank from DB (name, short_name, former_names)
+            excel_aliases = [excel_bank_name]
+            bank_obj = bank_obj_map.get(excel_bank_id)
+            if bank_obj:
+                if getattr(bank_obj, "short_name", None):
+                    excel_aliases.append(str(bank_obj.short_name))
+                former = getattr(bank_obj, "former_names", None)
+                if isinstance(former, list):
+                    excel_aliases.extend(str(x) for x in former if x)
+                elif isinstance(former, str) and former.strip():
+                    excel_aliases.append(former.strip())
+
+            c_ai = _clean_bank_str(ai_bank_name)
+            if not c_ai:
+                return True
+
+            ai_groups = _get_canonical_group_indices(ai_bank_name)
+
+            for alias in excel_aliases:
+                c_ex = _clean_bank_str(alias)
+                if not c_ex:
+                    continue
+                # 1. Direct or substring match
+                if c_ex == c_ai or c_ex in c_ai or c_ai in c_ex:
+                    return True
+                # 2. Canonical bank group match
+                ex_groups = _get_canonical_group_indices(alias)
+                if ex_groups and ai_groups and (ex_groups & ai_groups):
+                    return True
+                # 3. Acronym / Initials match (e.g. 'Commercial International Bank' -> 'cib')
+                ex_sig_words = [w for w in c_ex.split() if w not in _BANK_STOP_WORDS]
+                ai_sig_words = [w for w in c_ai.split() if w not in _BANK_STOP_WORDS]
+                if ex_sig_words and ai_sig_words:
+                    ex_initials = "".join(w[0] for w in c_ex.split() if w not in {"of", "the", "and", "egypt", "sae"})
+                    ai_initials = "".join(w[0] for w in c_ai.split() if w not in {"of", "the", "and", "egypt", "sae"})
+                    if len(ex_initials) >= 2 and (ex_initials == c_ai.replace(" ", "") or ex_initials in ai_sig_words):
+                        return True
+                    if len(ai_initials) >= 2 and (ai_initials == c_ex.replace(" ", "") or ai_initials in ex_sig_words):
+                        return True
+                    # Significant keyword overlap
+                    if set(ex_sig_words) == set(ai_sig_words):
+                        return True
+                    if len(set(ex_sig_words) & set(ai_sig_words)) >= 2:
+                        return True
+
+            return False
+
+        def _currencies_match(excel_curr: str, ai_curr: str) -> bool:
+            if not excel_curr or excel_curr == "Unknown" or not ai_curr:
+                return True
+            c1 = norm(excel_curr)
+            c2 = norm(ai_curr)
+            if c1 == c2:
+                return True
+            curr_aliases = {
+                "EGP": {"EGP", "LE", "L E", "EGYPTIAN POUND", "EGYPTIAN POUNDS", "جنيه", "جنيه مصري", "جم", "ج م"},
+                "USD": {"USD", "US$", "$", "US DOLLAR", "US DOLLARS", "DOLLAR", "دولار", "دولار امريكي"},
+                "EUR": {"EUR", "€", "EURO", "EUROS", "يورو"},
+                "GBP": {"GBP", "£", "STERLING", "POUND STERLING", "جنيه استرليني"},
+                "SAR": {"SAR", "SR", "SAUDI RIYAL", "ريال سعودي", "ريال"},
+                "AED": {"AED", "DH", "DIRHAM", "UAE DIRHAM", "درهم", "درهم اماراتي"},
+            }
+            for iso, eq_set in curr_aliases.items():
+                if (c1 == iso or c1 in eq_set) and (c2 == iso or c2 in eq_set):
+                    return True
+            return False
+
         def _extract_attachment_url(json_data: Dict[str, Any]) -> Optional[str]:
             for key in ('attachment_url', 'attachement', 'attachment', 'file_path', 'document', 'pdf', 'scan'):
                 val = json_data.get(key)
@@ -1216,14 +1427,15 @@ class MigrationService:
 
         # --- STEP 1: Sort each LG group chronologically & collect audit document tasks ---
         group_audit_plans = []
-        pending_doc_tasks = []  # List of dicts: {key, clean_url, fname, doc_role, lg_num, rec_id}
+        pending_doc_tasks = []  # List of dicts with expected record hints for AI disambiguation
 
         for lg_num, group in grouped_records.items():
             group.sort(key=migration_history_service._get_snapshot_sort_key)
             first_rec = group[0]
             last_rec = group[-1]
 
-            first_url = _extract_attachment_url(first_rec.source_data_json or {})
+            first_src = first_rec.source_data_json or {}
+            first_url = _extract_attachment_url(first_src)
             first_clean_url = None
             first_fname = None
             first_key = None
@@ -1238,13 +1450,19 @@ class MigrationService:
                     "doc_role": "CREATION",
                     "lg_num": str(lg_num),
                     "rec_id": first_rec.id,
+                    "expected_bank": bank_map.get(first_src.get("issuing_bank_id"), ""),
+                    "expected_amount": first_src.get("lg_amount", ""),
+                    "expected_currency": currency_map.get(first_src.get("lg_currency_id"), ""),
+                    "expected_issuance_date": clean_date(first_src.get("issuance_date")),
+                    "expected_expiry_date": clean_date(first_src.get("expiry_date")),
                 })
 
             last_clean_url = None
             last_fname = None
             last_key = None
             if last_rec.id != first_rec.id:
-                last_url = _extract_attachment_url(last_rec.source_data_json or {})
+                last_src = last_rec.source_data_json or {}
+                last_url = _extract_attachment_url(last_src)
                 if last_url:
                     last_clean_url = str(last_url).strip().strip("'").strip('"').replace("\u202a", "").replace("\u202c", "")
                     last_fname = os.path.basename(last_clean_url.replace("\\", "/"))
@@ -1256,6 +1474,11 @@ class MigrationService:
                         "doc_role": "AMENDMENT",
                         "lg_num": str(lg_num),
                         "rec_id": last_rec.id,
+                        "expected_bank": bank_map.get(last_src.get("issuing_bank_id") or first_src.get("issuing_bank_id"), ""),
+                        "expected_amount": last_src.get("lg_amount", ""),
+                        "expected_currency": currency_map.get(last_src.get("lg_currency_id") or first_src.get("lg_currency_id"), ""),
+                        "expected_issuance_date": clean_date(last_src.get("issuance_date") or first_src.get("issuance_date")),
+                        "expected_expiry_date": clean_date(last_src.get("expiry_date")),
                     })
 
             group_audit_plans.append({
@@ -1269,9 +1492,9 @@ class MigrationService:
                 "last_fname": last_fname,
             })
 
-        # --- STEP 2: Fetch & Process PDFs in Memory-Safe Multi-Document Batches (up to 6 PDFs per Gemini call) ---
-        BATCH_MAX_DOCS = 6
-        BATCH_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per batch to stay well within Vertex payload & RAM limits
+        # --- STEP 2: Fetch & Process PDFs in Focused Multi-Document Batches (up to 4 PDFs per Gemini call) ---
+        BATCH_MAX_DOCS = 4
+        BATCH_MAX_BYTES = 8 * 1024 * 1024  # 8 MB per batch for high accuracy & low RAM
         ai_results_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
         file_found_by_key: Dict[str, bool] = {}
 
@@ -1316,6 +1539,11 @@ class MigrationService:
                 "mime_type": mime,
                 "doc_role": task["doc_role"],
                 "lg_number_hint": task["lg_num"],
+                "expected_bank": task.get("expected_bank", ""),
+                "expected_amount": task.get("expected_amount", ""),
+                "expected_currency": task.get("expected_currency", ""),
+                "expected_issuance_date": task.get("expected_issuance_date", ""),
+                "expected_expiry_date": task.get("expected_expiry_date", ""),
             })
             current_batch_bytes += doc_size
             del content
@@ -1347,9 +1575,9 @@ class MigrationService:
                     if ai_data:
                         src = first_rec.source_data_json or {}
 
-                        # A. LG Number
+                        # A. LG Number (with RTL / BiDi & separator tolerance)
                         ai_lg_num = ai_data.get('lgNumber', '')
-                        if norm(lg_num) != norm(ai_lg_num):
+                        if ai_lg_num and not _lg_numbers_match(lg_num, ai_lg_num):
                             err = f"LG Number Mismatch: Excel='{lg_num}' vs AI='{ai_lg_num}'"
                             discrepancies.append(err)
                             logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=lg_number")
@@ -1358,7 +1586,7 @@ class MigrationService:
                         try:
                             val_excel = float(src.get('lg_amount', 0))
                             val_ai = float(ai_data.get('lgAmount', 0))
-                            if abs(val_excel - val_ai) > 1.0:
+                            if val_ai > 0 and abs(val_excel - val_ai) > 1.0:
                                 err = f"Amount Mismatch: Excel='{val_excel:,.2f}' vs AI='{val_ai:,.2f}'"
                                 discrepancies.append(err)
                                 logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=lg_amount")
@@ -1369,32 +1597,31 @@ class MigrationService:
                         excel_curr_id = src.get('lg_currency_id')
                         excel_curr_code = currency_map.get(excel_curr_id, "Unknown")
                         ai_curr = ai_data.get('currency', '')
-                        if norm(excel_curr_code) != norm(ai_curr):
+                        if ai_curr and not _currencies_match(excel_curr_code, ai_curr):
                             err = f"Currency Mismatch: Excel='{excel_curr_code}' vs AI='{ai_curr}'"
                             discrepancies.append(err)
                             logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=currency")
 
-                        # D. Issuing Bank
+                        # D. Issuing Bank (with DB short_name, former_names, acronyms & Arabic/English alias matching)
                         excel_bank_id = src.get('issuing_bank_id')
                         excel_bank_name = bank_map.get(excel_bank_id, "Unknown")
                         ai_bank = ai_data.get('issuingBankName', '')
-                        if excel_bank_name != "Unknown":
-                            if norm(excel_bank_name) not in norm(ai_bank) and norm(ai_bank) not in norm(excel_bank_name):
-                                err = f"Bank Mismatch: Excel='{excel_bank_name}' vs AI='{ai_bank}'"
-                                discrepancies.append(err)
-                                logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=issuing_bank")
+                        if not _banks_match(excel_bank_id, excel_bank_name, ai_bank):
+                            err = f"Bank Mismatch: Excel='{excel_bank_name}' vs AI='{ai_bank}'"
+                            discrepancies.append(err)
+                            logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=issuing_bank")
 
                         # E. Dates (Issuance & Expiry)
                         excel_date = clean_date(src.get('issuance_date'))
                         ai_date = clean_date(ai_data.get('issuanceDate'))
-                        if excel_date != ai_date:
+                        if excel_date and ai_date and excel_date != ai_date:
                             err = f"Issuance Date Mismatch: Excel='{excel_date}' vs AI='{ai_date}'"
                             discrepancies.append(err)
                             logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=issuance_date")
 
                         excel_exp = clean_date(src.get('expiry_date'))
                         ai_exp = clean_date(ai_data.get('expiryDate'))
-                        if excel_exp != ai_exp:
+                        if excel_exp and ai_exp and excel_exp != ai_exp:
                             err = f"Expiry Date Mismatch: Excel='{excel_exp}' vs AI='{ai_exp}'"
                             discrepancies.append(err)
                             logger.info(f"      [Audit Mismatch] record_id={first_rec.id} field=expiry_date")
