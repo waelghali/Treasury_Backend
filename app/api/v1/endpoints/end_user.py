@@ -1077,6 +1077,111 @@ def view_lg_document_securely(
     )
     return {"signed_url": streaming_url, "download_url": streaming_url}
 
+
+@router.post(
+    "/lg-records/{lg_record_id}/documents",
+    response_model=List[LGDocumentOut],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(check_subscription_status), Depends(check_for_read_only_mode)],
+    summary="Upload one or more supporting documents to an LG record and optionally link to a lifecycle event",
+)
+async def upload_lg_supporting_documents(
+    lg_record_id: int,
+    files: List[UploadFile] = File(...),
+    document_type: str = Form("INTERNAL_SUPPORTING"),
+    audit_log_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_end_user_context),
+):
+    """
+    Uploads and encrypts one or more supporting documents (e.g., Original LG Copy, Amendment Letter,
+    Internal Supporting Document) directly onto an existing LG record, and optionally binds the
+    uploaded document ID to a specific historical AuditLog event (MIGRATION_IMPORT_RECORD or LG_AMENDED).
+    """
+    lg_rec = (
+        db.query(models.LGRecord)
+        .options(
+            selectinload(models.LGRecord.beneficiary_corporate),
+            selectinload(models.LGRecord.lg_category),
+        )
+        .filter(
+            models.LGRecord.id == lg_record_id,
+            models.LGRecord.customer_id == current_user.customer_id,
+            models.LGRecord.is_deleted == False,
+        )
+        .first()
+    )
+    if not lg_rec:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="LG Record not found or not accessible.",
+        )
+
+    lg_record_details = {
+        "beneficiary_corporate_code": getattr(lg_rec.beneficiary_corporate, "code", "ENTITY") if lg_rec.beneficiary_corporate else "ENTITY",
+        "lg_category_code": getattr(lg_rec.lg_category, "code", "CAT") if lg_rec.lg_category else "CAT",
+        "lg_number": lg_rec.lg_number,
+    }
+
+    created_docs: List[models.LGDocument] = []
+    for upload in files:
+        if not upload or not upload.filename:
+            continue
+        file_bytes = await upload.read()
+        if not file_bytes:
+            continue
+        doc_in = LGDocumentCreate(
+            document_type=document_type or "INTERNAL_SUPPORTING",
+            file_name=upload.filename,
+            mime_type=upload.content_type or "application/pdf",
+            file_path="",
+            lg_instruction_id=None,
+        )
+        db_doc = await crud_lg_document.create_document(
+            db=db,
+            obj_in=doc_in,
+            file_content=file_bytes,
+            lg_record_id=lg_rec.id,
+            uploaded_by_user_id=current_user.user_id,
+            lg_record_details=lg_record_details,
+        )
+        created_docs.append(db_doc)
+
+    if not created_docs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid document files were provided.",
+        )
+
+    if audit_log_id is not None:
+        audit_row = (
+            db.query(models.AuditLog)
+            .filter(
+                models.AuditLog.id == audit_log_id,
+                models.AuditLog.lg_record_id == lg_rec.id,
+                models.AuditLog.customer_id == current_user.customer_id,
+            )
+            .first()
+        )
+        if audit_row:
+            details_dict = dict(audit_row.details or {})
+            details_dict["amendment_document_id"] = created_docs[0].id
+            details_dict["document_id"] = created_docs[0].id
+            existing_ids = list(details_dict.get("attached_document_ids") or [])
+            for d in created_docs:
+                if d.id not in existing_ids:
+                    existing_ids.append(d.id)
+            details_dict["attached_document_ids"] = existing_ids
+            audit_row.details = details_dict
+            flag_modified(audit_row, "details")
+            db.add(audit_row)
+
+    db.commit()
+    for d in created_docs:
+        db.refresh(d)
+    return created_docs
+
+
 @router.get("/lg-records/", response_model=List[LGRecordOut], dependencies=[Depends(check_subscription_status)])
 def list_lg_records(
     skip: int = 0,
