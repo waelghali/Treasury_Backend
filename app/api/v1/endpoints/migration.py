@@ -1252,9 +1252,19 @@ async def import_historical_records(
                     models.LGRecord.customer_id == current_user.customer_id,
                 ).first()
                 if existing_lg_in_prod:
-                    if existing_lg_in_prod.migration_source in ("LEGACY", "MIGRATION") or any(
+                    is_migrated_rec = existing_lg_in_prod.migration_source in ("LEGACY", "MIGRATION") or any(
                         s.production_lg_id == existing_lg_in_prod.id for s in snapshots
-                    ):
+                    )
+                    has_live_instr = db.query(models.LGInstruction.id).filter(
+                        models.LGInstruction.lg_record_id == existing_lg_in_prod.id,
+                        models.LGInstruction.is_deleted == False,
+                    ).first() is not None
+                    within_48h = True
+                    if existing_lg_in_prod.created_at:
+                        now_dt = datetime.now(existing_lg_in_prod.created_at.tzinfo) if existing_lg_in_prod.created_at.tzinfo else datetime.utcnow()
+                        within_48h = (now_dt - existing_lg_in_prod.created_at).total_seconds() <= 48 * 3600
+
+                    if is_migrated_rec and not has_live_instr and within_48h:
                         logger.info(
                             f"Purging previously migrated LG id={existing_lg_in_prod.id} ({lg_num}) to perform clean historical re-import."
                         )
@@ -1741,17 +1751,17 @@ def delete_all_staged_records(
     return {"deleted_count": deleted_count, "message": f"Deleted {deleted_count} staged records."}
 
 
-@router.post("/reset-migrated", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
-def reset_migrated_records_for_clean_reimport(
-    current_user: TokenData = Depends(get_current_corporate_admin_context),
-    db: Session = Depends(get_db),
-):
+def _evaluate_migration_reset_eligibility(
+    db: Session,
+    customer_id: int,
+) -> Tuple[Dict[str, Any], List[models.LGRecord], List[models.LGMigrationStaging]]:
     """
-    Purges previously migrated LGRecord entries (and their incomplete history/documents) for the
-    current customer and resets all staged LGMigrationStaging records back to Ready/Expired/Duplicate
-    so a clean migration can be executed immediately without re-uploading the Excel sheet.
+    Evaluates whether the temporary 'Reset & Clean Migrated LGs' action is currently allowed.
+    Rules:
+    1. Must have at least 1 migrated LGRecord in production for this customer.
+    2. Immediately suspended if ANY live LGInstruction has been issued on any migrated LGRecord.
+    3. Automatically suspended 48 hours after the latest migrated LGRecord's created_at timestamp.
     """
-    customer_id = current_user.customer_id
     all_staged = db.query(models.LGMigrationStaging).filter(
         models.LGMigrationStaging.customer_id == customer_id
     ).order_by(models.LGMigrationStaging.id.asc()).all()
@@ -1765,12 +1775,106 @@ def reset_migrated_records_for_clean_reimport(
 
     migrated_lgs = db.query(models.LGRecord).filter(
         models.LGRecord.customer_id == customer_id,
+        models.LGRecord.is_deleted == False,
         (
             models.LGRecord.migration_source.in_(["LEGACY", "MIGRATION"])
             | (models.LGRecord.id.in_(linked_prod_ids) if linked_prod_ids else False)
             | (func.lower(models.LGRecord.lg_number).in_(staged_lg_numbers) if staged_lg_numbers else False)
         ),
     ).all()
+
+    if not migrated_lgs:
+        return (
+            {
+                "allowed": False,
+                "reason": "No migrated LG records currently exist in production.",
+                "migrated_count": 0,
+                "hours_remaining": 0.0,
+            },
+            migrated_lgs,
+            all_staged,
+        )
+
+    migrated_ids = [lg.id for lg in migrated_lgs]
+    has_live_instruction = (
+        db.query(models.LGInstruction.id)
+        .filter(
+            models.LGInstruction.lg_record_id.in_(migrated_ids),
+            models.LGInstruction.is_deleted == False,
+        )
+        .first()
+        is not None
+    )
+    if has_live_instruction:
+        return (
+            {
+                "allowed": False,
+                "reason": "Reset & Clean is permanently suspended because live instructions have already been issued on migrated LG records.",
+                "migrated_count": len(migrated_lgs),
+                "hours_remaining": 0.0,
+            },
+            migrated_lgs,
+            all_staged,
+        )
+
+    created_timestamps = [lg.created_at for lg in migrated_lgs if getattr(lg, "created_at", None)]
+    hours_remaining = 48.0
+    if created_timestamps:
+        latest_created_at = max(created_timestamps)
+        now_dt = datetime.now(latest_created_at.tzinfo) if latest_created_at.tzinfo else datetime.utcnow()
+        elapsed_hours = (now_dt - latest_created_at).total_seconds() / 3600.0
+        if elapsed_hours > 48.0:
+            return (
+                {
+                    "allowed": False,
+                    "reason": "Reset & Clean is permanently suspended because the 48-hour post-migration verification window has expired.",
+                    "migrated_count": len(migrated_lgs),
+                    "hours_remaining": 0.0,
+                },
+                migrated_lgs,
+                all_staged,
+            )
+        hours_remaining = round(max(0.1, 48.0 - elapsed_hours), 1)
+
+    return (
+        {
+            "allowed": True,
+            "reason": f"Available for {hours_remaining}h (auto-suspends 48h after last migrated LG or upon first live instruction).",
+            "migrated_count": len(migrated_lgs),
+            "hours_remaining": hours_remaining,
+        },
+        migrated_lgs,
+        all_staged,
+    )
+
+
+@router.get("/reset-migrated-status", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
+def get_reset_migrated_status(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
+):
+    eligibility, _, _ = _evaluate_migration_reset_eligibility(db, current_user.customer_id)
+    return eligibility
+
+
+@router.post("/reset-migrated", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
+def reset_migrated_records_for_clean_reimport(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Purges previously migrated LGRecord entries (and their incomplete history/documents) for the
+    current customer and resets all staged LGMigrationStaging records back to Ready/Expired/Duplicate
+    so a clean migration can be executed immediately without re-uploading the Excel sheet.
+    Automatically suspended 48 hours after the last migrated LG or upon the first live instruction.
+    """
+    customer_id = current_user.customer_id
+    eligibility, migrated_lgs, all_staged = _evaluate_migration_reset_eligibility(db, customer_id)
+    if not eligibility.get("allowed"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=eligibility.get("reason") or "Reset & Clean is no longer available.",
+        )
 
     purged_lg_numbers = []
     for lg_rec in migrated_lgs:
