@@ -3,7 +3,7 @@ import csv
 import io
 import json
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from fastapi import APIRouter, Body, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, cast
