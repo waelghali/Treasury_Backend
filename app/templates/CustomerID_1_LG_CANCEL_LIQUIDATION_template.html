@@ -233,7 +233,7 @@
             </td>
             <td class="doc-meta-cell">
                 <div class="action-pill">Withdrawal of Liquidation</div>
-                <div class="meta-line">Date: <strong>{{current_date}}</strong></div>
+                <div class="meta-line">Date: <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{current_date}}</span></strong></div>
                 <div class="meta-line">Internal Ref: <strong>{{internal_ref}}</strong></div>
             </td>
         </tr>
@@ -264,7 +264,7 @@
 
     <p>
         With reference to the above-mentioned subject, the below Letter of Guarantee details, and our previous liquidation instruction dated
-        <strong>{{liquidation_date}}</strong>, you are kindly requested to <strong>cancel and withdraw our liquidation demand</strong> with immediate effect.
+        <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{liquidation_date}}</span></strong>, you are kindly requested to <strong>cancel and withdraw our liquidation demand</strong> with immediate effect.
     </p>
 
     <p>
@@ -300,7 +300,7 @@
         </tr>
         <tr>
             <th>Commercial Settlement Reference &amp; Date</th>
-            <td>Ref: <strong>{{settlement_reference}}</strong> &bull; Date: {{settlement_date}}</td>
+            <td>Ref: <strong>{{settlement_reference}}</strong> &bull; Date: <span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{settlement_date}}</span></td>
         </tr>
     </table>
 
@@ -333,6 +333,18 @@
     <div class="footer-note">
         Official Corporate Banking Instruction &bull; Generated via {{platform_name}} &bull; Ref: {{internal_ref}}
     </div>
+    <script>
+        (function () {
+            var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            var nodes = document.querySelectorAll('[data-date-format="DD-MMM-YYYY"]');
+            for (var i = 0; i < nodes.length; i++) {
+                nodes[i].innerHTML = nodes[i].innerHTML.replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, function (m, y, mo, d) {
+                    var idx = parseInt(mo, 10) - 1;
+                    return (idx >= 0 && idx < 12) ? (d + "-" + months[idx] + "-" + y) : m;
+                });
+            }
+        })();
+    </script>
 </body>
 </html>
 

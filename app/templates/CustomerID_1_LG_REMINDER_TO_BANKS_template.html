@@ -227,7 +227,7 @@
             </td>
             <td class="doc-meta-cell">
                 <div class="action-pill">Urgent Follow-Up Reminder</div>
-                <div class="meta-line">Date: <strong>{{current_date}}</strong></div>
+                <div class="meta-line">Date: <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{current_date}}</span></strong></div>
                 <div class="meta-line">Original Ref: <strong>{{original_instruction_serial}}</strong></div>
             </td>
         </tr>
@@ -258,7 +258,7 @@
 
     <p>
         With reference to the above-mentioned subject and the below Letter of Guarantee details, this is an official follow-up reminder regarding our prior banking instruction dated
-        <strong>{{original_instruction_date}}</strong> {{delivery_clause}} under reference #<strong>{{original_instruction_serial}}</strong>.
+        <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{original_instruction_date}}</span></strong> <span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{delivery_clause}}</span> under reference #<strong>{{original_instruction_serial}}</strong>.
     </p>
 
     <p>
@@ -289,7 +289,7 @@
         </tr>
         <tr>
             <th>Original Instruction Date</th>
-            <td>{{original_instruction_date}} (Delivered: {{original_instruction_delivery_date}})</td>
+            <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{original_instruction_date}}</span> (Delivered: <span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{original_instruction_delivery_date}}</span>)</td>
         </tr>
         <tr class="highlight-row">
             <th>Days Elapsed Without Bank Confirmation</th>
@@ -324,6 +324,18 @@
     <div class="footer-note">
         Official Corporate Banking Instruction &bull; Generated via {{platform_name}} &bull; Original Ref: {{original_instruction_serial}}
     </div>
+    <script>
+        (function () {
+            var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            var nodes = document.querySelectorAll('[data-date-format="DD-MMM-YYYY"]');
+            for (var i = 0; i < nodes.length; i++) {
+                nodes[i].innerHTML = nodes[i].innerHTML.replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, function (m, y, mo, d) {
+                    var idx = parseInt(mo, 10) - 1;
+                    return (idx >= 0 && idx < 12) ? (d + "-" + months[idx] + "-" + y) : m;
+                });
+            }
+        })();
+    </script>
 </body>
 </html>
 

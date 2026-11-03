@@ -233,7 +233,7 @@
             </td>
             <td class="doc-meta-cell">
                 <div class="action-pill">LG Extension Instruction</div>
-                <div class="meta-line">Date: <strong>{{current_date}}</strong></div>
+                <div class="meta-line">Date: <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{current_date}}</span></strong></div>
                 <div class="meta-line">Instruction Ref: <strong>{{instruction_serial}}</strong></div>
             </td>
         </tr>
@@ -265,7 +265,7 @@
     <p>
         With reference to the above-mentioned subject and the Letter of Guarantee details set out below, you are kindly requested to
         <strong>extend — or liquidate, in case of not extending —</strong> the specified Letter of Guarantee until
-        <strong>{{new_expiry_date}}</strong>, as the supplier / applicant (<strong>{{lg_issuer_name}}</strong>) is still fulfilling their contractual obligation.
+        <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{new_expiry_date}}</span></strong>, as the supplier / applicant (<strong>{{lg_issuer_name}}</strong>) is still fulfilling their contractual obligation.
     </p>
 
     <div class="section-heading">Letter of Guarantee Specifications &amp; Extension Schedule</div>
@@ -288,11 +288,11 @@
         </tr>
         <tr>
             <th>Issuance Date</th>
-            <td>{{issuance_date}}</td>
+            <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{issuance_date}}</span></td>
         </tr>
         <tr>
             <th>Current Expiry Date</th>
-            <td>{{old_expiry_date}}</td>
+            <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{old_expiry_date}}</span></td>
         </tr>
         <tr>
             <th>Extension Period</th>
@@ -300,7 +300,7 @@
         </tr>
         <tr class="highlight-row">
             <th>Extend To Date (New Expiry Date)</th>
-            <td><span style="font-size: 10pt;">{{new_expiry_date}}</span></td>
+            <td><span style="font-size: 10pt;"><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{new_expiry_date}}</span></span></td>
         </tr>
     </table>
 
@@ -337,5 +337,17 @@
     <div class="footer-note">
         Official Corporate Banking Instruction &bull; Generated via {{platform_name}} &bull; Ref: {{instruction_serial}}
     </div>
+    <script>
+        (function () {
+            var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            var nodes = document.querySelectorAll('[data-date-format="DD-MMM-YYYY"]');
+            for (var i = 0; i < nodes.length; i++) {
+                nodes[i].innerHTML = nodes[i].innerHTML.replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, function (m, y, mo, d) {
+                    var idx = parseInt(mo, 10) - 1;
+                    return (idx >= 0 && idx < 12) ? (d + "-" + months[idx] + "-" + y) : m;
+                });
+            }
+        })();
+    </script>
 </body>
 </html>

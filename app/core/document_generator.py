@@ -5,9 +5,36 @@ import os
 import gc
 import ctypes
 from typing import Optional, List
+from datetime import datetime
+import re
 import logging
 
 logger = logging.getLogger(__name__)
+
+def _apply_template_date_formatting(html_content: str) -> str:
+    """
+    Honors data-date-format="DD-MMM-YYYY" attributes inside HTML templates by converting
+    any ISO date ('YYYY-MM-DD') inside those elements to 'DD-MMM-YYYY' (e.g., '03-Nov-2026')
+    prior to WeasyPrint static PDF rendering.
+    """
+    if not html_content or 'data-date-format="DD-MMM-YYYY"' not in html_content:
+        return html_content
+
+    def _iso_to_dd_mmm_yyyy(match: re.Match) -> str:
+        try:
+            return datetime.strptime(match.group(0), "%Y-%m-%d").strftime("%d-%b-%Y")
+        except ValueError:
+            return match.group(0)
+
+    def _format_span(span_match: re.Match) -> str:
+        return re.sub(r"\b\d{4}-\d{2}-\d{2}\b", _iso_to_dd_mmm_yyyy, span_match.group(0))
+
+    return re.sub(
+        r'<span[^>]*data-date-format="DD-MMM-YYYY"[^>]*>.*?</span>',
+        _format_span,
+        html_content,
+        flags=re.DOTALL,
+    )
 
 def _render_pdf_worker(html_content: str) -> Optional[bytes]:
     """
@@ -15,7 +42,7 @@ def _render_pdf_worker(html_content: str) -> Optional[bytes]:
     """
     try:
         from weasyprint import HTML
-        html = HTML(string=html_content)
+        html = HTML(string=_apply_template_date_formatting(html_content))
         pdf_bytes = html.write_pdf()
         del html
         return pdf_bytes
@@ -40,7 +67,7 @@ def _render_and_merge_pdfs_worker(html_segments: List[str]) -> Optional[bytes]:
         for segment in html_segments:
             if not segment or not segment.strip():
                 continue
-            html_obj = HTML(string=segment)
+            html_obj = HTML(string=_apply_template_date_formatting(segment))
             seg_bytes = html_obj.write_pdf()
             del html_obj
             if seg_bytes:

@@ -233,7 +233,7 @@
             </td>
             <td class="doc-meta-cell">
                 <div class="action-pill">LG Reduction Instruction</div>
-                <div class="meta-line">Date: <strong>{{current_date}}</strong></div>
+                <div class="meta-line">Date: <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{current_date}}</span></strong></div>
                 <div class="meta-line">Instruction Ref: <strong>{{instruction_serial}}</strong></div>
             </td>
         </tr>
@@ -296,11 +296,11 @@
         </tr>
         <tr>
             <th>Issuance Date</th>
-            <td>{{issuance_date}}</td>
+            <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{issuance_date}}</span></td>
         </tr>
         <tr>
             <th>Expiry Date</th>
-            <td>{{expiry_date}}</td>
+            <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{expiry_date}}</span></td>
         </tr>
     </table>
 
@@ -337,6 +337,18 @@
     <div class="footer-note">
         Official Corporate Banking Instruction &bull; Generated via {{platform_name}} &bull; Ref: {{instruction_serial}}
     </div>
+    <script>
+        (function () {
+            var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            var nodes = document.querySelectorAll('[data-date-format="DD-MMM-YYYY"]');
+            for (var i = 0; i < nodes.length; i++) {
+                nodes[i].innerHTML = nodes[i].innerHTML.replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, function (m, y, mo, d) {
+                    var idx = parseInt(mo, 10) - 1;
+                    return (idx >= 0 && idx < 12) ? (d + "-" + months[idx] + "-" + y) : m;
+                });
+            }
+        })();
+    </script>
 </body>
 </html>
 
