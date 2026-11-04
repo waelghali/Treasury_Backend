@@ -62,10 +62,12 @@ def build_lg_renewal_digest_html(
     for idx, item in enumerate(items):
         bg_color = "#ffffff" if idx % 2 == 0 else "#f8fafc"
         days_left = item.get("days_until_expiry", 0)
-        is_urgent = item.get("urgency_level") == "urgent"
+        is_critical = item.get("urgency_level") == "critical" or days_left <= 3
+        is_urgent = item.get("urgency_level") in ("critical", "urgent")
 
-
-        if is_urgent:
+        if is_critical:
+            badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #991b1b; color: #ffffff; font-size: 11px; font-weight: 800; border: 1px solid #7f1d1d;">CRITICAL ({days_left}d)</span>"""
+        elif is_urgent:
             badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #fef2f2; color: #dc2626; font-size: 11px; font-weight: 700; border: 1px solid #fecaca;">URGENT ({days_left}d)</span>"""
         else:
             badge_html = f"""<span style="display: inline-block; padding: 4px 10px; border-radius: 12px; background-color: #fffbeb; color: #d97706; font-size: 11px; font-weight: 700; border: 1px solid #fef3c7;">NOTICE ({days_left}d)</span>"""
@@ -171,7 +173,7 @@ def build_lg_renewal_digest_html(
         <!-- FOOTER -->
         <div style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
             <p style="margin: 0 0 6px 0; font-size: 12px; color: #64748b; font-weight: 500;">
-                Grow Treasury Management Platform &bull; Automated Daily Notification Service
+                Grow Treasury Management Platform &bull; Automated Notification Service
             </p>
             <p style="margin: 0; font-size: 11px; color: #94a3b8;">
                 Generated on {current_time_str} for {customer_name}. Confidential.

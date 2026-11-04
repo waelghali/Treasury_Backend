@@ -524,25 +524,20 @@ async def run_daily_print_reminders(db: Session):
 
 async def run_daily_renewal_reminders(db: Session):
     """
-    Orchestrates the daily execution of renewal reminders.
+    Orchestrates the execution of LG renewal reminders:
+    - Unified Owner-grouped weekly digest (with Treasury/Admins CC'd) + separate critical (<= 3d) alerts.
+    - Smart Mobile Alerts for LG Custody.
     """
     logger.info("Starting renewal reminders.")
-    
-    # Feature 1: Reminders to Users/Admins
-    try:
-        await crud_lg_record.run_renewal_reminders_to_users_and_admins(db)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error in Feature 1 (Users/Admins) reminders: {e}", exc_info=True)
 
-    # Feature 2: Reminders to Internal Owners
+    # Unified Renewal Digest & Critical Alerts (grouped by Internal Owner, CC'ing Treasury & Admins)
     try:
         await crud_lg_record.run_internal_owner_renewal_reminders(db)
     except Exception as e:
         db.rollback()
-        logger.error(f"Error in Feature 2 (Internal Owners) reminders: {e}", exc_info=True)
+        logger.error(f"Error in consolidated Owner/Treasury renewal reminders: {e}", exc_info=True)
 
-    # Feature 3: Smart Mobile Alerts for LG Custody (Inaction Escalation, Undelivered Letters, Day 0 Cutoff)
+    # Smart Mobile Alerts for LG Custody (Inaction Escalation, Undelivered Letters, Day 0 Cutoff)
     try:
         from app.services.notifications.lg_custody_service import run_lg_custody_mobile_alerts_sweep
         await run_lg_custody_mobile_alerts_sweep(db)

@@ -3206,10 +3206,15 @@ class CRUDLGRecord(CRUDBase):
 
     async def run_internal_owner_renewal_reminders(self, db: Session):
         """
-        Feature 2: Sends renewal reminders to Internal Owners for LGs nearing expiry.
-        LGs are consolidated per internal owner into a single digest email.
+        Unified Renewal & Expiry Reminders (Approach A + Option 2):
+        - Groups all eligible VALID LGs per customer by Internal Owner (or Unassigned).
+        - Sends a single consolidated Weekly Digest per Owner (`TO`: Internal Owner,
+          `CC`: Owner's Manager + End Users/Treasury + Corporate Admins + Common Comm List),
+          governed by an Owner-digest-level cooldown (`NUMBER_OF_DAYS_FOR_NEXT_REMINDER`, default 7 days).
+        - Separates critical LGs (`days_until_expiry <= 3`) into a dedicated daily Critical Expiry Alert
+          so critical items are escalated without re-triggering the full weekly portfolio digest.
         """
-        logger.info("--- START: Internal Owner Renewal Reminders Task ---")
+        logger.info("--- START: Consolidated Owner-Grouped Renewal Reminders Task ---")
         current_date_aware = datetime.now(EEST_TIMEZONE)
         current_date_only = current_date_aware.date()
 
@@ -3228,12 +3233,17 @@ class CRUDLGRecord(CRUDBase):
                     db, customer.id, GlobalConfigKey.NUMBER_OF_DAYS_FOR_NEXT_REMINDER
                 )
 
-                initial_days = int(auto_renew_reminder_config.get('effective_value', 60))
-                interval_days = int(next_reminder_config.get('effective_value', 7))
-                
+                initial_days = int(auto_renew_reminder_config.get('effective_value', 60)) if auto_renew_reminder_config else 60
+                raw_interval = int(next_reminder_config.get('effective_value', 7)) if next_reminder_config else 7
+                interval_days = raw_interval if raw_interval >= 1 else 7
+                urgent_days_limit = initial_days // 2
+
                 lookahead_date = current_date_only + timedelta(days=initial_days)
 
-                logger.info(f"[Customer: {customer.id}] Config: Start reminders {initial_days} days before. Lookahead until: {lookahead_date}")
+                logger.info(
+                    f"[Customer: {customer.id}] Config: window={initial_days}d, urgent={urgent_days_limit}d, "
+                    f"weekly_interval={interval_days}d, lookahead={lookahead_date}"
+                )
 
                 # 2. Query Eligible LGs
                 query = db.query(models.LGRecord).filter(
@@ -3243,7 +3253,7 @@ class CRUDLGRecord(CRUDBase):
                     models.LGRecord.expiry_date >= current_date_only,
                     models.LGRecord.expiry_date <= lookahead_date
                 )
-                
+
                 eligible_lgs = query.options(
                     selectinload(models.LGRecord.internal_owner_contact),
                     selectinload(models.LGRecord.lg_category),
@@ -3251,6 +3261,7 @@ class CRUDLGRecord(CRUDBase):
                     selectinload(models.LGRecord.lg_currency),
                     selectinload(models.LGRecord.lg_type),
                     selectinload(models.LGRecord.lg_status),
+                    selectinload(models.LGRecord.issuing_bank),
                     selectinload(models.LGRecord.instructions)
                 ).all()
 
@@ -3266,13 +3277,14 @@ class CRUDLGRecord(CRUDBase):
 
                 for owner_id, lgs in owner_groups.items():
                     internal_owner = lgs[0].internal_owner_contact if lgs else None
-                    owner_due_lgs = []
+                    weekly_candidates = []
+                    critical_due_lgs = []
 
                     for lg in lgs:
-                        lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') else lg.expiry_date
+                        lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
                         days_until_expiry = (lg_expiry_val - current_date_only).days
-                        
-                        # 3. Check for Actions (The "Stop" Button)
+
+                        # 3. Check for Terminal Actions (The "Stop" Button)
                         relevant_action = db.query(models.AuditLog).filter(
                             models.AuditLog.lg_record_id == lg.id,
                             models.AuditLog.action_type.in_([
@@ -3285,44 +3297,91 @@ class CRUDLGRecord(CRUDBase):
                             logger.info(f" -> LG id={lg.id}: SKIPPED. Action '{relevant_action.action_type}' already exists.")
                             continue
 
-                        # 4. Check Last Sent Reminder
-                        last_reminder = db.query(models.AuditLog).filter(
-                            models.AuditLog.lg_record_id == lg.id,
-                            models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
-                        ).order_by(models.AuditLog.timestamp.desc()).first()
+                        # 4. Split into Separate Critical Alert (<= 3 days) vs. Weekly Digest (> 3 days)
+                        if days_until_expiry <= 3:
+                            last_crit = db.query(models.AuditLog).filter(
+                                models.AuditLog.lg_record_id == lg.id,
+                                models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
+                            ).order_by(models.AuditLog.timestamp.desc()).first()
 
-                        # CRITICAL OVERRIDE: If days_until_expiry <= 3, ignore the cooldown interval and send daily reminders
-                        is_critical_daily = days_until_expiry <= 3
-
-                        should_send = False
-                        if not last_reminder:
-                            logger.info(f" -> LG id={lg.id}: Initial reminder due ({days_until_expiry} days left).")
-                            should_send = True
-                        else:
-                            last_rem_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
-                            days_since_last = (current_date_only - last_rem_date).days
-                            
-                            if is_critical_daily and last_rem_date < current_date_only:
-                                logger.info(f" -> LG id={lg.id}: Critical daily reminder due ({days_until_expiry} days left <= 3d).")
-                                should_send = True
-                            elif days_since_last >= interval_days:
-                                logger.info(f" -> LG id={lg.id}: Follow-up due. Last sent {days_since_last} days ago.")
-                                should_send = True
+                            should_send_critical = False
+                            if not last_crit:
+                                should_send_critical = True
                             else:
-                                logger.info(f" -> LG id={lg.id}: SKIPPED. Last reminder was only {days_since_last} days ago (Interval: {interval_days}).")
+                                last_crit_date = last_crit.timestamp.date() if hasattr(last_crit.timestamp, 'date') else last_crit.timestamp
+                                if last_crit_date < current_date_only:
+                                    should_send_critical = True
 
-                        if should_send:
-                            owner_due_lgs.append({
+                            if should_send_critical:
+                                critical_due_lgs.append({
+                                    "lg": lg,
+                                    "days_until_expiry": days_until_expiry,
+                                    "urgency_level": "critical"
+                                })
+                        else:
+                            weekly_candidates.append({
                                 "lg": lg,
-                                "days_until_expiry": days_until_expiry
+                                "days_until_expiry": days_until_expiry,
+                                "urgency_level": "urgent" if days_until_expiry <= urgent_days_limit else "normal"
                             })
 
-                    if owner_due_lgs:
+                    # 5A. Evaluate Digest-Level Cooldown for Weekly Digest (> 3d items)
+                    if weekly_candidates:
+                        digest_query = db.query(models.AuditLog).filter(
+                            models.AuditLog.customer_id == customer.id,
+                            models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_DIGEST_SENT,
+                            models.AuditLog.entity_type == "InternalOwnerContact"
+                        )
+                        if owner_id is not None:
+                            digest_query = digest_query.filter(models.AuditLog.entity_id == owner_id)
+                        else:
+                            digest_query = digest_query.filter(models.AuditLog.entity_id.is_(None))
+
+                        last_owner_digest = digest_query.order_by(models.AuditLog.timestamp.desc()).first()
+
+                        should_send_weekly = False
+                        if not last_owner_digest:
+                            # Fallback check on per-LG reminder logs in case digest log didn't exist yet
+                            candidate_ids = [item["lg"].id for item in weekly_candidates]
+                            last_any_lg_rem = db.query(models.AuditLog).filter(
+                                models.AuditLog.lg_record_id.in_(candidate_ids),
+                                models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_REMINDER_SENT
+                            ).order_by(models.AuditLog.timestamp.desc()).first()
+
+                            if not last_any_lg_rem:
+                                should_send_weekly = True
+                            else:
+                                last_dt = last_any_lg_rem.timestamp.date() if hasattr(last_any_lg_rem.timestamp, 'date') else last_any_lg_rem.timestamp
+                                if (current_date_only - last_dt).days >= interval_days:
+                                    should_send_weekly = True
+                        else:
+                            last_digest_date = last_owner_digest.timestamp.date() if hasattr(last_owner_digest.timestamp, 'date') else last_owner_digest.timestamp
+                            days_since_digest = (current_date_only - last_digest_date).days
+                            if days_since_digest >= interval_days:
+                                should_send_weekly = True
+                            else:
+                                logger.info(
+                                    f" -> Owner id={owner_id} (Customer {customer.id}): Weekly digest SKIPPED "
+                                    f"(last sent {days_since_digest}d ago, interval={interval_days}d)."
+                                )
+
+                        if should_send_weekly:
+                            await self._send_consolidated_internal_owner_renewal_digest(
+                                db=db,
+                                customer=customer,
+                                internal_owner=internal_owner,
+                                owner_due_lgs=weekly_candidates,
+                                is_critical_alert=False
+                            )
+
+                    # 5B. Dispatch Separate Critical Expiry Alert (<= 3d items)
+                    if critical_due_lgs:
                         await self._send_consolidated_internal_owner_renewal_digest(
                             db=db,
                             customer=customer,
                             internal_owner=internal_owner,
-                            owner_due_lgs=owner_due_lgs
+                            owner_due_lgs=critical_due_lgs,
+                            is_critical_alert=True
                         )
 
             except Exception as e:
@@ -3331,37 +3390,69 @@ class CRUDLGRecord(CRUDBase):
             finally:
                 db.commit()
 
-        logger.info("--- FINISHED: Internal Owner Renewal Reminders Task ---")
+        logger.info("--- FINISHED: Consolidated Owner-Grouped Renewal Reminders Task ---")
 
     async def _send_consolidated_internal_owner_renewal_digest(
         self,
         db: Session,
         customer: models.Customer,
         internal_owner: Optional[models.InternalOwnerContact],
-        owner_due_lgs: List[Dict[str, Any]]
+        owner_due_lgs: List[Dict[str, Any]],
+        is_critical_alert: bool = False
     ):
         """
-        Sends a single consolidated HTML digest email to an Internal Owner (and manager)
-        listing all non-auto-renew LGs requiring their action.
+        Sends a consolidated HTML digest email (or separate Critical <= 3d Alert) for an Internal Owner group:
+        - If an Internal Owner is assigned: `TO` = Internal Owner, `CC` = Manager + End Users (Treasury) + Corporate Admins + Common Comm List.
+        - If Unassigned (`internal_owner` is None): `TO` = End Users (Treasury), `CC` = Corporate Admins + Common Comm List.
         """
         if not owner_due_lgs:
             return
 
-        owner_name = internal_owner.email if (internal_owner and getattr(internal_owner, 'email', None)) else "Internal Owner"
+        has_owner_email = bool(internal_owner and getattr(internal_owner, 'email', None))
+        owner_label = internal_owner.email if has_owner_email else "Unassigned"
+        recipient_greeting = internal_owner.email if has_owner_email else "Treasury Team"
 
-        logger.info(f"Preparing Feature 2 consolidated digest for Internal Owner id={internal_owner.id if internal_owner else 'N/A'} (customer {customer.id}) with {len(owner_due_lgs)} LGs.")
+        logger.info(
+            f"Preparing {'CRITICAL alert' if is_critical_alert else 'Weekly digest'} for "
+            f"Internal Owner='{owner_label}' (customer {customer.id}) with {len(owner_due_lgs)} LGs."
+        )
 
         email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer.id)
 
+        # Query active End Users (Treasury) and Corporate Admins
+        end_users = db.query(models.User).filter(
+            models.User.customer_id == customer.id,
+            models.User.role == models.UserRole.END_USER,
+            models.User.is_deleted == False
+        ).all()
+        end_user_emails = [u.email for u in end_users if u.email]
+
+        corporate_admins = db.query(models.User).filter(
+            models.User.customer_id == customer.id,
+            models.User.role == models.UserRole.CORPORATE_ADMIN,
+            models.User.is_deleted == False
+        ).all()
+        admin_emails = [a.email for a in corporate_admins if a.email]
+
         to_emails = []
-        if internal_owner and internal_owner.email:
-            to_emails.append(internal_owner.email)
-
         cc_emails = []
-        if internal_owner and internal_owner.manager_email:
-            cc_emails.append(internal_owner.manager_email)
 
-        # Add common communication list
+        if has_owner_email:
+            # Approach A: TO = Internal Owner; CC = Manager + Treasury (End Users) + Corporate Admins
+            to_emails.append(internal_owner.email)
+            if internal_owner.manager_email:
+                cc_emails.append(internal_owner.manager_email)
+            cc_emails.extend(end_user_emails)
+            cc_emails.extend(admin_emails)
+        else:
+            # Unassigned LGs: TO = Treasury (End Users), fallback to Corporate Admins; CC = Corporate Admins
+            if end_user_emails:
+                to_emails.extend(end_user_emails)
+                cc_emails.extend(admin_emails)
+            else:
+                to_emails.extend(admin_emails)
+
+        # Add common communication list to CC
         common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
             db, customer.id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
         )
@@ -3373,36 +3464,18 @@ class CRUDLGRecord(CRUDBase):
             except json.JSONDecodeError:
                 logger.warning(f"COMMON_COMMUNICATION_LIST for customer {customer.id} is not valid JSON. Skipping.")
 
-        # Add End Users and Corporate Admins
-        end_users = db.query(models.User).filter(
-            models.User.customer_id == customer.id,
-            models.User.role == models.UserRole.END_USER,
-            models.User.is_deleted == False
-        ).all()
-        for user in end_users:
-            if user.email:
-                to_emails.append(user.email)
-
-        corporate_admins = db.query(models.User).filter(
-            models.User.customer_id == customer.id,
-            models.User.role == models.UserRole.CORPORATE_ADMIN,
-            models.User.is_deleted == False
-        ).all()
-        for admin in corporate_admins:
-            if admin.email:
-                cc_emails.append(admin.email)
-
         to_emails = list(set(to_emails))
         cc_emails = list(set(cc_emails) - set(to_emails))
 
         if not to_emails and not cc_emails:
-            logger.warning(f"No valid recipients found for Internal Owner id={internal_owner.id if internal_owner else 'N/A'} renewal digest. Skipping email.")
+            logger.warning(f"No valid recipients found for Internal Owner '{owner_label}' renewal digest. Skipping email.")
             return
 
         items_for_html = []
         for item in owner_due_lgs:
             lg = item["lg"]
             lg_expiry_val = lg.expiry_date.date() if hasattr(lg.expiry_date, 'date') and callable(lg.expiry_date.date) else lg.expiry_date
+            urgency_lvl = item.get("urgency_level") or ("critical" if item["days_until_expiry"] <= 3 else ("urgent" if item["days_until_expiry"] <= 30 else "normal"))
 
             items_for_html.append({
                 "lg_number": lg.lg_number,
@@ -3413,16 +3486,20 @@ class CRUDLGRecord(CRUDBase):
                 "amount_formatted": f"{lg.lg_currency.symbol if lg.lg_currency else ''} {float(lg.lg_amount):,.2f}",
                 "expiry_date_str": lg_expiry_val.strftime('%Y-%m-%d'),
                 "days_until_expiry": item["days_until_expiry"],
-                "urgency_level": "urgent" if item["days_until_expiry"] <= 30 else "normal",
+                "urgency_level": urgency_lvl,
                 "auto_renewal": bool(lg.auto_renewal)
             })
 
-        digest_title = "MY ACTION REQUIRED: EXPIRING LGS"
-        email_subject = f"Expiry Digest · {len(owner_due_lgs)} LG(s) Nearing Expiry"
+        if is_critical_alert:
+            digest_title = "CRITICAL ALERT: LGS EXPIRING WITHIN 3 DAYS"
+            email_subject = f"CRITICAL · {len(owner_due_lgs)} LG(s) Expiring Within 3 Days ({owner_label})"
+        else:
+            digest_title = "EXPIRY & RENEWAL DIGEST"
+            email_subject = f"Expiry Digest ({owner_label}) · {len(owner_due_lgs)} LG(s) Nearing Expiry"
 
         email_body_html = build_lg_renewal_digest_html(
             customer_name=customer.name,
-            recipient_name=owner_name,
+            recipient_name=recipient_greeting,
             digest_title=digest_title,
             items=items_for_html
         )
@@ -3456,34 +3533,42 @@ class CRUDLGRecord(CRUDBase):
                         "email_subject": email_subject,
                         "email_method": email_method_for_log,
                         "digest_consolidated": True,
+                        "is_critical_alert": is_critical_alert,
                         "digest_items_count": len(owner_due_lgs)
                     },
                     customer_id=customer.id,
                     lg_record_id=lg.id,
                 )
 
-            # 2. Audit log summary for Internal Owner Digest
-            log_action(
-                db,
-                user_id=None,
-                action_type=AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_DIGEST_SENT,
-                entity_type="InternalOwnerContact",
-                entity_id=internal_owner.id if internal_owner else None,
-                details={
-                    "customer_name": customer.name,
-                    "internal_owner_name": owner_name,
-                    "due_lgs_count": len(owner_due_lgs),
-                    "lg_numbers": [item["lg"].lg_number for item in owner_due_lgs],
-                    "recipients": to_emails,
-                    "cc_recipients": cc_emails,
-                    "email_subject": email_subject,
-                    "email_method": email_method_for_log
-                },
-                customer_id=customer.id,
+            # 2. Audit log summary for Weekly Digest cooldown tracking
+            if not is_critical_alert:
+                log_action(
+                    db,
+                    user_id=None,
+                    action_type=AUDIT_ACTION_TYPE_LG_OWNER_RENEWAL_DIGEST_SENT,
+                    entity_type="InternalOwnerContact",
+                    entity_id=internal_owner.id if internal_owner else None,
+                    details={
+                        "customer_name": customer.name,
+                        "internal_owner_name": owner_label,
+                        "due_lgs_count": len(owner_due_lgs),
+                        "lg_numbers": [item["lg"].lg_number for item in owner_due_lgs],
+                        "recipients": to_emails,
+                        "cc_recipients": cc_emails,
+                        "email_subject": email_subject,
+                        "email_method": email_method_for_log
+                    },
+                    customer_id=customer.id,
+                )
+            logger.info(
+                f"Consolidated {'critical alert' if is_critical_alert else 'weekly renewal digest'} "
+                f"sent successfully for Owner='{owner_label}' ({len(owner_due_lgs)} LGs)."
             )
-            logger.info(f"Consolidated Feature 2 renewal digest sent successfully for Internal Owner id={internal_owner.id if internal_owner else 'N/A'} ({len(owner_due_lgs)} LGs).")
         else:
-            logger.error(f"Failed to send Feature 2 renewal digest email for Internal Owner id={internal_owner.id if internal_owner else 'N/A'}: {error_reason}")
+            logger.error(
+                f"Failed to send {'critical alert' if is_critical_alert else 'weekly renewal digest'} "
+                f"for Owner='{owner_label}': {error_reason}"
+            )
 
     async def _send_internal_owner_renewal_reminder_email(self,
                                                            db: Session,
@@ -3903,6 +3988,36 @@ class CRUDLGRecord(CRUDBase):
         if global_template:
             logger.debug(f"Resolved global fallback template ID {global_template.id} for action {action_type}")
         return global_template
+
+    def _parse_any_date(self, val: Any) -> Optional[date]:
+        """
+        Parses a date, datetime, ISO date string ('YYYY-MM-DD'), or 'DD-MMM-YYYY' string into a date object.
+        """
+        if not val or val == "N/A":
+            return None
+        if isinstance(val, datetime):
+            return val.date()
+        if isinstance(val, date):
+            return val
+        s = str(val).strip()
+        for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(s[:11] if "%b" in fmt else s[:10], fmt).date()
+            except ValueError:
+                continue
+        try:
+            return date.fromisoformat(s[:10])
+        except Exception:
+            return None
+
+    def _format_letter_date(self, val: Any) -> str:
+        """
+        Formats any date/datetime/date-string consistently as 'DD-MMM-YYYY' (e.g., '03-Nov-2026').
+        """
+        d = self._parse_any_date(val)
+        if d:
+            return d.strftime("%d-%b-%Y")
+        return str(val) if val and str(val).strip() else "N/A"
 
     def _format_extension_period(self, old_date: date, new_date: date) -> str:
         """
