@@ -1240,6 +1240,7 @@ async def import_historical_records(
     db.flush()
     
     batch_results = {'imported': 0, 'updated': 0, 'failed': 0, 'skipped_exists': 0}
+    purged_any_migrated_lg = False
     
     for lg_num, snapshots in lg_groups.items():
         with db.begin_nested() as nested_session:
@@ -1269,6 +1270,7 @@ async def import_historical_records(
                             f"Purging previously migrated LG id={existing_lg_in_prod.id} ({lg_num}) to perform clean historical re-import."
                         )
                         _purge_migrated_lg_record(db, existing_lg_in_prod)
+                        purged_any_migrated_lg = True
                     else:
                         logger.warning(f"LG already exists in production (LG id={existing_lg_in_prod.id}). Skipping import.")
                         for snap in snapshots:
@@ -1459,6 +1461,13 @@ async def import_historical_records(
     batch.finished_at = func.now()
     db.add(batch)
     db.commit()
+
+    if purged_any_migrated_lg:
+        try:
+            from app.core.audit_crypto import reseal_audit_log_chain
+            reseal_audit_log_chain(db)
+        except Exception as reseal_err:
+            logger.warning(f"Failed to auto-reseal WORM audit chain after historical re-import: {reseal_err}")
     
     return {
         "message": "Historical migration process completed.",
@@ -1910,6 +1919,12 @@ def reset_migrated_records_for_clean_reimport(
         reset_count += 1
 
     db.commit()
+    if purged_lg_numbers:
+        try:
+            from app.core.audit_crypto import reseal_audit_log_chain
+            reseal_audit_log_chain(db)
+        except Exception as reseal_err:
+            logger.warning(f"Failed to auto-reseal WORM audit chain after migration reset: {reseal_err}")
     logger.info(
         f"Reset migrated records for customer {customer_id}: purged {len(purged_lg_numbers)} production LGs, reset {reset_count} staged records."
     )

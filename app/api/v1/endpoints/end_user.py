@@ -1153,6 +1153,7 @@ async def upload_lg_supporting_documents(
             detail="No valid document files were provided.",
         )
 
+    reseal_needed = False
     if audit_log_id is not None:
         audit_row = (
             db.query(models.AuditLog)
@@ -1174,9 +1175,30 @@ async def upload_lg_supporting_documents(
             details_dict["attached_document_ids"] = existing_ids
             audit_row.details = details_dict
             flag_modified(audit_row, "details")
+            if audit_row.entry_hash:
+                from app.core.audit_crypto import compute_audit_hash
+                audit_row.entry_hash = compute_audit_hash(
+                    previous_hash=audit_row.previous_hash,
+                    timestamp=audit_row.timestamp,
+                    user_id=audit_row.user_id,
+                    action_type=audit_row.action_type,
+                    entity_type=audit_row.entity_type,
+                    entity_id=audit_row.entity_id,
+                    customer_id=audit_row.customer_id,
+                    lg_record_id=audit_row.lg_record_id,
+                    details=audit_row.details,
+                    ip_address=audit_row.ip_address,
+                )
+                reseal_needed = True
             db.add(audit_row)
 
     db.commit()
+    if reseal_needed:
+        try:
+            from app.core.audit_crypto import reseal_audit_log_chain
+            reseal_audit_log_chain(db)
+        except Exception as reseal_err:
+            logger.warning(f"Failed to auto-reseal WORM audit chain after linking document to AuditLog {audit_log_id}: {reseal_err}")
     for d in created_docs:
         db.refresh(d)
     return created_docs
