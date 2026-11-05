@@ -4957,7 +4957,7 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
             try:
                 from app.services.notifications.push_channel import enqueue_dealer_push
                 asgn = next((a for a in rfq.assignments if a.quotation_bank and a.quotation_bank.bank_id == bank_res.get('bank_id')), None)
-                if asgn:
+                if asgn and is_winner:
                     event_code = "DEALER_DEAL_CONFIRMED" if is_winner else "DEALER_DEAL_CONCLUDED"
                     title = f"RFQ {ref_no} · Deal confirmed" if is_winner else f"RFQ {ref_no} · Quotation concluded"
                     body = "Your offer has been selected for trade execution." if is_winner else "Thank you for quoting. This quotation request has concluded."

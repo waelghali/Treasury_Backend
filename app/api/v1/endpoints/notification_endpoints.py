@@ -162,7 +162,10 @@ def subscribe_push(
         and not sub.is_deleted
     )
     if not is_already_active and _active_subs_query(db, current_user.user_id).count() >= MAX_SUBSCRIPTIONS_PER_USER:
-        raise HTTPException(status_code=409, detail="Too many devices. Remove an old device first.")
+        oldest = _active_subs_query(db, current_user.user_id).order_by(PushSubscription.created_at.asc()).first()
+        if oldest:
+            oldest.is_active = False
+            oldest.revoked_reason = "ADMIN_REVOKED"
 
     if sub is None:
         sub = PushSubscription(endpoint=payload.endpoint)
@@ -183,6 +186,8 @@ def subscribe_push(
     sub.device_label = payload.device_label
     sub.platform = platform
     sub.device_type = platform or "web"
+    if sub.revoked_reason == "SIGNED_OUT":
+        sub.revoked_reason = None
     sub.is_active = True
     sub.is_deleted = False
     sub.failure_count = 0

@@ -505,6 +505,13 @@ def _acceptance_expired(db: Session, now: datetime, evaluate: Callable) -> int:
             continue
         if rfq.acceptance_status == "PENDING":
             _evaluate_once("deadline", rfq, db, evaluate)
+        if rfq.acceptance_status in ("AUTO_ACCEPTED", "AUTO_REJECTED"):
+            db.query(UserNotification).filter(
+                UserNotification.module == "QUOTATION",
+                UserNotification.reference_key == str(rfq.id),
+                UserNotification.event_type.in_(["RFQ_QUOTES_READY", "RFQ_CLOSING_SOON"]),
+                UserNotification.is_read == False,
+            ).update({"is_read": True, "expires_at": now}, synchronize_session=False)
         if rfq.acceptance_status == "AUTO_ACCEPTED":
             raised += _raise(db, EventCode.RFQ_DEAL_AUTO_RESOLVED, rfq, extra={"decision": "auto-accepted"})
         elif rfq.acceptance_status == "AUTO_REJECTED":

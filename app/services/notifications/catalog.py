@@ -85,6 +85,7 @@ class EventSpec:
     expiry: ExpiryPolicy = ExpiryPolicy.FIXED_24H
     # Placeholders allowed in title/body. Anything else is a programming error.
     allowed_fields: Tuple[str, ...] = field(default=("ref_no",))
+    send_push: bool = True
 
 
 QUOTATIONS = "QUOTATIONS"
@@ -236,6 +237,7 @@ CATALOG: Dict[EventCode, EventSpec] = {
         body="The acceptance time ran out and the deal was {decision} by your company policy.",
         link=LinkTarget.RFQ_RESULTS,
         allowed_fields=("ref_no", "decision"),
+        send_push=False,
     ),
 
     # ── LG Custody events ──────────────────────────────────────────────────────────

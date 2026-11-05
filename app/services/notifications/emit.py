@@ -141,7 +141,7 @@ def emit(
         ]
         db.add_all(rows)
         try:
-            pushes = enqueue_push(db, rows)
+            pushes = enqueue_push(db, rows) if getattr(spec, "send_push", True) else 0
         except Exception:
             pushes = 0
             logger.exception("Notification %s for RFQ %s: push enqueue failed (in-app kept)", spec.code.value, rfq.id)
@@ -227,7 +227,7 @@ def emit_lg(
         ]
         db.add_all(rows)
         try:
-            pushes = enqueue_push(db, rows)
+            pushes = enqueue_push(db, rows) if getattr(spec, "send_push", True) else 0
         except Exception:
             pushes = 0
             logger.exception("Notification %s for LG %s: push enqueue failed (in-app kept)", spec.code.value, lg_record.id)

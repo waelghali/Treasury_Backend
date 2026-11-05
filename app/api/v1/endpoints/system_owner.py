@@ -542,51 +542,639 @@ def get_dashboard_metrics(
     current_user: TokenData = Depends(HasPermission("system_owner:view_dashboard"))
 ):
     """
-    Retrieves key metrics for the System Owner dashboard.
-    For now, focuses on active customers, active users, and recent audit activity.
-    LG-related metrics will be integrated once the LG_CUSTODY module is active.
+    Retrieves diversified, zero-confidentiality-breach macro telemetry for the System Owner dashboard.
+    Aggregates cross-module adoption, database/record scale & 30d momentum, automation/velocity performance,
+    and an anonymized activity stream without exposing tenant identities, PII, or financial values.
     """
-    total_active_customers = db.query(Customer).filter(Customer.is_deleted == False).count()
-    total_active_users = db.query(User).filter(User.is_deleted == False).count()
-    
-    customers_change_percent = "+12%" if total_active_customers > 0 else "0%"
-    users_change_percent = "+8%" if total_active_users > 0 else "0%"
+    from sqlalchemy import text as sql_text, distinct
+    from dateutil.relativedelta import relativedelta
+    from app.constants import LgStatusEnum, SubscriptionStatus
+    from app.models import (
+        LGRecord, LGInstruction, LGDocument, ApprovalRequest, AIUsageLog, UserDevice,
+        IssuanceRequest, IssuedLGRecord, IssuanceFacility, IssuanceMaintenanceAction,
+        IssuanceRequestDocument, BankFormTemplate, ReconciliationSession,
+        QuotationRequest, QuotationOffer, QuotationTBillOffer, QuotationBankAssignment,
+        BankStatement, BankTransaction, ReconciliationMatch, CollaborativePattern,
+        InboxItem, InboxOutboundRequest, InboxAttachment
+    )
 
-    seven_days_ago = datetime.utcnow() - timedelta(days=7)
-    recent_activity_logs = db.query(AuditLog).filter(
-        AuditLog.timestamp >= seven_days_ago
-    ).order_by(AuditLog.timestamp.desc()).limit(10).all()
+    now = datetime.utcnow()
+    d_30_ago = now - timedelta(days=30)
+    d_60_ago = now - timedelta(days=60)
+    d_7_ago = now - timedelta(days=7)
+
+    def _safe_scalar(fn, default=0):
+        try:
+            val = fn()
+            return val if val is not None else default
+        except Exception:
+            db.rollback()
+            return default
+
+    def _calc_delta_str(curr_30d: int, prev_30d: int, total_val: int = 0) -> str:
+        if prev_30d > 0:
+            pct = round(((curr_30d - prev_30d) / prev_30d) * 100)
+            sign = "+" if pct >= 0 else ""
+            return f"{sign}{pct}% (30d)"
+        if curr_30d > 0:
+            if total_val > curr_30d:
+                base = total_val - curr_30d
+                pct = round((curr_30d / base) * 100)
+                return f"+{pct}% (30d)"
+            return f"+{curr_30d} new (30d)"
+        return "0% (30d)"
+
+    def _calc_delta_pct(curr_30d: int, prev_30d: int, total_val: int = 0) -> int:
+        if prev_30d > 0:
+            return round(((curr_30d - prev_30d) / prev_30d) * 100)
+        if curr_30d > 0:
+            if total_val > curr_30d:
+                return round((curr_30d / (total_val - curr_30d)) * 100)
+            return 100
+        return 0
+
+    # =========================================================================
+    # 1. TENANTS & USERS SCALE + GROWTH
+    # =========================================================================
+    total_active_customers = _safe_scalar(
+        lambda: db.query(Customer).filter(Customer.is_deleted == False).count()
+    )
+    customers_new_30d = _safe_scalar(
+        lambda: db.query(Customer).filter(Customer.is_deleted == False, Customer.created_at >= d_30_ago).count()
+    )
+    customers_prev_30d = _safe_scalar(
+        lambda: db.query(Customer).filter(
+            Customer.is_deleted == False,
+            Customer.created_at >= d_60_ago,
+            Customer.created_at < d_30_ago
+        ).count()
+    )
+    customers_change_percent = _calc_delta_str(customers_new_30d, customers_prev_30d, total_active_customers)
+
+    active_sub_count = _safe_scalar(
+        lambda: db.query(Customer).filter(Customer.is_deleted == False, Customer.status == SubscriptionStatus.ACTIVE).count()
+    )
+    grace_sub_count = _safe_scalar(
+        lambda: db.query(Customer).filter(Customer.is_deleted == False, Customer.status == SubscriptionStatus.GRACE).count()
+    )
+    expired_sub_count = _safe_scalar(
+        lambda: db.query(Customer).filter(Customer.is_deleted == False, Customer.status == SubscriptionStatus.EXPIRED).count()
+    )
+
+    total_active_users = _safe_scalar(
+        lambda: db.query(User).filter(User.is_deleted == False).count()
+    )
+    users_new_30d = _safe_scalar(
+        lambda: db.query(User).filter(User.is_deleted == False, User.created_at >= d_30_ago).count()
+    )
+    users_prev_30d = _safe_scalar(
+        lambda: db.query(User).filter(
+            User.is_deleted == False,
+            User.created_at >= d_60_ago,
+            User.created_at < d_30_ago
+        ).count()
+    )
+    users_change_percent = _calc_delta_str(users_new_30d, users_prev_30d, total_active_users)
+
+    # 7-day & 30-day active user engagement (from AuditLog + UserDevice)
+    active_users_7d = _safe_scalar(
+        lambda: db.query(func.count(distinct(AuditLog.user_id))).filter(
+            AuditLog.timestamp >= d_7_ago,
+            AuditLog.user_id.isnot(None)
+        ).scalar()
+    )
+    active_users_30d = _safe_scalar(
+        lambda: db.query(func.count(distinct(AuditLog.user_id))).filter(
+            AuditLog.timestamp >= d_30_ago,
+            AuditLog.user_id.isnot(None)
+        ).scalar()
+    )
+
+    # Subscription plan module entitlements across active customers
+    customers_with_plans = []
+    try:
+        customers_with_plans = db.query(Customer).options(selectinload(Customer.subscription_plan)).filter(
+            Customer.is_deleted == False
+        ).all()
+    except Exception:
+        customers_with_plans = []
+
+    entitled_custody = sum(1 for c in customers_with_plans if c.subscription_plan and getattr(c.subscription_plan, 'has_custody_module', True))
+    entitled_issuance = sum(1 for c in customers_with_plans if c.subscription_plan and getattr(c.subscription_plan, 'has_issuance_module', False))
+    entitled_quotation = sum(1 for c in customers_with_plans if c.subscription_plan and getattr(c.subscription_plan, 'has_quotation_module', False))
+    entitled_recon = sum(1 for c in customers_with_plans if c.subscription_plan and getattr(c.subscription_plan, 'has_reconciliation_module', False))
+    entitled_inbox = sum(1 for c in customers_with_plans if c.subscription_plan and getattr(c.subscription_plan, 'can_email_inbox', False))
+    entitled_ai = sum(1 for c in customers_with_plans if c.subscription_plan and getattr(c.subscription_plan, 'can_ai_integration', False))
+
+    # =========================================================================
+    # 2. MODULE-BY-MODULE VOLUME, ADOPTION & 30D MOMENTUM
+    # =========================================================================
+    # --- Module 1: LG Custody ---
+    custody_lgs_total = _safe_scalar(lambda: db.query(LGRecord).filter(LGRecord.is_deleted == False).count())
+    custody_lgs_valid = _safe_scalar(
+        lambda: db.query(LGRecord).filter(LGRecord.is_deleted == False, LGRecord.lg_status_id == LgStatusEnum.VALID.value).count()
+    )
+    custody_instr_total = _safe_scalar(lambda: db.query(LGInstruction).filter(LGInstruction.is_deleted == False).count())
+    custody_docs_total = _safe_scalar(lambda: db.query(LGDocument).filter(LGDocument.is_deleted == False).count())
+    custody_30d = _safe_scalar(
+        lambda: db.query(LGRecord).filter(LGRecord.is_deleted == False, LGRecord.created_at >= d_30_ago).count()
+        + db.query(LGInstruction).filter(LGInstruction.is_deleted == False, LGInstruction.created_at >= d_30_ago).count()
+    )
+    custody_prev_30d = _safe_scalar(
+        lambda: db.query(LGRecord).filter(LGRecord.is_deleted == False, LGRecord.created_at >= d_60_ago, LGRecord.created_at < d_30_ago).count()
+        + db.query(LGInstruction).filter(LGInstruction.is_deleted == False, LGInstruction.created_at >= d_60_ago, LGInstruction.created_at < d_30_ago).count()
+    )
+    custody_tenants = _safe_scalar(
+        lambda: db.query(func.count(distinct(LGRecord.customer_id))).filter(LGRecord.is_deleted == False).scalar()
+    )
+    custody_volume = custody_lgs_total + custody_instr_total
+
+    # --- Module 2: LG Issuance & Facilities ---
+    issuance_reqs_total = _safe_scalar(lambda: db.query(IssuanceRequest).filter(IssuanceRequest.is_deleted == False).count())
+    issued_lgs_total = _safe_scalar(lambda: db.query(IssuedLGRecord).count())
+    issued_lgs_active = _safe_scalar(
+        lambda: db.query(IssuedLGRecord).filter(IssuedLGRecord.status.in_(["ACTIVE", "LG_ISSUED", "DELIVERED_TO_BANK", "INTERNAL_PROCESSING"])).count()
+    )
+    facilities_active = _safe_scalar(
+        lambda: db.query(IssuanceFacility).filter(IssuanceFacility.is_deleted == False, IssuanceFacility.status == "ACTIVE").count()
+    )
+    issuance_maint_total = _safe_scalar(
+        lambda: db.query(IssuanceMaintenanceAction).filter(IssuanceMaintenanceAction.is_deleted == False).count()
+    )
+    issuance_docs_total = _safe_scalar(
+        lambda: db.query(IssuanceRequestDocument).filter(IssuanceRequestDocument.is_deleted == False).count()
+    )
+    issuance_30d = _safe_scalar(
+        lambda: db.query(IssuanceRequest).filter(IssuanceRequest.is_deleted == False, IssuanceRequest.created_at >= d_30_ago).count()
+        + db.query(IssuedLGRecord).filter(IssuedLGRecord.created_at >= d_30_ago).count()
+        + db.query(IssuanceMaintenanceAction).filter(IssuanceMaintenanceAction.is_deleted == False, IssuanceMaintenanceAction.created_at >= d_30_ago).count()
+    )
+    issuance_prev_30d = _safe_scalar(
+        lambda: db.query(IssuanceRequest).filter(IssuanceRequest.is_deleted == False, IssuanceRequest.created_at >= d_60_ago, IssuanceRequest.created_at < d_30_ago).count()
+        + db.query(IssuedLGRecord).filter(IssuedLGRecord.created_at >= d_60_ago, IssuedLGRecord.created_at < d_30_ago).count()
+        + db.query(IssuanceMaintenanceAction).filter(IssuanceMaintenanceAction.is_deleted == False, IssuanceMaintenanceAction.created_at >= d_60_ago, IssuanceMaintenanceAction.created_at < d_30_ago).count()
+    )
+    issuance_tenants = _safe_scalar(
+        lambda: db.query(func.count(distinct(IssuanceRequest.customer_id))).filter(IssuanceRequest.is_deleted == False).scalar()
+    )
+    issuance_volume = issuance_reqs_total + issued_lgs_total + issuance_maint_total + facilities_active
+
+    # --- Module 3: FX & T-Bill Quotations ---
+    rfqs_total = _safe_scalar(lambda: db.query(QuotationRequest).filter(QuotationRequest.is_deleted == False).count())
+    rfqs_completed = _safe_scalar(
+        lambda: db.query(QuotationRequest).filter(
+            QuotationRequest.is_deleted == False,
+            QuotationRequest.status.in_(["COMPLETED", "ACCEPTED"])
+        ).count()
+    )
+    fx_offers_total = _safe_scalar(lambda: db.query(QuotationOffer).filter(QuotationOffer.is_deleted == False).count())
+    tbill_offers_total = _safe_scalar(lambda: db.query(QuotationTBillOffer).filter(QuotationTBillOffer.is_deleted == False).count())
+    all_offers_total = fx_offers_total + tbill_offers_total
+    quotation_30d = _safe_scalar(
+        lambda: db.query(QuotationRequest).filter(QuotationRequest.is_deleted == False, QuotationRequest.created_at >= d_30_ago).count()
+        + db.query(QuotationOffer).filter(QuotationOffer.is_deleted == False, QuotationOffer.created_at >= d_30_ago).count()
+        + db.query(QuotationTBillOffer).filter(QuotationTBillOffer.is_deleted == False, QuotationTBillOffer.created_at >= d_30_ago).count()
+    )
+    quotation_prev_30d = _safe_scalar(
+        lambda: db.query(QuotationRequest).filter(QuotationRequest.is_deleted == False, QuotationRequest.created_at >= d_60_ago, QuotationRequest.created_at < d_30_ago).count()
+        + db.query(QuotationOffer).filter(QuotationOffer.is_deleted == False, QuotationOffer.created_at >= d_60_ago, QuotationOffer.created_at < d_30_ago).count()
+        + db.query(QuotationTBillOffer).filter(QuotationTBillOffer.is_deleted == False, QuotationTBillOffer.created_at >= d_60_ago, QuotationTBillOffer.created_at < d_30_ago).count()
+    )
+    quotation_tenants = _safe_scalar(
+        lambda: db.query(func.count(distinct(QuotationRequest.customer_id))).filter(QuotationRequest.is_deleted == False).scalar()
+    )
+    quotation_volume = rfqs_total + all_offers_total
+
+    # --- Module 4: Bank Reconciliation (Statements + Position Recon) ---
+    statements_total = _safe_scalar(lambda: db.query(BankStatement).filter(BankStatement.is_deleted == False).count())
+    pos_sessions_total = _safe_scalar(lambda: db.query(ReconciliationSession).filter(ReconciliationSession.is_deleted == False).count())
+    bank_txns_total = _safe_scalar(lambda: db.query(BankTransaction).filter(BankTransaction.is_deleted == False).count())
+    bank_txns_handled = _safe_scalar(
+        lambda: db.query(BankTransaction).filter(
+            BankTransaction.is_deleted == False,
+            (BankTransaction.is_reconciled == True) | (BankTransaction.is_classified == True)
+        ).count()
+    )
+    recon_matches_total = _safe_scalar(lambda: db.query(ReconciliationMatch).filter(ReconciliationMatch.is_deleted == False).count())
+    collab_patterns_promoted = _safe_scalar(
+        lambda: db.query(CollaborativePattern).filter(CollaborativePattern.is_deleted == False, CollaborativePattern.is_promoted == True).count()
+    )
+    recon_30d = _safe_scalar(
+        lambda: db.query(BankStatement).filter(BankStatement.is_deleted == False, BankStatement.created_at >= d_30_ago).count()
+        + db.query(BankTransaction).filter(BankTransaction.is_deleted == False, BankTransaction.created_at >= d_30_ago).count()
+        + db.query(ReconciliationSession).filter(ReconciliationSession.is_deleted == False, ReconciliationSession.created_at >= d_30_ago).count()
+    )
+    recon_prev_30d = _safe_scalar(
+        lambda: db.query(BankStatement).filter(BankStatement.is_deleted == False, BankStatement.created_at >= d_60_ago, BankStatement.created_at < d_30_ago).count()
+        + db.query(BankTransaction).filter(BankTransaction.is_deleted == False, BankTransaction.created_at >= d_60_ago, BankTransaction.created_at < d_30_ago).count()
+        + db.query(ReconciliationSession).filter(ReconciliationSession.is_deleted == False, ReconciliationSession.created_at >= d_60_ago, ReconciliationSession.created_at < d_30_ago).count()
+    )
+    recon_tenants = _safe_scalar(
+        lambda: db.query(func.count(distinct(BankStatement.company_id))).filter(BankStatement.is_deleted == False).scalar()
+    )
+    recon_volume = statements_total + pos_sessions_total + bank_txns_total
+
+    # --- Module 5: Smart Inbox & Automated Mail ---
+    inbox_items_total = _safe_scalar(lambda: db.query(InboxItem).filter(InboxItem.is_deleted == False).count())
+    inbox_outbound_total = _safe_scalar(lambda: db.query(InboxOutboundRequest).filter(InboxOutboundRequest.is_deleted == False).count())
+    inbox_actioned_total = _safe_scalar(
+        lambda: db.query(InboxItem).filter(InboxItem.is_deleted == False, InboxItem.status.in_(["CONFIRMED", "ACTIONED"])).count()
+    )
+    inbox_attachments_total = _safe_scalar(lambda: db.query(InboxAttachment).filter(InboxAttachment.is_deleted == False).count())
+    inbox_30d = _safe_scalar(
+        lambda: db.query(InboxItem).filter(InboxItem.is_deleted == False, InboxItem.created_at >= d_30_ago).count()
+        + db.query(InboxOutboundRequest).filter(InboxOutboundRequest.is_deleted == False, InboxOutboundRequest.created_at >= d_30_ago).count()
+    )
+    inbox_prev_30d = _safe_scalar(
+        lambda: db.query(InboxItem).filter(InboxItem.is_deleted == False, InboxItem.created_at >= d_60_ago, InboxItem.created_at < d_30_ago).count()
+        + db.query(InboxOutboundRequest).filter(InboxOutboundRequest.is_deleted == False, InboxOutboundRequest.created_at >= d_60_ago, InboxOutboundRequest.created_at < d_30_ago).count()
+    )
+    inbox_tenants = _safe_scalar(
+        lambda: db.query(func.count(distinct(InboxItem.customer_id))).filter(InboxItem.is_deleted == False).scalar()
+    )
+    inbox_volume = inbox_items_total + inbox_outbound_total
+
+    # --- Module 6: AI & OCR Intelligence ---
+    ai_calls_total = _safe_scalar(lambda: db.query(AIUsageLog).filter(AIUsageLog.is_deleted == False).count())
+    ai_tokens_total = _safe_scalar(lambda: db.query(func.sum(AIUsageLog.total_tokens)).filter(AIUsageLog.is_deleted == False).scalar())
+    ai_pages_total = _safe_scalar(lambda: db.query(func.sum(AIUsageLog.total_pages)).filter(AIUsageLog.is_deleted == False).scalar())
+    bank_forms_ai_total = _safe_scalar(lambda: db.query(BankFormTemplate).filter(BankFormTemplate.is_deleted == False).count())
+    ai_30d = _safe_scalar(
+        lambda: db.query(AIUsageLog).filter(AIUsageLog.is_deleted == False, AIUsageLog.created_at >= d_30_ago).count()
+    )
+    ai_prev_30d = _safe_scalar(
+        lambda: db.query(AIUsageLog).filter(AIUsageLog.is_deleted == False, AIUsageLog.created_at >= d_60_ago, AIUsageLog.created_at < d_30_ago).count()
+    )
+    ai_tenants = _safe_scalar(
+        lambda: db.query(func.count(distinct(AIUsageLog.customer_id))).filter(AIUsageLog.is_deleted == False).scalar()
+    )
+    ai_volume = ai_calls_total + bank_forms_ai_total
+
+    # Combine modules and compute usage share & rank
+    raw_modules = [
+        {
+            "id": "custody",
+            "name": "LG Custody & Lifecycle",
+            "short_name": "LG Custody",
+            "category": "Core Guarantee Vault",
+            "total_volume": custody_volume,
+            "volume_30d": custody_30d,
+            "volume_prev_30d": custody_prev_30d,
+            "growth_pct": _calc_delta_pct(custody_30d, custody_prev_30d, custody_volume),
+            "growth_label": _calc_delta_str(custody_30d, custody_prev_30d, custody_volume),
+            "adopted_tenants": custody_tenants,
+            "entitled_tenants": max(entitled_custody, custody_tenants),
+            "sub_metrics": [
+                {"label": "Active LGs", "value": custody_lgs_valid},
+                {"label": "Instructions", "value": custody_instr_total},
+                {"label": "Vault Docs", "value": custody_docs_total},
+            ],
+        },
+        {
+            "id": "issuance",
+            "name": "LG Issuance & Facilities",
+            "short_name": "LG Issuance",
+            "category": "Credit Lines & Outbound",
+            "total_volume": issuance_volume,
+            "volume_30d": issuance_30d,
+            "volume_prev_30d": issuance_prev_30d,
+            "growth_pct": _calc_delta_pct(issuance_30d, issuance_prev_30d, issuance_volume),
+            "growth_label": _calc_delta_str(issuance_30d, issuance_prev_30d, issuance_volume),
+            "adopted_tenants": issuance_tenants,
+            "entitled_tenants": max(entitled_issuance, issuance_tenants),
+            "sub_metrics": [
+                {"label": "Requests", "value": issuance_reqs_total},
+                {"label": "Issued LGs", "value": issued_lgs_total},
+                {"label": "Facilities", "value": facilities_active},
+            ],
+        },
+        {
+            "id": "quotations",
+            "name": "FX & T-Bill Quotations",
+            "short_name": "Quotations Desk",
+            "category": "Bidding & Liquidity",
+            "total_volume": quotation_volume,
+            "volume_30d": quotation_30d,
+            "volume_prev_30d": quotation_prev_30d,
+            "growth_pct": _calc_delta_pct(quotation_30d, quotation_prev_30d, quotation_volume),
+            "growth_label": _calc_delta_str(quotation_30d, quotation_prev_30d, quotation_volume),
+            "adopted_tenants": quotation_tenants,
+            "entitled_tenants": max(entitled_quotation, quotation_tenants),
+            "sub_metrics": [
+                {"label": "RFQs Launched", "value": rfqs_total},
+                {"label": "Bank Quotes", "value": all_offers_total},
+                {"label": "Completed", "value": rfqs_completed},
+            ],
+        },
+        {
+            "id": "reconciliation",
+            "name": "Bank Reconciliation",
+            "short_name": "Reconciliation",
+            "category": "Statements & Matching",
+            "total_volume": recon_volume,
+            "volume_30d": recon_30d,
+            "volume_prev_30d": recon_prev_30d,
+            "growth_pct": _calc_delta_pct(recon_30d, recon_prev_30d, recon_volume),
+            "growth_label": _calc_delta_str(recon_30d, recon_prev_30d, recon_volume),
+            "adopted_tenants": recon_tenants,
+            "entitled_tenants": max(entitled_recon, recon_tenants),
+            "sub_metrics": [
+                {"label": "Statements", "value": statements_total + pos_sessions_total},
+                {"label": "Bank Txns", "value": bank_txns_total},
+                {"label": "Matched/Classified", "value": bank_txns_handled},
+            ],
+        },
+        {
+            "id": "inbox",
+            "name": "Smart Inbox & Mail",
+            "short_name": "Smart Inbox",
+            "category": "Email Ingestion & Polls",
+            "total_volume": inbox_volume,
+            "volume_30d": inbox_30d,
+            "volume_prev_30d": inbox_prev_30d,
+            "growth_pct": _calc_delta_pct(inbox_30d, inbox_prev_30d, inbox_volume),
+            "growth_label": _calc_delta_str(inbox_30d, inbox_prev_30d, inbox_volume),
+            "adopted_tenants": inbox_tenants,
+            "entitled_tenants": max(entitled_inbox, inbox_tenants),
+            "sub_metrics": [
+                {"label": "Inbound Emails", "value": inbox_items_total},
+                {"label": "Outbound Polls", "value": inbox_outbound_total},
+                {"label": "Actioned", "value": inbox_actioned_total},
+            ],
+        },
+        {
+            "id": "ai_copilot",
+            "name": "AI & OCR Co-Pilot",
+            "short_name": "AI & OCR",
+            "category": "Document AI & Assistant",
+            "total_volume": ai_volume,
+            "volume_30d": ai_30d,
+            "volume_prev_30d": ai_prev_30d,
+            "growth_pct": _calc_delta_pct(ai_30d, ai_prev_30d, ai_volume),
+            "growth_label": _calc_delta_str(ai_30d, ai_prev_30d, ai_volume),
+            "adopted_tenants": ai_tenants,
+            "entitled_tenants": max(entitled_ai, ai_tenants),
+            "sub_metrics": [
+                {"label": "AI/OCR Calls", "value": ai_calls_total},
+                {"label": "Pages Scanned", "value": ai_pages_total},
+                {"label": "AI Bank Forms", "value": bank_forms_ai_total},
+            ],
+        },
+    ]
+
+    total_platform_volume = sum(m["total_volume"] for m in raw_modules)
+    total_30d_volume = sum(m["volume_30d"] for m in raw_modules)
+    total_prev_30d_volume = sum(m["volume_prev_30d"] for m in raw_modules)
+
+    for m in raw_modules:
+        if total_platform_volume > 0:
+            m["usage_share_pct"] = round((m["total_volume"] / total_platform_volume) * 100, 1)
+        else:
+            m["usage_share_pct"] = 0.0
+        if total_30d_volume > 0:
+            m["active_share_30d_pct"] = round((m["volume_30d"] / total_30d_volume) * 100, 1)
+        else:
+            m["active_share_30d_pct"] = m["usage_share_pct"]
+
+    # Sort modules by total_volume descending so #1 most used is immediately clear
+    module_usage = sorted(raw_modules, key=lambda x: (x["volume_30d"], x["total_volume"]), reverse=True)
+    most_used_module = module_usage[0]["short_name"] if module_usage and module_usage[0]["total_volume"] > 0 else "LG Custody"
+
+    # =========================================================================
+    # 3. PLATFORM SIZE, DATABASE FOOTPRINT & 4-MONTH GROWTH TREND
+    # =========================================================================
+    db_size_mb = 0.0
+    try:
+        raw_bytes = db.execute(sql_text("SELECT pg_database_size(current_database())")).scalar()
+        if raw_bytes:
+            db_size_mb = round(float(raw_bytes) / (1024 * 1024), 2)
+    except Exception:
+        db.rollback()
+        db_size_mb = 0.0
+
+    total_stored_documents = (
+        custody_docs_total
+        + issuance_docs_total
+        + bank_forms_ai_total
+        + statements_total
+        + pos_sessions_total
+        + inbox_attachments_total
+    )
+    total_audit_blocks = _safe_scalar(lambda: db.query(AuditLog).count())
+    total_active_lgs_combined = custody_lgs_valid + issued_lgs_active
+
+    records_growth_pct = _calc_delta_pct(total_30d_volume, total_prev_30d_volume, total_platform_volume)
+    records_growth_label = _calc_delta_str(total_30d_volume, total_prev_30d_volume, total_platform_volume)
+    is_increasing = total_30d_volume >= total_prev_30d_volume and total_30d_volume > 0
+
+    if total_30d_volume > total_prev_30d_volume * 1.15 and total_30d_volume > 0:
+        momentum_status = "ACCELERATING"
+    elif total_30d_volume >= total_prev_30d_volume and total_30d_volume > 0:
+        momentum_status = "GROWING"
+    elif total_30d_volume > 0:
+        momentum_status = "STEADY"
+    else:
+        momentum_status = "BASELINE"
+
+    # Build 4-month stacked activity history (anonymized counts per module)
+    monthly_growth_trend = []
+    for i in range(3, -1, -1):
+        m_dt = now - relativedelta(months=i)
+        m_start = datetime(m_dt.year, m_dt.month, 1)
+        m_end = m_start + relativedelta(months=1)
+        m_label = m_start.strftime("%b %Y")
+
+        c_cnt = _safe_scalar(
+            lambda: db.query(LGRecord).filter(LGRecord.is_deleted == False, LGRecord.created_at >= m_start, LGRecord.created_at < m_end).count()
+            + db.query(LGInstruction).filter(LGInstruction.is_deleted == False, LGInstruction.created_at >= m_start, LGInstruction.created_at < m_end).count()
+        )
+        i_cnt = _safe_scalar(
+            lambda: db.query(IssuanceRequest).filter(IssuanceRequest.is_deleted == False, IssuanceRequest.created_at >= m_start, IssuanceRequest.created_at < m_end).count()
+            + db.query(IssuedLGRecord).filter(IssuedLGRecord.created_at >= m_start, IssuedLGRecord.created_at < m_end).count()
+        )
+        q_cnt = _safe_scalar(
+            lambda: db.query(QuotationRequest).filter(QuotationRequest.is_deleted == False, QuotationRequest.created_at >= m_start, QuotationRequest.created_at < m_end).count()
+            + db.query(QuotationOffer).filter(QuotationOffer.is_deleted == False, QuotationOffer.created_at >= m_start, QuotationOffer.created_at < m_end).count()
+        )
+        r_cnt = _safe_scalar(
+            lambda: db.query(BankStatement).filter(BankStatement.is_deleted == False, BankStatement.created_at >= m_start, BankStatement.created_at < m_end).count()
+            + db.query(BankTransaction).filter(BankTransaction.is_deleted == False, BankTransaction.created_at >= m_start, BankTransaction.created_at < m_end).count()
+        )
+        inb_cnt = _safe_scalar(
+            lambda: db.query(InboxItem).filter(InboxItem.is_deleted == False, InboxItem.created_at >= m_start, InboxItem.created_at < m_end).count()
+        )
+        ai_cnt = _safe_scalar(
+            lambda: db.query(AIUsageLog).filter(AIUsageLog.is_deleted == False, AIUsageLog.created_at >= m_start, AIUsageLog.created_at < m_end).count()
+        )
+        tot_m = c_cnt + i_cnt + q_cnt + r_cnt + inb_cnt + ai_cnt
+        monthly_growth_trend.append({
+            "month": m_label,
+            "custody": c_cnt,
+            "issuance": i_cnt,
+            "quotations": q_cnt,
+            "reconciliation": r_cnt,
+            "inbox": inb_cnt,
+            "ai": ai_cnt,
+            "total": tot_m,
+        })
+
+    # =========================================================================
+    # 4. PERFORMANCE & OPERATIONAL VELOCITY INSIGHTS
+    # =========================================================================
+    # A. Internal Approval Turnaround (hours)
+    avg_approval_hours = 0.0
+    try:
+        avg_app_interval = db.query(
+            func.avg(ApprovalRequest.updated_at - ApprovalRequest.created_at)
+        ).filter(
+            ApprovalRequest.updated_at.isnot(None),
+            ApprovalRequest.updated_at >= ApprovalRequest.created_at
+        ).scalar()
+        if avg_app_interval:
+            avg_approval_hours = round(max(0.0, avg_app_interval.total_seconds() / 3600.0), 1)
+    except Exception:
+        db.rollback()
+
+    # B. Bank Processing SLA Turnaround (days)
+    avg_bank_sla_days = 0.0
+    try:
+        avg_bank_interval = db.query(
+            func.avg(LGInstruction.bank_reply_date - LGInstruction.delivery_date)
+        ).filter(
+            LGInstruction.is_deleted == False,
+            LGInstruction.delivery_date.isnot(None),
+            LGInstruction.bank_reply_date.isnot(None),
+            LGInstruction.bank_reply_date >= LGInstruction.delivery_date
+        ).scalar()
+        if avg_bank_interval:
+            avg_bank_sla_days = round(max(0.0, avg_bank_interval.total_seconds() / 86400.0), 1)
+    except Exception:
+        db.rollback()
+
+    # C. Reconciliation Automation Rate (%)
+    recon_automation_rate_pct = (
+        round((bank_txns_handled / bank_txns_total) * 100, 1) if bank_txns_total > 0 else 0.0
+    )
+
+    # D. Quotation Deal Completion & Bank Liquidity Rate
+    total_assignments = _safe_scalar(
+        lambda: db.query(QuotationBankAssignment).filter(QuotationBankAssignment.is_deleted == False).count()
+    )
+    quotation_response_rate_pct = (
+        round(min(100.0, (all_offers_total / total_assignments) * 100), 1) if total_assignments > 0 else 0.0
+    )
+    quotation_completion_rate_pct = (
+        round((rfqs_completed / rfqs_total) * 100, 1) if rfqs_total > 0 else 0.0
+    )
+
+    # E. Smart Inbox Classification Health
+    inbox_errors = _safe_scalar(
+        lambda: db.query(InboxItem).filter(InboxItem.is_deleted == False, InboxItem.status == "PARSE_ERROR").count()
+    )
+    inbox_accuracy_rate_pct = (
+        round(((inbox_items_total - inbox_errors) / inbox_items_total) * 100, 1)
+        if inbox_items_total > 0 else 100.0
+    )
+
+    # =========================================================================
+    # 5. SANITIZED, ZERO-PII RECENT ACTIVITY FEED
+    # =========================================================================
+    recent_activity_logs = []
+    try:
+        recent_activity_logs = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(15).all()
+    except Exception:
+        db.rollback()
+
+    def _classify_module_tag(action_type: str, entity_type: str) -> str:
+        act = (action_type or "").upper()
+        ent = (entity_type or "").upper()
+        if "QUOTATION" in act or "RFQ" in act or "QUOTATION" in ent:
+            return "Quotations"
+        if "ISSUANCE" in act or "FACILITY" in act or "ISSUANCE" in ent or "FACILITY" in ent:
+            return "Issuance"
+        if "RECON" in act or "STATEMENT" in act or "RECON" in ent or "STATEMENT" in ent:
+            return "Reconciliation"
+        if "INBOX" in act or "INBOX" in ent:
+            return "Smart Inbox"
+        if "LG_" in act or "LGRECORD" in ent or "LGINSTRUCTION" in ent:
+            return "LG Custody"
+        if "LOGIN" in act or "AUTH" in act or "MFA" in act or "PASSWORD" in act:
+            return "Security"
+        return "Platform"
 
     formatted_recent_activity = []
     for log in recent_activity_logs:
-        action_desc = f"{log.action_type.replace('_', ' ').title()} on {log.entity_type} ID {log.entity_id}"
-        if log.details and 'name' in log.details:
-            action_desc += f" (Name: {log.details['name']})"
-        elif log.details and 'email' in log.details:
-            action_desc += f" (Email: {log.details['email']})"
-        elif log.details and 'category_name' in log.details:
-            action_desc += f" (Category: {log.details['category_name']})"
-
-        
-        user_email = "System/Unknown"
+        # Strict Zero-PII actor label: only show anonymized tenant index & role, never user email or customer name
+        actor_label = "System Task"
         if log.user_id:
-            user = db.query(User).filter(User.id == log.user_id).first()
-            if user:
-                user_email = user.email
-        
+            user_obj = _safe_scalar(lambda: db.query(User).filter(User.id == log.user_id).first(), None)
+            if user_obj:
+                role_str = getattr(user_obj.role, "value", str(user_obj.role)).replace("_", " ").title()
+                if user_obj.customer_id:
+                    actor_label = f"Tenant #{user_obj.customer_id} • {role_str}"
+                else:
+                    actor_label = role_str
+        elif log.customer_id:
+            actor_label = f"Tenant #{log.customer_id} • Automated"
+
+        clean_action = (log.action_type or "EVENT").replace("_", " ").title()
+        clean_entity = (log.entity_type or "System").replace("_", " ")
+        module_tag = _classify_module_tag(log.action_type, log.entity_type)
+
         formatted_recent_activity.append({
             "id": log.id,
-            "timestamp": log.timestamp.isoformat(),
-            "description": f"[{user_email}] {action_desc}"
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+            "actor": actor_label,
+            "module": module_tag,
+            "description": f"{clean_action} ({clean_entity})"
         })
-    
+
     return {
-            "total_active_customers": total_active_customers,
-            "customers_change_percent": customers_change_percent,
-            "total_active_users": total_active_users,
-            "users_change_percent": users_change_percent,
-            "recent_activity": formatted_recent_activity
-        }
+        # Top-level KPIs (backward-compatible keys + new privacy-safe scale metrics)
+        "total_active_customers": total_active_customers,
+        "customers_change_percent": customers_change_percent,
+        "customers_new_30d": customers_new_30d,
+        "tenant_status_breakdown": {
+            "active": active_sub_count,
+            "grace": grace_sub_count,
+            "expired": expired_sub_count,
+        },
+        "total_active_users": total_active_users,
+        "users_change_percent": users_change_percent,
+        "users_new_30d": users_new_30d,
+        "active_users_7d": active_users_7d,
+        "active_users_30d": active_users_30d,
+        "total_active_lgs": str(total_active_lgs_combined),
+        "lgs_change_percent": _calc_delta_str(custody_30d + issuance_30d, custody_prev_30d + issuance_prev_30d, total_active_lgs_combined),
+        "most_used_module": most_used_module,
+        "scale_and_footprint": {
+            "total_records_managed": total_platform_volume,
+            "records_added_30d": total_30d_volume,
+            "records_added_prev_30d": total_prev_30d_volume,
+            "records_growth_pct": records_growth_pct,
+            "records_growth_label": records_growth_label,
+            "is_increasing": is_increasing,
+            "momentum_status": momentum_status,
+            "db_size_mb": db_size_mb,
+            "total_stored_documents": total_stored_documents,
+            "total_audit_blocks": total_audit_blocks,
+            "ai_tokens_total": ai_tokens_total,
+            "ai_pages_total": ai_pages_total,
+        },
+        "module_usage": module_usage,
+        "monthly_growth_trend": monthly_growth_trend,
+        "performance_insights": {
+            "avg_approval_hours": avg_approval_hours,
+            "avg_bank_sla_days": avg_bank_sla_days,
+            "recon_automation_rate_pct": recon_automation_rate_pct,
+            "promoted_collab_patterns": collab_patterns_promoted,
+            "quotation_response_rate_pct": quotation_response_rate_pct,
+            "quotation_completion_rate_pct": quotation_completion_rate_pct,
+            "inbox_accuracy_rate_pct": inbox_accuracy_rate_pct,
+            "active_user_engagement_30d_pct": round((active_users_30d / total_active_users) * 100, 1) if total_active_users > 0 else 0.0,
+        },
+        "recent_activity": formatted_recent_activity,
+    }
 
 @router.get("/template-placeholders", response_model=List[Dict[str, str]])
 def get_template_placeholders(
