@@ -87,10 +87,11 @@ def generate_verification_token_and_code(
 ) -> Tuple[str, str]:
     """
     Returns (signed_qr_token, formatted_6_digit_code 'XXX-XXX').
+    Note: secret_ts is mixed into the cryptographic HMAC signature and 6-digit PIN
+    calculation, but is NEVER exposed in the token string or portal response.
     """
-    base_payload = f"{record_kind}.{record_id}.{secret_ts}"
-    sig = _compute_hmac_sig(f"QR_TOKEN:{base_payload}:{serial_number}", length=16)
-    token = f"{base_payload}.{sig}"
+    sig = _compute_hmac_sig(f"QR_TOKEN:{record_kind}.{record_id}:{secret_ts}:{serial_number}", length=18)
+    token = f"{record_kind}.{record_id}.{sig}"
 
     # 6-digit gate code derived from secret_ts + instruction identity + LG number
     gate_payload = f"GATE_PIN:{record_kind}:{record_id}:{(serial_number or '').strip().upper()}:{(lg_number or '').strip().upper()}:{secret_ts}"
@@ -433,10 +434,10 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
     Validates the QR token signature and returns minimal gate prompt info (without revealing LG details
     until the 6-digit Security Code is entered).
     """
-    if not token or token.count(".") != 3:
+    if not token or token.count(".") != 2:
         return {"valid_token": False, "reason": "Malformed verification link."}
 
-    kind, id_str, ts_str, sig = token.split(".")
+    kind, id_str, sig = token.split(".")
     if kind == "P":
         return {
             "valid_token": True,
@@ -445,11 +446,10 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
             "prompt": "Enter the 6-digit Security Code printed at the bottom of the instruction letter.",
         }
 
-    if kind not in ("I", "M") or not id_str.isdigit() or not ts_str.isdigit():
+    if kind not in ("I", "M") or not id_str.isdigit():
         return {"valid_token": False, "reason": "Invalid verification token parameters."}
 
     record_id = int(id_str)
-    secret_ts = int(ts_str)
 
     if kind == "I":
         from app.models.models import LGInstruction
@@ -457,9 +457,9 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
         if not inst:
             return {"valid_token": False, "reason": "Instruction record not found."}
         db_ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
-        expected_sig = _compute_hmac_sig(f"QR_TOKEN:{kind}.{record_id}.{secret_ts}:{inst.serial_number}", length=16)
-        if not hmac.compare_digest(sig, expected_sig) or db_ts != secret_ts:
-            return {"valid_token": False, "reason": "Cryptographic signature or issuance timestamp mismatch."}
+        expected_sig = _compute_hmac_sig(f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{inst.serial_number}", length=18)
+        if not hmac.compare_digest(sig, expected_sig):
+            return {"valid_token": False, "reason": "Cryptographic signature mismatch."}
         serial = inst.serial_number or ""
         masked_serial = serial[:6] + "••••" + serial[-5:] if len(serial) > 12 else serial
         return {
@@ -475,9 +475,9 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
     if not maint:
         return {"valid_token": False, "reason": "Maintenance instruction record not found."}
     db_ts = _to_epoch_seconds(getattr(maint, "created_at", None))
-    expected_sig = _compute_hmac_sig(f"QR_TOKEN:{kind}.{record_id}.{secret_ts}:{maint.letter_serial_number}", length=16)
-    if not hmac.compare_digest(sig, expected_sig) or db_ts != secret_ts:
-        return {"valid_token": False, "reason": "Cryptographic signature or issuance timestamp mismatch."}
+    expected_sig = _compute_hmac_sig(f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{maint.letter_serial_number}", length=18)
+    if not hmac.compare_digest(sig, expected_sig):
+        return {"valid_token": False, "reason": "Cryptographic signature mismatch."}
     serial = maint.letter_serial_number or ""
     masked_serial = serial[:6] + "••••" + serial[-4:] if len(serial) > 10 else serial
     return {
@@ -498,10 +498,10 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
     if len(clean_code) != 6:
         return {"verified": False, "reason": "Please enter the complete 6-digit numeric Security Code."}
 
-    if not token or token.count(".") != 3:
+    if not token or token.count(".") != 2:
         return {"verified": False, "reason": "Invalid verification token."}
 
-    kind, id_str, ts_str, sig = token.split(".")
+    kind, id_str, sig = token.split(".")
     if kind == "P":
         _, expected_code = generate_verification_token_and_code("P", 0, "SAMPLE-REF-0001", "SAMPLE-LG", 1762600000)
         if clean_code != expected_code.replace("-", ""):
@@ -523,11 +523,10 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
             "delivery_status": "Sample Preview Mode",
         }
 
-    if kind not in ("I", "M") or not id_str.isdigit() or not ts_str.isdigit():
+    if kind not in ("I", "M") or not id_str.isdigit():
         return {"verified": False, "reason": "Invalid verification token."}
 
     record_id = int(id_str)
-    secret_ts = int(ts_str)
 
     if kind == "I":
         from app.models.models import LGInstruction, LGRecord
@@ -550,11 +549,11 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
         lg = inst.lg_record
         db_ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
         expected_token, expected_code = generate_verification_token_and_code(
-            "I", inst.id, inst.serial_number or "", lg.lg_number or "", secret_ts
+            "I", inst.id, inst.serial_number or "", lg.lg_number or "", db_ts
         )
 
-        if not hmac.compare_digest(token, expected_token) or db_ts != secret_ts:
-            return {"verified": False, "reason": "Cryptographic signature or issuance timestamp mismatch."}
+        if not hmac.compare_digest(token, expected_token):
+            return {"verified": False, "reason": "Cryptographic signature mismatch."}
 
         if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
             return {
@@ -611,7 +610,7 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
             param_value = str(details.get("payment_amount_formatted") or amount_str)
 
         issue_dt = getattr(inst, "instruction_date", None) or getattr(inst, "created_at", None)
-        issue_date_str = issue_dt.strftime("%d-%b-%Y %H:%M UTC") if isinstance(issue_dt, datetime) else "N/A"
+        issue_date_str = issue_dt.strftime("%d-%b-%Y") if isinstance(issue_dt, datetime) else "N/A"
 
         cust_name = lg.customer.name if lg.customer else ""
         entity_name = lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else cust_name
@@ -663,11 +662,11 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
     lg_num = ilg.bank_lg_number or ilg.lg_ref_number or ""
     db_ts = _to_epoch_seconds(getattr(maint, "created_at", None))
     expected_token, expected_code = generate_verification_token_and_code(
-        "M", maint.id, maint.letter_serial_number or "", lg_num, secret_ts
+        "M", maint.id, maint.letter_serial_number or "", lg_num, db_ts
     )
 
-    if not hmac.compare_digest(token, expected_token) or db_ts != secret_ts:
-        return {"verified": False, "reason": "Cryptographic signature or issuance timestamp mismatch."}
+    if not hmac.compare_digest(token, expected_token):
+        return {"verified": False, "reason": "Cryptographic signature mismatch."}
 
     if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
         return {
@@ -678,7 +677,7 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
     curr_code = ilg.currency.iso_code if ilg.currency else "EGP"
     amt_str = f"{curr_code} {float(ilg.current_amount):,.2f}" if ilg.current_amount is not None else "N/A"
     issue_dt = getattr(maint, "created_at", None)
-    issue_date_str = issue_dt.strftime("%d-%b-%Y %H:%M UTC") if isinstance(issue_dt, datetime) else "N/A"
+    issue_date_str = issue_dt.strftime("%d-%b-%Y") if isinstance(issue_dt, datetime) else "N/A"
 
     return {
         "verified": True,
