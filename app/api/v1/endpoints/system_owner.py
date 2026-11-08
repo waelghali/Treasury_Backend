@@ -3890,6 +3890,13 @@ def review_and_validate_template(
     for k, v in sample_data.items():
         rendered_preview = re.sub(r"\{\{\s*" + re.escape(k) + r"\s*\}\}", str(v), rendered_preview)
 
+    if not payload.get("is_notification_template", False):
+        try:
+            from app.core.instruction_verification import inject_mandatory_verification_footer
+            rendered_preview = inject_mandatory_verification_footer(rendered_preview)
+        except Exception:
+            pass
+
     is_ready = len(missing_essential) == 0 and ("<html" in content.lower() or "<table" in content.lower() or "<div" in content.lower())
 
     return {

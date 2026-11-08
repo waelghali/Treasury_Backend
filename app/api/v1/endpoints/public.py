@@ -266,3 +266,62 @@ def serve_document(
         )
 
     return FileResponse(full_path)
+
+
+from pydantic import BaseModel
+
+class InstructionVerifyConfirmIn(BaseModel):
+    token: str
+    code: str
+
+
+@router.get("/verify-instruction/inspect", tags=["Public"])
+def inspect_instruction_qr_token(
+    t: str = Query(..., description="Cryptographic QR verification token"),
+    db: Session = Depends(get_db),
+):
+    """
+    Public endpoint: validates the QR token signature & secret issuance timestamp,
+    and returns the masked instruction reference for the 6-digit Security Code gate.
+    """
+    from app.core.instruction_verification import inspect_verification_token
+    return inspect_verification_token(db, t)
+
+
+@router.post("/verify-instruction/confirm", tags=["Public"])
+def confirm_instruction_authenticity(
+    payload: InstructionVerifyConfirmIn,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Public endpoint: verifies the 6-digit Security Code printed on the physical letter
+    against the cryptographic QR token and secret database issuance timestamp.
+    """
+    from app.core.instruction_verification import verify_instruction_with_code
+    from app.crud.crud import log_action
+
+    result = verify_instruction_with_code(db, payload.token, payload.code)
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        log_action(
+            db,
+            user_id=None,
+            action_type="PUBLIC_INSTRUCTION_VERIFIED" if result.get("verified") else "PUBLIC_INSTRUCTION_VERIFY_FAILED",
+            entity_type="LGInstruction",
+            entity_id=None,
+            details={
+                "token_prefix": (payload.token or "")[:24],
+                "verified": bool(result.get("verified")),
+                "instruction_serial": result.get("instruction_serial"),
+                "client_ip": client_ip,
+            },
+            customer_id=None,
+            lg_record_id=None,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return result

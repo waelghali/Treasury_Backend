@@ -143,6 +143,18 @@ class CRUDLGInstruction(CRUDBase):
                 db.add(db_obj)
                 db.flush()
                 db.refresh(db_obj)
+                try:
+                    from app.core.instruction_verification import register_instruction_for_verification
+                    lg_rec_for_ver = db.query(models.LGRecord).filter(models.LGRecord.id == lg_record_id).first()
+                    register_instruction_for_verification(
+                        record_id=db_obj.id,
+                        serial_number=db_obj.serial_number,
+                        lg_number=lg_rec_for_ver.lg_number if lg_rec_for_ver else "",
+                        created_at=getattr(db_obj, "created_at", None) or getattr(db_obj, "instruction_date", None),
+                        record_kind="I",
+                    )
+                except Exception as ver_err:
+                    logger.debug(f"Could not register instruction for QR verification cache: {ver_err}")
 
                 # Auto-supersede any unprinted Discrepancy Letter on older instructions when a new operational instruction is issued on the same LG
                 if full_action_type_for_db != ACTION_TYPE_LG_REMINDER_TO_BANKS:

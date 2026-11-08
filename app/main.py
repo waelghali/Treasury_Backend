@@ -369,16 +369,8 @@ def configure_app_instance(fastapi_app: FastAPI):
             # --- System Health Watchdog: Startup & Crash / Reboot Detection ---
             try:
                 from sqlalchemy.orm import Session as DBSession
-                from app.core.telemetry_service import record_startup_watchdog
-                with DBSession(engine) as watchdog_db:
-                    record_startup_watchdog(watchdog_db)
-            except Exception as w_err:
-                logger.warning(f"Startup watchdog check skipped: {w_err}")
-
-            # --- Auto-Sync Letter Templates from Disk → DB ---
-            try:
-                from sqlalchemy.orm import Session as DBSession
                 from app.models import Template
+                from app.core.instruction_verification import strip_legacy_template_footers
                 import re as _re
 
                 templates_folder = os.path.join(os.path.dirname(__file__), "templates")
@@ -386,6 +378,9 @@ def configure_app_instance(fastapi_app: FastAPI):
                     with DBSession(engine) as tpl_db:
                         updated_count = 0
                         created_count = 0
+                        sanitized_count = 0
+                        custom_templates_by_action = {}
+
                         for entry in os.scandir(templates_folder):
                             if not (entry.is_file() and entry.name.endswith("_template.html")):
                                 continue
@@ -393,58 +388,78 @@ def configure_app_instance(fastapi_app: FastAPI):
                             filename = entry.name
                             customer_match = _re.match(r"CustomerID_(\d+)_(.*)_template\.html", filename)
 
-                            if customer_match:
-                                customer_id = int(customer_match.group(1))
-                                action_type = customer_match.group(2)
-                                is_global = False
-                            else:
-                                action_type = filename.replace("_template.html", "")
-                                customer_id = None
-                                is_global = True
-
                             with open(entry.path, "r", encoding="utf-8") as f:
-                                new_html = f.read()
+                                new_html = strip_legacy_template_footers(f.read())
 
-                            query = tpl_db.query(Template).filter(
+                            if customer_match:
+                                action_type = customer_match.group(2)
+                                custom_templates_by_action[action_type] = new_html
+                                continue
+
+                            action_type = filename.replace("_template.html", "")
+                            tpl = tpl_db.query(Template).filter(
                                 Template.action_type == action_type,
                                 Template.is_notification_template == False,
-                                Template.is_global == is_global,
+                                Template.is_global == True,
                                 Template.is_deleted == False
-                            )
-                            if not is_global:
-                                query = query.filter(Template.customer_id == customer_id)
+                            ).first()
 
-                            tpl = query.first()
                             if tpl:
-                                # Update existing template if content differs
                                 if tpl.content != new_html:
                                     tpl.content = new_html
                                     updated_count += 1
                             else:
-                                # Create new template record from disk file
                                 human_name = action_type.replace("_", " ").title() + " Instruction"
-                                owner_label = f" (Customer {customer_id})" if not is_global else ""
                                 new_tpl = Template(
-                                    name=human_name + owner_label,
+                                    name=human_name,
                                     template_type="LETTER",
                                     action_type=action_type,
                                     content=new_html,
                                     language="EN",
-                                    is_global=is_global,
-                                    customer_id=customer_id,
+                                    is_global=True,
+                                    customer_id=None,
                                     is_notification_template=False,
                                     is_default=True,
                                 )
                                 tpl_db.add(new_tpl)
                                 created_count += 1
-                                logger.info(f"Template auto-sync: created '{action_type}'{owner_label} from disk.")
+                                logger.info(f"Template auto-sync: created global '{action_type}' from disk.")
+
+                        # Update existing customized customer templates in-place regardless of customer_id
+                        # across local and production DBs, and strip duplicate footers from ALL letter templates
+                        all_letter_tpls = tpl_db.query(Template).filter(
+                            Template.is_notification_template == False,
+                            Template.is_deleted == False
+                        ).all()
+
+                        for tpl in all_letter_tpls:
+                            if not tpl.content:
+                                continue
+                            target_html = tpl.content
+                            # If this is a customized customer template built from our unified corporate layout,
+                            # keep it synced with the latest layout regardless of which customer_id it has in this DB
+                            if (
+                                not tpl.is_global
+                                and tpl.action_type in custom_templates_by_action
+                                and 'class="letter-title"' in target_html
+                                and ('class="meta-strip"' in target_html or 'class="ref-bar"' in target_html)
+                            ):
+                                target_html = custom_templates_by_action[tpl.action_type]
+
+                            # Strip any legacy footer HTML or @bottom-* CSS from every template in the DB
+                            target_html = strip_legacy_template_footers(target_html)
+                            if target_html != tpl.content:
+                                tpl.content = target_html
+                                sanitized_count += 1
 
                         tpl_db.commit()
                         parts = []
                         if updated_count:
-                            parts.append(f"updated {updated_count}")
+                            parts.append(f"updated {updated_count} global")
                         if created_count:
-                            parts.append(f"created {created_count}")
+                            parts.append(f"created {created_count} global")
+                        if sanitized_count:
+                            parts.append(f"sanitized/updated {sanitized_count} DB")
                         if parts:
                             logger.info(f"Template auto-sync: {', '.join(parts)} template(s).")
                         else:

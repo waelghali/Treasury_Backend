@@ -36,16 +36,19 @@ def _apply_template_date_formatting(html_content: str) -> str:
         flags=re.DOTALL,
     )
 
-def _render_single_html_one_page(html_content: str) -> bytes:
+def _render_single_html_one_page(html_content: str, filename_hint: str = "") -> bytes:
     """
     Renders an HTML document via WeasyPrint and guarantees it fits on a single A4 page
     (while strictly preserving the top letterhead margin, e.g. 40mm) by progressively
     compacting vertical spacing and font size if content (such as long notes or addresses)
     would otherwise spill onto page 2.
+    Also enforces the mandatory platform QR & 6-digit Security Code footer.
     """
     from weasyprint import HTML, CSS
+    from app.core.instruction_verification import inject_mandatory_verification_footer
 
     formatted_html = _apply_template_date_formatting(html_content)
+    formatted_html = inject_mandatory_verification_footer(formatted_html, filename_hint=filename_hint)
     html_obj = HTML(string=formatted_html)
     doc = html_obj.render()
 
@@ -59,55 +62,55 @@ def _render_single_html_one_page(html_content: str) -> bytes:
         # Step 1: Slightly tighter vertical spacing & table padding
         """
         body { font-size: 9.2pt !important; line-height: 1.4 !important; padding-top: 0 !important; }
-        .header-table { padding-bottom: 7px !important; margin-bottom: 12px !important; }
-        .recipient-block { margin-bottom: 11px !important; }
-        .subject-line { margin-bottom: 11px !important; padding: 3px 0 3px 10px !important; font-size: 10pt !important; }
-        .salutation { margin-bottom: 7px !important; }
-        p { margin-bottom: 8px !important; }
-        .spec-table { margin: 8px 0 10px 0 !important; font-size: 9pt !important; }
-        .spec-table th, .spec-table td { padding: 4.5px 10px !important; }
-        .notes-wrapper { margin: 8px 0 !important; }
-        .signature-section { margin-top: 14px !important; }
-        .sig-table { margin-top: 56px !important; }
-        .footer-note { margin-top: 14px !important; padding-top: 5px !important; }
+        .header-table { padding-bottom: 6px !important; margin-bottom: 11px !important; }
+        .recipient-block { margin-bottom: 10px !important; }
+        .subject-line { margin-bottom: 10px !important; padding: 3px 0 3px 10px !important; font-size: 10pt !important; }
+        .salutation { margin-bottom: 6px !important; }
+        p { margin-bottom: 7px !important; }
+        .spec-table { margin: 7px 0 9px 0 !important; font-size: 9pt !important; }
+        .spec-table th, .spec-table td { padding: 4px 10px !important; }
+        .notes-wrapper { margin: 6px 0 !important; }
+        .signature-section { margin-top: 12px !important; }
+        .sig-table { margin-top: 52px !important; }
+        #grow-mandatory-security-footer { margin-top: 10px !important; padding-top: 5px !important; }
         """,
         # Step 2: Medium compacting for letters with multi-line notes / declarations
         """
         @page { margin-bottom: 10mm !important; }
         body { font-size: 8.6pt !important; line-height: 1.32 !important; padding-top: 0 !important; }
         .company-title { font-size: 12.5pt !important; }
-        .header-table { padding-bottom: 5px !important; margin-bottom: 9px !important; }
-        .recipient-block { margin-bottom: 8px !important; font-size: 9pt !important; }
+        .header-table { padding-bottom: 5px !important; margin-bottom: 8px !important; }
+        .recipient-block { margin-bottom: 7px !important; font-size: 9pt !important; }
         .recipient-name { font-size: 9.5pt !important; }
-        .subject-line { margin-bottom: 8px !important; padding: 2px 0 2px 8px !important; font-size: 9.5pt !important; }
+        .subject-line { margin-bottom: 7px !important; padding: 2px 0 2px 8px !important; font-size: 9.5pt !important; }
         .salutation { margin-bottom: 5px !important; }
-        p { margin-bottom: 6px !important; }
-        .spec-table { margin: 6px 0 8px 0 !important; font-size: 8.4pt !important; }
+        p { margin-bottom: 5px !important; }
+        .spec-table { margin: 5px 0 7px 0 !important; font-size: 8.4pt !important; }
         .spec-table th, .spec-table td { padding: 3.5px 8px !important; }
-        .notes-wrapper { margin: 6px 0 !important; }
-        .notes-wrapper h3 { font-size: 8.5pt !important; margin: 4px 0 2px 0 !important; }
-        .signature-section { margin-top: 10px !important; }
-        .sig-table { margin-top: 44px !important; }
-        .footer-note { margin-top: 10px !important; padding-top: 4px !important; }
+        .notes-wrapper { margin: 5px 0 !important; }
+        .notes-wrapper h3 { font-size: 8.5pt !important; margin: 3px 0 2px 0 !important; }
+        .signature-section { margin-top: 8px !important; }
+        .sig-table { margin-top: 40px !important; }
+        #grow-mandatory-security-footer { margin-top: 8px !important; padding-top: 4px !important; }
         """,
         # Step 3: High-density fallback for very long custom notes
         """
         @page { margin-bottom: 8mm !important; }
-        body { font-size: 7.8pt !important; line-height: 1.24 !important; padding-top: 0 !important; }
+        body { font-size: 7.8pt !important; line-height: 1.22 !important; padding-top: 0 !important; }
         .company-title { font-size: 11.5pt !important; }
         .header-table { padding-bottom: 4px !important; margin-bottom: 6px !important; }
-        .recipient-block { margin-bottom: 6px !important; font-size: 8.2pt !important; }
+        .recipient-block { margin-bottom: 5px !important; font-size: 8.2pt !important; }
         .recipient-name { font-size: 8.8pt !important; }
-        .subject-line { margin-bottom: 6px !important; padding: 2px 0 2px 8px !important; font-size: 8.8pt !important; }
+        .subject-line { margin-bottom: 5px !important; padding: 2px 0 2px 8px !important; font-size: 8.8pt !important; }
         .salutation { margin-bottom: 4px !important; }
         p { margin-bottom: 4px !important; }
-        .spec-table { margin: 4px 0 6px 0 !important; font-size: 7.8pt !important; }
+        .spec-table { margin: 4px 0 5px 0 !important; font-size: 7.8pt !important; }
         .spec-table th, .spec-table td { padding: 2.5px 6px !important; }
         .notes-wrapper { margin: 4px 0 !important; }
         .notes-wrapper h3 { font-size: 8pt !important; margin: 2px 0 !important; }
         .signature-section { margin-top: 6px !important; }
-        .sig-table { margin-top: 34px !important; }
-        .footer-note { margin-top: 6px !important; padding-top: 3px !important; font-size: 6.8pt !important; }
+        .sig-table { margin-top: 30px !important; }
+        #grow-mandatory-security-footer { margin-top: 6px !important; padding-top: 3px !important; }
         """,
     ]
 
@@ -122,12 +125,12 @@ def _render_single_html_one_page(html_content: str) -> bytes:
     return pdf_bytes
 
 
-def _render_pdf_worker(html_content: str) -> Optional[bytes]:
+def _render_pdf_worker(html_content: str, filename_hint: str = "") -> Optional[bytes]:
     """
     Renders HTML to PDF bytes using WeasyPrint and immediately frees native C-heap memory.
     """
     try:
-        return _render_single_html_one_page(html_content)
+        return _render_single_html_one_page(html_content, filename_hint=filename_hint)
     finally:
         gc.collect()
         try:
@@ -136,7 +139,7 @@ def _render_pdf_worker(html_content: str) -> Optional[bytes]:
         except Exception:
             pass
 
-def _render_and_merge_pdfs_worker(html_segments: List[str]) -> Optional[bytes]:
+def _render_and_merge_pdfs_worker(html_segments: List[str], filename_hint: str = "") -> Optional[bytes]:
     """
     Renders each HTML segment as an independent PDF (so each letter has its own @page headers,
     footers, and independent Page 1 of 1 numbering) and merges the resulting PDFs into a single PDF stream.
@@ -148,7 +151,7 @@ def _render_and_merge_pdfs_worker(html_segments: List[str]) -> Optional[bytes]:
         for segment in html_segments:
             if not segment or not segment.strip():
                 continue
-            seg_bytes = _render_single_html_one_page(segment)
+            seg_bytes = _render_single_html_one_page(segment, filename_hint=filename_hint)
             if seg_bytes:
                 reader = PdfReader(io.BytesIO(seg_bytes))
                 for page in reader.pages:
@@ -175,7 +178,7 @@ async def generate_pdf_from_html(html_content: str, filename_hint: str = "docume
     logger.debug(f"generate_pdf_from_html: Attempting to generate PDF for '{filename_hint}' (length: {len(html_content)} chars).")
 
     try:
-        pdf_bytes = await asyncio.to_thread(_render_pdf_worker, html_content)
+        pdf_bytes = await asyncio.to_thread(_render_pdf_worker, html_content, filename_hint)
         if pdf_bytes:
             logger.info(f"generate_pdf_from_html: Successfully generated PDF bytes for '{filename_hint}' (size: {len(pdf_bytes)} bytes).")
             return pdf_bytes
@@ -197,7 +200,7 @@ async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_
     """
     logger.debug(f"generate_merged_pdf_from_html_list: Rendering and merging {len(html_segments)} letters for '{filename_hint}'.")
     try:
-        pdf_bytes = await asyncio.to_thread(_render_and_merge_pdfs_worker, html_segments)
+        pdf_bytes = await asyncio.to_thread(_render_and_merge_pdfs_worker, html_segments, filename_hint)
         if pdf_bytes:
             logger.info(f"generate_merged_pdf_from_html_list: Successfully generated merged PDF for '{filename_hint}' ({len(html_segments)} letters, size: {len(pdf_bytes)} bytes).")
             return pdf_bytes
