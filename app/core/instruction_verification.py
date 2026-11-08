@@ -646,11 +646,55 @@ def _build_failed_code_response(client_ip: str, token: str) -> Dict[str, Any]:
     }
 
 
-def verify_instruction_with_code(db: Any, token: str, entered_code: str, client_ip: str = "unknown") -> Dict[str, Any]:
+def _trigger_honeypot_lockout(client_ip: str, token: str) -> Dict[str, Any]:
+    """
+    Silently trips the maximum 30-minute cooldown (1800s) for automated bots that fill the
+    decoy honeypot field or submit faster than humanly possible (< 800ms).
+    Returns a standard cooldown response so the bot does not know a honeypot was triggered.
+    """
+    ip = (client_ip or "unknown").strip()
+    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    ip_key = f"ip_all:{ip}"
+    now = datetime.now(timezone.utc).timestamp()
+    max_cooldown = _COOLDOWN_SCHEDULE_SECONDS[-1]  # 1800s (30 minutes)
+    store = _load_cooldown_store()
+
+    store[tok_key] = {
+        "fails": _FREE_TYPO_ATTEMPTS + len(_COOLDOWN_SCHEDULE_SECONDS),
+        "last_fail": now,
+        "locked_until": now + max_cooldown,
+    }
+    store[ip_key] = {
+        "fails": 12,
+        "last_fail": now,
+        "locked_until": now + max_cooldown,
+    }
+    _save_cooldown_store(store)
+
+    return {
+        "verified": False,
+        "cooldown_seconds": max_cooldown,
+        "_honeypot_tripped": True,
+        "reason": (
+            f"Too many failed attempts from your connection. Please wait "
+            f"{_format_duration_human(max_cooldown)} ({max_cooldown}s) before trying again."
+        ),
+    }
+
+
+def verify_instruction_with_code(
+    db: Any,
+    token: str,
+    entered_code: str,
+    client_ip: str = "unknown",
+    honeypot_value: str = "",
+    elapsed_ms: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Verifies both the cryptographic QR token (bound to the secret database issuance timestamp)
     AND the 6-digit Security Code printed on the physical letter.
-    Enforces a progressive per-IP cooldown ladder (1m, 3m, 5m, 10m, 15m, 30m) on repeated failures.
+    Enforces a progressive per-IP cooldown ladder (1m, 3m, 5m, 10m, 15m, 30m) on repeated failures,
+    and an instant 30-minute silent lockout if the bot honeypot or sub-second speed trap is tripped.
     """
     rem_cooldown = _check_cooldown_status(client_ip, token)
     if rem_cooldown > 0:
@@ -662,6 +706,12 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str, client_
                 f"{_format_duration_human(rem_cooldown)} ({rem_cooldown}s) before trying again."
             ),
         }
+
+    # Check Honeypot field & Sub-second Bot Speed Trap (< 800ms from page render)
+    if (honeypot_value and str(honeypot_value).strip()) or (
+        elapsed_ms is not None and 0 <= int(elapsed_ms) < 800
+    ):
+        return _trigger_honeypot_lockout(client_ip, token)
 
     clean_code = re.sub(r"[^0-9]", "", entered_code or "")
     if len(clean_code) != 6:

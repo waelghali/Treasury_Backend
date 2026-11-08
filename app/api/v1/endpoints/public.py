@@ -269,10 +269,13 @@ def serve_document(
 
 
 from pydantic import BaseModel
+from typing import Optional
 
 class InstructionVerifyConfirmIn(BaseModel):
     token: str
     code: str
+    bank_branch_code: Optional[str] = ""
+    elapsed_ms: Optional[int] = None
 
 
 def _extract_client_ip(request: Request) -> str:
@@ -315,14 +318,26 @@ def confirm_instruction_authenticity(
     from app.crud.crud import log_action
 
     client_ip = _extract_client_ip(request)
-    result = verify_instruction_with_code(db, payload.token, payload.code, client_ip=client_ip)
+    result = verify_instruction_with_code(
+        db,
+        payload.token,
+        payload.code,
+        client_ip=client_ip,
+        honeypot_value=payload.bank_branch_code or "",
+        elapsed_ms=payload.elapsed_ms,
+    )
+    honeypot_tripped = bool(result.pop("_honeypot_tripped", False))
 
     try:
-        client_ip = request.client.host if request.client else "unknown"
+        action_name = (
+            "PUBLIC_INSTRUCTION_HONEYPOT_TRIGGERED"
+            if honeypot_tripped
+            else ("PUBLIC_INSTRUCTION_VERIFIED" if result.get("verified") else "PUBLIC_INSTRUCTION_VERIFY_FAILED")
+        )
         log_action(
             db,
             user_id=None,
-            action_type="PUBLIC_INSTRUCTION_VERIFIED" if result.get("verified") else "PUBLIC_INSTRUCTION_VERIFY_FAILED",
+            action_type=action_name,
             entity_type="LGInstruction",
             entity_id=None,
             details={
@@ -330,6 +345,7 @@ def confirm_instruction_authenticity(
                 "verified": bool(result.get("verified")),
                 "instruction_serial": result.get("instruction_serial"),
                 "client_ip": client_ip,
+                "honeypot_tripped": honeypot_tripped,
             },
             customer_id=None,
             lg_record_id=None,
