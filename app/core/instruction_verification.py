@@ -429,11 +429,144 @@ def _mask_lg_number(lg_number: str) -> str:
     return "*" * min(6, len(s) - 4) + s[-4:]
 
 
-def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
+# ==============================================================================
+# PROGRESSIVE COOLDOWN ("BOREDOM" FRICTION) PER CLIENT IP + TOKEN
+# ==============================================================================
+# 2 free typo attempts (attempts 1 & 2 -> 0s cooldown)
+# Starting on 3rd failed attempt: 1m, 3m, 5m, 10m, 15m, 30m (max cap, never permanent)
+_FREE_TYPO_ATTEMPTS = 2
+_COOLDOWN_SCHEDULE_SECONDS = [60, 180, 300, 600, 900, 1800]
+_INACTIVITY_RESET_SECONDS = 3600  # Reset failure counter after 1 hour of no failed tries
+_COOLDOWN_MEMORY_STORE: Dict[str, Dict[str, float]] = {}
+
+
+def _get_cooldown_file_path() -> str:
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "grow_verify_ip_cooldown.json")
+
+
+def _load_cooldown_store() -> Dict[str, Dict[str, float]]:
+    import json
+    now = datetime.now(timezone.utc).timestamp()
+    store = dict(_COOLDOWN_MEMORY_STORE)
+    path = _get_cooldown_file_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                disk_data = json.load(f)
+            if isinstance(disk_data, dict):
+                for k, v in disk_data.items():
+                    if isinstance(v, dict):
+                        mem_v = store.get(k)
+                        if not mem_v or float(v.get("last_fail", 0)) >= float(mem_v.get("last_fail", 0)):
+                            store[k] = v
+        except Exception:
+            pass
+    # Prune expired entries older than _INACTIVITY_RESET_SECONDS
+    cleaned = {
+        k: v
+        for k, v in store.items()
+        if now - float(v.get("last_fail", 0)) < _INACTIVITY_RESET_SECONDS
+    }
+    _COOLDOWN_MEMORY_STORE.clear()
+    _COOLDOWN_MEMORY_STORE.update(cleaned)
+    return cleaned
+
+
+def _save_cooldown_store(store: Dict[str, Dict[str, float]]) -> None:
+    import json
+    _COOLDOWN_MEMORY_STORE.clear()
+    _COOLDOWN_MEMORY_STORE.update(store)
+    path = _get_cooldown_file_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(store, f)
+    except Exception:
+        pass
+
+
+def _format_duration_human(seconds: int) -> str:
+    if seconds >= 60:
+        mins = (seconds + 59) // 60
+        return f"{mins} minute{'s' if mins != 1 else ''}"
+    return f"{seconds} second{'s' if seconds != 1 else ''}"
+
+
+def _check_cooldown_status(client_ip: str, token: str) -> int:
+    """
+    Returns remaining cooldown seconds (> 0) if this (client_ip, token) or client_ip is currently in cooldown,
+    or 0 if allowed to proceed.
+    """
+    ip = (client_ip or "unknown").strip()
+    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    ip_key = f"ip_all:{ip}"
+    now = datetime.now(timezone.utc).timestamp()
+    store = _load_cooldown_store()
+
+    rem_tok = int(max(0.0, float(store.get(tok_key, {}).get("locked_until", 0.0)) - now))
+    rem_ip = int(max(0.0, float(store.get(ip_key, {}).get("locked_until", 0.0)) - now))
+    return max(rem_tok, rem_ip)
+
+
+def _record_failed_attempt(client_ip: str, token: str) -> Tuple[int, int, int]:
+    """
+    Records a failed verification attempt for (client_ip, token) and returns:
+    (fail_count, cooldown_seconds_applied, free_attempts_remaining).
+    """
+    ip = (client_ip or "unknown").strip()
+    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    ip_key = f"ip_all:{ip}"
+    now = datetime.now(timezone.utc).timestamp()
+    store = _load_cooldown_store()
+
+    # 1. Update per-(IP + Token) counter
+    entry = store.get(tok_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0})
+    fails = int(entry.get("fails", 0)) + 1
+    cooldown_sec = 0
+    if fails > _FREE_TYPO_ATTEMPTS:
+        idx = min(fails - _FREE_TYPO_ATTEMPTS - 1, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
+        cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[idx]
+
+    entry["fails"] = fails
+    entry["last_fail"] = now
+    entry["locked_until"] = (now + cooldown_sec) if cooldown_sec > 0 else 0.0
+    store[tok_key] = entry
+
+    # 2. Update broader per-IP counter across all tokens (allows 5 free tries across tokens before cooldown)
+    ip_entry = store.get(ip_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0})
+    ip_fails = int(ip_entry.get("fails", 0)) + 1
+    ip_cooldown_sec = 0
+    if ip_fails > 5:
+        ip_idx = min(ip_fails - 6, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
+        ip_cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[ip_idx]
+    ip_entry["fails"] = ip_fails
+    ip_entry["last_fail"] = now
+    ip_entry["locked_until"] = max(float(ip_entry.get("locked_until", 0.0)), (now + ip_cooldown_sec) if ip_cooldown_sec > 0 else 0.0)
+    store[ip_key] = ip_entry
+
+    _save_cooldown_store(store)
+    effective_cooldown = max(cooldown_sec, ip_cooldown_sec)
+    free_remaining = max(0, _FREE_TYPO_ATTEMPTS - fails)
+    return fails, effective_cooldown, free_remaining
+
+
+def _reset_cooldown_on_success(client_ip: str, token: str) -> None:
+    """Clears the per-(IP + Token) failure counter upon a valid 6-digit verification."""
+    ip = (client_ip or "unknown").strip()
+    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    store = _load_cooldown_store()
+    if tok_key in store:
+        del store[tok_key]
+        _save_cooldown_store(store)
+
+
+def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") -> Dict[str, Any]:
     """
     Validates the QR token signature and returns minimal gate prompt info (without revealing LG details
     until the 6-digit Security Code is entered).
     """
+    rem_cooldown = _check_cooldown_status(client_ip, token)
+
     if not token or token.count(".") != 2:
         return {"valid_token": False, "reason": "Malformed verification link."}
 
@@ -443,6 +576,7 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
             "valid_token": True,
             "is_preview": True,
             "masked_serial": "SAMPLE-REF-0001",
+            "cooldown_seconds": rem_cooldown,
             "prompt": "Enter the 6-digit Security Code printed at the bottom of the instruction letter.",
         }
 
@@ -466,6 +600,7 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
             "valid_token": True,
             "is_preview": False,
             "masked_serial": masked_serial,
+            "cooldown_seconds": rem_cooldown,
             "prompt": "Enter the 6-digit Security Code printed in the footer of the instruction letter.",
         }
 
@@ -484,16 +619,50 @@ def inspect_verification_token(db: Any, token: str) -> Dict[str, Any]:
         "valid_token": True,
         "is_preview": False,
         "masked_serial": masked_serial,
+        "cooldown_seconds": rem_cooldown,
         "prompt": "Enter the 6-digit Security Code printed in the footer of the instruction letter.",
     }
 
 
-def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict[str, Any]:
+def _build_failed_code_response(client_ip: str, token: str) -> Dict[str, Any]:
+    """Records a failed 6-digit PIN attempt and returns a structured response with progressive cooldown."""
+    fails, cooldown_sec, free_rem = _record_failed_attempt(client_ip, token)
+    if cooldown_sec > 0:
+        return {
+            "verified": False,
+            "cooldown_seconds": cooldown_sec,
+            "failed_attempts": fails,
+            "reason": (
+                f"Invalid Security Code (Attempt #{fails}). To protect instruction security, "
+                f"verification from your connection is paused for {_format_duration_human(cooldown_sec)}."
+            ),
+        }
+    hint = f" ({free_rem} attempt{'s' if free_rem != 1 else ''} remaining before temporary cooldown)." if free_rem > 0 else "."
+    return {
+        "verified": False,
+        "cooldown_seconds": 0,
+        "failed_attempts": fails,
+        "reason": f"Verification Failed: The 6-digit Security Code does not match this instruction letter{hint}",
+    }
+
+
+def verify_instruction_with_code(db: Any, token: str, entered_code: str, client_ip: str = "unknown") -> Dict[str, Any]:
     """
     Verifies both the cryptographic QR token (bound to the secret database issuance timestamp)
     AND the 6-digit Security Code printed on the physical letter.
-    Returns masked assurance details and live instruction status if verified.
+    Enforces a progressive per-IP cooldown ladder (1m, 3m, 5m, 10m, 15m, 30m) on repeated failures.
     """
+    rem_cooldown = _check_cooldown_status(client_ip, token)
+    if rem_cooldown > 0:
+        return {
+            "verified": False,
+            "cooldown_seconds": rem_cooldown,
+            "reason": (
+                f"Too many failed attempts from your connection. Please wait "
+                f"{_format_duration_human(rem_cooldown)} ({rem_cooldown}s) before trying again."
+            ),
+        }
+
     clean_code = re.sub(r"[^0-9]", "", entered_code or "")
     if len(clean_code) != 6:
         return {"verified": False, "reason": "Please enter the complete 6-digit numeric Security Code."}
@@ -505,7 +674,8 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
     if kind == "P":
         _, expected_code = generate_verification_token_and_code("P", 0, "SAMPLE-REF-0001", "SAMPLE-LG", 1762600000)
         if clean_code != expected_code.replace("-", ""):
-            return {"verified": False, "reason": "The 6-digit Security Code entered does not match this instruction."}
+            return _build_failed_code_response(client_ip, token)
+        _reset_cooldown_on_success(client_ip, token)
         return {
             "verified": True,
             "status_Category": "ACTIVE",
@@ -556,10 +726,9 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
             return {"verified": False, "reason": "Cryptographic signature mismatch."}
 
         if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
-            return {
-                "verified": False,
-                "reason": "Verification Failed: The 6-digit Security Code does not match this instruction letter.",
-            }
+            return _build_failed_code_response(client_ip, token)
+
+        _reset_cooldown_on_success(client_ip, token)
 
         details = inst.details if isinstance(inst.details, dict) else {}
         raw_status = (inst.status or "Instruction Issued").strip()
@@ -669,10 +838,9 @@ def verify_instruction_with_code(db: Any, token: str, entered_code: str) -> Dict
         return {"verified": False, "reason": "Cryptographic signature mismatch."}
 
     if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
-        return {
-            "verified": False,
-            "reason": "Verification Failed: The 6-digit Security Code does not match this instruction letter.",
-        }
+        return _build_failed_code_response(client_ip, token)
+
+    _reset_cooldown_on_success(client_ip, token)
 
     curr_code = ilg.currency.iso_code if ilg.currency else "EGP"
     amt_str = f"{curr_code} {float(ilg.current_amount):,.2f}" if ilg.current_amount is not None else "N/A"

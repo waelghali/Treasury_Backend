@@ -275,8 +275,20 @@ class InstructionVerifyConfirmIn(BaseModel):
     code: str
 
 
+def _extract_client_ip(request: Request) -> str:
+    """Extracts the originating client IP behind reverse proxies (Render / Cloudflare)."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    xrip = request.headers.get("x-real-ip")
+    if xrip:
+        return xrip.strip()
+    return request.client.host if request.client else "unknown"
+
+
 @router.get("/verify-instruction/inspect", tags=["Public"])
 def inspect_instruction_qr_token(
+    request: Request,
     t: str = Query(..., description="Cryptographic QR verification token"),
     db: Session = Depends(get_db),
 ):
@@ -285,7 +297,8 @@ def inspect_instruction_qr_token(
     and returns the masked instruction reference for the 6-digit Security Code gate.
     """
     from app.core.instruction_verification import inspect_verification_token
-    return inspect_verification_token(db, t)
+    client_ip = _extract_client_ip(request)
+    return inspect_verification_token(db, t, client_ip=client_ip)
 
 
 @router.post("/verify-instruction/confirm", tags=["Public"])
@@ -301,7 +314,8 @@ def confirm_instruction_authenticity(
     from app.core.instruction_verification import verify_instruction_with_code
     from app.crud.crud import log_action
 
-    result = verify_instruction_with_code(db, payload.token, payload.code)
+    client_ip = _extract_client_ip(request)
+    result = verify_instruction_with_code(db, payload.token, payload.code, client_ip=client_ip)
 
     try:
         client_ip = request.client.host if request.client else "unknown"
