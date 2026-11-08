@@ -444,6 +444,7 @@ class CRUDLGInstruction(CRUDBase):
         current_date_obj = date.today()
 
         remindable_instruction_types = [
+            "LG_ACTIVATE_NON_OPERATIVE",
             "LG_DECREASE_AMOUNT",
             "LG_EXTENSION",
             "LG_LIQUIDATE",
@@ -738,6 +739,7 @@ class CRUDLGInstruction(CRUDBase):
         # 3. Fetch Eligible Instructions
         current_datetime = datetime.now()
         remindable_instruction_types = [
+            "LG_ACTIVATE_NON_OPERATIVE",
             "LG_DECREASE_AMOUNT",
             "LG_EXTENSION",
             "LG_LIQUIDATE",

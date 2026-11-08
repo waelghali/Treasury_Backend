@@ -1295,10 +1295,39 @@ class LGInstructionRecordBankReply(BaseModel):
             raise ValueError("Bank reply date cannot be in the future.")
         return self
 
+class AutoRenewalBatchItemOut(BaseModel):
+    lg_record_id: int
+    lg_number: str
+    beneficiary_name: Optional[str] = None
+    bank_name: Optional[str] = None
+    amount: Optional[float] = None
+    currency_code: Optional[str] = None
+    old_expiry_date: Optional[str] = None
+    new_expiry_date: Optional[str] = None
+    instruction_id: Optional[int] = None
+    instruction_serial: Optional[str] = None
+    instruction_status: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    bank_reply_date: Optional[datetime] = None
+    is_printed: Optional[bool] = False
+
+class AutoRenewalBatchOut(BaseModel):
+    batch_id: str
+    audit_log_id: Optional[int] = None
+    created_at: datetime
+    triggered_by_email: Optional[str] = None
+    renewed_count: int
+    items: List[AutoRenewalBatchItemOut] = []
+
+class BulkReprintInstructionsIn(BaseModel):
+    instruction_ids: List[int] = Field(..., description="List of LGInstruction IDs to merge and reprint as a single PDF.")
+
 class AutoRenewalRunSummaryOut(BaseModel):
     renewed_count: int
     message: str
     combined_pdf_base64: Optional[str] = None
+    batch_id: Optional[str] = None
+    renewed_items: Optional[List[AutoRenewalBatchItemOut]] = None
 
 class LGAutoRenewalItemIn(BaseModel):
     lg_record_id: int = Field(..., description="The ID of the LG record to renew.")

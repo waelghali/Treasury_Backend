@@ -2,23 +2,11 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>LG Release Instruction — {{lg_number}}</title>
+    <title>LG Release & Discharge Instruction — {{lg_number}}</title>
     <style>
         @page {
             size: A4 portrait;
-            margin: 18mm 16mm 18mm 16mm;
-            @top-right {
-                content: "Instruction Ref: {{instruction_serial}}";
-                font-family: 'Inter', 'Helvetica Neue', Arial, sans-serif;
-                font-size: 7.5pt;
-                color: #475569;
-            }
-            @bottom-left {
-                content: "{{customer_name}} — Corporate Treasury & Guarantee Operations";
-                font-family: 'Inter', 'Helvetica Neue', Arial, sans-serif;
-                font-size: 7.5pt;
-                color: #64748b;
-            }
+            margin: 40mm 19mm 14mm 19mm;
         }
         body {
             font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif;
@@ -28,15 +16,16 @@
             margin: 0;
             padding: 0;
         }
+        /* Clean, breathable letterhead */
         .header-table {
             width: 100%;
             border-collapse: collapse;
-            border-bottom: 2.5px solid #0f172a;
-            padding-bottom: 10px;
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 8px;
             margin-bottom: 14px;
         }
         .brand-bar {
-            width: 6px;
+            width: 5px;
             background-color: #FF7900;
             padding: 0;
         }
@@ -45,86 +34,61 @@
             vertical-align: top;
         }
         .company-title {
-            font-size: 15pt;
+            font-size: 14pt;
             font-weight: 800;
             color: #0f172a;
-            letter-spacing: 0.3px;
+            letter-spacing: 0.2px;
             text-transform: uppercase;
         }
-        .company-sub {
-            font-size: 8.5pt;
-            font-weight: 600;
-            color: #334155;
-            margin-top: 2px;
-        }
         .company-meta {
-            font-size: 8pt;
+            font-size: 8.5pt;
             color: #475569;
-            margin-top: 2px;
+            margin-top: 3px;
         }
         .doc-meta-cell {
             text-align: right;
             vertical-align: top;
-            width: 38%;
-        }
-        .action-pill {
-            display: inline-block;
-            background-color: #0f172a;
-            color: #ffffff;
-            border-left: 4px solid #FF7900;
-            padding: 4px 10px;
-            font-size: 8pt;
-            font-weight: 700;
-            letter-spacing: 0.6px;
-            text-transform: uppercase;
-            margin-bottom: 6px;
+            width: 36%;
+            font-size: 9pt;
+            color: #334155;
         }
         .meta-line {
-            font-size: 8.5pt;
-            color: #334155;
-            margin-top: 2px;
+            margin-bottom: 3px;
         }
         .meta-line strong {
             color: #0f172a;
-            font-family: 'Courier New', Courier, monospace;
-            font-size: 9pt;
         }
-        .recipient-card {
-            width: 100%;
-            border-collapse: collapse;
-            background-color: #f8fafc;
-            border: 1px solid #cbd5e1;
+        /* Clean recipient block without heavy outer box */
+        .recipient-block {
             margin-bottom: 14px;
+            font-size: 9.75pt;
+            line-height: 1.42;
         }
-        .recipient-card td {
-            padding: 9px 12px;
-            vertical-align: top;
-            font-size: 9pt;
-        }
-        .card-kicker {
-            font-size: 7pt;
+        .recipient-label {
+            font-size: 8pt;
             font-weight: 700;
             text-transform: uppercase;
-            letter-spacing: 0.6px;
-            color: #475569;
-            margin-bottom: 3px;
+            letter-spacing: 0.5px;
+            color: #64748b;
+            margin-bottom: 2px;
         }
-        .subject-banner {
-            background-color: #f1f5f9;
-            border: 1px solid #94a3b8;
-            border-left: 5px solid #FF7900;
-            padding: 8px 12px;
-            margin-bottom: 14px;
-            font-size: 10pt;
-            font-weight: 700;
+        .recipient-name {
+            font-weight: 800;
+            font-size: 10.25pt;
             color: #0f172a;
         }
-        .lg-badge {
-            font-family: 'Courier New', Courier, monospace;
-            background-color: #ffffff;
-            border: 1px solid #64748b;
-            padding: 1px 6px;
-            font-weight: 800;
+        .recipient-address {
+            color: #334155;
+            font-size: 9.25pt;
+        }
+        /* Minimalist subject line */
+        .subject-line {
+            border-left: 4px solid #FF7900;
+            padding: 3px 0 3px 12px;
+            margin-bottom: 14px;
+            font-size: 10.25pt;
+            font-weight: 700;
+            color: #0f172a;
         }
         .salutation {
             font-weight: 600;
@@ -135,88 +99,80 @@
             margin-bottom: 10px;
             text-align: justify;
         }
-        .section-heading {
-            font-size: 8.5pt;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #0f172a;
-            border-bottom: 1.5px solid #0f172a;
-            padding-bottom: 3px;
-            margin-top: 12px;
-            margin-bottom: 8px;
-        }
+        /* Clean specification table with generous padding */
         .spec-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 12px;
-            font-size: 9pt;
+            margin: 10px 0 12px 0;
+            font-size: 9.25pt;
         }
         .spec-table th, .spec-table td {
-            border: 1px solid #94a3b8;
-            padding: 6px 10px;
+            border-bottom: 1px solid #cbd5e1;
+            padding: 5.5px 12px;
             text-align: left;
-            vertical-align: top;
+            vertical-align: middle;
+        }
+        .spec-table tr:first-child th, .spec-table tr:first-child td {
+            border-top: 1.5px solid #0f172a;
         }
         .spec-table th {
-            background-color: #f1f5f9;
-            color: #0f172a;
-            font-weight: 700;
-            width: 32%;
-            font-size: 8.5pt;
-        }
-        .spec-table tr.highlight-row td, .spec-table tr.highlight-row th {
+            color: #334155;
+            font-weight: 600;
+            width: 36%;
             background-color: #f8fafc;
+        }
+        .spec-table td {
+            color: #0f172a;
+        }
+        .spec-table tr.highlight-row th, .spec-table tr.highlight-row td {
+            background-color: #f1f5f9;
             border-top: 1.5px solid #0f172a;
             border-bottom: 1.5px solid #0f172a;
             font-weight: 800;
-        }
-        .clause-box {
-            background-color: #f8fafc;
-            border: 1px solid #cbd5e1;
-            border-left: 4px solid #0f172a;
-            padding: 8px 12px;
-            margin: 12px 0;
-            font-size: 9pt;
-            font-weight: 600;
             color: #0f172a;
         }
+        .notes-wrapper {
+            margin: 14px 0;
+        }
         .notes-wrapper h3 {
-            font-size: 9pt;
+            font-size: 9.5pt;
             text-transform: uppercase;
             margin: 8px 0 4px 0;
             color: #0f172a;
         }
+        /* Open, uncluttered signature block for wet-ink signing */
         .signature-section {
-            margin-top: 22px;
+            margin-top: 20px;
             width: 100%;
             page-break-inside: avoid;
         }
         .sig-table {
             width: 100%;
             border-collapse: collapse;
+            margin-top: 72px;
         }
-        .sig-box {
-            width: 47%;
-            border: 1px solid #94a3b8;
-            padding: 10px 12px;
-            height: 72px;
+        .sig-cell {
+            width: 44%;
             vertical-align: top;
-            font-size: 8.5pt;
         }
         .sig-line {
-            margin-top: 36px;
-            border-top: 1px solid #0f172a;
-            padding-top: 4px;
+            border-top: 1.5px solid #0f172a;
+            padding-top: 6px;
             font-weight: 700;
-            font-size: 8.5pt;
+            font-size: 9pt;
+            color: #0f172a;
+        }
+        .sig-sub {
+            font-size: 8pt;
+            color: #475569;
+            margin-top: 2px;
         }
         .footer-note {
-            margin-top: 16px;
-            border-top: 1px solid #cbd5e1;
-            padding-top: 6px;
+            margin-top: 22px;
+            border-top: 1px solid #e2e8f0;
+            padding-top: 7px;
             font-size: 7.5pt;
-            color: #475569;
+            color: #64748b;
             text-align: center;
         }
     </style>
@@ -228,78 +184,66 @@
             <td class="brand-bar"></td>
             <td class="company-block">
                 <div class="company-title">{{customer_name}}</div>
-                <div class="company-sub">Treasury &amp; Trade Finance Operations — Letter of Guarantee Dept.</div>
                 <div class="company-meta" dir="auto">{{customer_address}} &bull; {{customer_contact_email}}</div>
             </td>
             <td class="doc-meta-cell">
-                <div class="action-pill">LG Release &amp; Discharge</div>
                 <div class="meta-line">Date: <strong><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{current_date}}</span></strong></div>
-                <div class="meta-line">Instruction Ref: <strong>{{instruction_serial}}</strong></div>
+                <div class="meta-line">Ref: <strong>{{instruction_serial}}</strong></div>
             </td>
         </tr>
     </table>
 
-    <!-- Recipient & Beneficiary Block -->
-    <table class="recipient-card">
-        <tr>
-            <td style="width: 55%; border-right: 1px solid #cbd5e1;">
-                <div class="card-kicker">To (Issuing / Advising Bank)</div>
-                <div style="font-weight: 800; font-size: 10pt; color: #0f172a;">{{recipient_name}}</div>
-                <div style="color: #334155; margin-top: 2px;" dir="auto">{{recipient_address}}</div>
-            </td>
-            <td style="width: 45%;">
-                <div class="card-kicker">Beneficiary Entity</div>
-                <div style="font-weight: 700; color: #0f172a;">{{lg_beneficiary_name}}</div>
-                <div style="color: #475569; font-size: 8pt; margin-top: 2px;">Issuing Bank on Record: {{issuing_bank_name}}</div>
-            </td>
-        </tr>
-    </table>
+    <!-- Recipient Block -->
+    <div class="recipient-block">
+        <div class="recipient-label">To</div>
+        <div class="recipient-name">{{recipient_name}}</div>
+        <div class="recipient-address" dir="auto">{{recipient_address}}</div>
+    </div>
 
-    <!-- Subject Banner -->
-    <div class="subject-banner">
-        SUBJECT: Instruction to Release &amp; Discharge Letter of Guarantee #<span class="lg-badge">{{lg_number}}</span>
+    <!-- Subject Line -->
+    <div class="subject-line">
+        Subject: Instruction to Release &amp; Discharge Letter of Guarantee No. {{lg_number}}
     </div>
 
     <div class="salutation">Dear Sirs,</div>
 
     <p>
-        With reference to the above-mentioned subject and the Letter of Guarantee details set out below, kindly note that
+        With reference to the Letter of Guarantee detailed below, kindly note that
         <strong>{{lg_issuer_name}}</strong> has fulfilled their contractual obligations. Accordingly, the specified Letter of Guarantee is now
         <strong>null and void</strong>, and we hereby confirm that the issuing bank (<strong>{{issuing_bank_name}}</strong>) and
-        <strong>{{lg_issuer_name}}</strong> are released from all liability and any further claim in respect of LG #<strong>{{lg_number}}</strong>.
+        <strong>{{lg_issuer_name}}</strong> are released from all liability and any further claim in respect of Letter of Guarantee No. <strong>{{lg_number}}</strong>.
     </p>
 
-    <div class="section-heading">Released Letter of Guarantee Specifications</div>
     <table class="spec-table">
         <tr>
             <th>LG Number</th>
-            <td><strong style="font-family: 'Courier New', monospace; font-size: 9.5pt;">{{lg_number}}</strong></td>
+            <td><strong>{{lg_number}}</strong></td>
         </tr>
         <tr>
-            <th>Issuer / Applicant</th>
+            <th>Applicant (Issued For)</th>
             <td><strong>{{lg_issuer_name}}</strong></td>
         </tr>
         <tr>
-            <th>Beneficiary Name</th>
+            <th>Beneficiary</th>
             <td>{{lg_beneficiary_name}}</td>
         </tr>
         <tr>
-            <th>Issuing Date</th>
+            <th>Issuance Date</th>
             <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{issuance_date}}</span></td>
         </tr>
         <tr>
-            <th>Maturity / Expiry Date</th>
+            <th>Expiry Date</th>
             <td><span class="date-dd-mmm-yyyy" data-date-format="DD-MMM-YYYY">{{expiry_date}}</span></td>
         </tr>
         <tr class="highlight-row">
-            <th>L/G Amount Released</th>
-            <td><span style="font-size: 10pt;">{{lg_amount_formatted}} ({{lg_currency}})</span></td>
+            <th>LG Amount Released</th>
+            <td>{{lg_amount_formatted}}</td>
         </tr>
     </table>
 
-    <div class="clause-box">
+    <p>
         {{enclosed_documents_clause}}
-    </div>
+    </p>
 
     <div class="notes-wrapper">
         {{notes_section}}
@@ -311,25 +255,24 @@
 
     <!-- Signatures -->
     <div class="signature-section">
-        <p style="margin-bottom: 8px;">Yours faithfully,<br><strong>For and on behalf of {{lg_beneficiary_name}} ({{customer_name}})</strong></p>
+        <p style="margin-bottom: 0;">Yours faithfully,<br><strong>For and on behalf of {{lg_beneficiary_name}}</strong></p>
         <table class="sig-table">
             <tr>
-                <td class="sig-box">
-                    <div style="color: #475569; font-size: 8pt;">First Authorized Signatory</div>
-                    <div class="sig-line">Name, Title &amp; Signature</div>
+                <td class="sig-cell">
+                    <div class="sig-line">Authorized Signatory</div>
                 </td>
-                <td style="width: 6%;"></td>
-                <td class="sig-box">
-                    <div style="color: #475569; font-size: 8pt;">Second Authorized Signatory &amp; Corporate Stamp</div>
-                    <div class="sig-line">Name, Title &amp; Signature</div>
+                <td style="width: 12%;"></td>
+                <td class="sig-cell">
+                    <div class="sig-line">Authorized Signatory</div>
                 </td>
             </tr>
         </table>
     </div>
 
     <div class="footer-note">
-        Official Corporate Banking Instruction &bull; Generated via {{platform_name}} &bull; Ref: {{instruction_serial}}
+        Official Corporate Banking Instruction &bull; Generated via <strong>Grow Business Development</strong> &mdash; Treasury Management Platform
     </div>
+
     <script>
         (function () {
             var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -344,4 +287,3 @@
     </script>
 </body>
 </html>
-

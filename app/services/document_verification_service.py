@@ -569,7 +569,7 @@ class DocumentVerificationService:
         # --- 2b. Document Type & Relevance Check ---
         detected_doc_type = extracted_data.get("detected_document_type")
         if detected_doc_type == "ORIGINAL_LG_LETTER" and action_type in (
-            "LG_EXTENSION", "EXTEND", "EXTENSION", "LG_DECREASE_AMOUNT", "LG_LIQUIDATION", "LG_LIQUIDATE", "LG_RELEASE", "CANCEL_LIQUIDATION"
+            "LG_EXTENSION", "EXTEND", "EXTENSION", "LG_DECREASE_AMOUNT", "LG_LIQUIDATION", "LG_LIQUIDATE", "LG_RELEASE", "LG_ACTIVATE_NON_OPERATIVE", "CANCEL_LIQUIDATION"
         ):
             mismatches.append(
                 "Document Type Mismatch: Attached document appears to be an Original LG Issuance Letter, not a bank reply advice for this instruction."

@@ -2615,7 +2615,7 @@ class CRUDLGRecord(CRUDBase):
 
         if not preview.candidates:
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No eligible LG candidates found for customer {customer_id}.")
-            return 0, None
+            return 0, None, None, []
 
         candidate_map = {c.id: c for c in preview.candidates}
 
@@ -2654,11 +2654,15 @@ class CRUDLGRecord(CRUDBase):
 
         if not targets_to_renew:
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs selected for renewal for customer {customer_id}.")
-            return 0, None
+            return 0, None, None, []
 
+        batch_id = f"BULK-EXT-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{customer_id}"
+        batch_timestamp = datetime.now().isoformat()
         renewed_lg_count = 0
         all_generated_instruction_htmls = []
         renewed_lg_numbers = []
+        renewed_instruction_ids = []
+        renewed_items = []
 
         for lg_id, new_expiry_date_as_date in targets_to_renew:
             cand = candidate_map.get(lg_id)
@@ -2673,6 +2677,35 @@ class CRUDLGRecord(CRUDBase):
                 all_generated_instruction_htmls.append(generated_html)
                 renewed_lg_count += 1
                 renewed_lg_numbers.append(updated_lg.lg_number)
+                renewed_instruction_ids.append(instruction_id)
+
+                db_inst = db.query(models.LGInstruction).filter(models.LGInstruction.id == instruction_id).first()
+                inst_details = dict(db_inst.details or {}) if db_inst else {}
+                if db_inst:
+                    inst_details["is_bulk_renewal"] = True
+                    inst_details["bulk_renewal_batch_id"] = batch_id
+                    inst_details["bulk_renewal_timestamp"] = batch_timestamp
+                    db_inst.details = inst_details
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(db_inst, "details")
+                    db.add(db_inst)
+
+                renewed_items.append({
+                    "lg_record_id": updated_lg.id,
+                    "lg_number": updated_lg.lg_number,
+                    "beneficiary_name": updated_lg.beneficiary_corporate.entity_name if updated_lg.beneficiary_corporate else (cand.beneficiary_name if cand else None),
+                    "bank_name": self._get_effective_issuing_bank_name(updated_lg),
+                    "amount": float(updated_lg.lg_amount) if updated_lg.lg_amount is not None else None,
+                    "currency_code": updated_lg.lg_currency.iso_code if updated_lg.lg_currency else (cand.currency_code if cand else None),
+                    "old_expiry_date": inst_details.get("old_expiry_date") or (cand.current_expiry_date.isoformat() if cand else None),
+                    "new_expiry_date": new_expiry_date_as_date.isoformat(),
+                    "instruction_id": instruction_id,
+                    "instruction_serial": db_inst.serial_number if db_inst else None,
+                    "instruction_status": db_inst.status if db_inst else "Instruction Issued",
+                    "delivery_date": db_inst.delivery_date.isoformat() if (db_inst and db_inst.delivery_date) else None,
+                    "bank_reply_date": db_inst.bank_reply_date.isoformat() if (db_inst and db_inst.bank_reply_date) else None,
+                    "is_printed": bool(db_inst.is_printed) if db_inst else False,
+                })
                 logger.info(f"Successfully renewed LG id={updated_lg.id} to {updated_lg.expiry_date.date()}. Instruction ID: {instruction_id}.")
             except HTTPException as e:
                 logger.error(f"Skipping LG id={lg_id} due to error during extension: {e.detail}", exc_info=True)
@@ -2681,7 +2714,7 @@ class CRUDLGRecord(CRUDBase):
 
         if not all_generated_instruction_htmls:
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs were successfully renewed for customer {customer_id}.")
-            return 0, None
+            return 0, None, None, []
 
         # Render each letter as an independent PDF (preserving its own @page headers, footers, and serial number)
         # and merge the resulting PDFs into a single print batch PDF.
@@ -2706,8 +2739,11 @@ class CRUDLGRecord(CRUDBase):
             entity_id=customer_id,
             details={
                 "action": "Bulk LG Renewal (Auto & Forced)",
+                "batch_id": batch_id,
                 "renewed_lg_count": renewed_lg_count,
                 "renewed_lg_numbers": renewed_lg_numbers,
+                "renewed_instruction_ids": renewed_instruction_ids,
+                "renewed_items": renewed_items,
                 "auto_renewal_threshold_days": preview.auto_renewal_days_threshold,
                 "force_renewal_threshold_days": preview.forced_renew_days_threshold,
                 "combined_pdf_generated": combined_pdf_bytes is not None,
@@ -2716,9 +2752,9 @@ class CRUDLGRecord(CRUDBase):
             customer_id=customer_id,
             lg_record_id=None,
         )
-        logger.info(f"Bulk LG Renewal process completed for customer {customer_id}. {renewed_lg_count} LGs renewed.")
+        logger.info(f"Bulk LG Renewal process completed for customer {customer_id} (Batch {batch_id}). {renewed_lg_count} LGs renewed.")
 
-        return renewed_lg_count, combined_pdf_bytes
+        return renewed_lg_count, combined_pdf_bytes, batch_id, renewed_items
         
     def get_active_lg_records_count_for_customer(self, db: Session, customer_id: int) -> int:
         """

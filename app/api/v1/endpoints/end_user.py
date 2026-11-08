@@ -44,6 +44,9 @@ from app.schemas.all_schemas import (
     LGDocumentCreate,
     LGRecordToggleAutoRenewalRequest,
     AutoRenewalRunSummaryOut,
+    AutoRenewalBatchItemOut,
+    AutoRenewalBatchOut,
+    BulkReprintInstructionsIn,
     AutoRenewalPreviewOut,
     RunAutoRenewalRequestIn,
     CustomerConfigurationOut,
@@ -131,7 +134,7 @@ try:
     )
     from app.core.ai_integration import process_lg_document_with_ai, generate_signed_gcs_url, process_amendment_with_ai
 
-    from app.core.document_generator import generate_pdf_from_html
+    from app.core.document_generator import generate_pdf_from_html, generate_merged_pdf_from_html_list
     from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
 
 except Exception as e:
@@ -313,7 +316,7 @@ async def run_auto_renewal_endpoint(
         has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
         selected_items = request_payload.renewals if request_payload and request_payload.renewals is not None else None
 
-        renewed_count, combined_pdf_bytes = await crud_lg_record.run_auto_renewal_process(
+        renewed_count, combined_pdf_bytes, batch_id, renewed_items = await crud_lg_record.run_auto_renewal_process(
             db,
             user_id=end_user_context.user_id,
             customer_id=end_user_context.customer_id,
@@ -327,13 +330,17 @@ async def run_auto_renewal_endpoint(
             return AutoRenewalRunSummaryOut(
                 renewed_count=renewed_count,
                 message=f"Successfully renewed {renewed_count} eligible LG(s). Consolidated instruction letter generated.",
-                combined_pdf_base64=pdf_base64
+                combined_pdf_base64=pdf_base64,
+                batch_id=batch_id,
+                renewed_items=renewed_items
             )
         else:
             return AutoRenewalRunSummaryOut(
                 renewed_count=renewed_count,
                 message="No eligible LGs were renewed.",
-                combined_pdf_base64=None
+                combined_pdf_base64=None,
+                batch_id=batch_id,
+                renewed_items=renewed_items
             )
     except HTTPException as e:
         logger.error(f"HTTPException during bulk renewal for customer {end_user_context.customer_id}: {e.detail}", exc_info=True)
@@ -344,6 +351,262 @@ async def run_auto_renewal_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred during bulk renewal: {e}"
         )
+
+
+def _render_instruction_letter_html(db: Session, db_instruction: models.LGInstruction) -> str:
+    """Helper to render the populated HTML for a single LGInstruction letter."""
+    template = crud_template.get(db, db_instruction.template_id)
+    if not template:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Template not found for instruction {db_instruction.id}.")
+
+    generated_html = template.content
+    instruction_details = dict(db_instruction.details or {})
+    lg_record_for_template = db_instruction.lg_record
+    if lg_record_for_template:
+        recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record_for_template)
+        issuance_date_str = lg_record_for_template.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "issuance_date", None) else "N/A"
+        expiry_date_str = lg_record_for_template.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "expiry_date", None) else "N/A"
+        customer_obj = lg_record_for_template.customer
+        entity_obj = lg_record_for_template.beneficiary_corporate
+        customer_address_val = (entity_obj.address if entity_obj and entity_obj.address else (customer_obj.address if customer_obj else "")) or ""
+        customer_email_val = (entity_obj.contact_email if entity_obj and entity_obj.contact_email else (customer_obj.contact_email if customer_obj else "")) or ""
+
+        instruction_details.update({
+            "lg_number": lg_record_for_template.lg_number,
+            "lg_serial_number": lg_record_for_template.lg_number,
+            "instruction_serial": db_instruction.serial_number or "",
+            "serial_number": db_instruction.serial_number or "",
+            "lg_amount": float(lg_record_for_template.lg_amount),
+            "lg_currency": lg_record_for_template.lg_currency.iso_code if lg_record_for_template.lg_currency else "",
+            "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record_for_template),
+            "lg_issuer_name": lg_record_for_template.issuer_name,
+            "lg_beneficiary_name": lg_record_for_template.beneficiary_corporate.entity_name if lg_record_for_template.beneficiary_corporate else "",
+            "customer_name": lg_record_for_template.customer.name if lg_record_for_template.customer else "",
+            "customer_address": customer_address_val,
+            "customer_contact_email": customer_email_val,
+            "internal_owner_email": lg_record_for_template.internal_owner_contact.email if lg_record_for_template.internal_owner_contact else "",
+            "current_date": (db_instruction.instruction_date.strftime("%Y-%m-%d") if getattr(db_instruction, "instruction_date", None) else date.today().strftime("%Y-%m-%d")),
+            "platform_name": "Treasury Management Platform",
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
+        })
+        instruction_details.setdefault("issuance_date", issuance_date_str)
+        instruction_details.setdefault("issue_date", issuance_date_str)
+        instruction_details.setdefault("expiry_date", instruction_details.get("old_expiry_date") or expiry_date_str)
+        instruction_details.setdefault("maturity_date", instruction_details.get("old_expiry_date") or expiry_date_str)
+        instruction_details.setdefault("notes_section", "")
+
+        if "old_expiry_date" in instruction_details and "new_expiry_date" in instruction_details and "extension_period" not in instruction_details:
+            try:
+                old_d = datetime.strptime(str(instruction_details["old_expiry_date"])[:10], "%Y-%m-%d").date()
+                new_d = datetime.strptime(str(instruction_details["new_expiry_date"])[:10], "%Y-%m-%d").date()
+                instruction_details["extension_period"] = crud_lg_record._format_extension_period(old_d, new_d)
+            except Exception:
+                instruction_details["extension_period"] = "N/A"
+
+        symbol = lg_record_for_template.lg_currency.symbol if lg_record_for_template.lg_currency else ""
+        instruction_details["lg_amount_formatted"] = f"{symbol} {float(lg_record_for_template.lg_amount):,.2f}"
+
+    for key, value in instruction_details.items():
+        str_value = str(value) if value is not None else ""
+        generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
+
+    return generated_html
+
+
+@router.get(
+    "/lg-records/auto-renewal-history",
+    response_model=List[AutoRenewalBatchOut],
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
+    summary="Get history of bulk auto-renewal runs and their extended LGs"
+)
+def get_auto_renewal_history_endpoint(
+    limit: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    allowed_ids_set = set(allowed_ids) if not has_all else set()
+
+    logs = (
+        db.query(models.AuditLog)
+        .options(selectinload(models.AuditLog.user))
+        .filter(
+            models.AuditLog.customer_id == end_user_context.customer_id,
+            models.AuditLog.action_type == AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED,
+        )
+        .order_by(models.AuditLog.timestamp.desc())
+        .limit(100)
+        .all()
+    )
+
+    batches: List[AutoRenewalBatchOut] = []
+    for log_entry in logs:
+        details = log_entry.details if isinstance(log_entry.details, dict) else {}
+        if details.get("action") != "Bulk LG Renewal (Auto & Forced)":
+            continue
+
+        batch_id = details.get("batch_id") or f"RUN-{log_entry.id}"
+        inst_ids = details.get("renewed_instruction_ids") or []
+        lg_numbers = details.get("renewed_lg_numbers") or []
+
+        instructions: List[models.LGInstruction] = []
+        if inst_ids:
+            instructions = (
+                db.query(models.LGInstruction)
+                .options(
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+                )
+                .filter(
+                    models.LGInstruction.id.in_(inst_ids),
+                    models.LGInstruction.is_deleted == False,
+                    models.LGInstruction.lg_record.has(models.LGRecord.customer_id == end_user_context.customer_id),
+                )
+                .all()
+            )
+        elif lg_numbers and log_entry.timestamp:
+            # Fallback for legacy runs created before renewed_instruction_ids was stored
+            log_date = log_entry.timestamp.date()
+            instructions = (
+                db.query(models.LGInstruction)
+                .join(models.LGRecord, models.LGInstruction.lg_record_id == models.LGRecord.id)
+                .options(
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+                    selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+                )
+                .filter(
+                    models.LGRecord.customer_id == end_user_context.customer_id,
+                    models.LGRecord.lg_number.in_(lg_numbers),
+                    models.LGInstruction.is_deleted == False,
+                    models.LGInstruction.instruction_type == "LG_EXTENSION",
+                    func.date(models.LGInstruction.instruction_date) == log_date,
+                )
+                .order_by(models.LGInstruction.id.desc())
+                .all()
+            )
+            # Deduplicate per LG number (closest to log timestamp)
+            seen_lg = set()
+            deduped = []
+            for inst in instructions:
+                if inst.lg_record_id not in seen_lg:
+                    seen_lg.add(inst.lg_record_id)
+                    deduped.append(inst)
+            instructions = deduped
+
+        inst_by_id = {inst.id: inst for inst in instructions}
+        ordered_insts = [inst_by_id[i] for i in inst_ids if i in inst_by_id] if inst_ids else instructions
+
+        items_out: List[AutoRenewalBatchItemOut] = []
+        for inst in ordered_insts:
+            lg_rec = inst.lg_record
+            if not lg_rec:
+                continue
+            if not has_all and lg_rec.beneficiary_corporate_id not in allowed_ids_set:
+                continue
+            inst_det = inst.details if isinstance(inst.details, dict) else {}
+            items_out.append(
+                AutoRenewalBatchItemOut(
+                    lg_record_id=lg_rec.id,
+                    lg_number=lg_rec.lg_number,
+                    beneficiary_name=lg_rec.beneficiary_corporate.entity_name if lg_rec.beneficiary_corporate else None,
+                    bank_name=crud_lg_record._get_effective_issuing_bank_name(lg_rec),
+                    amount=float(lg_rec.lg_amount) if lg_rec.lg_amount is not None else None,
+                    currency_code=lg_rec.lg_currency.iso_code if lg_rec.lg_currency else None,
+                    old_expiry_date=inst_det.get("old_expiry_date"),
+                    new_expiry_date=inst_det.get("new_expiry_date") or (lg_rec.expiry_date.strftime("%Y-%m-%d") if lg_rec.expiry_date else None),
+                    instruction_id=inst.id,
+                    instruction_serial=inst.serial_number,
+                    instruction_status=inst.status,
+                    delivery_date=inst.delivery_date,
+                    bank_reply_date=inst.bank_reply_date,
+                    is_printed=bool(inst.is_printed),
+                )
+            )
+
+        if not items_out and not has_all:
+            continue
+
+        batches.append(
+            AutoRenewalBatchOut(
+                batch_id=batch_id,
+                audit_log_id=log_entry.id,
+                created_at=log_entry.timestamp,
+                triggered_by_email=log_entry.user.email if log_entry.user else None,
+                renewed_count=len(items_out) if items_out else int(details.get("renewed_lg_count") or 0),
+                items=items_out,
+            )
+        )
+        if len(batches) >= limit:
+            break
+
+    return batches
+
+
+@router.post(
+    "/lg-records/auto-renewal-reprint",
+    response_model=Dict[str, Any],
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
+    summary="Regenerate and merge extension instruction PDFs for a previous auto-renewal batch or selected instructions"
+)
+async def reprint_auto_renewal_batch_endpoint(
+    payload: BulkReprintInstructionsIn,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    if not payload.instruction_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No instruction IDs provided.")
+
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    allowed_ids_set = set(allowed_ids) if not has_all else set()
+
+    instructions = (
+        db.query(models.LGInstruction)
+        .options(
+            selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+            selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+            selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+            selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.internal_owner_contact),
+            selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
+            selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+        )
+        .filter(
+            models.LGInstruction.id.in_(payload.instruction_ids),
+            models.LGInstruction.is_deleted == False,
+            models.LGInstruction.lg_record.has(models.LGRecord.customer_id == end_user_context.customer_id),
+        )
+        .all()
+    )
+
+    inst_by_id = {inst.id: inst for inst in instructions}
+    ordered_insts = [inst_by_id[i] for i in payload.instruction_ids if i in inst_by_id]
+
+    html_list: List[str] = []
+    for inst in ordered_insts:
+        if not has_all and inst.lg_record and inst.lg_record.beneficiary_corporate_id not in allowed_ids_set:
+            continue
+        html_list.append(_render_instruction_letter_html(db, inst))
+
+    if not html_list:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No accessible instructions found to reprint.")
+
+    combined_pdf_bytes = await generate_merged_pdf_from_html_list(
+        html_list,
+        f"reprint_bulk_lg_renewal_customer_{end_user_context.customer_id}_{date.today().isoformat()}"
+    )
+    if not combined_pdf_bytes:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate combined PDF.")
+
+    pdf_base64 = base64.b64encode(combined_pdf_bytes).decode("utf-8")
+    return {
+        "count": len(html_list),
+        "message": f"Successfully regenerated consolidated PDF for {len(html_list)} instruction letter(s).",
+        "combined_pdf_base64": pdf_base64,
+    }
 
 
 @router.get("/status", dependencies=[Depends(check_subscription_status)]) # ADDED dependency
