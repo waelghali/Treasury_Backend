@@ -60,6 +60,7 @@ class BankSimpleOut(BaseModel):
     allow_dealer_comments: Optional[bool] = True
     allow_dealer_feedback: Optional[bool] = True
     allow_dealer_mobile_alerts: Optional[bool] = True
+    allow_manual_recording: Optional[bool] = False
 
     class Config:
         from_attributes = True
@@ -78,6 +79,7 @@ class QuotationBankOut(QuotationBankBase):
     handshake_confirmed_at: Optional[datetime] = None
     all_contacts_pending: Optional[bool] = False
     has_active_contacts: Optional[bool] = True
+    allow_manual_recording: Optional[bool] = False
     
     class Config:
         from_attributes = True
@@ -179,6 +181,7 @@ class QuotationLegOut(BaseModel):
     winner_rate: Optional[float] = None
     saved_vs_avg: Optional[float] = None
     execution_reference: Optional[str] = None
+    is_manual_deal: Optional[bool] = False
     deal_slip_pdf_path: Optional[str] = None
     rejection_reason: Optional[str] = None
     document_path: Optional[str] = None
@@ -251,6 +254,7 @@ class QuotationRequestOut(BaseModel):
     delegated_by_user_id: Optional[int] = None
     delegated_to_name: Optional[str] = None
     release_docs_to_winner_only: Optional[bool] = False
+    is_manual_deal: Optional[bool] = False
     assigned_banks: Optional[List[dict]] = None
     legs: Optional[List[QuotationLegOut]] = []
 
@@ -413,6 +417,8 @@ class QuotationResultItem(BaseModel):
     is_passed: Optional[bool] = False
     is_excluded: Optional[bool] = False
     is_cross_entity: Optional[bool] = False
+    allow_manual_recording: Optional[bool] = False
+    is_manual_quote: Optional[bool] = False
     desk_proof: Optional[dict] = None
 
 class QuotationResultsOut(BaseModel):
@@ -477,3 +483,46 @@ class DocumentTicketOut(BaseModel):
     ticket: str
     download_url: str
     expires_in_seconds: int = 900
+
+# --- Manual / Offline Quote & Deal Recording Schemas ---
+class ManualProxyQuoteItem(BaseModel):
+    leg_id: Optional[Union[str, int]] = None
+    price: Optional[float] = None
+    rate: Optional[float] = None
+    discount_rate: Optional[float] = None
+    offered_value_date: Optional[Union[str, date]] = None
+    settlement_date: Optional[Union[str, date]] = None
+    maturity_date: Optional[Union[str, date]] = None
+    max_amount: Optional[float] = None
+    notes: Optional[str] = None
+
+class ManualProxyQuoteRequest(BaseModel):
+    bank_id: int
+    quotes: Optional[List[ManualProxyQuoteItem]] = None
+    tbill_lines: Optional[List[TBillLineItem]] = None
+    notes: Optional[str] = None
+
+class ManualDealLegInput(BaseModel):
+    direction: Optional[str] = "Buy"
+    buy_currency: Optional[str] = "USD"
+    sell_currency: Optional[str] = "EGP"
+    amount: float
+    value_date: Optional[Union[str, date]] = None
+    settlement_date: Optional[Union[str, date]] = None
+    maturity_date: Optional[Union[str, date]] = None
+    executed_rate: float
+    notes: Optional[str] = None
+    cost_min: Optional[float] = 0.0
+    cost_percent: Optional[float] = 0.0
+    cost_max: Optional[float] = 0.0
+    cost_flat: Optional[float] = 0.0
+
+class ManualDealRecordCreate(BaseModel):
+    entity_id: Optional[int] = None
+    type: str = "FX_SPOT" # "FX_SPOT" or "TBILL"
+    bank_id: int
+    deal_reference: Optional[str] = None
+    internal_notes: Optional[str] = None
+    document_path: Optional[str] = None
+    eval_rate: Optional[float] = None
+    legs: List[ManualDealLegInput]

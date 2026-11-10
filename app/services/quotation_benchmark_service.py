@@ -81,6 +81,9 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
         for a in assignments:
             off = db.query(QuotationOffer).filter(QuotationOffer.assignment_id == a.id).order_by(QuotationOffer.submitted_at.desc()).first()
             if off:
+                # Exclude manually typed corporate user quotes from cross-tenant anonymous benchmarks
+                if getattr(off, 'submitted_by_email', None) and str(off.submitted_by_email).upper().startswith("MANUAL_"):
+                    continue
                 price = tenant_key_service.resolve_offer_price(off, tenant_dek)
                 if price and price > 0:
                     quotes.append(price)
@@ -89,6 +92,10 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
     else:
         for a in assignments:
             tb_offers = db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == a.id).all()
+            tb_offers = [
+                o for o in tb_offers
+                if not (getattr(o, 'submitted_by_email', None) and str(o.submitted_by_email).upper().startswith("MANUAL_"))
+            ]
             if tb_offers:
                 rates = [
                     r for r in (tenant_key_service.resolve_tbill_discount_rate(o, tenant_dek) for o in tb_offers)

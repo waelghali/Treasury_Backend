@@ -128,6 +128,9 @@ async def broadcast_rfq_to_banks(
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if not bank_row:
                 continue
+            # Strictly suppress all outbound emails and push alerts for banks with manual recording enabled
+            if bank_row.bank and getattr(bank_row.bank, 'allow_manual_recording', False):
+                continue
 
             contacts = bank_row.contacts
             if isinstance(contacts, str):

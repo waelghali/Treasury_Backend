@@ -32,7 +32,8 @@ from app.schemas.schemas_quotation import (
     ReTenderRequest, QuotationResubmitRequest,
     QuotationCancellationRequest, QuotationRescheduleRequest,
     QuotationDelegateRequest,
-    DocumentTicketRequest, DocumentTicketOut
+    DocumentTicketRequest, DocumentTicketOut,
+    ManualProxyQuoteRequest, ManualDealRecordCreate
 )
 from app.crud.crud_quotation import crud_quotation, get_bank_leg_signature
 from app.models.models_quotation import (
@@ -747,7 +748,9 @@ def create_quotation_bank(
     )
 
     # Dispatch dealer invitation handshake email for all newly added contacts (first onboarding or roster additions)
-    if added_contacts:
+    # Air-gap: Strictly suppress dealer handshake invitations if bank has manual recording enabled
+    is_manual_bank = bool(bank.bank and getattr(bank.bank, 'allow_manual_recording', False))
+    if added_contacts and not is_manual_bank:
         import secrets
         from datetime import datetime, timezone, timedelta
         from app.core.email_service import send_email, get_customer_email_settings
@@ -1019,6 +1022,11 @@ def invite_bank_contact(
     bank = db.query(Bank).filter(Bank.id == bank_id).first()
     if not bank:
         raise HTTPException(status_code=404, detail="Bank not found.")
+    if getattr(bank, "allow_manual_recording", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Manual / Offline recording is enabled for this bank. Outbound dealer handshake invitations are suppressed."
+        )
 
     cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
     clean_email = body.email.strip().lower()
@@ -2021,6 +2029,8 @@ def create_rfq(
                 bank_row = db.query(QuotationBank).filter(QuotationBank.id == q_bank_id).first() if q_bank_id else None
                 if not bank_row:
                     continue
+                if bank_row.bank and getattr(bank_row.bank, "allow_manual_recording", False):
+                    continue
                     
                 contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
                 if not contacts and bank_row.emails:
@@ -2358,6 +2368,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         if not all_tbill_offers:
             for a in assignments:
                 q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+                is_manual_bank = bool(q_bank and q_bank.bank and getattr(q_bank.bank, 'allow_manual_recording', False))
                 results.append({
                     "bank_id": q_bank.bank_id if q_bank else 0,
                     "quotation_bank_id": a.quotation_bank_id,
@@ -2375,6 +2386,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "approved_by_email": a.approved_by_email,
                     "approved_at": a.approved_at,
                     "approval_notes": a.approval_notes,
+                    "allow_manual_recording": is_manual_bank,
+                    "is_manual_quote": False,
                     "cost_min": a.cost_min or 0.0,
                     "cost_percent": a.cost_percent or 0.0,
                     "cost_max": a.cost_max or 0.0,
@@ -2454,9 +2467,11 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
         for a in assignments:
             q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
             bank_id = q_bank.bank_id if q_bank else 0
+            is_manual_bank = bool(q_bank and q_bank.bank and getattr(q_bank.bank, 'allow_manual_recording', False))
             
             bank_offers = [o for o in parsed_offers if o['bank_id'] == bank_id]
             best_offer = bank_best.get(bank_id)
+            sub_by = best_offer.get('submitted_by_email') if best_offer else (bank_offers[0].get('submitted_by_email') if bank_offers else None)
             
             results.append({
                 "bank_id": bank_id,
@@ -2465,7 +2480,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 "bank_emails": q_bank.emails if q_bank else "",
                 "offers": bank_offers,
                 "best_score": best_offer['score'] if best_offer else None,
-                "submitted_by_email": best_offer.get('submitted_by_email') if best_offer else (bank_offers[0].get('submitted_by_email') if bank_offers else None),
+                "submitted_by_email": sub_by,
                 "notes": best_offer.get('notes') if best_offer else (bank_offers[0].get('notes') if bank_offers else None),
                 "token": a.token,
                 "quotation_base": a.quotation_base or rfq.quotation_base,
@@ -2476,6 +2491,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 "approved_by_email": a.approved_by_email,
                 "approved_at": a.approved_at,
                 "approval_notes": a.approval_notes,
+                "allow_manual_recording": is_manual_bank,
+                "is_manual_quote": bool(sub_by and str(sub_by).upper().startswith("MANUAL_")),
                 "cost_min": a.cost_min or 0.0,
                 "cost_percent": a.cost_percent or 0.0,
                 "cost_max": a.cost_max or 0.0,
@@ -2530,6 +2547,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             for a in assignments:
                 cfg = a.get_config_for_leg(leg.id)
                 q_bank = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+                is_manual_bank = bool(q_bank and q_bank.bank and getattr(q_bank.bank, 'allow_manual_recording', False))
                 if getattr(cfg, 'is_invited', True) is False:
                     leg_results.append({
                         "bank_id": q_bank.bank_id if q_bank else 0,
@@ -2557,6 +2575,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "is_document_visible": False,
                         "contacts": q_bank.contacts if (q_bank and q_bank.contacts) else [],
                         "approval_status": a.approval_status,
+                        "allow_manual_recording": is_manual_bank,
+                        "is_manual_quote": False,
                         "cost_min": 0.0,
                         "cost_percent": 0.0,
                         "cost_max": 0.0,
@@ -2602,6 +2622,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "approved_by_email": a.approved_by_email,
                         "approved_at": a.approved_at,
                         "approval_notes": a.approval_notes,
+                        "allow_manual_recording": is_manual_bank,
+                        "is_manual_quote": False,
                         "cost_min": cfg.cost_min or 0.0,
                         "cost_percent": cfg.cost_percent or 0.0,
                         "cost_max": cfg.cost_max or 0.0,
@@ -2642,6 +2664,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         "approved_by_email": a.approved_by_email,
                         "approved_at": a.approved_at,
                         "approval_notes": a.approval_notes,
+                        "allow_manual_recording": is_manual_bank,
+                        "is_manual_quote": False,
                         "cost_min": cfg.cost_min or 0.0,
                         "cost_percent": cfg.cost_percent or 0.0,
                         "cost_max": cfg.cost_max or 0.0,
@@ -2680,6 +2704,7 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                         logger.warning(f"Error computing TVM adjustment: {tvm_err}")
 
                 offered_val_str = str(effective_val_date).split('T')[0] if effective_val_date is not None else None
+                is_manual_q = bool(offer_db.submitted_by_email and str(offer_db.submitted_by_email).upper().startswith("MANUAL_"))
 
                 leg_results.append({
                     "bank_id": q_bank.bank_id if q_bank else 0,
@@ -2710,6 +2735,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                     "approved_by_email": a.approved_by_email,
                     "approved_at": a.approved_at,
                     "approval_notes": a.approval_notes,
+                    "allow_manual_recording": is_manual_bank,
+                    "is_manual_quote": is_manual_q,
                     "cost_min": cfg.cost_min or 0.0,
                     "cost_percent": cfg.cost_percent or 0.0,
                     "cost_max": cfg.cost_max or 0.0,
@@ -2834,6 +2861,12 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
             if hasattr(leg, 'id') and leg_savings_summary and not leg_is_inconclusive and not is_leg_declined:
                 leg.winner_bank_name = leg_savings_summary.get("winner_bank_name")
                 leg.winner_bank_id = leg_winner_bank_id
+                winner_res_item = next((r for r in valid_leg_results if r['bank_id'] == leg_winner_bank_id), None)
+                if winner_res_item and winner_res_item.get("is_manual_quote"):
+                    if not getattr(leg, "execution_reference", None):
+                        leg.execution_reference = "MANUAL_PROXY"
+                elif getattr(leg, "execution_reference", None) == "MANUAL_PROXY":
+                    leg.execution_reference = None
                 tenant_key_service.apply_encrypted_leg_winner(
                     leg,
                     win_rate=leg_savings_summary.get("winner_rate"),
@@ -2917,7 +2950,8 @@ def compute_rfq_standings(rfq: QuotationRequest, db: Session, dispatch_emails: b
                 "deviation_percent": leg_deviation_pct,
                 "has_execution_banks": leg_has_execution,
                 "savings_summary": leg_savings_summary,
-                "market_benchmark": leg_market_bm
+                "market_benchmark": leg_market_bm,
+                "is_manual_deal": bool(getattr(leg, "is_manual_deal", False))
             })
 
     # --- Live Trading Floor Presence Telemetry ---
@@ -3825,7 +3859,8 @@ def retender_quotation(
         has_exec_retender = (pa.quotation_base or parent.quotation_base or "Execution").lower() in ("execution", "mixed")
         if getattr(pa, "is_cross_entity", False):
             has_exec_retender = False
-        assignment_approval_status = "PENDING" if (has_approvers and has_execution and has_exec_retender) else None
+        is_manual_bank = bool(bank_row and bank_row.bank and getattr(bank_row.bank, "allow_manual_recording", False))
+        assignment_approval_status = "PENDING" if (has_approvers and has_execution and has_exec_retender and not is_manual_bank) else None
 
         new_assignment = QuotationBankAssignment(
             id=str(uuid.uuid4()),
@@ -3924,6 +3959,8 @@ def retender_quotation(
         for item in assigned_records_to_email:
             bank_row = item["bank_row"]
             if not bank_row: continue
+            if bank_row.bank and getattr(bank_row.bank, "allow_manual_recording", False):
+                continue
             contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
             if not contacts and bank_row.emails:
                 contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
@@ -4315,7 +4352,8 @@ def resubmit_quotation(
                 contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                 has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                 has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec_leg and not is_cross_bank) else None
+                is_manual_bank = bool(q_bank and q_bank.bank and getattr(q_bank.bank, 'allow_manual_recording', False))
+                bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec_leg and not is_cross_bank and not is_manual_bank) else None
 
                 bank_value_date = root_bank_info.get('valueDate') or rfq.value_date
                 if w_date and (rfq.type == 'FX_SPOT' or not rfq.type) and bank_value_date:
@@ -4664,6 +4702,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
         banks_map = {}
         for leg in legs_data:
             for r in leg.get("results", []):
+                if r.get("allow_manual_recording") or r.get("is_manual_quote"):
+                    continue
                 q_base = (r.get('quotation_base') or leg.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
                 if q_base == 'indicative':
                     continue
@@ -4836,6 +4876,8 @@ async def _execute_dispatch_rfq_result_emails(rfq_id: str, db: Session, force: b
     else:
         # Single-Ticket execution
         for bank_res in results:
+            if bank_res.get("allow_manual_recording") or bank_res.get("is_manual_quote"):
+                continue
             q_base = (bank_res.get('quotation_base') or rfq.quotation_base or 'Execution').lower()
             if q_base == 'indicative':
                 continue
@@ -5091,6 +5133,11 @@ def resend_rfq_bank_invite(
     q_bank = db.query(QuotationBank).filter(QuotationBank.id == quotation_bank_id).first()
     if not q_bank:
         raise HTTPException(status_code=404, detail="Quotation bank not found")
+    if q_bank.bank and getattr(q_bank.bank, "allow_manual_recording", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Manual / Offline recording is enabled for this bank. Outbound emails to this counterparty are suppressed."
+        )
 
     contacts = q_bank.contacts
     if isinstance(contacts, str):
@@ -5417,5 +5464,453 @@ def get_active_acceptance_alert_enduser(
         user_role=user_role,
         db=db
     )
+
+
+@router.post("/{rfq_id}/manual-quote")
+def submit_manual_proxy_quote(
+    rfq_id: str,
+    payload: ManualProxyQuoteRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Records an offline / manual proxy quote on behalf of a bank counterparty inside an active RFQ.
+    Strictly permitted only for banks where System Owner has enabled allow_manual_recording=True.
+    Zero outbound emails or push notifications are dispatched to the bank.
+    """
+    from app.models.models import Bank
+    from app.services.tenant_key_service import tenant_key_service
+
+    rfq = db.query(QuotationRequest).filter(
+        QuotationRequest.id == rfq_id,
+        QuotationRequest.customer_id == current_user.customer_id
+    ).first()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Quotation request not found.")
+
+    if rfq.status in ("CANCELLED", "REJECTED"):
+        raise HTTPException(status_code=400, detail=f"Cannot enter an offline quote for a quotation in {rfq.status} status.")
+
+    if rfq.acceptance_status in ("ACCEPTED", "AUTO_ACCEPTED", "REJECTED", "AUTO_REJECTED"):
+        raise HTTPException(status_code=400, detail="Deal decision has already been finalized for this quotation.")
+
+    # Locate the bank assignment for this RFQ
+    assignments = db.query(QuotationBankAssignment).filter(QuotationBankAssignment.rfq_id == rfq.id).all()
+    target_assignment = None
+    target_q_bank = None
+    for a in assignments:
+        qb = db.query(QuotationBank).filter(QuotationBank.id == a.quotation_bank_id).first()
+        if qb and (qb.bank_id == payload.bank_id or qb.id == payload.bank_id):
+            target_assignment = a
+            target_q_bank = qb
+            break
+
+    if not target_assignment or not target_q_bank:
+        raise HTTPException(status_code=404, detail="Bank counterparty assignment not found on this quotation.")
+
+    bank_obj = target_q_bank.bank or db.query(Bank).filter(Bank.id == target_q_bank.bank_id).first()
+    if not bank_obj or not getattr(bank_obj, "allow_manual_recording", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Manual / Offline quote entry is only permitted for banks enabled for Manual Recording by the System Owner."
+        )
+
+    if target_assignment.approval_status == "PENDING":
+        target_assignment.approval_status = None
+
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, rfq.customer_id)
+    submitted_by_marker = f"MANUAL_PROXY:{current_user.email or current_user.user_id}"
+
+    if rfq.type == "TBILL":
+        db.query(QuotationTBillOffer).filter(QuotationTBillOffer.assignment_id == target_assignment.id).delete()
+        for q_item in (payload.quotes or []):
+            rate_val = q_item.discount_rate if q_item.discount_rate is not None else (q_item.rate if q_item.rate is not None else q_item.price)
+            if rate_val is None or float(rate_val) <= 0:
+                continue
+            s_date = q_item.settlement_date or rfq.settlement_date_start
+            m_date = q_item.maturity_date or rfq.maturity_date_start
+            max_amt = q_item.max_amount if q_item.max_amount is not None else rfq.amount
+            tb_offer = QuotationTBillOffer(
+                assignment_id=target_assignment.id,
+                settlement_date=str(s_date).split("T")[0] if s_date else None,
+                maturity_date=str(m_date).split("T")[0] if m_date else None,
+                discount_rate=None,
+                max_amount=None,
+                notes=q_item.notes or payload.notes,
+                submitted_by_email=submitted_by_marker
+            )
+            tenant_key_service.apply_encrypted_tbill_offer(tb_offer, float(rate_val), float(max_amt or 0.0), tenant_dek)
+            db.add(tb_offer)
+    else:
+        rfq_legs = rfq.legs if (rfq.legs and len(rfq.legs) > 0) else []
+        default_leg_id = rfq_legs[0].id if len(rfq_legs) == 1 else None
+        for q_item in (payload.quotes or []):
+            rate_val = q_item.price if q_item.price is not None else (q_item.rate if q_item.rate is not None else q_item.discount_rate)
+            if rate_val is None or float(rate_val) <= 0:
+                continue
+            raw_leg_id = str(q_item.leg_id) if (q_item.leg_id is not None and str(q_item.leg_id) not in ("", "None", "null", "NaN")) else None
+            target_leg_id = raw_leg_id or default_leg_id
+            if len(rfq_legs) <= 1:
+                db.query(QuotationOffer).filter(
+                    QuotationOffer.assignment_id == target_assignment.id,
+                    or_(QuotationOffer.leg_id == target_leg_id, QuotationOffer.leg_id.is_(None))
+                ).delete(synchronize_session=False)
+            else:
+                db.query(QuotationOffer).filter(
+                    QuotationOffer.assignment_id == target_assignment.id,
+                    QuotationOffer.leg_id == target_leg_id
+                ).delete(synchronize_session=False)
+
+            leg_cfg = db.query(QuotationBankLegConfig).filter(
+                QuotationBankLegConfig.assignment_id == target_assignment.id,
+                QuotationBankLegConfig.leg_id == target_leg_id
+            ).first() if target_leg_id else None
+            if leg_cfg:
+                leg_cfg.is_passed = False
+
+            val_date = q_item.offered_value_date or (leg_cfg.value_date if leg_cfg and leg_cfg.value_date else rfq.value_date)
+            fx_offer = QuotationOffer(
+                assignment_id=target_assignment.id,
+                leg_id=target_leg_id,
+                price=None,
+                offered_value_date=str(val_date).split("T")[0] if val_date else None,
+                notes=q_item.notes or payload.notes,
+                submitted_by_email=submitted_by_marker
+            )
+            tenant_key_service.apply_encrypted_offer_price(fx_offer, float(rate_val), tenant_dek)
+            db.add(fx_offer)
+
+    # If the bidding window had already elapsed with zero quotes (causing status='COMPLETED' with no acceptance decision),
+    # reopen evaluation so compute_rfq_standings can award the newly entered offline quote and start the acceptance window.
+    if rfq.status == "COMPLETED" and rfq.acceptance_status not in ("ACCEPTED", "AUTO_ACCEPTED", "REJECTED", "AUTO_REJECTED"):
+        rfq.status = "EVALUATING"
+        for l_obj in (rfq.legs or []):
+            if l_obj.status in ("COMPLETED", "INCONCLUSIVE"):
+                l_obj.status = "EVALUATING"
+
+    db.commit()
+
+    log_action(
+        db=db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_MANUAL_PROXY_QUOTE_ENTERED",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": str(rfq.id),
+            "ref_no": rfq.ref_no,
+            "bank_id": bank_obj.id,
+            "bank_name": bank_obj.name,
+            "quotes_count": len(payload.quotes or []),
+            "entered_by": current_user.email or f"User #{current_user.user_id}"
+        },
+        customer_id=rfq.customer_id
+    )
+    db.commit()
+
+    standings = compute_rfq_standings(rfq, db, dispatch_emails=False)
+    return {
+        "status": "success",
+        "message": f"Offline quote recorded for {bank_obj.name}.",
+        "rfq_id": rfq.id,
+        "winner_bank_id": standings.get("winner_bank_id")
+    }
+
+
+@router.post("/manual-deal")
+def record_manual_deal(
+    payload: ManualDealRecordCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_active_user)
+):
+    """
+    Directly records a completed offline / manual deal with a bank where System Owner
+    has enabled allow_manual_recording=True.
+    - Creates a completed & accepted QuotationRequest, QuotationLeg(s), Assignment, and Offer(s).
+    - Computes and freezes the customer's CBE / Interbank Market Benchmark Snapshot.
+    - Strictly air-gapped: zero outbound emails or push notifications are ever sent to the bank.
+    """
+    from app.models.models import Bank, CustomerEntity, User
+    from app.services.tenant_key_service import tenant_key_service
+    from app.services.live_market_service import live_market_service
+
+    bank_obj = db.query(Bank).filter(Bank.id == payload.bank_id).first()
+    if not bank_obj:
+        raise HTTPException(status_code=404, detail="Bank not found.")
+    if not getattr(bank_obj, "allow_manual_recording", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Manual deal recording is only permitted for banks where Manual Recording is enabled by the System Owner."
+        )
+
+    if not payload.legs or len(payload.legs) == 0:
+        raise HTTPException(status_code=400, detail="At least one deal leg with an executed rate is required.")
+    if len(payload.legs) > 4:
+        raise HTTPException(status_code=400, detail="A maximum of 4 currency pairs can be recorded in a single deal package.")
+
+    for idx, l_in in enumerate(payload.legs, start=1):
+        if l_in.executed_rate is None or float(l_in.executed_rate) <= 0:
+            raise HTTPException(status_code=400, detail=f"Leg #{idx}: Executed rate must be greater than zero.")
+        if l_in.amount is None or float(l_in.amount) <= 0:
+            raise HTTPException(status_code=400, detail=f"Leg #{idx}: Deal amount must be greater than zero.")
+
+    # Resolve entity_id if customer has entities
+    active_entities = db.query(CustomerEntity).filter(
+        CustomerEntity.customer_id == current_user.customer_id,
+        CustomerEntity.is_active == True,
+        CustomerEntity.is_deleted == False
+    ).all()
+    resolved_entity_id = payload.entity_id
+    if active_entities:
+        if not resolved_entity_id and len(active_entities) == 1:
+            resolved_entity_id = active_entities[0].id
+        elif not resolved_entity_id:
+            raise HTTPException(status_code=400, detail="Please select the requesting Legal Entity.")
+
+    trade_type = (payload.type or "FX_SPOT").upper()
+
+    # Ensure a QuotationBank roster entry exists for this customer + bank (auto-provision if needed)
+    q_bank = db.query(QuotationBank).filter(
+        QuotationBank.customer_id == current_user.customer_id,
+        QuotationBank.bank_id == bank_obj.id,
+        QuotationBank.trade_type.in_([trade_type, "BOTH"])
+    ).first()
+    if not q_bank:
+        q_bank = db.query(QuotationBank).filter(
+            QuotationBank.customer_id == current_user.customer_id,
+            QuotationBank.bank_id == bank_obj.id
+        ).first()
+    if not q_bank:
+        q_bank = QuotationBank(
+            customer_id=current_user.customer_id,
+            bank_id=bank_obj.id,
+            emails="",
+            contacts=[],
+            trade_type="BOTH",
+            entity_scope="ALL_ENTITIES"
+        )
+        db.add(q_bank)
+        db.flush()
+
+    now = datetime.now(timezone.utc)
+    rfq_id = str(uuid.uuid4())
+    date_str = now.strftime("%Y%m%d")
+    prefix = "TB" if trade_type == "TBILL" else "RFQ"
+    ref_no = f"{prefix}-{date_str}-{uuid.uuid4().hex[:4].upper()}"
+    while db.query(QuotationRequest.id).filter(QuotationRequest.ref_no == ref_no).first():
+        ref_no = f"{prefix}-{date_str}-{uuid.uuid4().hex[:4].upper()}"
+
+    first_leg = payload.legs[0]
+    first_val_date = str(first_leg.value_date or now.strftime("%Y-%m-%d")).split("T")[0]
+    first_settle = str(first_leg.settlement_date or first_val_date).split("T")[0]
+    first_maturity = str(first_leg.maturity_date or first_val_date).split("T")[0]
+
+    effective_eval_rate = payload.eval_rate
+    if effective_eval_rate is None or effective_eval_rate <= 0:
+        try:
+            from app.core.background_tasks import get_effective_quotation_eval_rate
+            effective_eval_rate = get_effective_quotation_eval_rate(db, current_user.customer_id)
+        except Exception:
+            effective_eval_rate = 20.25
+
+    tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
+    submitted_by_marker = f"MANUAL_DEAL:{current_user.email or current_user.user_id}"
+    exec_ref_marker = f"MANUAL:{payload.deal_reference.strip()}" if (payload.deal_reference and payload.deal_reference.strip()) else "MANUAL_RECORDED"
+
+    db_rfq = QuotationRequest(
+        id=rfq_id,
+        ref_no=ref_no,
+        customer_id=current_user.customer_id,
+        entity_id=resolved_entity_id,
+        created_by_user_id=current_user.user_id,
+        type=trade_type,
+        direction=first_leg.direction or "Buy",
+        value_date=first_val_date,
+        amount=float(first_leg.amount),
+        buy_currency=(first_leg.buy_currency or "USD").upper(),
+        sell_currency=(first_leg.sell_currency or "EGP").upper(),
+        settlement_date_start=first_settle if trade_type == "TBILL" else None,
+        settlement_date_end=first_settle if trade_type == "TBILL" else None,
+        maturity_date_start=first_maturity if trade_type == "TBILL" else None,
+        maturity_date_end=first_maturity if trade_type == "TBILL" else None,
+        eval_rate=effective_eval_rate,
+        window_start=now,
+        window_end=now,
+        quotation_base="Execution",
+        document_path=payload.document_path,
+        status="COMPLETED",
+        acceptance_status="ACCEPTED",
+        acceptance_resolved_at=now,
+        acceptance_resolved_by_user_id=current_user.user_id,
+        winner_bank_name=bank_obj.name,
+        internal_notes=payload.internal_notes,
+        comments_to_banks=payload.deal_reference
+    )
+    tenant_key_service.apply_encrypted_rfq_winner(
+        db_rfq,
+        win_rate=float(first_leg.executed_rate),
+        saved_vs_avg=0.0,
+        dek=tenant_dek
+    )
+    db.add(db_rfq)
+    db.flush()
+
+    assignment_id = str(uuid.uuid4())
+    db_assignment = QuotationBankAssignment(
+        id=assignment_id,
+        rfq_id=rfq_id,
+        quotation_bank_id=q_bank.id,
+        token=str(uuid.uuid4()),
+        cost_min=float(first_leg.cost_min or 0.0),
+        cost_percent=float(first_leg.cost_percent or 0.0),
+        cost_max=float(first_leg.cost_max or 0.0),
+        cost_flat=float(first_leg.cost_flat or 0.0),
+        quotation_base="Execution",
+        is_document_visible=True,
+        value_date=first_val_date,
+        allow_alternative_value_date=False,
+        approval_status=None
+    )
+    db.add(db_assignment)
+    db.flush()
+
+    created_legs = []
+    for idx, l_in in enumerate(payload.legs, start=1):
+        leg_id = f"{rfq_id}-leg-{idx}"
+        l_val_date = str(l_in.value_date or first_val_date).split("T")[0]
+        l_buy = (l_in.buy_currency or "USD").upper()
+        l_sell = (l_in.sell_currency or "EGP").upper()
+        l_dir = l_in.direction or "Buy"
+        l_amt = float(l_in.amount)
+        l_rate = float(l_in.executed_rate)
+
+        leg_obj = QuotationLeg(
+            id=leg_id,
+            rfq_id=rfq_id,
+            leg_index=idx,
+            type=trade_type,
+            direction=l_dir,
+            buy_currency=l_buy,
+            sell_currency=l_sell,
+            amount=l_amt,
+            value_date=l_val_date,
+            allow_alternative_value_date=False,
+            quotation_base="Execution",
+            status="ACCEPTED",
+            entity_id=resolved_entity_id,
+            winner_bank_id=bank_obj.id,
+            winner_bank_name=bank_obj.name,
+            execution_reference=exec_ref_marker
+        )
+        tenant_key_service.apply_encrypted_leg_winner(
+            leg_obj,
+            win_rate=l_rate,
+            saved_vs_avg=0.0,
+            dek=tenant_dek
+        )
+
+        # Compute and freeze CBE / Interbank Market Benchmark Snapshot for this leg
+        if trade_type == "FX_SPOT":
+            try:
+                leg_bm = live_market_service.get_empirical_reference(
+                    db=db,
+                    customer_id=current_user.customer_id,
+                    from_code=l_buy,
+                    to_code=l_sell,
+                    direction=l_dir,
+                    amount=l_amt
+                )
+                if leg_bm:
+                    leg_bm["quote_evaluation"] = live_market_service.evaluate_quote_spread(
+                        quote_rate=l_rate,
+                        benchmark=leg_bm,
+                        direction=l_dir
+                    )
+                    leg_bm["frozen_at"] = now.isoformat()
+                    leg_bm["frozen_by_user_id"] = current_user.user_id
+                    leg_bm["is_frozen_snapshot"] = True
+                    leg_obj.market_benchmark_snapshot = leg_bm
+                    if idx == 1:
+                        db_rfq.market_benchmark_snapshot = leg_bm
+            except Exception as bm_err:
+                logger.warning(f"Non-blocking error computing market benchmark snapshot for manual deal {ref_no}: {bm_err}")
+
+        db.add(leg_obj)
+        created_legs.append(leg_obj)
+
+        leg_cfg = QuotationBankLegConfig(
+            id=str(uuid.uuid4()),
+            assignment_id=assignment_id,
+            leg_id=leg_id,
+            is_invited=True,
+            is_passed=False,
+            cost_min=float(l_in.cost_min or 0.0),
+            cost_percent=float(l_in.cost_percent or 0.0),
+            cost_max=float(l_in.cost_max or 0.0),
+            cost_flat=float(l_in.cost_flat or 0.0),
+            quotation_base="Execution",
+            is_document_visible=True,
+            value_date=_parse_date_only(l_val_date) if "_parse_date_only" in globals() else None,
+            allow_alternative_value_date=False
+        )
+        db.add(leg_cfg)
+
+        if trade_type == "TBILL":
+            s_d = str(l_in.settlement_date or first_settle).split("T")[0]
+            m_d = str(l_in.maturity_date or first_maturity).split("T")[0]
+            tb_offer = QuotationTBillOffer(
+                assignment_id=assignment_id,
+                settlement_date=s_d,
+                maturity_date=m_d,
+                discount_rate=None,
+                max_amount=None,
+                notes=l_in.notes or payload.deal_reference or payload.internal_notes,
+                submitted_by_email=submitted_by_marker
+            )
+            tenant_key_service.apply_encrypted_tbill_offer(tb_offer, l_rate, l_amt, tenant_dek)
+            db.add(tb_offer)
+        else:
+            fx_offer = QuotationOffer(
+                assignment_id=assignment_id,
+                leg_id=leg_id,
+                price=None,
+                offered_value_date=l_val_date,
+                notes=l_in.notes or payload.deal_reference or payload.internal_notes,
+                submitted_by_email=submitted_by_marker
+            )
+            tenant_key_service.apply_encrypted_offer_price(fx_offer, l_rate, tenant_dek)
+            db.add(fx_offer)
+
+    db.commit()
+
+    log_action(
+        db=db,
+        user_id=current_user.user_id,
+        action_type="QUOTATION_MANUAL_DEAL_RECORDED",
+        entity_type="QuotationRequest",
+        entity_id=None,
+        details={
+            "rfq_id": rfq_id,
+            "ref_no": ref_no,
+            "type": trade_type,
+            "bank_id": bank_obj.id,
+            "bank_name": bank_obj.name,
+            "legs_count": len(payload.legs),
+            "deal_reference": payload.deal_reference,
+            "is_manual_deal": True
+        },
+        customer_id=current_user.customer_id
+    )
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Manual deal {ref_no} recorded with {bank_obj.name}.",
+        "rfq_id": rfq_id,
+        "ref_no": ref_no,
+        "winner_bank_id": bank_obj.id,
+        "winner_bank_name": bank_obj.name
+    }
+
 
 

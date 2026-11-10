@@ -218,6 +218,7 @@ class CRUDQuotation:
                 db.commit()
                 db.refresh(existing)
                 existing.entity_ids = [a.entity_id for a in existing.entity_associations] if entity_scope == "SPECIFIC_ENTITIES" else []
+                existing.allow_manual_recording = bool(existing.bank and getattr(existing.bank, 'allow_manual_recording', False))
                 return existing
 
         db_obj = QuotationBank(
@@ -242,6 +243,7 @@ class CRUDQuotation:
         db.commit()
         db.refresh(db_obj)
         db_obj.entity_ids = [a.entity_id for a in db_obj.entity_associations] if entity_scope == "SPECIFIC_ENTITIES" else []
+        db_obj.allow_manual_recording = bool(db_obj.bank and getattr(db_obj.bank, 'allow_manual_recording', False))
         return db_obj
 
     def delete_quotation_bank(self, db: Session, customer_id: int, bank_id: int):
@@ -344,9 +346,15 @@ class CRUDQuotation:
 
             b.contacts = enriched_contacts
             total_contacts = len(enriched_contacts)
-            # All contacts pending if there are contacts and all are pending, or if there are no contacts at all
-            b.all_contacts_pending = (total_contacts == 0) or (pending_count == total_contacts)
-            b.has_active_contacts = (accepted_count > 0)
+            is_manual_bank = bool(b.bank and getattr(b.bank, 'allow_manual_recording', False))
+            b.allow_manual_recording = is_manual_bank
+            if is_manual_bank:
+                b.all_contacts_pending = False
+                b.has_active_contacts = True
+            else:
+                # All contacts pending if there are contacts and all are pending, or if there are no contacts at all
+                b.all_contacts_pending = (total_contacts == 0) or (pending_count == total_contacts)
+                b.has_active_contacts = (accepted_count > 0)
             return b
 
         query = db.query(QuotationBank).filter(QuotationBank.customer_id == customer_id)
@@ -703,7 +711,9 @@ class CRUDQuotation:
                 if not q_bank:
                     continue
 
-                # Ensure bank has at least one active (accepted) contact to quote
+                is_manual_bank = bool(q_bank.bank and getattr(q_bank.bank, 'allow_manual_recording', False))
+
+                # Ensure bank has at least one active (accepted) contact to quote (unless manual recording is enabled for this bank)
                 from app.models.models_quotation import QuotationBankContactInvitation
                 from app.core.security_crypto import compute_email_blind_index
                 pending_invs = db.query(QuotationBankContactInvitation).filter(
@@ -728,7 +738,7 @@ class CRUDQuotation:
                     c_blind = compute_email_blind_index(c_email)
                     if c_email not in pending_emails and c_blind not in pending_blind_indices:
                         active_contacts.append(c)
-                if bank_contacts and len(active_contacts) == 0:
+                if not is_manual_bank and bank_contacts and len(active_contacts) == 0:
                     db.rollback()
                     b_name = b_data.get('name') or (q_bank.bank.name if (q_bank and getattr(q_bank, 'bank', None)) else f"Bank #{raw_bank_id}")
                     raise HTTPException(
@@ -807,7 +817,7 @@ class CRUDQuotation:
                     contacts = q_bank.contacts if isinstance(q_bank.contacts, list) else []
                     has_approver = any(c.get('role') == 'APPROVER' for c in contacts)
                     has_execution = any(c.get('role') == 'EXECUTION' for c in contacts)
-                    bank_approval_status = 'PENDING' if (has_approver and has_execution and has_any_exec and not is_cross_bank) else None
+                    bank_approval_status = 'PENDING' if (not is_manual_bank and has_approver and has_execution and has_any_exec and not is_cross_bank) else None
 
                     b_val_d = _parse_date_only(primary_b_data.get('valueDate') or primary_leg_obj.value_date)
                     b_allow_alt = any(

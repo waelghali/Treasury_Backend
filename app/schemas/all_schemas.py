@@ -407,6 +407,7 @@ class BankBase(BaseModel):
     allow_dealer_comments: Optional[bool] = Field(True, description="Whether dealers quoting for this bank can enter free-text notes/comments")
     allow_dealer_feedback: Optional[bool] = Field(True, description="Whether dealers quoting for this bank are allowed to submit terminal feedback / see feedback button")
     allow_dealer_mobile_alerts: Optional[bool] = Field(True, description="Whether dealers quoting for this bank are allowed to receive mobile push alerts or see pairing banners")
+    allow_manual_recording: Optional[bool] = Field(False, description="Whether corporate users can manually record offline quotes/deals for this bank without platform emails/handshakes")
 
 class BankCreate(BankBase):
     pass
@@ -424,6 +425,7 @@ class BankUpdate(BankBase):
     allow_dealer_comments: Optional[bool] = None
     allow_dealer_feedback: Optional[bool] = None
     allow_dealer_mobile_alerts: Optional[bool] = None
+    allow_manual_recording: Optional[bool] = None
 
 class BankOut(BankBase, BaseSchema):
     dealer_count: Optional[int] = Field(0, description="Total active enrolled dealers under this bank")
@@ -1073,6 +1075,7 @@ class LGRecordMinimalOut(BaseSchema):
     lg_currency_id: int
     beneficiary_corporate_id: int
     lg_sequence_number: int # New: Expose lg_sequence_number
+    custody_serial: Optional[str] = None
     issuing_bank_id: int
     lg_type_id: int
     lg_status_id: int
@@ -1105,7 +1108,8 @@ class LGRecordOut(LGRecordBase, BaseSchema):
     customer_id: int
     lg_period_months: int
     lg_amount: Optional[str] = None
-    lg_sequence_number: int # New: Expose lg_sequence_number in LGRecordOut
+    lg_sequence_number: int # New: Expose lg_sequence_number
+    custody_serial: Optional[str] = None
     beneficiary_corporate: 'CustomerEntityOut'
     lg_category: Optional['LGCategoryOut'] = []
     lg_currency: 'CurrencyOut'

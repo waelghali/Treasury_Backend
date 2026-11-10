@@ -293,6 +293,7 @@ class Bank(BaseModel):
     allow_dealer_comments = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can enter free-text notes/comments")
     allow_dealer_feedback = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can submit terminal feedback or see feedback button")
     allow_dealer_mobile_alerts = Column(Boolean, default=True, nullable=False, server_default='true', comment="Whether dealers quoting for this bank can receive mobile push alerts or see pairing banners")
+    allow_manual_recording = Column(Boolean, default=False, nullable=False, server_default='false', comment="Whether corporate users can manually record offline quotes/deals for this bank without platform emails/handshakes")
 
     def __repr__(self: Bank):
         return f"<Bank(id={self.id}, name='{self.name}')>"
@@ -542,6 +543,33 @@ class LGRecord(BaseModel):
         Index('ix_lg_records_migrated_from_staging_id', 'migrated_from_staging_id'),
 
     )
+    @property
+    def custody_serial(self) -> str:
+        """
+        Immutable human-friendly serial in format '01-0001' (2-digit entity sequence + 4-digit LG sequence).
+        """
+        seq = self.lg_sequence_number or 1
+        entity_rank = 1
+        try:
+            from sqlalchemy.orm import object_session
+            session = object_session(self)
+            if session is not None and self.customer_id:
+                cache_key = f"customer_entity_ranks_{self.customer_id}"
+                ranks = session.info.get(cache_key)
+                if ranks is None:
+                    entity_ids = [
+                        r[0] for r in session.query(CustomerEntity.id)
+                        .filter(CustomerEntity.customer_id == self.customer_id)
+                        .order_by(CustomerEntity.id.asc())
+                        .all()
+                    ]
+                    ranks = {eid: idx + 1 for idx, eid in enumerate(entity_ids)}
+                    session.info[cache_key] = ranks
+                entity_rank = ranks.get(self.beneficiary_corporate_id, 1)
+        except Exception:
+            entity_rank = 1
+        return f"{entity_rank:02d}-{seq:04d}"
+
     def __repr__(self: LGRecord):
         return f"<LGRecord(id={self.id}, lg_number='{self.lg_number}', customer_id={self.customer_id})>"
 
@@ -1007,3 +1035,22 @@ class SystemHoliday(BaseModel):
 
     def __repr__(self):
         return f"<SystemHoliday(id={self.id}, date={self.holiday_date}, name='{self.name}')>"
+
+
+class SystemOwnerEmailSender(BaseModel):
+    """
+    Stores the Cloudflare-routed (and noreply) sender identities allowed for System Owner
+    outbound email composition on the platform's verified domain.
+    """
+    __tablename__ = "system_owner_email_senders"
+
+    email = Column(String(255), nullable=False, unique=True, index=True, comment="Sender email address on verified domain")
+    display_name = Column(String(255), nullable=False, comment="Default display name for From header")
+    description = Column(String(500), nullable=True, comment="Description or Cloudflare routing purpose")
+    can_receive_replies = Column(Boolean, default=True, nullable=False, comment="True if routed in Cloudflare to receive replies; False for noreply")
+    default_reply_to = Column(String(255), nullable=True, comment="Optional Reply-To override when this sender is selected")
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_default = Column(Boolean, default=False, nullable=False)
+
+    def __repr__(self):
+        return f"<SystemOwnerEmailSender(id={self.id}, email='{self.email}', display_name='{self.display_name}')>"

@@ -189,6 +189,8 @@ async def execute_rfq_15m_reminder(rfq_id: str, db: Optional[Session] = None) ->
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if not bank_row:
                 continue
+            if bank_row.bank and getattr(bank_row.bank, 'allow_manual_recording', False):
+                continue
 
             contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
             if not contacts and bank_row.emails:

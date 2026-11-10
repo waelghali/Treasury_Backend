@@ -252,7 +252,8 @@ async def send_email(
     attachments: Optional[List[EmailAttachment]] = None,
     reply_to: Optional[str] = None,
     save_copy: bool = True,
-    allow_platform_fallback: bool = True
+    allow_platform_fallback: bool = True,
+    bcc_emails: Optional[List[str]] = None
 ) -> EmailSendResult:
     """
     Sends an email using provided settings.
@@ -271,8 +272,9 @@ async def send_email(
 
     to_emails = process_recipients(to_emails)
     cc_emails = process_recipients(cc_emails or [])
+    bcc_emails = process_recipients(bcc_emails or [])
 
-    if not to_emails and not cc_emails:
+    if not to_emails and not cc_emails and not bcc_emails:
         logger.info("Email delivery suppressed: All recipients belong to dummy/test domains.")
         return EmailSendResult(True, None)
 
@@ -350,7 +352,7 @@ async def send_email(
             msg.attach(part)
 
     # 3. Consolidate Recipients
-    all_recipients = list(set(to_emails + (cc_emails or [])))
+    all_recipients = list(set(to_emails + (cc_emails or []) + (bcc_emails or [])))
     if not all_recipients:
         logger.info("Email delivery suppressed: No valid recipients found after filtering.")
         return EmailSendResult(True, None)
@@ -467,10 +469,15 @@ async def send_email(
             tried.add(key)
 
             def _send_via_fallback(fb=fb):
-                # Only rewrite identity headers when the fallback sends from a different address
-                # (e.g. customer SMTP failed -> platform relay). Same-address fallback
-                # (Resend -> Brevo, both on the Grow domain) keeps the original headers intact.
-                if (fb.sender_email or "").lower() != original_sender:
+                # Only rewrite identity headers when the fallback sends from a different domain
+                # (e.g. customer SMTP failed -> platform relay). Same-domain fallback
+                # (Resend -> Brevo, both on the verified Grow domain) keeps the original sender address intact.
+                orig_domain = original_sender.split("@")[-1] if "@" in original_sender else ""
+                fb_domain = (fb.sender_email or "").lower().split("@")[-1] if "@" in (fb.sender_email or "") else ""
+                same_verified_domain = bool(orig_domain and orig_domain == fb_domain)
+                effective_fb_from = email_settings.sender_email if same_verified_domain else fb.sender_email
+
+                if not same_verified_domain and (fb.sender_email or "").lower() != original_sender:
                     from_name = f"{email_settings.sender_display_name or 'Corporate Treasury'} ({email_settings.sender_email})"
                     encoded_name = Header(from_name, 'utf-8').encode()
                     if 'From' in msg:
@@ -489,7 +496,7 @@ async def send_email(
                     fb_server = smtplib.SMTP(fb.smtp_host, int(fb.smtp_port), timeout=8)
                     fb_server.starttls()
                 fb_server.login(fb.smtp_username, fb.smtp_password)
-                fb_server.send_message(msg, from_addr=fb.sender_email, to_addrs=all_recipients)
+                fb_server.send_message(msg, from_addr=effective_fb_from, to_addrs=all_recipients)
                 fb_server.quit()
 
             try:

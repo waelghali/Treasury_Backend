@@ -367,6 +367,14 @@ class QuotationRequest(BaseModel):
         self._creator_name = value
 
     @property
+    def is_manual_deal(self) -> bool:
+        if self.ref_no and str(self.ref_no).upper().startswith("MNL-"):
+            return True
+        if self.legs and any(getattr(l, "is_manual_deal", False) for l in self.legs):
+            return True
+        return False
+
+    @property
     def release_docs_to_winner_only(self) -> bool:
         if not self.document_path:
             return False
@@ -677,6 +685,14 @@ class QuotationLeg(BaseModel):
     @property
     def tolerance_percent(self) -> float:
         return self.max_tolerance_percent
+
+    @property
+    def is_manual_deal(self) -> bool:
+        if self.execution_reference and str(self.execution_reference).upper().startswith("MANUAL"):
+            return True
+        if self.rfq and getattr(self.rfq, "ref_no", "") and str(self.rfq.ref_no).upper().startswith("MNL-"):
+            return True
+        return False
 
     def get_parsed_documents(self) -> list:
         if not self.document_path:

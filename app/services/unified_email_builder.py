@@ -77,7 +77,8 @@ def build_standard_email_html(
     recipient_name: Optional[str] = None,
     cta_text: Optional[str] = None,
     cta_url: Optional[str] = None,
-    platform_name: str = "Grow Treasury Platform"
+    platform_name: str = "Grow Treasury Platform",
+    footer_subtitle: str = "Automated System Notification"
 ) -> str:
     """
     Generates a standard corporate SaaS HTML email with dark navy branding.
@@ -175,7 +176,7 @@ def build_standard_email_html(
                     <tr>
                         <td bgcolor="#f8fafc" style="background-color: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;" class="mobile-padding">
                             <p style="margin: 0 0 4px 0; font-size: 12px; color: #64748b; font-weight: 500;">
-                                {platform_name} &bull; Automated System Notification
+                                {platform_name} &bull; {footer_subtitle}
                             </p>
                             <p style="margin: 0; font-size: 11px; color: #94a3b8;">
                                 Generated on {current_time_str} for {customer_name}. Confidential.

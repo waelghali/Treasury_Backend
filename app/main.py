@@ -329,6 +329,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_comments BOOLEAN NOT NULL DEFAULT TRUE;",
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_feedback BOOLEAN NOT NULL DEFAULT TRUE;",
                     "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_dealer_mobile_alerts BOOLEAN NOT NULL DEFAULT TRUE;",
+                    "ALTER TABLE banks ADD COLUMN IF NOT EXISTS allow_manual_recording BOOLEAN NOT NULL DEFAULT FALSE;",
                     "ALTER TABLE dealer_alert_reminders ADD COLUMN IF NOT EXISTS otp_code VARCHAR(255);",
                     "ALTER TABLE dealer_alert_reminders ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ;",
                     "ALTER TABLE dealer_alert_reminders ADD COLUMN IF NOT EXISTS otp_failed_attempts INTEGER NOT NULL DEFAULT 0;",

@@ -3466,6 +3466,47 @@ def toggle_bank_dealer_mobile_alerts(
         "allow_dealer_mobile_alerts": db_bank.allow_dealer_mobile_alerts
     }
 
+class BankManualRecordingToggleRequest(BaseModel):
+    allow_manual_recording: bool
+
+@router.put("/banks/{bank_id}/manual-recording")
+def toggle_bank_manual_recording(
+    bank_id: int,
+    payload: BankManualRecordingToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("bank:edit")),
+    request: Request = None
+):
+    """Toggle whether corporate users can record manual/offline quotes and deals for this bank (when bank has not approved platform usage)."""
+    db_bank = crud_bank.get(db, id=bank_id)
+    if db_bank is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bank not found or already deleted")
+    
+    db_bank.allow_manual_recording = payload.allow_manual_recording
+    db.commit()
+    db.refresh(db_bank)
+    
+    client_host = get_client_ip(request) if request else None
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="UPDATE",
+        entity_type="Bank",
+        entity_id=db_bank.id,
+        details={
+            "action": "toggle_manual_recording",
+            "name": db_bank.name,
+            "allow_manual_recording": db_bank.allow_manual_recording,
+            "ip_address": client_host
+        }
+    )
+    return {
+        "success": True,
+        "bank_id": db_bank.id,
+        "name": db_bank.name,
+        "allow_manual_recording": db_bank.allow_manual_recording
+    }
+
 @router.get("/banks/{bank_id}/dealers")
 def get_bank_dealers(
     bank_id: int,
@@ -5129,6 +5170,630 @@ def update_dealer_feedback_status(
     db.commit()
     db.refresh(fb)
     return fb.to_dict()
+
+
+# ==============================================================================
+# SYSTEM OWNER DIRECT EMAIL COMPOSER (CLOUDFLARE ROUTED SENDERS & BRANDED CARD)
+# ==============================================================================
+from fastapi import Form
+import json
+from html import escape as html_escape
+from app.models.models import SystemOwnerEmailSender
+from app.models.models_quotation import QuotationBank
+from app.core.email_service import EmailSettings
+from app.services.unified_email_builder import build_standard_email_html
+
+
+def _get_platform_verified_domain() -> str:
+    """Returns the verified email domain configured for the platform (defaults to growbusinessdevelopment.com)."""
+    global_cfg = get_global_email_settings()
+    if global_cfg and global_cfg.sender_email and "@" in global_cfg.sender_email:
+        dom = global_cfg.sender_email.split("@")[-1].strip().lower()
+        if dom and dom != "example.com":
+            return dom
+    return "growbusinessdevelopment.com"
+
+
+def _ensure_email_senders_seeded(db: Session) -> str:
+    """Ensures the system_owner_email_senders table exists and is seeded with Cloudflare-routed addresses."""
+    verified_domain = _get_platform_verified_domain()
+    try:
+        SystemOwnerEmailSender.__table__.create(bind=db.get_bind(), checkfirst=True)
+    except Exception as e:
+        logger.warning(f"Table creation check for system_owner_email_senders warning: {e}")
+
+    existing_count = db.query(SystemOwnerEmailSender).filter(SystemOwnerEmailSender.is_deleted == False).count()
+    if existing_count == 0:
+        default_senders = [
+            SystemOwnerEmailSender(
+                email=f"wael.ghali@{verified_domain}",
+                display_name="Wael Ghali - Grow Business Development",
+                description="Executive & Founder direct communication (Cloudflare Routed)",
+                can_receive_replies=True,
+                default_reply_to=f"wael.ghali@{verified_domain}",
+                is_active=True,
+                is_default=True,
+            ),
+            SystemOwnerEmailSender(
+                email=f"info@{verified_domain}",
+                display_name="Grow Business Development",
+                description="General inquiries, partnerships & client communication (Cloudflare Routed)",
+                can_receive_replies=True,
+                default_reply_to=f"info@{verified_domain}",
+                is_active=True,
+                is_default=False,
+            ),
+            SystemOwnerEmailSender(
+                email=f"support@{verified_domain}",
+                display_name="Grow Treasury Support",
+                description="Technical & operational customer support (Cloudflare Routed)",
+                can_receive_replies=True,
+                default_reply_to=f"support@{verified_domain}",
+                is_active=True,
+                is_default=False,
+            ),
+            SystemOwnerEmailSender(
+                email=f"LG_Custody@{verified_domain}",
+                display_name="Grow BD Treasury Platform",
+                description="LG Custody & Treasury operations desk (Cloudflare Routed)",
+                can_receive_replies=True,
+                default_reply_to=f"LG_Custody@{verified_domain}",
+                is_active=True,
+                is_default=False,
+            ),
+            SystemOwnerEmailSender(
+                email=f"noreply@{verified_domain}",
+                display_name="Grow BD System Notifications",
+                description="Outbound-only announcements & system notices (Does not receive replies)",
+                can_receive_replies=False,
+                default_reply_to=f"info@{verified_domain}",
+                is_active=True,
+                is_default=False,
+            ),
+        ]
+        for s in default_senders:
+            db.add(s)
+        db.commit()
+    else:
+        # Ensure wael.ghali@growbusinessdevelopment.com is present even if table was previously seeded
+        wael_email = f"wael.ghali@{verified_domain}"
+        has_wael = (
+            db.query(SystemOwnerEmailSender)
+            .filter(func.lower(SystemOwnerEmailSender.email) == wael_email.lower())
+            .first()
+        )
+        if not has_wael:
+            db.add(
+                SystemOwnerEmailSender(
+                    email=wael_email,
+                    display_name="Wael Ghali - Grow Business Development",
+                    description="Executive & Founder direct communication (Cloudflare Routed)",
+                    can_receive_replies=True,
+                    default_reply_to=wael_email,
+                    is_active=True,
+                    is_default=False,
+                )
+            )
+            db.commit()
+
+    return verified_domain
+
+
+def _serialize_sender(s: SystemOwnerEmailSender) -> Dict[str, Any]:
+    return {
+        "id": s.id,
+        "email": s.email,
+        "display_name": s.display_name,
+        "description": s.description or "",
+        "can_receive_replies": bool(s.can_receive_replies),
+        "default_reply_to": s.default_reply_to or "",
+        "is_active": bool(s.is_active),
+        "is_default": bool(s.is_default),
+    }
+
+
+def _format_composed_body_to_html(raw_body: str) -> str:
+    """
+    Converts plain-text paragraphs, bullet lists, or inline HTML into clean corporate HTML
+    for insertion into the Branded Grow Card (`build_standard_email_html`).
+    """
+    if not raw_body:
+        return ""
+    trimmed = raw_body.strip()
+    lower = trimmed.lower()
+    if "<p" in lower or "<div" in lower or "<table" in lower or "<ul" in lower or "<ol" in lower:
+        return trimmed
+
+    blocks = re.split(r"\n\s*\n", trimmed)
+    rendered_blocks = []
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        # Check if all lines in this block are bullet items
+        if all(l.startswith(("- ", "* ", "• ")) for l in lines):
+            items_html = "".join(
+                f"<li style='margin-bottom: 6px; line-height: 1.6; color: #334155;'>{html_escape(l[2:].strip())}</li>"
+                for l in lines
+            )
+            rendered_blocks.append(f"<ul style='margin: 0 0 16px 0; padding-left: 20px; color: #334155;'>{items_html}</ul>")
+        else:
+            escaped_lines = "<br/>".join(html_escape(l) for l in block.split("\n"))
+            rendered_blocks.append(
+                f"<p style='margin: 0 0 16px 0; line-height: 1.65; color: #334155; font-size: 14px;'>{escaped_lines}</p>"
+            )
+    return "".join(rendered_blocks)
+
+
+class EmailSenderIn(BaseModel):
+    email: str
+    display_name: str
+    description: Optional[str] = ""
+    can_receive_replies: bool = True
+    default_reply_to: Optional[str] = None
+    is_active: bool = True
+    is_default: bool = False
+
+
+@router.get("/email-composer/bootstrap")
+def get_email_composer_bootstrap(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """
+    Returns Cloudflare-routed sender identities, recipient helpers (Customer Tenants, Users,
+    Partner Banks, Trial Registrations), and recent sent email audit history.
+    """
+    verified_domain = _ensure_email_senders_seeded(db)
+
+    senders = (
+        db.query(SystemOwnerEmailSender)
+        .filter(SystemOwnerEmailSender.is_deleted == False)
+        .order_by(SystemOwnerEmailSender.is_default.desc(), SystemOwnerEmailSender.id.asc())
+        .all()
+    )
+
+    # 1. Customers & their Users
+    customers = (
+        db.query(Customer)
+        .options(selectinload(Customer.users))
+        .filter(Customer.is_deleted == False)
+        .order_by(Customer.name.asc())
+        .all()
+    )
+    customer_groups = []
+    for c in customers:
+        user_list = []
+        for u in (c.users or []):
+            if getattr(u, "is_deleted", False):
+                continue
+            role_val = u.role.value if hasattr(u.role, "value") else str(u.role)
+            user_list.append({
+                "id": u.id,
+                "email": u.email,
+                "role": role_val,
+                "label": f"{u.email} ({role_val.replace('_', ' ').title()})",
+            })
+        customer_groups.append({
+            "id": c.id,
+            "name": c.name,
+            "contact_email": c.contact_email,
+            "status": c.status.value if hasattr(c.status, "value") else str(c.status),
+            "users": user_list,
+        })
+
+    # 2. Partner Banks & known desk contacts from QuotationBank
+    banks = db.query(Bank).filter(Bank.is_deleted == False).order_by(Bank.name.asc()).all()
+    q_banks = db.query(QuotationBank).filter(QuotationBank.is_deleted == False).all()
+    bank_emails_map: Dict[int, set] = {}
+    for qb in q_banks:
+        b_set = bank_emails_map.setdefault(qb.bank_id, set())
+        if qb.emails:
+            for e_str in str(qb.emails).split(","):
+                clean_e = e_str.strip()
+                if "@" in clean_e:
+                    b_set.add(clean_e)
+        if qb.authorized_contact_email and "@" in qb.authorized_contact_email:
+            b_set.add(qb.authorized_contact_email.strip())
+        if isinstance(qb.contacts, list):
+            for ct in qb.contacts:
+                if isinstance(ct, dict) and ct.get("email") and "@" in str(ct.get("email")):
+                    b_set.add(str(ct["email"]).strip())
+
+    bank_groups = []
+    for b in banks:
+        emails = sorted(list(bank_emails_map.get(b.id, set())))
+        if emails or b.email_domain:
+            bank_groups.append({
+                "id": b.id,
+                "name": b.name,
+                "short_name": b.short_name or b.name,
+                "email_domain": b.email_domain,
+                "emails": emails,
+            })
+
+    # 3. Recent Trial Registrations
+    trials = (
+        db.query(TrialRegistration)
+        .filter(TrialRegistration.is_deleted == False)
+        .order_by(TrialRegistration.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    trial_contacts = [
+        {
+            "id": t.id,
+            "organization_name": t.organization_name,
+            "contact_name": t.contact_admin_name,
+            "email": t.admin_email,
+            "status": t.status,
+        }
+        for t in trials
+        if t.admin_email and "@" in t.admin_email
+    ]
+
+    # 4. Recent Sent Emails History
+    recent_logs = (
+        db.query(AuditLog)
+        .filter(AuditLog.action_type == "SYSTEM_OWNER_DIRECT_EMAIL")
+        .order_by(AuditLog.timestamp.desc())
+        .limit(25)
+        .all()
+    )
+    history = []
+    for log_entry in recent_logs:
+        details = log_entry.details if isinstance(log_entry.details, dict) else {}
+        history.append({
+            "id": log_entry.id,
+            "timestamp": log_entry.timestamp.isoformat() if log_entry.timestamp else None,
+            "sender_email": details.get("sender_email"),
+            "sender_display_name": details.get("sender_display_name"),
+            "to_emails": details.get("to_emails", []),
+            "cc_emails": details.get("cc_emails", []),
+            "bcc_emails": details.get("bcc_emails", []),
+            "subject": details.get("subject"),
+            "header_badge": details.get("header_badge"),
+            "recipient_name": details.get("recipient_name"),
+            "body_preview": details.get("body_preview"),
+            "attachments": details.get("attachments", []),
+            "success": details.get("success", True),
+            "error": details.get("error"),
+        })
+
+    return {
+        "verified_domain": verified_domain,
+        "platform_name": os.getenv("PLATFORM_NAME", "Grow BD Treasury Platform"),
+        "senders": [_serialize_sender(s) for s in senders],
+        "recipients": {
+            "customers": customer_groups,
+            "banks": bank_groups,
+            "trials": trial_contacts,
+        },
+        "history": history,
+    }
+
+
+@router.post("/email-composer/senders")
+def create_email_composer_sender(
+    payload: EmailSenderIn,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Add a new Cloudflare-routed sender address on the platform's verified domain."""
+    verified_domain = _ensure_email_senders_seeded(db)
+    clean_email = (payload.email or "").strip()
+    if "@" not in clean_email:
+         clean_email = f"{clean_email}@{verified_domain}"
+
+    email_domain = clean_email.split("@")[-1].lower()
+    if email_domain != verified_domain.lower():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sender email must belong to the verified Cloudflare/SMTP domain '@{verified_domain}'."
+        )
+
+    existing = (
+        db.query(SystemOwnerEmailSender)
+        .filter(func.lower(SystemOwnerEmailSender.email) == clean_email.lower())
+        .first()
+    )
+    if existing:
+        if existing.is_deleted:
+            existing.is_deleted = False
+            existing.display_name = payload.display_name.strip()
+            existing.description = (payload.description or "").strip()
+            existing.can_receive_replies = payload.can_receive_replies
+            existing.default_reply_to = (payload.default_reply_to or "").strip() or None
+            existing.is_active = payload.is_active
+            if payload.is_default:
+                db.query(SystemOwnerEmailSender).update({SystemOwnerEmailSender.is_default: False})
+                existing.is_default = True
+            db.commit()
+            db.refresh(existing)
+            return _serialize_sender(existing)
+        raise HTTPException(status_code=400, detail=f"Sender '{clean_email}' already exists in the list.")
+
+    if payload.is_default:
+        db.query(SystemOwnerEmailSender).update({SystemOwnerEmailSender.is_default: False})
+
+    is_noreply = clean_email.lower().startswith(("noreply@", "no-reply@", "do-not-reply@"))
+    can_receive = False if is_noreply else payload.can_receive_replies
+
+    new_sender = SystemOwnerEmailSender(
+        email=clean_email,
+        display_name=payload.display_name.strip() or "Grow Business Development",
+        description=(payload.description or "").strip(),
+        can_receive_replies=can_receive,
+        default_reply_to=(payload.default_reply_to or "").strip() or None,
+        is_active=payload.is_active,
+        is_default=payload.is_default,
+    )
+    db.add(new_sender)
+    db.commit()
+    db.refresh(new_sender)
+    return _serialize_sender(new_sender)
+
+
+@router.put("/email-composer/senders/{sender_id}")
+def update_email_composer_sender(
+    sender_id: int,
+    payload: EmailSenderIn,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Update a Cloudflare-routed sender identity."""
+    verified_domain = _ensure_email_senders_seeded(db)
+    sender = (
+        db.query(SystemOwnerEmailSender)
+        .filter(SystemOwnerEmailSender.id == sender_id, SystemOwnerEmailSender.is_deleted == False)
+        .first()
+    )
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender identity not found.")
+
+    clean_email = (payload.email or "").strip()
+    if "@" not in clean_email:
+        clean_email = f"{clean_email}@{verified_domain}"
+    if clean_email.split("@")[-1].lower() != verified_domain.lower():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sender email must belong to '@{verified_domain}'."
+        )
+
+    if payload.is_default:
+        db.query(SystemOwnerEmailSender).filter(SystemOwnerEmailSender.id != sender_id).update(
+            {SystemOwnerEmailSender.is_default: False}
+        )
+
+    sender.email = clean_email
+    sender.display_name = payload.display_name.strip() or sender.display_name
+    sender.description = (payload.description or "").strip()
+    sender.can_receive_replies = payload.can_receive_replies
+    sender.default_reply_to = (payload.default_reply_to or "").strip() or None
+    sender.is_active = payload.is_active
+    sender.is_default = payload.is_default
+
+    db.commit()
+    db.refresh(sender)
+    return _serialize_sender(sender)
+
+
+@router.delete("/email-composer/senders/{sender_id}")
+def delete_email_composer_sender(
+    sender_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Remove a sender identity from the Cloudflare sender list."""
+    sender = (
+        db.query(SystemOwnerEmailSender)
+        .filter(SystemOwnerEmailSender.id == sender_id, SystemOwnerEmailSender.is_deleted == False)
+        .first()
+    )
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender identity not found.")
+
+    sender.is_deleted = True
+    sender.is_active = False
+    db.commit()
+    return {"success": True, "id": sender_id}
+
+
+def _parse_email_list(raw_val: Optional[str]) -> List[str]:
+    if not raw_val:
+        return []
+    raw_val = raw_val.strip()
+    if not raw_val:
+        return []
+    items: List[str] = []
+    if raw_val.startswith("["):
+        try:
+            parsed = json.loads(raw_val)
+            if isinstance(parsed, list):
+                items = [str(x).strip() for x in parsed if x and str(x).strip()]
+        except Exception:
+            pass
+    if not items:
+        items = [x.strip() for x in re.split(r"[,;\n]+", raw_val) if x.strip()]
+    # Validate basic email shape
+    valid = []
+    seen = set()
+    for addr in items:
+        lower = addr.lower()
+        if "@" in addr and "." in addr.split("@")[-1] and lower not in seen:
+            seen.add(lower)
+            valid.append(addr)
+    return valid
+
+
+@router.post("/email-composer/send")
+async def send_system_owner_composed_email(
+    request: Request,
+    sender_email: str = Form(...),
+    sender_display_name: Optional[str] = Form(None),
+    to_emails: str = Form(...),
+    cc_emails: Optional[str] = Form(None),
+    bcc_emails: Optional[str] = Form(None),
+    reply_to: Optional[str] = Form(None),
+    subject: str = Form(...),
+    header_title: Optional[str] = Form(None),
+    header_badge: Optional[str] = Form(None),
+    recipient_name: Optional[str] = Form(None),
+    body: str = Form(...),
+    cta_text: Optional[str] = Form(None),
+    cta_url: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """
+    Composes and dispatches an executive Branded Grow Card email from an approved
+    Cloudflare-routed sender address (via Resend / Brevo failover) with optional attachments.
+    """
+    verified_domain = _ensure_email_senders_seeded(db)
+
+    # 1. Validate sender against configured Cloudflare sender list
+    sender_record = (
+        db.query(SystemOwnerEmailSender)
+        .filter(
+            func.lower(SystemOwnerEmailSender.email) == sender_email.strip().lower(),
+            SystemOwnerEmailSender.is_deleted == False,
+            SystemOwnerEmailSender.is_active == True,
+        )
+        .first()
+    )
+    if not sender_record:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sender '{sender_email}' is not an active verified Cloudflare sender. Please select a valid sender from the list."
+        )
+
+    # 2. Parse recipients
+    to_list = _parse_email_list(to_emails)
+    cc_list = _parse_email_list(cc_emails)
+    bcc_list = _parse_email_list(bcc_emails)
+
+    if not to_list and not cc_list and not bcc_list:
+        raise HTTPException(status_code=400, detail="Please specify at least one valid recipient email address.")
+
+    if not subject or not subject.strip():
+        raise HTTPException(status_code=400, detail="Email subject is required.")
+    if not body or not body.strip():
+        raise HTTPException(status_code=400, detail="Email body content is required.")
+
+    # 3. Determine effective display name, Reply-To, and Branded Grow Card attributes
+    effective_display_name = (sender_display_name or "").strip() or sender_record.display_name or "Grow Business Development"
+    effective_reply_to = (reply_to or "").strip() or sender_record.default_reply_to or (
+        sender_record.email if sender_record.can_receive_replies else f"info@{verified_domain}"
+    )
+
+    platform_name = os.getenv("PLATFORM_NAME", "Grow BD Treasury Platform")
+    card_title = (header_title or "").strip() or subject.strip()
+    card_badge = (header_badge or "").strip() or effective_display_name
+    is_noreply = not sender_record.can_receive_replies or sender_record.email.lower().startswith(("noreply@", "no-reply@"))
+    footer_subtitle = "Automated System Notification" if is_noreply else f"Official Communication &bull; {sender_record.email}"
+
+    formatted_body_html = _format_composed_body_to_html(body)
+    full_html = build_standard_email_html(
+        customer_name=card_badge,
+        title=card_title,
+        content_html=formatted_body_html,
+        recipient_name=(recipient_name or "").strip() or None,
+        cta_text=(cta_text or "").strip() or None,
+        cta_url=(cta_url or "").strip() or None,
+        platform_name=platform_name,
+        footer_subtitle=footer_subtitle,
+    )
+
+    # 4. Read file attachments
+    email_attachments: List[EmailAttachment] = []
+    attachment_names: List[str] = []
+    for up_file in (files or []):
+        if not up_file or not up_file.filename:
+            continue
+        file_bytes = await up_file.read()
+        if not file_bytes:
+            continue
+        email_attachments.append(
+            EmailAttachment(
+                filename=up_file.filename,
+                content=file_bytes,
+                mime_type=up_file.content_type or "application/octet-stream",
+            )
+        )
+        attachment_names.append(f"{up_file.filename} ({round(len(file_bytes) / 1024, 1)} KB)")
+
+    # 5. Build EmailSettings from Global Relay using the selected Cloudflare sender
+    base_global = get_global_email_settings()
+    custom_email_settings = EmailSettings(
+        smtp_host=base_global.smtp_host,
+        smtp_port=base_global.smtp_port,
+        smtp_username=base_global.smtp_username,
+        smtp_password=base_global.smtp_password,
+        sender_email=sender_record.email,
+        sender_display_name=effective_display_name,
+        reply_to=effective_reply_to,
+    )
+
+    # 6. Send via Resend / Brevo failover engine
+    send_res = await send_email(
+        db=db,
+        to_emails=to_list,
+        subject_template=subject.strip(),
+        body_template=full_html,
+        template_data={},
+        email_settings=custom_email_settings,
+        cc_emails=cc_list,
+        bcc_emails=bcc_list,
+        sender_name=effective_display_name,
+        attachments=email_attachments if email_attachments else None,
+        reply_to=effective_reply_to,
+        save_copy=True,
+        allow_platform_fallback=True,
+    )
+
+    # 7. Record Audit Trail
+    log_details = {
+        "sender_email": sender_record.email,
+        "sender_display_name": effective_display_name,
+        "reply_to": effective_reply_to,
+        "to_emails": to_list,
+        "cc_emails": cc_list,
+        "bcc_emails": bcc_list,
+        "subject": subject.strip(),
+        "header_title": card_title,
+        "header_badge": card_badge,
+        "recipient_name": (recipient_name or "").strip() or None,
+        "body_preview": body.strip()[:300],
+        "attachments": attachment_names,
+        "success": bool(send_res.success),
+        "error": send_res.error,
+    }
+    try:
+        log_action(
+            db,
+            user_id=current_user.user_id,
+            action_type="SYSTEM_OWNER_DIRECT_EMAIL",
+            entity_type="SystemEmail",
+            entity_id=sender_record.id,
+            details=log_details,
+            customer_id=None,
+            ip_address=get_client_ip(request),
+        )
+    except Exception as audit_err:
+        logger.warning(f"Failed to record audit log for SYSTEM_OWNER_DIRECT_EMAIL: {audit_err}")
+
+    if not send_res.success:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Email delivery failed across configured relays: {send_res.error or 'Unknown SMTP error'}"
+        )
+
+    return {
+        "success": True,
+        "message": f"Email successfully dispatched from {sender_record.email} to {len(to_list) + len(cc_list) + len(bcc_list)} recipient(s).",
+        "details": log_details,
+    }
 
 
 # Make sure the router inclusion remains at the bottom

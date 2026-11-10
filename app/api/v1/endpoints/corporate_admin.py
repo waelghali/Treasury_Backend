@@ -2687,6 +2687,8 @@ def approve_quotation_request(
         for assignment in assignments_to_email:
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if bank_row:
+                if bank_row.bank and getattr(bank_row.bank, 'allow_manual_recording', False):
+                    continue
                 contacts = bank_row.contacts if isinstance(bank_row.contacts, list) and len(bank_row.contacts) > 0 else []
                 if not contacts and bank_row.emails:
                     contacts = [{"email": e.strip(), "name": "", "role": "EXECUTION"} for e in bank_row.emails.split(',') if e.strip()]
@@ -2847,6 +2849,8 @@ def approve_quotation_cancellation(
 
             bank_row = db.query(QuotationBank).filter(QuotationBank.id == assignment.quotation_bank_id).first()
             if not bank_row:
+                continue
+            if bank_row.bank and getattr(bank_row.bank, 'allow_manual_recording', False):
                 continue
 
             # Extract structured contacts with roles
