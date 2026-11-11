@@ -5215,6 +5215,15 @@ def _ensure_email_senders_seeded(db: Session) -> str:
                 is_default=True,
             ),
             SystemOwnerEmailSender(
+                email=f"ismail.abdelmeguid@{verified_domain}",
+                display_name="Ismail Abdelmeguid - Grow Business Development",
+                description="Executive & Leadership direct communication (Cloudflare Routed)",
+                can_receive_replies=True,
+                default_reply_to=f"ismail.abdelmeguid@{verified_domain}",
+                is_active=True,
+                is_default=False,
+            ),
+            SystemOwnerEmailSender(
                 email=f"info@{verified_domain}",
                 display_name="Grow Business Development",
                 description="General inquiries, partnerships & client communication (Cloudflare Routed)",
@@ -5255,25 +5264,40 @@ def _ensure_email_senders_seeded(db: Session) -> str:
             db.add(s)
         db.commit()
     else:
-        # Ensure wael.ghali@growbusinessdevelopment.com is present even if table was previously seeded
-        wael_email = f"wael.ghali@{verified_domain}"
-        has_wael = (
-            db.query(SystemOwnerEmailSender)
-            .filter(func.lower(SystemOwnerEmailSender.email) == wael_email.lower())
-            .first()
-        )
-        if not has_wael:
-            db.add(
-                SystemOwnerEmailSender(
-                    email=wael_email,
-                    display_name="Wael Ghali - Grow Business Development",
-                    description="Executive & Founder direct communication (Cloudflare Routed)",
-                    can_receive_replies=True,
-                    default_reply_to=wael_email,
-                    is_active=True,
-                    is_default=False,
-                )
+        # Ensure executive Cloudflare-routed emails are present even if table was previously seeded
+        required_exec_senders = [
+            (
+                f"wael.ghali@{verified_domain}",
+                "Wael Ghali - Grow Business Development",
+                "Executive & Founder direct communication (Cloudflare Routed)",
+            ),
+            (
+                f"ismail.abdelmeguid@{verified_domain}",
+                "Ismail Abdelmeguid - Grow Business Development",
+                "Executive & Leadership direct communication (Cloudflare Routed)",
+            ),
+        ]
+        added_any = False
+        for exec_email, exec_name, exec_desc in required_exec_senders:
+            exists = (
+                db.query(SystemOwnerEmailSender)
+                .filter(func.lower(SystemOwnerEmailSender.email) == exec_email.lower())
+                .first()
             )
+            if not exists:
+                db.add(
+                    SystemOwnerEmailSender(
+                        email=exec_email,
+                        display_name=exec_name,
+                        description=exec_desc,
+                        can_receive_replies=True,
+                        default_reply_to=exec_email,
+                        is_active=True,
+                        is_default=False,
+                    )
+                )
+                added_any = True
+        if added_any:
             db.commit()
 
     return verified_domain
