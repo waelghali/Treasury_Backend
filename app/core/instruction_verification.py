@@ -78,6 +78,50 @@ def _compute_hmac_sig(payload: str, length: int = 16) -> str:
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:length]
 
 
+def _generate_v1_token_and_6digit_code(
+    record_kind: str,
+    record_id: int,
+    serial_number: str,
+    lg_number: str,
+    secret_ts: int,
+) -> Tuple[str, str]:
+    """
+    Legacy v1 generator (6-digit footer code 'XXX-XXX' with token kind 'I', 'M', 'P').
+    Preserved so all previously printed v1 instructions continue to verify seamlessly.
+    """
+    base_kind = record_kind.rstrip("2")
+    sig = _compute_hmac_sig(f"QR_TOKEN:{base_kind}.{record_id}:{secret_ts}:{serial_number}", length=18)
+    token = f"{base_kind}.{record_id}.{sig}"
+
+    gate_payload = f"GATE_PIN:{base_kind}:{record_id}:{(serial_number or '').strip().upper()}:{(lg_number or '').strip().upper()}:{secret_ts}"
+    gate_digest = hmac.new(_SECRET_KEY, gate_payload.encode("utf-8"), hashlib.sha256).digest()
+    code_int = (int.from_bytes(gate_digest[:4], "big") % 900000) + 100000
+    code_str = f"{str(code_int)[:3]}-{str(code_int)[3:]}"
+    return token, code_str
+
+
+def _extract_lg_last2_candidates(lg_number: str) -> Tuple[str, str]:
+    """
+    Returns (alphanumeric_last2, raw_nonspace_last2) in uppercase for matching the last 2 characters
+    of the LG Number printed in the body of the instruction.
+    """
+    raw = re.sub(r"\s+", "", (lg_number or "").strip()).upper()
+    alnum = re.sub(r"[^A-Z0-9]", "", raw)
+    c1 = alnum[-2:] if len(alnum) >= 2 else alnum.zfill(2)
+    c2 = raw[-2:] if len(raw) >= 2 else raw.zfill(2)
+    return c1, c2
+
+
+def _matches_lg_last2(lg_number: str, entered_lg_tail: str) -> bool:
+    """Checks if the user-entered 2 characters match the last 2 characters of the LG Number."""
+    entered_raw = re.sub(r"\s+", "", (entered_lg_tail or "").strip()).upper()
+    entered_alnum = re.sub(r"[^A-Z0-9]", "", entered_raw)
+    if not entered_raw:
+        return False
+    c1, c2 = _extract_lg_last2_candidates(lg_number)
+    return entered_alnum == c1 or entered_raw == c2
+
+
 def generate_verification_token_and_code(
     record_kind: str,
     record_id: int,
@@ -86,19 +130,23 @@ def generate_verification_token_and_code(
     secret_ts: int,
 ) -> Tuple[str, str]:
     """
-    Returns (signed_qr_token, formatted_6_digit_code 'XXX-XXX').
-    Note: secret_ts is mixed into the cryptographic HMAC signature and 6-digit PIN
+    Generates a v2 split-verification QR token ('I2.<id>.<sig>') and 4-digit Footer Security Code ('XXXX').
+    During verification, the user must provide BOTH:
+      1) The last 2 characters of the LG Number (from the upper body of the letter), AND
+      2) The 4-digit Security Code (from the bottom footer).
+    Note: secret_ts is mixed into the cryptographic HMAC signature and 4-digit PIN
     calculation, but is NEVER exposed in the token string or portal response.
     """
-    sig = _compute_hmac_sig(f"QR_TOKEN:{record_kind}.{record_id}:{secret_ts}:{serial_number}", length=18)
-    token = f"{record_kind}.{record_id}.{sig}"
+    base_kind = record_kind.rstrip("2")
+    v2_kind = f"{base_kind}2"
+    sig = _compute_hmac_sig(f"QR_TOKEN:{v2_kind}.{record_id}:{secret_ts}:{serial_number}", length=18)
+    token = f"{v2_kind}.{record_id}.{sig}"
 
-    # 6-digit gate code derived from secret_ts + instruction identity + LG number
-    gate_payload = f"GATE_PIN:{record_kind}:{record_id}:{(serial_number or '').strip().upper()}:{(lg_number or '').strip().upper()}:{secret_ts}"
+    # 4-digit footer security code (1000..9999) derived from secret_ts + instruction identity + LG number
+    gate_payload = f"GATE_PIN_V2:{base_kind}:{record_id}:{(serial_number or '').strip().upper()}:{(lg_number or '').strip().upper()}:{secret_ts}"
     gate_digest = hmac.new(_SECRET_KEY, gate_payload.encode("utf-8"), hashlib.sha256).digest()
-    code_int = (int.from_bytes(gate_digest[:4], "big") % 900000) + 100000  # Always 6 digits: 100000..999999
-    code_str = f"{str(code_int)[:3]}-{str(code_int)[3:]}"
-    return token, code_str
+    code_int = (int.from_bytes(gate_digest[:4], "big") % 9000) + 1000  # Always 4 digits: 1000..9999
+    return token, str(code_int)
 
 
 def generate_qr_svg_data_uri(url: str) -> str:
@@ -228,7 +276,7 @@ def _resolve_instruction_meta(html_content: str, filename_hint: str = "") -> Dic
         "kind": "P",
         "id": 0,
         "serial_number": serial or "SAMPLE-REF-0001",
-        "lg_number": "SAMPLE-LG",
+        "lg_number": "LG-2026-4120",
         "secret_ts": 1762600000,
     }
 
@@ -382,7 +430,7 @@ def inject_mandatory_verification_footer(html_content: str, filename_hint: str =
                         Official Corporate Banking Instruction &bull; Generated via <span style="color: #0f172a;">Grow Business Development</span> &mdash; Treasury Management Platform
                     </div>
                     <div style="margin-top: 2px;">
-                        <strong>Authenticity Verification:</strong> Scan the QR code to verify instruction genuineness and enter Security Code:
+                        <strong>Authenticity Verification:</strong> Scan the QR code and enter the <strong>last 2 characters of the LG Number</strong> + Security Code:
                         <span style="display: inline-block; font-family: 'Courier New', Courier, monospace; font-weight: 800; font-size: 8.5pt; color: #0f172a; background-color: #f1f5f9; border: 1px solid #94a3b8; padding: 0px 5px; letter-spacing: 0.8px;">{code_formatted}</span>
                     </div>
                 </td>
@@ -563,35 +611,56 @@ def _reset_cooldown_on_success(client_ip: str, token: str) -> None:
 def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") -> Dict[str, Any]:
     """
     Validates the QR token signature and returns minimal gate prompt info (without revealing LG details
-    until the 6-digit Security Code is entered).
+    until the Security Code is entered). Supports both v1 (6-digit footer code) and v2 (2 LG chars + 4-digit footer code).
     """
     rem_cooldown = _check_cooldown_status(client_ip, token)
 
-    if not token or token.count(".") != 2:
+    if not token or token.count(".") not in (2, 3):
         return {"valid_token": False, "reason": "Malformed verification link."}
 
-    kind, id_str, sig = token.split(".")
-    if kind == "P":
+    parts = token.split(".")
+    if len(parts) == 4:
+        kind, id_str, _legacy_ts_str, sig = parts
+        sig_len = 16
+    else:
+        kind, id_str, sig = parts
+        sig_len = 18
+
+    is_v2 = kind.endswith("2")
+    base_kind = kind.rstrip("2")
+    version = 2 if is_v2 else 1
+
+    if base_kind == "P":
         return {
             "valid_token": True,
             "is_preview": True,
+            "version": version,
             "masked_serial": "SAMPLE-REF-0001",
             "cooldown_seconds": rem_cooldown,
-            "prompt": "Enter the 6-digit Security Code printed at the bottom of the instruction letter.",
+            "prompt": (
+                "Enter the last 2 characters of the LG Number (from the letter body) and the 4-digit Security Code (from the footer)."
+                if version == 2
+                else "Enter the 6-digit Security Code printed at the bottom of the instruction letter."
+            ),
         }
 
-    if kind not in ("I", "M") or not id_str.isdigit():
+    if base_kind not in ("I", "M") or not id_str.isdigit():
         return {"valid_token": False, "reason": "Invalid verification token parameters."}
 
     record_id = int(id_str)
 
-    if kind == "I":
+    if base_kind == "I":
         from app.models.models import LGInstruction
         inst = db.query(LGInstruction).filter(LGInstruction.id == record_id, LGInstruction.is_deleted == False).first()
         if not inst:
             return {"valid_token": False, "reason": "Instruction record not found."}
         db_ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
-        expected_sig = _compute_hmac_sig(f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{inst.serial_number}", length=18)
+        expected_sig = _compute_hmac_sig(
+            f"QR_TOKEN:{kind}.{record_id}.{db_ts}:{inst.serial_number}"
+            if sig_len == 16
+            else f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{inst.serial_number}",
+            length=sig_len,
+        )
         if not hmac.compare_digest(sig, expected_sig):
             return {"valid_token": False, "reason": "Cryptographic signature mismatch."}
         serial = inst.serial_number or ""
@@ -599,18 +668,28 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
         return {
             "valid_token": True,
             "is_preview": False,
+            "version": version,
             "masked_serial": masked_serial,
             "cooldown_seconds": rem_cooldown,
-            "prompt": "Enter the 6-digit Security Code printed in the footer of the instruction letter.",
+            "prompt": (
+                "Enter the last 2 characters of the LG Number (from the letter body) and the 4-digit Security Code (from the footer)."
+                if version == 2
+                else "Enter the 6-digit Security Code printed in the footer of the instruction letter."
+            ),
         }
 
-    # kind == "M"
+    # base_kind == "M"
     from app.models.models_issuance import IssuedLGMaintenanceAction
     maint = db.query(IssuedLGMaintenanceAction).filter(IssuedLGMaintenanceAction.id == record_id).first()
     if not maint:
         return {"valid_token": False, "reason": "Maintenance instruction record not found."}
     db_ts = _to_epoch_seconds(getattr(maint, "created_at", None))
-    expected_sig = _compute_hmac_sig(f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{maint.letter_serial_number}", length=18)
+    expected_sig = _compute_hmac_sig(
+        f"QR_TOKEN:{kind}.{record_id}.{db_ts}:{maint.letter_serial_number}"
+        if sig_len == 16
+        else f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{maint.letter_serial_number}",
+        length=sig_len,
+    )
     if not hmac.compare_digest(sig, expected_sig):
         return {"valid_token": False, "reason": "Cryptographic signature mismatch."}
     serial = maint.letter_serial_number or ""
@@ -618,32 +697,59 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
     return {
         "valid_token": True,
         "is_preview": False,
+        "version": version,
         "masked_serial": masked_serial,
         "cooldown_seconds": rem_cooldown,
-        "prompt": "Enter the 6-digit Security Code printed in the footer of the instruction letter.",
+        "prompt": (
+            "Enter the last 2 characters of the LG Number (from the letter body) and the 4-digit Security Code (from the footer)."
+            if version == 2
+            else "Enter the 6-digit Security Code printed in the footer of the instruction letter."
+        ),
     }
 
 
-def _build_failed_code_response(client_ip: str, token: str) -> Dict[str, Any]:
-    """Records a failed 6-digit PIN attempt and returns a structured response with progressive cooldown."""
+def _build_failed_code_response(client_ip: str, token: str, custom_reason: Optional[str] = None, tamper_alert: bool = False) -> Dict[str, Any]:
+    """Records a failed verification attempt and returns a structured response with progressive cooldown."""
     fails, cooldown_sec, free_rem = _record_failed_attempt(client_ip, token)
     if cooldown_sec > 0:
+        base_msg = (
+            custom_reason
+            if custom_reason
+            else f"Invalid Security Code (Attempt #{fails})."
+        )
         return {
             "verified": False,
+            "tamper_alert": tamper_alert,
             "cooldown_seconds": cooldown_sec,
             "failed_attempts": fails,
             "reason": (
-                f"Invalid Security Code (Attempt #{fails}). To protect instruction security, "
+                f"{base_msg} To protect instruction security, "
                 f"verification from your connection is paused for {_format_duration_human(cooldown_sec)}."
             ),
         }
     hint = f" ({free_rem} attempt{'s' if free_rem != 1 else ''} remaining before temporary cooldown)." if free_rem > 0 else "."
+    default_msg = f"Verification Failed: The Security Code does not match this instruction letter{hint}"
     return {
         "verified": False,
+        "tamper_alert": tamper_alert,
         "cooldown_seconds": 0,
         "failed_attempts": fails,
-        "reason": f"Verification Failed: The 6-digit Security Code does not match this instruction letter{hint}",
+        "reason": f"{custom_reason}{hint}" if custom_reason else default_msg,
     }
+
+
+def _build_tamper_lg_mismatch_response(client_ip: str, token: str, entered_lg_tail: str) -> Dict[str, Any]:
+    """
+    Triggered when the 4-digit footer code matches the QR token, but the 2 LG characters entered
+    from the letter body do NOT match the LG attached to that QR token (indicating a copied footer).
+    """
+    tail_disp = (entered_lg_tail or "").strip().upper() or "??"
+    msg = (
+        f"Security Warning — Guarantee Number Mismatch: The 4-digit footer code belongs to this QR seal, "
+        f"but this QR seal was NOT issued for a Guarantee ending in '{tail_disp}'. "
+        f"Please check that the bottom footer was not copied from a different instruction"
+    )
+    return _build_failed_code_response(client_ip, token, custom_reason=msg, tamper_alert=True)
 
 
 def _trigger_honeypot_lockout(client_ip: str, token: str) -> Dict[str, Any]:
@@ -689,12 +795,14 @@ def verify_instruction_with_code(
     client_ip: str = "unknown",
     honeypot_value: str = "",
     elapsed_ms: Optional[int] = None,
+    lg_tail: str = "",
 ) -> Dict[str, Any]:
     """
     Verifies both the cryptographic QR token (bound to the secret database issuance timestamp)
-    AND the 6-digit Security Code printed on the physical letter.
-    Enforces a progressive per-IP cooldown ladder (1m, 3m, 5m, 10m, 15m, 30m) on repeated failures,
-    and an instant 30-minute silent lockout if the bot honeypot or sub-second speed trap is tripped.
+    AND the physical Security Code.
+    - For v1 tokens ('I.', 'M.', 'P.'): verifies the 6-digit footer code (100% backward compatible).
+    - For v2 tokens ('I2.', 'M2.', 'P2.'): verifies the 4-digit footer code AND the last 2 characters
+      of the LG Number from the letter body, triggering a Tamper Warning if the footer was copied onto a different LG.
     """
     rem_cooldown = _check_cooldown_status(client_ip, token)
     if rem_cooldown > 0:
@@ -713,18 +821,49 @@ def verify_instruction_with_code(
     ):
         return _trigger_honeypot_lockout(client_ip, token)
 
-    clean_code = re.sub(r"[^0-9]", "", entered_code or "")
-    if len(clean_code) != 6:
-        return {"verified": False, "reason": "Please enter the complete 6-digit numeric Security Code."}
-
-    if not token or token.count(".") != 2:
+    if not token or token.count(".") not in (2, 3):
         return {"verified": False, "reason": "Invalid verification token."}
 
-    kind, id_str, sig = token.split(".")
-    if kind == "P":
-        _, expected_code = generate_verification_token_and_code("P", 0, "SAMPLE-REF-0001", "SAMPLE-LG", 1762600000)
-        if clean_code != expected_code.replace("-", ""):
-            return _build_failed_code_response(client_ip, token)
+    parts = token.split(".")
+    if len(parts) == 4:
+        kind, id_str, _legacy_ts_str, sig = parts
+        sig_len = 16
+    else:
+        kind, id_str, sig = parts
+        sig_len = 18
+
+    is_v2 = kind.endswith("2")
+    base_kind = kind.rstrip("2")
+
+    # Normalize inputs for v1 vs v2
+    entered_lg_tail = (lg_tail or "").strip()
+    clean_code = re.sub(r"[^0-9]", "", entered_code or "")
+
+    if is_v2:
+        # Allow combined 6-char entry (2 LG chars + 4 digits) if lg_tail wasn't passed separately
+        if not entered_lg_tail and len(re.sub(r"[\s\-]", "", entered_code or "")) == 6:
+            compact = re.sub(r"[\s\-]", "", entered_code or "")
+            entered_lg_tail = compact[:2]
+            clean_code = re.sub(r"[^0-9]", "", compact[2:])
+        if len(re.sub(r"\s+", "", entered_lg_tail)) < 2:
+            return {"verified": False, "reason": "Please enter the last 2 characters of the LG Number from the top of the letter."}
+        if len(clean_code) != 4:
+            return {"verified": False, "reason": "Please enter the 4-digit Security Code printed in the letter footer."}
+    else:
+        if len(clean_code) != 6:
+            return {"verified": False, "reason": "Please enter the complete 6-digit numeric Security Code."}
+
+    if base_kind == "P":
+        if is_v2:
+            _, expected_code = generate_verification_token_and_code("P", 0, "SAMPLE-REF-0001", "LG-2026-4120", 1762600000)
+            if not hmac.compare_digest(clean_code, expected_code):
+                return _build_failed_code_response(client_ip, token)
+            if not _matches_lg_last2("LG-2026-4120", entered_lg_tail):
+                return _build_tamper_lg_mismatch_response(client_ip, token, entered_lg_tail)
+        else:
+            _, expected_code = _generate_v1_token_and_6digit_code("P", 0, "SAMPLE-REF-0001", "SAMPLE-LG", 1762600000)
+            if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
+                return _build_failed_code_response(client_ip, token)
         _reset_cooldown_on_success(client_ip, token)
         return {
             "verified": True,
@@ -743,12 +882,12 @@ def verify_instruction_with_code(
             "delivery_status": "Sample Preview Mode",
         }
 
-    if kind not in ("I", "M") or not id_str.isdigit():
+    if base_kind not in ("I", "M") or not id_str.isdigit():
         return {"verified": False, "reason": "Invalid verification token."}
 
     record_id = int(id_str)
 
-    if kind == "I":
+    if base_kind == "I":
         from app.models.models import LGInstruction, LGRecord
         from sqlalchemy.orm import selectinload
 
@@ -768,15 +907,29 @@ def verify_instruction_with_code(
 
         lg = inst.lg_record
         db_ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
-        expected_token, expected_code = generate_verification_token_and_code(
-            "I", inst.id, inst.serial_number or "", lg.lg_number or "", db_ts
+        expected_sig = _compute_hmac_sig(
+            f"QR_TOKEN:{kind}.{record_id}.{db_ts}:{inst.serial_number}"
+            if sig_len == 16
+            else f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{inst.serial_number}",
+            length=sig_len,
         )
-
-        if not hmac.compare_digest(token, expected_token):
+        if not hmac.compare_digest(sig, expected_sig):
             return {"verified": False, "reason": "Cryptographic signature mismatch."}
 
-        if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
-            return _build_failed_code_response(client_ip, token)
+        if is_v2:
+            _, expected_code = generate_verification_token_and_code(
+                "I", inst.id, inst.serial_number or "", lg.lg_number or "", db_ts
+            )
+            if not hmac.compare_digest(clean_code, expected_code):
+                return _build_failed_code_response(client_ip, token)
+            if not _matches_lg_last2(lg.lg_number or "", entered_lg_tail):
+                return _build_tamper_lg_mismatch_response(client_ip, token, entered_lg_tail)
+        else:
+            _, expected_code = _generate_v1_token_and_6digit_code(
+                "I", inst.id, inst.serial_number or "", lg.lg_number or "", db_ts
+            )
+            if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
+                return _build_failed_code_response(client_ip, token)
 
         _reset_cooldown_on_success(client_ip, token)
 
@@ -880,15 +1033,29 @@ def verify_instruction_with_code(
     ilg = maint.issued_lg
     lg_num = ilg.bank_lg_number or ilg.lg_ref_number or ""
     db_ts = _to_epoch_seconds(getattr(maint, "created_at", None))
-    expected_token, expected_code = generate_verification_token_and_code(
-        "M", maint.id, maint.letter_serial_number or "", lg_num, db_ts
+    expected_sig = _compute_hmac_sig(
+        f"QR_TOKEN:{kind}.{record_id}.{db_ts}:{maint.letter_serial_number}"
+        if sig_len == 16
+        else f"QR_TOKEN:{kind}.{record_id}:{db_ts}:{maint.letter_serial_number}",
+        length=sig_len,
     )
-
-    if not hmac.compare_digest(token, expected_token):
+    if not hmac.compare_digest(sig, expected_sig):
         return {"verified": False, "reason": "Cryptographic signature mismatch."}
 
-    if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
-        return _build_failed_code_response(client_ip, token)
+    if is_v2:
+        _, expected_code = generate_verification_token_and_code(
+            "M", maint.id, maint.letter_serial_number or "", lg_num, db_ts
+        )
+        if not hmac.compare_digest(clean_code, expected_code):
+            return _build_failed_code_response(client_ip, token)
+        if not _matches_lg_last2(lg_num, entered_lg_tail):
+            return _build_tamper_lg_mismatch_response(client_ip, token, entered_lg_tail)
+    else:
+        _, expected_code = _generate_v1_token_and_6digit_code(
+            "M", maint.id, maint.letter_serial_number or "", lg_num, db_ts
+        )
+        if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
+            return _build_failed_code_response(client_ip, token)
 
     _reset_cooldown_on_success(client_ip, token)
 

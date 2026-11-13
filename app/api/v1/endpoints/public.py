@@ -274,6 +274,7 @@ from typing import Optional
 class InstructionVerifyConfirmIn(BaseModel):
     token: str
     code: str
+    lg_tail: Optional[str] = ""
     bank_branch_code: Optional[str] = ""
     elapsed_ms: Optional[int] = None
 
@@ -325,14 +326,20 @@ def confirm_instruction_authenticity(
         client_ip=client_ip,
         honeypot_value=payload.bank_branch_code or "",
         elapsed_ms=payload.elapsed_ms,
+        lg_tail=payload.lg_tail or "",
     )
     honeypot_tripped = bool(result.pop("_honeypot_tripped", False))
+    tamper_alert = bool(result.get("tamper_alert", False))
 
     try:
         action_name = (
             "PUBLIC_INSTRUCTION_HONEYPOT_TRIGGERED"
             if honeypot_tripped
-            else ("PUBLIC_INSTRUCTION_VERIFIED" if result.get("verified") else "PUBLIC_INSTRUCTION_VERIFY_FAILED")
+            else (
+                "PUBLIC_INSTRUCTION_TAMPER_ALERT"
+                if tamper_alert
+                else ("PUBLIC_INSTRUCTION_VERIFIED" if result.get("verified") else "PUBLIC_INSTRUCTION_VERIFY_FAILED")
+            )
         )
         log_action(
             db,
@@ -346,6 +353,7 @@ def confirm_instruction_authenticity(
                 "instruction_serial": result.get("instruction_serial"),
                 "client_ip": client_ip,
                 "honeypot_tripped": honeypot_tripped,
+                "tamper_alert": tamper_alert,
             },
             customer_id=None,
             lg_record_id=None,
