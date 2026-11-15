@@ -20,9 +20,11 @@ import edge_tts
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 AUDIO_ROOT = os.path.join(BASE_DIR, "frontend", "public", "demo", "audio")
 PITCHES_DIR = os.path.join(AUDIO_ROOT, "pitches")
+STORIES_DIR = os.path.join(AUDIO_ROOT, "stories")
 os.makedirs(PITCHES_DIR, exist_ok=True)
+os.makedirs(STORIES_DIR, exist_ok=True)
 
-VOICE_EN = "en-US-AvaMultilingualNeural"
+VOICE_EN = "en-US-AvaNeural"
 RATE_EN = "-2%"
 
 VOICE_AR = "ar-JO-SanaNeural"
@@ -36,12 +38,12 @@ PITCH_NARRATIONS = {
         "ar": 'مُلَخَّصٌ لِصَانِعِ القَرَارْ، الوَحْدَةُ الأُولَى: حِفْظُ خِطَابَاتِ الضَّمَانِ الوَارِدَة. حِمَايَةٌ كَامِلَةٌ لِلْغِطَاءِ المَالِيِّ لِلشَّرِكَةِ مِنْ ضَيَاعِ مَوَاعِيدِ الانْتِهَاءِ أَوْ شُرُوطِ المُصَادَرَةِ المُقَيِّدَة. بِالنِّسْبَةِ لِلْمُدِيرِينَ المَالِيِّينَ وَمُدِيرِي الخِزَانَةِ المَسْؤُولِينَ عَنْ ضَمَانَاتٍ بِمَلَايِينِ الجُنَيْهَاتْ، فَإِنَّ فَوَاتَ مَوْعِدِ انْتِهَاءِ ضَمَانٍ وَاحِدٍ فِي جَدَاوِلِ الإِكْسِيلْ يَعْنِي ضَيَاعَ حَقِّ الشَّرِكَةِ المَالِيِّ فَوْراً. تَقُومُ وَحْدَةُ الحِفْظِ بِرَقْمَنَةِ الضَّمَانَاتِ الوَارِدَةِ بِالذَّكَاءِ الاصْطِنَاعِيِّ خِلَالَ ثَوَانٍ، وَكَشْفِ شُرُوطِ التَّسْيِيلِ المُقَيِّدَةِ مُبَكِّراً. وَتُنَفِّذُ طَلَبَاتِ التَّمْدِيدِ الحِمَائِيَّةَ مُبَاشَرَةً دُونَ تَعْطِيلْ، مَعَ فَرْضِ رَقَابَةِ المُرَاجِعِ وَالمُعْتَمِدِ الصَّارِمَةِ عَلَى كُلِّ إِفْرَاجٍ أَوْ تَخْفِيضٍ أَوْ تَعْدِيلٍ أَوْ تَسْيِيلْ، وَإِرْسَالِ تَنْبِيهَاتٍ وَتَصْعِيدٍ آلِيٍّ عِنْدَ تَأَخُّرِ مَسْؤُولِ المَشْرُوعِ أَوِ التَّسْلِيمِ أَوْ رَدِّ البَنْكْ.',
     },
     'pitch_issuance': {
-        "en": 'Module Two, Executive Brief: Letter of Guarantee Issuance. Lower bank guarantee commissions, free up trapped cash margins, and issue faster. Managing outgoing guarantee requests over email leads to duplicate submissions, routing deals to higher-cost banks, and leaving expired guarantees locking up credit lines for months. Grow standardizes department intake and scores all bank facilities in real time for the lowest commission and cash margin. It enforces multi-step credit approvals with SLA reminders and escalations, automatically fills official bank PDF forms, and reconciles bank position statements to reclaim trapped limits.',
-        "ar": 'مُلَخَّصٌ لِصَانِعِ القَرَارْ، الوَحْدَةُ الثَّانِيَة: إِصْدَارُ خِطَابَاتِ الضَّمَانِ الصَّادِرَة. خَفْضُ عُمُولَاتِ الإِصْدَارْ، وَتَحْرِيرُ الغِطَاءِ النَّقْدِيِّ المُحْتَجَزْ، وَتَسْرِيعُ دَوْرَةِ التَّنْفِيذْ. إِدَارَةُ طَلَبَاتِ إِصْدَارِ خِطَابَاتِ الضَّمَانِ عَبْرَ البَرِيدِ الإِلِكْتْرُونِيِّ تُؤَدِّي لِتَكْرَارِ الطَّلَبَاتِ وَتَوْجِيهِهَا لِبُنُوكٍ أَعْلَى تَكْلِفَة، وَبَقَاءِ ضَمَانَاتٍ مُنْتَهِيَةٍ تَحْجِزُ حُدُودَ التَّسْهِيلَاتِ البَنْكِيَّةِ لِشُهُورْ. تُوَحِّدُ هَذِهِ الوَحْدَةُ اسْتِقْبَالَ طَلَبَاتِ الإِدَارَاتْ، وَتُفَاضِلُ لَحْظِيّاً بَيْنَ البُنُوكِ لِاخْتِيَارِ أَقَلِّ عُمُولَةٍ وَغِطَاءٍ نَقْدِيّ. كَمَا تُطَبِّقُ مَصْفُوفَةَ المَوَافَقَاتِ الائْتِمَانِيَّةِ مَعَ تَنْبِيهَاتٍ وَتَصْعِيدٍ لِلتَّأْخِيرْ، وَتَمْلَأُ نَمَاذِجَ البُنُوكِ الرَّسْمِيَّةَ تِلْقَائِيّاً، مَعَ مُطَابَقَةِ كُشُوفِ المَرَاكِزِ لِتَحْرِيرِ الحُدُودِ المُحْتَجَزَة.',
+        "en": 'Module Two, Executive Brief: Letter of Guarantee Issuance. Unify outgoing guarantee requests, custom approvals, and smart bank facility scoring. Managing outgoing guarantee requests over email leads to missing documents, duplicate submissions, and inconsistent bank selection. Grow digitizes and unifies all internal guarantee requests in one central portal with a fully customizable request form and sequential approval matrix. It scores eligible bank facilities from zero to one hundred across commission and cash margin terms, automatically fills official bank PDF forms, and reconciles Bank LG Position reports against your register.',
+        "ar": 'مُلَخَّصٌ لِصَانِعِ القَرَارْ، الوَحْدَةُ الثَّانِيَة: إِصْدَارُ خِطَابَاتِ الضَّمَانِ الصَّادِرَة. تَوْحِيدُ طَلَبَاتِ إِصْدَارِ الضَّمَانَاتِ وَمَصْفُوفَةِ الاعْتِمَادِ وَالمُفَاضَلَةِ الذَّكِيَّةِ بَيْنَ التَّسْهِيلَاتْ. إِدَارَةُ طَلَبَاتِ الإِصْدَارِ عَبْرَ البَرِيدِ الإِلِكْتْرُونِيِّ تُؤَدِّي لِنَقْصِ المُسْتَنَدَاتِ وَتَكْرَارِ الطَّلَبَاتِ وَتَبَايُنِ اخْتِيَارِ البُنُوكْ. تُرَقْمِنُ هَذِهِ الوَحْدَةُ كَافَّةَ طَلَبَاتِ الإِدَارَاتِ وَتُوَحِّدُهَا فِي مَكَانٍ وَاحِدٍ بِنَمُوذَجِ طَلَبٍ وَمَصْفُوفَةِ اعْتِمَادٍ قَابِلَةٍ لِلتَّخْصِيصِ الكَامِلْ، وَتُفَاضِلُ لَحْظِيّاً بَيْنَ التَّسْهِيلَاتِ البَنْكِيَّةِ حَسَبَ شُرُوطِ العُمُولَةِ وَالغِطَاءْ، وَتَمْلَأُ نَمَاذِجَ البُنُوكِ الرَّسْمِيَّةَ تِلْقَائِيّاً مَعَ مُطَابَقَةِ تَقَارِيرِ مَرَاكِزِ الضَّمَانَاتِ البَنْكِيَّة.',
     },
     'pitch_quotations': {
-        "en": 'Module Three, Executive Brief: Foreign Exchange and Treasury Bill Quotations. Capture every basis point with auditable multi-bank competition. Shopping Foreign Exchange Spot and Sovereign Treasury Bill rates over phone calls or chat leaves basis points on the table and gives boards and auditors zero proof of best execution. Grow supports pre-broadcast approval and dispatches multi-pair currency baskets and Treasury Bill quote requests simultaneously to relationship banks through secure, zero-password dealer links. It gives dealers a blind live competitive rank to sharpen quotes without revealing rival prices, ranks bids by true all-in net cost after bank fee schedules and settlement-date time value of money, lets treasurers cherry-pick winning banks per currency leg, and seals Best Execution Audit Certificates alongside cryptographically signed Deal Execution Receipts.',
-        "ar": 'مُلَخَّصٌ لِصَانِعِ القَرَارْ، الوَحْدَةُ الثَّالِثَة: عُرُوضُ أَسْعَارِ العُمْلَاتِ وَأُذُونِ الخِزَانَة. تَحْقِيقُ أَفْضَلِ سِعْرِ تَنْفِيذٍ صَافٍ بِمُنَافَسَةٍ مَصْرِفِيَّةٍ فَوْرِيَّةٍ وَقَابِلَةٍ لِلْمُرَاجَعَة. التَّفَاوُضُ الهَاتِفِيُّ عَلَى أَسْعَارِ العُمْلَاتِ الفَوْرِيَّةِ وَأُذُونِ الخِزَانَةِ يُفْقِدُ الشَّرِكَةَ نِقَاطاً سِعْرِيَّةً مُؤَثِّرَة، وَلَا يَتْرُكُ أَيَّ إِثْبَاتٍ رَقَابِيٍّ عَلَى عَدَالَةِ التَّنْفِيذْ. تَدْعَمُ هَذِهِ الوَحْدَةُ اعْتِمَادَ مَا قَبْلَ البَثّ، وَتُرْسِلُ طَلَبَاتِ سَلَّاتِ العُمْلَاتِ الفَوْرِيَّةِ وَأُذُونِ الخِزَانَةِ لِكَافَّةِ البُنُوكِ فِي لَحْظَةٍ وَاحِدَةٍ عَبْرَ رَوَابِطَ مُؤَمَّنَةٍ بِدُونِ كَلِمَةِ مُرُورْ. وَتَعْرِضُ لِلْمُتَدَاوِلِ تَرْتِيبَهُ التَّنَافُسِيَّ الحَيَّ لِتَحْسِينِ السِّعْرِ دُونَ كَشْفِ أَسْعَارِ المُنَافِسِينْ، ثُمَّ تُرَتِّبُ العُرُوضَ بِالصَّافِي الشَّامِلِ بَعْدَ مَصْفُوفَةِ العُمُولَاتِ وَتَكْلِفَةِ تَارِيخِ التَّسْوِيَة، وَتُتِيحُ تَرْسِيَةَ كُلِّ عُمْلَةٍ لِأَفْضَلِ بَنْكْ، مَعَ إِصْدَارِ شَهَادَةِ تَدْقِيقٍ وَإِيصَالَاتِ صَفْقَةٍ رَقْمِيَّةٍ مَعْزُولَة.',
+        "en": 'Module Three, Executive Brief: Foreign Exchange and Treasury Bill Quotations. Capture every basis point with auditable multi-bank competition. Shopping Foreign Exchange Spot and Sovereign Treasury Bill rates over phone calls or chat leaves basis points on the table and gives boards and auditors zero proof of best execution. Grow adapts to every Central Bank of Egypt scenario, supporting Execution versus Indicative benchmark roles, selective document visibility, and alternative value dates. It dispatches multi-pair currency baskets and Treasury Bill quote requests simultaneously through zero-password dealer links, keeps every quote sealed with encryption until window close, ranks bids by true all-in net cost benchmarked against both live market rates and Central Bank fixings, lets treasurers cherry-pick winning banks per currency leg, and seals Best Execution Audit Certificates plus bank-scoped Deal Execution Receipts.',
+        "ar": 'مُلَخَّصٌ لِصَانِعِ القَرَارْ، الوَحْدَةُ الثَّالِثَة: عُرُوضُ أَسْعَارِ العُمْلَاتِ وَأُذُونِ الخِزَانَة. تَحْقِيقُ أَفْضَلِ سِعْرِ تَنْفِيذٍ صَافٍ بِمُنَافَسَةٍ مَصْرِفِيَّةٍ فَوْرِيَّةٍ وَقَابِلَةٍ لِلْمُرَاجَعَة. التَّفَاوُضُ الهَاتِفِيُّ عَلَى أَسْعَارِ العُمْلَاتِ الفَوْرِيَّةِ وَأُذُونِ الخِزَانَةِ يُفْقِدُ الشَّرِكَةَ نِقَاطاً سِعْرِيَّةً مُؤَثِّرَة، وَلَا يَتْرُكُ أَيَّ إِثْبَاتٍ رَقَابِيٍّ عَلَى عَدَالَةِ التَّنْفِيذْ. تُغَطِّي هَذِهِ الوَحْدَةُ كَافَّةَ السِّينَارْيُوهَاتِ المُتَوَافِقَةِ مَعَ مُتَطَلَّبَاتِ البَنْكِ المَرْكَزِيِّ المِصْرِيّ، وَتُرْسِلُ طَلَبَاتِ سَلَّاتِ العُمْلَاتِ وَأُذُونِ الخِزَانَةِ لِكَافَّةِ البُنُوكِ فِي لَحْظَةٍ وَاحِدَةٍ عَبْرَ رَوَابِطَ مُؤَمَّنَةٍ بِدُونِ كَلِمَةِ مُرُورْ، وَتَحْفَظُ العُرُوضَ مُشَفَّرَةً بِالكَامِلِ حَتَّى إِغْلَاقِ النَّافِذَة، ثُمَّ تُرَتِّبُهَا بِالصَّافِي الشَّامِلِ مَعَ مُقَارَنَتِهَا بِأَسْعَارِ السُّوقِ اللَّحْظِيَّةِ وَمُؤَشِّرِ البَنْكِ المَرْكَزِيّ، وَتُتِيحُ تَرْسِيَةَ كُلِّ عُمْلَةٍ لِأَفْضَلِ بَنْكٍ مَعَ إِصْدَارِ شَهَادَةِ تَدْقِيقٍ وَإِيصَالَاتِ صَفْقَةٍ رَقْمِيَّةٍ مَعْزُولَة.',
     },
     'pitch_reconciliation': {
         "en": 'Module Four, Executive Brief: Bank Auto-Reconciliation. Turn days of manual statement matching into minutes of exception governance. Finance teams lose days every month matching multi-bank statements, chasing wire fee differences across inter-account transfers, and posting bank charges manually. Grow imports Arabic and English bank statements with zero setup and automatically classifies bank fees, taxes, payroll, interest, and bounced checks. It pairs liquidity sweeps and error reversals automatically, learns recurring counterparty rules from user confirmations while protecting sensitive identities, flags ambiguous entries clearly for human review, and exports accounting entries through customizable ERP and General Ledger profiles.',
@@ -264,8 +266,8 @@ TOUR_STEP_NARRATIONS = {
     },
     'quotations_rfq': {
         1: {
-            "en": 'Step One: Multi-Pair Foreign Exchange Spot Basket Builder. Instead of calling banks one by one while currency markets move, structure up to four currency pairs in a single simultaneous tender. Here we combine buying five hundred thousand US Dollars and two hundred fifty thousand Euros against Egyptian Pounds, guided by live Central Bank fixings.',
-            "ar": 'الخُطْوَةُ الأُولَى: بِنَاءُ سَلَّةِ عُمْلَاتٍ فَوْرِيَّةٍ مُتَعَدِّدَةِ الأَزْوَاجِ فِي مُنَاقَصَةٍ مَصْرِفِيَّةٍ وَاحِدَة. بَدَلاً مِنَ الاتِّصَالِ الهَاتِفِيِّ المُتَتَابِعِ بِالبُنُوكِ مَعَ تَحَرُّكِ السُّوقْ، ابْنِ سَلَّةَ شِرَاءٍ حَتَّى أَرْبَعَةِ أَزْوَاجِ عُمْلَاتٍ مَعاً، مِثْلِ شِرَاءِ خَمْسِمِائَةِ أَلْفِ دُولَارْ وَمِائَتَيْنِ وَخَمْسِينَ أَلْفَ يُورُو، مَعَ اسْتِرْشَادٍ لَحْظِيٍّ بِسِعْرِ البَنْكِ المَرْكَزِيّ.',
+            "en": 'Step One: Multi-Pair Foreign Exchange Spot Basket Builder. Instead of calling banks one by one while currency markets move, structure up to four currency pairs in a single simultaneous tender. Here we combine buying five hundred thousand US Dollars and two hundred fifty thousand Euros against Egyptian Pounds, guided by live market feeds and Central Bank fixings.',
+            "ar": 'الخُطْوَةُ الأُولَى: بِنَاءُ سَلَّةِ عُمْلَاتٍ فَوْرِيَّةٍ مُتَعَدِّدَةِ الأَزْوَاجِ فِي مُنَاقَصَةٍ مَصْرِفِيَّةٍ وَاحِدَة. بَدَلاً مِنَ الاتِّصَالِ الهَاتِفِيِّ المُتَتَابِعِ بِالبُنُوكِ مَعَ تَحَرُّكِ السُّوقْ، ابْنِ سَلَّةَ شِرَاءٍ حَتَّى أَرْبَعَةِ أَزْوَاجِ عُمْلَاتٍ مَعاً، مِثْلِ شِرَاءِ خَمْسِمِائَةِ أَلْفِ دُولَارْ وَمِائَتَيْنِ وَخَمْسِينَ أَلْفَ يُورُو، مَعَ اسْتِرْشَادٍ بِأَسْعَارِ السُّوقِ اللَّحْظِيَّةِ وَسِعْرِ البَنْكِ المَرْكَزِيّ.',
         },
         2: {
             "en": "Step Two: Per-Bank Tariff Schedule and Settlement Time-Value Normalization. Selecting your relationship banks automatically applies each bank's pre-agreed commission percentage, minimum and maximum fee clamps, and flat transfer charges. It also enables alternative settlement dates normalized by your Time-Value-of-Money rate so different value dates rank fairly.",
@@ -298,12 +300,8 @@ TOUR_STEP_NARRATIONS = {
             "ar": 'الخُطْوَةُ الثَّالِثَة: حَارِسُ الحِمَايَةِ اللَّحْظِيَّةِ مِنْ أَخْطَاءِ الفَاصِلَةِ العَشْرِيَّةِ وَعَكْسِ الأَسْعَارْ. عِنْدَ إِدْخَالِ سِعْرٍ خَاطِئٍ بِفَاصِلَةٍ مُزَاحَة، يَعْتَرِضُ النِّظَامُ الإِرْسَالَ فَوْراً مُنَبِّهاً لِانْعِكَاسِ السِّعْرِ التَّقَاطُعِيِّ مُقَارَنَةً بِمُؤَشِّرِ البَنْكِ المَرْكَزِيِّ لِحِمَايَةِ الطَّرَفَيْنْ.',
         },
         4: {
-            "en": 'Step Four: Blind Live Competitive Rank Feedback. With live ranking active, the bank dealer sees their real-time rank standing without ever seeing competitor names or rival prices, creating instant competitive tension to tighten their spread while the window remains open.',
-            "ar": 'الخُطْوَةُ الرَّابِعَة: مُؤَشِّرُ التَّرْتِيبِ التَّنَافُسِيِّ الحَيِّ وَالسِّرِّيّ. يَرَى مُتَدَاوِلُ البَنْكِ تَرْتِيبَهُ التَّنَافُسِيَّ الحَالِيَّ بَيْنَ البُنُوكِ المُشَارِكَةِ كَرَقْمِ تَرْتِيبٍ فَقَطْ دُونَ أَيِّ كَشْفٍ لِأَسْمَاءِ أَوْ أَسْعَارِ المُنَافِسِينْ، مِمَّا يَدْفَعُهُ لِتَحْسِينِ سِعْرِهِ فَوْراً لِصَالِحِ الشَّرِكَة.',
-        },
-        5: {
-            "en": 'Step Five: Sharpening the Quote to Capture Rank Number One. Tightening the Dollar quote to fifty-one point two four elevates First National Corporate Bank to Number One Leading Quote in Market, locking in measurable basis-point savings for your treasury team. Click Next Tour for Net Award and Audit Certificates.',
-            "ar": 'الخُطْوَةُ الخَامِسَة: تَحْسِينُ السِّعْرِ وَانْتِزَاعُ المَرْكَزِ الأَوَّلِ فِي العَطَاءْ. بِمُجَرَّدِ خَفْضِ السِّعْرِ إِلَى وَاحِدٍ وَخَمْسِينَ جُنَيْهاً وَأَرْبَعَةٍ وَعِشْرِينَ قِرْشاً، يَرْتَقِي البَنْكُ فَوْراً إِلَى صَدَارَةِ المُنَافَسَة، مُحَقِّقاً وَفْراً مَالِيّاً مُبَاشِراً لِخِزَانَةِ الشَّرِكَةِ قَبْلَ إِغْلَاقِ النَّافِذَة.',
+            "en": 'Step Four: Encrypted Quote Submission and Real-Time Updates Before Cutoff. Once submitted, First National Corporate Bank’s firm quotes on Dollars and Euros are sealed with encryption, remaining completely hidden from rival banks and premature peeking while allowing the dealer to revise their own quote anytime before the window closes. Click Next Tour for Net Award and Audit Certificates.',
+            "ar": 'الخُطْوَةُ الرَّابِعَة: تَسْجِيلُ العَرْضِ مُشَفَّراً مَعَ إِمْكَانِيَّةِ تَحْدِيثِهِ لَحْظِيّاً قَبْلَ الإِغْلَاقْ. فَوْرَ الإِرْسَالْ، تُحْفَظُ أَسْعَارُ البَنْكِ المُلْزِمَةُ مُشَفَّرَةً بِالكَامِلِ دُونَ أَيِّ كَشْفٍ لِلْبُنُوكِ المُنَافِسَةِ أَوِ اطِّلَاعٍ مُبَكِّرٍ قَبْلَ انْتِهَاءِ الوَقْتْ، مَعَ إِتَاحَةِ تَحْدِيثِ المُتَدَاوِلِ لِعَرْضِهِ لَحْظِيّاً مَعَ تَحَرُّكِ السُّوقِ حَتَّى إِغْلَاقِ النَّافِذَة.',
         },
     },
     'quotations_award': {
@@ -316,8 +314,8 @@ TOUR_STEP_NARRATIONS = {
             "ar": 'الخُطْوَةُ الثَّانِيَة: التَّرْسِيَةُ المُجَزَّأَةُ لِأَفْضَلِ بَنْكٍ فِي كُلِّ عُمْلَةٍ خِلَالَ مُهْلَةِ القَبُولْ. يُرَشِّحُ النِّظَامُ الفَائِزَ الأَفْضَلَ لِكُلِّ عُمْلَةٍ عَلَى حِدَة؛ فَيَفُوزُ البَنْكُ الوَطَنِيُّ بِشِرَاءِ الدُّولَارْ، بَيْنَمَا يَفُوزُ بَنْكُ البَحْرِ المُتَوَسِّطِ بِشِرَاءِ اليُورُو لِتَعْظِيمِ إِجْمَالِيِّ الوَفْرْ.',
         },
         3: {
-            "en": 'Step Three: Four-Pillar Central Bank Rate Triangulation. Every awarded leg records a permanent benchmark check comparing your executed rate against the frozen Central Bank official mid-rate, live interbank spot feeds, historical fixings, and anonymous corporate spread cohorts.',
-            "ar": 'الخُطْوَةُ الثَّالِثَة: تَوْثِيقُ عَدَالَةِ السِّعْرِ مُقَارَنَةً بِمُؤَشِّرِ البَنْكِ المَرْكَزِيِّ لَحْظَةَ التَّنْفِيذْ. يُوَثِّقُ النِّظَامُ لِكُلِّ عُمْلَةٍ مُقَارَنَةً مَرْجِعِيَّةً رُبَاعِيَّةً تَرْبِطُ سِعْرَ التَّنْفِيذِ الفِعْلِيَّ بِالسِّعْرِ الرَّسْمِيِّ المُعْلَنِ مِنَ البَنْكِ المَرْكَزِيِّ وَمُتَوَسِّطَاتِ السُّوقْ.',
+            "en": 'Step Three: Dual Live Market and Central Bank Rate Benchmarking. Every awarded leg records a permanent benchmark check comparing your executed net rate against both live interbank spot feeds and frozen Central Bank official fixings, alongside historical fixings and anonymous corporate spread cohorts.',
+            "ar": 'الخُطْوَةُ الثَّالِثَة: تَوْثِيقُ عَدَالَةِ السِّعْرِ مُقَارَنَةً بِأَسْعَارِ السُّوقِ اللَّحْظِيَّةِ وَمُؤَشِّرِ البَنْكِ المَرْكَزِيّ. يُوَثِّقُ النِّظَامُ لِكُلِّ عُمْلَةٍ مُقَارَنَةً مَرْجِعِيَّةً تَرْبِطُ سِعْرَ التَّنْفِيذِ الفِعْلِيَّ بِأَسْعَارِ السُّوقِ الفَوْرِيَّةِ وَالسِّعْرِ الرَّسْمِيِّ المُعْلَنِ مِنَ البَنْكِ المَرْكَزِيِّ وَمُتَوَسِّطَاتِ السُّوقْ.',
         },
         4: {
             "en": 'Step Four: Printable Best Execution Audit Certificate. One click opens an executive Best Execution Audit Certificate ready for print or PDF export, documenting every invited bank, submission timestamp, net price, and quantified treasury savings for boards and statutory auditors.',
@@ -423,6 +421,100 @@ TOUR_STEP_NARRATIONS = {
 }
 
 
+STORY_CHAPTER_NARRATIONS = {
+    "platform_intro": {
+        1: {
+            "en": "Grow unifies corporate treasury in four specialized modules, starting with LG Custody, which scans incoming vendor guarantees with AI, highlights restrictive claim wording upfront, drives automated expiry reminders and management escalations so no guarantee slips, fast-tracks protective extensions, and seals releases with QR-verified bank letters.",
+            "ar": "تُوَحِّدُ مِنَصَّةُ Grow عَمَلِيَّاتِ الخِزَانَةِ المُؤَسَّسِيَّةِ فِي أَرْبَعِ وَحَدَاتٍ مُتَخَصِّصَة؛ تَبْدَأُ بِوَحْدَةِ حِفْظِ الضَّمَانَاتِ الوَارِدَةِ الَّتِي تَمْسَحُ ضَمَانَاتِ المُقَاوِلِينَ بِالذَّكَاءِ الاصْطِنَاعِيّ، وَتَكْشِفُ شُرُوطَ المُصَادَرَةِ المُقَيِّدَةَ مُبَكِّراً، وَتُطْلِقُ تَنْبِيهَاتٍ اسْتِبَاقِيَّةً وَتَصْعِيداً آلِيّاً لِلْإِدَارَةِ قَبْلَ أَيِّ اسْتِحْقَاقْ، وَتُنَفِّذُ التَّمْدِيدَ الحِمَائِيَّ مُبَاشَرَةً مَعَ تَأْمِينِ الإِفْرَاجِ بِخِطَابَاتِ كيو آرْ مُوَثَّقَة.",
+        },
+        2: {
+            "en": "Second, LG Issuance digitizes and unifies all outgoing guarantee requests in one place, with a fully customizable request form and configurable approval matrix. AI verifies contracts and wording risks, scores bank facilities from zero to one hundred across fees and margin terms, automatically fills official bank PDF forms, and reconciles Bank LG Position reports.",
+            "ar": "ثَانِياً، تُرَقْمِنُ وَحْدَةُ إِصْدَارِ الضَّمَانَاتِ الصَّادِرَةِ كَافَّةَ طَلَبَاتِ الإِدَارَاتِ وَتُوَحِّدُهَا فِي مَكَانٍ وَاحِدٍ بِنَمُوذَجِ طَلَبٍ وَمَصْفُوفَةِ اعْتِمَادٍ قَابِلَةٍ لِلتَّخْصِيصِ الكَامِلْ؛ مَعَ فَحْصٍ ذَكِيٍّ لِلْعُقُودِ وَالصِّيَاغَة، وَمُفَاضَلَةٍ لَحْظِيَّةٍ لِلتَّسْهِيلَاتِ مِنْ صِفْرٍ إِلَى مِائَة، وَتَعْبِئَةٍ آلِيَّةٍ لِاسْتِمَارَاتِ البُنُوكْ، وَمُطَابَقَةِ تَقَارِيرِ مَرَاكِزِ الضَّمَانَاتِ البَنْكِيَّة.",
+        },
+        3: {
+            "en": "Third, Foreign Exchange and Treasury Bill Quotations replaces phone shopping with flexible, auditable multi-bank competition tailored to Central Bank of Egypt scenarios, supporting Execution versus Indicative benchmark roles, selective document visibility, and alternative value dates. Banks quote through zero-password links into sealed bidding, then rank on all-in net cost checked against live market and Central Bank rates.",
+            "ar": "ثَالِثاً، تَسْتَبْدِلُ وَحْدَةُ عُرُوضِ العُمْلَاتِ وَأُذُونِ الخِزَانَةِ التَّفَاوُضَ الهَاتِفِيَّ بِمُنَافَسَةٍ مَصْرِفِيَّةٍ مُوَثَّقَةٍ وَمَرِنَةٍ بِالكَامِلْ تُغَطِّي مُخْتَلِفَ السِّينَارْيُوهَاتِ المُتَوَافِقَةِ مَعَ مُتَطَلَّبَاتِ البَنْكِ المَرْكَزِيِّ المِصْرِيّ، مِنَ الفَصْلِ بَيْنَ بُنُوكِ التَّنْفِيذِ وَبُنُوكِ التَّسْعِيرِ الِاسْتِرْشَادِيِّ وَالتَّحَكُّمِ فِي إِتَاحَةِ المُسْتَنَدَاتِ وَتَوَارِيخِ التَّسْوِيَة. كَمَا تَدْعَمُ التَّسْعِيرَ المُشَفَّرَ بِلَا كَلِمَةِ مُرُورْ، وَالتَّرْسِيَةَ بِالصَّافِي الشَّامِلِ مُقَارَنَةً بِأَسْعَارِ السُّوقِ اللَّحْظِيَّةِ وَمُؤَشِّرِ المَرْكَزِيّ.",
+        },
+        4: {
+            "en": "Fourth, Bank Auto-Reconciliation imports Arabic and English bank statements with zero setup, pairs cross-bank sweeps even when wire fees are deducted, continuously learns and evolves with every review under per-company encryption, and exports balanced double-entry ERP journals. Choose any module next to watch its story or explore hands-on.",
+            "ar": "رَابِعاً، تَسْتَوْرِدُ وَحْدَةُ المُطَابَقَةِ البَنْكِيَّةِ الذَّكِيَّةِ كُشُوفَ الحِسَابَاتِ العَرَبِيَّةَ وَالإِنْجِلِيزِيَّةَ دُونَ إِعْدَادَاتٍ مُسْبَقَة، وَتَرْبِطُ التَّحْوِيلَاتِ البَيْنِيَّةَ حَتَّى مَعَ خَصْمِ عُمُولَاتِ التَّحْوِيلْ، وَتَتَعَلَّمُ وَتَتَطَوَّرُ بِاسْتِمْرَارٍ مَعَ كُلِّ دَوْرَةِ مُطَابَقَةٍ بِتَشْفِيرٍ مُسْتَقِلٍّ لِكُلِّ شَرِكَة، وَتُصَدِّرُ قُيُودَ يَوْمِيَّةٍ مُزْدَوَجَةً مُتَوَازِنَةً لِنِظَامِ إي آر بي. اخْتَرْ أَيَّ وَحْدَةٍ الآنَ لِمُشَاهَدَةِ قِصَّتِهَا أَوْ تَجْرِبَتِهَا تَفَاعُلِيّاً.",
+        },
+    },
+    "custody": {
+        1: {
+            "en": "Missing a single expiry date in an Excel sheet can wipe out millions in supplier performance security overnight. In LG Custody, your team uploads any incoming guarantee scan and Grow's AI extracts every field in seconds, highlighting conditional claim wording upfront and linking project owners with automatic management escalations.",
+            "ar": "فَوَاتُ مَوْعِدِ انْتِهَاءِ ضَمَانٍ وَاحِدٍ فِي جَدَاوِلِ الإِكْسِيلْ قَدْ يُفْقِدُ الشَّرِكَةَ مَلَايِينَ الجُنَيْهَاتِ مِنْ غِطَاءِ حُسْنِ التَّنْفِيذِ فَوْراً. فِي وَحْدَةِ حِفْظِ الضَّمَانَاتِ الوَارِدَة، يَرْفَعُ فَرِيقُكَ صُورَةَ الضَّمَانِ لِتَسْتَخْرِجَ مِنَصَّةُ Grow كَافَّةَ البَيَانَاتِ بِالذَّكَاءِ الاصْطِنَاعِيِّ خِلَالَ ثَوَانٍ، وَتَكْشِفَ شُرُوطَ التَّسْيِيلِ المُقَيِّدَةَ مُبَكِّراً مَعَ رَبْطِ مَسْؤُولِ المَشْرُوعِ بِسِلْسِلَةِ تَصْعِيدٍ آلِيٍّ لِلْإِدَارَة.",
+        },
+        2: {
+            "en": "A live four-queue Action Center tracks upcoming renewals, pending prints, branch deliveries, and overdue bank replies, backed by automated owner reminders and multi-stage management escalations before any cutoff date. Because extending a vendor guarantee protects your company, Grow executes protective extensions directly with zero approval delay.",
+            "ar": "يُرَاقِبُ مَرْكَزُ الإِجْرَاءَاتِ الحَيُّ أَرْبَعَ قَوَائِمَ تَشْمَلُ التَّجْدِيدَاتِ وَالطِّبَاعَةَ وَالتَّسْلِيمَ وَرُدُودَ البُنُوكِ المُتَأَخِّرَة، مَدْعُوماً بِتَنْبِيهَاتٍ اسْتِبَاقِيَّةٍ لِلْمَسْؤُولِينَ وَتَصْعِيدٍ آلِيٍّ مُتَدَرِّجٍ لِلْإِدَارَةِ قَبْلَ فَوَاتِ أَيِّ مُهْلَة؛ مَعَ تَنْفِيذِ التَّمْدِيدِ الحِمَائِيِّ مُبَاشَرَةً دُونَ انْتِظَارِ طَوَابِيرِ الاعْتِمَادْ.",
+        },
+        3: {
+            "en": "Whenever an action reduces your financial protection, such as a milestone reduction, release, or liquidation, Grow blocks self-approval, requires supporting evidence, and enforces Maker-Checker sign-off. Approved bank letters carry a digitally signed QR code and split security code that bank officers verify online in seconds.",
+            "ar": "عِنْدَمَا يُؤَثِّرُ الإِجْرَاءُ عَلَى الغِطَاءِ المَالِيِّ لِلشَّرِكَة، مِثْلِ التَّخْفِيضِ المَرْحَلِيِّ أَوِ الإِفْرَاجِ أَوِ التَّسْيِيلْ، يَمْنَعُ النِّظَامُ الاعْتِمَادَ الذَّاتِيَّ وَيُلْزِمُ بِإِرْفَاقِ المُسْتَنَدَاتِ المُؤَيِّدَةِ وَاعْتِمَادِ المُرَاجِعِ وَالمُعْتَمِدْ. وَتَصْدُرُ خِطَابَاتُ البُنُوكِ مَخْتُومَةً بِرَمْزِ كيو آرْ مُوَقَّعٍ رَقْمِيّاً وَكُودِ أَمَانٍ يَتَحَقَّقُ مِنْهُ مُوَظَّفُ البَنْكِ فَوْراً عَبْرَ بَوَّابَةِ التَّحَقُّقْ.",
+        },
+        4: {
+            "en": "Printing a bank letter is never the finish line. Grow audits physical bank receiving stamps for date accuracy and cross-checks incoming bank amendment advices side by side against your original instruction, ensuring no guarantee expires or changes silently before closing the audit loop.",
+            "ar": "طِبَاعَةُ الخِطَابِ لَيْسَتْ نِهَايَةَ المَطَافْ؛ فَالنِّظَامُ يَفْحَصُ خَتْمَ اسْتِلَامِ البَنْكِ الفِعْلِيَّ لِمُطَابَقَةِ التَّوَارِيخْ، وَيُرَاجِعُ إِشْعَارَ البَنْكِ الرَّسْمِيَّ جَنْباً إِلَى جَنْبٍ مَعَ تَعْلِيمَاتِكُمُ الأَصْلِيَّةِ بِالذَّكَاءِ الاصْطِنَاعِيّ، لِضَمَانِ عَدَمِ تَعْدِيلِ أَوْ سُقُوطِ أَيِّ ضَمَانٍ بِصَمْتٍ وَإِغْلَاقِ الدَّوْرَةِ الرَّقَابِيَّةِ بِالكَامِلْ.",
+        },
+    },
+    "issuance": {
+        1: {
+            "en": "Instead of scattered department emails, LG Issuance digitizes and unifies all outgoing guarantee requests in one central portal, with a fully customizable request form and sequential approval matrix by amount, department, or risk, while AI verifies contracts, blocks duplicates, and flags risky beneficiary wording.",
+            "ar": "بَدَلاً مِنْ تَشَتُّتِ الطَّلَبَاتِ عَبْرَ الإِيمِيلَاتْ، تُرَقْمِنُ وَحْدَةُ الإِصْدَارِ كَافَّةَ طَلَبَاتِ الإِدَارَاتِ وَتُوَحِّدُهَا فِي بَوَّابَةٍ مَرْكَزِيَّةٍ بِنَمُوذَجِ طَلَبٍ وَمَصْفُوفَةِ مَوَافَقَاتٍ قَابِلَةٍ لِلتَّخْصِيصِ الكَامِلِ حَسَبَ المَبْلَغِ أَوِ الإِدَارَةِ أَوِ المَخَاطِرْ، بَيْنَمَا يُطَابِقُ الذَّكَاءُ الاصْطِنَاعِيُّ العُقُودَ وَيَمْنَعُ التَّكْرَارَ وَيَكْشِفُ فِخَاخَ الصِّيَاغَة.",
+        },
+        2: {
+            "en": "Choosing which bank line should issue a new guarantee shouldn't rely on guesswork. Grow evaluates every eligible bank facility from zero to one hundred across commission tariffs, cash margin terms, actual bank turnaround speed, and sub-limit utilization, reserving facility headroom atomically upon selection.",
+            "ar": "اخْتِيَارُ البَنْكِ الأَنْسَبِ لِإِصْدَارِ الضَّمَانِ لَمْ يَعُدْ يَعْتَمِدُ عَلَى التَّقْدِيرِ الشَّخْصِيّ؛ إِذْ تُقَيِّمُ مِنَصَّةُ Grow كَافَّةَ التَّسْهِيلَاتِ المُؤَهَّلَةِ مِنْ صِفْرٍ إِلَى مِائَةٍ حَسَبَ شُرُوطِ العُمُولَةِ وَنِسْبَةِ الغِطَاءِ وَسُرْعَةِ تَنْفِيذِ البَنْكِ الفِعْلِيَّةِ وَإِتَاحَةِ الحُدُودِ الفَرْعِيَّة، مَعَ حَجْزِ الرَّصِيدِ الائْتِمَانِيِّ لَحْظِيّاً.",
+        },
+        3: {
+            "en": "Instead of retyping paper bank forms by hand, Grow populates the selected bank's official PDF application and legal wording annex in one click, tracks branch delivery, and cross-checks the bank's final issued guarantee scan with AI to catch tariff or expiry discrepancies immediately.",
+            "ar": "بَدَلاً مِنْ إِعَادَةِ كِتَابَةِ اسْتِمَارَاتِ البُنُوكِ الوَرَقِيَّةِ يَدَوِيّاً، تَمْلَأُ المِنَصَّةُ نَمُوذَجَ بي دي إفْ الرَّسْمِيَّ لِلْبَنْكِ المُخْتَارِ وَمُلْحَقَ الصِّيَاغَةِ بِضَغْطَةٍ وَاحِدَة، وَتَتَتَبَّعُ التَّسْلِيمَ لِلْفَرْعْ، ثُمَّ تُطَابِقُ صُورَةَ الضَّمَانِ الصَّادِرِ مِنَ البَنْكِ بِالذَّكَاءِ الاصْطِنَاعِيِّ لِكَشْفِ أَيِّ اخْتِلَافٍ فِي المَبْلَغِ أَوِ الصَّلَاحِيَّةِ فَوْراً.",
+        },
+        4: {
+            "en": "Post-issuance lifecycle stays governed end to end: guarantee returns execute directly, extensions and amount increases route through your approval matrix, and periodic Bank LG Position reports reconcile automatically against your register to flag amount variances, unrecorded items, or expired guarantees still open at the bank.",
+            "ar": "تَسْتَمِرُّ الحَوْكَمَةُ طَوَالَ دَوْرَةِ حَيَاةِ الضَّمَانِ الصَّادِرْ؛ حَيْثُ تُنَفَّذُ إِجْرَاءَاتُ رَدِّ وَإِلْغَاءِ الضَّمَانِ مُبَاشَرَةً، وَتَمُرُّ التَّمْدِيدَاتُ وَالزِّيَادَاتُ عَبْرَ مَصْفُوفَةِ الاعْتِمَادْ، وَتُطَابِقُ المِنَصَّةُ تَقَارِيرَ مَرَاكِزِ الضَّمَانَاتِ الوَارِدَةَ مِنَ البُنُوكِ تِلْقَائِيّاً مَعَ سِجِلَّاتِكُمْ لِكَشْفِ أَيِّ فُرُوقِ مَبَالِغَ أَوْ ضَمَانَاتٍ مُنْتَهِيَةٍ مَا زَالَتْ مَفْتُوحَةً لَدَى البَنْكْ.",
+        },
+    },
+    "quotations": {
+        1: {
+            "en": "Shopping Foreign Exchange deals or Treasury Bills by phone leaves basis points on the table. Grow adapts to every Central Bank of Egypt scenario, supporting Execution versus Indicative benchmark banks per leg, selective supporting-document visibility, alternative value dates, and upfront bank fee and time-value-of-money normalization.",
+            "ar": "التَّفَاوُضُ الهَاتِفِيُّ يُفْقِدُ الشَّرِكَةَ نِقَاطاً سِعْرِيَّةً مُؤَثِّرَة؛ لِذَا تُغَطِّي مِنَصَّةُ Grow كَافَّةَ السِّينَارْيُوهَاتِ المُتَوَافِقَةِ مَعَ مُتَطَلَّبَاتِ البَنْكِ المَرْكَزِيِّ المِصْرِيّ، مِنْ تَحْدِيدِ بُنُوكِ التَّنْفِيذِ الفِعْلِيِّ وَبُنُوكِ التَّسْعِيرِ الِاسْتِرْشَادِيِّ لِكُلِّ عُمْلَة، وَالتَّحَكُّمِ فِي إِتَاحَةِ المُسْتَنَدَاتِ وَتَوَارِيخِ التَّسْوِيَة، وَاحْتِسَابِ عُمُولَاتِ كُلِّ بَنْكٍ مُسْبَقاً.",
+        },
+        2: {
+            "en": "Banks hate creating portal passwords. Grow authenticates bank dealers in seconds through domain-locked one-time codes into an encrypted bidding desk, complete with live fat-finger guardrails that block misplaced decimals and inverted currency legs before a mistaken quote ever hits your blotter.",
+            "ar": "تَتَجَنَّبُ البُنُوكُ دَائِماً تَعْقِيدَاتِ إِنْشَاءِ الحِسَابَاتِ وَكَلِمَاتِ المُرُورْ؛ لِذَلِكَ تُوَثِّقُ المِنَصَّةُ هُوِيَّةَ مُتَدَاوِلِ البَنْكِ خِلَالَ ثَوَانٍ بِرَمْزِ تَحَقُّقٍ مُرْتَبِطٍ بِنِطَاقِ البَنْكْ، دَاخِلَ نَافِذَةِ تَسْعِيرٍ مُشَفَّرَةٍ مُزَوَّدَةٍ بِضَوَابِطَ ذَكِيَّةٍ تَمْنَعُ أَخْطَاءَ العَلَامَةِ العَشْرِيَّةِ أَوْ عَكْسَ أَسْعَارِ العُمْلَاتِ قَبْلَ إِرْسَالِ العَرْضْ.",
+        },
+        3: {
+            "en": "While the bidding countdown is open, every submitted quote stays strictly sealed with encryption until the clock hits zero, preventing premature rate leakage while your treasury desk tracks live dealer connections and locked-in quotes in real time, and dealers freely update their own sealed quotes as the market moves.",
+            "ar": "طَوَالَ سَرَيَانِ العَدِّ التَّنَازُلِيِّ لِلطَّرْحْ، تَظَلُّ كَافَّةُ العُرُوضِ المُقَدَّمَةِ مُشَفَّرَةً بِالكَامِلِ حَتَّى لَحْظَةِ الإِغْلَاقْ، مِمَّا يَمْنَعُ أَيَّ كَشْفٍ مُبَكِّرٍ لِلْأَسْعَارْ، بَيْنَمَا يُتَابِعُ فَرِيقُ الخِزَانَةِ اتِّصَالَ البُنُوكِ وَعَدَدَ العُرُوضِ المُسَجَّلَةِ لَحْظِيّاً مَعَ إِمْكَانِيَّةِ تَحْدِيثِ كُلِّ مُتَدَاوِلٍ لِعَرْضِهِ المُشَفَّرِ قَبْلَ انْتِهَاءِ المُهْلَة.",
+        },
+        4: {
+            "en": "The instant the window closes, Grow ranks bids by all-in net cost, benchmarks quotes against both live market rates and Central Bank fixings, lets you cherry-pick the winning bank per currency leg, and generates a Best Execution Audit Certificate plus bank-scoped cryptographic Deal Execution Receipts.",
+            "ar": "فَوْرَ إِغْلَاقِ نَافِذَةِ التَّسْعِيرْ، تُرَتِّبُ المِنَصَّةُ العُرُوضَ بِالصَّافِي الشَّامِلْ، وَتُقَارِنُهَا بِأَسْعَارِ السُّوقِ اللَّحْظِيَّةِ وَمُؤَشِّرِ البَنْكِ المَرْكَزِيِّ مَعاً، وَتُتِيحُ تَرْسِيَةَ كُلِّ عُمْلَةٍ لِأَفْضَلِ بَنْكٍ عَلَى حِدَة، مَعَ إِصْدَارِ شَهَادَةِ تَدْقِيقِ أَفْضَلِ تَنْفِيذٍ لِلْمُرَاجِعِينَ وَإِيصَالَاتِ صَفْقَةٍ رَقْمِيَّةٍ مَعْزُولَةٍ لِكُلِّ بَنْكٍ فَائِزْ.",
+        },
+    },
+    "reconciliation": {
+        1: {
+            "en": "Finance teams lose days every month formatting multi-bank Excel files and decoding cryptic Arabic and English memos. Grow auto-detects statement columns with zero setup, verifies opening-to-closing mathematical balance continuity, and classifies fees, taxes, payroll, and collections with explainable AI badges.",
+            "ar": "تَسْتَنْزِفُ الفِرَقُ المَالِيَّةُ أَيَّاماً كُلَّ شَهْرٍ فِي تَنْسِيقِ كُشُوفِ البُنُوكِ وَفَكِّ رُمُوزِ القُيُودِ العَرَبِيَّةِ وَالإِنْجِلِيزِيَّة. تَكْتَشِفُ مِنَصَّةُ Grow أَعْمِدَةَ أَيِّ كَشْفِ حِسَابٍ تِلْقَائِيّاً دُونَ إِعْدَادَاتٍ مُسْبَقَة، وَتَتَحَقَّقُ رِيَاضِيّاً مِنْ تَسَلْسُلِ الرَّصِيدِ الِافْتِتَاحِيِّ وَالخِتَامِيّ، وَتُصَنِّفُ العُمُولَاتِ وَالضَّرَائِبَ وَالرَّوَاتِبَ وَالتَّحْصِيلَاتِ بِشَارَاتٍ مُفَسَّرَة.",
+        },
+        2: {
+            "en": "Inter-bank transfers break traditional matching whenever corridor wire fees reduce the incoming credit. Grow pairs outgoing and incoming liquidity sweeps across banks automatically, isolates exact wire fee deductions, nets returned wires to zero, and reconciles ERP invoices with fee tolerances.",
+            "ar": "تَفْشَلُ المُطَابَقَةُ التَّقْلِيدِيَّةُ فِي التَّحْوِيلَاتِ بَيْنَ البُنُوكِ بِمُجَرَّدِ خَصْمِ عُمُولَةِ التَّحْوِيلِ مِنَ المَبْلَغِ المُسْتَلَمْ. تَرْبِطُ المِنَصَّةُ التَّحْوِيلَاتِ الصَّادِرَةَ وَالوَارِدَةَ عَبْرَ البُنُوكِ تِلْقَائِيّاً مَعَ فَصْلِ فَرْقِ عُمُولَةِ التَّحْوِيلِ بِدِقَّة، وَتُصَفِّي الحَوَالَاتِ المُرْتَدَّة، وَتُطَابِقُ فَوَاتِيرَ إي آر بي مَعَ مُعَالَجَةِ فُرُوقِ الرُّسُومْ.",
+        },
+        3: {
+            "en": "Every time your team confirms a vendor, customer, or bank pattern, Grow learns and evolves automatically, inducing recurring rules in one click, self-monitoring rule precision over time, and encrypting counterparty names inside per-company vaults with zero sensitive identity exposure.",
+            "ar": "مَعَ كُلِّ تَأْكِيدٍ لِتَصْنِيفِ مُوَرِّدٍ أَوْ عَمِيلٍ أَوْ حَرَكَةٍ بَنْكِيَّة، يَتَعَلَّمُ النِّظَامُ وَيَتَطَوَّرُ تِلْقَائِيّاً؛ فَيَسْتَنْتِجُ قَوَاعِدَ التَّكْرَارِ بِضَغْطَةٍ وَاحِدَة، وَيُرَاقِبُ دِقَّتَهَا وَيُحَدِّثُهَا ذَاتِيّاً بِمُرُورِ الوَقْتْ، مَعَ حِفْظِ أَسْمَاءِ الأَطْرَافِ مُشَفَّرَةً بِمَفَاتِيحَ مُسْتَقِلَّةٍ لِكُلِّ شَرِكَةٍ وَحِمَايَةٍ تَامَّةٍ لِلْخُصُوصِيَّة.",
+        },
+        4: {
+            "en": "Once exceptions are reviewed, Grow expands every bank movement into balanced Cash, Customer or Vendor Offset, and Bank Fee Variance journal legs, formatted to your SAP, Oracle, or Dynamics layout and locked on download so no batch can ever be double-posted.",
+            "ar": "فَوْرَ مُرَاجَعَةِ الِاسْتِثْنَاءَاتْ، يُحَوِّلُ النِّظَامُ كُلَّ حَرَكَةٍ بَنْكِيَّةٍ إِلَى قَيْدِ يَوْمِيَّةٍ مُتَوَازِنٍ يَشْمَلُ البَنْكَ وَحِسَابَ العَمِيلِ أَوِ المُوَرِّدِ وَسَطْرَ فَرْقِ العُمُولَة، مُنَسَّقاً حَسَبَ قَالَبِ نِظَامِ إي آر بي لَدَيْكُمْ، مَعَ قَفْلِ الدُّفْعَةِ عِنْدَ التَّحْمِيلِ لِمَنْعِ تَكْرَارِ تَرْحِيلِ أَيِّ قَيْدٍ مَرَّتَيْنْ.",
+        },
+    },
+}
+
+
 def _validate_ar_script(label: str, txt: str):
     if "جرو" in txt:
         raise ValueError(f"[{label}] Forbidden Arabic transliteration 'جرو' found; use 'Grow'!")
@@ -458,6 +550,15 @@ def validate_scripts():
             spaced_match = spaced_acronym_re.findall(langs["en"])
             if spaced_match:
                 raise ValueError(f"Found spaced-period acronym {spaced_match} inside TOUR_STEP_NARRATIONS[{tour_dir}][{step}]['en']!")
+
+    for story_id, chapters_map in STORY_CHAPTER_NARRATIONS.items():
+        for ch_num, langs in chapters_map.items():
+            _validate_ar_script(f"STORY_CHAPTER_NARRATIONS[{story_id}][{ch_num}]", langs["ar"])
+            if langs["ar"].count("Grow") > 1:
+                raise ValueError(f"At most 1 'Grow' allowed per chapter in STORY_CHAPTER_NARRATIONS[{story_id}][{ch_num}]['ar']!")
+            spaced_match = spaced_acronym_re.findall(langs["en"])
+            if spaced_match:
+                raise ValueError(f"Found spaced-period acronym {spaced_match} inside STORY_CHAPTER_NARRATIONS[{story_id}][{ch_num}]['en']!")
 
 
 def _sec_to_frame_byte(sec: float, total_len: int) -> int:
@@ -507,12 +608,15 @@ async def _get_english_grow_frames():
         if _GROW_CLIP_CACHE is not None:
             return _GROW_CLIP_CACHE
         g_audio, g_words = await _collect_tts_retry(
-            "Platform Grow today.", VOICE_EN, rate="-6%", pitch="-2Hz"
+            "Platform Grow, today.", "en-US-AvaMultilingualNeural", rate="-6%", pitch="-2Hz"
         )
         silence = g_audio[: FRAME_BYTES * 2]  # 48ms clean silent MP3 frames
         grow_idx = next(i for i, w in enumerate(g_words) if w["text"].lower() == "grow")
         cut_start = _sec_to_frame_byte(g_words[grow_idx]["offset_s"], len(g_audio))
-        cut_end = _sec_to_frame_byte(g_words[grow_idx + 1]["offset_s"] - 0.010, len(g_audio))
+        cut_end = _sec_to_frame_byte(
+            min(g_words[grow_idx + 1]["offset_s"] - 0.020, g_words[grow_idx]["offset_s"] + g_words[grow_idx]["dur_s"] + 0.070),
+            len(g_audio),
+        )
         _GROW_CLIP_CACHE = silence + g_audio[cut_start:cut_end] + silence
         return _GROW_CLIP_CACHE
 
@@ -564,10 +668,14 @@ async def synth_file(out_path: str, lang: str, text: str, force: bool = False):
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            communicate = edge_tts.Communicate(text=tts_text, voice=voice, rate=rate)
+            chosen_voice = "en-US-AvaNeural" if (lang == "en" and attempt >= 3) else voice
+            communicate = edge_tts.Communicate(
+                text=tts_text, voice=chosen_voice, rate=rate
+            )
             await asyncio.wait_for(communicate.save(tmp_path), timeout=45.0)
             os.replace(tmp_path, out_path)
-            print(f"[OK]   {os.path.relpath(out_path, AUDIO_ROOT)} [{voice} {rate}] ({os.path.getsize(out_path) // 1024} KB)", flush=True)
+            await asyncio.sleep(0.15)
+            print(f"[OK]   {os.path.relpath(out_path, AUDIO_ROOT)} [{chosen_voice} {rate}] ({os.path.getsize(out_path) // 1024} KB)", flush=True)
             return
         except Exception as exc:
             print(f"[WARN] {os.path.basename(out_path)} attempt {attempt} failed: {repr(exc)}", flush=True)
@@ -580,26 +688,36 @@ async def main():
     force_all = "--force-all" in sys.argv
     only_ar = "--only-ar" in sys.argv
     only_en = "--only-en" in sys.argv
+    only_stories = "--only-stories" in sys.argv
     target_langs = ("ar",) if only_ar else (("en",) if only_en else ("en", "ar"))
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(1)
 
     async def bounded_synth(out_path: str, lang: str, text: str):
         async with sem:
             await synth_file(out_path, lang, text, force=force_all)
 
     tasks = []
-    for tour_dir, steps_map in TOUR_STEP_NARRATIONS.items():
-        target_dir = os.path.join(AUDIO_ROOT, tour_dir)
-        os.makedirs(target_dir, exist_ok=True)
-        for step, langs in steps_map.items():
+    if not only_stories:
+        for tour_dir, steps_map in TOUR_STEP_NARRATIONS.items():
+            target_dir = os.path.join(AUDIO_ROOT, tour_dir)
+            os.makedirs(target_dir, exist_ok=True)
+            for step, langs in steps_map.items():
+                for lang in target_langs:
+                    out_path = os.path.join(target_dir, f"step{step}_{lang}.mp3")
+                    tasks.append(bounded_synth(out_path, lang, langs[lang]))
+
+        for key, langs in PITCH_NARRATIONS.items():
             for lang in target_langs:
-                out_path = os.path.join(target_dir, f"step{step}_{lang}.mp3")
+                out_path = os.path.join(PITCHES_DIR, f"{key}_{lang}.mp3")
                 tasks.append(bounded_synth(out_path, lang, langs[lang]))
 
-    for key, langs in PITCH_NARRATIONS.items():
-        for lang in target_langs:
-            out_path = os.path.join(PITCHES_DIR, f"{key}_{lang}.mp3")
-            tasks.append(bounded_synth(out_path, lang, langs[lang]))
+    for story_id, chapters_map in STORY_CHAPTER_NARRATIONS.items():
+        story_out_dir = os.path.join(STORIES_DIR, story_id)
+        os.makedirs(story_out_dir, exist_ok=True)
+        for ch_num, langs in chapters_map.items():
+            for lang in target_langs:
+                out_path = os.path.join(story_out_dir, f"ch{ch_num}_{lang}.mp3")
+                tasks.append(bounded_synth(out_path, lang, langs[lang]))
 
     await asyncio.gather(*tasks)
 
