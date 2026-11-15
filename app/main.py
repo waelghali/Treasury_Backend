@@ -296,7 +296,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         quotations_endpoints, public_quotations, bank_dealer_endpoints, reconciliation_endpoints,
         notification_endpoints, ai_query_assistant, user_feedback,
         inbox_endpoints, system_holidays_endpoints, campaign_endpoints,
-        document_streaming
+        document_streaming, public_demo_chat
     )
 
     from app.api.v1.endpoints import issuance as issuance_package
@@ -605,6 +605,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(auth_v2_router, prefix="/api/v2")
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
+    fastapi_app.include_router(public_demo_chat.router, prefix="/api/v1/public-demo", tags=["Public Demo AI Product Expert"])
     from app.core.security import require_issuance_module, require_custody_module, require_issuance_or_custody_module
     fastapi_app.include_router(issuance_package.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_or_custody_module)])
     fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])
@@ -672,6 +673,7 @@ def configure_app_instance(fastapi_app: FastAPI):
     os.makedirs(os.path.join("uploads", "quotations"), exist_ok=True)
     os.makedirs(os.path.join("private_storage", "inbox"), exist_ok=True)
     os.makedirs(os.path.join("private_storage", "ai_chat_logs"), exist_ok=True)
+    os.makedirs(os.path.join("private_storage", "public_demo_chat_logs"), exist_ok=True)
 
     @fastapi_app.get("/uploads/quotations/{legacy_rel_path:path}", include_in_schema=False)
     def serve_legacy_quotation_upload(
