@@ -23,11 +23,13 @@ if sys.platform.startswith("linux"):
         pass
 
 # FastAPI imports
-from fastapi import FastAPI, Depends, HTTPException, status
+from typing import Optional
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # SQLAlchemy imports
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 # APScheduler Imports
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -253,11 +255,22 @@ def configure_app_instance(fastapi_app: FastAPI):
         "http://127.0.0.1",
         "http://127.0.0.1:3000",
     ]
+    for env_origin_key in ("FRONTEND_URL", "ADDITIONAL_CORS_ORIGINS"):
+        raw_env_origins = os.getenv(env_origin_key, "")
+        for extra_origin in raw_env_origins.split(","):
+            cleaned = extra_origin.strip().rstrip("/")
+            if cleaned and cleaned not in origins:
+                origins.append(cleaned)
+
+    cors_origin_regex = os.getenv(
+        "CORS_ORIGIN_REGEX",
+        r"^https:\/\/([a-zA-Z0-9_-]+\.)*growbusinessdevelopment\.com$",
+    )
 
     fastapi_app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_origin_regex=r"^https:\/\/([a-zA-Z0-9_-]+\.)*(vercel\.app|growbusinessdevelopment\.com)$",
+        allow_origin_regex=cors_origin_regex,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -339,6 +352,8 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "CREATE INDEX IF NOT EXISTS ix_user_notifications_reference_key ON user_notifications (reference_key);",
                     "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'AUTO_ACCEPT_SINGLE_QUOTE';",
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, is_deleted, created_at, updated_at) VALUES ('AUTO_ACCEPT_SINGLE_QUOTE', NULL, NULL, 'false', 'boolean', 'When Auto-Accept is active, controls whether uncontested single quotes can be auto-executed (true) or halted for manual corporate sign-off (false). Invariant: cannot be true if Default Action is Auto-Reject.', '[\"quotation\", \"quotations\"]'::jsonb, false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
+                    "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'FACILITY_SCORE_WEIGHT_RARITY';",
+                    "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'FACILITY_SCORE_WEIGHT_URGENT_RARITY';",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS encrypted_email TEXT;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS email_blind_index VARCHAR(64);",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);",
@@ -355,6 +370,41 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "UPDATE quotation_rfqs SET status = 'COMPLETED', acceptance_status = 'NO_QUOTES', acceptance_deadline = NULL, acceptance_resolved_at = NULL, acceptance_resolved_by_user_id = NULL WHERE status = 'EVALUATING' AND window_end < NOW() AND (acceptance_deadline IS NULL OR acceptance_deadline < NOW()) AND NOT EXISTS (SELECT 1 FROM quotation_offers qo JOIN quotation_bank_assignments qba ON qo.assignment_id = qba.id WHERE qba.rfq_id = quotation_rfqs.id);",
                     "UPDATE quotation_rfqs SET status = 'COMPLETED' WHERE status = 'INCONCLUSIVE';",
                     "UPDATE quotation_legs SET status = 'COMPLETED' WHERE status = 'INCONCLUSIVE';",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS balance_continuity_status VARCHAR(40) DEFAULT 'VALIDATED';",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS balance_variance_amount NUMERIC(18,2) DEFAULT 0;",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS continuity_warnings_json JSON;",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS detected_mapping_json JSON;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS tokenized_description TEXT;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS encrypted_raw_description TEXT;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS encrypted_counterparty_name TEXT;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS encrypted_custom_fields TEXT;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS custom_fields_json JSON;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS amount_tier VARCHAR(20);",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS iban_bank_code VARCHAR(10);",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS auto_confirmed BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS companion_parent_id INTEGER;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS classification_reasoning TEXT;",
+                    "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS top_suggestions_json JSON;",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS bank_id INTEGER;",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS rule_origin VARCHAR(30) DEFAULT 'MANUAL';",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS lifecycle_state VARCHAR(30) DEFAULT 'AUTO_CONFIRMED';",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS signature_hash VARCHAR(64);",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS assigned_category VARCHAR(100);",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS assigned_sub_category VARCHAR(100);",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS confirmations_count INTEGER DEFAULT 1;",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS overrides_count INTEGER DEFAULT 0;",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS empirical_precision NUMERIC(5,2) DEFAULT 100.00;",
+                    "ALTER TABLE classification_rules ADD COLUMN IF NOT EXISTS calibrated_confidence INTEGER DEFAULT 85;",
+                    "ALTER TABLE classification_rules ALTER COLUMN created_by DROP NOT NULL;",
+                    "ALTER TABLE reconciliation_counterparties ADD COLUMN IF NOT EXISTS blind_token VARCHAR(64);",
+                    "ALTER TABLE reconciliation_counterparties ADD COLUMN IF NOT EXISTS encrypted_name TEXT;",
+                    "ALTER TABLE collaborative_patterns ADD COLUMN IF NOT EXISTS amount_tier VARCHAR(20) DEFAULT 'ANY';",
+                    "ALTER TABLE collaborative_patterns ADD COLUMN IF NOT EXISTS semantic_flags_json JSON;",
+                    "ALTER TABLE collaborative_patterns ADD COLUMN IF NOT EXISTS rejection_count INTEGER DEFAULT 0;",
+                    "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS blind_entity_token VARCHAR(64);",
+                    "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS encrypted_entity_name TEXT;",
+                    "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS custom_fields_json JSON;",
+                    "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS encrypted_custom_fields TEXT;",
                 ]
                 with engine.connect() as conn:
                     for stmt in migrations:
@@ -364,6 +414,71 @@ def configure_app_instance(fastapi_app: FastAPI):
                         except Exception as stmt_err:
                             conn.rollback()
                             logger.debug(f"Schema migration statement ignored ({stmt[:40]}...): {stmt_err}")
+                try:
+                    from sqlalchemy.orm import Session as DBSession
+                    with DBSession(engine) as weight_seed_db:
+                        has_rarity = weight_seed_db.execute(
+                            text("SELECT 1 FROM global_configurations WHERE key::text = 'FACILITY_SCORE_WEIGHT_RARITY' LIMIT 1")
+                        ).first()
+                        if not has_rarity:
+                            rows_norm = dict(weight_seed_db.execute(
+                                text("SELECT key::text, value_default FROM global_configurations WHERE key::text IN ('FACILITY_SCORE_WEIGHT_COST','FACILITY_SCORE_WEIGHT_MARGIN','FACILITY_SCORE_WEIGHT_SLA','FACILITY_SCORE_WEIGHT_CAPACITY','FACILITY_SCORE_WEIGHT_CURRENCY_MATCH') AND is_deleted IS NOT TRUE")
+                            ).fetchall())
+                            if not rows_norm:
+                                rarity_def = '15'
+                            elif (
+                                rows_norm.get('FACILITY_SCORE_WEIGHT_COST') == '30'
+                                and rows_norm.get('FACILITY_SCORE_WEIGHT_MARGIN') == '15'
+                                and rows_norm.get('FACILITY_SCORE_WEIGHT_SLA') == '15'
+                                and rows_norm.get('FACILITY_SCORE_WEIGHT_CAPACITY') == '20'
+                                and rows_norm.get('FACILITY_SCORE_WEIGHT_CURRENCY_MATCH') == '20'
+                            ):
+                                weight_seed_db.execute(text("UPDATE global_configurations SET value_default = '25', updated_at = NOW() WHERE key::text = 'FACILITY_SCORE_WEIGHT_COST'"))
+                                weight_seed_db.execute(text("UPDATE global_configurations SET value_default = '15', updated_at = NOW() WHERE key::text IN ('FACILITY_SCORE_WEIGHT_CAPACITY', 'FACILITY_SCORE_WEIGHT_CURRENCY_MATCH')"))
+                                rarity_def = '15'
+                            else:
+                                rarity_def = '0'
+                            weight_seed_db.execute(
+                                text("INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, is_deleted, created_at, updated_at) VALUES ('FACILITY_SCORE_WEIGHT_RARITY', '0', '100', :def_val, 'percentage', 'Weight for preserving rare/specialized credit lines (cross-border, open-ended, multi-currency, rare LG types) for requests that genuinely need them while prioritizing dedicated project or standard common lines first.', '[\"issuance\"]'::jsonb, false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING"),
+                                {"def_val": rarity_def},
+                            )
+                            weight_seed_db.commit()
+
+                        has_urg_rarity = weight_seed_db.execute(
+                            text("SELECT 1 FROM global_configurations WHERE key::text = 'FACILITY_SCORE_WEIGHT_URGENT_RARITY' LIMIT 1")
+                        ).first()
+                        if not has_urg_rarity:
+                            rows_urg = dict(weight_seed_db.execute(
+                                text("SELECT key::text, value_default FROM global_configurations WHERE key::text IN ('FACILITY_SCORE_WEIGHT_URGENT_COST','FACILITY_SCORE_WEIGHT_URGENT_MARGIN','FACILITY_SCORE_WEIGHT_URGENT_SLA','FACILITY_SCORE_WEIGHT_URGENT_CAPACITY','FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH') AND is_deleted IS NOT TRUE")
+                            ).fetchall())
+                            if not rows_urg:
+                                urg_rarity_def = '10'
+                            elif (
+                                rows_urg.get('FACILITY_SCORE_WEIGHT_URGENT_COST') == '15'
+                                and rows_urg.get('FACILITY_SCORE_WEIGHT_URGENT_MARGIN') == '10'
+                                and rows_urg.get('FACILITY_SCORE_WEIGHT_URGENT_SLA') == '40'
+                                and rows_urg.get('FACILITY_SCORE_WEIGHT_URGENT_CAPACITY') == '15'
+                                and rows_urg.get('FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH') == '20'
+                            ):
+                                weight_seed_db.execute(text("UPDATE global_configurations SET value_default = '35', updated_at = NOW() WHERE key::text = 'FACILITY_SCORE_WEIGHT_URGENT_SLA'"))
+                                weight_seed_db.execute(text("UPDATE global_configurations SET value_default = '15', updated_at = NOW() WHERE key::text = 'FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH'"))
+                                urg_rarity_def = '10'
+                            else:
+                                urg_rarity_def = '0'
+                            weight_seed_db.execute(
+                                text("INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, is_deleted, created_at, updated_at) VALUES ('FACILITY_SCORE_WEIGHT_URGENT_RARITY', '0', '100', :def_val, 'percentage', 'Urgent issuance weight for preserving rare/specialized credit lines when common or project-dedicated lines can fulfill the urgent request.', '[\"issuance\"]'::jsonb, false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING"),
+                                {"def_val": urg_rarity_def},
+                            )
+                            weight_seed_db.commit()
+                except Exception as rarity_seed_err:
+                    logger.debug(f"Facility rarity weight seed skipped: {rarity_seed_err}")
+                try:
+                    from sqlalchemy.orm import Session as DBSession
+                    from app.services.banking_standards_ontology import banking_standards_ontology
+                    with DBSession(engine) as seed_db:
+                        banking_standards_ontology.ensure_foundational_knowledge_seeded(seed_db)
+                except Exception as seed_err:
+                    logger.debug(f"Foundational banking standards seed skipped: {seed_err}")
             except Exception as e:
                 logger.warning(f"Startup schema migration check: {e}")
 
@@ -508,8 +623,9 @@ def configure_app_instance(fastapi_app: FastAPI):
         dependencies=[Depends(require_quotation_module)]
     )
     # Direct quotation document gateway accessible to both Corporate Users & Invited Bank Dealers
+    # (Strictly exposes /documents/ticket and /documents/download only; all corporate trading routes require require_quotation_module)
     fastapi_app.include_router(
-        quotations_endpoints.router,
+        quotations_endpoints.document_gateway_router,
         prefix="/api/v1/quotations",
         tags=["Quotation Document Gateway"]
     )
@@ -552,11 +668,28 @@ def configure_app_instance(fastapi_app: FastAPI):
         tags=["Campaigns & Cashback"]
     )
 
-    # --- Static Files Mounting for Supporting Uploads ---
-    from fastapi.staticfiles import StaticFiles
-    os.makedirs("uploads/quotations", exist_ok=True)
-    os.makedirs("uploads/inbox", exist_ok=True)
-    fastapi_app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+    # --- Protected Legacy Uploads Reader (replaces public StaticFiles mount) ---
+    os.makedirs(os.path.join("uploads", "quotations"), exist_ok=True)
+    os.makedirs(os.path.join("private_storage", "inbox"), exist_ok=True)
+    os.makedirs(os.path.join("private_storage", "ai_chat_logs"), exist_ok=True)
+
+    @fastapi_app.get("/uploads/quotations/{legacy_rel_path:path}", include_in_schema=False)
+    def serve_legacy_quotation_upload(
+        legacy_rel_path: str,
+        request: Request,
+        token: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        db: Session = Depends(get_db),
+    ):
+        from app.api.v1.endpoints.public import serve_document
+        target_rel = os.path.join("uploads", "quotations", legacy_rel_path)
+        return serve_document(
+            request=request,
+            file_path=target_rel,
+            token=token,
+            auth_token=auth_token,
+            db=db,
+        )
 
     # --- APScheduler Setup ---
     # Quiet internal APScheduler executor tick spam ("Running job ...", "Job ... executed successfully")

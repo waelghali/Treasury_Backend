@@ -5,7 +5,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, and_, desc
 from datetime import datetime
 
-from app.models.models_reconciliation_v2 import CollaborativePattern, CollaborativeTenantVote
+from app.models.models_reconciliation_v2 import CollaborativePattern, CollaborativeTenantVote, Counterparty
+from app.services.reconciliation_confidentiality_service import (
+    reconciliation_confidentiality,
+    classify_amount_tier,
+)
 import logging
 
 logger = logging.getLogger("app.collaborative_learning")
@@ -13,7 +17,7 @@ logger = logging.getLogger("app.collaborative_learning")
 # Consensus Promotion Thresholds
 K_THRESHOLD_SAME_BANK = 2     # 2 distinct companies with the same bank
 K_THRESHOLD_UNIVERSAL = 3     # 3 distinct companies across different banks
-MIN_AGREEMENT_PERCENT = 75.0  # At least 75% consensus among voting companies
+MIN_AGREEMENT_PERCENT = 80.0  # At least 80% consensus among voting companies
 
 # Common financial noise words to strip during signature sanitization
 STOP_WORDS = {
@@ -24,61 +28,44 @@ STOP_WORDS = {
     "تحويل", "سداد", "دفع", "رقم", "تاريخ", "من", "إلى", "عن", "عبر"
 }
 
+
 class CollaborativeLearningService:
     """
     Dynamic, privacy-preserving collaborative intelligence engine.
-    Extracts anonymized structural signatures from user confirmations across companies,
-    tallies distinct-tenant consensus, and autonomously promotes high-confidence
-    patterns to benefit all platform users.
+    Extracts zero-PII structural signatures from user confirmations across companies,
+    qualifies patterns by amount scale tier and semantic flags, tallies distinct-tenant
+    consensus, and autonomously promotes high-confidence patterns to benefit all users.
     """
 
-    def sanitize_signature(self, raw_description: str, description_line2: Optional[str] = None) -> Optional[str]:
+    def sanitize_signature(
+        self,
+        raw_description: str,
+        description_line2: Optional[str] = None,
+        known_entities: Optional[List[str]] = None,
+        counterparty_name: Optional[str] = None,
+    ) -> Optional[str]:
         """
-        The Privacy Sanitizer Shield:
-        Strips all PII, IBANs, account numbers, dates, reference codes, amounts, and noise.
-        Extracts only the stable canonical semantic anchor / n-gram.
+        The Zero-Knowledge Privacy Sanitizer Shield:
+        Uses Counterparty-Aware PII Scrubbing to strip all customer/vendor names,
+        legal suffixes, preposition-following beneficiaries, IBANs, account numbers,
+        dates, reference codes, and amounts.
+        Returns only verified structural banking vocabulary tokens.
         """
         if not raw_description:
             return None
 
-        combined = f"{raw_description} {description_line2 or ''}".upper()
-
-        # 1. Strip IBANs (International Bank Account Numbers)
-        combined = re.sub(r'\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b', ' ', combined)
-
-        # 2. Strip Account / Card number sequences (10+ digits or 4-digit groups)
-        combined = re.sub(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', ' ', combined)
-        combined = re.sub(r'\b\d{8,30}\b', ' ', combined)
-
-        # 3. Strip Dates (various formats: YYYY-MM-DD, DD/MM/YYYY, etc.)
-        combined = re.sub(r'\b\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b', ' ', combined)
-
-        # 4. Strip Currencies and Amounts (e.g. EGP 15,000.00, $500, 1500.50 USD)
-        combined = re.sub(r'[$€£¥]', ' ', combined)
-        combined = re.sub(r'\b(EGP|USD|EUR|GBP|SAR|AED|KWD|QAR)\s*[\d,.]+', ' ', combined)
-        combined = re.sub(r'[\d,.]+\s*(EGP|USD|EUR|GBP|SAR|AED|KWD|QAR)\b', ' ', combined)
-        combined = re.sub(r'\b\d+([.,]\d+)?\b', ' ', combined)
-
-        # 5. Strip Reference / Batch / Invoice alphanumeric codes
-        combined = re.sub(r'\b(INV|INVOICE|REF|BATCH|TRF|TXN|TRX|TRACE|SEQ|CHQ|CHECK)[#:\-\s]*[A-Z0-9]+\b', ' ', combined)
-
-        # 6. Normalize punctuation and spaces
-        combined = re.sub(r'[^a-zA-Z\u0600-\u06FF\s]', ' ', combined)
-        words = [w.strip() for w in combined.split() if len(w.strip()) >= 3]
-
-        # 7. Remove solitary generic stop words while keeping composite phrases
-        meaningful_words = [w for w in words if w not in STOP_WORDS]
-        if not meaningful_words:
+        extracted = reconciliation_confidentiality.extract_privacy_safe_rule_signature(
+            raw_description=raw_description,
+            description_line2=description_line2,
+            known_entities=known_entities,
+            counterparty_name=counterparty_name,
+        )
+        # Prefer strict banking structural signature for cross-tenant sharing;
+        # fall back to tenant_signature only if all tokens are non-entity banking words
+        sig = extracted.get("collaborative_signature") or extracted.get("tenant_signature")
+        if not sig or len(sig) < 4:
             return None
-
-        # Build candidate signature (up to 4 key tokens)
-        signature = " ".join(meaningful_words[:4]).strip()
-        
-        # Minimum length check to avoid noise
-        if len(signature) < 4:
-            return None
-
-        return signature
+        return sig
 
     def submit_confirmation(
         self,
@@ -88,45 +75,80 @@ class CollaborativeLearningService:
         raw_description: str,
         direction: str,  # "CREDIT" or "DEBIT"
         category: str,
-        gl_account: Optional[str] = None
+        gl_account: Optional[str] = None,
+        amount: Any = None,
+        counterparty_name: Optional[str] = None,
+        previous_category: Optional[str] = None,
     ) -> Optional[CollaborativePattern]:
         """
         Federated Learning Ingestion:
         Called whenever any company confirms or classifies a transaction.
-        Processes the raw narrative through the Privacy Sanitizer and records the consensus vote.
+        Processes the raw narrative through the Counterparty-Aware Privacy Sanitizer,
+        qualifies by amount_tier, and records the consensus vote.
         """
-        signature = self.sanitize_signature(raw_description)
+        # Load tenant's known counterparty names so none of them can ever leak into collaborative signatures
+        known_entities = []
+        try:
+            cps = db.query(Counterparty.name).filter(
+                Counterparty.company_id == company_id,
+                Counterparty.is_deleted == False
+            ).limit(500).all()
+            known_entities = [c[0] for c in cps if c and c[0]]
+        except Exception:
+            pass
+
+        signature = self.sanitize_signature(
+            raw_description=raw_description,
+            known_entities=known_entities,
+            counterparty_name=counterparty_name,
+        )
         if not signature or not category:
             return None
 
         clean_direction = direction.upper() if direction in ["CREDIT", "DEBIT"] else "DEBIT"
         clean_category = category.strip()
+        tier = classify_amount_tier(amount) if amount is not None else "ANY"
 
-        # Find existing pattern (first bank-scoped, then universal)
+        semantic_flags = reconciliation_confidentiality.detect_semantic_flags(
+            raw_description=raw_description,
+            direction=clean_direction,
+            amount=amount,
+        )
+
+        # Find existing pattern matching (signature, direction, bank_id, amount_tier)
         pattern = db.query(CollaborativePattern).filter(
             CollaborativePattern.signature_token == signature,
             CollaborativePattern.direction == clean_direction,
-            CollaborativePattern.bank_id == bank_id
+            CollaborativePattern.bank_id == bank_id,
+            or_(
+                CollaborativePattern.amount_tier == tier,
+                CollaborativePattern.amount_tier == "ANY",
+                CollaborativePattern.amount_tier == None,
+            )
         ).first()
 
         if not pattern:
-            # Create candidate pattern
             pattern = CollaborativePattern(
                 bank_id=bank_id,
                 signature_token=signature,
                 direction=clean_direction,
+                amount_tier=tier,
+                semantic_flags_json={
+                    "is_reversal": semantic_flags.get("is_reversal", False),
+                    "is_negative_collection": semantic_flags.get("is_negative_collection", False),
+                },
                 suggested_category=clean_category,
                 suggested_gl_account=gl_account,
                 distinct_tenants_count=1,
                 total_confirmations=1,
+                rejection_count=0,
                 agreement_score=Decimal("100.00"),
-                confidence_score=60,
+                confidence_score=62,
                 is_promoted=False
             )
             db.add(pattern)
             db.flush()
 
-            # Record initial vote
             vote = CollaborativeTenantVote(
                 pattern_id=pattern.id,
                 company_id=company_id,
@@ -134,18 +156,21 @@ class CollaborativeLearningService:
             )
             db.add(vote)
         else:
-            # Existing pattern: update confirmation count
             pattern.total_confirmations = (pattern.total_confirmations or 0) + 1
             pattern.last_confirmed_at = func.now()
+            if not pattern.amount_tier or pattern.amount_tier == "ANY":
+                pattern.amount_tier = tier
 
-            # Check if this company has voted before
+            # If user overrode a previous category predicted by this pattern, record rejection penalty
+            if previous_category and previous_category != clean_category and pattern.suggested_category == previous_category:
+                pattern.rejection_count = (pattern.rejection_count or 0) + 1
+
             existing_vote = db.query(CollaborativeTenantVote).filter(
                 CollaborativeTenantVote.pattern_id == pattern.id,
                 CollaborativeTenantVote.company_id == company_id
             ).first()
 
             if not existing_vote:
-                # New distinct tenant voting!
                 new_vote = CollaborativeTenantVote(
                     pattern_id=pattern.id,
                     company_id=company_id,
@@ -154,42 +179,41 @@ class CollaborativeLearningService:
                 db.add(new_vote)
                 db.flush()
 
-                # Re-calculate distinct tenant count
                 distinct_count = db.query(func.count(func.distinct(CollaborativeTenantVote.company_id))).filter(
                     CollaborativeTenantVote.pattern_id == pattern.id
                 ).scalar() or 1
                 pattern.distinct_tenants_count = distinct_count
             else:
+                if existing_vote.category_voted != clean_category:
+                    pattern.rejection_count = (pattern.rejection_count or 0) + 1
                 existing_vote.category_voted = clean_category
                 existing_vote.last_voted_at = func.now()
 
-            # Re-calculate consensus agreement ratio
             total_votes = db.query(CollaborativeTenantVote).filter(
                 CollaborativeTenantVote.pattern_id == pattern.id
             ).all()
 
             if total_votes:
-                # Tally votes per category
                 tally = {}
                 for v in total_votes:
                     tally[v.category_voted] = tally.get(v.category_voted, 0) + 1
                 
-                # Winning category
                 top_category, top_votes = max(tally.items(), key=lambda x: x[1])
-                agreement = (top_votes / len(total_votes)) * 100
+                rejections = int(pattern.rejection_count or 0)
+                effective_denominator = max(1, len(total_votes) + rejections)
+                agreement = (top_votes / effective_denominator) * 100
                 pattern.agreement_score = Decimal(str(round(agreement, 2)))
                 pattern.suggested_category = top_category
 
-                # Update confidence score based on distinct companies and agreement
-                # Base 60 + 12 per distinct tenant, scaled by agreement
-                raw_confidence = 60 + (pattern.distinct_tenants_count - 1) * 12
-                scaled_confidence = int(min(98, raw_confidence * (agreement / 100)))
-                pattern.confidence_score = max(50, scaled_confidence)
+                raw_confidence = 62 + (pattern.distinct_tenants_count - 1) * 12
+                scaled_confidence = int(min(97, raw_confidence * (agreement / 100)))
+                pattern.confidence_score = max(40, scaled_confidence)
 
-                # Promotion Evaluation
                 k_threshold = K_THRESHOLD_SAME_BANK if pattern.bank_id else K_THRESHOLD_UNIVERSAL
                 if pattern.distinct_tenants_count >= k_threshold and agreement >= MIN_AGREEMENT_PERCENT:
                     pattern.is_promoted = True
+                elif agreement < MIN_AGREEMENT_PERCENT:
+                    pattern.is_promoted = False
 
         db.commit()
         db.refresh(pattern)
@@ -201,16 +225,18 @@ class CollaborativeLearningService:
         bank_id: Optional[int],
         raw_description: str,
         direction: str,  # "CREDIT" or "DEBIT"
-        description_line2: Optional[str] = None
+        description_line2: Optional[str] = None,
+        amount: Any = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Evaluates a transaction narrative against promoted collaborative patterns.
-        Returns prediction if high-confidence collaborative consensus exists.
+        Evaluates a transaction narrative against promoted collaborative patterns,
+        enforcing direction and amount-scale compatibility (e.g. preventing a MICRO
+        fee signature from misclassifying a LARGE vendor payment).
         """
         combined = f"{raw_description or ''} {description_line2 or ''}".upper()
         clean_dir = direction.upper() if direction in ["CREDIT", "DEBIT"] else "DEBIT"
+        tx_tier = classify_amount_tier(amount) if amount is not None else "ANY"
 
-        # Fetch active promoted patterns matching this bank OR universal (bank_id is None)
         patterns = db.query(CollaborativePattern).filter(
             CollaborativePattern.is_promoted == True,
             or_(
@@ -222,7 +248,6 @@ class CollaborativeLearningService:
                 CollaborativePattern.bank_id == None
             )
         ).order_by(
-            # Specific bank matches take precedence over universal matches
             CollaborativePattern.bank_id.desc().nullslast(),
             CollaborativePattern.confidence_score.desc()
         ).all()
@@ -231,6 +256,17 @@ class CollaborativeLearningService:
             return None
 
         for p in patterns:
+            # Amount-scale guardrail: BANK_CHARGES pattern learned on MICRO/SMALL cannot fire on LARGE/MACRO
+            p_tier = getattr(p, "amount_tier", "ANY") or "ANY"
+            if p.suggested_category == "BANK_CHARGES" and tx_tier in ("LARGE", "MACRO"):
+                continue
+            if p_tier not in ("ANY", tx_tier):
+                # Allow adjacent tiers (e.g., MICRO <-> SMALL or MEDIUM <-> LARGE)
+                tier_order = ["MICRO", "SMALL", "MEDIUM", "LARGE", "MACRO"]
+                if p_tier in tier_order and tx_tier in tier_order:
+                    if abs(tier_order.index(p_tier) - tier_order.index(tx_tier)) > 1:
+                        continue
+
             sig_tokens = p.signature_token.split()
             is_match = (p.signature_token in combined) or (len(sig_tokens) > 1 and all(tok in combined for tok in sig_tokens))
             if is_match:
@@ -240,7 +276,8 @@ class CollaborativeLearningService:
                     "confidence": p.confidence_score,
                     "signature": p.signature_token,
                     "distinct_tenants": p.distinct_tenants_count,
-                    "is_bank_specific": p.bank_id is not None
+                    "is_bank_specific": p.bank_id is not None,
+                    "amount_tier": p_tier,
                 }
 
         return None
@@ -262,7 +299,6 @@ class CollaborativeLearningService:
             CollaborativePattern.is_promoted == True
         ).scalar() or 0
 
-        # Sample of recently promoted patterns (purely signature and category)
         recent_promoted = db.query(CollaborativePattern).filter(
             CollaborativePattern.is_promoted == True
         ).order_by(CollaborativePattern.last_confirmed_at.desc()).limit(10).all()
@@ -272,6 +308,7 @@ class CollaborativeLearningService:
             "category": p.suggested_category,
             "confidence": p.confidence_score,
             "distinct_tenants": p.distinct_tenants_count,
+            "amount_tier": getattr(p, "amount_tier", "ANY") or "ANY",
             "scope": "Bank Specific" if p.bank_id else "Universal"
         } for p in recent_promoted]
 
@@ -293,8 +330,6 @@ class CollaborativeLearningService:
     ) -> Dict[str, Any]:
         """
         Dynamically decays confidence of patterns that haven't been re-confirmed.
-        Ensures that if banks change their narration syntax or obsolete formats fade out,
-        the knowledge base self-prunes and demotes outdated patterns without manual intervention.
         """
         from datetime import datetime, timedelta, timezone
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=inactive_days)
@@ -313,7 +348,6 @@ class CollaborativeLearningService:
                 p.confidence_score = new_conf
                 decayed_count += 1
 
-            # Demote if confidence falls below threshold or if agreement is insufficient
             if p.is_promoted and (new_conf < min_confidence or (p.agreement_score or 0) < MIN_AGREEMENT_PERCENT):
                 p.is_promoted = False
                 demoted_count += 1

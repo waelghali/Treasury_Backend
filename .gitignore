@@ -25,8 +25,9 @@ Thumbs.db
 lg-document-processing-*.json
 singular-arbor-*.json
 
-# Uploads, legacy & external test assets
+# Uploads, private local storage, legacy & external test assets
 uploads/
+private_storage/
 _legacy_archive/
 _external_assets/
 test_assets/

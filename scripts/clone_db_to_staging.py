@@ -1,10 +1,11 @@
+import os
 # scripts/clone_db_to_staging.py
 import sys, os, time
 sys.path.insert(0, os.path.abspath("."))
 from sqlalchemy import create_engine, text, MetaData, Table
 
-LOCAL_DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:Voda%21%4012@localhost:5432/grow")
-STAGING_DB_URL = os.getenv("STAGING_DB_URL", "postgresql://treasury_staging_db2_user:p6LvCt0ZloPjhSpKrk5wMeTsvESNTsgT@dpg-daogub3m8hqs73el19a0-a.frankfurt-postgres.render.com/treasury_staging_db2")
+LOCAL_DB_URL = os.environ["DATABASE_URL"]
+STAGING_DB_URL = os.environ["STAGING_DB_URL"]
 
 def clone():
     start_time = time.time()

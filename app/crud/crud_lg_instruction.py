@@ -638,9 +638,10 @@ class CRUDLGInstruction(CRUDBase):
             "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
             "notes_section": "",
         }
+        from app.core.document_generator import escape_html_placeholder
         generated_html = reminder_template.content
         for key, value in template_data.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
         generated_content_path = None
         new_reminder_instruction = await self.create(
@@ -901,9 +902,10 @@ class CRUDLGInstruction(CRUDBase):
                 "notes_section": "",
             }
             
+            from app.core.document_generator import escape_html_placeholder
             generated_html = reminder_template.content
             for key, value in template_data.items():
-                str_value = str(value) if value is not None else ""
+                str_value = escape_html_placeholder(key, value)
                 generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
             
             consolidated_html_content.append(generated_html)

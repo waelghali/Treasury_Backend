@@ -41,6 +41,91 @@ class IssuanceService:
             return user.email
         return f"User #{user_id}"
 
+    def _get_tenant_request(
+        self,
+        db: Session,
+        request_id: int,
+        customer_id: Optional[int] = None,
+        detail: str = "Request not found."
+    ) -> IssuanceRequest:
+        """Fetch an IssuanceRequest and enforce customer_id isolation when provided."""
+        request = crud_issuance_request.get(db, id=request_id)
+        if not request or (customer_id is not None and request.customer_id != customer_id):
+            raise HTTPException(status_code=404, detail=detail)
+        return request
+
+    def _get_effective_margin_and_exposure_factor(
+        self,
+        facility: Optional[IssuanceFacility],
+        sub_limit: Optional[IssuanceFacilitySubLimit]
+    ) -> Tuple[float, Decimal]:
+        """
+        Returns (margin_pct, exposure_factor).
+        When facility.margin_reduces_exposure is True, cash margin is deducted from
+        credit-line utilization (e.g. 20% cash margin -> 0.80 exposure factor).
+        """
+        raw_margin = None
+        if sub_limit is not None and getattr(sub_limit, "default_cash_margin_pct", None) is not None:
+            raw_margin = sub_limit.default_cash_margin_pct
+        elif facility is not None and getattr(facility, "facility_default_margin_pct", None) is not None:
+            raw_margin = facility.facility_default_margin_pct
+        margin_pct = float(raw_margin or 0)
+
+        if facility is not None and bool(getattr(facility, "margin_reduces_exposure", False)) and margin_pct > 0:
+            factor = Decimal(str(max(0.0, min(1.0, 1.0 - (margin_pct / 100.0)))))
+        else:
+            factor = Decimal("1.0")
+        return margin_pct, factor
+
+    def compute_sub_limit_used_in_facility_ccy(
+        self,
+        db: Session,
+        facility: IssuanceFacility,
+        sub_limit: IssuanceFacilitySubLimit
+    ) -> Decimal:
+        """
+        Computes sub-limit utilization strictly in the facility's currency,
+        preventing raw cross-currency sums when multi_currency_allowed=True.
+        """
+        from app.services.fx_service import fx_service
+
+        _, exposure_factor = self._get_effective_margin_and_exposure_factor(facility, sub_limit)
+
+        lg_buckets = db.query(
+            IssuedLGRecord.currency_id,
+            func.coalesce(func.sum(IssuedLGRecord.current_amount), 0)
+        ).filter(
+            IssuedLGRecord.facility_sub_limit_id == sub_limit.id,
+            IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING"])
+        ).group_by(IssuedLGRecord.currency_id).all()
+
+        lg_used_fac_ccy = Decimal("0")
+        for lg_ccy_id, bucket_sum in lg_buckets:
+            amt_dec = Decimal(str(bucket_sum or 0))
+            if amt_dec <= 0:
+                continue
+            if not lg_ccy_id or lg_ccy_id == facility.currency_id:
+                conv_amt = amt_dec
+            else:
+                conv_amt, _ = fx_service.convert(
+                    db, amt_dec, lg_ccy_id, facility.currency_id, allow_ai=False
+                )
+                if conv_amt is None:
+                    conv_amt = amt_dec
+            lg_used_fac_ccy += (conv_amt * exposure_factor).quantize(Decimal("0.01"))
+
+        pending_exposure = db.query(
+            func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)
+        ).filter(
+            IssuanceExposureEntry.sub_limit_id == sub_limit.id,
+            IssuanceExposureEntry.is_active == True
+        ).scalar()
+        pending_dec = Decimal(str(pending_exposure or 0))
+
+        base_used = max(lg_used_fac_ccy, pending_dec)
+        init_util = Decimal(str(getattr(sub_limit, "initial_utilization", 0) or 0))
+        return base_used + init_util
+
     def _get_fx_rate(self, db: Session, from_currency_id: int, to_currency_code: str = "EGP") -> Decimal:
         """
         LEGACY WRAPPER — delegates to the centralized FxService.
@@ -477,7 +562,7 @@ class IssuanceService:
         
         return None, []
 
-    def get_approval_roadmap(self, db: Session, request_id: int) -> dict:
+    def get_approval_roadmap(self, db: Session, request_id: int, customer_id: Optional[int] = None) -> dict:
         """
         Computes the full lifecycle approval roadmap for a request.
         Evaluates ALL workflow policies and returns their status
@@ -488,6 +573,8 @@ class IssuanceService:
         request = crud_issuance_request.get(db, id=request_id)
         if not request:
             return {"steps": []}
+        if customer_id is not None and request.customer_id != customer_id:
+            raise HTTPException(status_code=404, detail="Request not found.")
 
         # Get ALL workflow policies for this customer (ordered)
         policies = db.query(IssuanceWorkflowPolicy).filter(
@@ -657,7 +744,7 @@ class IssuanceService:
         return policy.approver_type
 
 
-    def submit_for_approval(self, db: Session, request_id: int, user_id: int) -> IssuanceRequest:
+    def submit_for_approval(self, db: Session, request_id: int, user_id: int, customer_id: Optional[int] = None) -> IssuanceRequest:
         """
         Unified submit flow: DRAFT -> creates V1 snapshot -> runs approval matrix
         -> PENDING_APPROVAL or APPROVED_INTERNAL.
@@ -665,7 +752,9 @@ class IssuanceService:
         from app.models.models_issuance import IssuanceRequestSnapshot, IssuanceRequestVersion
 
         request = crud_issuance_request.get(db, id=request_id)
-        if not request or request.status not in ("DRAFT", "REVISION_REQUIRED"):
+        if not request or (customer_id is not None and request.customer_id != customer_id):
+            raise HTTPException(status_code=404, detail="Request not found")
+        if request.status not in ("DRAFT", "REVISION_REQUIRED"):
             raise HTTPException(status_code=400, detail="Only DRAFT or REVISION_REQUIRED requests can be submitted")
 
         # Determine start step: resume from returned step or start from 0
@@ -818,10 +907,12 @@ class IssuanceService:
 
         return request
 
-    def approve_request(self, db: Session, request_id: int, approver_user_id: int) -> IssuanceRequest:
+    def approve_request(self, db: Session, request_id: int, approver_user_id: int, customer_id: Optional[int] = None) -> IssuanceRequest:
         """ Records a signature. If enough signatures are collected, moves to the next step. """
         request = crud_issuance_request.get(db, id=request_id)
-        if not request or request.status != "PENDING_APPROVAL":
+        if not request or (customer_id is not None and request.customer_id != customer_id):
+            raise HTTPException(status_code=404, detail="Request not found")
+        if request.status != "PENDING_APPROVAL":
             raise HTTPException(status_code=400, detail="Request is not pending approval")
             
         # 1. Verify Authorization (type-safe: cast JSONB values to int)
@@ -948,11 +1039,9 @@ class IssuanceService:
 
         return request
 
-    def reject_request(self, db: Session, request_id: int, user_id: int, rejection_reason: str = None) -> IssuanceRequest:
+    def reject_request(self, db: Session, request_id: int, user_id: int, rejection_reason: str = None, customer_id: Optional[int] = None) -> IssuanceRequest:
         """ Rejects the request and clears pending approvers. """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found")
+        request = self._get_tenant_request(db, request_id, customer_id, detail="Request not found")
 
         request.status = "REJECTED"
         request.pending_approver_users = []
@@ -988,14 +1077,12 @@ class IssuanceService:
 
         return request
 
-    def return_for_revision(self, db: Session, request_id: int, user_id: int, revision_notes: str = None) -> IssuanceRequest:
+    def return_for_revision(self, db: Session, request_id: int, user_id: int, revision_notes: str = None, customer_id: Optional[int] = None) -> IssuanceRequest:
         """
         Returns a request for revision instead of rejecting it.
         The requestor can edit and resubmit — approval resumes from the step that returned it.
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found")
+        request = self._get_tenant_request(db, request_id, customer_id, detail="Request not found")
         if request.status != "PENDING_APPROVAL":
             raise HTTPException(status_code=400, detail="Only PENDING_APPROVAL requests can be returned for revision")
 
@@ -1041,16 +1128,284 @@ class IssuanceService:
     # 3. SMART FACILITY SELECTION
     # ==========================================================================
 
-    def get_suitable_facilities(self, db: Session, request_id: int) -> List[SuitableFacilityOut]:
+    @staticmethod
+    def _is_true_flag(val: Any) -> bool:
+        return val is True
+
+    @staticmethod
+    def _safe_num(val: Any, default: Optional[float] = None) -> Optional[float]:
+        if isinstance(val, bool) or val is None:
+            return default
+        if isinstance(val, (int, float, Decimal)):
+            return float(val)
+        return default
+
+    @staticmethod
+    def _scarcity_penalty(count: int, total_subs: int) -> float:
+        """Higher deduction when a capability is rare in the customer's active portfolio."""
+        if count <= 0 or total_subs <= 1:
+            return 0.0
+        if count == 1:
+            return 42.0  # Unique / monopoly capability in portfolio
+        if count == 2 and total_subs >= 3:
+            return 26.0  # Very scarce (only 2 lines offer it)
+        if (count / float(total_subs)) <= 0.5:
+            return 15.0  # Minority capability
+        return 0.0       # Common capability (>50% of lines offer it)
+
+    def _build_portfolio_rarity_profile(self, facilities: List[Any], request: Any) -> Dict[str, Any]:
+        """
+        Scans all active sub-limits of the customer to quantify how rare each special
+        capability is across the portfolio ("save rare lines for rare guarantees").
+        """
+        counts = {
+            "cross_border": 0,
+            "third_party": 0,
+            "multi_currency": 0,
+            "open_ended": 0,
+            "confirmation": 0,
+            "extended_tenor": 0,
+            "wildcard_lg_types": 0,
+        }
+        lg_type_counts: Dict[str, int] = {}
+        active_subs_count = 0
+        has_matching_dedicated_project = False
+        has_narrow_lg_type_for_req = False
+        has_single_entity_for_req = False
+
+        req_proj_id = getattr(request, "project_id", None)
+        req_proj_str = str(req_proj_id) if isinstance(req_proj_id, (int, str)) and not isinstance(req_proj_id, bool) else None
+        req_lg_type_id = getattr(request, "lg_type_id", None)
+        req_lg_str = str(req_lg_type_id) if req_lg_type_id is not None else None
+        req_entity_id = getattr(request, "issuing_entity_id", None)
+
+        all_known_lg_types = set()
+        for fac in (facilities or []):
+            if self._is_true_flag(getattr(fac, "is_deleted", False)):
+                continue
+            if getattr(fac, "status", None) != "ACTIVE":
+                continue
+            exp = getattr(fac, "expiry_date", None)
+            if isinstance(exp, date) and exp < date.today():
+                continue
+            for sub in (getattr(fac, "sub_limits", None) or []):
+                raw_types = getattr(sub, "lg_type_ids", None)
+                if isinstance(raw_types, (list, tuple, set)) and raw_types:
+                    for t in raw_types:
+                        all_known_lg_types.add(str(t))
+
+        for fac in (facilities or []):
+            if self._is_true_flag(getattr(fac, "is_deleted", False)):
+                continue
+            if getattr(fac, "status", None) != "ACTIVE":
+                continue
+            exp = getattr(fac, "expiry_date", None)
+            if isinstance(exp, date) and exp < date.today():
+                continue
+
+            fac_cb = self._is_true_flag(getattr(fac, "allow_cross_border", False))
+            fac_tp = self._is_true_flag(getattr(fac, "allow_third_party_issuance", False))
+            fac_mc = self._is_true_flag(getattr(fac, "multi_currency_allowed", False))
+            fac_tenor_months = self._safe_num(getattr(fac, "tenor_months", None), 12.0) or 12.0
+            fac_entities = getattr(fac, "entities", None)
+            if isinstance(fac_entities, (list, tuple)) and len(fac_entities) == 1:
+                ent_id = getattr(fac_entities[0], "id", None)
+                if req_entity_id is not None and ent_id == req_entity_id:
+                    has_single_entity_for_req = True
+
+            for sub in (getattr(fac, "sub_limits", None) or []):
+                active_subs_count += 1
+                if fac_cb:
+                    counts["cross_border"] += 1
+                if fac_tp:
+                    counts["third_party"] += 1
+                if fac_mc:
+                    counts["multi_currency"] += 1
+                if self._is_true_flag(getattr(sub, "allows_open_ended", False)):
+                    counts["open_ended"] += 1
+                if self._is_true_flag(getattr(sub, "allows_confirmation", False)):
+                    counts["confirmation"] += 1
+
+                max_td = self._safe_num(getattr(sub, "max_tenor_days", None), None)
+                eff_tenor_days = max_td if max_td is not None else (fac_tenor_months * 30.0)
+                if eff_tenor_days > 365.0:
+                    counts["extended_tenor"] += 1
+
+                ded_projects = getattr(sub, "dedicated_project_ids", None)
+                if req_proj_str and isinstance(ded_projects, list) and ded_projects:
+                    if req_proj_str in [str(p) for p in ded_projects]:
+                        has_matching_dedicated_project = True
+
+                raw_types = getattr(sub, "lg_type_ids", None)
+                if isinstance(raw_types, (list, tuple, set)) and raw_types:
+                    str_types = {str(t) for t in raw_types}
+                    for t_str in str_types:
+                        lg_type_counts[t_str] = lg_type_counts.get(t_str, 0) + 1
+                    if req_lg_str and req_lg_str in str_types:
+                        has_narrow_lg_type_for_req = True
+                else:
+                    counts["wildcard_lg_types"] += 1
+                    for t_str in all_known_lg_types:
+                        lg_type_counts[t_str] = lg_type_counts.get(t_str, 0) + 1
+
+        any_scarce_perk = any(
+            self._scarcity_penalty(c, active_subs_count) > 0
+            for c in counts.values()
+        ) or any(
+            self._scarcity_penalty(c, active_subs_count) > 0
+            for c in lg_type_counts.values()
+        )
+
+        return {
+            "total_active_subs": active_subs_count,
+            "counts": counts,
+            "lg_type_counts": lg_type_counts,
+            "has_matching_dedicated_project": has_matching_dedicated_project,
+            "has_narrow_lg_type_for_req": has_narrow_lg_type_for_req,
+            "has_single_entity_for_req": has_single_entity_for_req,
+            "any_scarce_perk": any_scarce_perk,
+        }
+
+    def _compute_facility_rarity_score(
+        self,
+        fac: Any,
+        sub: Any,
+        request: Any,
+        rarity_profile: Dict[str, Any],
+        available: float,
+        limit_total: float,
+    ) -> tuple:
+        """
+        Computes (rarity_score 0..100, saved_capabilities_list).
+        - High score (90..100): project-dedicated match or common line with no wasted scarce perks.
+        - Lower score: line carries scarce capabilities across the portfolio that this request does NOT need.
+        - Advisory only: guides ranking while leaving user 100% free to pick any line.
+        """
+        total_subs = rarity_profile.get("total_active_subs", 0)
+        if total_subs <= 1:
+            return 100.0, []
+
+        counts = rarity_profile.get("counts", {})
+        lg_type_counts = rarity_profile.get("lg_type_counts", {})
+        base_score = 100.0
+        wasted_penalty = 0.0
+        saved_capabilities: List[str] = []
+
+        # 1. Project Dedication alignment
+        req_proj_id = getattr(request, "project_id", None)
+        req_proj_str = str(req_proj_id) if isinstance(req_proj_id, (int, str)) and not isinstance(req_proj_id, bool) else None
+        ded_projects = getattr(sub, "dedicated_project_ids", None)
+        is_dedicated_match = bool(
+            req_proj_str
+            and isinstance(ded_projects, list)
+            and ded_projects
+            and req_proj_str in [str(p) for p in ded_projects]
+        )
+        if rarity_profile.get("has_matching_dedicated_project"):
+            if is_dedicated_match:
+                # Narrower single-project dedication scores 100; multi-project dedication slightly lower
+                if len(ded_projects) > 1:
+                    base_score = 94.0
+            else:
+                # Save general-purpose credit lines when the project has its own dedicated facility
+                wasted_penalty += 22.0
+                saved_capabilities.append("General-Purpose Line")
+
+        # 2. Determine what special capabilities this request genuinely needs
+        needs_cb = self._is_true_flag(getattr(request, "is_cross_border", False))
+        needs_tp = self._is_true_flag(getattr(request, "is_third_party", False))
+        needs_mc = (getattr(fac, "currency_id", None) != getattr(request, "currency_id", None))
+        req_expiry = getattr(request, "requested_expiry_date", None)
+        needs_oe = self._is_true_flag(getattr(request, "is_open_ended", False)) or (req_expiry is None)
+
+        cbd = getattr(request, "cross_border_details", None)
+        te = getattr(request, "treasury_enrichment", None)
+        needs_conf = needs_cb or bool(isinstance(cbd, dict) and cbd.get("requires_counter_guarantee")) or bool(isinstance(te, dict) and te.get("requires_confirmation"))
+
+        req_issue = getattr(request, "requested_issue_date", None)
+        if not isinstance(req_issue, date):
+            req_issue = date.today()
+        needs_ext_tenor = needs_oe or (isinstance(req_expiry, date) and (req_expiry - req_issue).days > 365)
+
+        # 3. Penalize wasting scarce capabilities that the current request does NOT need
+        if self._is_true_flag(getattr(fac, "allow_cross_border", False)) and not needs_cb:
+            p = self._scarcity_penalty(counts.get("cross_border", 0), total_subs)
+            if p > 0:
+                wasted_penalty += p
+                saved_capabilities.append("Cross-Border")
+
+        if self._is_true_flag(getattr(fac, "allow_third_party_issuance", False)) and not needs_tp:
+            p = self._scarcity_penalty(counts.get("third_party", 0), total_subs)
+            if p > 0:
+                wasted_penalty += p
+                saved_capabilities.append("Third-Party")
+
+        if self._is_true_flag(getattr(fac, "multi_currency_allowed", False)) and not needs_mc:
+            p = self._scarcity_penalty(counts.get("multi_currency", 0), total_subs)
+            if p > 0:
+                wasted_penalty += p
+                saved_capabilities.append("Multi-Currency")
+
+        if self._is_true_flag(getattr(sub, "allows_open_ended", False)) and not needs_oe:
+            p = self._scarcity_penalty(counts.get("open_ended", 0), total_subs)
+            if p > 0:
+                wasted_penalty += p
+                saved_capabilities.append("Open-Ended")
+
+        if self._is_true_flag(getattr(sub, "allows_confirmation", False)) and not needs_conf:
+            p = self._scarcity_penalty(counts.get("confirmation", 0), total_subs)
+            if p > 0:
+                wasted_penalty += p
+                saved_capabilities.append("Confirmation")
+
+        fac_tenor_months = self._safe_num(getattr(fac, "tenor_months", None), 12.0) or 12.0
+        max_td = self._safe_num(getattr(sub, "max_tenor_days", None), None)
+        eff_tenor_days = max_td if max_td is not None else (fac_tenor_months * 30.0)
+        if eff_tenor_days > 365.0 and not needs_ext_tenor:
+            p = self._scarcity_penalty(counts.get("extended_tenor", 0), total_subs) * 0.6
+            if p > 0:
+                wasted_penalty += p
+                saved_capabilities.append("Long-Tenor")
+
+        # 4. Scarce LG Type coverage preservation (e.g., save the only line that can issue Advance Payment LGs)
+        req_lg_id = getattr(request, "lg_type_id", None)
+        req_lg_str = str(req_lg_id) if req_lg_id is not None else None
+        raw_types = getattr(sub, "lg_type_ids", None)
+        if isinstance(raw_types, (list, tuple, set)) and raw_types:
+            other_types = [str(t) for t in raw_types if str(t) != req_lg_str]
+            best_other_penalty = 0.0
+            for ot in other_types:
+                best_other_penalty = max(best_other_penalty, self._scarcity_penalty(lg_type_counts.get(ot, 0), total_subs))
+            if best_other_penalty > 0:
+                wasted_penalty += best_other_penalty * 0.65
+                saved_capabilities.append("Rare LG Types")
+        elif rarity_profile.get("has_narrow_lg_type_for_req"):
+            p = self._scarcity_penalty(counts.get("wildcard_lg_types", 0), total_subs)
+            if p > 0:
+                wasted_penalty += p * 0.55
+                saved_capabilities.append("All-Type Umbrella")
+
+        # 5. Group Umbrella vs Single-Entity facility preservation
+        fac_entities = getattr(fac, "entities", None)
+        if rarity_profile.get("has_single_entity_for_req") and isinstance(fac_entities, (list, tuple)) and len(fac_entities) != 1:
+            wasted_penalty += 15.0
+            saved_capabilities.append("Group Umbrella")
+
+        # 6. Tight remaining capacity amplifier on scarce lines (<35% remaining)
+        if wasted_penalty > 0 and limit_total > 0 and (available / limit_total) < 0.35:
+            wasted_penalty *= 1.25
+
+        final_rarity_score = round(max(0.0, min(100.0, base_score - wasted_penalty)), 1)
+        return final_rarity_score, saved_capabilities
+
+    def get_suitable_facilities(self, db: Session, request_id: int, customer_id: Optional[int] = None) -> List[SuitableFacilityOut]:
         """
         Smart Engine v2:
         - Iterates through SUB-LIMITS (e.g., "Standard LGs", "Bid Bonds").
         - Calculates Costs (Commission, Margin).
         - Generates Tags ("BEST_PRICE", "NO_MARGIN").
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found")
+        request = self._get_tenant_request(db, request_id, customer_id, detail="Request not found")
 
         # 1. Fetch Facilities
         facilities = crud_facility.get_multi_by_customer(db, customer_id=request.customer_id)
@@ -1076,17 +1431,19 @@ class IssuanceService:
             raw_weights = {
                 'cost': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_COST, 15),
                 'margin': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_MARGIN, 10),
-                'sla': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_SLA, 40),
+                'sla': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_SLA, 35),
                 'capacity': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_CAPACITY, 15),
-                'currency_match': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH, 20),
+                'currency_match': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH, 15),
+                'rarity': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_RARITY, 10),
             }
         else:
             raw_weights = {
-                'cost': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_COST, 30),
+                'cost': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_COST, 25),
                 'margin': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_MARGIN, 15),
                 'sla': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_SLA, 15),
-                'capacity': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_CAPACITY, 20),
-                'currency_match': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_CURRENCY_MATCH, 20),
+                'capacity': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_CAPACITY, 15),
+                'currency_match': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_CURRENCY_MATCH, 15),
+                'rarity': _get_weight(GlobalConfigKey.FACILITY_SCORE_WEIGHT_RARITY, 15),
             }
 
         total_w = sum(raw_weights.values()) or 1.0
@@ -1095,6 +1452,10 @@ class IssuanceService:
         w_sla = raw_weights['sla'] / total_w
         w_capacity = raw_weights['capacity'] / total_w
         w_currency = raw_weights['currency_match'] / total_w
+        w_rarity = raw_weights['rarity'] / total_w
+
+        # Portfolio Rarity & Capability Preservation Profile (save scarce perks for rare guarantees)
+        rarity_profile = self._build_portfolio_rarity_profile(facilities, request)
         
         candidates = []
         
@@ -1194,65 +1555,78 @@ class IssuanceService:
                     # Filter: Dedication — if sub-limit is earmarked for specific projects, only match those
                     if sub.dedicated_project_ids and isinstance(sub.dedicated_project_ids, list):
                         req_project_id = getattr(request, 'project_id', None)
-                        if sub.dedicated_project_ids and req_project_id not in sub.dedicated_project_ids:
+                        str_dedicated_projects = [str(p) for p in sub.dedicated_project_ids]
+                        if not req_project_id or str(req_project_id) not in str_dedicated_projects:
                             logger.info(
                                 f"[FACILITY MATCH]     SKIP {sub_label}: dedication mismatch "
                                 f"req_project_id={req_project_id} not in {sub.dedicated_project_ids}"
                             )
                             continue
 
-                    # Calculate REAL Utilization (sub-limit level)
-                    used_amount = db.query(func.coalesce(func.sum(IssuedLGRecord.current_amount), 0)).filter(
-                        IssuedLGRecord.facility_sub_limit_id == sub.id,
-                        IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING"])
-                    ).scalar()
+                    # Convert request amount to facility currency (matches reserve_facility & issue_lg)
+                    from app.services.fx_service import fx_service
+                    req_amount_raw = Decimal(str(request.amount or 0))
+                    if fac.currency_id == request.currency_id:
+                        req_in_fac_ccy = req_amount_raw
+                        fx_rate = Decimal("1.0")
+                    else:
+                        req_in_fac_ccy, fx_rate = fx_service.convert(
+                            db, req_amount_raw, request.currency_id, fac.currency_id, allow_ai=False
+                        )
+                        if req_in_fac_ccy is None or not fx_rate:
+                            logger.warning(
+                                f"[FACILITY MATCH]     SKIP {sub_label}: missing FX rate "
+                                f"from currency_id={request.currency_id} to fac.currency_id={fac.currency_id}"
+                            )
+                            continue
 
-                    pending_exposure = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)).filter(
-                        IssuanceExposureEntry.sub_limit_id == sub.id,
-                        IssuanceExposureEntry.is_active == True
-                    ).scalar()
+                    margin_pct, exposure_factor = self._get_effective_margin_and_exposure_factor(fac, sub)
+                    required_exposure_dec = (req_in_fac_ccy * exposure_factor).quantize(Decimal("0.01"))
+                    required_exposure_float = float(required_exposure_dec)
 
-                    total_used = max(float(used_amount), float(pending_exposure))
-                    initial_util = float(getattr(sub, 'initial_utilization', 0) or 0)
-                    total_used += initial_util
-                    available = float(sub.limit_amount) - total_used
+                    # Calculate REAL Utilization in facility currency (sub-limit level)
+                    total_used_dec = self.compute_sub_limit_used_in_facility_ccy(db, fac, sub)
+                    total_used = float(total_used_dec)
                     limit_total = float(sub.limit_amount)
+                    available = limit_total - total_used
 
                     # Bug C fix: Calculate utilization against FACILITY total, not sub-limit cap
                     facility_total = float(fac.total_limit_amount)
-                    # Facility-level total used (across ALL sub-limits)
-                    facility_total_used_q = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)).filter(
-                        IssuanceExposureEntry.facility_id == fac.id,
-                        IssuanceExposureEntry.is_active == True
-                    ).scalar()
-                    facility_total_used = float(facility_total_used_q)
+                    # Facility-level total used (across ALL sub-limits, in facility currency)
+                    facility_total_used_dec = Decimal("0")
                     for sl in fac.sub_limits:
-                        facility_total_used += float(getattr(sl, 'initial_utilization', 0) or 0)
+                        facility_total_used_dec += self.compute_sub_limit_used_in_facility_ccy(db, fac, sl)
+                    facility_total_used = float(facility_total_used_dec)
                     facility_available = facility_total - facility_total_used
                     utilization = (facility_total_used / facility_total * 100) if facility_total > 0 else 0.0
 
-                    # Sufficient = fits in BOTH sub-limit cap AND facility total
-                    has_sufficient = available >= float(request.amount) and facility_available >= float(request.amount)
+                    # Sufficient = fits in sub-limit cap, facility total cap, AND max_amount_per_lg (all in facility currency)
+                    exceeds_max_per_lg = bool(sub.max_amount_per_lg and float(req_in_fac_ccy) > float(sub.max_amount_per_lg))
+                    has_sufficient = (
+                        available >= required_exposure_float
+                        and facility_available >= required_exposure_float
+                        and not exceeds_max_per_lg
+                    )
 
-                    # 3. Calculate Financials (proper cost formula)
+                    # 3. Calculate Financials (commission floors/flat fees are in facility currency; normalize back to request currency)
                     comm_rate = float(sub.default_commission_rate or 0)
                     min_comm = float(sub.default_min_commission or 0)
                     flat_fee = float(sub.default_flat_fee or 0)
-                    margin_pct = float(sub.default_cash_margin_pct or 0)
                     
-                    amount = float(request.amount)
-                    # Commission = max(percentage-based, minimum floor) + flat fee
-                    pct_comm = amount * (comm_rate / 100.0)
-                    est_comm = max(pct_comm, min_comm) + flat_fee
-                    req_margin = amount * (margin_pct / 100.0)
-                    # Total cost to the customer
-                    total_cost = est_comm + req_margin
+                    amount = float(request.amount or 0)
+                    req_fac_float = float(req_in_fac_ccy)
+                    pct_comm_fac = req_fac_float * (comm_rate / 100.0)
+                    est_comm_fac = max(pct_comm_fac, min_comm) + flat_fee
+                    fx_rate_float = float(fx_rate) if fx_rate else 1.0
+                    est_comm = round(est_comm_fac / fx_rate_float, 2) if fx_rate_float > 0 else est_comm_fac
+                    req_margin = round(amount * (margin_pct / 100.0), 2)
 
                     # 4. Generate Tags
                     tags = []
                     if not has_sufficient:
-                        # Distinguish: sub-limit has room but facility total is full
-                        if available >= float(request.amount) and facility_available < float(request.amount):
+                        if exceeds_max_per_lg:
+                            tags.append("INSUFFICIENT_LIMIT")
+                        elif available >= required_exposure_float and facility_available < required_exposure_float:
                             tags.append("FACILITY_FULL")
                         else:
                             tags.append("INSUFFICIENT_LIMIT")
@@ -1273,25 +1647,29 @@ class IssuanceService:
                     if sla_info.get("slippage_risk"):
                         tags.append("SLA_SLIPPAGE_RISK")
 
-                    # Phase 3: Facility Limit "What-If" Pipeline Advisor
+                    # Phase 3: Facility Limit "What-If" Pipeline Advisor (FX-converted into facility currency)
                     sub_pipeline_amount = Decimal(0)
                     sub_pipeline_count = 0
                     for pr in pipeline_requests:
-                        if getattr(pr, 'selected_sub_limit_id', None) == sub.id:
-                            sub_pipeline_amount += Decimal(str(pr.amount or 0))
-                            sub_pipeline_count += 1
-                        elif not getattr(pr, 'selected_sub_limit_id', None) and getattr(pr, 'selected_bank_id', None) == fac.bank_id:
-                            sub_pipeline_amount += Decimal(str(pr.amount or 0))
+                        matches_pipeline = (
+                            getattr(pr, 'selected_sub_limit_id', None) == sub.id
+                            or (not getattr(pr, 'selected_sub_limit_id', None) and getattr(pr, 'selected_bank_id', None) == fac.bank_id)
+                        )
+                        if matches_pipeline:
+                            pr_amt = Decimal(str(pr.amount or 0))
+                            if pr.currency_id and pr.currency_id != fac.currency_id:
+                                pr_conv, _ = fx_service.convert(db, pr_amt, pr.currency_id, fac.currency_id, allow_ai=False)
+                                pr_amt = pr_conv if pr_conv is not None else pr_amt
+                            sub_pipeline_amount += (pr_amt * exposure_factor).quantize(Decimal("0.01"))
                             sub_pipeline_count += 1
 
                     avail_dec = Decimal(str(round(max(0.0, available), 2)))
-                    req_amt_dec = Decimal(str(request.amount or 0))
                     real_net_headroom = max(Decimal(0), avail_dec - sub_pipeline_amount)
-                    post_issuance_headroom = real_net_headroom - req_amt_dec
+                    post_issuance_headroom = real_net_headroom - required_exposure_dec
 
                     if post_issuance_headroom < Decimal(0):
                         headroom_status = "OVERCOMMIT_WARNING"
-                    elif post_issuance_headroom < (req_amt_dec * Decimal("0.25")):
+                    elif post_issuance_headroom < (required_exposure_dec * Decimal("0.25")):
                         headroom_status = "TIGHT"
                     else:
                         headroom_status = "SAFE"
@@ -1299,8 +1677,8 @@ class IssuanceService:
                     # 5. Compute multi-factor score (0-100, higher is better)
                     # C3: Weights (w_cost, w_margin, w_sla, w_capacity, w_currency) pre-loaded from GlobalConfig
                     
-                    # Cost score: lower cost = higher score (normalize against amount)
-                    cost_ratio = total_cost / amount if amount > 0 else 0
+                    # Cost score: strictly non-refundable bank fee cost (est_comm); refundable cash margin is scored separately in margin_score
+                    cost_ratio = est_comm / amount if amount > 0 else 0
                     cost_score = max(0, 100 - (cost_ratio * 100 * 5))  # 5x penalty
                     
                     # Margin score: lower margin = higher score
@@ -1328,13 +1706,34 @@ class IssuanceService:
                         currency_match_score = 50.0
                     else:
                         currency_match_score = 0.0
+
+                    # Rarity preservation score — prefer project-dedicated & common lines; preserve scarce capabilities
+                    rarity_score, saved_capabilities = self._compute_facility_rarity_score(
+                        fac=fac,
+                        sub=sub,
+                        request=request,
+                        rarity_profile=rarity_profile,
+                        available=available,
+                        limit_total=limit_total,
+                    )
+                    if saved_capabilities and rarity_score <= 78.0 and raw_weights['rarity'] > 0:
+                        tags.append("RARE_LINE_SAVE")
+                    elif (
+                        not saved_capabilities
+                        and rarity_profile.get("total_active_subs", 0) >= 2
+                        and rarity_profile.get("any_scarce_perk", False)
+                        and raw_weights['rarity'] > 0
+                        and "DEDICATED" not in tags
+                    ):
+                        tags.append("COMMON_FIT")
                     
                     facility_score = round(
                         cost_score * w_cost + 
                         margin_score * w_margin + 
                         sla_score * w_sla + 
                         capacity_score * w_capacity +
-                        currency_match_score * w_currency, 
+                        currency_match_score * w_currency +
+                        rarity_score * w_rarity, 
                         1
                     )
 
@@ -1352,6 +1751,11 @@ class IssuanceService:
                         ) for opt in bank_options
                     ]
 
+                    fac_ccy_code = (
+                        getattr(fac.currency, "iso_code", None)
+                        or getattr(fac.currency, "code", None)
+                    ) if getattr(fac, "currency", None) else None
+
                     candidates.append(SuitableFacilityOut(
                         facility_id=fac.id,
                         available_methods=method_dtos,
@@ -1359,6 +1763,7 @@ class IssuanceService:
                         bank_id=fac.bank_id,
                         sub_limit_id=sub.id,
                         sub_limit_name=sub.limit_name,
+                        facility_currency_code=fac_ccy_code,
                         limit_available=max(0, available),
                         total_limit=limit_total,
                         total_used=total_used,
@@ -1386,7 +1791,11 @@ class IssuanceService:
                         pipeline_in_flight_count=sub_pipeline_count,
                         real_net_headroom=real_net_headroom,
                         post_issuance_headroom=post_issuance_headroom,
-                        headroom_status=headroom_status
+                        headroom_status=headroom_status,
+
+                        # Additive: Portfolio Rarity & Capability Preservation
+                        rarity_score=rarity_score,
+                        saved_capabilities=saved_capabilities,
                     ))
                 except Exception as e:
                     import logging
@@ -1423,13 +1832,11 @@ class IssuanceService:
     # 3. INTELLIGENT SELECTION
     # ==========================================================================
 
-    def find_suitable_facilities(self, db: Session, request_id: int) -> List[Dict[str, Any]]:
+    def find_suitable_facilities(self, db: Session, request_id: int, customer_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         THE SMART ENGINE: Finds facilities that match the request criteria AND have available limit.
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found")
+        request = self._get_tenant_request(db, request_id, customer_id, detail="Request not found")
 
         # 1. Fetch all active facilities for this customer
         facilities = crud_issuance_facility.get_multi_by_customer(db, customer_id=request.customer_id)
@@ -1481,16 +1888,15 @@ class IssuanceService:
         db: Session,
         request_id: int,
         user_id: int,
-        sub_limit_id: int
+        sub_limit_id: int,
+        customer_id: Optional[int] = None
     ) -> IssuanceRequest:
         """
         Reserve facility capacity for a request without creating the LG record.
         APPROVED_INTERNAL → FACILITY_RESERVED
         Creates an exposure entry of type RESERVATION.
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found.")
+        request = self._get_tenant_request(db, request_id, customer_id)
 
         if request.status != "APPROVED_INTERNAL":
             raise HTTPException(
@@ -1514,12 +1920,12 @@ class IssuanceService:
         if not sub_limit:
             raise HTTPException(status_code=404, detail="Selected facility sub-limit not found.")
 
-        # Load facility for currency context (C1: multi-currency utilization fix)
+        # Load facility for currency & tenant context (C1: multi-currency utilization + strict tenant wall)
         facility = db.query(IssuanceFacility).filter(
             IssuanceFacility.id == sub_limit.facility_id
         ).first()
-        if not facility:
-            raise HTTPException(status_code=404, detail="Facility not found.")
+        if not facility or facility.customer_id != request.customer_id:
+            raise HTTPException(status_code=404, detail="Selected facility sub-limit not found.")
 
         # C4: Respect FX_SUSPENDED status
         if facility.status == "FX_SUSPENDED":
@@ -1562,10 +1968,11 @@ class IssuanceService:
                         detail=f"Beneficiary country '{request_country}' is excluded from this sub-limit."
                     )
 
-        # 3. Dedicated project check
+        # 3. Dedicated project check (strict: blank project_id cannot consume a project-dedicated sub-limit)
         if sub_limit.dedicated_project_ids:
             request_project_id = getattr(request, 'project_id', None)
-            if request_project_id and request_project_id not in sub_limit.dedicated_project_ids:
+            str_dedicated_projects = [str(p) for p in sub_limit.dedicated_project_ids]
+            if not request_project_id or str(request_project_id) not in str_dedicated_projects:
                 raise HTTPException(
                     status_code=400,
                     detail="This sub-limit is dedicated to specific projects. "
@@ -1616,50 +2023,43 @@ class IssuanceService:
                        "Please ensure exchange rates are up to date."
             )
 
+        # Apply facility.margin_reduces_exposure when enabled
+        _, exposure_factor = self._get_effective_margin_and_exposure_factor(facility, sub_limit)
+        effective_exposure_amount = (facility_equivalent_amount * exposure_factor).quantize(Decimal("0.01"))
+
         # Check sub-limit availability (amounts now in facility currency)
-        used_amount = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0))\
-            .filter(
-                IssuanceExposureEntry.sub_limit_id == sub_limit_id,
-                IssuanceExposureEntry.is_active == True
-            ).scalar()
-        # Add initial utilization
-        used_amount = float(used_amount) + float(getattr(sub_limit, 'initial_utilization', 0) or 0)
+        used_amount = float(self.compute_sub_limit_used_in_facility_ccy(db, facility, sub_limit))
 
         available_amount = float(sub_limit.limit_amount) - used_amount
-        if float(facility_equivalent_amount) > available_amount:
+        if float(effective_exposure_amount) > available_amount:
             raise HTTPException(
                 status_code=400,
                 detail=f"Insufficient sub-limit capacity. Available: {available_amount:,.2f} "
                        f"({facility.currency.iso_code if facility.currency else 'N/A'}), "
-                       f"Required: {float(facility_equivalent_amount):,.2f}"
+                       f"Required: {float(effective_exposure_amount):,.2f}"
             )
 
         # Check FACILITY-level total cap
-        facility_total_used_q = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0))\
-            .filter(
-                IssuanceExposureEntry.facility_id == facility.id,
-                IssuanceExposureEntry.is_active == True
-            ).scalar()
-        facility_total_used = float(facility_total_used_q)
-        # Add initial utilization from all sub-limits
+        facility_total_used_dec = Decimal("0")
         for sl in facility.sub_limits:
-            facility_total_used += float(getattr(sl, 'initial_utilization', 0) or 0)
+            facility_total_used_dec += self.compute_sub_limit_used_in_facility_ccy(db, facility, sl)
+        facility_total_used = float(facility_total_used_dec)
         facility_available = float(facility.total_limit_amount) - facility_total_used
-        if float(facility_equivalent_amount) > facility_available:
+        if float(effective_exposure_amount) > facility_available:
             raise HTTPException(
                 status_code=400,
                 detail=f"Insufficient facility total limit. Facility available: {facility_available:,.2f}, "
-                       f"Required: {float(facility_equivalent_amount):,.2f}"
+                       f"Required: {float(effective_exposure_amount):,.2f}"
             )
 
-        # Check max per LG (compare in facility currency)
+        # Check max per LG (compare face amount in facility currency)
         if sub_limit.max_amount_per_lg and float(facility_equivalent_amount) > float(sub_limit.max_amount_per_lg):
             raise HTTPException(
                 status_code=400,
                 detail=f"Amount exceeds maximum per LG ({float(sub_limit.max_amount_per_lg):,.2f}) for this sub-limit."
             )
 
-        # Create exposure reservation (amounts in facility currency)
+        # Create exposure reservation (net credit-line exposure in facility currency)
         from datetime import date as date_cls
 
         exposure_entry = IssuanceExposureEntry(
@@ -1670,7 +2070,7 @@ class IssuanceService:
             original_amount_delta=request.amount,
             original_currency_id=request.currency_id,
             fx_rate_used=fx_rate,
-            facility_equivalent_delta=facility_equivalent_amount,
+            facility_equivalent_delta=effective_exposure_amount,
             is_active=True,
             effective_date=date_cls.today()
         )
@@ -1703,15 +2103,14 @@ class IssuanceService:
         self,
         db: Session,
         request_id: int,
-        user_id: int
+        user_id: int,
+        customer_id: Optional[int] = None
     ) -> IssuanceRequest:
         """
         Release a facility reservation, freeing the held capacity.
         FACILITY_RESERVED → APPROVED_INTERNAL
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found.")
+        request = self._get_tenant_request(db, request_id, customer_id)
 
         if request.status != "FACILITY_RESERVED":
             raise HTTPException(
@@ -1747,7 +2146,7 @@ class IssuanceService:
     # ================================================================
     # C5: Pre-Execution FX Drift Check
     # ================================================================
-    def pre_execution_check(self, db: Session, request_id: int) -> Dict[str, Any]:
+    def pre_execution_check(self, db: Session, request_id: int, customer_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Runs pre-execution checks for a reserved request before issue_lg.
         Returns warnings (FX drift, etc.) the frontend can display.
@@ -1755,9 +2154,7 @@ class IssuanceService:
         from app.services.fx_service import fx_service
         from app.constants import GlobalConfigKey
 
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found.")
+        request = self._get_tenant_request(db, request_id, customer_id)
 
         result = {
             "request_id": request_id,
@@ -1867,7 +2264,8 @@ class IssuanceService:
         issuance_method: Optional[str] = "MANUAL",
         bank_method_id: Optional[int] = None,
         bank_id: Optional[int] = None,
-        manual_pricing: Optional[Dict[str, Any]] = None  # D3: cost data for no-facility LGs
+        manual_pricing: Optional[Dict[str, Any]] = None,  # D3: cost data for no-facility LGs
+        customer_id: Optional[int] = None
     ) -> IssuedLGRecord:
         """
         The single, unified execution method. Performs:
@@ -1883,9 +2281,10 @@ class IssuanceService:
 
         # --- STEP 1: Fetch & Validate (with row-level lock to prevent concurrent issuance) ---
         # Lock only the main table to avoid "FOR UPDATE cannot be applied to nullable outer join"
-        request = db.query(IssuanceRequest).filter(
-            IssuanceRequest.id == request_id
-        ).with_for_update(of=IssuanceRequest).first()
+        req_q = db.query(IssuanceRequest).filter(IssuanceRequest.id == request_id)
+        if customer_id is not None:
+            req_q = req_q.filter(IssuanceRequest.customer_id == customer_id)
+        request = req_q.with_for_update(of=IssuanceRequest).first()
         if not request:
             raise HTTPException(status_code=404, detail="Request not found.")
 
@@ -1975,15 +2374,32 @@ class IssuanceService:
                 if not sub_limit:
                     raise HTTPException(status_code=404, detail="Selected facility sub-limit not found.")
 
+                facility = db.query(IssuanceFacility).filter(
+                    IssuanceFacility.id == sub_limit.facility_id
+                ).first()
+                if not facility or facility.customer_id != request.customer_id:
+                    raise HTTPException(status_code=404, detail="Selected facility sub-limit not found.")
+
                 if not already_reserved:
                     # Only check availability and create exposure if NOT already reserved
                     # (reserved requests already have an active exposure entry)
-                    
-                    # C1: Convert request amount to facility currency for capacity comparison
-                    facility = db.query(IssuanceFacility).filter(
-                        IssuanceFacility.id == sub_limit.facility_id
-                    ).first()
+                    if facility.status == "FX_SUSPENDED":
+                        raise HTTPException(
+                            status_code=400,
+                            detail="This facility is suspended due to FX breach. Contact your Corporate Admin."
+                        )
 
+                    if sub_limit.dedicated_project_ids:
+                        request_project_id = getattr(request, 'project_id', None)
+                        str_dedicated_projects = [str(p) for p in sub_limit.dedicated_project_ids]
+                        if not request_project_id or str(request_project_id) not in str_dedicated_projects:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="This sub-limit is dedicated to specific projects. "
+                                       "The request's project does not match."
+                            )
+
+                    # C1: Convert request amount to facility currency for capacity comparison
                     from app.services.fx_service import fx_service
                     facility_equivalent_amount, fx_rate = fx_service.convert(
                         db,
@@ -1998,39 +2414,32 @@ class IssuanceService:
                             detail="Cannot determine FX rate for facility currency conversion."
                         )
 
-                    used_amount = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0))\
-                        .filter(
-                            IssuanceExposureEntry.sub_limit_id == sub_limit_id,
-                            IssuanceExposureEntry.is_active == True
-                        ).scalar()
-                    used_amount = float(used_amount) + float(getattr(sub_limit, 'initial_utilization', 0) or 0)
+                    _, exposure_factor = self._get_effective_margin_and_exposure_factor(facility, sub_limit)
+                    effective_exposure_amount = (facility_equivalent_amount * exposure_factor).quantize(Decimal("0.01"))
 
+                    used_amount = float(self.compute_sub_limit_used_in_facility_ccy(db, facility, sub_limit))
                     available_amount = float(sub_limit.limit_amount) - used_amount
 
-                    if float(facility_equivalent_amount) > available_amount:
+                    if float(effective_exposure_amount) > available_amount:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Insufficient sub-limit capacity. Available: {available_amount:,.2f}, Required: {float(facility_equivalent_amount):,.2f}"
+                            detail=f"Insufficient sub-limit capacity. Available: {available_amount:,.2f}, Required: {float(effective_exposure_amount):,.2f}"
                         )
 
                     # Check FACILITY-level total cap
                     if facility:
-                        facility_total_used_q = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0))\
-                            .filter(
-                                IssuanceExposureEntry.facility_id == facility.id,
-                                IssuanceExposureEntry.is_active == True
-                            ).scalar()
-                        facility_total_used = float(facility_total_used_q)
+                        facility_total_used_dec = Decimal("0")
                         for sl in facility.sub_limits:
-                            facility_total_used += float(getattr(sl, 'initial_utilization', 0) or 0)
+                            facility_total_used_dec += self.compute_sub_limit_used_in_facility_ccy(db, facility, sl)
+                        facility_total_used = float(facility_total_used_dec)
                         facility_available = float(facility.total_limit_amount) - facility_total_used
-                        if float(facility_equivalent_amount) > facility_available:
+                        if float(effective_exposure_amount) > facility_available:
                             raise HTTPException(
                                 status_code=400,
-                                detail=f"Insufficient facility total limit. Available: {facility_available:,.2f}, Required: {float(facility_equivalent_amount):,.2f}"
+                                detail=f"Insufficient facility total limit. Available: {facility_available:,.2f}, Required: {float(effective_exposure_amount):,.2f}"
                             )
 
-                    # Check max amount per LG if configured
+                    # Check max amount per LG if configured (compare face amount in facility currency)
                     if sub_limit.max_amount_per_lg and float(facility_equivalent_amount) > float(sub_limit.max_amount_per_lg):
                         raise HTTPException(
                             status_code=400,
@@ -2048,7 +2457,7 @@ class IssuanceService:
                         original_amount_delta=request.amount,
                         original_currency_id=request.currency_id,
                         fx_rate_used=fx_rate,
-                        facility_equivalent_delta=facility_equivalent_amount,
+                        facility_equivalent_delta=effective_exposure_amount,
                         is_active=True,
                         effective_date=date_cls.today()
                     )
@@ -2212,7 +2621,8 @@ class IssuanceService:
         db: Session,
         request_id: int,
         user_id: int,
-        reason: str
+        reason: str,
+        customer_id: Optional[int] = None
     ) -> IssuanceRequest:
         """
         Cancels a request and releases any facility reservation.
@@ -2221,9 +2631,7 @@ class IssuanceService:
         import logging
         logger = logging.getLogger(__name__)
 
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found.")
+        request = self._get_tenant_request(db, request_id, customer_id)
 
         cancellable_statuses = ("APPROVED_INTERNAL", "INTERNAL_PROCESSING")
         if request.status not in cancellable_statuses:
@@ -2286,15 +2694,14 @@ class IssuanceService:
         db: Session,
         request_id: int,
         user_id: int,
-        reason: str
+        reason: str,
+        customer_id: Optional[int] = None
     ) -> IssuanceRequest:
         """
         End user or requestor submits a cancellation request (goes to admin for approval).
         Allowed from: PENDING_APPROVAL, APPROVED_INTERNAL, FACILITY_RESERVED
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found.")
+        request = self._get_tenant_request(db, request_id, customer_id)
 
         cancellable = ("PENDING_APPROVAL", "APPROVED_INTERNAL", "FACILITY_RESERVED")
         if request.status not in cancellable:
@@ -2363,16 +2770,15 @@ class IssuanceService:
         request_id: int,
         admin_user_id: int,
         approved: bool,
-        note: str = None
+        note: str = None,
+        customer_id: Optional[int] = None
     ) -> IssuanceRequest:
         """
         Admin approves or rejects a cancellation request.
         Approve → cancel the request (release reservations, etc.)
         Reject  → restore previous status
         """
-        request = crud_issuance_request.get(db, id=request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="Request not found.")
+        request = self._get_tenant_request(db, request_id, customer_id)
 
         if request.status != "CANCELLATION_REQUESTED":
             raise HTTPException(
@@ -2736,7 +3142,7 @@ class IssuanceService:
             "lg_wording_clause": lg_wording_clause,
             "other_instructions": other_instructions,
             "other_instructions_section": (
-                f'<div class="instructions"><p><strong>Other Instructions:</strong></p><p>{other_instructions}</p></div>'
+                f'<div class="instructions"><p><strong>Other Instructions:</strong></p><p>{__import__("html").escape(str(other_instructions), quote=True)}</p></div>'
                 if other_instructions else ""
             ),
             "conditions_acceptance": conditions_acceptance,
@@ -2792,9 +3198,10 @@ class IssuanceService:
 
         generated_html = _process_conditionals(generated_html, placeholder_data)
 
-        # 6b. Replace {{key}} placeholders
+        # 6b. Replace {{key}} placeholders with safe HTML escaping
+        from app.core.document_generator import escape_html_placeholder
         for key, value in placeholder_data.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
 
         # 7. Generate PDF

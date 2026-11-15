@@ -496,6 +496,7 @@ class SuitableFacilityOut(BaseModel):
     bank_id: int
     sub_limit_id: int
     sub_limit_name: str
+    facility_currency_code: Optional[str] = None
     limit_available: Decimal
     total_limit: Decimal = Decimal(0)
     total_used: Decimal = Decimal(0)
@@ -523,6 +524,10 @@ class SuitableFacilityOut(BaseModel):
     real_net_headroom: Optional[Decimal] = None
     post_issuance_headroom: Optional[Decimal] = None
     headroom_status: Optional[str] = "SAFE"
+
+    # Additive: Portfolio Rarity & Capability Preservation Advisor
+    rarity_score: Optional[float] = None
+    saved_capabilities: Optional[List[str]] = None
 
 # ==============================================================================
 # 4. RECONCILIATION & WORKFLOW (EXISTING)

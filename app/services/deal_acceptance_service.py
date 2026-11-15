@@ -122,7 +122,7 @@ async def execute_shared_deal_acceptance(
     Supports Maker, Corporate Admin, and Delegated Colleague.
     Supports both Multi-Leg basket RFQs and Single-Leg RFQs.
     """
-    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).with_for_update().first()
     if not rfq:
         raise HTTPException(status_code=404, detail="Quotation not found.")
 
@@ -133,6 +133,36 @@ async def execute_shared_deal_acceptance(
     check_deal_authority(rfq, user, action_name="accept")
 
     now_utc = datetime.now(timezone.utc)
+
+    # Idempotent return if this deal was already accepted (e.g. double-click or multi-tab race)
+    if rfq.acceptance_status in ("ACCEPTED", "AUTO_ACCEPTED"):
+        return {
+            "status": "success",
+            "message": f"Deal already accepted for RFQ {rfq.ref_no}.",
+            "rfq_id": rfq.id,
+            "rfq_status": rfq.status,
+            "acceptance_status": rfq.acceptance_status,
+        }
+
+    # Block acceptance if already declined, cancelled, or timed out
+    if rfq.status in ("REJECTED", "CANCELLED") or rfq.acceptance_status in ("REJECTED", "AUTO_REJECTED", "EXPIRED"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot accept deal: This quotation has already been declined, cancelled, or expired."
+        )
+
+    if rfq.acceptance_deadline:
+        acc_deadline_utc = (
+            rfq.acceptance_deadline.replace(tzinfo=timezone.utc)
+            if rfq.acceptance_deadline.tzinfo is None
+            else rfq.acceptance_deadline.astimezone(timezone.utc)
+        )
+        if now_utc > acc_deadline_utc:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot accept deal: The post-window acceptance countdown has expired."
+            )
+
     rfq.acceptance_resolved_at = now_utc
     rfq.acceptance_resolved_by_user_id = user.id
 
@@ -278,7 +308,7 @@ async def execute_shared_deal_decline(
     When update_reason_only=True (or if the deal was already rejected in Step 1),
     updates only the decline reason without re-triggering counterparty emails.
     """
-    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).first()
+    rfq = db.query(QuotationRequest).filter(QuotationRequest.id == rfq_id).with_for_update().first()
     if not rfq:
         raise HTTPException(status_code=404, detail="Quotation not found.")
 
@@ -287,6 +317,12 @@ async def execute_shared_deal_decline(
         raise HTTPException(status_code=401, detail="User not authenticated.")
 
     check_deal_authority(rfq, user, action_name="decline")
+
+    if rfq.acceptance_status in ("ACCEPTED", "AUTO_ACCEPTED"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot decline deal: This quotation has already been accepted and confirmed."
+        )
 
     already_rejected = (rfq.acceptance_status == 'REJECTED' or rfq.status == 'REJECTED')
 

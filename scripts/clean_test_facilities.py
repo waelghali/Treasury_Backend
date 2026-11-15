@@ -1,9 +1,10 @@
+import os
 # scripts/clean_test_facilities.py
 import sys, os
 sys.path.insert(0, os.path.abspath("."))
 from sqlalchemy import create_engine, text
 
-STAGING_DB_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
+STAGING_DB_URL = os.environ["STAGING_DB_URL"]
 
 def clean():
     eng = create_engine(STAGING_DB_URL)

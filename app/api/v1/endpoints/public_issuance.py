@@ -178,8 +178,8 @@ def public_verify_domain(
 
 @router.post("/verify-otp")
 def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
-    email = payload.get("email", "").lower()
-    otp_code = payload.get("otp", "")
+    email = (payload.get("email") or "").strip().lower()
+    otp_code = str(payload.get("otp") or "").strip()
 
     # --- OTP Rate Limiting (brute-force protection) ---
     # Configurable thresholds via GlobalConfig (defaults: 5 attempts, 15 min lockout)
@@ -200,17 +200,24 @@ def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
     except Exception:
         db.rollback()
 
-    lockout_window = datetime.now(timezone.utc) - timedelta(minutes=lockout_minutes)
+    now_utc = datetime.now(timezone.utc)
+    lockout_window = now_utc - timedelta(minutes=lockout_minutes)
 
-    # Count recent failed OTP attempts for this email (verified=False and created within window)
-    recent_failures = db.query(func.count(ExternalOTP.id)).filter(
-        ExternalOTP.email == email,
-        ExternalOTP.is_verified == False,
-        ExternalOTP.created_at >= lockout_window,
-    ).scalar() or 0
+    # Count actual failed OTP guesses committed within the lockout window for this email
+    from app.models.models import AuditLog
+    recent_failed_logs = db.query(AuditLog.details).filter(
+        AuditLog.action_type == "OTP_FAILED",
+        AuditLog.entity_type == "OTP",
+        AuditLog.timestamp >= lockout_window,
+    ).all()
+    recent_failures = sum(
+        1 for (details_json,) in recent_failed_logs
+        if isinstance(details_json, dict) and str(details_json.get("email", "")).strip().lower() == email
+    )
 
     if recent_failures >= max_attempts:
         log_action(db, None, "OTP_RATE_LIMITED", "OTP", None, {"email": email, "attempts": recent_failures})
+        db.commit()
         raise HTTPException(
             status_code=429,
             detail=f"Too many failed attempts. Please try again in {lockout_minutes} minutes."
@@ -219,12 +226,28 @@ def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
     record = db.query(ExternalOTP).filter(
         ExternalOTP.email == email,
         ExternalOTP.otp_code == otp_code,
-        ExternalOTP.expires_at > datetime.now(timezone.utc),
+        ExternalOTP.expires_at > now_utc,
         ExternalOTP.is_verified == False
     ).first()
 
     if not record:
-        log_action(db, None, "OTP_FAILED", "OTP", None, {"email": email})
+        new_failure_count = recent_failures + 1
+        if new_failure_count >= max_attempts:
+            # Burn any active unverified OTP codes for this email so a locked-out code can never be reused
+            active_otps = db.query(ExternalOTP).filter(
+                ExternalOTP.email == email,
+                ExternalOTP.is_verified == False,
+                ExternalOTP.expires_at > now_utc,
+            ).all()
+            for otp_row in active_otps:
+                otp_row.expires_at = now_utc
+        log_action(db, None, "OTP_FAILED", "OTP", None, {"email": email, "attempt": new_failure_count})
+        db.commit()
+        if new_failure_count >= max_attempts:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Please try again in {lockout_minutes} minutes."
+            )
         raise HTTPException(status_code=400, detail="Invalid or expired code.")
 
     record.is_verified = True

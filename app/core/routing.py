@@ -7,34 +7,82 @@ import os
 from typing import Optional
 
 
+from urllib.parse import urlparse
+
+
+def _is_trusted_grow_url(candidate_url: str, allow_backend_hosts: bool = False) -> bool:
+    """
+    Validates that a URL derived from request headers belongs strictly to official Grow
+    domains (or localhost during non-production development) to prevent reset-link poisoning.
+    """
+    if not candidate_url:
+        return False
+    try:
+        parsed = urlparse(candidate_url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+
+    host = parsed.hostname.lower().strip(".")
+    is_prod_env = bool(
+        "grow_xl8z" in os.getenv("DATABASE_URL", "").lower()
+        or os.getenv("ENVIRONMENT") == "production"
+        or os.getenv("RENDER")
+    )
+
+    if host == "growbusinessdevelopment.com" or host.endswith(".growbusinessdevelopment.com"):
+        return parsed.scheme == "https"
+
+    if allow_backend_hosts and host.endswith(".onrender.com"):
+        configured_backend = (os.getenv("BACKEND_URL") or os.getenv("API_BASE_URL") or "").lower()
+        if configured_backend and host in configured_backend:
+            return parsed.scheme == "https"
+
+    if not is_prod_env and host in ("localhost", "127.0.0.1", "testserver"):
+        return True
+
+    # Also trust exact match against configured FRONTEND_URL / BACKEND_URL
+    for env_key in ("FRONTEND_URL", "BACKEND_URL", "API_BASE_URL"):
+        env_url = os.getenv(env_key, "").strip()
+        if env_url:
+            try:
+                env_host = (urlparse(env_url).hostname or "").lower()
+                if env_host and host == env_host:
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
 def get_frontend_base_url(request: Optional[object] = None) -> str:
     """
     Returns the canonical frontend base URL for the active environment.
-    Priority:
-    1. Origin header from incoming request (e.g. https://staging.growbusinessdevelopment.com)
-    2. Referer header from incoming request
-    3. X-Forwarded-Host or Host header from incoming request
-    4. FRONTEND_URL environment variable
-    5. Automatic environment detection (Staging DB or staging environment variables)
-    6. Default: http://localhost:3000
+    Validates incoming headers against official Grow domains before use.
     """
     if request and hasattr(request, "headers"):
         origin = request.headers.get("origin")
         if origin and origin.startswith("http"):
-            return origin.rstrip("/")
-        
+            clean_origin = origin.rstrip("/")
+            if _is_trusted_grow_url(clean_origin):
+                return clean_origin
+
         referer = request.headers.get("referer")
         if referer and referer.startswith("http"):
-            from urllib.parse import urlparse
             parsed = urlparse(referer)
             if parsed.scheme and parsed.netloc:
-                return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
-        
+                clean_ref = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+                if _is_trusted_grow_url(clean_ref):
+                    return clean_ref
+
         host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         if host:
             is_ssl = "growbusinessdevelopment.com" in str(host) or "render.com" in str(host) or "vercel.app" in str(host)
             proto = request.headers.get("x-forwarded-proto", "https" if is_ssl else "http")
-            return f"{proto}://{host}".rstrip("/")
+            candidate = f"{proto}://{host}".rstrip("/")
+            if _is_trusted_grow_url(candidate):
+                return candidate
 
     env_val = os.getenv("FRONTEND_URL")
     if env_val and env_val.strip():
@@ -53,11 +101,6 @@ def get_frontend_base_url(request: Optional[object] = None) -> str:
 def get_backend_base_url(request: Optional[object] = None) -> str:
     """
     Returns the canonical backend API base URL for document streaming and download endpoints.
-    Priority:
-    1. BACKEND_URL or API_BASE_URL environment variable
-    2. Host and proto from incoming request
-    3. Production / Staging domain detection
-    4. Default: http://localhost:8000
     """
     env_backend = os.getenv("BACKEND_URL") or os.getenv("API_BASE_URL")
     if env_backend and env_backend.strip():
@@ -68,7 +111,9 @@ def get_backend_base_url(request: Optional[object] = None) -> str:
         if host:
             is_ssl = "growbusinessdevelopment.com" in str(host) or "render.com" in str(host) or "vercel.app" in str(host)
             proto = request.headers.get("x-forwarded-proto", "https" if is_ssl else "http")
-            return f"{proto}://{host}".rstrip("/")
+            candidate = f"{proto}://{host}".rstrip("/")
+            if _is_trusted_grow_url(candidate, allow_backend_hosts=True):
+                return candidate
 
     db_url = os.getenv("DATABASE_URL", "").lower()
     if "staging" in db_url or os.getenv("ENVIRONMENT") == "staging":

@@ -1,10 +1,11 @@
+import os
 # scripts/extract_staging_backup.py
 import sys, os, time, pickle
 sys.path.insert(0, os.path.abspath("."))
 from sqlalchemy import create_engine, text, MetaData, Table
 
-REMOTE_STAGING_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
-LOCAL_BACKUP_URL = "postgresql://postgres:Voda%21%4012@localhost:5432/grow_staging_backup"
+REMOTE_STAGING_URL = os.environ["STAGING_DB_URL"]
+LOCAL_BACKUP_URL = os.environ["LOCAL_BACKUP_URL"]
 
 def extract():
     start_time = time.time()

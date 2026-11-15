@@ -1,3 +1,4 @@
+import os
 import sys
 sys.path.insert(0, '.')
 import io
@@ -9,7 +10,7 @@ from app.core.pdf_form_filler import build_request_data_dict, fill_pdf_form
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-STAGING_DB_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
+STAGING_DB_URL = os.environ["STAGING_DB_URL"]
 eng = create_engine(STAGING_DB_URL)
 SessionLocal = sessionmaker(bind=eng)
 db = SessionLocal()

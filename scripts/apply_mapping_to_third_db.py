@@ -1,9 +1,12 @@
+import os
 import sys
 sys.path.insert(0, '.')
 from sqlalchemy import create_engine, text
 import json
 
-PROD_DB_URL = "postgresql://grow_xl8z_user:JUeq65Xm7OZQorlc32SyeysYbuemRdBD@dpg-d2brigndiees73f2d9dg-a.frankfurt-postgres.render.com/grow_xl8z"
+PROD_DB_URL = os.environ.get("PROD_DB_URL") or os.environ.get("THIRD_DB_URL")
+if not PROD_DB_URL:
+    raise RuntimeError("PROD_DB_URL (or THIRD_DB_URL) environment variable is required.")
 
 CHECKBOX_MAP = {
     "Check1": {"mapped_to": "lg_type_is_bid_bond", "label": "Bid Bond / ابتدائي"},

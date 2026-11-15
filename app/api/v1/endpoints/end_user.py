@@ -130,7 +130,8 @@ try:
         get_current_active_user,
         get_current_user,
         check_subscription_status,
-        check_for_read_only_mode, get_client_ip
+        check_for_read_only_mode, get_client_ip,
+        get_issuance_read_context,
     )
     from app.core.ai_integration import process_lg_document_with_ai, generate_signed_gcs_url, process_amendment_with_ai
 
@@ -221,6 +222,20 @@ def get_fresh_entity_permissions(db: Session, user_id: int) -> Tuple[bool, List[
     has_all = user.has_all_entity_access
     allowed_ids = [assoc.customer_entity_id for assoc in user.entity_associations]
     return has_all, allowed_ids
+
+
+def _get_accessible_lg_record(db: Session, lg_record_id: int, user_ctx: TokenData):
+    """
+    Loads an LG record scoped strictly to both the user's customer AND assigned subsidiaries.
+    """
+    fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, user_ctx.user_id)
+    return crud_lg_record.get_lg_record_with_relations(
+        db,
+        lg_record_id,
+        user_ctx.customer_id,
+        user_has_all_access=fresh_has_all_access,
+        user_allowed_entity_ids=fresh_entity_ids,
+    )
 
 # --- Helper for Fuzzy Matching ---
 def find_best_match(extracted_name: str, valid_entities: List[Dict[str, Any]], threshold: int = 70) -> Optional[int]:
@@ -1097,7 +1112,7 @@ async def scan_amendment_letter_file(
     """
     client_host = get_client_ip(request) if request else None
 
-    lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -1342,6 +1357,126 @@ def view_lg_document_securely(
 
 
 @router.post(
+    "/lg-records/{lg_record_id}/analyze-special-wording",
+    dependencies=[Depends(check_subscription_status)],
+    summary="Advisory bilingual (AR/EN) Beneficiary Protection Check for an inbound/custody LG record",
+)
+async def analyze_custody_lg_special_wording(
+    lg_record_id: int,
+    document_id: Optional[int] = Form(None),
+    wording_text: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_issuance_read_context),
+):
+    """
+    Beneficiary Protection Check (LG Custody — Inbound):
+    Scans an attached Custody LG document, pasted Arabic/English vendor guarantee text, or stored
+    payment/claim conditions from the BENEFICIARY perspective (flagging claim-blocking hurdles such as
+    non-operative clauses, court-judgment requirements, vendor-consent gates, revocability, or unilateral
+    vendor reductions). Strictly advisory — never alters LG status or blocks custody workflows.
+    """
+    from app.services.wording_risk_service import (
+        analyze_special_wording_traps,
+        load_and_unseal_stored_document_bytes,
+    )
+
+    lg_record = db.query(models.LGRecord).filter(
+        models.LGRecord.id == lg_record_id,
+        models.LGRecord.customer_id == current_user.customer_id,
+        models.LGRecord.is_deleted == False,
+    ).first()
+    if not lg_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG record not found.")
+
+    file_bytes: Optional[bytes] = None
+    filename = "custody_lg.pdf"
+    if document_id:
+        db_doc = db.query(models.LGDocument).filter(
+            models.LGDocument.id == document_id,
+            models.LGDocument.lg_record_id == lg_record_id,
+            models.LGDocument.is_deleted == False,
+        ).first()
+        if not db_doc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+        filename = db_doc.file_name or "custody_lg.pdf"
+        try:
+            file_bytes = load_and_unseal_stored_document_bytes(
+                db, db_doc.file_path, current_user.customer_id, encryption_context="lg_custody_doc"
+            )
+        except FileNotFoundError as fnf:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(fnf))
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Could not read document: {exc}")
+    elif file:
+        filename = file.filename or "custody_lg.pdf"
+        file_bytes = await file.read()
+
+    effective_wording_text = (wording_text or "").strip()
+    if not file_bytes and not effective_wording_text:
+        stored_parts = [
+            str(getattr(lg_record, "payment_conditions", "") or "").strip(),
+            str(getattr(lg_record, "other_conditions", "") or "").strip(),
+            str(getattr(lg_record, "mandatory_claim_statement", "") or "").strip(),
+        ]
+        effective_wording_text = "\n\n".join(p for p in stored_parts if p).strip()
+
+    if not file_bytes and not effective_wording_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide a document_id, file upload, or wording_text (or record payment conditions) to run the Beneficiary Protection Check.",
+        )
+
+    beneficiary_corp = getattr(lg_record, "beneficiary_corporate", None)
+    beneficiary_entity_name = (
+        getattr(beneficiary_corp, "entity_name", None)
+        if beneficiary_corp is not None and not isinstance(beneficiary_corp, str)
+        else beneficiary_corp
+    )
+    op_status_obj = getattr(lg_record, "lg_operational_status", None)
+    op_status_name = (
+        getattr(op_status_obj, "name", None)
+        if op_status_obj is not None and not isinstance(op_status_obj, str)
+        else op_status_obj
+    )
+    adv_raw = getattr(lg_record, "advising_status", None)
+    adv_status_str = getattr(adv_raw, "value", str(adv_raw)) if adv_raw is not None else None
+    rule_obj = getattr(lg_record, "applicable_rule", None)
+    applicable_rules_str = (
+        getattr(rule_obj, "name", None)
+        if rule_obj is not None and not isinstance(rule_obj, str)
+        else (getattr(lg_record, "applicable_rules_text", None) or None)
+    )
+
+    request_context = {
+        "issuer_name": getattr(lg_record, "issuer_name", None),
+        "beneficiary_name": beneficiary_entity_name,
+        "currency": getattr(lg_record.lg_currency, "iso_code", None) if getattr(lg_record, "lg_currency", None) else None,
+        "lg_type": getattr(lg_record.lg_type, "name", None) if getattr(lg_record, "lg_type", None) else None,
+        "lg_value": float(lg_record.lg_amount) if getattr(lg_record, "lg_amount", None) else None,
+        "lg_expiry_date": str(lg_record.expiry_date) if getattr(lg_record, "expiry_date", None) else None,
+        "lg_purpose": getattr(lg_record, "description_purpose", None),
+        "operational_status": op_status_name,
+        "advising_status": adv_status_str,
+        "foreign_bank_name": getattr(lg_record, "foreign_bank_name", None),
+        "foreign_bank_country": getattr(lg_record, "foreign_bank_country", None),
+        "auto_renewal": getattr(lg_record, "auto_renewal", None),
+        "applicable_rules": applicable_rules_str,
+    }
+
+    return await analyze_special_wording_traps(
+        wording_text=effective_wording_text or None,
+        file_bytes=file_bytes,
+        filename=filename,
+        request_context=request_context,
+        db=db,
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+        perspective="BENEFICIARY",
+    )
+
+
+@router.post(
     "/lg-records/{lg_record_id}/documents",
     response_model=List[LGDocumentOut],
     status_code=status.HTTP_201_CREATED,
@@ -1580,7 +1715,7 @@ async def extend_lg_record(
             detail="Invalid date format for new_expiry_date. Please use YYYY-MM-DD."
         )
 
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         log_action(db, user_id=end_user_context.user_id, action_type="LG_EXTEND_FAILED", entity_type="LGRecord", entity_id=lg_record_id, details={"reason": "LG Record not found or not accessible to user's customer", "new_expiry_date": new_expiry_date}, customer_id=end_user_context.customer_id, lg_record_id=lg_record_id)
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="LG Record not found or you do not have access to it.")
@@ -1653,7 +1788,7 @@ async def release_lg_record(
     
     release_in = LGRecordRelease(reason=reason, notes=notes)
     
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -1847,7 +1982,7 @@ async def liquidate_lg_record(
         notes=notes
     )
 
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -2038,7 +2173,7 @@ async def decrease_lg_amount_record(
     # NEW: Include notes in the decrease_in object
     decrease_in = LGRecordDecreaseAmount(decrease_amount=decrease_amount, reason=reason, notes=notes)
 
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -2233,7 +2368,7 @@ async def activate_non_operative_lg_record(
         notes=notes
     )
 
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -2426,7 +2561,7 @@ async def amend_lg_record(
         reason=reason
     )
 
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -2593,7 +2728,7 @@ async def toggle_lg_auto_renewal_api(
     """
     client_host = get_client_ip(request) if request else None
 
-    db_lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, end_user_context.customer_id)
+    db_lg_record = _get_accessible_lg_record(db, lg_record_id, end_user_context)
     if not db_lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -2768,6 +2903,10 @@ async def change_lg_owner_api(
     if change_in.change_scope == InternalOwnerChangeScope.SINGLE_LG:
         action_type = ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER
         entity_id = change_in.lg_record_id
+        if change_in.lg_record_id:
+            accessible_lg = _get_accessible_lg_record(db, change_in.lg_record_id, end_user_context)
+            if not accessible_lg:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, change_in.lg_record_id, end_user_context.customer_id)
         if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
@@ -4560,7 +4699,7 @@ def get_lg_record_lifecycle_history(
     Fetches the chronological list of all audit log events associated with a given LG record,
     with an optional filter for action type.
     """
-    lg_record = crud_lg_record.get_lg_record_with_relations(db, lg_record_id, current_user_context.customer_id)
+    lg_record = _get_accessible_lg_record(db, lg_record_id, current_user_context)
     if not lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
 
@@ -5385,12 +5524,14 @@ async def cancel_lg_instruction(
 ):
     client_host = get_client_ip(request) if request else None
     
-    # 1. Fetch the instruction to get the LG Record ID
+    # 1. Fetch the instruction to get the LG Record ID and verify customer + subsidiary access
     db_instruction = crud_lg_instruction.get(db, instruction_id)
     if not db_instruction or not db_instruction.lg_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instruction not found or not accessible.")
     
     lg_record_id = db_instruction.lg_record_id
+    if not _get_accessible_lg_record(db, lg_record_id, end_user_context):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instruction not found or not accessible.")
     
     # 2. Check if Maker-Checker is enabled for the customer
     customer = crud_customer.get_with_relations(db, end_user_context.customer_id)

@@ -1,10 +1,13 @@
+import os
 import sys
 sys.path.insert(0, '.')
 from sqlalchemy import create_engine, text
 import json
 
-PROD_DB_URL = "postgresql://grow_xl8z_user:JUeq65Xm7OZQorlc32SyeysYbuemRdBD@dpg-d2brigndiees73f2d9dg-a.frankfurt-postgres.render.com/grow_xl8z"
-STAGING_DB_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
+PROD_DB_URL = os.environ.get("PROD_DB_URL") or os.environ.get("THIRD_DB_URL")
+STAGING_DB_URL = os.environ.get("STAGING_DB_URL")
+if not PROD_DB_URL or not STAGING_DB_URL:
+    raise RuntimeError("Both PROD_DB_URL and STAGING_DB_URL environment variables are required.")
 
 eng_prod = create_engine(PROD_DB_URL, pool_pre_ping=True)
 eng_stag = create_engine(STAGING_DB_URL, pool_pre_ping=True)

@@ -74,10 +74,42 @@ class AIQueryAssistantService:
     """
 
     def __init__(self):
-        self._last_referenced_lg: Optional[Dict[str, Any]] = None
-        self._current_query_params: Dict[str, Any] = {}
+        self._max_context_entries: int = 500
+        self._last_referenced_lg_by_user: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self._query_params_by_user: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
-    def classify_and_interpret(self, user_question: str) -> Dict[str, Any]:
+    def _set_last_referenced_lg(self, customer_id: Optional[int], user_id: Optional[int], ref: Dict[str, Any]) -> None:
+        if customer_id is None or user_id is None:
+            return
+        key = (int(customer_id), int(user_id))
+        self._last_referenced_lg_by_user.pop(key, None)
+        if len(self._last_referenced_lg_by_user) >= self._max_context_entries:
+            oldest_key = next(iter(self._last_referenced_lg_by_user))
+            self._last_referenced_lg_by_user.pop(oldest_key, None)
+        self._last_referenced_lg_by_user[key] = ref
+
+    def _get_last_referenced_lg(self, customer_id: Optional[int], user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        if customer_id is None or user_id is None:
+            return None
+        return self._last_referenced_lg_by_user.get((int(customer_id), int(user_id)))
+
+    def _set_query_params(self, customer_id: Optional[int], user_id: Optional[int], params: Dict[str, Any]) -> None:
+        key = (int(customer_id or 0), int(user_id or 0))
+        self._query_params_by_user.pop(key, None)
+        if len(self._query_params_by_user) >= self._max_context_entries:
+            oldest_key = next(iter(self._query_params_by_user))
+            self._query_params_by_user.pop(oldest_key, None)
+        self._query_params_by_user[key] = dict(params or {})
+
+    def _get_query_params(self, customer_id: Optional[int], user_id: Optional[int]) -> Dict[str, Any]:
+        return self._query_params_by_user.get((int(customer_id or 0), int(user_id or 0)), {})
+
+    def classify_and_interpret(
+        self,
+        user_question: str,
+        customer_id: Optional[int] = None,
+        user_id: Optional[int] = None
+    ) -> Dict[str, Any]:
         q_raw = user_question.strip()
         q_lower = q_raw.lower()
 
@@ -184,8 +216,9 @@ class AIQueryAssistantService:
                 "parameters": {"scope": "all_organization", "limit": 10}
             }
 
-        # 1. Pronoun / Context continuation
-        if self._last_referenced_lg and any(kw in q_lower for kw in [
+        # 1. Pronoun / Context continuation (strictly isolated per (customer_id, user_id))
+        last_ref_lg = self._get_last_referenced_lg(customer_id, user_id)
+        if last_ref_lg and any(kw in q_lower for kw in [
             "this lg", "this guarantee", "it", "about it", "who is the beneficiary",
             "which bank issued it", "what is its amount", "when does it expire",
             "show me details", "more details", "what is the currency"
@@ -195,8 +228,8 @@ class AIQueryAssistantService:
                 "topic": "treasury",
                 "intent": "get_lg_details",
                 "parameters": {
-                    "lg_id": self._last_referenced_lg.get("lg_id"),
-                    "lg_number": self._last_referenced_lg.get("lg_number")
+                    "lg_id": last_ref_lg.get("lg_id"),
+                    "lg_number": last_ref_lg.get("lg_number")
                 }
             }
 
@@ -529,7 +562,7 @@ class AIQueryAssistantService:
         has_all_entity_access: bool = True,
         entity_ids: Optional[List[int]] = None
     ) -> Any:
-        self._current_query_params = params
+        self._set_query_params(customer_id, user_id, params)
 
         custody_base = db.query(LGRecord).filter(
             LGRecord.customer_id == customer_id,
@@ -544,9 +577,11 @@ class AIQueryAssistantService:
             IssuanceFacility.is_deleted == False
         )
 
-        if not has_all_entity_access and entity_ids:
-            custody_base = custody_base.filter(LGRecord.entity_id.in_(entity_ids))
-            issuance_base = issuance_base.filter(IssuanceRequest.issuing_entity_id.in_(entity_ids))
+        safe_eids: Optional[List[int]] = None
+        if not has_all_entity_access:
+            safe_eids = entity_ids if entity_ids else [-1]
+            custody_base = custody_base.filter(LGRecord.beneficiary_corporate_id.in_(safe_eids))
+            issuance_base = issuance_base.filter(IssuanceRequest.issuing_entity_id.in_(safe_eids))
 
         if intent == "get_user_profile":
             user = db.query(User).filter(User.id == user_id).first()
@@ -750,7 +785,13 @@ class AIQueryAssistantService:
                 func.date(LGRecord.expiry_date) >= now_dt.date()
             ).options(joinedload(LGRecord.lg_currency), joinedload(LGRecord.issuing_bank)).all()
 
-            instructions = db.query(LGInstruction).filter(LGInstruction.is_deleted == False).all()
+            inst_q = db.query(LGInstruction).join(LGRecord).filter(
+                LGRecord.customer_id == customer_id,
+                LGInstruction.is_deleted == False
+            )
+            if safe_eids is not None:
+                inst_q = inst_q.filter(LGRecord.beneficiary_corporate_id.in_(safe_eids))
+            instructions = inst_q.all()
             pending_issuance = issuance_base.filter(
                 IssuanceRequest.status.in_(["PENDING_APPROVAL", "SUBMITTED", "PENDING"])
             ).all()
@@ -811,10 +852,13 @@ class AIQueryAssistantService:
             }
 
         if intent == "get_action_center_summary":
-            instructions = db.query(LGInstruction).join(LGRecord).filter(
+            inst_q = db.query(LGInstruction).join(LGRecord).filter(
                 LGRecord.customer_id == customer_id,
                 LGInstruction.is_deleted == False
-            ).all()
+            )
+            if safe_eids is not None:
+                inst_q = inst_q.filter(LGRecord.beneficiary_corporate_id.in_(safe_eids))
+            instructions = inst_q.all()
             pending_issuance = issuance_base.filter(
                 IssuanceRequest.status.in_(["PENDING_APPROVAL", "SUBMITTED", "PENDING"])
             ).all()
@@ -832,7 +876,7 @@ class AIQueryAssistantService:
                 joinedload(LGRecord.lg_currency)
             ).all()
 
-            outbound_records = db.query(
+            outbound_q = db.query(
                 IssuanceRequest.beneficiary_name,
                 Currency.iso_code,
                 func.sum(IssuanceRequest.amount)
@@ -840,9 +884,12 @@ class AIQueryAssistantService:
                 IssuanceRequest.customer_id == customer_id,
                 IssuanceRequest.is_deleted == False,
                 IssuanceRequest.beneficiary_name != None
-            ).group_by(IssuanceRequest.beneficiary_name, Currency.iso_code).all()
+            )
+            if safe_eids is not None:
+                outbound_q = outbound_q.filter(IssuanceRequest.issuing_entity_id.in_(safe_eids))
+            outbound_records = outbound_q.group_by(IssuanceRequest.beneficiary_name, Currency.iso_code).all()
 
-            inbound_issuers = db.query(
+            inbound_q = db.query(
                 LGRecord.issuer_name,
                 Currency.iso_code,
                 func.sum(LGRecord.lg_amount)
@@ -851,7 +898,10 @@ class AIQueryAssistantService:
                 LGRecord.is_deleted == False,
                 func.upper(LgStatus.name) == "VALID",
                 LGRecord.issuer_name != None
-            ).group_by(LGRecord.issuer_name, Currency.iso_code).all()
+            )
+            if safe_eids is not None:
+                inbound_q = inbound_q.filter(LGRecord.beneficiary_corporate_id.in_(safe_eids))
+            inbound_issuers = inbound_q.group_by(LGRecord.issuer_name, Currency.iso_code).all()
 
             return {
                 "custody_records": custody_records,
@@ -860,7 +910,7 @@ class AIQueryAssistantService:
             }
 
         if intent == "get_top_issuers":
-            return db.query(
+            top_issuers_q = db.query(
                 LGRecord.issuer_name,
                 Currency.iso_code,
                 func.sum(LGRecord.lg_amount)
@@ -869,7 +919,10 @@ class AIQueryAssistantService:
                 LGRecord.is_deleted == False,
                 func.upper(LgStatus.name) == "VALID",
                 LGRecord.issuer_name != None
-            ).group_by(LGRecord.issuer_name, Currency.iso_code).all()
+            )
+            if safe_eids is not None:
+                top_issuers_q = top_issuers_q.filter(LGRecord.beneficiary_corporate_id.in_(safe_eids))
+            return top_issuers_q.group_by(LGRecord.issuer_name, Currency.iso_code).all()
 
         if intent == "get_entity_distribution":
             return custody_base.join(LGRecord.lg_status).filter(
@@ -1080,7 +1133,8 @@ class AIQueryAssistantService:
             pending_issuance_cnt = sum(1 for req in issuance_requests if str(req.status).upper() in ["PENDING_APPROVAL", "SUBMITTED", "PENDING"])
             issued_cnt = sum(1 for req in issuance_requests if str(req.status).upper() in ["ISSUED", "COMPLETED"])
 
-            is_position_query = self._current_query_params.get("scope") == "position_overview" or "position" in getattr(self, "_current_user_question", "").lower()
+            current_params = self._get_query_params(customer_id, user_id)
+            is_position_query = current_params.get("scope") == "position_overview" or "position" in (user_question or "").lower()
             header_title = "📊 **Consolidated Letter of Guarantee Position**:" if is_position_query else "📊 **Corporate Guarantee Portfolio Overview**:"
 
             answer = (
@@ -1608,7 +1662,7 @@ class AIQueryAssistantService:
                     {"label": "📤 View Issuance Pipeline", "query": "show issuance pipeline"}
                 ]
 
-            if self._current_query_params.get("sort_by") == "amount_desc":
+            if self._get_query_params(customer_id, user_id).get("sort_by") == "amount_desc":
                 lines = [f"🏆 **Highest Value Guarantees in Portfolio (Ranked by Amount)**:\n"]
                 for idx, r in enumerate(records[:10], 1):
                     curr_code = r.lg_currency.iso_code if r.lg_currency else "EGP"
@@ -1656,7 +1710,7 @@ class AIQueryAssistantService:
             r = query_result
             if not r:
                 return "Guarantee record not found.", [], []
-            self._last_referenced_lg = {"lg_id": r.id, "lg_number": r.lg_number}
+            self._set_last_referenced_lg(customer_id, user_id, {"lg_id": r.id, "lg_number": r.lg_number})
 
             curr_code = r.lg_currency.iso_code if r.lg_currency else "EGP"
             b_name = r.issuing_bank.name if r.issuing_bank else "N/A"
@@ -2233,7 +2287,7 @@ class AIQueryAssistantService:
 
             # LEVEL 4 / 3 / 1 / 2: Natural Language Query Pipeline
             logger.info(f"AI Assistant NL query: user_id={user_id}, customer_id={customer_id}, q='{user_question[:60]}'")
-            classification = self.classify_and_interpret(user_question)
+            classification = self.classify_and_interpret(user_question, customer_id=customer_id, user_id=user_id)
             suggested_level = classification.get("suggested_level", 1)
             intent = classification.get("intent", "search_lgs")
             params = classification.get("parameters", {})
@@ -2343,7 +2397,9 @@ class AIQueryAssistantService:
                 from app.core.ai_integration import _get_genai_client, _safe_generate_content_sync, GEMINI_MODEL_NAME
                 client = _get_genai_client()
                 if client:
+                    sanitized_q, q_token_map = privacy_tokenizer.sanitize_user_question(user_question or "")
                     tok_recs, tok_ben, tok_fac, token_map = privacy_tokenizer.tokenize_complex_payload([], {}, [])
+                    token_map.update(q_token_map)
                     genai_contents = (
                         "You are Grow Treasury Assistant, an institutional corporate treasury AI expert embedded in the Grow Treasury System. "
                         "You have full knowledge of Grow modules: Letter of Guarantee (Custody & Issuance), Bank Reconciliation, and "
@@ -2359,6 +2415,9 @@ class AIQueryAssistantService:
                         contents=genai_contents
                     )
                     raw_text = response.text or ""
+                    is_valid_out, _ = privacy_tokenizer.validate_ai_output_tokens(raw_text, token_map)
+                    if not is_valid_out:
+                        raise ValueError("AI output failed privacy token validation")
                     final_answer = privacy_tokenizer.detokenize_response(raw_text, token_map)
                     return {
                         "success": True,

@@ -27,7 +27,7 @@ from app.services.inbox_classification_service import inbox_classification_servi
 logger = logging.getLogger("app.inbox_polling")
 
 ALLOWED_ATTACHMENT_EXTENSIONS = {".xlsx", ".xls", ".csv", ".pdf"}
-STORAGE_BASE_DIR = os.path.join("uploads", "inbox")
+STORAGE_BASE_DIR = os.path.join("private_storage", "inbox")
 
 
 class InboxPollingService:

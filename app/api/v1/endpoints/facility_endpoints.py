@@ -27,23 +27,13 @@ def list_facilities(
         include_deleted=include_archived
     )
 
+    from app.services.issuance_service import issuance_service
+
     for fac in facilities:
         total_used = Decimal("0")
         total_reserved = Decimal("0")
         for sub in fac.sub_limits:
-            # Active LG amounts
-            used_amount = db.query(func.coalesce(func.sum(IssuedLGRecord.current_amount), 0)).filter(
-                IssuedLGRecord.facility_sub_limit_id == sub.id,
-                IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING"])
-            ).scalar()
-            # Pending exposure
-            pending = db.query(func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)).filter(
-                IssuanceExposureEntry.sub_limit_id == sub.id,
-                IssuanceExposureEntry.is_active == True
-            ).scalar()
-            sub_used = max(Decimal(str(used_amount)), Decimal(str(pending)))
-            # Add initial utilization
-            sub_used += Decimal(str(getattr(sub, 'initial_utilization', 0) or 0))
+            sub_used = issuance_service.compute_sub_limit_used_in_facility_ccy(db, fac, sub)
             total_used += sub_used
 
             # Reserved amount (RESERVATION entries only)
@@ -121,6 +111,7 @@ def restore_facility(
 @router.post("/upload-attachment")
 def upload_facility_attachment(
     file: UploadFile = File(...),
+    db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     # 1. Define the path: {env}/customer_{customer_id}/facilities/fac_docs/{filename}

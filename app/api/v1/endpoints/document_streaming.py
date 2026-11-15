@@ -118,6 +118,165 @@ def _extract_customer_id_from_path(gcs_uri: str) -> Optional[int]:
     return None
 
 
+def _authorize_dealer_rfq_document(
+    db: Session,
+    dealer_token: str,
+    gcs_uri: str,
+    leg_id: Optional[str] = None,
+    session_token: Optional[str] = None,
+) -> tuple[int, str, Optional[str]]:
+    """
+    Validates a Bank Dealer invitation token and enforces RFQ attachment membership,
+    INTERNAL_ONLY air-gap, WINNER_ONLY timing/award gates, and multi-leg isolation.
+    Returns (customer_id, caller_desc, resolved_leg_id).
+    """
+    from app.models.models_quotation import (
+        QuotationBankAssignment,
+        QuotationRequest,
+        QuotationLeg,
+        QuotationAccessOTP,
+    )
+
+    assignment = db.query(QuotationBankAssignment).filter(
+        QuotationBankAssignment.token == dealer_token,
+        QuotationBankAssignment.is_deleted == False,
+    ).first()
+    if not assignment:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    rfq_fk = getattr(assignment, "rfq_id", None) or getattr(assignment, "quotation_rfq_id", None)
+    rfq = getattr(assignment, "rfq", None) or (
+        db.query(QuotationRequest).filter(QuotationRequest.id == rfq_fk).first() if rfq_fk else None
+    )
+    if not rfq:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
+
+    if getattr(assignment, "is_document_visible", True) is False:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    doc_filename = gcs_uri.split("/")[-1]
+    rfq_docs_str = rfq.document_path or ""
+    all_rfq_doc_paths = rfq_docs_str + " " + " ".join([l.document_path or "" for l in (rfq.legs or [])])
+    if doc_filename not in all_rfq_doc_paths and gcs_uri not in all_rfq_doc_paths:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    parsed_rfq_docs = rfq.get_parsed_documents() if hasattr(rfq, "get_parsed_documents") else []
+    matching_doc = next(
+        (d for d in parsed_rfq_docs if d.get("path") and (gcs_uri in d.get("path") or doc_filename in d.get("path"))),
+        None,
+    )
+
+    if matching_doc and (matching_doc.get("is_internal_only") or matching_doc.get("scope") == "INTERNAL_ONLY"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    is_deal_executed = (
+        rfq.status in ("COMPLETED", "ACCEPTED")
+        or getattr(rfq, "acceptance_status", None) in ("ACCEPTED", "AUTO_ACCEPTED")
+    )
+    is_winner_timing = (
+        (matching_doc and matching_doc.get("release_timing") == "WINNER_ONLY")
+        or getattr(rfq, "release_to_winner_only", False)
+    )
+    if is_winner_timing and not is_deal_executed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    assigned_bank_master_id = assignment.quotation_bank.bank_id if getattr(assignment, "quotation_bank", None) else None
+    target_leg = None
+    if leg_id:
+        target_leg = db.query(QuotationLeg).filter(
+            QuotationLeg.id == leg_id,
+            QuotationLeg.rfq_id == rfq.id,
+        ).first()
+        if not target_leg:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Access denied or Not found")
+    else:
+        for l in (rfq.legs or []):
+            if l.document_path and doc_filename in l.document_path:
+                target_leg = l
+                break
+
+    if target_leg:
+        leg_cfg = assignment.get_config_for_leg(target_leg.id) if hasattr(assignment, "get_config_for_leg") else None
+        if leg_cfg is not None:
+            if getattr(leg_cfg, "is_invited", True) is False or getattr(leg_cfg, "is_document_visible", True) is False:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+        if target_leg.status in ("COMPLETED", "ACCEPTED") and target_leg.winner_bank_id is not None:
+            is_leg_winner = (
+                (assigned_bank_master_id is not None and assigned_bank_master_id == target_leg.winner_bank_id)
+                or assignment.quotation_bank_id == target_leg.winner_bank_id
+            )
+            if not is_leg_winner:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+    elif is_winner_timing and is_deal_executed:
+        rfq_winner_match = (
+            (assigned_bank_master_id is not None and assigned_bank_master_id == rfq.winner_bank_id)
+            or assignment.quotation_bank_id == rfq.winner_bank_id
+        )
+        any_leg_won = any(
+            (assigned_bank_master_id is not None and assigned_bank_master_id == l.winner_bank_id)
+            or assignment.quotation_bank_id == l.winner_bank_id
+            for l in (rfq.legs or [])
+        )
+        if not (rfq_winner_match or any_leg_won):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    if session_token is not None:
+        has_otps = db.query(QuotationAccessOTP).filter(QuotationAccessOTP.assignment_id == assignment.id).first()
+        if has_otps:
+            clean_session = session_token.split("_tab_")[0] if (session_token and "_tab_" in session_token) else session_token
+            if not clean_session:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+            otp_match = db.query(QuotationAccessOTP).filter(
+                QuotationAccessOTP.assignment_id == assignment.id,
+                QuotationAccessOTP.magic_token == clean_session,
+            ).first()
+            if not otp_match:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied or Not found")
+
+    resolved_leg = str(leg_id or (target_leg.id if target_leg else "")) or None
+    caller_desc = f"Bank Dealer: Bank {assignment.quotation_bank_id} (RFQ {rfq.ref_no})"
+    return rfq.customer_id, caller_desc, resolved_leg
+
+
+def _verify_corporate_document_access(
+    db: Session,
+    payload: dict,
+    gcs_uri: str,
+) -> tuple[Optional[int], Optional[int], str]:
+    """
+    Resolves customer_id for a verified Corporate User or System Owner JWT payload,
+    preserving System Owner path resolution and Holding-Group parent access.
+    """
+    customer_id = payload.get("customer_id")
+    user_id = payload.get("user_id")
+    user_email = payload.get("sub") or payload.get("email") or "user"
+    role = (payload.get("role") or "").lower()
+    is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
+
+    uri_customer_id = _extract_customer_id_from_path(gcs_uri)
+    if is_super:
+        if not customer_id and uri_customer_id:
+            customer_id = uri_customer_id
+        caller_desc = f"System Owner {user_email} (Target Customer {customer_id})"
+        return customer_id, user_id, caller_desc
+
+    if uri_customer_id and customer_id and uri_customer_id != customer_id:
+        has_parent_access = False
+        try:
+            from app.models.models import Customer
+            target_cust = db.query(Customer).filter(Customer.id == uri_customer_id).first()
+            if target_cust and getattr(target_cust, "parent_id", None) == customer_id:
+                has_parent_access = True
+                customer_id = uri_customer_id
+        except Exception:
+            has_parent_access = False
+        if not has_parent_access:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to tenant document")
+
+    caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
+    return customer_id, user_id, caller_desc
+
+
 @router.post("/ticket", response_model=DocumentTicketOut)
 def create_document_download_ticket(
     req: DocumentTicketRequest,
@@ -130,56 +289,36 @@ def create_document_download_ticket(
     """
     customer_id = None
     caller_desc = "Unknown"
+    resolved_leg_id = req.leg_id
     gcs_uri = urllib.parse.unquote(req.gcs_uri.strip())
 
     if not gcs_uri.startswith("gs://"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid GCS URI")
 
-    # 1. Check Corporate User Auth (Bearer token)
+    # 1. Check Corporate User / System Owner Auth (Bearer token)
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
-        token_str = auth_header.split(" ")[1]
+        token_str = auth_header.split(" ", 1)[1].strip()
         try:
             payload = verify_access_token(token_str)
-            customer_id = payload.get("customer_id")
-            user_id = payload.get("user_id")
-            user_email = payload.get("sub") or payload.get("email") or "user"
-            caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
-
-            role = (payload.get("role") or "").lower()
-            is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
-
-            # Tenant isolation check
-            uri_customer_id = _extract_customer_id_from_path(gcs_uri)
-            if not is_super and uri_customer_id and customer_id and uri_customer_id != customer_id:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to tenant document")
+            customer_id, _, caller_desc = _verify_corporate_document_access(db, payload, gcs_uri)
         except HTTPException:
-            raise
+            if not req.token:
+                raise
         except Exception as e:
             logger.warning(f"Bearer token verification failed in ticket creation: {e}")
+            if not req.token:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token")
 
-    # 2. Check Bank Dealer invitation token fallback (Quotation dealer session)
+    # 2. Check Bank Dealer invitation token fallback (Quotation dealer session with full governance)
     if not customer_id and req.token:
-        try:
-            from app.models.models_quotation import QuotationBankAssignment, QuotationRFQ
-            assignment = db.query(QuotationBankAssignment).filter(
-                QuotationBankAssignment.token == req.token,
-                QuotationBankAssignment.is_deleted == False
-            ).first()
-            if assignment:
-                rfq = db.query(QuotationRFQ).filter(QuotationRFQ.id == assignment.quotation_rfq_id).first()
-                if rfq:
-                    customer_id = rfq.customer_id
-                    caller_desc = f"Bank Dealer: Bank {assignment.quotation_bank_id} (RFQ {rfq.ref_no})"
-        except Exception as dealer_err:
-            logger.warning(f"Dealer token resolution failed: {dealer_err}")
-
-    # 3. Superuser path resolution fallback
-    if not customer_id:
-        uri_customer_id = _extract_customer_id_from_path(gcs_uri)
-        # If superuser or system caller
-        if auth_header and uri_customer_id:
-            customer_id = uri_customer_id
+        customer_id, caller_desc, resolved_leg_id = _authorize_dealer_rfq_document(
+            db=db,
+            dealer_token=req.token,
+            gcs_uri=gcs_uri,
+            leg_id=req.leg_id,
+            session_token=getattr(req, "session_token", None),
+        )
 
     if not customer_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required to access document")
@@ -188,7 +327,7 @@ def create_document_download_ticket(
         "gcs_uri": gcs_uri,
         "customer_id": customer_id,
         "caller_desc": caller_desc,
-        "leg_id": req.leg_id,
+        "leg_id": resolved_leg_id,
         "created_at": int(time.time())
     }
     ticket = generate_download_ticket(ticket_payload, expiry_minutes=15)
@@ -207,6 +346,7 @@ def download_document_stream(
     ticket: Optional[str] = Query(None, description="15-minute signed ephemeral ticket"),
     auth_token: Optional[str] = Query(None, description="Corporate User JWT (query param fallback)"),
     token: Optional[str] = Query(None, description="Bank Dealer invitation token"),
+    leg_id: Optional[str] = Query(None, description="Optional RFQ trade leg ID"),
     context: Optional[str] = Query(None, description="Optional explicit AAD context override"),
     request: Request = None,
     db: Session = Depends(get_db)
@@ -218,6 +358,7 @@ def download_document_stream(
     customer_id = None
     caller_desc = None
     corporate_user_id = None
+    ticket_filename = None
     client_ip = request.client.host if (request and request.client) else None
 
     # Step 1: Validate Ephemeral Ticket (Highest Priority)
@@ -243,52 +384,31 @@ def download_document_stream(
         raw_jwt = None
         auth_header = request.headers.get("Authorization") if request else None
         if auth_header and auth_header.startswith("Bearer "):
-            raw_jwt = auth_header.split(" ")[1]
+            raw_jwt = auth_header.split(" ", 1)[1].strip()
         elif auth_token:
             raw_jwt = auth_token
 
         if raw_jwt:
             try:
                 payload = verify_access_token(raw_jwt)
-                customer_id = payload.get("customer_id")
-                corporate_user_id = payload.get("user_id")
-                user_email = payload.get("sub") or payload.get("email") or "user"
-                caller_desc = f"Corporate User {user_email} (Customer {customer_id})"
-
-                role = (payload.get("role") or "").lower()
-                is_super = role in ("system_owner", "super_admin") or payload.get("is_superuser", False)
-
-                uri_cust = _extract_customer_id_from_path(gcs_uri)
-                if is_super and not customer_id and uri_cust:
-                    customer_id = uri_cust
-                elif not is_super and uri_cust and customer_id and uri_cust != customer_id:
-                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to tenant document")
+                customer_id, corporate_user_id, caller_desc = _verify_corporate_document_access(db, payload, gcs_uri)
             except HTTPException:
-                raise
+                if not token:
+                    raise
             except Exception as e:
                 logger.warning(f"JWT verification failed in universal download: {e}")
+                if not token:
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token")
 
-    # Step 3: Authenticate via Bank Dealer token if still unresolved
+    # Step 3: Authenticate via Bank Dealer token if still unresolved (enforcing RFQ & leg governance)
     if not customer_id and token:
-        try:
-            from app.models.models_quotation import QuotationBankAssignment, QuotationRFQ
-            assignment = db.query(QuotationBankAssignment).filter(
-                QuotationBankAssignment.token == token,
-                QuotationBankAssignment.is_deleted == False
-            ).first()
-            if assignment:
-                rfq = db.query(QuotationRFQ).filter(QuotationRFQ.id == assignment.quotation_rfq_id).first()
-                if rfq:
-                    customer_id = rfq.customer_id
-                    caller_desc = f"Bank Dealer: Bank {assignment.quotation_bank_id} (RFQ {rfq.ref_no})"
-        except Exception as e:
-            logger.warning(f"Dealer token resolution failed: {e}")
-
-    # Fallback to customer_id from path if system owner or verified admin
-    if not customer_id:
-        path_cust = _extract_customer_id_from_path(gcs_uri)
-        if path_cust:
-            customer_id = path_cust
+        customer_id, caller_desc, _ = _authorize_dealer_rfq_document(
+            db=db,
+            dealer_token=token,
+            gcs_uri=gcs_uri,
+            leg_id=leg_id,
+            session_token=None,
+        )
 
     if not customer_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required to download document")

@@ -239,27 +239,61 @@ async def register_free_trial(
 
 @router.get("/documents/", tags=["Public"], response_class=FileResponse)
 def serve_document(
+    request: Request,
     file_path: str = Query(..., description="The path to the document to be served."),
+    token: Optional[str] = Query(None, description="Optional Bank Dealer invitation token"),
+    auth_token: Optional[str] = Query(None, description="Optional Corporate User JWT"),
     db: Session = Depends(get_db)
 ):
     """
-    Serves a document from the local file system. 
-    NOTE: This function is now DEPRECATED for commercial register documents, 
-    as they are stored in GCS. It is only kept here if other files still use 
-    the local 'uploads' directory, but should be removed or refactored.
+    Legacy local quotation document reader.
+    Restricted strictly to authenticated Corporate Users or invited Bank Dealers,
+    and confined exclusively to uploads/quotations/ (never inbox or AI chat logs).
     """
-    # Security check: Ensure the path is within the allowed uploads directory.
-    base_dir = os.path.abspath("uploads")
-    full_path = os.path.abspath(file_path)
+    from app.core.security import verify_access_token
 
-    if not full_path.startswith(base_dir):
+    allowed_base = os.path.realpath(os.path.join("uploads", "quotations"))
+    full_path = os.path.realpath(file_path)
+
+    if not (full_path.startswith(allowed_base + os.sep)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access to the requested path is forbidden."
         )
 
-    # Check if the file exists
-    if not os.path.exists(full_path):
+    is_authorized = False
+    auth_header = request.headers.get("Authorization") if request else None
+    raw_jwt = auth_header.split(" ", 1)[1].strip() if (auth_header and auth_header.startswith("Bearer ")) else auth_token
+    if raw_jwt:
+        try:
+            payload = verify_access_token(raw_jwt)
+            if payload.get("user_id"):
+                is_authorized = True
+        except Exception:
+            is_authorized = False
+
+    if not is_authorized and token:
+        from app.models.models_quotation import QuotationBankAssignment
+        assignment = db.query(QuotationBankAssignment).filter(
+            QuotationBankAssignment.token == token,
+            QuotationBankAssignment.is_deleted == False
+        ).first()
+        if assignment and getattr(assignment, "is_document_visible", True) is not False:
+            rfq = getattr(assignment, "rfq", None)
+            fname = os.path.basename(full_path)
+            rfq_paths = ((rfq.document_path or "") if rfq else "") + " " + " ".join(
+                [(l.document_path or "") for l in (getattr(rfq, "legs", None) or [])]
+            )
+            if fname in rfq_paths:
+                is_authorized = True
+
+    if not is_authorized:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required to access document."
+        )
+
+    if not os.path.isfile(full_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File not found."

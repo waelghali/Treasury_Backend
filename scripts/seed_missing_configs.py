@@ -1,10 +1,23 @@
+import os
 import sys
 sys.path.insert(0, '.')
 import psycopg2
 
-PROD_DB = 'postgresql://grow_xl8z_user:JUeq65Xm7OZQorlc32SyeysYbuemRdBD@dpg-d2brigndiees73f2d9dg-a.frankfurt-postgres.render.com/grow_xl8z'
-STAGING_DB = 'postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db'
-LOCAL_DB = 'postgresql://postgres:Voda%21%4012@localhost:5432/grow'
+PROD_DB = os.environ.get('PROD_DB_URL')
+STAGING_DB = os.environ.get('STAGING_DB_URL')
+LOCAL_DB = os.environ.get('LOCAL_DB_URL') or os.environ.get('DATABASE_URL')
+
+target_dbs = [
+    (name, url)
+    for name, url in [
+        ('Local DB (grow)', LOCAL_DB),
+        ('Staging DB (treasury_staging_db)', STAGING_DB),
+        ('Prod DB (grow_xl8z)', PROD_DB),
+    ]
+    if url
+]
+if not target_dbs:
+    raise RuntimeError("Set at least one of LOCAL_DB_URL, STAGING_DB_URL, or PROD_DB_URL in environment.")
 
 configs_to_seed = [
     ('LOGIN_MAX_FAILED_ATTEMPTS', '5', '1', '20', 'Maximum failed login attempts before lockout', 'attempts', '["AUTH"]'),
@@ -18,7 +31,7 @@ configs_to_seed = [
     ('INBOX_GENERIC_DOMAIN_BLACKLIST', 'gmail.com,yahoo.com,hotmail.com,outlook.com', None, None, 'Blacklisted generic domains for Smart Inbox banking matching', None, '["SMART_INBOX"]'),
 ]
 
-for name, url in [('Local DB (grow)', LOCAL_DB), ('Staging DB (treasury_staging_db)', STAGING_DB), ('Prod DB (grow_xl8z)', PROD_DB)]:
+for name, url in target_dbs:
     print(f"\n--- Checking {name} ---")
     try:
         conn = psycopg2.connect(url)

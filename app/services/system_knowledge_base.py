@@ -86,17 +86,19 @@ When set to `true`, End Users are blocked from submitting the action until the r
 --- GROUP 3: SMART BANK FACILITY RECOMMENDATION & SCORING WEIGHTS ---
 Calculates a 0-100 score for each available bank facility when recommending optimal banks for issuance requests:
 * **Normal Issuance Scoring Weights**:
-  - `FACILITY_SCORE_WEIGHT_COST` (Default: `30%`): Weight for commission and issuance fees.
-  - `FACILITY_SCORE_WEIGHT_CAPACITY` (Default: `20%`): Weight for available facility headroom.
-  - `FACILITY_SCORE_WEIGHT_CURRENCY_MATCH` (Default: `20%`): Weight for matching currency vs FX conversion.
+  - `FACILITY_SCORE_WEIGHT_COST` (Default: `25%`): Weight for commission and issuance fees.
+  - `FACILITY_SCORE_WEIGHT_CAPACITY` (Default: `15%`): Weight for available facility headroom.
+  - `FACILITY_SCORE_WEIGHT_CURRENCY_MATCH` (Default: `15%`): Weight for matching currency vs FX conversion.
   - `FACILITY_SCORE_WEIGHT_MARGIN` (Default: `15%`): Weight for cash margin collateral requirement.
   - `FACILITY_SCORE_WEIGHT_SLA` (Default: `15%`): Weight for bank turnaround speed.
+  - `FACILITY_SCORE_WEIGHT_RARITY` (Default: `15%`): Weight for saving rare/specialized credit lines for rare guarantees and using common/dedicated lines first.
 * **Urgent Issuance Scoring Weights**:
-  - `FACILITY_SCORE_WEIGHT_URGENT_SLA` (Default: `40%`): Drastically prioritizes bank turnaround speed.
+  - `FACILITY_SCORE_WEIGHT_URGENT_SLA` (Default: `35%`): Drastically prioritizes bank turnaround speed.
   - `FACILITY_SCORE_WEIGHT_URGENT_COST` (Default: `15%`)
   - `FACILITY_SCORE_WEIGHT_URGENT_CAPACITY` (Default: `15%`)
-  - `FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH` (Default: `20%`)
+  - `FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH` (Default: `15%`)
   - `FACILITY_SCORE_WEIGHT_URGENT_MARGIN` (Default: `10%`)
+  - `FACILITY_SCORE_WEIGHT_URGENT_RARITY` (Default: `10%`)
 * **Facility Limits & Portal**:
   - `RESERVATION_TTL_DAYS` (Default: `14` days): Facility limit reservation hold duration before automatic release.
   - `PUBLIC_ISSUANCE_SESSION_EXPIRY_MINUTES` (Default: `60` min): OTP session expiry for external requestors on public portal.

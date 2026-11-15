@@ -1960,9 +1960,10 @@ class IssuanceMaintenanceService:
         }
 
         # Notes section as HTML block (matches custody pattern)
+        import html as _html_mod
         notes_html = ""
         if action.notes:
-            notes_html = f"<h3>Additional Notes</h3><p>{action.notes}</p>"
+            notes_html = f"<h3>Additional Notes</h3><p>{_html_mod.escape(str(action.notes), quote=True)}</p>"
         placeholder_data["notes_section"] = notes_html
 
         # Action-specific extra placeholders
@@ -2006,9 +2007,10 @@ class IssuanceMaintenanceService:
                 placeholder_data["payment_issuing_bank_name"] = placeholder_data.get("bank_name", "N/A")
 
         # Fill template
+        from app.core.document_generator import escape_html_placeholder
         generated_html = template.content
         for key, value in placeholder_data.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
 
         return generated_html
@@ -2182,9 +2184,10 @@ class IssuanceMaintenanceService:
                 placeholder_data["payment_issuing_bank_name"] = placeholder_data.get("bank_name", "N/A")
 
         # Fill template
+        from app.core.document_generator import escape_html_placeholder
         generated_html = template.content
         for key, value in placeholder_data.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
 
         # Generate PDF (synchronous call via asyncio for background context)

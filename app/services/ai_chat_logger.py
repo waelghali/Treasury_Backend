@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
-LOCAL_LOG_DIR = os.path.join(os.getcwd(), "uploads", "ai_chat_logs")
+LOCAL_LOG_DIR = os.path.join(os.getcwd(), "private_storage", "ai_chat_logs")
 
 
 class AIChatLogger:

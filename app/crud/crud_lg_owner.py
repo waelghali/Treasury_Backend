@@ -278,9 +278,10 @@ class CRUDLGOwner(CRUDBase):
                 }
                 instruction_details["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
 
+                from app.core.document_generator import escape_html_placeholder
                 generated_instruction_html = instruction_template.content
                 for key, value in instruction_details.items():
-                    str_value = str(value) if value is not None else ""
+                    str_value = escape_html_placeholder(key, value)
                     generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
                 try:

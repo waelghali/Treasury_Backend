@@ -70,21 +70,17 @@ MFA_DEVICE_EXEMPT_EMAILS: Set[str] = {
     "requestor@globex.com",
     "end.user@cyberdyne.com",
     "corp.admin@cyberdyne.com",
-    "grow-requestor@maildrop.cc",
-    "grow-approver@maildrop.cc",
-    "grow-officer@maildrop.cc",
-    "grow-treasury@maildrop.cc",
-    "grow-bankdesk@maildrop.cc",
-    "grow-inbox@maildrop.cc",
 }
 
 def is_email_mfa_exempt(email: Optional[str]) -> bool:
     if not email:
         return False
     email_lower = email.lower().strip()
-    if email_lower in {e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS}:
+    extra_env = os.getenv("MFA_EXEMPT_EMAILS", "")
+    extra_set = {e.strip().lower() for e in extra_env.split(",") if e.strip()}
+    if email_lower in ({e.lower() for e in MFA_DEVICE_EXEMPT_EMAILS} | extra_set):
         return True
-    exempt_domains = ("@globex.com", "@cyberdyne.com", "@maildrop.cc", "@testcorp.local")
+    exempt_domains = ("@globex.com", "@cyberdyne.com", "@testcorp.local")
     return any(email_lower.endswith(dom) for dom in exempt_domains)
 
 
@@ -407,6 +403,7 @@ class AuthService:
                         "sub": user.email, 
                         "user_id": user.id, 
                         "is_mfa_verified": False,
+                        "token_use": "mfa_challenge",
                         "role": user.role.value
                     },
                     expires_delta=timedelta(minutes=15)

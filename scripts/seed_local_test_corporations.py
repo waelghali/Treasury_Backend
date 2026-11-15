@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta, timezone
 from app.core.hashing import get_password_hash
 
-LOCAL_DB_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:Voda%21%4012@localhost:5432/grow')
+LOCAL_DB_URL = os.environ['DATABASE_URL']
 
 def seed_local():
     eng = create_engine(LOCAL_DB_URL)

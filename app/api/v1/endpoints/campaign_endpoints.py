@@ -178,7 +178,12 @@ def manual_verify_claim(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_system_owner)
 ):
-    claim = crud_campaign.manual_verify_claim(db, claim_id=claim_id, user_id=current_user.id, notes=payload.notes)
+    claim = crud_campaign.manual_verify_claim(
+        db,
+        claim_id=claim_id,
+        user_id=getattr(current_user, "user_id", None) or getattr(current_user, "id", None),
+        notes=payload.notes,
+    )
     if not claim:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Claim not found.")
     return _format_claim_out(claim)

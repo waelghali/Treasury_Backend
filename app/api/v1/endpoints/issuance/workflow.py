@@ -126,7 +126,7 @@ def get_approval_roadmap(
     current_user: TokenData = Depends(get_issuance_read_context)
 ):
     """Returns the full approval lifecycle roadmap for a request."""
-    return issuance_service.get_approval_roadmap(db, request_id)
+    return issuance_service.get_approval_roadmap(db, request_id, customer_id=current_user.customer_id)
 
 @router.get("/my-pending-approvals", response_model=List[IssuanceRequestOut])
 def get_my_pending_approvals(
@@ -232,7 +232,9 @@ async def submit_request_for_approval(
     except Exception as e:
         logger.warning(f"Internal submit auto-verify exception: {e}")
 
-    result = issuance_service.submit_for_approval(db, request_id, current_user.user_id)
+    result = issuance_service.submit_for_approval(
+        db, request_id, current_user.user_id, customer_id=current_user.customer_id
+    )
     
     logger.debug(f"internal_submit: status={result.status}, approvers={result.pending_approver_users}")
     
@@ -315,7 +317,9 @@ def approve_request_action(
     Approver (Manager) approves the request. 
     Moves to Next Step OR 'APPROVED_INTERNAL'.
     """
-    result = issuance_service.approve_request(db, request_id, current_user.user_id)
+    result = issuance_service.approve_request(
+        db, request_id, current_user.user_id, customer_id=current_user.customer_id
+    )
     currency = result.currency.iso_code if result.currency else "N/A"
     
     # --- Resolve email data NOW while DB session is active (not in background task) ---
@@ -433,7 +437,10 @@ def reject_request_action(
 ):
     """ Approver rejects the request. """
     rejection_reason = body.get("rejection_reason") if body else None
-    result = issuance_service.reject_request(db, request_id, current_user.user_id, rejection_reason=rejection_reason)
+    result = issuance_service.reject_request(
+        db, request_id, current_user.user_id,
+        rejection_reason=rejection_reason, customer_id=current_user.customer_id
+    )
     
     # --- Resolve email data NOW while DB session is active ---
     from app.core.email_service import send_email, get_customer_email_settings
@@ -512,7 +519,9 @@ def request_cancellation_action(
     reason = body.get("reason", "").strip()
     if not reason or len(reason) < 5:
         raise HTTPException(status_code=400, detail="A cancellation reason is required (min 5 characters).")
-    return issuance_service.request_cancellation(db, request_id, current_user.user_id, reason)
+    return issuance_service.request_cancellation(
+        db, request_id, current_user.user_id, reason, customer_id=current_user.customer_id
+    )
 
 @router.post("/requests/{request_id}/resolve-cancellation", response_model=IssuanceRequestOut)
 def resolve_cancellation_action(
@@ -524,7 +533,9 @@ def resolve_cancellation_action(
     """Admin approves or rejects a cancellation request."""
     approved = body.get("approved", False)
     note = body.get("note", "")
-    return issuance_service.resolve_cancellation(db, request_id, current_user.user_id, approved, note)
+    return issuance_service.resolve_cancellation(
+        db, request_id, current_user.user_id, approved, note, customer_id=current_user.customer_id
+    )
 
 
 @router.post("/requests/{request_id}/return-for-revision", response_model=IssuanceRequestOut)
@@ -540,7 +551,7 @@ def return_for_revision_action(
     Requestor can edit and re-submit — approval resumes from the same step.
     """
     result = issuance_service.return_for_revision(
-        db, request_id, current_user.user_id, payload.revision_notes
+        db, request_id, current_user.user_id, payload.revision_notes, customer_id=current_user.customer_id
     )
     
     # --- Email notification to requestor ---

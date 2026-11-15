@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, Field
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from datetime import datetime
 from decimal import Decimal
 
@@ -15,11 +15,13 @@ class BankTransactionBase(BaseModel):
     currency: str
     running_balance: Decimal
     raw_description: str
+    tokenized_description: Optional[str] = None
     counterparty_name: Optional[str] = None
     counterparty_iban: Optional[str] = None
+    iban_bank_code: Optional[str] = None
     e2e_id: Optional[str] = None
 
-    # New expanded fields
+    # Expanded & Schema-Agnostic fields
     company_name: Optional[str] = None
     account_number: Optional[str] = None
     back_office_ref: Optional[str] = None
@@ -36,22 +38,30 @@ class BankTransactionBase(BaseModel):
     amount_in_currency: Optional[Decimal] = None
     amount_in_egp: Optional[Decimal] = None
     transfer_type: Optional[str] = None
+    amount_tier: Optional[str] = None
+    custom_fields_json: Optional[Dict[str, Any]] = None
     applied_rule_id: Optional[int] = None
     linked_txn_id: Optional[int] = None
+    companion_parent_id: Optional[int] = None
 
 class BankTransactionOut(BankTransactionBase):
     id: int
     statement_id: int
     is_reconciled: bool
     is_classified: bool
+    auto_confirmed: Optional[bool] = False
     is_reversal: bool
     is_duplicate: bool
+    is_exported: Optional[bool] = False
+    is_locked: Optional[bool] = False
     created_at: datetime
     applied_rule_name: Optional[str] = None
     internal_category: Optional[str] = None
     classification_source: Optional[str] = None
     classification_confidence: Optional[int] = None
     suggested_category: Optional[str] = None
+    classification_reasoning: Optional[str] = None
+    top_suggestions_json: Optional[List[Dict[str, Any]]] = None
     variance_amount: Optional[Decimal] = None
 
 
@@ -67,6 +77,10 @@ class BankStatementBase(BaseModel):
     statement_end_date: datetime
     account_number: Optional[str] = None
     currency_id: Optional[int] = None
+    balance_continuity_status: Optional[str] = "VALIDATED"
+    balance_variance_amount: Optional[Decimal] = Decimal("0.00")
+    continuity_warnings_json: Optional[List[str]] = None
+    detected_mapping_json: Optional[Dict[str, Any]] = None
 
 class BankStatementCreate(BankStatementBase):
     pass
@@ -88,11 +102,16 @@ class ClassificationRuleBase(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     priority: int = 100
+    bank_id: Optional[int] = None
     rule_name: Optional[str] = None
-    rule_type: Optional[str] = "LITERAL"  # LITERAL or CONCEPT
+    rule_type: Optional[str] = "LITERAL"  # LITERAL, CONCEPT, LEARNED_COMPOSITE
+    rule_origin: Optional[str] = "MANUAL" # MANUAL, LEARNED_ONLINE, COLLABORATIVE, SYSTEM_ADAPTED
+    lifecycle_state: Optional[str] = "AUTO_CONFIRMED" # CANDIDATE, SUGGESTED, AUTO_CONFIRMED, DEMOTED
     stop_after_match: bool = True
     conditions_json: Any
     assigned_gl_account: str
+    assigned_category: Optional[str] = None
+    assigned_sub_category: Optional[str] = None
     is_active: bool = True
 
 class ClassificationRuleCreate(ClassificationRuleBase):
@@ -101,16 +120,24 @@ class ClassificationRuleCreate(ClassificationRuleBase):
 class ClassificationRuleUpdate(BaseModel):
     rule_name: Optional[str] = None
     rule_type: Optional[str] = None
+    lifecycle_state: Optional[str] = None
+    bank_id: Optional[int] = None
     priority: Optional[int] = None
     stop_after_match: Optional[bool] = None
     conditions_json: Optional[Any] = None
     assigned_gl_account: Optional[str] = None
+    assigned_category: Optional[str] = None
+    assigned_sub_category: Optional[str] = None
     is_active: Optional[bool] = None
 
 class ClassificationRuleOut(ClassificationRuleBase):
     id: int
     company_id: int
-    usage_count: int
+    usage_count: int = 0
+    confirmations_count: Optional[int] = 1
+    overrides_count: Optional[int] = 0
+    empirical_precision: Optional[Decimal] = Decimal("100.00")
+    calibrated_confidence: Optional[int] = 85
     created_at: datetime
 
 
@@ -139,6 +166,7 @@ class CounterpartyUpdate(BaseModel):
 class CounterpartyOut(CounterpartyBase):
     id: int
     company_id: Optional[int] = None
+    blind_token: Optional[str] = None
     learned_count: int = 0
     is_verified: bool = False
     created_at: datetime
@@ -157,6 +185,7 @@ class InternalLedgerRecordBase(BaseModel):
     bank_id: Optional[int] = None
     bank_name: Optional[str] = None
     bank_account_number: Optional[str] = None
+    custom_fields_json: Optional[Dict[str, Any]] = None
     status: Optional[str] = "OPEN"
 
 class InternalLedgerRecordCreate(InternalLedgerRecordBase):
@@ -245,5 +274,89 @@ class UnmatchActionRequest(BaseModel):
     erp_record_ids: Optional[List[int]] = None
 
 
+# ── Learned Matching Tolerance Rules & Customizable Export Schemas ──────────
+
+class MatchingToleranceRuleBase(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    bank_id: Optional[int] = None
+    rule_name: str
+    pass_type: str = "FEE_TOLERANCE"
+    direction: str = "EITHER"
+    record_type: Optional[str] = None
+    max_date_window_days: int = 7
+    max_fixed_fee_variance: Decimal = Decimal("50.00")
+    max_percentage_variance: Decimal = Decimal("0.0200")
+    default_variance_disposition: str = "BANK_FEE_WRITEOFF"
+    variance_gl_account: Optional[str] = "BANK_CHARGES"
+    lifecycle_state: str = "AUTO_CONFIRMED"
+    is_active: bool = True
+
+class MatchingToleranceRuleCreate(MatchingToleranceRuleBase):
+    pass
+
+class MatchingToleranceRuleOut(MatchingToleranceRuleBase):
+    id: int
+    company_id: int
+    confirmations_count: int = 1
+    overrides_count: int = 0
+    created_at: datetime
 
 
+class ExportColumnSpec(BaseModel):
+    source_field: str # e.g. "booking_date", "raw_description", "debit_amount", "custom_fields.Branch"
+    custom_header: str # User-chosen column header name
+    default_value: Optional[str] = ""
+
+class ReconciliationExportProfileBase(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    profile_name: str
+    description: Optional[str] = None
+    file_format: str = "CSV" # CSV or XLSX
+    columns_config_json: List[Dict[str, Any]]
+    amount_mode: str = "SPLIT_DEBIT_CREDIT" # SPLIT_DEBIT_CREDIT, SINGLE_SIGNED, ABSOLUTE_WITH_DC_FLAG
+    date_format: str = "%Y-%m-%d"
+    filter_config_json: Optional[Dict[str, Any]] = None
+    expand_journal_legs: bool = False
+    bank_gl_account: Optional[str] = "1010010 - Cash at Bank"
+    is_default: bool = False
+    is_active: bool = True
+
+class ReconciliationExportProfileCreate(ReconciliationExportProfileBase):
+    pass
+
+class ReconciliationExportProfileUpdate(BaseModel):
+    profile_name: Optional[str] = None
+    description: Optional[str] = None
+    file_format: Optional[str] = None
+    columns_config_json: Optional[List[Dict[str, Any]]] = None
+    amount_mode: Optional[str] = None
+    date_format: Optional[str] = None
+    filter_config_json: Optional[Dict[str, Any]] = None
+    expand_journal_legs: Optional[bool] = None
+    bank_gl_account: Optional[str] = None
+    is_default: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+class ReconciliationExportProfileOut(ReconciliationExportProfileBase):
+    id: int
+    company_id: int
+    created_at: datetime
+
+class CustomExportExecuteRequest(BaseModel):
+    profile_id: Optional[int] = None
+    statement_id: Optional[int] = None
+    bank_id: Optional[int] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    only_reconciled: Optional[bool] = None
+    only_classified: Optional[bool] = None
+    exclude_already_exported: bool = False
+    mark_as_exported: bool = False
+    file_format: Optional[str] = None # Override CSV or XLSX
+    columns_config: Optional[List[Dict[str, Any]]] = None # Ad-hoc custom column list & order
+    amount_mode: Optional[str] = None
+    date_format: Optional[str] = None
+    expand_journal_legs: Optional[bool] = None
+    bank_gl_account: Optional[str] = None

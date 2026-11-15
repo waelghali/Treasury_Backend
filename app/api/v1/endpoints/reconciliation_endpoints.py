@@ -1,12 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from decimal import Decimal
+import io
+import csv
 
 from app.database import get_db
 from app.models.models_reconciliation_v2 import (
     BankStatement, BankTransaction, InternalLedgerRecord, ClassificationTaxonomy, Counterparty,
-    ReconciliationMatch
+    ReconciliationMatch, ClassificationRule, ReconciliationExportProfile, MatchingToleranceRule
 )
 # Fix: get_current_corporate_admin is often a proxy or defined in security
 from app.api.v1.endpoints.corporate_admin import get_current_corporate_admin_context as get_current_corporate_admin
@@ -17,12 +20,15 @@ from app.schemas.schemas_reconciliation_v2 import (
     InternalLedgerRecordOut, TaxonomyNodeCreate, TaxonomyNodeUpdate,
     TaxonomyNodeOut, ClassifyTransactionRequest, ERPUploadResult,
     BulkClassifyRequest, BulkClearClassificationRequest, BulkOperationResult,
-    MatchActionRequest, UnmatchActionRequest
+    MatchActionRequest, UnmatchActionRequest,
+    MatchingToleranceRuleCreate, MatchingToleranceRuleOut,
+    ReconciliationExportProfileCreate, ReconciliationExportProfileUpdate,
+    ReconciliationExportProfileOut, CustomExportExecuteRequest
 )
 
 from app.crud.crud_reconciliation_v2 import (
     crud_bank_statement, crud_bank_transaction, crud_classification_rule, crud_counterparty,
-    crud_internal_ledger, crud_taxonomy
+    crud_internal_ledger, crud_taxonomy, crud_export_profile, crud_matching_tolerance_rule
 )
 from app.services.bank_reconciliation_service import bank_reconcile_service
 from app.core.security import TokenData
@@ -182,9 +188,20 @@ def manual_match_records(
 
     primary_bank_id = bank_txns[0].id
 
+    # Calculate total bank vs ERP amounts to detect and learn fee/FX tolerance online
+    total_bank_amt = sum(
+        max(Decimal(str(b.credit_amount or 0)), Decimal(str(b.debit_amount or 0)))
+        for b in bank_txns
+    )
+    total_erp_amt = sum(abs(Decimal(str(e.amount or 0))) for e in erp_records)
+    computed_variance = req.variance_amount if req.variance_amount is not None else abs(total_erp_amt - total_bank_amt)
+    disposition = req.variance_disposition or ("BANK_FEE_WRITEOFF" if req.write_off_variance_as_fee or computed_variance > 0 else "NONE")
+
     # 4. Create reconciliation match records and link
     for b_txn in bank_txns:
         b_txn.is_reconciled = True
+        if computed_variance > 0:
+            b_txn.variance_amount = computed_variance
         for erp in erp_records:
             m = ReconciliationMatch(
                 bank_txn_id=b_txn.id,
@@ -192,6 +209,8 @@ def manual_match_records(
                 source_record_id=erp.id,
                 match_type=match_type,
                 match_logic=req.type or "MANUAL",
+                variance_amount=computed_variance,
+                variance_disposition=disposition,
                 created_by=current_user.user_id
             )
             db.add(m)
@@ -199,6 +218,31 @@ def manual_match_records(
     for erp in erp_records:
         erp.status = "RECONCILED"
         erp.matched_bank_txn_id = primary_bank_id
+
+    # 5. Online Learning: If 1:1 match had a fee/FX variance or date lag, learn a MatchingToleranceRule online
+    if len(bank_txns) == 1 and len(erp_records) == 1 and computed_variance > Decimal("0.00"):
+        try:
+            b0 = bank_txns[0]
+            e0 = erp_records[0]
+            direction = "CREDIT" if (b0.credit_amount or 0) > 0 else "DEBIT"
+            bank_id = b0.statement.bank_id if b0.statement else None
+            b_dt = b0.booking_date.replace(tzinfo=None) if b0.booking_date else None
+            e_dt = e0.record_date.replace(tzinfo=None) if e0.record_date else None
+            lag_days = abs((b_dt - e_dt).days) if (b_dt and e_dt) else 0
+            bank_reconcile_service._learn_matching_tolerance_online(
+                db=db,
+                customer_id=current_user.customer_id,
+                bank_id=bank_id,
+                direction=direction,
+                record_type=e0.record_type,
+                variance_amount=computed_variance,
+                gross_amount=total_erp_amt,
+                date_lag_days=lag_days,
+                disposition=disposition,
+                user_id=current_user.user_id,
+            )
+        except Exception:
+            pass
 
     db.commit()
 
@@ -443,6 +487,41 @@ def get_all_transactions(
         search=search,
         skip=skip,
         limit=limit
+    )
+
+@router.post("/learn-from-history")
+def learn_from_history(
+    statement_id: Optional[int] = None,
+    limit: int = 2000,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """
+    Bulk Historical Learning:
+    Mines ClassificationRules, BankAccountProfiles, Counterparties, and zero-PII
+    CollaborativePatterns from historical classified transactions in the database.
+    """
+    return bank_reconcile_service.learn_from_history(
+        db=db,
+        customer_id=current_user.customer_id,
+        statement_id=statement_id,
+        user_id=current_user.user_id,
+        limit=limit
+    )
+
+@router.post("/seed-foundational-knowledge")
+def seed_foundational_knowledge(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """
+    Idempotently seeds Foundational Banking Standards Rules (SWIFT MT940, ISO 20022,
+    MENA/Egyptian Treasury Rails) and Collaborative Consensus Patterns for this customer.
+    """
+    from app.services.banking_standards_ontology import banking_standards_ontology
+    return banking_standards_ontology.ensure_foundational_knowledge_seeded(
+        db=db,
+        customer_id=current_user.customer_id
     )
 
 @router.get("/rules", response_model=List[ClassificationRuleOut])
@@ -718,38 +797,31 @@ def inline_classify_transaction(
 ):
     """
     Inline classification action:
-    Classifies an unclassified transaction, optionally binds to counterparty,
-    and submits anonymized pattern to the collaborative consensus brain.
+    Classifies a transaction, induces or self-heals online ClassificationRules,
+    updates account purity profile, optionally binds to counterparty, and submits
+    a zero-PII signature to the collaborative consensus brain.
     """
     txn = crud_bank_transaction.get(db, id=txn_id)
     if not txn:
         raise HTTPException(status_code=404, detail="Bank transaction not found")
-    
-    # Apply category
-    txn.classification_category = req.category
-    txn.internal_category = req.gl_account or req.category
-    txn.category = req.category
+
+    # Call confirm_and_learn first so it captures previous_category & previous_rule_id for online self-healing
+    updated_txn = bank_reconcile_service.confirm_and_learn(
+        db=db,
+        transaction_id=txn.id,
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+        counterparty_name=req.counterparty_name if req.remember_for_counterparty else None,
+        category=req.category,
+        gl_account=req.gl_account,
+        sub_category=req.sub_category,
+    )
+    updated_txn.category = req.category
     if req.sub_category:
-        txn.sub_category = req.sub_category
-    txn.classification_source = "MANUAL"
-    txn.classification_confidence = 100
-    txn.is_classified = True
-
-    # If learn flag is true, trigger learning loop
-    if req.remember_for_counterparty:
-        bank_reconcile_service.confirm_and_learn(
-            db=db,
-            transaction_id=txn.id,
-            customer_id=current_user.customer_id,
-            user_id=current_user.user_id,
-            counterparty_name=req.counterparty_name,
-            category=req.category,
-            gl_account=req.gl_account
-        )
-
+        updated_txn.sub_category = req.sub_category
     db.commit()
-    db.refresh(txn)
-    return txn
+    db.refresh(updated_txn)
+    return updated_txn
 
 
 @router.post("/transactions/bulk-classify", response_model=BulkOperationResult)
@@ -924,7 +996,8 @@ def get_erp_records(
         InternalLedgerRecord.company_id == current_user.customer_id
     )
     if is_reconciled is not None:
-        query = query.filter(InternalLedgerRecord.is_reconciled == is_reconciled)
+        target_status = "RECONCILED" if is_reconciled else "OPEN"
+        query = query.filter(InternalLedgerRecord.status == target_status)
     if status:
         query = query.filter(InternalLedgerRecord.status == status)
     if search:
@@ -935,6 +1008,275 @@ def get_erp_records(
             (InternalLedgerRecord.gl_account.ilike(s))
         )
     return query.order_by(InternalLedgerRecord.record_date.desc()).offset(skip).limit(limit).all()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ONLINE RULE LIFECYCLE & LEARNED TOLERANCE RULES ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@router.post("/rules/{rule_id}/promote", response_model=ClassificationRuleOut)
+def promote_or_toggle_rule_lifecycle(
+    rule_id: int,
+    lifecycle_state: str = "AUTO_CONFIRMED",
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """
+    Promotes an online-learned rule from SUGGESTED to AUTO_CONFIRMED (or demotes to SUGGESTED).
+    """
+    rule = db.query(ClassificationRule).filter(
+        ClassificationRule.id == rule_id,
+        ClassificationRule.company_id == current_user.customer_id,
+        ClassificationRule.is_deleted == False
+    ).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+
+    if lifecycle_state not in ("SUGGESTED", "AUTO_CONFIRMED", "CANDIDATE", "DEMOTED"):
+        raise HTTPException(status_code=400, detail="Invalid lifecycle_state")
+
+    rule.lifecycle_state = lifecycle_state
+    if lifecycle_state == "AUTO_CONFIRMED":
+        rule.calibrated_confidence = max(rule.calibrated_confidence or 85, 90)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@router.get("/tolerance-rules", response_model=List[MatchingToleranceRuleOut])
+def get_tolerance_rules(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    return crud_matching_tolerance_rule.get_by_customer(db, customer_id=current_user.customer_id)
+
+
+@router.post("/tolerance-rules", response_model=MatchingToleranceRuleOut)
+def create_tolerance_rule(
+    rule_in: MatchingToleranceRuleCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    return crud_matching_tolerance_rule.create_rule(
+        db, obj_in=rule_in, customer_id=current_user.customer_id, user_id=current_user.user_id
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  USER-CUSTOMIZABLE EXPORT BUILDER & EXECUTION ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@router.get("/export-profiles", response_model=List[ReconciliationExportProfileOut])
+def get_export_profiles(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """Returns all saved custom export profiles for the customer."""
+    return crud_export_profile.get_by_customer(db, customer_id=current_user.customer_id)
+
+
+@router.post("/export-profiles", response_model=ReconciliationExportProfileOut)
+def create_export_profile(
+    profile_in: ReconciliationExportProfileCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """Creates a new customizable export template (custom column selection, order, headers, format)."""
+    return crud_export_profile.create_profile(
+        db, obj_in=profile_in, customer_id=current_user.customer_id, user_id=current_user.user_id
+    )
+
+
+@router.put("/export-profiles/{profile_id}", response_model=ReconciliationExportProfileOut)
+def update_export_profile(
+    profile_id: int,
+    profile_in: ReconciliationExportProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    return crud_export_profile.update_profile(
+        db, profile_id=profile_id, obj_in=profile_in, customer_id=current_user.customer_id
+    )
+
+
+@router.delete("/export-profiles/{profile_id}")
+def delete_export_profile(
+    profile_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    crud_export_profile.delete_profile(db, profile_id=profile_id, customer_id=current_user.customer_id)
+    return {"status": "success"}
+
+
+@router.get("/export/available-fields")
+def get_available_export_fields(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """
+    Returns all standard fields plus any dynamic custom columns (`custom_fields.<col>`)
+    discovered from the customer's uploaded bank statements.
+    """
+    standard_fields = [
+        {"source_field": "booking_date", "default_header": "Booking Date", "group": "Core Bank"},
+        {"source_field": "value_date", "default_header": "Value Date", "group": "Core Bank"},
+        {"source_field": "account_number", "default_header": "Account Number", "group": "Core Bank"},
+        {"source_field": "raw_description", "default_header": "Description", "group": "Core Bank"},
+        {"source_field": "description_line2", "default_header": "Description Line 2", "group": "Core Bank"},
+        {"source_field": "debit_amount", "default_header": "Debit", "group": "Amounts"},
+        {"source_field": "credit_amount", "default_header": "Credit", "group": "Amounts"},
+        {"source_field": "signed_amount", "default_header": "Signed Net Amount", "group": "Amounts"},
+        {"source_field": "absolute_amount", "default_header": "Absolute Amount", "group": "Amounts"},
+        {"source_field": "dc_indicator", "default_header": "D/C Indicator", "group": "Amounts"},
+        {"source_field": "currency", "default_header": "Currency", "group": "Amounts"},
+        {"source_field": "running_balance", "default_header": "Running Balance", "group": "Amounts"},
+        {"source_field": "counterparty_name", "default_header": "Counterparty", "group": "Classification & GL"},
+        {"source_field": "classification_category", "default_header": "Category", "group": "Classification & GL"},
+        {"source_field": "sub_category", "default_header": "Sub-Category", "group": "Classification & GL"},
+        {"source_field": "internal_category", "default_header": "GL Account", "group": "Classification & GL"},
+        {"source_field": "classification_source", "default_header": "Classification Source", "group": "Classification & GL"},
+        {"source_field": "classification_confidence", "default_header": "Confidence %", "group": "Classification & GL"},
+        {"source_field": "applied_rule_name", "default_header": "Applied Rule", "group": "Classification & GL"},
+        {"source_field": "classification_reasoning", "default_header": "Audit Reasoning", "group": "Classification & GL"},
+        {"source_field": "is_reconciled", "default_header": "Reconciled Status", "group": "Reconciliation"},
+        {"source_field": "matched_erp_reference", "default_header": "Matched ERP Reference", "group": "Reconciliation"},
+        {"source_field": "variance_amount", "default_header": "Fee / FX Variance", "group": "Reconciliation"},
+        {"source_field": "back_office_ref", "default_header": "Bank Reference", "group": "References"},
+        {"source_field": "e2e_id", "default_header": "E2E / SWIFT ID", "group": "References"},
+        {"source_field": "cheque_number", "default_header": "Cheque Number", "group": "References"},
+        {"source_field": "counterparty_iban", "default_header": "Counterparty IBAN", "group": "References"},
+    ]
+
+    # Discover custom fields preserved from uploaded statements
+    sample_txns = db.query(BankTransaction).join(BankStatement).filter(
+        BankStatement.company_id == current_user.customer_id,
+        BankTransaction.custom_fields_json != None,
+        BankTransaction.is_deleted == False
+    ).order_by(BankTransaction.id.desc()).limit(100).all()
+
+    custom_keys = set()
+    for t in sample_txns:
+        if isinstance(t.custom_fields_json, dict):
+            custom_keys.update(t.custom_fields_json.keys())
+
+    for ck in sorted(custom_keys):
+        standard_fields.append({
+            "source_field": f"custom_fields.{ck}",
+            "default_header": ck,
+            "group": "Custom Uploaded Columns"
+        })
+
+    return {"available_fields": standard_fields}
+
+
+@router.post("/export/preview")
+def preview_custom_export(
+    req: CustomExportExecuteRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """
+    Returns live export summary stats and the first 50 formatted rows for preview.
+    """
+    cid = current_user.customer_id
+    base_q = db.query(BankTransaction).join(BankStatement).filter(
+        BankStatement.company_id == cid,
+        BankTransaction.is_deleted == False
+    )
+    total_count = base_q.count()
+    finalized_count = base_q.filter(
+        (BankTransaction.is_reconciled == True) | (BankTransaction.is_classified == True)
+    ).count()
+    unclassified_count = base_q.filter(BankTransaction.is_classified == False).count()
+    exported_count = base_q.filter(BankTransaction.is_exported == True).count()
+
+    headers, rows, _, fmt = bank_reconcile_service.build_custom_export_rows(db, cid, req)
+    return {
+        "summary": {
+            "total_transactions": total_count,
+            "finalized_count": finalized_count,
+            "unclassified_count": unclassified_count,
+            "exported_count": exported_count,
+            "matching_export_rows": len(rows),
+        },
+        "headers": headers,
+        "preview_rows": rows[:50],
+        "file_format": fmt,
+    }
+
+
+@router.post("/export/download")
+def download_custom_export(
+    req: CustomExportExecuteRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin)
+):
+    """
+    Generates and streams the user-customized CSV or Excel (.xlsx) export file.
+    Optionally marks transactions as exported & locked.
+    """
+    cid = current_user.customer_id
+    headers, rows, txns, fmt = bank_reconcile_service.build_custom_export_rows(db, cid, req)
+
+    if req.mark_as_exported and txns:
+        for t in txns:
+            t.is_exported = True
+            t.is_locked = True
+        db.commit()
+
+    def _sanitize_spreadsheet_cell(val):
+        if not isinstance(val, str) or not val:
+            return val
+        stripped = val.lstrip(" ")
+        if not stripped:
+            return val
+        first_ch = stripped[0]
+        if first_ch in ("=", "+", "@") or val[0] in ("\t", "\r"):
+            return f"'{val}"
+        if first_ch == "-":
+            # Allow genuine negative numbers (e.g. "-1250.50" or "-1,250.50") while escaping formulas like "-SUM(...)"
+            num_probe = stripped[1:].replace(",", "").strip()
+            try:
+                float(num_probe)
+                return val
+            except ValueError:
+                return f"'{val}"
+        return val
+
+    safe_rows = [
+        {k: _sanitize_spreadsheet_cell(v) for k, v in r.items()}
+        for r in rows
+    ]
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    if fmt == "XLSX":
+        import pandas as pd
+        df_out = pd.DataFrame(safe_rows, columns=headers)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_out.to_excel(writer, index=False, sheet_name="Reconciliation_Export")
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="reconciliation_export_{timestamp}.xlsx"'}
+        )
+    else:
+        str_buf = io.StringIO()
+        # Write UTF-8 BOM so Excel opens Arabic characters cleanly
+        str_buf.write('\ufeff')
+        writer = csv.DictWriter(str_buf, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        for r in safe_rows:
+            writer.writerow(r)
+        byte_buf = io.BytesIO(str_buf.getvalue().encode("utf-8"))
+        return StreamingResponse(
+            byte_buf,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="reconciliation_export_{timestamp}.csv"'}
+        )
+
 
 
 

@@ -18,7 +18,10 @@ from app.crud.crud import crud_user, crud_role_permission
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 25))
-TRUST_X_FORWARDED = os.getenv("TRUST_X_FORWARDED", "false").lower() == "true"
+TRUST_X_FORWARDED = os.getenv(
+    "TRUST_X_FORWARDED",
+    "true" if os.getenv("RENDER") else "false",
+).lower() == "true"
 
 if SECRET_KEY is None:
     raise ValueError("SECRET_KEY environment variable is not set.")
@@ -65,33 +68,40 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
 
 
 def get_client_ip(request: Request) -> str:
-    # 1. Check for X-Forwarded-For (standard for Render/Vercel)
-    x_forwarded_for = request.headers.get("x-forwarded-for")
-    if x_forwarded_for:
-        # Grab the first IP in the chain (the actual user)
-        return x_forwarded_for.split(',')[0].strip()
-    
-    # 2. Check for X-Real-IP (used by some proxies)
-    x_real_ip = request.headers.get("x-real-ip")
-    if x_real_ip:
-        return x_real_ip
+    if TRUST_X_FORWARDED:
+        # 1. Check for X-Forwarded-For when behind a trusted reverse proxy (e.g. Render)
+        x_forwarded_for = request.headers.get("x-forwarded-for")
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0].strip()
 
-    # 3. Fallback to the direct connection host
+        # 2. Check for X-Real-IP (used by some trusted proxies)
+        x_real_ip = request.headers.get("x-real-ip")
+        if x_real_ip:
+            return x_real_ip.strip()
+
+    # 3. Direct connection host (cannot be spoofed via HTTP headers)
     if request.client and request.client.host:
         return request.client.host
-        
+
     return "IP_NOT_FOUND"
 
 def verify_access_token(token: str) -> Dict[str, Any]:
-    """Decodes and validates a JWT access token, returning the payload dict."""
+    """Decodes and validates a full JWT access token, rejecting pre-MFA challenge tokens."""
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid or expired access token: {e}",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if payload.get("token_use") == "mfa_challenge" or payload.get("is_mfa_verified") is False:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MFA verification is required before using this session.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload
 
 # --- Dependencies ---
 
@@ -129,6 +139,14 @@ def get_current_user(
         if email is None or user_id is None or role is None:
             raise credentials_exception
 
+        # Block pre-MFA waiting-room tokens from acting as authenticated sessions
+        if payload.get("token_use") == "mfa_challenge" or payload.get("is_mfa_verified") is False:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="MFA verification required.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         # Load permissions from DB based on role (Ensures permissions are always up to date)
         db_permissions = crud_role_permission.get_permissions_for_role(db, role)
         permission_names = [p.name for p in db_permissions]
@@ -147,6 +165,7 @@ def get_current_user(
             has_all_entity_access=payload.get("has_all_entity_access"),
             entity_ids=payload.get("entity_ids", []),
             must_change_password=payload.get("must_change_password"),
+            is_mfa_verified=bool(payload.get("is_mfa_verified", True)),
             subscription_status=sub_status,
             must_accept_policies=payload.get("must_accept_policies"),
             last_accepted_legal_version=payload.get("last_accepted_legal_version"),
@@ -158,6 +177,8 @@ def get_current_user(
             customer_name=payload.get("customer_name"),
             subscription_end_date=payload.get("subscription_end_date"),
         )
+    except HTTPException:
+        raise
     except (JWTError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -174,15 +195,28 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 4. Synchronize active module access directly from customer's subscription plan
+    # 4. Synchronize live password policy, subscription status & module entitlements from DB
     is_so = (token_data.role == UserRole.SYSTEM_OWNER)
-    if user.customer and user.customer.subscription_plan:
-        plan = user.customer.subscription_plan
-        token_data.has_custody_module = is_so or bool(plan.has_custody_module)
-        token_data.has_issuance_module = is_so or bool(plan.has_issuance_module)
-        token_data.has_quotation_module = is_so or bool(plan.has_quotation_module)
-        token_data.has_reconciliation_module = is_so or bool(plan.has_reconciliation_module)
-        token_data.can_email_inbox = is_so or bool(getattr(plan, 'can_email_inbox', True))
+    if not is_so:
+        token_data.must_change_password = bool(user.must_change_password)
+        if token_data.customer_id is None and user.customer_id is not None:
+            token_data.customer_id = user.customer_id
+    if user.customer:
+        if not is_so and getattr(user.customer, "status", None):
+            live_status_val = user.customer.status.value if hasattr(user.customer.status, "value") else str(user.customer.status)
+            try:
+                token_data.subscription_status = SubscriptionStatus(live_status_val)
+            except ValueError:
+                pass
+        if getattr(user.customer, "end_date", None):
+            token_data.subscription_end_date = user.customer.end_date.isoformat()
+        if user.customer.subscription_plan:
+            plan = user.customer.subscription_plan
+            token_data.has_custody_module = is_so or bool(plan.has_custody_module)
+            token_data.has_issuance_module = is_so or bool(plan.has_issuance_module)
+            token_data.has_quotation_module = is_so or bool(plan.has_quotation_module)
+            token_data.has_reconciliation_module = is_so or bool(plan.has_reconciliation_module)
+            token_data.can_email_inbox = is_so or bool(getattr(plan, 'can_email_inbox', True))
         if not token_data.customer_name and user.customer.name:
             token_data.customer_name = user.customer.name
     

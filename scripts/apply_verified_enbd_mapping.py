@@ -1,10 +1,11 @@
+import os
 import sys
 sys.path.insert(0, '.')
 from sqlalchemy import create_engine, text
 import json
 
-STAGING_DB_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
-LOCAL_DB_URL = "postgresql://postgres:Voda%21%4012@localhost:5432/grow"
+STAGING_DB_URL = os.environ["STAGING_DB_URL"]
+LOCAL_DB_URL = os.environ.get("LOCAL_DB_URL") or os.environ["DATABASE_URL"]
 
 CHECKBOX_MAP = {
     "Check1": {"mapped_to": "lg_type_is_bid_bond", "label": "Bid Bond / ابتدائي"},

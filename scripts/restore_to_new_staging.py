@@ -1,9 +1,10 @@
+import os
 # scripts/restore_to_new_staging.py
 import sys, os, time
 sys.path.insert(0, os.path.abspath("."))
 from sqlalchemy import create_engine, text, MetaData, Table
 
-LOCAL_BACKUP_URL = "postgresql://postgres:Voda%21%4012@localhost:5432/grow_staging_backup"
+LOCAL_BACKUP_URL = os.environ["LOCAL_BACKUP_URL"]
 
 def restore(new_staging_url: str):
     start_time = time.time()

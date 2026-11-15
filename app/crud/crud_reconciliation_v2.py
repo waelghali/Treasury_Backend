@@ -7,12 +7,16 @@ from app.crud.crud import CRUDBase, log_action
 from app.models.models_reconciliation_v2 import (
     BankStatement, BankTransaction, MultiReference, 
     ReconciliationMatch, ClassificationRule, Counterparty, InternalLedgerRecord,
-    ClassificationTaxonomy
+    ClassificationTaxonomy, ReconciliationExportProfile, MatchingToleranceRule
 )
 from app.schemas.schemas_reconciliation_v2 import (
     BankStatementCreate, ClassificationRuleCreate,
-    CounterpartyCreate, CounterpartyUpdate, TaxonomyNodeCreate, TaxonomyNodeUpdate
+    CounterpartyCreate, CounterpartyUpdate, TaxonomyNodeCreate, TaxonomyNodeUpdate,
+    ReconciliationExportProfileCreate, ReconciliationExportProfileUpdate,
+    MatchingToleranceRuleCreate
 )
+from app.services.reconciliation_confidentiality_service import reconciliation_confidentiality
+from app.core.security_crypto import encrypt_field
 
 class CRUDBankStatement(CRUDBase):
     def get(self, db: Session, id: Any) -> Optional[BankStatement]:
@@ -42,14 +46,37 @@ class CRUDBankStatement(CRUDBase):
         return db_obj
 
 class CRUDBankTransaction(CRUDBase):
+    def _resolve_confidential_fields(self, db: Session, txns: List[BankTransaction], customer_id: Optional[int] = None) -> List[BankTransaction]:
+        if not txns:
+            return txns
+        cid = customer_id or (txns[0].statement.company_id if txns[0].statement else None)
+        dek = reconciliation_confidentiality.get_tenant_dek(db, cid) if cid else None
+        if not dek:
+            return txns
+        for t in txns:
+            resolved = reconciliation_confidentiality.resolve_transaction_fields(t, dek)
+            if resolved.get("raw_description"):
+                t.raw_description = resolved["raw_description"]
+            if resolved.get("counterparty_name"):
+                t.counterparty_name = resolved["counterparty_name"]
+            if resolved.get("custom_fields"):
+                t.custom_fields_json = resolved["custom_fields"]
+        return txns
+
     def get_by_statement(self, db: Session, statement_id: int) -> List[BankTransaction]:
-        return db.query(self.model).filter(self.model.statement_id == statement_id).all()
+        txns = db.query(self.model).filter(
+            self.model.statement_id == statement_id,
+            self.model.is_deleted == False
+        ).order_by(self.model.booking_date.asc(), self.model.id.asc()).all()
+        return self._resolve_confidential_fields(db, txns)
 
     def get_unreconciled(self, db: Session, customer_id: int) -> List[BankTransaction]:
-        return db.query(self.model).join(BankStatement).filter(
+        txns = db.query(self.model).join(BankStatement).filter(
             BankStatement.company_id == customer_id,
-            self.model.is_reconciled == False
+            self.model.is_reconciled == False,
+            self.model.is_deleted == False
         ).all()
+        return self._resolve_confidential_fields(db, txns, customer_id=customer_id)
 
     def get_filtered(self, db: Session, customer_id: int, 
                     bank_id: Optional[int] = None, 
@@ -63,7 +90,10 @@ class CRUDBankTransaction(CRUDBase):
         """
         Fetches transactions across multiple statements with advanced filtering.
         """
-        query = db.query(self.model).join(BankStatement).filter(BankStatement.company_id == customer_id)
+        query = db.query(self.model).join(BankStatement).filter(
+            BankStatement.company_id == customer_id,
+            self.model.is_deleted == False
+        )
         
         if bank_id:
             query = query.filter(BankStatement.bank_id == bank_id)
@@ -88,23 +118,30 @@ class CRUDBankTransaction(CRUDBase):
         if search:
             query = query.filter(or_(
                 self.model.raw_description.ilike(f"%{search}%"),
+                self.model.tokenized_description.ilike(f"%{search}%"),
+                self.model.counterparty_name.ilike(f"%{search}%"),
                 self.model.e2e_id.ilike(f"%{search}%")
             ))
             
         from sqlalchemy.orm import joinedload
-        # Default order: Ledger style (Newest first) unless user sorts otherwise in frontend
-        return query.options(joinedload(self.model.applied_rule)).order_by(self.model.booking_date.desc(), self.model.id.desc()).offset(skip).limit(limit).all()
+        txns = query.options(joinedload(self.model.applied_rule)).order_by(
+            self.model.booking_date.desc(), self.model.id.desc()
+        ).offset(skip).limit(limit).all()
+        return self._resolve_confidential_fields(db, txns, customer_id=customer_id)
 
 class CRUDClassificationRule(CRUDBase):
     def get_by_customer(self, db: Session, customer_id: int) -> List[ClassificationRule]:
         return db.query(self.model).filter(
             self.model.company_id == customer_id,
             self.model.is_deleted == False
-        ).order_by(self.model.priority.asc()).all()
+        ).order_by(self.model.priority.asc(), self.model.id.desc()).all()
 
     def create_rule(self, db: Session, obj_in: ClassificationRuleCreate, customer_id: int, user_id: int) -> ClassificationRule:
+        data = obj_in.model_dump()
+        if not data.get("assigned_category"):
+            data["assigned_category"] = data.get("assigned_gl_account")
         db_obj = ClassificationRule(
-            **obj_in.model_dump(),
+            **data,
             company_id=customer_id,
             created_by=user_id
         )
@@ -180,9 +217,16 @@ class CRUDCounterparty(CRUDBase):
     def create_counterparty(self, db: Session, obj_in: CounterpartyCreate, 
                             customer_id: Optional[int], user_id: int) -> Counterparty:
         company_id = obj_in.company_id if obj_in.company_id is not None else customer_id
+        clean_name = obj_in.name.strip()
+        dek = reconciliation_confidentiality.get_tenant_dek(db, company_id) if company_id else None
+        blind_tok = reconciliation_confidentiality.compute_blind_token(clean_name, dek, prefix="ENT_TOK")
+        enc_name = encrypt_field(clean_name, dek, field_context="counterparty:name") if dek else None
+
         db_obj = Counterparty(
-            name=obj_in.name.strip(),
-            aliases=obj_in.aliases or [],
+            name=clean_name,
+            blind_token=blind_tok,
+            encrypted_name=enc_name,
+            aliases=obj_in.aliases or [clean_name],
             entity_type=obj_in.entity_type,
             default_gl_account=obj_in.default_gl_account,
             default_category=obj_in.default_category,
@@ -212,6 +256,12 @@ class CRUDCounterparty(CRUDBase):
         update_data = obj_in.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             setattr(db_obj, field, value)
+
+        if "name" in update_data and update_data["name"]:
+            dek = reconciliation_confidentiality.get_tenant_dek(db, customer_id)
+            db_obj.blind_token = reconciliation_confidentiality.compute_blind_token(update_data["name"], dek, prefix="ENT_TOK")
+            if dek:
+                db_obj.encrypted_name = encrypt_field(update_data["name"], dek, field_context="counterparty:name")
             
         db.commit()
         db.refresh(db_obj)
@@ -250,23 +300,31 @@ class CRUDCounterparty(CRUDBase):
                            user_id: Optional[int] = None) -> Counterparty:
         """
         Learning feedback loop: If counterparty exists, increments learned_count.
-        If new, auto-registers it as unverified so it works for future transactions.
+        If new, auto-registers it with deterministic blind token so it works for future transactions.
         """
         clean_name = name.strip()
         if not clean_name:
             return None
+
+        dek = reconciliation_confidentiality.get_tenant_dek(db, customer_id)
+        blind_tok = reconciliation_confidentiality.compute_blind_token(clean_name, dek, prefix="ENT_TOK")
 
         existing = db.query(self.model).filter(
             or_(
                 self.model.company_id == customer_id,
                 self.model.company_id == None
             ),
-            self.model.name.ilike(clean_name),
+            or_(
+                self.model.name.ilike(clean_name),
+                and_(self.model.blind_token != None, self.model.blind_token == blind_tok)
+            ),
             self.model.is_deleted == False
         ).first()
 
         if existing:
             existing.learned_count = (existing.learned_count or 0) + 1
+            if not existing.blind_token:
+                existing.blind_token = blind_tok
             if default_category and not existing.default_category:
                 existing.default_category = default_category
             if default_gl and not existing.default_gl_account:
@@ -275,8 +333,11 @@ class CRUDCounterparty(CRUDBase):
             db.refresh(existing)
             return existing
         else:
+            enc_name = encrypt_field(clean_name, dek, field_context="counterparty:name") if dek else None
             new_cp = Counterparty(
                 name=clean_name,
+                blind_token=blind_tok,
+                encrypted_name=enc_name,
                 aliases=[clean_name],
                 entity_type=entity_type,
                 default_category=default_category,
@@ -368,3 +429,76 @@ class CRUDClassificationTaxonomy(CRUDBase):
 crud_taxonomy = CRUDClassificationTaxonomy(ClassificationTaxonomy)
 
 
+class CRUDReconciliationExportProfile(CRUDBase):
+    def get_by_customer(self, db: Session, customer_id: int) -> List[ReconciliationExportProfile]:
+        return db.query(self.model).filter(
+            self.model.company_id == customer_id,
+            self.model.is_deleted == False,
+            self.model.is_active == True
+        ).order_by(self.model.is_default.desc(), self.model.id.asc()).all()
+
+    def create_profile(self, db: Session, obj_in: ReconciliationExportProfileCreate, customer_id: int, user_id: int) -> ReconciliationExportProfile:
+        if obj_in.is_default:
+            db.query(self.model).filter(self.model.company_id == customer_id).update({"is_default": False})
+        db_obj = ReconciliationExportProfile(
+            **obj_in.model_dump(),
+            company_id=customer_id,
+            created_by=user_id
+        )
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
+    def update_profile(self, db: Session, profile_id: int, obj_in: ReconciliationExportProfileUpdate, customer_id: int) -> ReconciliationExportProfile:
+        db_obj = db.query(self.model).filter(
+            self.model.id == profile_id,
+            self.model.company_id == customer_id,
+            self.model.is_deleted == False
+        ).first()
+        if not db_obj:
+            raise HTTPException(status_code=404, detail="Export profile not found")
+        update_data = obj_in.model_dump(exclude_unset=True)
+        if update_data.get("is_default"):
+            db.query(self.model).filter(self.model.company_id == customer_id).update({"is_default": False})
+        for field, value in update_data.items():
+            setattr(db_obj, field, value)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
+    def delete_profile(self, db: Session, profile_id: int, customer_id: int) -> bool:
+        db_obj = db.query(self.model).filter(
+            self.model.id == profile_id,
+            self.model.company_id == customer_id,
+            self.model.is_deleted == False
+        ).first()
+        if not db_obj:
+            raise HTTPException(status_code=404, detail="Export profile not found")
+        self.soft_delete(db, db_obj=db_obj)
+        db.commit()
+        return True
+
+crud_export_profile = CRUDReconciliationExportProfile(ReconciliationExportProfile)
+
+
+class CRUDMatchingToleranceRule(CRUDBase):
+    def get_by_customer(self, db: Session, customer_id: int) -> List[MatchingToleranceRule]:
+        return db.query(self.model).filter(
+            self.model.company_id == customer_id,
+            self.model.is_deleted == False,
+            self.model.is_active == True
+        ).order_by(self.model.id.asc()).all()
+
+    def create_rule(self, db: Session, obj_in: MatchingToleranceRuleCreate, customer_id: int, user_id: int) -> MatchingToleranceRule:
+        db_obj = MatchingToleranceRule(
+            **obj_in.model_dump(),
+            company_id=customer_id,
+            created_by=user_id
+        )
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
+crud_matching_tolerance_rule = CRUDMatchingToleranceRule(MatchingToleranceRule)

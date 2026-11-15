@@ -1,15 +1,79 @@
 # core/document_generator.py
 import asyncio
+import html
 import io
 import os
 import gc
 import ctypes
-from typing import Optional, List
+from typing import Optional, List, Any, Set
 from datetime import datetime
+from urllib.parse import urlparse, unquote
+from urllib.request import url2pathname
 import re
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Template placeholder keys that intentionally contain pre-formatted HTML wrapper tags
+RAW_HTML_TEMPLATE_KEYS: Set[str] = {
+    "notes_section",
+    "other_instructions_section",
+}
+
+
+def escape_html_placeholder(key: str, value: Any) -> str:
+    """
+    Safely escapes user-controlled text values before inserting into HTML letter templates
+    while preserving intentional pre-built HTML section blocks.
+    """
+    if value is None:
+        return ""
+    str_val = str(value)
+    if key in RAW_HTML_TEMPLATE_KEYS:
+        return str_val
+    return html.escape(str_val, quote=True)
+
+
+def _safe_weasyprint_url_fetcher(url: str):
+    """
+    Hardened WeasyPrint URL fetcher that blocks SSRF (arbitrary HTTP/HTTPS/cloud metadata)
+    and arbitrary local file:// reads outside the application's static asset directory.
+    """
+    from weasyprint import default_url_fetcher
+
+    parsed = urlparse(url or "")
+    scheme = (parsed.scheme or "").lower()
+
+    if scheme == "data":
+        return default_url_fetcher(url)
+
+    if scheme == "file":
+        app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        raw_path = url2pathname(unquote(parsed.path or ""))
+        if parsed.netloc and os.name == "nt":
+            raw_path = f"//{parsed.netloc}{raw_path}"
+        target_path = os.path.abspath(raw_path)
+        allowed_roots = [
+            os.path.abspath(os.path.join(app_root, "static")),
+            os.path.abspath(os.path.join(app_root, "assets")),
+            os.path.abspath(os.path.join(app_root, "templates")),
+        ]
+        if any(target_path == r or target_path.startswith(r + os.sep) for r in allowed_roots):
+            return default_url_fetcher(url)
+        logger.warning(f"Blocked unauthorized local file fetch during PDF rendering: {url}")
+        return {"string": b"", "mime_type": "text/plain"}
+
+    if scheme == "https":
+        host = (parsed.hostname or "").lower().strip(".")
+        if (
+            host == "growbusinessdevelopment.com"
+            or host.endswith(".growbusinessdevelopment.com")
+            or host in ("fonts.googleapis.com", "fonts.gstatic.com")
+        ):
+            return default_url_fetcher(url)
+
+    logger.warning(f"Blocked external URL fetch during PDF rendering: {url}")
+    return {"string": b"", "mime_type": "text/plain"}
 
 def _apply_template_date_formatting(html_content: str) -> str:
     """
@@ -49,7 +113,7 @@ def _render_single_html_one_page(html_content: str, filename_hint: str = "") -> 
 
     formatted_html = _apply_template_date_formatting(html_content)
     formatted_html = inject_mandatory_verification_footer(formatted_html, filename_hint=filename_hint)
-    html_obj = HTML(string=formatted_html)
+    html_obj = HTML(string=formatted_html, url_fetcher=_safe_weasyprint_url_fetcher)
     doc = html_obj.render()
 
     if len(doc.pages) <= 1:

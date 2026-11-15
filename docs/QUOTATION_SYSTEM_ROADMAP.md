@@ -1,6 +1,6 @@
         # Grow Treasury — Quotation Module Architectural Roadmap
 
-*Last Updated: October 29, 2026*  
+*Last Updated: November 14, 2026*  
 *Status: Production = `main` @ `12efde2` (backend) / `7955b8e` (frontend). Next release candidate = local branch `safe/2026-10-15-reviewed-fixes` (not merged, not pushed). Notification/Push engine = prototype on local branch `wip/notification-engine-2026-10-15` — **ON HOLD** (see [Current Release State](#-current-release-state--branch-split-2026-10-15)).*
 
 ---
@@ -28,8 +28,9 @@
 18. [Phase 14: Instrument Expansion — FX Forwards, NDFs, FX Swaps & Money Market Deposits](#16-phase-14-instrument-expansion--fx-forwards-ndfs-fx-swaps--money-market-deposits-deep-product--variable-analysis)
 19. [Phase 15: Partial Fill & Tiered Multi-Bank Allocation on T-Bills & Large FX Orders](#17-phase-15-partial-fill--tiered-multi-bank-allocation-on-t-bills--large-fx-orders)
 20. [Phase 16: Outbound Email Governance & Multi-Tier Sender Identity Architecture (Planned 🚀)](#18-phase-16-outbound-email-governance--multi-tier-sender-identity-architecture-planned-)
-21. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#19-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
-22. [Production Database Migration Ledger](#20-production-database-migration-ledger-audit--compliance-log)
+21. [Phase 17: Granular Per-User Module & Capability Entitlements + Bank Reconciliation Role Alignment (Planned 🚀)](#19-phase-17-granular-per-user-module--capability-entitlements--bank-reconciliation-role-alignment-planned-)
+22. [Master Implementation Status: What We Have vs. What Still Needs to Be Done](#20-master-implementation-status-what-we-have-vs-what-still-needs-to-be-done)
+23. [Production Database Migration Ledger](#21-production-database-migration-ledger-audit--compliance-log)
 
 ---
 
@@ -2570,8 +2571,162 @@ Before implementing the routing tier changes in §18.2–18.3, all **8 latent em
 
 ---
 
+## 19. Phase 17: Granular Per-User Module & Capability Entitlements + Bank Reconciliation Role Alignment (Planned 🚀)
 
-## 19. Master Implementation Status: What We Have vs. What Still Needs to Be Done
+### 19.1 Executive Summary, Complexity Verdict & Architectural Head-Start
+
+Corporate customers on multi-module subscriptions (e.g., `MAX All`) need to segregate user access below the tenant's `SubscriptionPlan` ceiling—for example, allowing **End User X** to operate **LG Custody (Inbound)** while **End User Y** operates **LG Issuance (Outbound)**, **FX & T-Bill Quotations**, **Bank Statement Reconciliation**, or **Smart Email Inbox**, without exposing unauthorized modules, documents, AI queries, or background email alerts.
+
+#### Complexity & Effort Assessment Across Granularity Tiers
+
+| Scope Tier | What Corporate Admin / System Owner Can Configure Per User | Complexity | Estimated Effort | Risk Profile |
+| :--- | :--- | :---: | :---: | :--- |
+| **Tier 1: Module-Level Entitlements** | Toggle which subscribed modules a user can access (**LG Custody**, **LG Issuance**, **Quotations**, **Bank Reconciliation**, **Smart Inbox**) + optional **Reports** & **AI Assistant** | **Low–Medium** | ~3–5 dev days | **Low** — directly leverages existing `TokenData` session flags |
+| **Tier 2: Per-Module Operational Mode (`None / View Only / Execute`) + Checker Scoping** | Per-module mode (`none`, `view`, `execute` — e.g., User X *executes* Custody and *views* Issuance) + module-scoping `checker` and `viewer` roles | **Medium** | +3–4 dev days | **Medium** — Issuance & Quotations currently treat `role == end_user` as full Maker |
+| **Tier 3: Granular Sub-Capabilities / Action Toggles** | Per-action restrictions inside a module (e.g., *Create Request* vs. *Reserve Facility*, *Launch RFQ* vs. *Accept Winning Deal*, *Extend LG* vs. *Release/Liquidate LG*) | **High** | +6–10 dev days | **Medium–High** — ~60+ endpoint & UI button guards |
+| **Tier 4: Cross-Product `Entity × Module` Matrix** | Different legal entities per module for the same user (e.g., *Entity A* for Custody, *Entity B* for Issuance) | **Very High** | +5–8 dev days | **High** — rewrites `entity_ids` filtering across all CRUD, JWTs, & AI queries *(intentionally avoided unless an enterprise holding group mandates it)* |
+
+#### Two Existing Codebase Patterns That Provide a Major Head-Start
+1. **End-to-End Per-Session Module Flags Already Exist**:
+   - **Backend Auth**: `TokenData` and `get_current_user` (`app/core/security.py:47-51, 213-220`) and `build_user_token_data` (`app/auth_v2/services.py:238-242`) already compute and propagate five boolean flags into every JWT and `/auth/v2/account/me` response:
+     - `has_custody_module`
+     - `has_issuance_module`
+     - `has_quotation_module`
+     - `has_reconciliation_module`
+     - `can_email_inbox`
+   - **Frontend Session Sync**: `frontend/src/App.js:170-188` and `frontend/src/components/ProtectedLayout.js:261-266` already store, live-sync, and pass these flags down to `EndUserLayout.js:211-270` and `EndUserRoutes.js:43-68`.
+   - **Leverage**: Currently, those flags read strictly from `customer.subscription_plan`. Computing `effective_flag = plan_flag AND user_flag` at those two backend auth chokepoints immediately personalizes session entitlements per user while enforcing the **Subscription Ceiling Rule** automatically.
+2. **Proven Admin UX & CRUD Pattern (`has_all_entity_access` + `entity_ids`)**:
+   - `frontend/src/pages/CorporateAdmin/UserForm.js:291-348`, `CustomerUserManagement.js`, and `app/crud/crud_user.py:49-115` already implement *"Access all entities under this customer"* (default `True`) vs. explicit checkbox selection, complete with validation and WORM audit trail logging. Mirroring this pattern (`has_all_module_access = True` default) ensures **zero breaking changes** for all existing customers and users.
+
+---
+
+### 19.2 Complete Catalog of Reasonable Per-User Options
+
+#### A. Primary Business Modules (Bounded by Customer `SubscriptionPlan`)
+
+| Module Option | Plan Ceiling Field (`models.py:67-74`) | Controlled Workflows & Capabilities | Codebase Status & Alignment Notes |
+| :--- | :--- | :--- | :--- |
+| **1. LG Custody (Inbound)** | `has_custody_module` | Recording third-party LGs, AI scan intake, extensions, releases, decreases, liquidations, amendments, non-operative activation, print/delivery tracking, internal owners. | Currently assumed accessible to every `end_user` if enabled on the plan. Requires adding `require_custody_module` to Custody endpoints (see §19.3). |
+| **2. LG Issuance (Outbound)** | `has_issuance_module` | Outbound LG requests, public requestor portal management, bank facility reservations, issuance execution, post-issuance maintenance, position reconciliation, bank directory. | Sub-routers currently sit behind a shared `require_issuance_or_custody_module` parent mount; operational sub-routers must enforce `require_issuance_module` (see §19.3). |
+| **3. FX & T-Bill Quotations** | `has_quotation_module` | Launching Spot/Forward/Multi-Leg FX & T-Bill RFQs, live dealer board, offline manual proxy quotes, binding deal acceptance/decline, quotation history. | Backend `/api/v1/quotations` (`app/main.py:652`) **already** enforces `Depends(require_quotation_module)`. Frontend `EndUserRoutes.js` just needs conditional route wrapping. |
+| **4. Smart Email Inbox** | `can_email_inbox` | Reviewing, classifying, and actioning inbound bank correspondence into Custody/Issuance workflows. | Backend `/api/v1/end-user/inbox` (`inbox_endpoints.py:140`) **already** enforces `Depends(require_email_inbox_feature)`. Frontend `EndUserLayout.js:225` currently displays the sidebar link whenever `custody \|\| issuance` without checking `can_email_inbox` (must be fixed). |
+| **5. Bank Statement Reconciliation** | `has_reconciliation_module` | Uploading bank statements & ERP ledgers, auto-matching, transaction classification, rule learning, variance resolution, accounting export. | **Role Relocation Confirmed**: Temporarily placed under `Corporate Admin` (`reconciliation_endpoints.py:47`, `CorporateAdminRoutes.js:104-109`) during internal testing, with **zero live customers using it yet**. Daily operational execution (`ImportDashboard`, `ReconciliationWorkspace`, `AccountingExport`) will move to `End User` (with optional Corporate Admin read-only oversight + `/rules/{id}/promote` & `/taxonomy` governance), carrying **zero customer migration risk**. |
+
+#### B. Operational Mode Per Module (`none` vs. `view` vs. `execute`)
+Real corporate treasuries frequently split execution from visibility across desks:
+- **Custody Specialist**: `execute` on **LG Custody**, `view` on **LG Issuance** (can inspect outbound LG status without touching credit facilities).
+- **Issuance Desk Officer**: `execute` on **LG Issuance**, `none` on **LG Custody**, `view` on **Quotations**.
+- **Internal Auditor / Executive**: `view` across selected modules. *(Note: The legacy global `UserRole.VIEWER` in `ViewerLayout.js:18-22` only renders 3 Custody links today and lacks Issuance/Quotation support; per-module `view` mode cleanly modernizes read-only access across all modules.)*
+
+#### C. Granular Sub-Capabilities Within Enabled Modules (Future-Ready via Hybrid JSONB)
+1. **LG Custody Sub-Options** *(partially wired via `HasPermission` in `end_user.py` and `Permission` / `RolePermission` in `models.py:448-473`)*:
+   - **Intake & Recording**: Manual LG creation & AI Document Scan (`lg_record:create`, `lg_record:ai_scan`, bounded by `can_ai_integration`).
+   - **Routine Lifecycle Maintenance**: Extend expiry (`lg_record:extend`), Amend (`lg_record:amend`), Activate, Update delivery/bank reply status (`lg_instruction:update_status`), Manage Internal Owners.
+   - **High-Risk Financial Reductions**: Release LG (`lg_record:release`), Decrease Amount (`lg_record:decrease_amount`), Liquidate LG (`lg_record:liquidate`).
+2. **LG Issuance Sub-Options** *(currently gated by role check `get_current_treasury_context` in `security.py:298-322` rather than `HasPermission`)*:
+   - **Request Intake & Review**: Create internal issuance requests, manage External Requestor public links/submissions, verify drafts (`requests.py`).
+   - **Treasury Bank Execution**: Select bank/facility, reserve credit facility limits, issue to bank, upload bank confirmations (`workflow.py`).
+   - **Post-Issuance & Position Reconciliation**: Maintenance actions (`post_issuance.py`) and bank position reconciliation (`reconciliation.py`).
+   - **Facility Pricing Visibility**: View sensitive bank facility margin/commission rates vs. operational availability only.
+3. **FX & T-Bill Quotations Sub-Options** *(`quotations_endpoints.py`)*:
+   - **RFQ Preparation & Live Monitoring**: Create RFQs and monitor live dealer quotes.
+   - **Binding Deal Execution**: Accept/decline winning bank quotes (`deal_acceptance_service.py`) and record offline manual proxy quotes (`/{rfq_id}/manual-quote`).
+   - **Instrument Scope**: Foreign Exchange (`FX_SPOT`, `FX_FORWARD`) vs. Treasury Bills (`TBILL`).
+4. **Cross-Cutting Platform Capabilities**:
+   - **Reports & CSV Exports** (`reports` — gates `/end-user/reports` and CSV downloads in `reports.py:297-320, 460`).
+   - **AI Treasury Assistant** (`ai_assistant` — gates the floating AI chat widget and `/api/v1/ai-assistant/chat` in `ai_query_assistant.py:54`).
+
+#### D. Role Interaction (`checker`, `viewer`, `corporate_admin`)
+- **`checker` (Approvers)**: `ApprovalMatrix` (`models.py:918`) already includes a `module` column (`CUSTODY` or `ISSUANCE`), alongside Custody `ApprovalRequest` and Quotation counterparty/deal approvals. Module-scoping `checker` users prevents Custody approvers from seeing Issuance queues and vice versa.
+- **`corporate_admin`**: Retains `has_all_module_access = True` up to the Customer's `SubscriptionPlan` ceiling so a tenant can never accidentally lock all its administrators out of a subscribed module.
+- **Entity Access (`has_all_entity_access` + `entity_ids`)**: Kept unified across the user's enabled modules (simple, auditable, and covers 99% of corporate structures without `Entity × Module` combinatorial complexity).
+
+---
+
+### 19.3 Deep-Dive Codebase Audit: All 7 Enforcement Surfaces & Hidden Leak Vectors
+
+Hiding sidebar links in React alone leaves critical API, background-email, AI, and document-download backdoors open—and can crash shared UI screens. Full enforcement spans **7 surfaces**:
+
+1. **Surface 1 — Unprotected & Shared Backend API Routers (`app/main.py`, `end_user.py`, `issuance/*`)**:
+   - **Custody Router Lacks Module Guard**: `/api/v1/end-user` (`app/main.py:602`) has **no** `Depends(require_custody_module)`. Because `HasPermission("lg_record:view")` (`app/core/security.py:151`) resolves permissions purely from `RolePermission` by `role == end_user`, an **Issuance-only** End User (`has_custody_module=False`) could still call `/api/v1/end-user/lg-records` directly unless Custody endpoints enforce `require_custody_module` (while keeping shared profile/dashboard endpoints like `/users/me_dashboard_info` dual-module safe).
+   - **Issuance Router Uses a Shared `OR` Guard**: `/api/v1/issuance` (`app/main.py:609`) mounts with `Depends(require_issuance_or_custody_module)` because shared approval/change-request endpoints reside under it. Thus, a **Custody-only** End User (`has_custody_module=True, has_issuance_module=False`) passes the parent router guard and could hit `/api/v1/issuance/requests` (`Depends(get_current_treasury_context)`) unless operational Issuance sub-routers (`requests.py`, `workflow.py`, `post_issuance.py`, `reconciliation.py`, `banks.py`, `analytics.py`) explicitly enforce `Depends(require_issuance_module)`.
+2. **Surface 2 — Shared Frontend Pages & Login Redirects (`EndUserActionCenter.js`, `EndUserDashboard.js`, `EndUserLayout.js`, `EndUserRoutes.js`, `App.js`)**:
+   - **Action Center `403` Crash Trap**: `EndUserActionCenter.js:139-176` (`fetchAllTasks`) unconditionally calls 4 Custody endpoints (`lg-for-renewal`, `instructions-undelivered`, `instructions-awaiting-reply`, `approved-requests-pending-print`) **without `.catch()`**, while only catching errors on Issuance calls. Once Custody endpoints enforce `require_custody_module`, an Issuance-only user opening Action Center would hit an unhandled `403 Forbidden` crash unless both API calls and UI tabs are gated by `hasCustodyModule` and `hasIssuanceModule`.
+   - **Dashboard Hardcoded Custody Widgets**: `EndUserDashboard.js:136-245` unconditionally renders Custody KPI cards ("Active LGs", "LGs for Renewal", "Record New LG" quick action) AND an "Issuance Actions" tab even when a module is disabled.
+   - **Sidebar & Route Gaps**: `EndUserLayout.js:225` shows `Smart Inbox` whenever `hasCustodyModule || hasIssuanceModule` without checking `canEmailInbox`. `EndUserRoutes.js:70-99` leaves `/quotations/*`, `/inbox`, and `/reports` unwrapped by module flags. `App.js:356-376` (`getDefaultRedirectPath`) only handles `!custody && !issuance && quotation -> /end-user/quotations/active` and must dynamically route single-module users (e.g., Issuance-only, Reconciliation-only, Inbox-only) to their first permitted landing page.
+   - **Global Quotation Deal Poller**: `ProtectedLayout.js:341-355` already gates `/quotations/active-acceptance-alert` behind `hasQuotationModule`, so per-user `TokenData` intersection automatically silences background polling for users without Quotation access.
+3. **Surface 3 — Background Cron Emails & In-App / Web Push Notifications (Silent Data Leak Vector)**:
+   - Scheduled `APScheduler` jobs run outside HTTP `TokenData` context and query `User` rows directly from PostgreSQL:
+     - **In-App & Mobile Push**: `app/services/notifications/audiences.py:126-138` (`resolve_lg_audience`) selects every active `User.role == UserRole.END_USER` matching entity scope—without checking module entitlement.
+     - **Scheduled Cron Digests & Workflow Emails**: `app/core/background_tasks.py` (lines 711, 1413, 1527, 1633, 1721, 1825), `app/crud/crud_lg_record.py` (lines 2803, 3129, 3466, 3654), and `issuance_notifications.py` query `User.role == UserRole.END_USER` for Custody renewal digests, print escalations, undelivered instruction alerts, and Issuance SLA/reconciliation reminders.
+   - **Fix**: Central helper `user_has_module_access(user, module_key)` applied across `audiences.py` and background email recipient queries so Issuance-only users never receive Custody alerts and vice versa.
+4. **Surface 4 — AI Treasury Query Assistant (`ai_query_assistant.py`, `ai_query_service.py`)**:
+   - `app/api/v1/endpoints/ai_query_assistant.py:78-86` passes `customer_id`, `user_id`, `has_all_entity_access`, and `entity_ids` to `ai_query_assistant_service.process_query()`, **omitting module flags**.
+   - Inside `app/services/ai_query_service.py:990-1041`, intents query both Custody (`LGRecord`) and Issuance (`IssuanceRequest` / `IssuedLGRecord`) tables (and hardcode active module labels in profile answers). Passing effective module flags into `process_query()` blocks cross-module data answers.
+5. **Surface 5 — Reports & Treasury Ops Health (`reports.py`)**:
+   - `app/api/v1/endpoints/reports.py:297-320` (`/reports/end-user/my-lg-dashboard`) and line 460 (`/reports/ops-health`) check `role == UserRole.END_USER` without checking `has_custody_module` or `reports` access.
+6. **Surface 6 — Universal Document Streaming Gateway (`document_streaming.py`)**:
+   - `_resolve_context_for_uri()` (`app/api/v1/endpoints/document_streaming.py:92-107`) **already classifies** every GCS URI into `"lg_custody_doc"`, `"lg_issuance_doc"`, `"quotation_doc"`, `"facility_doc"`, and `"kyc_doc"`.
+   - Extending `_verify_corporate_document_access()` (`document_streaming.py:241-277`)—which currently checks only `customer_id`—with a ~10-line check matching the resolved URI context against the user's module entitlements blocks cross-module document unsealing.
+7. **Surface 7 — Admin User Forms, CRUD & Subscription Ceiling Rule**:
+   - Touchpoints: `UserForm.js`, `UserManagementPage.js` (module badges per user row), `CustomerUserManagement.js` (System Owner parity), `app/schemas/all_schemas.py:140-240` (`UserCreate`, `UserUpdate`, `UserCreateCorporateAdmin`, `UserUpdateCorporateAdmin`, `UserOut`), and `app/crud/crud_user.py`.
+   - **Runtime Ceiling Rule**: Admins only see toggles for modules active on Customer A's `SubscriptionPlan`. Computing `effective = plan_entitlement AND user_entitlement` dynamically ensures plan downgrades restrict access immediately without mutating user records (and plan upgrades restore them seamlessly).
+
+---
+
+### 19.4 Backward-Compatible Hybrid Data Model (`users` Table)
+
+To avoid adding 20+ rigid boolean columns over time, add **two fields** to `User` in `app/models/models.py:147` (mirroring `has_all_entity_access`):
+
+```sql
+ALTER TABLE users
+  ADD COLUMN has_all_module_access BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN module_permissions JSONB NULL;
+```
+
+#### Canonical `module_permissions` JSONB Schema (Used When `has_all_module_access = FALSE`)
+```json
+{
+  "custody":        { "access": "execute", "denied_actions": [] },
+  "issuance":       { "access": "none",    "denied_actions": [] },
+  "quotation":      { "access": "view",    "denied_actions": ["accept_deal"] },
+  "reconciliation": { "access": "none",    "denied_actions": [] },
+  "email_inbox":    { "access": "execute", "denied_actions": [] },
+  "reports":        { "access": "view",    "denied_actions": [] },
+  "ai_assistant":   { "access": "execute", "denied_actions": [] }
+}
+```
+
+- **100% Backward Compatibility**: All existing users receive `has_all_module_access = TRUE`, preserving exact current behavior with zero backfill risk.
+- **Zero-Migration Extensibility**: Early moves only need `"access": "none" | "execute"` (simple `On / Off` checkboxes), while later moves can activate `"access": "view"` (`View Only` mode) and `"denied_actions"` (sub-capability toggles) using the **exact same JSONB column** with zero future DDL migrations.
+- **Validation Guardrail (`crud_user.py`)**: When `has_all_module_access == False` for an `end_user`, require at least one subscribed module to have `access != "none"` so an admin cannot create an account with zero accessible screens.
+
+---
+
+### 19.5 Ultra-Safe "Tiny Moves" Micro-Phased Rollout Plan
+
+Each move is tiny (~0.5–1 day), atomic, and independently deployable. Crucially, **Moves 1–3 harden the session plumbing, shared UI screens, and backend routers *before* any user is restricted in Move 5**, guaranteeing zero `403` UI crashes or half-baked states if paused after any step:
+
+| Move | Title & Exact File Touchpoints | Safety & Verification Guarantee | Est. Effort |
+| :--- | :--- | :--- | :---: |
+| **Move 1** | **Invisible DB & Auth Token Foundation**<br>`models.py` (`User`), `all_schemas.py`, `security.py` (`TokenData`, `get_current_user`, central `resolve_effective_user_modules`), `auth_v2/services.py` (`build_user_token_data`, `/account/me`). | Every existing and newly created user defaults to `has_all_module_access = True`, producing **100% identical** JWTs and behavior to production today. Verified via unit tests on `resolve_effective_user_modules(user, plan)`. | ~0.5 day |
+| **Move 2** | **Defensive Shared-Page Hardening (Single-Module Safe UI)**<br>`EndUserActionCenter.js` (conditional Custody/Issuance fetches & tabs), `EndUserDashboard.js` (conditional Custody cards & Issuance tab), `EndUserLayout.js` (check `canEmailInbox`), `EndUserRoutes.js` (wrap Quotations/Inbox/Reports routes), `App.js` (`getDefaultRedirectPath` fallback chain). | Immediately improves UX and eliminates latent bugs for **plan-level** single-module customers; zero change for multi-module users. Guarantees the UI never calls disabled module APIs ahead of Move 3. | ~1 day |
+| **Move 3** | **Backend Router, Report, AI & Document Gateway Guards**<br>`end_user.py` (`require_custody_module` on Custody endpoints; dual-module safe `/users/me_dashboard_info`), `issuance/{requests,workflow,post_issuance,reconciliation,banks,analytics}.py` (`require_issuance_module`), `reports.py`, `ai_query_assistant.py` + `ai_query_service.py`, `document_streaming.py` (`_verify_corporate_document_access` URI context match). | Because Move 2 already stopped the frontend from calling disabled endpoints, tightening backend guards causes **zero UI errors** while sealing direct-API, AI-query, report, and document-unsealing bypasses. | ~1 day |
+| **Move 4** | **Relocate Bank Statement Reconciliation to `End User`**<br>`EndUserRoutes.js` & `EndUserLayout.js` (mount `ImportDashboard`, `ReconciliationWorkspace`, `AccountingExport` under `hasReconciliationModule`), `reconciliation_endpoints.py` (replace `get_current_corporate_admin` on daily operations with `require_reconciliation_module` + treasury user context; retain Corporate Admin oversight / rule promotion & taxonomy governance as chosen). | **Zero live customers use Bank Reconciliation yet**—moving daily operations out of `Corporate Admin` into `End User` before exposing user toggles carries **0% production disruption**. | ~1 day |
+| **Move 5** | **Activate Admin UI (`UserForm` Module Checkboxes — Core Feature Live!)**<br>`UserForm.js`, `UserManagementPage.js` (per-user module pills), `CustomerUserManagement.js` (System Owner parity), `crud_user.py` (validation + WORM audit details). Adds *"Access all subscribed modules"* (default checked) + checkboxes for subscribed modules. | All underlying layers (Moves 1–4) are already live and verified. Existing users remain untouched (`has_all_module_access = True`). **Customer A -> User X (Custody) / User Y (Issuance) goes live safely.** | ~1 day |
+| **Move 6** | **Filter Background Cron Emails & In-App / Push Notifications**<br>`notifications/audiences.py` (`resolve_lg_audience`), `background_tasks.py`, `crud_lg_record.py`, `issuance_notifications.py` using `user_has_module_access(user, module_key)`. | Pure recipient-list filtering in background/push dispatchers; zero impact on interactive UI or API latency. Eliminates cross-module email/push noise. | ~0.5–1 day |
+| **Move 7** *(Optional Later)* | **Per-Module `View Only` vs. `Execute` Mode + Checker Module Scoping**<br>Upgrade `UserForm` toggles from `Off / On` to `No Access / View Only / Full Access`; enforce write-blocks on `view` mode in Issuance/Quotations/Custody; filter `checker` approval queues by allowed modules; modernize `ViewerLayout.js`. | Uses `"access": "view"` in the existing `module_permissions` JSONB column from Move 1—**zero DB migration required**. | ~3 days |
+| **Move 8** *(Optional Later)* | **Granular Sub-Capability / Action Toggles**<br>Expandable per-module capability checkboxes in `UserForm` populating `"denied_actions"` in `module_permissions` JSONB (e.g., *Create RFQ* vs. *Accept Deal*, *Requestor* vs. *Facility Executor*, *Extend* vs. *Release/Liquidate*). | Uses `"denied_actions"` in the existing `module_permissions` JSONB column from Move 1—**zero DB migration required**. | Incremental |
+
+#### Final Pre-Flight Confirmations Before Executing Move 4 & Move 5
+1. **Move 4 (Bank Reconciliation Governance Split)**: Confirm whether `Corporate Admin` retains read-only statement/match visibility + `/rules/{id}/promote` & `/taxonomy` rule governance (matching Custody/Issuance Segregation of Duties), or whether 100% of Reconciliation screens move exclusively to `End User`.
+2. **Move 5 (Initial Toggle Set)**: Confirm whether Move 5 exposes the **5 business modules** (*LG Custody*, *LG Issuance*, *Quotations*, *Bank Reconciliation*, *Smart Inbox*) alone first, or includes **Reports** and **AI Assistant** checkboxes in the same form update.
+
+---
+
+
+## 20. Master Implementation Status: What We Have vs. What Still Needs to Be Done
 
 This matrix serves as the authoritative ground truth comparing active production code against upcoming deliverables:
 
@@ -2641,15 +2796,18 @@ This matrix serves as the authoritative ground truth comparing active production
 | **Multi-Bank Execution** | **Partial Fill & Tiered Allocation Waterfall for T-Bills & Large FX (Phase 15)** | 🚀 **Planned / Queued** | `allocation_waterfall_service.py`, `quotations_endpoints.py`, `GlobalDealAcceptanceModal.js`, `ResultsView.js` | Automated best-execution waterfall solver respecting `max_amount` caps, VWAR computation, manual tranche override, and per-tranche receipts. |
 | **Email Infrastructure** | **Latent Email Bug Fixes & `EmailSendResult` Hardening (Phase 16.4)** | ✅ **Completed & Verified** | `email_service.py`, `customer_onboarding_service.py`, `auth_v2/services.py`, `dealer_alert_reminder_service.py`, `system_owner.py`, `crud_lg_owner.py`, `inbox_outbound_service.py` | Fixed 8 latent bugs (`EmailSendResult(tuple)` truthiness, RFC 5322 `Date`/`Message-ID` headers, `TypeError` unpack crashes, broken imports, missing `await`, and Port 443 Exchange EWS outbound support) with zero changes to routing behavior. |
 | **Email Governance** | **3-Tier Outbound Email Routing & `PlatformEmailPersona` Architecture (Phase 16.1–16.3)** | 🚀 **Planned / Queued** | `email_service.py` + 45 call sites across Quotations, Auth, Onboarding, Subscriptions, Custody, Issuance | Classify all emails into `CUSTOMER_ONLY` (Tier A), `PLATFORM_ONLY` (Tier B), and `CUSTOMER_PREFERRED` (Tier C), and introduce `PlatformEmailPersona` (`SECURITY`, `TRADING_DESK`, `NOTIFICATIONS`, `SUPPORT_BILLING`). Full specs in Section 18. |
+| **Access Governance** | **Granular Per-User Module & Capability Entitlements (Phase 17 — Moves 1–3, 5–8)** | 🚀 **Planned / Queued** | `models.py:User`, `security.py`, `auth_v2/services.py`, `end_user.py`, `issuance/*`, `ai_query_service.py`, `document_streaming.py`, `audiences.py`, `background_tasks.py`, `EndUserActionCenter.js`, `EndUserDashboard.js`, `UserForm.js` | Per-user module & capability scoping bounded by `SubscriptionPlan` ceiling (`effective = plan AND user`) via backward-compatible `has_all_module_access` + `module_permissions` JSONB, delivered in 6 ultra-safe micro-moves (+ optional Moves 7–8). Full analysis & rollout steps in Section 19. |
+| **Role Alignment** | **Bank Statement Reconciliation Relocation to `End User` (Phase 17 — Move 4)** | 🚀 **Planned / Queued** | `reconciliation_endpoints.py`, `EndUserRoutes.js`, `EndUserLayout.js`, `CorporateAdminRoutes.js`, `CorporateAdminLayout.js` | Relocate daily statement/ERP upload, auto-matching, classification, and accounting export from temporary testing placement on `Corporate Admin` to `End User` under `hasReconciliationModule` (zero live customers impacted). Full specs in Section 19.2 & 19.5. |
 
 ---
 
-## 20. Production Database Migration Ledger (Audit & Compliance Log)
+## 21. Production Database Migration Ledger (Audit & Compliance Log)
 
 This ledger tracks all production database schema states, DDL operations, and migration audits across the roadmap implementation:
 
 | Timestamp (UTC) | Phase | Target Table(s) | Column(s) / Constraints | Migration Type | Status & Operational Impact |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Planned (2026-11)** | **Phase 17 — Move 1 (Per-User Module & Capability Entitlements)** | `users` | `has_all_module_access` (`BOOLEAN NOT NULL DEFAULT TRUE`), `module_permissions` (`JSONB NULL`) | **Additive Non-Breaking DDL** | 🚀 **Planned / Queued**<br>100% backward-compatible additive columns (`DEFAULT TRUE` preserves current behavior for every existing user with zero backfill downtime). Supports simple module toggles (Moves 1–6), `View Only vs. Execute` modes (Move 7), and granular `denied_actions` (Move 8) without future schema migrations. |
 | **2026-10-29** | **Phase N7d & N5c (Zero-Trust QR Pairing, Dealer OTP Hardening & LG Custody Smart Mobile Alerts)** | `user_mobile_pair_tokens`, `dealer_mobile_pair_tokens`, `dealer_alert_reminders`, `user_notifications` | New tables `user_mobile_pair_tokens` & `dealer_mobile_pair_tokens`; `dealer_alert_reminders` OTP columns (`otp_code`, `otp_expires_at`, `otp_failed_attempts`); 8 `LG_CUSTODY` catalog events (Zero DDL for Custody events) | **New Tables DDL & Additive Service Layer** | ✅ **Active & Verified**<br>Ephemeral 15m QR pairing with HMAC-SHA256 OTP, 60s resend cooldown, and 3-attempt burn. Locked in Obsidian Titanium inactive alert badge. Added 'Middle Management' LG Custody mobile notification sweep & Maker-Checker hooks using the shared Web Push activation/deactivation channel with strict lock-screen masking (`...8412`, `Hassan A*** C***`, zero amounts). Verified 5/5 in `test_lg_custody_notifications.py` and 9/9 in `test_notifications_quotation_q1.py`. |
 | **2026-10-28** | **Phase N7c (Trading Desk Multi-Device Isolation & 3-Channel Alert Hub)** | `push_subscriptions` | None (No DDL Required) | **Logic & Query Isolation Hardening** | ✅ **Active & Verified**<br>Implemented strict SQL-level separation (`_is_phone_sub_filter`) distinguishing desktop browsers from mobile smartphone subscriptions. Resolved bug where Windows PC alerts masked QR pairing. Fixed unlinking logic so phone unsubscription strictly leaves desktop sessions active. Streamlined trading desk into a 3-channel hub (Audio chimes, Windows PC, Mobile Phone). |
 | **2026-10-27** | **Phase 6.8 (Twelve Data Real-Time FX Feed & T-10s Batch Snapshotting)** | `quotation_rfqs`, `quotation_legs` | None (No DDL Required) | **Live Feed Integration & Pre-Fetch Hook** | ✅ **Active & Verified**<br>Integrated Twelve Data real-time FX spot provider via `.env`. Single-request multi-currency batch query for basket tenders. Automated T-10s countdown & window-close snapshotting into `market_benchmark_snapshot` eliminates decision modal latency (0ms). Verified with `USD/EGP` live rate `56.1018` (+313.1 bps drift vs CBE fixing). |

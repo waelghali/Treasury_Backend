@@ -695,15 +695,16 @@ class CRUDLGRecord(CRUDBase):
         if notes:
             notes_html = f"""
             <h3>Additional Notes</h3>
-            <p>{notes}</p>
+            <p>{__import__("html").escape(str(notes), quote=True)}</p>
             """
         instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
 
         instruction_details["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
 
+        from app.core.document_generator import escape_html_placeholder
         generated_instruction_html = instruction_template.content
         for key, value in instruction_details.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
         try:
@@ -997,14 +998,15 @@ class CRUDLGRecord(CRUDBase):
         if notes:
             notes_html = f"""
             <h3>Additional Notes</h3>
-            <p>{notes}</p>
+            <p>{__import__("html").escape(str(notes), quote=True)}</p>
             """
         instruction_details["notes_section"] = notes_html # NEW: Use this placeholder key
         
         instruction_details["lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
+        from app.core.document_generator import escape_html_placeholder
         generated_instruction_html = instruction_template.content
         for key, value in instruction_details.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
         try:
@@ -1293,13 +1295,13 @@ class CRUDLGRecord(CRUDBase):
             notes_html_parts.append(f"""
             <div style="background-color: #f8fafc; border-left: 3px solid #2563eb; padding: 6px 10px; margin: 8px 0;">
                 <h3 style="margin: 0 0 4px 0; font-size: 9.5pt; color: #1e3a8a;">Mandatory Claim Declaration / Conditions:</h3>
-                <p style="margin: 0; font-style: italic; font-size: 9pt;">{mandatory_stmt}</p>
+                <p style="margin: 0; font-style: italic; font-size: 9pt;">{__import__("html").escape(str(mandatory_stmt), quote=True)}</p>
             </div>
             """)
         if notes and notes.strip() and notes.strip() != mandatory_stmt:
             notes_html_parts.append(f"""
             <h3>Additional Notes</h3>
-            <p>{notes}</p>
+            <p>{__import__("html").escape(str(notes), quote=True)}</p>
             """)
         notes_html = "".join(notes_html_parts)
         instruction_details["notes_section"] = notes_html
@@ -1312,9 +1314,10 @@ class CRUDLGRecord(CRUDBase):
         instruction_details["original_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(original_amount):,.2f}"
         instruction_details["new_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}"
         
+        from app.core.document_generator import escape_html_placeholder
         generated_instruction_html = instruction_template.content
         for key, value in instruction_details.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
         if "notes_section" in generated_instruction_html:
@@ -1547,7 +1550,7 @@ class CRUDLGRecord(CRUDBase):
             if notes:
                 notes_html = f"""
                 <h3>Additional Notes</h3>
-                <p>{notes}</p>
+                <p>{__import__("html").escape(str(notes), quote=True)}</p>
                 """
             instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
             
@@ -1555,9 +1558,10 @@ class CRUDLGRecord(CRUDBase):
             instruction_details["decrease_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(decrease_amount):,.2f}"
             instruction_details["new_lg_amount_formatted"] = f"{lg_record.lg_currency.symbol} {float(new_amount):,.2f}"
 
+            from app.core.document_generator import escape_html_placeholder
             generated_instruction_html = instruction_template.content
             for key, value in instruction_details.items():
-                str_value = str(value) if value is not None else ""
+                str_value = escape_html_placeholder(key, value)
                 generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
             try:
@@ -1817,16 +1821,17 @@ class CRUDLGRecord(CRUDBase):
         if notes:
             notes_html = f"""
             <h3>Additional Notes</h3>
-            <p>{notes}</p>
+            <p>{__import__("html").escape(str(notes), quote=True)}</p>
             """
         instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
 
         instruction_details["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
         instruction_details["payment_amount_formatted"] = f"{payment_currency.iso_code if payment_currency else 'N/A'} {float(payment_details.amount):,.2f}"
 
+        from app.core.document_generator import escape_html_placeholder
         generated_instruction_html = instruction_template.content
         for key, value in instruction_details.items():
-            str_value = str(value) if value is not None else ""
+            str_value = escape_html_placeholder(key, value)
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
         try:

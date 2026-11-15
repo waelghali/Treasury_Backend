@@ -50,8 +50,18 @@ class CRUDFacility(CRUDBase):
 
         if entity_ids:
             from app.models import CustomerEntity  # Ensure this import works
-            # Fetch the actual entity objects from the DB
-            db_entities = db.query(CustomerEntity).filter(CustomerEntity.id.in_(entity_ids)).all()
+            from fastapi import HTTPException
+            # Fetch only active entity objects belonging to this customer
+            db_entities = db.query(CustomerEntity).filter(
+                CustomerEntity.id.in_(entity_ids),
+                CustomerEntity.customer_id == customer_id,
+                CustomerEntity.is_deleted == False,
+            ).all()
+            if len(db_entities) != len(set(entity_ids)):
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more selected entities do not belong to your organization."
+                )
             # Attach them to the facility relationship
             db_obj.entities = db_entities
 
@@ -98,11 +108,23 @@ class CRUDFacility(CRUDBase):
             if hasattr(db_obj, field):
                 setattr(db_obj, field, value)
 
-        # 2. Update Entities (The Fix)
+        # 2. Update Entities (Tenant-Isolated)
         if obj_in.entity_ids is not None:
-            # Assuming your model has a many-to-many relationship called 'entities'
-            from app.models import CustomerEntity # Import your entity model
-            new_entities = db.query(CustomerEntity).filter(CustomerEntity.id.in_(obj_in.entity_ids)).all()
+            from app.models import CustomerEntity
+            from fastapi import HTTPException
+            if obj_in.entity_ids:
+                new_entities = db.query(CustomerEntity).filter(
+                    CustomerEntity.id.in_(obj_in.entity_ids),
+                    CustomerEntity.customer_id == db_obj.customer_id,
+                    CustomerEntity.is_deleted == False,
+                ).all()
+                if len(new_entities) != len(set(obj_in.entity_ids)):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="One or more selected entities do not belong to your organization."
+                    )
+            else:
+                new_entities = []
             db_obj.entities = new_entities
 
         # 2. Reconcile Sub-limits (safe: don't delete sub-limits referenced by exposure entries)

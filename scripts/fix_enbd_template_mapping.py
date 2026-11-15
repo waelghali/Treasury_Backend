@@ -1,8 +1,9 @@
+import os
 from sqlalchemy import create_engine, text
 import json
 
-STAGING_DB_URL = "postgresql://treasury_staging_db_user:yiIxGco2LgNhZ2EWcdP4G9617dJ8hPwK@dpg-da8miv5g1s2s739rmm6g-a.frankfurt-postgres.render.com/treasury_staging_db"
-LOCAL_DB_URL = "postgresql://postgres:Voda%21%4012@localhost:5432/grow"
+STAGING_DB_URL = os.environ["STAGING_DB_URL"]
+LOCAL_DB_URL = os.environ.get("LOCAL_DB_URL") or os.environ["DATABASE_URL"]
 
 for name, url in [("STAGING", STAGING_DB_URL), ("LOCAL", LOCAL_DB_URL)]:
     try:

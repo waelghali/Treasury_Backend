@@ -311,40 +311,33 @@ async def accept_policies(
 
 @router.post("/refresh-token", response_model=Token)
 async def refresh_token(
+    db: Session = Depends(get_db),
     current_user: security.TokenData = Depends(security.get_current_active_user)
 ):
     """
-    Generates a new JWT for an already authenticated user to extend their session.
+    Generates a fresh JWT for an already MFA-verified active user,
+    reloading authoritative subscription status, permissions, and policy flags from DB.
     """
-    # Map the current TokenData back to a dictionary for encoding
-    new_data = {
-        "sub": current_user.email,
-        "user_id": current_user.user_id,
-        "role": current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
-        "permissions": current_user.permissions,
-        "customer_id": current_user.customer_id,
-        "customer_name": getattr(current_user, 'customer_name', None),
-        "subscription_status": current_user.subscription_status.value if current_user.subscription_status else None,
-        "subscription_end_date": getattr(current_user, 'subscription_end_date', None),
-        "has_all_entity_access": current_user.has_all_entity_access,
-        "entity_ids": current_user.entity_ids,
-        "must_change_password": current_user.must_change_password,
-        "must_accept_policies": current_user.must_accept_policies,
-        "last_accepted_legal_version": current_user.last_accepted_legal_version,
-        "has_custody_module": current_user.has_custody_module,
-        "has_issuance_module": current_user.has_issuance_module,
-        "has_quotation_module": current_user.has_quotation_module,
-        "has_reconciliation_module": current_user.has_reconciliation_module,
-        "can_email_inbox": getattr(current_user, 'can_email_inbox', True),
-    }
-    
-    # create_fresh_access_token is the alias for create_access_token
+    from app.models import User
+    from app.constants import UserRole, SubscriptionStatus
+
+    db_user = db.query(User).filter(User.id == current_user.user_id, User.is_deleted == False).first()
+    if not db_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User account is inactive or deleted.")
+
+    new_data = await auth_service.build_user_token_data(db, db_user)
+    if db_user.role != UserRole.SYSTEM_OWNER and new_data.get("subscription_status") == SubscriptionStatus.EXPIRED.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Subscription is expired. Access is denied. Please contact the system owner to renew."
+        )
+
     new_token = create_fresh_access_token(data=new_data)
-    
+
     return Token(
         access_token=new_token,
         token_type="bearer",
-        must_accept_policies=current_user.must_accept_policies
+        must_accept_policies=bool(new_data.get("must_accept_policies", False))
     )
 
 @router.post("/verify-mfa", response_model=Token)
@@ -357,19 +350,21 @@ async def verify_mfa(
     Verifies the 6-digit email code. If valid, trusts the device 
     and returns a full access token.
     """
-    # 1. Decode the session token to ensure it's a valid MFA attempt
-    
+    # 1. Decode the session token and bind strictly to the target email
     try:
         payload = security.jwt.decode(
             verify_data.mfa_session_token, 
             security.SECRET_KEY, 
             algorithms=[security.ALGORITHM]
         )
-        if payload.get("is_mfa_verified") is not True: 
-            # Note: We set this to False in Phase 2 for MFA tokens
-            pass 
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid MFA session.")
+
+    token_email = (payload.get("sub") or "").strip().lower()
+    if not token_email or token_email != verify_data.email.strip().lower():
+        raise HTTPException(status_code=401, detail="MFA session does not match email.")
+    if payload.get("is_mfa_verified") is not False:
+        raise HTTPException(status_code=401, detail="Invalid MFA challenge token.")
 
     # 2. Call the service to validate the code and trust the device
     user_data = await auth_service.verify_mfa_code(
@@ -393,14 +388,23 @@ async def resend_mfa_code(
     db: Session = Depends(get_db)
 ):
     """Generates and sends a new MFA code for an active session."""
-    # SURGICAL FIX: Ensure User is imported
     from app.models import User 
 
-    # 1. Validate the session token
+    # 1. Validate the session token and bind strictly to the target email
     try:
-        security.jwt.decode(verify_data.mfa_session_token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
+        payload = security.jwt.decode(
+            verify_data.mfa_session_token,
+            security.SECRET_KEY,
+            algorithms=[security.ALGORITHM]
+        )
     except Exception:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+
+    token_email = (payload.get("sub") or "").strip().lower()
+    if not token_email or token_email != verify_data.email.strip().lower():
+        raise HTTPException(status_code=401, detail="MFA session does not match email.")
+    if payload.get("is_mfa_verified") is not False:
+        raise HTTPException(status_code=401, detail="Invalid MFA challenge token.")
 
     # 2. Fetch the user 
     user = db.query(User).filter(User.email == verify_data.email).first()

@@ -2392,6 +2392,126 @@ async def analyze_supporting_document_endpoint(
     return result
 
 
+@router.post("/requests/{request_id}/analyze-special-wording")
+async def analyze_request_special_wording_endpoint(
+    request_id: int,
+    document_id: Optional[int] = Form(None),
+    wording_text: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_issuance_read_context),
+):
+    """
+    Idea D (Part 1): Bilingual (Arabic & English) Guarantee Special-Wording Trap Detector.
+    Scans an attached SPECIAL_WORDING / BANK_LG_COPY document, an uploaded file, or pasted draft wording.
+    Strictly advisory — saves a GREEN / AMBER / RED risk scorecard without blocking approval or issuance.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models.models_issuance import IssuanceRequestDocument
+    from app.services.wording_risk_service import (
+        analyze_special_wording_traps,
+        load_and_unseal_stored_document_bytes,
+    )
+
+    request_obj = db.query(IssuanceRequest).filter(
+        IssuanceRequest.id == request_id,
+        IssuanceRequest.customer_id == current_user.customer_id,
+        IssuanceRequest.is_deleted == False,
+    ).first()
+    if not request_obj:
+        raise HTTPException(status_code=404, detail="Issuance request not found")
+
+    file_bytes: Optional[bytes] = None
+    filename = "special_wording.pdf"
+    doc_record = None
+
+    if document_id:
+        doc_record = db.query(IssuanceRequestDocument).filter(
+            IssuanceRequestDocument.id == document_id,
+            IssuanceRequestDocument.request_id == request_id,
+            IssuanceRequestDocument.is_deleted == False,
+        ).first()
+        if not doc_record:
+            raise HTTPException(status_code=404, detail="Document not found")
+        filename = doc_record.file_name or "special_wording.pdf"
+        try:
+            file_bytes = load_and_unseal_stored_document_bytes(
+                db, doc_record.file_path, current_user.customer_id, encryption_context="lg_issuance_doc"
+            )
+        except FileNotFoundError as fnf:
+            raise HTTPException(status_code=404, detail=str(fnf))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read document from storage: {exc}")
+    elif file:
+        filename = file.filename or "special_wording.pdf"
+        file_bytes = await file.read()
+    elif not (wording_text and wording_text.strip()):
+        # Auto-discover latest SPECIAL_WORDING or BANK_LG_COPY attachment if available
+        doc_record = db.query(IssuanceRequestDocument).filter(
+            IssuanceRequestDocument.request_id == request_id,
+            IssuanceRequestDocument.document_type.in_(["SPECIAL_WORDING", "BANK_LG_COPY"]),
+            IssuanceRequestDocument.is_deleted == False,
+        ).order_by(IssuanceRequestDocument.created_at.desc()).first()
+        if doc_record and doc_record.file_path:
+            filename = doc_record.file_name or "special_wording.pdf"
+            try:
+                file_bytes = load_and_unseal_stored_document_bytes(
+                    db, doc_record.file_path, current_user.customer_id, encryption_context="lg_issuance_doc"
+                )
+            except Exception as exc:
+                logger.warning(f"Could not auto-load special wording attachment {doc_record.id}: {exc}")
+
+    effective_text = (wording_text or "").strip() or (request_obj.other_conditions or "").strip()
+    if not effective_text and not file_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Please attach a Special Wording PDF/file or paste the Arabic/English wording text to scan.",
+        )
+
+    request_context = {
+        "currency": getattr(request_obj.currency, "iso_code", None) if request_obj.currency else None,
+        "beneficiary_name": request_obj.beneficiary_name,
+        "beneficiary_country": request_obj.beneficiary_country,
+        "lg_type": getattr(request_obj.lg_type, "name", None) if getattr(request_obj, "lg_type", None) else None,
+        "lg_value": float(request_obj.amount) if request_obj.amount else None,
+        "lg_expiry_date": str(request_obj.requested_expiry_date) if request_obj.requested_expiry_date else None,
+        "lg_purpose": request_obj.lg_purpose,
+        "is_cross_border": bool(request_obj.is_cross_border),
+        "issuance_country": request_obj.issuance_country or "Egypt",
+        "is_auto_reducing": bool(request_obj.is_auto_reducing),
+        "applicable_rules": request_obj.applicable_rules,
+    }
+
+    result = await analyze_special_wording_traps(
+        wording_text=effective_text if (wording_text and wording_text.strip()) or not file_bytes else None,
+        file_bytes=file_bytes,
+        filename=filename,
+        request_context=request_context,
+        db=db,
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+    )
+
+    if result.get("status") == "OK":
+        meta = dict(request_obj.metadata_json or {})
+        meta["special_wording_analysis"] = {
+            **result,
+            "document_id": doc_record.id if doc_record else None,
+        }
+        request_obj.metadata_json = meta
+        flag_modified(request_obj, "metadata_json")
+
+        if doc_record and hasattr(doc_record, "ai_verification_result"):
+            existing_ver = dict(doc_record.ai_verification_result) if isinstance(doc_record.ai_verification_result, dict) else {}
+            existing_ver["wording_trap_analysis"] = result
+            doc_record.ai_verification_result = existing_ver
+            flag_modified(doc_record, "ai_verification_result")
+
+        db.commit()
+
+    return result
+
+
 # ==============================================================================
 # MAINTENANCE ACTIONS LISTING (End-User Dashboard)
 # ==============================================================================

@@ -44,6 +44,7 @@ from app.models.models_quotation import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+document_gateway_router = APIRouter()
 
 @router.post("/upload-documents")
 async def upload_quotation_documents(
@@ -87,7 +88,7 @@ async def upload_quotation_documents(
     return {"documents": list(uploaded_files)}
 
 
-@router.post("/documents/ticket", response_model=DocumentTicketOut)
+@document_gateway_router.post("/documents/ticket", response_model=DocumentTicketOut)
 def create_document_download_ticket(
     req: DocumentTicketRequest,
     request: Request,
@@ -306,7 +307,7 @@ def create_document_download_ticket(
     }
 
 
-@router.get("/documents/download")
+@document_gateway_router.get("/documents/download")
 def download_quotation_document(
     gcs_uri: Optional[str] = Query(None, description="GCS URI of the document to download"),
     ticket: Optional[str] = Query(None, description="15-minute signed ephemeral download ticket"),
@@ -601,6 +602,7 @@ def download_quotation_document(
         }
     )
 
+router.include_router(document_gateway_router)
 
 
 @router.get("/document-url")

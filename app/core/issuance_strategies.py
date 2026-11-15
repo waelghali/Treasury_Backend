@@ -40,10 +40,11 @@ class ManualPdfStrategy(IssuanceStrategy):
              for k, v in request.business_details.items():
                  data[f"{{{{details.{k}}}}}]"] = str(v)
 
-        # 3. Simple Replacement (No Jinja2)
+        # 3. Simple Replacement (No Jinja2) with HTML escaping for untrusted fields
+        import html as _html_mod
         filled_html = template_html
         for key, value in data.items():
-            filled_html = filled_html.replace(key, value)
+            filled_html = filled_html.replace(key, _html_mod.escape(str(value or ""), quote=True))
 
         # 4. Generate PDF Bytes (Async)
         pdf_bytes = await generate_pdf_from_html(filled_html, filename_hint=f"req_{request.id}")

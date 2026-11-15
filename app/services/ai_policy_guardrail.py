@@ -55,7 +55,11 @@ APPROVED_OPERATIONS: Dict[str, Dict[str, Any]] = {
     "get_entity_distribution": {"params": {}},
     "report_feedback": {"params": {"message": str, "feedback_type": str}},
     "get_daily_pulse": {"params": {}},
-    "get_bank_exposure": {"params": {"limit": int}}
+    "get_bank_exposure": {"params": {"limit": int}},
+    "lookup_deal_reference": {"params": {"ref": str}},
+    "get_last_rfq_participants": {"params": {"rfq_ref": str}},
+    "get_top_winning_banks": {"params": {"limit": int}},
+    "get_quotation_summary": {"params": {}},
 }
 
 APPROVED_INTENTS: Set[str] = set(APPROVED_OPERATIONS.keys())

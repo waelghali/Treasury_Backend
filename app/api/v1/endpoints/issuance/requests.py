@@ -335,7 +335,7 @@ def get_suitable_facilities(
     Returns facilities with utilization, cost calculations, and recommendation tags.
     Delegates to the service's Smart Engine v2.
     """
-    return issuance_service.get_suitable_facilities(db, request_id)
+    return issuance_service.get_suitable_facilities(db, request_id, customer_id=current_user.customer_id)
 
 @router.post("/requests/{request_id}/reserve", response_model=IssuanceRequestOut)
 def reserve_facility_for_request(
@@ -345,7 +345,9 @@ def reserve_facility_for_request(
     current_user: TokenData = Depends(get_current_treasury_context)
 ):
     """Reserve facility capacity without issuing the LG. APPROVED_INTERNAL → FACILITY_RESERVED."""
-    return issuance_service.reserve_facility(db, request_id, current_user.user_id, sub_limit_id)
+    return issuance_service.reserve_facility(
+        db, request_id, current_user.user_id, sub_limit_id, customer_id=current_user.customer_id
+    )
 
 @router.post("/requests/{request_id}/release-reservation", response_model=IssuanceRequestOut)
 def release_facility_reservation(
@@ -354,7 +356,9 @@ def release_facility_reservation(
     current_user: TokenData = Depends(get_current_treasury_context)
 ):
     """Release a facility reservation, freeing capacity. FACILITY_RESERVED → APPROVED_INTERNAL."""
-    return issuance_service.release_reservation(db, request_id, current_user.user_id)
+    return issuance_service.release_reservation(
+        db, request_id, current_user.user_id, customer_id=current_user.customer_id
+    )
 
 # C5: Pre-execution checks (FX drift warning)
 @router.get("/requests/{request_id}/pre-execution-check")
@@ -368,7 +372,7 @@ def pre_execution_check(
     Returns warnings about FX rate drift since reservation.
     Frontend should call this before showing the execute dialog.
     """
-    return issuance_service.pre_execution_check(db, request_id)
+    return issuance_service.pre_execution_check(db, request_id, customer_id=current_user.customer_id)
 
 @router.post("/requests/{request_id}/issue", response_model=IssuedLGRecordDetailOut)
 async def issue_lg(
@@ -393,7 +397,8 @@ async def issue_lg(
         issuance_method=body.issuance_method,
         bank_method_id=body.bank_method_id,
         bank_id=body.bank_id,
-        manual_pricing=body.manual_pricing
+        manual_pricing=body.manual_pricing,
+        customer_id=current_user.customer_id,
     )
     return new_lg
 
@@ -413,7 +418,8 @@ def cancel_issuance_request(
         db=db,
         request_id=request_id,
         user_id=current_user.user_id,
-        reason=body.reason
+        reason=body.reason,
+        customer_id=current_user.customer_id,
     )
 
 # ==============================================================================
@@ -426,15 +432,17 @@ async def print_issuance_application_form(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_issuance_read_context)
 ):
+    import html as _html
     request = crud_issuance_request.get(db, id=request_id)
-    if not request: raise HTTPException(404, "Request not found")
+    if not request or (current_user.customer_id is not None and request.customer_id != current_user.customer_id):
+        raise HTTPException(404, "Request not found")
 
     html_content = f"""
     <html><body>
         <h1>LG Issuance Application</h1>
         <p><strong>Ref:</strong> {request.id}</p>
-        <p><strong>Beneficiary:</strong> {request.beneficiary_name}</p>
-        <p><strong>Amount:</strong> {request.amount}</p>
+        <p><strong>Beneficiary:</strong> {_html.escape(str(request.beneficiary_name or ''))}</p>
+        <p><strong>Amount:</strong> {_html.escape(str(request.amount or ''))}</p>
     </body></html>
     """
     pdf_bytes = await generate_pdf_from_html(html_content, f"application_{request.id}")
@@ -705,7 +713,7 @@ def get_facility_recommendations(
     """
     Returns a list of facilities that CAN issue this LG, sorted by SLA.
     """
-    return issuance_service.get_suitable_facilities(db, request_id)
+    return issuance_service.get_suitable_facilities(db, request_id, customer_id=current_user.customer_id)
 
 
 # ==============================================================================
@@ -1023,7 +1031,11 @@ def list_request_documents(
     current_user: TokenData = Depends(get_issuance_read_context)
 ):
     """List all documents attached to an issuance request."""
-    from app.models.models_issuance import IssuanceRequestDocument
+    from app.models.models_issuance import IssuanceRequest, IssuanceRequestDocument
+
+    req = db.query(IssuanceRequest).filter(IssuanceRequest.id == request_id).first()
+    if not req or (current_user.customer_id is not None and req.customer_id != current_user.customer_id):
+        raise HTTPException(status_code=404, detail="Request not found")
     
     docs = db.query(IssuanceRequestDocument).filter(
         IssuanceRequestDocument.request_id == request_id,

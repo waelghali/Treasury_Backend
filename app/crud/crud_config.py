@@ -227,6 +227,39 @@ class CRUDCustomerConfiguration(CRUDBase):
             .first()
         )
 
+    _NORMAL_SIBLING_WEIGHT_KEYS = (
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_COST.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_MARGIN.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_SLA.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_CAPACITY.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_CURRENCY_MATCH.value,
+    )
+    _URGENT_SIBLING_WEIGHT_KEYS = (
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_COST.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_MARGIN.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_SLA.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_CAPACITY.value,
+        GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_CURRENCY_MATCH.value,
+    )
+
+    def _customer_has_legacy_weight_override(self, db: Session, customer_id: int, sibling_keys: tuple) -> bool:
+        """True if customer customized any of the original 5 facility weights (preserving their 100% sum)."""
+        try:
+            cnt = (
+                db.query(self.model)
+                .join(GlobalConfiguration, GlobalConfiguration.id == self.model.global_config_id)
+                .filter(
+                    self.model.customer_id == customer_id,
+                    self.model.is_deleted.isnot(True),
+                    self.model.configured_value.isnot(None),
+                    cast(GlobalConfiguration.key, String).in_(sibling_keys),
+                )
+                .count()
+            )
+            return cnt > 0
+        except Exception:
+            return False
+
     def get_customer_config_or_global_fallback(
         self, db: Session, customer_id: int, config_key: GlobalConfigKey
     ) -> Optional[Dict[str, Any]]:
@@ -247,6 +280,12 @@ class CRUDCustomerConfiguration(CRUDBase):
             effective_value = customer_config.configured_value
             source = "customer"
             configured_value_for_output = customer_config.configured_value
+        else:
+            key_str = global_config.key.value if hasattr(global_config.key, "value") else str(global_config.key)
+            if key_str == GlobalConfigKey.FACILITY_SCORE_WEIGHT_RARITY.value and self._customer_has_legacy_weight_override(db, customer_id, self._NORMAL_SIBLING_WEIGHT_KEYS):
+                effective_value = "0"
+            elif key_str == GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_RARITY.value and self._customer_has_legacy_weight_override(db, customer_id, self._URGENT_SIBLING_WEIGHT_KEYS):
+                effective_value = "0"
 
         # MODIFIED RETURN: Include all required fields for CustomerConfigurationOut
         return {
@@ -277,14 +316,30 @@ class CRUDCustomerConfiguration(CRUDBase):
             .all()
         }
 
+        gc_key_by_id = {
+            gc.id: (gc.key.value if hasattr(gc.key, "value") else str(gc.key))
+            for gc in all_global_configs
+        }
+        overridden_keys = {
+            gc_key_by_id[gid]
+            for gid, cc in customer_configs_map.items()
+            if gid in gc_key_by_id and cc.configured_value is not None
+        }
+        has_custom_normal_weights = any(k in overridden_keys for k in self._NORMAL_SIBLING_WEIGHT_KEYS)
+        has_custom_urgent_weights = any(k in overridden_keys for k in self._URGENT_SIBLING_WEIGHT_KEYS)
+
         result = []
         for gc in all_global_configs:
             customer_config = customer_configs_map.get(gc.id)
-            effective_value = (
-                customer_config.configured_value
-                if customer_config and customer_config.configured_value is not None
-                else gc.value_default
-            )
+            gc_key_str = gc_key_by_id.get(gc.id, "")
+            if customer_config and customer_config.configured_value is not None:
+                effective_value = customer_config.configured_value
+            elif gc_key_str == GlobalConfigKey.FACILITY_SCORE_WEIGHT_RARITY.value and has_custom_normal_weights:
+                effective_value = "0"
+            elif gc_key_str == GlobalConfigKey.FACILITY_SCORE_WEIGHT_URGENT_RARITY.value and has_custom_urgent_weights:
+                effective_value = "0"
+            else:
+                effective_value = gc.value_default
 
             result.append(
                 CustomerConfigurationOut(
