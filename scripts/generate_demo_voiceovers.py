@@ -69,7 +69,7 @@ TOUR_STEP_NARRATIONS = {
     'custody_scan': {
         1: {
             "en": 'Step One: Start from a Single Clean Dropzone with No Manual Typing. When a supplier or contractor delivers a new Letter of Guarantee, your team opens Record New LG. Instead of typing over fifteen fields by hand, they simply upload the PDF or scanned image. Click Upload and Scan on the screen to continue.',
-            "ar": 'الخُطْوَةُ الأُولَى: ابْدَأْ مِنْ نَافِذَةِ رَفْعٍ ذَكِيَّةٍ وَاحِدَة، بِدُونِ إِدْخَالٍ يَدَوِيٍّ مُرْهِقْ. عِنْدَ اسْتِلَامِ خِطَابِ ضَمَانٍ جَدِيدٍ مِنْ مُقَاوِلٍ أَوْ مُوَرِّدْ، يَفْتَحُ فَرِيقُ الخِزَانَةِ شَاشَةَ التَّسْجِيلِ لِضَمَانٍ جَدِيدْ. وَبَدَلاً مِنْ كِتَابَةِ عَشَرَاتِ الحُقُولِ يَدَوِيّاً، يَرْفَعُ مَلَفَّ بي دي إفْ أَوِ الصُّورَةَ مُبَاشَرَةً. اضْغَطْ عَلَى زِرِّ الرَّفْعِ وَالمَسْحِ عَلَى الشَّاشَةِ لِلْمُتَابَعَة.',
+            "ar": 'الخُطْوَةُ الأُولَى: ابْدَأْ مِنْ نَافِذَةِ رَفْعٍ ذَكِيَّةٍ وَاحِدَة، بِدُونِ إِدْخَالٍ يَدَوِيٍّ مُرْهِقْ. عِنْدَ اسْتِلَامِ خِطَابِ ضَمَانٍ جَدِيدٍ مِنْ مُقَاوِلٍ أَوْ مُوَرِّدْ، يَفْتَحُ فَرِيقُ الخِزَانَةِ صَفْحَةَ تَسْجِيلِ ضَمَانٍ جَدِيدْ. وَبَدَلاً مِنْ كِتَابَةِ عَشَرَاتِ الحُقُولِ يَدَوِيّاً، يَرْفَعُ مَلَفَّ بي دي إفْ أَوِ الصُّورَةَ مُبَاشَرَةً. اضْغَطْ عَلَى زِرِّ الرَّفْعِ وَالمَسْحِ عَلَى الشَّاشَةِ لِلْمُتَابَعَة.',
         },
         2: {
             "en": "Step Two: Attach the Bank Instrument and Launch AI OCR. Here, we attached a four point five million Egyptian Pound Performance Guarantee issued by First National Corporate Bank on behalf of NorthStar Electromechanical. One click on Scan Now sends it through Grow's privacy-shielded AI parser. Click Scan Now to extract the data.",
