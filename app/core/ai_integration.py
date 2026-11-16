@@ -95,7 +95,7 @@ else:
     genai_types = None
 
 # Model name constant - configurable via GEMINI_MODEL_NAME environment variable
-DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
+DEFAULT_PRIMARY_MODEL = "gemini-3.8-flash"
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 
 # Global API Studio client fallback
@@ -118,18 +118,16 @@ def _get_api_genai_client():
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
     Production Model Cascade across active Vertex AI & Gemini model tiers:
-    1. gemini-2.5-flash: Primary high-speed multimodal model
-    2. gemini-2.5-flash-lite: Independent high-throughput quota pool
-    3. gemini-2.0-flash: Proven fast fallback with separate quota pool
-    4. gemini-2.5-pro: Heavyweight reasoning fallback
+    1. gemini-3.8-flash: Primary high-capability multimodal & reasoning model
+    2. gemini-3.5-flash: Fast multimodal secondary fallback
+    3. gemini-4-argon: Frontier deep-reasoning fallback
     """
     primary = requested_model or GEMINI_MODEL_NAME or DEFAULT_PRIMARY_MODEL
     candidates = [
         primary,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
-        "gemini-2.5-pro",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-4-argon",
     ]
     seen = set()
     result = []
@@ -160,7 +158,7 @@ def _is_rate_limit_or_transient_error(exc: Exception) -> bool:
 _vertex_location_clients: Dict[str, Any] = {}
 
 def _get_vertex_genai_client_for_location(location: str):
-    """Returns a cached Vertex AI GenAI client for a specific region/location (e.g. 'us-central1', 'global', 'europe-west1')."""
+    """Returns a cached Vertex AI GenAI client for a specific region/location (e.g. 'global', 'us-central1', 'europe-west1')."""
     if not GEMINI_AVAILABLE or not VERTEX_AI_PROJECT_ID:
         return None
     if location in _vertex_location_clients:
@@ -179,55 +177,65 @@ def _get_vertex_genai_client_for_location(location: str):
         logger.warning(f"Could not initialize Vertex AI client for location '{location}': {e}")
         return None
 
-def _get_candidate_clients(primary_client) -> List[Tuple[str, Any]]:
+def _iter_candidate_clients(primary_client, cascade: Optional[List[str]] = None):
     """
-    Builds an ordered list of (client_label, client) across:
-    1. Primary client (e.g. Vertex AI us-central1)
-    2. Vertex AI 'global' endpoint (dynamic global routing pool to avoid regional 429s)
-    3. Vertex AI 'europe-west1' & 'us-east4' regional pools
-    4. Google AI Studio API client (if GEMINI_API_KEY / GOOGLE_API_KEY is configured)
+    Lazily yields (client_label, client) one-by-one so backup clients (and their httpx/SSL pools)
+    are ONLY instantiated if the primary endpoint actually fails:
+    1. Vertex AI 'global' endpoint first whenever Gemini 3.x/4.x models are in the cascade
+    2. Primary configured client (if distinct from 'global')
+    3. Google AI Studio API client (supports Gemini 3.8 / 3.5 / 4-argon as independent quota fallback)
+    4. Regional Vertex AI endpoints ('us-central1', 'europe-west1', 'us-east4')
     """
-    candidates: List[Tuple[str, Any]] = []
     seen_ids = set()
+    needs_global_first = bool(
+        cascade and any(m.startswith(("gemini-3", "gemini-4")) for m in cascade)
+    )
 
-    if primary_client is not None:
-        candidates.append((f"vertex:{VERTEX_AI_LOCATION}", primary_client))
+    if needs_global_first and VERTEX_AI_LOCATION != "global":
+        global_client = _get_vertex_genai_client_for_location("global")
+        if global_client is not None and id(global_client) not in seen_ids:
+            seen_ids.add(id(global_client))
+            yield ("vertex:global", global_client)
+
+    if primary_client is not None and id(primary_client) not in seen_ids:
         seen_ids.add(id(primary_client))
+        yield (f"vertex:{VERTEX_AI_LOCATION}", primary_client)
 
-    for loc in ("global", "europe-west1", "us-east4"):
+    if VERTEX_AI_LOCATION != "global" and not needs_global_first:
+        global_client = _get_vertex_genai_client_for_location("global")
+        if global_client is not None and id(global_client) not in seen_ids:
+            seen_ids.add(id(global_client))
+            yield ("vertex:global", global_client)
+
+    api_client = _get_api_genai_client()
+    if api_client is not None and id(api_client) not in seen_ids:
+        seen_ids.add(id(api_client))
+        yield ("ai_studio", api_client)
+
+    for loc in ("us-central1", "europe-west1", "us-east4"):
         if loc == VERTEX_AI_LOCATION and primary_client is not None:
             continue
         loc_client = _get_vertex_genai_client_for_location(loc)
         if loc_client is not None and id(loc_client) not in seen_ids:
-            candidates.append((f"vertex:{loc}", loc_client))
             seen_ids.add(id(loc_client))
-
-    api_client = _get_api_genai_client()
-    if api_client is not None and id(api_client) not in seen_ids:
-        candidates.append(("ai_studio", api_client))
-        seen_ids.add(id(api_client))
-
-    return candidates
+            yield (f"vertex:{loc}", loc_client)
 
 async def _safe_generate_content_async(client, model: str, contents, config=None):
     """
     Safely executes an async generate_content call with:
-    - Multi-region Vertex AI failover (primary -> global -> europe-west1 -> us-east4)
-    - Multi-model cascade (gemini-2.5-flash -> gemini-2.5-flash-lite -> gemini-2.0-flash -> gemini-2.5-pro)
-    - Google AI Studio fallback client
+    - Lazy multi-endpoint failover (vertex:global -> ai_studio -> regional Vertex endpoints)
+    - Multi-model cascade (gemini-3.8-flash -> gemini-3.5-flash -> gemini-4-argon)
     - Automatic exponential backoff + jitter on 429 RESOURCE_EXHAUSTED / 503 transient errors
     """
     import random
     cascade = _get_model_cascade(model)
-    candidate_clients = _get_candidate_clients(client)
     last_err = None
     max_rounds = 3
 
     for round_idx in range(max_rounds):
         hit_rate_limit_in_round = False
-        for client_label, active_client in candidate_clients:
+        for client_label, active_client in _iter_candidate_clients(client, cascade):
             for attempt_model in cascade:
-                # Google AI Studio does not support Vertex-only global routing quirks, but supports standard Gemini models
                 try:
                     return await active_client.aio.models.generate_content(
                         model=attempt_model,
@@ -244,7 +252,6 @@ async def _safe_generate_content_async(client, model: str, contents, config=None
                             f"[AI Retry] 429/Transient error on {client_label}/{attempt_model} "
                             f"(round {round_idx + 1}/{max_rounds}): {e}. Failing over..."
                         )
-                        # Brief pause before hitting next model/region
                         await asyncio.sleep(0.4 + random.uniform(0.1, 0.4))
                         continue
                     raise e
@@ -265,21 +272,19 @@ async def _safe_generate_content_async(client, model: str, contents, config=None
 def _safe_generate_content_sync(client, model: str, contents, config=None):
     """
     Safely executes a sync generate_content call with:
-    - Multi-region Vertex AI failover (primary -> global -> europe-west1 -> us-east4)
-    - Multi-model cascade
-    - Google AI Studio fallback client
+    - Lazy multi-endpoint failover (vertex:global -> ai_studio -> regional Vertex endpoints)
+    - Multi-model cascade (gemini-3.8-flash -> gemini-3.5-flash -> gemini-4-argon)
     - Automatic exponential backoff + jitter on 429 RESOURCE_EXHAUSTED / 503 transient errors
     """
     import time
     import random
     cascade = _get_model_cascade(model)
-    candidate_clients = _get_candidate_clients(client)
     last_err = None
     max_rounds = 3
 
     for round_idx in range(max_rounds):
         hit_rate_limit_in_round = False
-        for client_label, active_client in candidate_clients:
+        for client_label, active_client in _iter_candidate_clients(client, cascade):
             for attempt_model in cascade:
                 try:
                     return active_client.models.generate_content(
@@ -427,9 +432,9 @@ def get_service_account_email() -> str:
             pass
     return "service-account@grow-platform.iam.gserviceaccount.com"
 
-# Vertex AI project & location (reuses DOCUMENT_AI_PROJECT_ID as fallback)
+# Vertex AI project & location (defaults to 'global' where Gemini 3.x/4.x models are hosted)
 VERTEX_AI_PROJECT_ID = os.environ.get('GCP_PROJECT_ID') or os.environ.get('DOCUMENT_AI_PROJECT_ID', '')
-VERTEX_AI_LOCATION = os.environ.get('VERTEX_AI_LOCATION', 'us-central1')
+VERTEX_AI_LOCATION = os.environ.get('VERTEX_AI_LOCATION', 'global')
 
 @lru_cache(maxsize=1)
 def _get_genai_client():
@@ -765,11 +770,22 @@ async def perform_ocr_with_google_vision(file_uri: str, unique_file_id: str) -> 
         logger.error(f"An unexpected error occurred during Google Vision OCR for {file_uri}: {e}", exc_info=True)
         return None
 
+import threading as _threading
+
+# Shared lock across heavy native subprocesses (AI/OCR/PyMuPDF and WeasyPrint PDF rendering)
+# so concurrent heavy forks never stack simultaneously above a 512MB container RAM ceiling.
+HEAVY_SUBPROCESS_LOCK = _threading.Lock()
+_IN_FORKED_CHILD = False
+
 def _reclaim_system_memory():
-    """Runs Python generational garbage collection and glibc malloc_trim on Linux."""
+    """Runs Python generational garbage collection and glibc malloc_trim on Linux.
+    Inside a short-lived forked child (_IN_FORKED_CHILD=True), skips gc.collect() to avoid
+    mutating inherited PyGC_Head reference counters and breaking Copy-on-Write page sharing.
+    """
     try:
-        import gc
-        gc.collect()
+        if not _IN_FORKED_CHILD:
+            import gc
+            gc.collect()
         try:
             import ctypes
             libc = ctypes.CDLL("libc.so.6")
@@ -850,10 +866,17 @@ async def _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes: bytes, bucket_name
 
 # --- Text Sanitization Utility ---
 def _sanitize_text_for_json(text: str) -> str:
-    text = text.encode('unicode_escape').decode('utf-8')
-    text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
-    text = text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
-    return text
+    """
+    Cleans OCR text for safe inclusion in Gemini prompts while preserving native UTF-8
+    characters (including Arabic) and natural line/paragraph layout.
+    Strips null bytes, non-printable C0/C1 control characters, and lone surrogates.
+    """
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", "", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.encode("utf-8", errors="replace").decode("utf-8")
 
 async def _log_ai_usage_to_db(db: Session, current_user: "User", file_name: str, metadata: dict):
     """Logs token and OCR usage to the database."""
@@ -1198,71 +1221,89 @@ Document Text:
         logger.error(f"Error during Gemini AI extraction: {e}. Raw response length: {len(extracted_data_str or '') if 'extracted_data_str' in locals() else 'N/A'}", exc_info=True)
         raise
 
-def _execute_in_forked_worker_sync(coro_fn, args):
+def _execute_in_forked_worker_sync(coro_fn, args, default_return=(None, None)):
     """
     Runs an async AI/PDF/OCR coroutine in a disposable forked child process on Linux.
-    When the child exits via os._exit(0), the Linux kernel immediately reclaims 100%
-    of the ~90MB of PyMuPDF (fitz), Google Vision, Google GenAI, and GCS client memory,
-    keeping the main Uvicorn worker process completely free of heavy SDK bloat.
+    - Serialized via HEAVY_SUBPROCESS_LOCK so concurrent AI scans and WeasyPrint PDF
+      renders never stack in RAM simultaneously on a 512MB container.
+    - Disables cyclic GC inside the short-lived child so inherited parent heap pages
+      remain read-only and shared via Linux Copy-on-Write (saving ~80-120MB per fork).
+    - Detaches inherited SQLAlchemy pooled sockets via engine.dispose(close=False).
+    - When the child exits via os._exit(0), the Linux kernel immediately reclaims 100%
+      of PyMuPDF (fitz), Google Vision, Google GenAI, and GCS client memory.
     """
+    import gc
     import pickle
-    r_fd, w_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.close(r_fd)
-        except Exception:
-            pass
-        try:
-            global _gcs_client, _vision_client, _docai_client, _genai_client_global, _genai_api_client_global
-            _gcs_client = None
-            _vision_client = None
-            _docai_client = None
-            _genai_client_global = None
-            _genai_api_client_global = None
-            _vertex_location_clients.clear()
-            for cached_fn in (_get_gcs_client, _get_vision_client, _get_genai_client):
-                if hasattr(cached_fn, "cache_clear"):
-                    cached_fn.cache_clear()
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+
+    with HEAVY_SUBPROCESS_LOCK:
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
             try:
-                res = loop.run_until_complete(coro_fn(*args))
-            finally:
-                loop.close()
-            data_bytes = pickle.dumps(("ok", res))
-        except Exception as e:
-            logger.error(f"Isolated AI worker error: {e}", exc_info=True)
-            data_bytes = pickle.dumps(("err", str(e)))
-        try:
-            with os.fdopen(w_fd, "wb") as wf:
-                wf.write(data_bytes)
-                wf.flush()
-        except Exception:
-            pass
-        os._exit(0)
-    else:
-        os.close(w_fd)
-        try:
-            with os.fdopen(r_fd, "rb") as rf:
-                raw = rf.read()
-        finally:
-            try:
-                os.waitpid(pid, 0)
+                gc.disable()
             except Exception:
                 pass
-        if not raw:
-            return None, None
-        status_flag, payload = pickle.loads(raw)
-        if status_flag == "err":
-            return None, None
-        return payload
+            os.environ["DISABLE_ISOLATED_AI_FORK"] = "1"
+            try:
+                os.close(r_fd)
+            except Exception:
+                pass
+            try:
+                global _IN_FORKED_CHILD, _gcs_client, _vision_client, _docai_client, _genai_client_global, _genai_api_client_global
+                _IN_FORKED_CHILD = True
+                _gcs_client = None
+                _vision_client = None
+                _docai_client = None
+                _genai_client_global = None
+                _genai_api_client_global = None
+                _vertex_location_clients.clear()
+                for cached_fn in (_get_gcs_client, _get_vision_client, _get_genai_client, _get_docai_client):
+                    if hasattr(cached_fn, "cache_clear"):
+                        cached_fn.cache_clear()
+                try:
+                    from app.database import engine as _db_engine
+                    _db_engine.dispose(close=False)
+                except Exception:
+                    pass
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    res = loop.run_until_complete(coro_fn(*args))
+                finally:
+                    loop.close()
+                data_bytes = pickle.dumps(("ok", res))
+            except Exception as e:
+                logger.error(f"Isolated AI worker error: {e}", exc_info=True)
+                data_bytes = pickle.dumps(("err", str(e)))
+            try:
+                with os.fdopen(w_fd, "wb") as wf:
+                    wf.write(data_bytes)
+                    wf.flush()
+            except Exception:
+                pass
+            os._exit(0)
+        else:
+            os.close(w_fd)
+            try:
+                with os.fdopen(r_fd, "rb") as rf:
+                    raw = rf.read()
+            finally:
+                try:
+                    os.waitpid(pid, 0)
+                except Exception:
+                    pass
+            if not raw:
+                return default_return
+            status_flag, payload = pickle.loads(raw)
+            if status_flag == "err":
+                return default_return
+            return payload
 
 
-async def _run_coro_in_isolated_fork(coro_fn, *args):
+async def _run_coro_in_isolated_fork(coro_fn, *args, default_return=(None, None)):
     if hasattr(os, "fork") and os.getenv("DISABLE_ISOLATED_AI_FORK", "0") != "1":
         try:
-            return await asyncio.to_thread(_execute_in_forked_worker_sync, coro_fn, args)
+            return await asyncio.to_thread(_execute_in_forked_worker_sync, coro_fn, args, default_return)
         except OSError as fork_err:
             logger.warning(f"os.fork() unavailable ({fork_err}); falling back to in-process AI execution.")
     return await coro_fn(*args)
@@ -1422,7 +1463,7 @@ async def _process_amendment_with_ai_core(
                 raise Exception("Failed to convert PDF to images for OCR.")
             temp_files.extend([uri.replace(f"gs://{target_bucket_name}/", "") for uri in image_uris])
             all_page_texts = [await perform_ocr_with_google_vision(uri, unique_file_id) for uri in image_uris]
-            raw_text = "\\n".join(filter(None, all_page_texts))
+            raw_text = "\n".join(filter(None, all_page_texts))
             total_usage_metadata["total_pages_processed"] = len(image_uris)
         else:
             raise ValueError(f"Unsupported MIME type: {mime_type}")
@@ -1783,44 +1824,19 @@ async def process_batch_migration_documents_with_ai(
 
 AI_DOC_MAX_SIZE_BYTES = 2 * 1024 * 1024  # 2 MB — configurable here
 
-async def analyze_supporting_document(
+async def _analyze_supporting_document_core(
     pdf_bytes: bytes,
     doc_type: str,
     file_name: str,
     request_data: Optional[Dict[str, Any]] = None,
-    db: Optional[Session] = None,
-    customer_id: Optional[int] = None,
-    user_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    AI-driven document verification: sends BOTH the document text AND the
-    user-entered issuance request data to Gemini and asks it to compare them.
-
-    Args:
-        pdf_bytes: The document file bytes
-        doc_type: One of CONTRACT, PURCHASE_ORDER, FORMAL_REQUEST
-        file_name: Original filename for logging
-        request_data: Dict with the 9 fields to verify against:
-            - contract_value, currency, beneficiary_name, beneficiary_address,
-              lg_type, lg_value, lg_currency, lg_expiry_date, lg_purpose
-        db, customer_id, user_id: For usage logging
-
-    Returns:
-        {
-            "status": "OK" | "ERROR" | "NO_TEXT",
-            "comparison": [...],       # Per-field verdicts
-            "mismatches": int,
-            "total_fields_compared": int,
-            "summary": str | None,
-        }
-    """
+) -> Tuple[Dict[str, Any], Optional[Dict[str, int]]]:
     client = _get_genai_client()
     if not client:
-        return {"status": "ERROR", "message": "AI model not available. Submission will proceed without verification."}
+        return {"status": "ERROR", "message": "AI model not available. Submission will proceed without verification."}, None
 
     target_bucket_name = GCS_BUCKET_NAME
     if not target_bucket_name or not GOOGLE_CLOUD_LIBRARIES_AVAILABLE:
-        return {"status": "ERROR", "message": "Cloud storage not configured. Submission will proceed without verification."}
+        return {"status": "ERROR", "message": "Cloud storage not configured. Submission will proceed without verification."}, None
 
     if not request_data:
         request_data = {}
@@ -1836,7 +1852,7 @@ async def analyze_supporting_document(
         if mime_type == "application/pdf":
             image_uris = await _convert_pdf_to_images_and_upload_to_gcs(pdf_bytes, target_bucket_name, unique_file_id)
             if not image_uris:
-                return {"status": "ERROR", "message": "Failed to process document for AI analysis."}
+                return {"status": "ERROR", "message": "Failed to process document for AI analysis."}, None
             temp_files.extend([uri.replace(f"gs://{target_bucket_name}/", "") for uri in image_uris])
             all_page_texts = []
             for uri in image_uris:
@@ -1852,7 +1868,7 @@ async def analyze_supporting_document(
                 raw_text = await perform_ocr_with_google_vision(gcs_uri, unique_file_id)
 
         if not raw_text or len(raw_text.strip()) < 20:
-            return {"status": "NO_TEXT", "message": "Could not extract text from document. Submission will proceed without verification."}
+            return {"status": "NO_TEXT", "message": "Could not extract text from document. Submission will proceed without verification."}, None
 
         # --- Build the AI-driven comparison prompt ---
         sanitized_text = _sanitize_text_for_json(raw_text[:80000])
@@ -2004,15 +2020,12 @@ Return a JSON object with exactly these fields:
 
         mismatches = len([c for c in comparison if c.get("verdict") == "MISMATCH"])
 
-        # Log usage
-        if response.usage_metadata and db and customer_id:
-            log_ai_usage_sync(
-                db, customer_id, user_id,
-                f"[doc_verify] {file_name}",
-                prompt_tokens=response.usage_metadata.prompt_token_count,
-                completion_tokens=response.usage_metadata.candidates_token_count,
-                call_type="document_verification"
-            )
+        usage_meta = None
+        if response.usage_metadata:
+            usage_meta = {
+                "prompt_tokens": response.usage_metadata.prompt_token_count,
+                "completion_tokens": response.usage_metadata.candidates_token_count,
+            }
 
         return {
             "status": "OK",
@@ -2023,17 +2036,53 @@ Return a JSON object with exactly these fields:
             "comparison": comparison,
             "mismatches": mismatches,
             "total_fields_compared": len(comparison),
-        }
+        }, usage_meta
 
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse error in AI document verification: {e}")
-        return {"status": "ERROR", "message": "AI returned invalid response. Submission will proceed."}
+        return {"status": "ERROR", "message": "AI returned invalid response. Submission will proceed."}, None
     except Exception as e:
         logger.error(f"AI document verification failed: {e}", exc_info=True)
-        return {"status": "ERROR", "message": f"AI analysis failed: {str(e)[:100]}. Submission will proceed."}
+        return {"status": "ERROR", "message": f"AI analysis failed: {str(e)[:100]}. Submission will proceed."}, None
     finally:
         if temp_files:
             await _cleanup_gcs_files(target_bucket_name, f"lg_scans_temp/{unique_file_id}/")
+        _reclaim_system_memory()
+
+
+async def analyze_supporting_document(
+    pdf_bytes: bytes,
+    doc_type: str,
+    file_name: str,
+    request_data: Optional[Dict[str, Any]] = None,
+    db: Optional[Session] = None,
+    customer_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    AI-driven document verification: sends BOTH the document text AND the
+    user-entered issuance request data to Gemini in an isolated subprocess
+    and logs usage to DB in the parent worker.
+    """
+    fallback_err = ({"status": "ERROR", "message": "AI analysis failed. Submission will proceed."}, None)
+    result_dict, usage_meta = await _run_coro_in_isolated_fork(
+        _analyze_supporting_document_core,
+        pdf_bytes,
+        doc_type,
+        file_name,
+        request_data,
+        default_return=fallback_err,
+    )
+    if usage_meta and db and customer_id:
+        log_ai_usage_sync(
+            db, customer_id, user_id,
+            f"[doc_verify] {file_name}",
+            prompt_tokens=usage_meta.get("prompt_tokens", 0),
+            completion_tokens=usage_meta.get("completion_tokens", 0),
+            call_type="document_verification",
+        )
+    _reclaim_system_memory()
+    return result_dict
 
 # ==============================================================================
 # Bank Form PDF Analysis (for Issuance Module)

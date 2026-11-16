@@ -189,10 +189,124 @@ def _render_single_html_one_page(html_content: str, filename_hint: str = "") -> 
     return pdf_bytes
 
 
+def _prewarm_verification_cache_for_segments(html_segments: List[str], filename_hint: str = "") -> None:
+    """
+    Resolves instruction verification metadata in the parent process BEFORE forking so:
+    1. _RECENT_INSTRUCTIONS_CACHE stays warm in the parent and is inherited by the child via CoW.
+    2. The forked child never needs to open a PostgreSQL connection.
+    Does not import WeasyPrint, ReportLab, or PyPDF in the parent process.
+    """
+    try:
+        from app.core.instruction_verification import _resolve_instruction_meta
+        for seg in html_segments:
+            if seg and seg.strip():
+                _resolve_instruction_meta(seg, filename_hint=filename_hint)
+    except Exception as e:
+        logger.debug(f"Verification cache pre-warm skipped: {e}")
+
+
+def _merge_html_segments_to_pdf_bytes(html_segments: List[str], filename_hint: str = "") -> Optional[bytes]:
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for segment in html_segments:
+        if not segment or not segment.strip():
+            continue
+        seg_bytes = _render_single_html_one_page(segment, filename_hint=filename_hint)
+        if seg_bytes:
+            reader = PdfReader(io.BytesIO(seg_bytes))
+            for page in reader.pages:
+                writer.add_page(page)
+
+    if len(writer.pages) == 0:
+        return None
+
+    out_stream = io.BytesIO()
+    writer.write(out_stream)
+    return out_stream.getvalue()
+
+
+def _execute_pdf_in_forked_worker_sync(worker_fn, args) -> Optional[bytes]:
+    """
+    Runs WeasyPrint / ReportLab / PyPDF rendering in a short-lived forked child process on Linux.
+    When the child exits via os._exit(0), the kernel immediately reclaims 100% of WeasyPrint,
+    Cairo, Pango, Fontconfig, and ReportLab memory (~65-80MB), keeping the main Uvicorn
+    worker permanently lean on 512MB containers.
+    """
+    import pickle
+    from app.core.ai_integration import HEAVY_SUBPROCESS_LOCK
+
+    with HEAVY_SUBPROCESS_LOCK:
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                gc.disable()
+            except Exception:
+                pass
+            os.environ["DISABLE_ISOLATED_AI_FORK"] = "1"
+            try:
+                os.close(r_fd)
+            except Exception:
+                pass
+            try:
+                try:
+                    from app.database import engine as _db_engine
+                    _db_engine.dispose(close=False)
+                except Exception:
+                    pass
+                pdf_bytes = worker_fn(*args)
+                data_bytes = pickle.dumps(("ok", pdf_bytes))
+            except Exception as e:
+                logger.error(f"Isolated PDF worker error: {e}", exc_info=True)
+                data_bytes = pickle.dumps(("err", str(e)))
+            try:
+                with os.fdopen(w_fd, "wb") as wf:
+                    wf.write(data_bytes)
+                    wf.flush()
+            except Exception:
+                pass
+            os._exit(0)
+        else:
+            os.close(w_fd)
+            try:
+                with os.fdopen(r_fd, "rb") as rf:
+                    raw = rf.read()
+            finally:
+                try:
+                    os.waitpid(pid, 0)
+                except Exception:
+                    pass
+            if not raw:
+                return None
+            status_flag, payload = pickle.loads(raw)
+            if status_flag == "err":
+                logger.error(f"PDF child worker reported error: {payload}")
+                return None
+            return payload
+
+
+def _should_use_isolated_pdf_fork() -> bool:
+    return (
+        hasattr(os, "fork")
+        and os.getenv("DISABLE_ISOLATED_PDF_FORK", "0") != "1"
+        and os.getenv("DISABLE_ISOLATED_AI_FORK", "0") != "1"
+    )
+
+
 def _render_pdf_worker(html_content: str, filename_hint: str = "") -> Optional[bytes]:
     """
-    Renders HTML to PDF bytes using WeasyPrint and immediately frees native C-heap memory.
+    Renders HTML to PDF bytes using WeasyPrint. Uses an isolated forked child on Linux
+    so WeasyPrint/Cairo/Pango/Fontconfig memory (~70MB) is never retained in the main worker.
+    Falls back to in-thread rendering on platforms without os.fork (e.g. Windows dev).
     """
+    if _should_use_isolated_pdf_fork():
+        _prewarm_verification_cache_for_segments([html_content], filename_hint=filename_hint)
+        try:
+            return _execute_pdf_in_forked_worker_sync(_render_single_html_one_page, (html_content, filename_hint))
+        except OSError as fork_err:
+            logger.warning(f"os.fork() unavailable for PDF render ({fork_err}); falling back to in-process render.")
+
     try:
         return _render_single_html_one_page(html_content, filename_hint=filename_hint)
     finally:
@@ -203,30 +317,22 @@ def _render_pdf_worker(html_content: str, filename_hint: str = "") -> Optional[b
         except Exception:
             pass
 
+
 def _render_and_merge_pdfs_worker(html_segments: List[str], filename_hint: str = "") -> Optional[bytes]:
     """
     Renders each HTML segment as an independent PDF (so each letter has its own @page headers,
     footers, and independent Page 1 of 1 numbering) and merges the resulting PDFs into a single PDF stream.
+    Uses an isolated forked child on Linux so WeasyPrint/PyPDF memory is fully reclaimed on exit.
     """
+    if _should_use_isolated_pdf_fork():
+        _prewarm_verification_cache_for_segments(html_segments, filename_hint=filename_hint)
+        try:
+            return _execute_pdf_in_forked_worker_sync(_merge_html_segments_to_pdf_bytes, (html_segments, filename_hint))
+        except OSError as fork_err:
+            logger.warning(f"os.fork() unavailable for merged PDF render ({fork_err}); falling back to in-process render.")
+
     try:
-        from pypdf import PdfReader, PdfWriter
-
-        writer = PdfWriter()
-        for segment in html_segments:
-            if not segment or not segment.strip():
-                continue
-            seg_bytes = _render_single_html_one_page(segment, filename_hint=filename_hint)
-            if seg_bytes:
-                reader = PdfReader(io.BytesIO(seg_bytes))
-                for page in reader.pages:
-                    writer.add_page(page)
-
-        if len(writer.pages) == 0:
-            return None
-
-        out_stream = io.BytesIO()
-        writer.write(out_stream)
-        return out_stream.getvalue()
+        return _merge_html_segments_to_pdf_bytes(html_segments, filename_hint=filename_hint)
     finally:
         gc.collect()
         try:
@@ -234,9 +340,10 @@ def _render_and_merge_pdfs_worker(html_segments: List[str], filename_hint: str =
         except Exception:
             pass
 
+
 async def generate_pdf_from_html(html_content: str, filename_hint: str = "document") -> Optional[bytes]:
     """
-    Generates a PDF from HTML content using WeasyPrint in a separate thread with memory cleanup.
+    Generates a PDF from HTML content using WeasyPrint (isolated fork on Linux, thread on Windows).
     Returns the PDF as bytes.
     """
     logger.debug(f"generate_pdf_from_html: Attempting to generate PDF for '{filename_hint}' (length: {len(html_content)} chars).")
@@ -250,12 +357,7 @@ async def generate_pdf_from_html(html_content: str, filename_hint: str = "docume
     except Exception as e:
         logger.error(f"generate_pdf_from_html: Error generating PDF from HTML for '{filename_hint}': {e}", exc_info=True)
         return None
-    finally:
-        gc.collect()
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+
 
 async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_hint: str = "consolidated_documents") -> Optional[bytes]:
     """
@@ -272,9 +374,3 @@ async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_
     except Exception as e:
         logger.error(f"generate_merged_pdf_from_html_list: Error generating merged PDF for '{filename_hint}': {e}", exc_info=True)
         return None
-    finally:
-        gc.collect()
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass

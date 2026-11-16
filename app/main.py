@@ -986,6 +986,12 @@ def configure_app_instance(fastapi_app: FastAPI):
 
         from app.core.ai_integration import _reclaim_system_memory
         _reclaim_system_memory()
+        try:
+            import gc as _gc
+            if hasattr(_gc, "freeze"):
+                _gc.freeze()
+        except Exception:
+            pass
 
     @fastapi_app.on_event("shutdown")
     async def shutdown_scheduler():
