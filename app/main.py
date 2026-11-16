@@ -597,7 +597,13 @@ def configure_app_instance(fastapi_app: FastAPI):
         sys.exit(1)
 
     # --- Router Registration ---
+    from app.api.v1.endpoints import platform_activity_endpoints
     fastapi_app.include_router(system_owner.router, prefix="/api/v1/system-owner")
+    fastapi_app.include_router(
+        platform_activity_endpoints.router,
+        prefix="/api/v1/corporate-admin/activity",
+        tags=["Platform Activity & Controls"],
+    )
     fastapi_app.include_router(corporate_admin.router, prefix="/api/v1/corporate-admin")
     fastapi_app.include_router(end_user.router, prefix="/api/v1/end-user")
     fastapi_app.include_router(migration.router, prefix="/api/v1/corporate-admin") # Check if this prefix overlap is intentional
