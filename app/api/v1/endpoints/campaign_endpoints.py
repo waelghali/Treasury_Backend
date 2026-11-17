@@ -33,7 +33,11 @@ def _format_claim_out(c) -> CashbackClaimOut:
 
     verified_by_name = None
     if c.verified_by_user:
-        verified_by_name = f"{c.verified_by_user.first_name or ''} {c.verified_by_user.last_name or ''}".strip() or c.verified_by_user.email
+        u = c.verified_by_user
+        full_name = getattr(u, "full_name", None) or (
+            f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+        )
+        verified_by_name = full_name or getattr(u, "email", None)
 
     return CashbackClaimOut(
         id=c.id,
@@ -112,6 +116,50 @@ def create_campaign(
             detail="End date cannot be earlier than start date."
         )
     return crud_campaign.create_campaign(db, obj_in=obj_in)
+
+
+@router.get("/system-owner/campaigns/export-partner-report")
+def export_partner_report(
+    bank_id: Optional[int] = None,
+    customer_id: Optional[int] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_system_owner)
+):
+    claims = crud_campaign.list_claims(db, customer_id=customer_id, status=status_filter, limit=1000)
+    if bank_id:
+        claims = [c for c in claims if (c.issued_lg_record and c.issued_lg_record.bank_id == bank_id) or (c.lg_record and c.lg_record.issuing_bank_id == bank_id)]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Claim ID", "Campaign", "Customer", "Bank",
+        "LG Reference / Bank LG #", "LG Amount (EGP)",
+        "Cashback Amount (EGP)", "Status", "Verification Source",
+        "Verified At", "Verified By", "Notes"
+    ])
+    for c in claims:
+        fc = _format_claim_out(c)
+        writer.writerow([
+            fc.id,
+            fc.campaign_name or "N/A",
+            fc.customer_name or f"Customer #{fc.customer_id}",
+            fc.bank_name or "All Banks",
+            fc.lg_number or "N/A",
+            f"{float(fc.lg_amount):.2f}",
+            f"{float(fc.cashback_amount):.2f}",
+            fc.status,
+            fc.verification_source or "N/A",
+            fc.verified_at.strftime("%Y-%m-%d %H:%M") if fc.verified_at else "N/A",
+            fc.verified_by_name or "N/A",
+            fc.notes or ""
+        ])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=partner_cashback_audit_report.csv"}
+    )
 
 
 @router.get("/system-owner/campaigns/{campaign_id}", response_model=CampaignOut)
@@ -213,50 +261,6 @@ def get_campaign_stats(
     current_user: User = Depends(get_current_system_owner)
 ):
     return crud_campaign.get_system_stats(db)
-
-
-@router.get("/system-owner/campaigns/export-partner-report")
-def export_partner_report(
-    bank_id: Optional[int] = None,
-    customer_id: Optional[int] = None,
-    status_filter: Optional[str] = Query(None, alias="status"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_system_owner)
-):
-    claims = crud_campaign.list_claims(db, customer_id=customer_id, status=status_filter, limit=1000)
-    if bank_id:
-        claims = [c for c in claims if (c.issued_lg_record and c.issued_lg_record.bank_id == bank_id) or (c.lg_record and c.lg_record.issuing_bank_id == bank_id)]
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([
-        "Claim ID", "Campaign", "Customer", "Bank",
-        "LG Reference / Bank LG #", "LG Amount (EGP)",
-        "Cashback Amount (EGP)", "Status", "Verification Source",
-        "Verified At", "Verified By", "Notes"
-    ])
-    for c in claims:
-        fc = _format_claim_out(c)
-        writer.writerow([
-            fc.id,
-            fc.campaign_name or "N/A",
-            fc.customer_name or f"Customer #{fc.customer_id}",
-            fc.bank_name or "All Banks",
-            fc.lg_number or "N/A",
-            f"{float(fc.lg_amount):.2f}",
-            f"{float(fc.cashback_amount):.2f}",
-            fc.status,
-            fc.verification_source or "N/A",
-            fc.verified_at.strftime("%Y-%m-%d %H:%M") if fc.verified_at else "N/A",
-            fc.verified_by_name or "N/A",
-            fc.notes or ""
-        ])
-    output.seek(0)
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=partner_cashback_audit_report.csv"}
-    )
 
 
 # ==============================================================================

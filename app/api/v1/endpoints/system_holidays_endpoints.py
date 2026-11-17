@@ -125,11 +125,12 @@ def get_calendar_settings(
     current_user: TokenData = Depends(get_current_user)
 ):
     """Returns the current regional weekend convention and active country settings."""
+    from sqlalchemy import cast, String
     cfg_weekend = db.query(GlobalConfiguration).filter(
-        GlobalConfiguration.key == "WEEKEND_DAYS_SCHEME"
+        cast(GlobalConfiguration.key, String) == "WEEKEND_DAYS_SCHEME"
     ).first()
     cfg_country = db.query(GlobalConfiguration).filter(
-        GlobalConfiguration.key == "DEFAULT_CALENDAR_COUNTRY"
+        cast(GlobalConfiguration.key, String) == "DEFAULT_CALENDAR_COUNTRY"
     ).first()
 
     scheme = cfg_weekend.value_default if cfg_weekend and cfg_weekend.value_default else "MIDDLE_EAST"
@@ -157,6 +158,8 @@ def update_calendar_settings(
     current_user: TokenData = Depends(get_current_system_owner)
 ):
     """Updates the regional weekend scheme or country calendar at the System Owner level."""
+    from sqlalchemy import cast, String
+    from app.constants import GlobalConfigKey
     if payload.weekend_scheme:
         scheme_upper = payload.weekend_scheme.upper().strip()
         if scheme_upper not in WEEKEND_CONFIGURATIONS:
@@ -165,13 +168,13 @@ def update_calendar_settings(
                 detail=f"Invalid weekend scheme. Must be one of: {list(WEEKEND_CONFIGURATIONS.keys())}"
             )
         cfg_w = db.query(GlobalConfiguration).filter(
-            GlobalConfiguration.key == "WEEKEND_DAYS_SCHEME"
+            cast(GlobalConfiguration.key, String) == "WEEKEND_DAYS_SCHEME"
         ).first()
         if cfg_w:
             cfg_w.value_default = scheme_upper
         else:
             db.add(GlobalConfiguration(
-                key="WEEKEND_DAYS_SCHEME",
+                key=GlobalConfigKey.WEEKEND_DAYS_SCHEME,
                 value_default=scheme_upper,
                 description="Regional weekend scheme (MIDDLE_EAST vs WESTERN)"
             ))
@@ -179,13 +182,13 @@ def update_calendar_settings(
     if payload.default_country:
         country_clean = payload.default_country.upper().strip()
         cfg_c = db.query(GlobalConfiguration).filter(
-            GlobalConfiguration.key == "DEFAULT_CALENDAR_COUNTRY"
+            cast(GlobalConfiguration.key, String) == "DEFAULT_CALENDAR_COUNTRY"
         ).first()
         if cfg_c:
             cfg_c.value_default = country_clean
         else:
             db.add(GlobalConfiguration(
-                key="DEFAULT_CALENDAR_COUNTRY",
+                key=GlobalConfigKey.DEFAULT_CALENDAR_COUNTRY,
                 value_default=country_clean,
                 description="Default country code for automated bank holidays"
             ))

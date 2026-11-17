@@ -6,7 +6,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql import func, desc
 from sqlalchemy import and_, or_
 from fastapi import HTTPException, status
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import json
 import decimal
 from app.core.ai_integration import delete_file_from_gcs
@@ -393,10 +393,142 @@ class CRUDApprovalRequest(CRUDBase):
     # --- UPDATED METHOD END: _send_pending_approval_notification ---
     
     
+    def _serialize_lg_for_owner_transfer(self, lg: models.LGRecord) -> Dict[str, Any]:
+        exp_val = None
+        if getattr(lg, "expiry_date", None):
+            exp_val = lg.expiry_date.date().isoformat() if hasattr(lg.expiry_date, "date") else lg.expiry_date.isoformat()
+        iss_val = None
+        if getattr(lg, "issuance_date", None):
+            iss_val = lg.issuance_date.date().isoformat() if hasattr(lg.issuance_date, "date") else lg.issuance_date.isoformat()
+        return {
+            "id": lg.id,
+            "lg_number": lg.lg_number,
+            "issuer_name": lg.issuer_name,
+            "beneficiary_entity": lg.beneficiary_corporate.entity_name if getattr(lg, "beneficiary_corporate", None) else None,
+            "bank_name": lg.issuing_bank.name if getattr(lg, "issuing_bank", None) else (getattr(lg, "foreign_bank_name", None) or None),
+            "category_name": (getattr(lg.lg_category, "name", None) or getattr(lg.lg_category, "category_name", None)) if getattr(lg, "lg_category", None) else None,
+            "lg_type": lg.lg_type.name if getattr(lg, "lg_type", None) else None,
+            "amount": float(lg.lg_amount) if lg.lg_amount is not None else 0.0,
+            "currency_code": lg.lg_currency.iso_code if getattr(lg, "lg_currency", None) else "EGP",
+            "issuance_date": iss_val,
+            "expiry_date": exp_val,
+            "status": lg.lg_status.name if getattr(lg, "lg_status", None) else None,
+        }
+
+    def _serialize_owner_summary(self, owner: Optional[models.InternalOwnerContact]) -> Optional[Dict[str, Any]]:
+        if not owner:
+            return None
+        return {
+            "id": owner.id,
+            "email": owner.email,
+            "phone_number": owner.phone_number,
+            "internal_id": owner.internal_id,
+            "manager_email": owner.manager_email,
+        }
+
+    def _enrich_owner_change_requests(
+        self, db: Session, requests: List[models.ApprovalRequest], customer_id: int
+    ) -> List[models.ApprovalRequest]:
+        """
+        Enriches LG owner-change approval requests (`LG_CHANGE_BULK_LG_OWNER` / `LG_CHANGE_SINGLE_LG_OWNER`)
+        with human-readable `old_owner_summary`, `new_owner_summary`, `affected_lg_numbers`, and `affected_lgs`
+        so Corporate Admins / Checkers can inspect the exact list of LGs being transferred before approving.
+        - For PENDING bulk requests: refreshes live from DB so the list reflects all LGs currently owned by `old_owner`.
+        - For historical (APPROVED / REJECTED / WITHDRAWN) requests: preserves the persisted snapshot, backfilling
+          owner summaries if missing.
+        """
+        if not requests:
+            return requests
+
+        owner_actions = {ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER, ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER}
+        target_reqs = [r for r in requests if r and r.action_type in owner_actions]
+        if not target_reqs:
+            return requests
+
+        contact_ids = set()
+        pending_bulk_old_owner_ids = set()
+        for r in target_reqs:
+            det = r.request_details or {}
+            old_id = det.get("old_internal_owner_contact_id") or (
+                r.entity_id if r.entity_type == "InternalOwnerContact" else None
+            )
+            new_id = det.get("new_internal_owner_contact_id")
+            if old_id:
+                contact_ids.add(int(old_id))
+                if r.action_type == ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER and r.status == ApprovalRequestStatusEnum.PENDING:
+                    pending_bulk_old_owner_ids.add(int(old_id))
+            if new_id:
+                contact_ids.add(int(new_id))
+            if r.lg_record and r.lg_record.internal_owner_contact_id:
+                contact_ids.add(int(r.lg_record.internal_owner_contact_id))
+
+        contacts_by_id: Dict[int, models.InternalOwnerContact] = {}
+        if contact_ids:
+            rows = db.query(models.InternalOwnerContact).filter(
+                models.InternalOwnerContact.id.in_(contact_ids),
+                models.InternalOwnerContact.customer_id == customer_id,
+            ).all()
+            contacts_by_id = {c.id: c for c in rows}
+
+        live_lgs_by_owner: Dict[int, List[Dict[str, Any]]] = {oid: [] for oid in pending_bulk_old_owner_ids}
+        if pending_bulk_old_owner_ids:
+            live_lgs = db.query(models.LGRecord).options(
+                selectinload(models.LGRecord.beneficiary_corporate),
+                selectinload(models.LGRecord.issuing_bank),
+                selectinload(models.LGRecord.lg_currency),
+                selectinload(models.LGRecord.lg_status),
+                selectinload(models.LGRecord.lg_type),
+                selectinload(models.LGRecord.lg_category),
+            ).filter(
+                models.LGRecord.customer_id == customer_id,
+                models.LGRecord.internal_owner_contact_id.in_(pending_bulk_old_owner_ids),
+                models.LGRecord.is_deleted == False,
+            ).order_by(models.LGRecord.expiry_date.asc(), models.LGRecord.id.asc()).all()
+            for lg in live_lgs:
+                live_lgs_by_owner.setdefault(lg.internal_owner_contact_id, []).append(
+                    self._serialize_lg_for_owner_transfer(lg)
+                )
+
+        for r in target_reqs:
+            det = dict(r.request_details or {})
+            old_id = det.get("old_internal_owner_contact_id") or (
+                r.entity_id if r.entity_type == "InternalOwnerContact" else None
+            )
+            if not old_id and r.action_type == ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER:
+                snap_old_id = (r.lg_record_snapshot or {}).get("internal_owner_contact_id")
+                old_id = snap_old_id or (r.lg_record.internal_owner_contact_id if r.lg_record else None)
+            new_id = det.get("new_internal_owner_contact_id")
+
+            if old_id and int(old_id) in contacts_by_id and not det.get("old_owner_summary"):
+                det["old_owner_summary"] = self._serialize_owner_summary(contacts_by_id[int(old_id)])
+            elif not det.get("old_owner_summary") and r.entity_type == "InternalOwnerContact" and r.lg_record_snapshot:
+                det["old_owner_summary"] = r.lg_record_snapshot
+
+            if new_id and int(new_id) in contacts_by_id and not det.get("new_owner_summary"):
+                det["new_owner_summary"] = self._serialize_owner_summary(contacts_by_id[int(new_id)])
+            elif not det.get("new_owner_summary") and isinstance(det.get("new_internal_owner_contact_details"), dict):
+                det["new_owner_summary"] = det["new_internal_owner_contact_details"]
+
+            if r.action_type == ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER and r.status == ApprovalRequestStatusEnum.PENDING and old_id:
+                serialized_list = live_lgs_by_owner.get(int(old_id), [])
+                det["affected_lgs"] = serialized_list
+                det["affected_lg_numbers"] = [item["lg_number"] for item in serialized_list if item.get("lg_number")]
+                det["affected_lgs_count"] = len(serialized_list)
+            elif r.action_type == ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER and r.lg_record and not det.get("affected_lgs"):
+                single_item = self._serialize_lg_for_owner_transfer(r.lg_record)
+                det["affected_lgs"] = [single_item]
+                det["affected_lg_numbers"] = [single_item["lg_number"]] if single_item.get("lg_number") else []
+                det["affected_lgs_count"] = 1
+
+            # Set on instance dictionary without marking SQLAlchemy dirty during read-only GETs
+            r.__dict__["request_details"] = det
+
+        return requests
+
     def get_pending_requests_for_customer(
         self, db: Session, customer_id: int, skip: int = 0, limit: int = 100
     ) -> List[models.ApprovalRequest]:
-        return db.query(self.model).filter(
+        rows = db.query(self.model).filter(
             self.model.customer_id == customer_id,
             self.model.status == ApprovalRequestStatusEnum.PENDING,
         ).options(
@@ -405,11 +537,12 @@ class CRUDApprovalRequest(CRUDBase):
             selectinload(self.model.lg_record).selectinload(models.LGRecord.internal_owner_contact),
             selectinload(self.model.lg_record).selectinload(models.LGRecord.customer),
         ).order_by(desc(self.model.created_at)).offset(skip).limit(limit).all()
+        return self._enrich_owner_change_requests(db, rows, customer_id)
 
     def get_maker_pending_requests(
         self, db: Session, maker_user_id: int, customer_id: int, skip: int = 0, limit: int = 100
     ) -> List[models.ApprovalRequest]:
-        return db.query(self.model).filter(
+        rows = db.query(self.model).filter(
             self.model.maker_user_id == maker_user_id,
             self.model.customer_id == customer_id,
             self.model.status == ApprovalRequestStatusEnum.PENDING,
@@ -419,6 +552,7 @@ class CRUDApprovalRequest(CRUDBase):
             selectinload(self.model.lg_record).selectinload(models.LGRecord.internal_owner_contact),
             selectinload(self.model.lg_record).selectinload(models.LGRecord.customer),
         ).order_by(desc(self.model.created_at)).offset(skip).limit(limit).all()
+        return self._enrich_owner_change_requests(db, rows, customer_id)
 
 
     def get_pending_requests_for_lg(
@@ -449,7 +583,10 @@ class CRUDApprovalRequest(CRUDBase):
             selectinload(self.model.internal_owner_contact),
             selectinload(self.model.related_instruction).selectinload(models.LGInstruction.template)
         )
-        return query.first()
+        obj = query.first()
+        if obj:
+            self._enrich_owner_change_requests(db, [obj], customer_id)
+        return obj
 
     def get_all_for_customer(
         self,
@@ -509,7 +646,8 @@ class CRUDApprovalRequest(CRUDBase):
             selectinload(self.model.internal_owner_contact),
             selectinload(self.model.related_instruction).selectinload(models.LGInstruction.template)
         ).order_by(desc(self.model.created_at)).offset(skip).limit(limit)
-        return query.all()
+        rows = query.all()
+        return self._enrich_owner_change_requests(db, rows, customer_id)
 
 
     async def approve_request(
@@ -520,6 +658,40 @@ class CRUDApprovalRequest(CRUDBase):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval request not found or not accessible.")
         if db_request.status != ApprovalRequestStatusEnum.PENDING:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Request is already {db_request.status.value}.")
+
+        # Enforce APPROVAL_REQUEST_MAX_PENDING_DAYS at approval time (even before nightly cron runs)
+        max_pending_days = self._get_max_pending_days_for_customer(db, customer_id)
+        if max_pending_days and db_request.created_at:
+            created_utc = db_request.created_at if db_request.created_at.tzinfo else db_request.created_at.replace(tzinfo=timezone.utc)
+            if created_utc < datetime.now(timezone.utc) - timedelta(days=max_pending_days):
+                db_request.status = ApprovalRequestStatusEnum.AUTO_REJECTED_EXPIRED
+                db_request.updated_at = func.now()
+                db_request.reason = f"Request automatically rejected as it exceeded the maximum pending duration of {max_pending_days} days."
+                db.add(db_request)
+                log_action(
+                    db,
+                    user_id=None,
+                    action_type=AUDIT_ACTION_TYPE_APPROVAL_REQUEST_AUTO_REJECTED,
+                    entity_type="ApprovalRequest",
+                    entity_id=db_request.id,
+                    details={
+                        "entity_type_auto_rejected": db_request.entity_type,
+                        "entity_id_auto_rejected": db_request.entity_id,
+                        "action_type_auto_rejected": db_request.action_type,
+                        "maker_user_id": db_request.maker_user_id,
+                        "reason": db_request.reason,
+                        "max_pending_days_configured": max_pending_days,
+                    },
+                    customer_id=db_request.customer_id,
+                    lg_record_id=db_request.entity_id if db_request.entity_type == "LGRecord" else None,
+                )
+                _nuke_document(db, db_request.request_details or {})
+                self._clear_pending_cancellation_flag(db, db_request)
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Approval request has expired (exceeded {max_pending_days}-day approval window) and was automatically rejected.",
+                )
 
         if db_request.maker_user_id == checker_user_id:
             log_action(
@@ -537,7 +709,7 @@ class CRUDApprovalRequest(CRUDBase):
         current_entity_data = {}
         state_changed_details = {}
 
-        if db_request.entity_type == "LGRecord" and db_request.entity_id:
+        if db_request.entity_type == "LGRecord" and db_request.action_type != ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER and db_request.entity_id:
             import app.crud.crud as crud_instances
             current_lg_record = crud_instances.crud_lg_record.get_lg_record_with_relations(db, db_request.entity_id, customer_id)
             if not current_lg_record:
@@ -601,7 +773,7 @@ class CRUDApprovalRequest(CRUDBase):
         elif db_request.entity_type == "InternalOwnerContact" and db_request.entity_id:
             import app.crud.crud as crud_instances
             current_owner_contact = crud_instances.crud_internal_owner_contact.get(db, db_request.entity_id)
-            if not current_owner_contact:
+            if not current_owner_contact or current_owner_contact.customer_id != customer_id:
                 db_request.status = ApprovalRequestStatusEnum.INVALIDATED_BY_APPROVAL
                 db_request.checker_user_id = checker_user_id
                 db_request.updated_at = func.now()
@@ -639,6 +811,24 @@ class CRUDApprovalRequest(CRUDBase):
                     lg_record_id=None,
                 )
                 logger.debug(f"InternalOwnerContact state changed since request was made for approval {db_request.id}. Changes: {state_changed_details}")
+
+            if db_request.action_type == ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER:
+                remaining_lg_count = db.query(models.LGRecord.id).filter(
+                    models.LGRecord.customer_id == customer_id,
+                    models.LGRecord.internal_owner_contact_id == current_owner_contact.id,
+                    models.LGRecord.is_deleted == False,
+                ).count()
+                if remaining_lg_count <= 0:
+                    db_request.status = ApprovalRequestStatusEnum.INVALIDATED_BY_APPROVAL
+                    db_request.checker_user_id = checker_user_id
+                    db_request.updated_at = func.now()
+                    db_request.reason = f"Owner '{current_owner_contact.email}' has 0 LG records remaining in their ownership."
+                    db.add(db_request)
+                    db.commit()
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot approve bulk owner change: '{current_owner_contact.email}' currently has 0 LG records in their ownership. Request invalidated.",
+                    )
 
         db_request.status = ApprovalRequestStatusEnum.APPROVED
         db_request.checker_user_id = checker_user_id
@@ -781,7 +971,7 @@ class CRUDApprovalRequest(CRUDBase):
                 generated_instruction_id = instruction_id
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_record.activate_non_operative_lg call completed. Instruction ID: {generated_instruction_id}.")
 
-            elif db_request.entity_type == "LGRecord" and db_request.action_type in [ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER, ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER]:
+            elif db_request.entity_type in ("LGRecord", "InternalOwnerContact") and db_request.action_type in [ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER, ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER]:
                 logger.debug(f"Approval Request {db_request.id}: Detected '{db_request.action_type}' action. Preparing to call crud_instances.crud_lg_owner.change_lg_internal_owner_single_or_bulk. No instruction will be generated.")
 
                 change_in_data = LGRecordChangeOwner(**db_request.request_details)
@@ -789,13 +979,30 @@ class CRUDApprovalRequest(CRUDBase):
                 if db_request.action_type == ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER and not change_in_data.lg_record_id and db_request.entity_id:
                     change_in_data.lg_record_id = db_request.entity_id
 
-                await crud_instances.crud_lg_owner.change_lg_internal_owner_single_or_bulk(
+                transferred_lgs = await crud_instances.crud_lg_owner.change_lg_internal_owner_single_or_bulk(
                     db,
                     change_in=change_in_data,
                     user_id=db_request.maker_user_id,
                     customer_id=customer_id,
                     approval_request_id=db_request.id
                 )
+                # Persist exact snapshot of transferred LGs onto request_details for historical audit review
+                from sqlalchemy.orm.attributes import flag_modified
+                frozen_details = dict(db_request.request_details or {})
+                serialized_transferred = [self._serialize_lg_for_owner_transfer(lg) for lg in (transferred_lgs or [])]
+                frozen_details["affected_lgs"] = serialized_transferred
+                frozen_details["affected_lg_numbers"] = [
+                    item["lg_number"] for item in serialized_transferred if item.get("lg_number")
+                ]
+                frozen_details["affected_lgs_count"] = len(serialized_transferred)
+                if transferred_lgs and transferred_lgs[0].internal_owner_contact:
+                    frozen_details["new_owner_summary"] = self._serialize_owner_summary(
+                        transferred_lgs[0].internal_owner_contact
+                    )
+                db_request.request_details = frozen_details
+                flag_modified(db_request, "request_details")
+                db.add(db_request)
+                db.flush()
                 generated_instruction_id = None
                 logger.debug(f"Approval Request {db_request.id}: crud_instances.crud_lg_owner.change_lg_internal_owner_single_or_bulk call for '{db_request.action_type}' completed.")
 
@@ -890,7 +1097,7 @@ class CRUDApprovalRequest(CRUDBase):
             logger.exception(f"FATAL ERROR: Approval Request {db_request.id}: Unexpected critical error during underlying action. Rolled back. Traceback:")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected internal error occurred during approval execution. Please check server logs.")
 
-        if db_request.entity_type == "LGRecord" and db_request.entity_id:
+        if db_request.entity_type == "LGRecord" and db_request.action_type != ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER and db_request.entity_id:
             other_pending_requests = self.get_pending_requests_for_lg(db, db_request.entity_id, customer_id)
             for req in other_pending_requests:
                 if req.id != db_request.id:
@@ -1084,30 +1291,48 @@ class CRUDApprovalRequest(CRUDBase):
         db.refresh(approval_request)
         return approval_request
 
+    def _get_max_pending_days_for_customer(self, db: Session, customer_id: Optional[int], cache: Optional[Dict[Optional[int], Optional[int]]] = None) -> Optional[int]:
+        if cache is not None and customer_id in cache:
+            return cache[customer_id]
+        import app.crud.crud as crud_instances
+        max_days: Optional[int] = None
+        if customer_id:
+            try:
+                cfg = crud_instances.crud_customer_configuration.get_customer_config_or_global_fallback(
+                    db, customer_id, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS
+                )
+                if cfg and cfg.get("effective_value") is not None:
+                    max_days = int(cfg["effective_value"])
+            except (ValueError, TypeError):
+                max_days = None
+        if max_days is None:
+            global_cfg = crud_instances.crud_global_configuration.get_by_key(db, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS)
+            if global_cfg and global_cfg.value_default is not None:
+                try:
+                    max_days = int(global_cfg.value_default)
+                except (ValueError, TypeError):
+                    max_days = None
+        if cache is not None:
+            cache[customer_id] = max_days
+        return max_days
+
     def auto_reject_expired_requests(self, db: Session) -> List[models.ApprovalRequest]:
         auto_rejected_requests = []
-        import app.crud.crud as crud_instances
-        max_pending_days_config = crud_instances.crud_global_configuration.get_by_key(db, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS)
+        now_utc = datetime.now(timezone.utc)
+        max_days_cache: Dict[Optional[int], Optional[int]] = {}
 
-        if not max_pending_days_config or not max_pending_days_config.value_default:
-            logger.warning("APPROVAL_REQUEST_MAX_PENDING_DAYS not configured or has no default value. Auto-rejection skipped.")
-            return []
-
-        try:
-            max_pending_days = int(max_pending_days_config.value_default)
-        except ValueError:
-            logger.error(f"Invalid value_default for {GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS.value}. Expected integer. Auto-rejection skipped.", exc_info=True)
-            return []
-
-        cutoff_date = datetime.now(datetime.utcnow().astimezone().tzinfo) - timedelta(days=max_pending_days)
-
-
-        expired_requests = db.query(self.model).filter(
+        pending_requests = db.query(self.model).filter(
             self.model.status == ApprovalRequestStatusEnum.PENDING,
-            self.model.created_at < cutoff_date
         ).all()
 
-        for req in expired_requests:
+        for req in pending_requests:
+            max_pending_days = self._get_max_pending_days_for_customer(db, req.customer_id, max_days_cache)
+            if not max_pending_days or not req.created_at:
+                continue
+            created_utc = req.created_at if req.created_at.tzinfo else req.created_at.replace(tzinfo=timezone.utc)
+            if created_utc >= now_utc - timedelta(days=max_pending_days):
+                continue
+
             req.status = ApprovalRequestStatusEnum.AUTO_REJECTED_EXPIRED
             req.updated_at = func.now()
             req.reason = f"Request automatically rejected as it exceeded the maximum pending duration of {max_pending_days} days."

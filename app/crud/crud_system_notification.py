@@ -444,6 +444,26 @@ class CRUDSystemNotification(CRUDBase):
         return view_log
         
         
+    def create_notification(self, db: Session, *, obj_in: SystemNotificationCreate, user_id: Optional[int] = None) -> SystemNotification:
+        obj_in_data = obj_in.model_dump(exclude_unset=True)
+        creator_id = user_id
+        if creator_id is None:
+            if obj_in.target_user_ids:
+                creator_id = obj_in.target_user_ids[0]
+            elif obj_in.target_customer_ids:
+                u = db.query(User.id).filter(User.customer_id == obj_in.target_customer_ids[0], User.is_deleted == False).first()
+                if u:
+                    creator_id = u[0]
+            if creator_id is None:
+                u_any = db.query(User.id).order_by(User.id.asc()).first()
+                creator_id = u_any[0] if u_any else 1
+        db_obj = self.model(**obj_in_data)
+        db_obj.created_by_user_id = creator_id
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
     def create(self, db: Session, *, obj_in: SystemNotificationCreate, user_id: int) -> SystemNotification:
         obj_in_data = obj_in.model_dump(exclude_unset=True)
         db_obj = self.model(**obj_in_data)

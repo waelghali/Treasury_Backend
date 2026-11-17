@@ -59,6 +59,10 @@
                 <td>{{original_lg_amount_formatted}} {{lg_currency}}</td>
             </tr>
             <tr>
+                <th>Demanded Liquidation Amount ({{liquidation_type}}):</th>
+                <td>{{liquidation_amount_formatted}}</td>
+            </tr>
+            <tr>
                 <th>New Remaining LG Amount:</th>
                 <td>{{new_lg_amount_formatted}} {{lg_currency}}</td>
             </tr>
@@ -77,6 +81,8 @@
         </table>
 
         {{notes_section}}
+
+        <p>{{enclosed_documents_clause}}</p>
         
         <p>Kindly arrange to settle the proceeds of this guarantee by issuing a bank draft/cashier order payable to {{lg_beneficiary_name}}, and notify us once it is ready for collection.</p>
 

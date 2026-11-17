@@ -2907,6 +2907,11 @@ async def change_lg_owner_api(
             accessible_lg = _get_accessible_lg_record(db, change_in.lg_record_id, end_user_context)
             if not accessible_lg:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or not accessible.")
+            if change_in.new_internal_owner_contact_id and accessible_lg.internal_owner_contact_id == change_in.new_internal_owner_contact_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot change owner: the selected new owner is already the current owner of this LG.",
+                )
         existing_pending_requests = crud_approval_request.get_pending_requests_for_lg(db, change_in.lg_record_id, end_user_context.customer_id)
         if existing_pending_requests:
             first_pending_req = existing_pending_requests[0]
@@ -2916,7 +2921,40 @@ async def change_lg_owner_api(
             )
     elif change_in.change_scope == InternalOwnerChangeScope.ALL_BY_OLD_OWNER:
         action_type = ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER
-        entity_id = change_in.old_internal_owner_contact_id # Use the owner ID as the entity ID for the AR
+        entity_id = change_in.old_internal_owner_contact_id  # Use the owner ID as the entity ID for the AR
+        db_old_owner_check = crud_internal_owner_contact.get(db, change_in.old_internal_owner_contact_id)
+        if not db_old_owner_check or db_old_owner_check.customer_id != end_user_context.customer_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Old Internal Owner Contact not found.")
+        if change_in.new_internal_owner_contact_id and change_in.new_internal_owner_contact_id == db_old_owner_check.id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot transfer LGs to the same internal owner.")
+        if (
+            change_in.new_internal_owner_contact_details
+            and change_in.new_internal_owner_contact_details.email
+            and change_in.new_internal_owner_contact_details.email.strip().lower() == (db_old_owner_check.email or "").strip().lower()
+        ):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot transfer LGs to the same internal owner.")
+        owned_lg_count = db.query(models.LGRecord.id).filter(
+            models.LGRecord.customer_id == end_user_context.customer_id,
+            models.LGRecord.internal_owner_contact_id == db_old_owner_check.id,
+            models.LGRecord.is_deleted == False,
+        ).count()
+        if owned_lg_count <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot change owner: '{db_old_owner_check.email}' currently has 0 LG records in their ownership.",
+            )
+        if customer.subscription_plan.can_maker_checker:
+            existing_bulk_pending = db.query(models.ApprovalRequest).filter(
+                models.ApprovalRequest.customer_id == end_user_context.customer_id,
+                models.ApprovalRequest.action_type == ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER,
+                models.ApprovalRequest.entity_id == db_old_owner_check.id,
+                models.ApprovalRequest.status == ApprovalRequestStatusEnum.PENDING,
+            ).first()
+            if existing_bulk_pending:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"A bulk owner change request is already pending approval for '{db_old_owner_check.email}' (Request ID: {existing_bulk_pending.id}).",
+                )
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid change scope.")
 
@@ -2924,17 +2962,66 @@ async def change_lg_owner_api(
         try:
             lg_snapshot = None
             db_lg_record = None
+            db_old_owner = None
+            target_entity_type = "LGRecord"
             if change_in.change_scope == InternalOwnerChangeScope.SINGLE_LG and change_in.lg_record_id:
                 db_lg_record = crud_lg_record.get_lg_record_with_relations(db, change_in.lg_record_id, end_user_context.customer_id)
                 if not db_lg_record:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found for snapshot.")
                 lg_snapshot = crud_approval_request._get_lg_record_snapshot(db_lg_record)
+            elif change_in.change_scope == InternalOwnerChangeScope.ALL_BY_OLD_OWNER:
+                target_entity_type = "InternalOwnerContact"
+                db_old_owner = crud_internal_owner_contact.get(db, change_in.old_internal_owner_contact_id)
+                if not db_old_owner or db_old_owner.customer_id != end_user_context.customer_id:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Old Internal Owner Contact not found.")
+                lg_snapshot = crud_approval_request._get_internal_owner_contact_snapshot(db_old_owner)
+
+            req_details_payload = change_in.model_dump()
+            if change_in.new_internal_owner_contact_id:
+                db_new_owner_preview = crud_internal_owner_contact.get(db, change_in.new_internal_owner_contact_id)
+                if db_new_owner_preview and db_new_owner_preview.customer_id == end_user_context.customer_id:
+                    req_details_payload["new_owner_summary"] = crud_approval_request._serialize_owner_summary(db_new_owner_preview)
+            elif change_in.new_internal_owner_contact_details:
+                req_details_payload["new_owner_summary"] = change_in.new_internal_owner_contact_details.model_dump()
+
+            if change_in.change_scope == InternalOwnerChangeScope.ALL_BY_OLD_OWNER and db_old_owner:
+                req_details_payload["old_owner_summary"] = crud_approval_request._serialize_owner_summary(db_old_owner)
+                preview_lgs = db.query(models.LGRecord).options(
+                    selectinload(models.LGRecord.beneficiary_corporate),
+                    selectinload(models.LGRecord.issuing_bank),
+                    selectinload(models.LGRecord.lg_currency),
+                    selectinload(models.LGRecord.lg_status),
+                    selectinload(models.LGRecord.lg_type),
+                    selectinload(models.LGRecord.lg_category),
+                ).filter(
+                    models.LGRecord.customer_id == end_user_context.customer_id,
+                    models.LGRecord.internal_owner_contact_id == db_old_owner.id,
+                    models.LGRecord.is_deleted == False,
+                ).order_by(models.LGRecord.expiry_date.asc(), models.LGRecord.id.asc()).all()
+                if not preview_lgs:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"No active LG records found for old internal owner '{db_old_owner.email}'.",
+                    )
+                serialized_preview = [crud_approval_request._serialize_lg_for_owner_transfer(lg) for lg in preview_lgs]
+                req_details_payload["affected_lgs"] = serialized_preview
+                req_details_payload["affected_lg_numbers"] = [x["lg_number"] for x in serialized_preview if x.get("lg_number")]
+                req_details_payload["affected_lgs_count"] = len(serialized_preview)
+            elif change_in.change_scope == InternalOwnerChangeScope.SINGLE_LG and db_lg_record:
+                if db_lg_record.internal_owner_contact:
+                    req_details_payload["old_owner_summary"] = crud_approval_request._serialize_owner_summary(
+                        db_lg_record.internal_owner_contact
+                    )
+                single_preview = crud_approval_request._serialize_lg_for_owner_transfer(db_lg_record)
+                req_details_payload["affected_lgs"] = [single_preview]
+                req_details_payload["affected_lg_numbers"] = [single_preview["lg_number"]] if single_preview.get("lg_number") else []
+                req_details_payload["affected_lgs_count"] = 1
 
             approval_request_in = ApprovalRequestCreate(
-                entity_type="LGRecord",
+                entity_type=target_entity_type,
                 entity_id=entity_id,
                 action_type=action_type,
-                request_details=change_in.model_dump(),
+                request_details=req_details_payload,
                 lg_record_snapshot=lg_snapshot,
             )
             
@@ -2945,6 +3032,7 @@ async def change_lg_owner_api(
                 end_user_context.user_id,
                 end_user_context.customer_id,
                 lg_record=db_lg_record,
+                internal_owner_contact=db_old_owner,
             )
 
             log_action(
@@ -5725,9 +5813,22 @@ async def force_issuance_handover(
     from app.crud.crud import crud_approval_request
     from app.constants import ApprovalRequestStatusEnum
 
-    # Validate payload through schema if needed, but doing directly here
-    if not payload.get("lg_ids") or not payload.get("new_requestor"):
-        raise HTTPException(status_code=400, detail="lg_ids and new_requestor are required")
+    # Validate payload and ensure >0 eligible LGs exist for transfer
+    raw_lg_ids = payload.get("lg_ids")
+    if not isinstance(raw_lg_ids, list) or len(raw_lg_ids) == 0 or not payload.get("new_requestor"):
+        raise HTTPException(status_code=400, detail="At least one LG (lg_ids) and new_requestor are required")
+
+    from app.models.models_issuance import IssuedLGRecord
+    eligible_count = db.query(IssuedLGRecord.id).filter(
+        IssuedLGRecord.id.in_(raw_lg_ids),
+        IssuedLGRecord.customer_id == end_user_context.customer_id,
+        IssuedLGRecord.status.not_in(["CANCELLED", "LIQUIDATED", "EXPIRED"]),
+    ).count()
+    if eligible_count <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot initiate handover: 0 active LG records found in the selected ownership.",
+        )
         
     action_payload = {
         "lg_ids": payload["lg_ids"],

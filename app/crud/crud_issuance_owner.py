@@ -186,6 +186,9 @@ def execute_force_handover(db: Session, customer_id: int, lg_ids: List[int], new
         IssuedLGRecord.status.not_in(["CANCELLED", "LIQUIDATED", "EXPIRED"])
     ).all()
 
+    if not lgs:
+        raise HTTPException(status_code=400, detail="Cannot execute handover: 0 active LG records found to transfer.")
+
     for lg in lgs:
         req = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
         if req:

@@ -43,8 +43,9 @@ class BusinessCalendarService:
         scheme = self.default_weekend_scheme
         if db:
             try:
+                from sqlalchemy import cast, String
                 cfg = db.query(GlobalConfiguration).filter(
-                    GlobalConfiguration.key == "WEEKEND_DAYS_SCHEME"
+                    cast(GlobalConfiguration.key, String) == "WEEKEND_DAYS_SCHEME"
                 ).first()
                 if cfg and cfg.value_default:
                     scheme = cfg.value_default.upper().strip()

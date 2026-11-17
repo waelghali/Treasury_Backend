@@ -279,6 +279,42 @@ class IssuanceMaintenanceService:
         if not lg or lg.customer_id != customer_id:
             raise HTTPException(status_code=404, detail="LG not found")
 
+        # Enforce APPROVAL_REQUEST_MAX_PENDING_DAYS at approval time
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+        from app.core.background_tasks import _resolve_max_pending_days, _coerce_utc
+        max_days = _resolve_max_pending_days(db, customer_id, {})
+        ref_ts = _coerce_utc(action.updated_at) or _coerce_utc(action.created_at)
+        now_utc = _dt.now(_tz.utc)
+        if max_days and ref_ts and ref_ts < now_utc - _td(days=max_days):
+            expired_approvers = [int(x) for x in (action.pending_approver_users or [])]
+            reason_msg = f"Maintenance action automatically rejected as it exceeded the maximum pending duration of {max_days} days."
+            action.status = "AUTO_REJECTED_EXPIRED"
+            action.pending_approver_users = []
+            history = list(action.approval_history or [])
+            history.append({
+                "action": "AUTO_REJECTED_EXPIRED",
+                "step": action.current_step_number,
+                "reason": reason_msg,
+                "notes": reason_msg,
+                "expired_approver_user_ids": expired_approvers,
+                "timestamp": now_utc.isoformat(),
+            })
+            action.approval_history = history
+            _flag_modified(action, "approval_history")
+            db.add(action)
+            log_action(
+                db, user_id=None, action_type=f"ISSUANCE_MAINTENANCE_{action.action_type}_AUTO_REJECTED",
+                entity_type="IssuanceMaintenanceAction", entity_id=action.id,
+                details={"lg_ref": lg.lg_ref_number, "max_days": max_days, "reason": reason_msg},
+                customer_id=customer_id,
+            )
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=f"This maintenance action has expired (exceeded {max_days}-day approval window) and was automatically rejected.",
+            )
+
         # Verify authorization
         allowed_users = [int(uid) for uid in (action.pending_approver_users or [])]
         if approver_user_id not in allowed_users:
@@ -964,6 +1000,14 @@ class IssuanceMaintenanceService:
             target_outcome = data.get("target_outcome", "REACTIVATE")
             if target_outcome == "RELEASE":
                 lg.status = "RELEASED"
+                from sqlalchemy import or_
+                exp_conds = [IssuanceExposureEntry.lg_record_id == lg.id]
+                if lg.request_id:
+                    exp_conds.append(IssuanceExposureEntry.request_id == lg.request_id)
+                db.query(IssuanceExposureEntry).filter(
+                    or_(*exp_conds),
+                    IssuanceExposureEntry.is_active == True,
+                ).update({"is_active": False}, synchronize_session=False)
                 logger.info(f"CANCEL_LIQUIDATION executed for LG {lg.id} with outcome RELEASE — status set to RELEASED.")
             else:
                 lg.status = "ACTIVE"
@@ -971,6 +1015,19 @@ class IssuanceMaintenanceService:
 
         elif action.action_type == "CLOSE":
             lg.status = "CLOSED"
+            from sqlalchemy import or_
+            exp_conds = [IssuanceExposureEntry.lg_record_id == lg.id]
+            if lg.request_id:
+                exp_conds.append(IssuanceExposureEntry.request_id == lg.request_id)
+            db.query(IssuanceExposureEntry).filter(
+                or_(*exp_conds),
+                IssuanceExposureEntry.is_active == True,
+            ).update({"is_active": False}, synchronize_session=False)
+            if lg.customer_id:
+                from app.models import Customer
+                cust_obj = db.query(Customer).filter(Customer.id == lg.customer_id).first()
+                if cust_obj and (cust_obj.active_issuance_lg_count or 0) > 0:
+                    cust_obj.active_issuance_lg_count -= 1
 
         elif action.action_type == "AMENDMENT":
             # Amendment: apply approved amendable fields from action_data

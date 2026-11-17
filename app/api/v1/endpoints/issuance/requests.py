@@ -52,7 +52,7 @@ from .base import _read_bank_form_pdf_bytes, _send_edit_notifications, _detect_c
 def create_issuance_request_internal(
     request_in: IssuanceRequestCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(get_issuance_read_context)
 ):
     """Internal: Creates a DRAFT request (all required fields must be present)."""
     return crud_issuance_request.create_request(
@@ -979,7 +979,16 @@ def upload_request_document(
         raise HTTPException(status_code=404, detail="Request not found")
     
     from app.services.tenant_key_service import tenant_key_service
-    from app.core.storage_service import upload_stream_to_gcs_encrypted
+    from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+
+    safe_doc_slug = _slugify_doc_type(document_type)
+    safe_filename = (file.filename or "document.pdf").replace("/", "_").replace("\\", "_")
+    blob_path = build_customer_blob_path(
+        current_user.customer_id,
+        "lg_issuance",
+        f"req_{request_id}/{safe_doc_slug}_{uuid.uuid4().hex[:8]}_{safe_filename}",
+    )
+    bucket_name = GCS_BUCKET_NAME
 
     tenant_dek = tenant_key_service.get_or_create_tenant_dek(db, current_user.customer_id)
     stored_uri, _ = upload_stream_to_gcs_encrypted(

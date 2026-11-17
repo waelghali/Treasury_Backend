@@ -145,7 +145,7 @@ class InboxActionService:
 
         # Handle NIL / Zero Position Reconciliation (No attachment file required)
         if item.is_nil_position or not item.has_attachment:
-            # 1. Create ReconciliationSession with 0 bank records
+            # 1. Create ReconciliationSession with 0 bank records and mark as PARSED
             session = reconciliation_service.create_session(
                 db=db,
                 customer_id=customer_id,
@@ -155,6 +155,10 @@ class InboxActionService:
                 file_name="NIL_POSITION_CONFIRMATION",
                 notes=f"NIL/Zero position confirmed via Smart Inbox email: '{item.subject}' (Sender: {item.sender_email})"
             )
+            session.status = "PARSED"
+            session.parsing_method = "NIL_EMAIL"
+            session.total_bank_records = 0
+            db.flush()
 
             # 2. Run matching against active system LGs
             try:

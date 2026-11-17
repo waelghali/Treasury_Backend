@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from datetime import datetime
 from decimal import Decimal
 import io
 import csv
@@ -766,7 +767,7 @@ def update_taxonomy_node(
     Updates a taxonomy node (name, GL account, direction, description).
     """
     db_node = crud_taxonomy.get(db, id=node_id)
-    if not db_node:
+    if not db_node or db_node.is_deleted or db_node.company_id != current_user.customer_id:
         raise HTTPException(status_code=404, detail="Taxonomy node not found")
     return crud_taxonomy.update_node(db, db_obj=db_node, node_in=node_in, user_id=current_user.user_id)
 
@@ -780,11 +781,10 @@ def delete_taxonomy_node(
     Deactivates/soft-deletes a taxonomy node.
     """
     db_node = crud_taxonomy.get(db, id=node_id)
-    if not db_node:
+    if not db_node or db_node.is_deleted or db_node.company_id != current_user.customer_id:
         raise HTTPException(status_code=404, detail="Taxonomy node not found")
     db_node.is_active = False
     db_node.is_deleted = True
-    db_node.updated_by = current_user.user_id
     db.commit()
     return {"status": "success", "message": f"Taxonomy node #{node_id} deactivated."}
 

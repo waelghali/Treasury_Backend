@@ -115,6 +115,9 @@ class GlobalConfigKey(str, Enum):
     INBOX_DEFAULT_POSITION_REQUEST_DAY = "INBOX_DEFAULT_POSITION_REQUEST_DAY"
     INBOX_RETENTION_MONTHS = "INBOX_RETENTION_MONTHS"
     INBOX_GENERIC_DOMAIN_BLACKLIST = "INBOX_GENERIC_DOMAIN_BLACKLIST"
+    # Business Calendar & SLA Settings
+    WEEKEND_DAYS_SCHEME = "WEEKEND_DAYS_SCHEME"
+    DEFAULT_CALENDAR_COUNTRY = "DEFAULT_CALENDAR_COUNTRY"
 
 # NEW: Defines the types of subscription-related email notifications.
 class SubscriptionNotificationType(str, Enum):

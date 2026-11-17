@@ -2710,79 +2710,135 @@ async def run_daily_issuance_maintenance_reminders(db: Session):
 
 
 # ==============================================================================
-# AUTO-REJECT EXPIRED CANCEL & EDIT REQUESTS
+# AUTO-REJECT EXPIRED ISSUANCE, MAINTENANCE & ADMIN APPROVAL REQUESTS
 # ==============================================================================
+
+def _resolve_max_pending_days(db: Session, customer_id: Optional[int], cache: Dict[Optional[int], Optional[int]]) -> Optional[int]:
+    if customer_id in cache:
+        return cache[customer_id]
+    from app.crud.crud import crud_global_configuration
+    max_days: Optional[int] = None
+    if customer_id:
+        try:
+            cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS
+            )
+            if cfg and cfg.get("effective_value") is not None:
+                max_days = int(cfg["effective_value"])
+        except (ValueError, TypeError):
+            max_days = None
+    if max_days is None:
+        global_cfg = crud_global_configuration.get_by_key(db, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS)
+        if global_cfg and global_cfg.value_default is not None:
+            try:
+                max_days = int(global_cfg.value_default)
+            except (ValueError, TypeError):
+                max_days = None
+    cache[customer_id] = max_days
+    return max_days
+
+
+def _coerce_utc(val: Any) -> Optional[datetime]:
+    from datetime import timezone
+    if val is None:
+        return None
+    if isinstance(val, str):
+        try:
+            val = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if isinstance(val, datetime):
+        return val.astimezone(timezone.utc) if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    return None
+
 
 async def run_daily_issuance_approval_timeout(db: Session):
     """
-    Auto-rejects LGs stuck in CANCEL_REQUESTED and IssuanceRequests stuck
-    in EDIT_REQUESTED beyond the configured APPROVAL_REQUEST_MAX_PENDING_DAYS.
-    Mirrors the ApprovalRequest auto-reject pattern.
+    Auto-rejects ALL expired pending approvals across Issuance, Maintenance & Admin Changes
+    beyond each customer's configured APPROVAL_REQUEST_MAX_PENDING_DAYS:
+      1. IssuedLGRecord in CANCEL_REQUESTED (restores previous status)
+      2. IssuanceRequest in EDIT_REQUESTED (restores previous status)
+      3. IssuanceRequest in CANCELLATION_REQUESTED (restores pre_cancel_status)
+      4. IssuanceRequest in PENDING_APPROVAL (transitions to REJECTED)
+      5. IssuanceMaintenanceAction in PENDING_APPROVAL (transitions to AUTO_REJECTED_EXPIRED)
+      6. AdminChangeRequest in PENDING (transitions to REJECTED)
     """
-    logger.info("Running daily issuance approval timeout check...")
-
-    from app.models.models_issuance import IssuedLGRecord, IssuanceRequest
-
-    # Get max pending days config
-    from app.crud.crud import crud_global_configuration
-    max_pending_config = crud_global_configuration.get_by_key(
-        db, GlobalConfigKey.APPROVAL_REQUEST_MAX_PENDING_DAYS
+    from datetime import timezone
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models.models_issuance import (
+        IssuedLGRecord,
+        IssuanceRequest,
+        IssuanceMaintenanceAction,
+        AdminChangeRequest,
     )
-    if not max_pending_config or not max_pending_config.value_default:
-        logger.info("APPROVAL_REQUEST_MAX_PENDING_DAYS not configured. Skipping issuance timeout.")
-        return
 
-    try:
-        max_days = int(max_pending_config.value_default)
-    except (ValueError, TypeError):
-        logger.warning("Invalid APPROVAL_REQUEST_MAX_PENDING_DAYS value. Skipping.")
-        return
+    logger.info("Running daily issuance, maintenance & admin approval timeout check...")
 
-    cutoff = datetime.utcnow() - timedelta(days=max_days)
+    now_utc = datetime.now(timezone.utc)
+    max_days_cache: Dict[Optional[int], Optional[int]] = {}
     auto_rejected_count = 0
 
-    # 1. Auto-reject CANCEL_REQUESTED LGs
+    # 1. Auto-reject CANCEL_REQUESTED IssuedLGRecords (metadata lives on linked IssuanceRequest + custody_transfer_log)
     pending_cancels = db.query(IssuedLGRecord).filter(
         IssuedLGRecord.status == "CANCEL_REQUESTED",
     ).all()
 
     for lg in pending_cancels:
         try:
-            meta = dict(lg.metadata_json or {})
-            cancel_meta = meta.get("pending_cancellation", {})
-            requested_at_str = cancel_meta.get("requested_at")
-            if not requested_at_str:
+            max_days = _resolve_max_pending_days(db, lg.customer_id, max_days_cache)
+            if not max_days:
+                continue
+            cutoff = now_utc - timedelta(days=max_days)
+
+            linked_request = db.query(IssuanceRequest).filter(IssuanceRequest.lg_record_id == lg.id).first()
+            if not linked_request and lg.request_id:
+                linked_request = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
+            req_meta = dict(linked_request.metadata_json or {}) if linked_request and linked_request.metadata_json else {}
+            cancel_meta = req_meta.get("pending_cancellation")
+
+            if not cancel_meta:
+                for entry in reversed(lg.custody_transfer_log or []):
+                    if isinstance(entry, dict) and entry.get("action") == "CANCEL_REQUESTED":
+                        cancel_meta = {
+                            "cancel_reason": entry.get("reason", ""),
+                            "previous_status": entry.get("previous_status", "INTERNAL_PROCESSING"),
+                            "requested_by_user_id": entry.get("user_id"),
+                            "requested_at": entry.get("timestamp"),
+                        }
+                        break
+            cancel_meta = cancel_meta or {}
+
+            requested_at = _coerce_utc(cancel_meta.get("requested_at")) or _coerce_utc(lg.updated_at) or _coerce_utc(lg.created_at)
+            if not requested_at or requested_at >= cutoff:
                 continue
 
-            requested_at = datetime.fromisoformat(requested_at_str)
-            if requested_at > cutoff:
-                continue  # Not yet expired
-
-            # Auto-reject: restore previous status
             previous_status = cancel_meta.get("previous_status", "INTERNAL_PROCESSING")
             lg.status = previous_status
 
-            # Clean up metadata
-            if "pending_cancellation" in meta:
-                del meta["pending_cancellation"]
-            lg.metadata_json = meta
+            if linked_request and "pending_cancellation" in req_meta:
+                req_meta.pop("pending_cancellation", None)
+                linked_request.metadata_json = req_meta
+                flag_modified(linked_request, "metadata_json")
+                db.add(linked_request)
 
-            # Audit trail
             ctl = list(lg.custody_transfer_log or [])
             ctl.append({
                 "action": "CANCEL_AUTO_REJECTED",
-                "reason": f"Auto-rejected: exceeded {max_days} day approval window.",
+                "reason": f"Auto-rejected: exceeded {max_days}-day approval window.",
                 "restored_status": previous_status,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": now_utc.isoformat(),
             })
             lg.custody_transfer_log = ctl
+            flag_modified(lg, "custody_transfer_log")
+            db.add(lg)
 
-            log_action(db, None, "LG_CANCEL_AUTO_REJECTED",
-                       "IssuedLGRecord", lg.id,
-                       {"max_days": max_days, "restored_status": previous_status},
-                       lg.customer_id)
+            log_action(
+                db, None, "LG_CANCEL_AUTO_REJECTED",
+                "IssuedLGRecord", lg.id,
+                {"max_days": max_days, "restored_status": previous_status},
+                lg.customer_id,
+            )
 
-            # Notify requestor
             try:
                 requestor_id = cancel_meta.get("requested_by_user_id")
                 if requestor_id:
@@ -2813,14 +2869,15 @@ async def run_daily_issuance_approval_timeout(db: Session):
 
     for req in pending_edits:
         try:
+            max_days = _resolve_max_pending_days(db, req.customer_id, max_days_cache)
+            if not max_days:
+                continue
+            cutoff = now_utc - timedelta(days=max_days)
+
             meta = dict(req.metadata_json or {})
             edit_meta = meta.get("pending_edit", {})
-            requested_at_str = edit_meta.get("requested_at")
-            if not requested_at_str:
-                continue
-
-            requested_at = datetime.fromisoformat(requested_at_str)
-            if requested_at > cutoff:
+            requested_at = _coerce_utc(edit_meta.get("requested_at")) or _coerce_utc(req.updated_at) or _coerce_utc(req.created_at)
+            if not requested_at or requested_at >= cutoff:
                 continue
 
             previous_status = edit_meta.get("previous_status", "APPROVED_INTERNAL")
@@ -2829,20 +2886,25 @@ async def run_daily_issuance_approval_timeout(db: Session):
             if "pending_edit" in meta:
                 del meta["pending_edit"]
             req.metadata_json = meta
+            flag_modified(req, "metadata_json")
 
             audit = list(req.approval_chain_audit or [])
             audit.append({
                 "action": "EDIT_AUTO_REJECTED",
-                "reason": f"Auto-rejected: exceeded {max_days} day approval window.",
+                "reason": f"Auto-rejected: exceeded {max_days}-day approval window.",
                 "restored_status": previous_status,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": now_utc.isoformat(),
             })
             req.approval_chain_audit = audit
+            flag_modified(req, "approval_chain_audit")
+            db.add(req)
 
-            log_action(db, None, "ISSUANCE_EDIT_AUTO_REJECTED",
-                       "IssuanceRequest", req.id,
-                       {"max_days": max_days, "restored_status": previous_status},
-                       req.customer_id)
+            log_action(
+                db, None, "ISSUANCE_EDIT_AUTO_REJECTED",
+                "IssuanceRequest", req.id,
+                {"max_days": max_days, "restored_status": previous_status},
+                req.customer_id,
+            )
 
             auto_rejected_count += 1
             logger.info(f"Auto-rejected edit request for request {req.id} ({req.serial_number})")
@@ -2850,11 +2912,198 @@ async def run_daily_issuance_approval_timeout(db: Session):
         except Exception as e:
             logger.error(f"Error auto-rejecting edit for request {req.id}: {e}", exc_info=True)
 
+    # 3. Auto-reject CANCELLATION_REQUESTED IssuanceRequests
+    pending_req_cancels = db.query(IssuanceRequest).filter(
+        IssuanceRequest.status == "CANCELLATION_REQUESTED",
+    ).all()
+
+    for req in pending_req_cancels:
+        try:
+            max_days = _resolve_max_pending_days(db, req.customer_id, max_days_cache)
+            if not max_days:
+                continue
+            cutoff = now_utc - timedelta(days=max_days)
+
+            meta = dict(req.metadata_json or {})
+            audit = list(req.approval_chain_audit or [])
+            cancel_ts = None
+            for entry in reversed(audit):
+                if isinstance(entry, dict) and entry.get("action") == "CANCELLATION_REQUESTED":
+                    cancel_ts = _coerce_utc(entry.get("timestamp"))
+                    break
+            requested_at = cancel_ts or _coerce_utc(req.updated_at) or _coerce_utc(req.created_at)
+            if not requested_at or requested_at >= cutoff:
+                continue
+
+            previous_status = meta.get("pre_cancel_status", "APPROVED_INTERNAL")
+            req.status = previous_status
+            req.cancellation_reason = None
+            meta.pop("pre_cancel_status", None)
+            req.metadata_json = meta
+            flag_modified(req, "metadata_json")
+
+            audit.append({
+                "action": "CANCELLATION_AUTO_REJECTED",
+                "reason": f"Auto-rejected: exceeded {max_days}-day approval window.",
+                "restored_status": previous_status,
+                "timestamp": now_utc.isoformat(),
+            })
+            req.approval_chain_audit = audit
+            flag_modified(req, "approval_chain_audit")
+            db.add(req)
+
+            log_action(
+                db, None, "ISSUANCE_CANCELLATION_AUTO_REJECTED",
+                "IssuanceRequest", req.id,
+                {"max_days": max_days, "restored_status": previous_status},
+                req.customer_id,
+            )
+
+            auto_rejected_count += 1
+            logger.info(f"Auto-rejected cancellation request for IssuanceRequest {req.id} ({req.serial_number})")
+
+        except Exception as e:
+            logger.error(f"Error auto-rejecting cancellation for request {req.id}: {e}", exc_info=True)
+
+    # 4. Auto-reject PENDING_APPROVAL IssuanceRequests
+    pending_issuance_reqs = db.query(IssuanceRequest).filter(
+        IssuanceRequest.status == "PENDING_APPROVAL",
+        IssuanceRequest.is_deleted == False,
+    ).all()
+
+    for req in pending_issuance_reqs:
+        try:
+            max_days = _resolve_max_pending_days(db, req.customer_id, max_days_cache)
+            if not max_days:
+                continue
+            cutoff = now_utc - timedelta(days=max_days)
+
+            ref_ts = _coerce_utc(req.updated_at) or _coerce_utc(req.created_at)
+            if not ref_ts or ref_ts >= cutoff:
+                continue
+
+            expired_approvers = [int(x) for x in (req.pending_approver_users or [])]
+            reason_msg = f"Request automatically rejected as it exceeded the maximum pending duration of {max_days} days."
+            req.status = "REJECTED"
+            req.pending_approver_users = []
+            req.signatures_collected = 0
+            req.revision_notes = reason_msg
+
+            audit = list(req.approval_chain_audit or [])
+            audit.append({
+                "action": "AUTO_REJECTED_EXPIRED",
+                "step": req.current_approval_step,
+                "notes": reason_msg,
+                "reason": reason_msg,
+                "expired_approver_user_ids": expired_approvers,
+                "timestamp": now_utc.isoformat(),
+            })
+            req.approval_chain_audit = audit
+            flag_modified(req, "approval_chain_audit")
+            db.add(req)
+
+            log_action(
+                db, None, "ISSUANCE_REQUEST_AUTO_REJECTED",
+                "IssuanceRequest", req.id,
+                {"serial_number": req.serial_number, "max_days": max_days, "reason": reason_msg},
+                req.customer_id,
+            )
+
+            auto_rejected_count += 1
+            logger.info(f"Auto-rejected expired IssuanceRequest {req.id} ({req.serial_number})")
+
+        except Exception as e:
+            logger.error(f"Error auto-rejecting IssuanceRequest {req.id}: {e}", exc_info=True)
+
+    # 5. Auto-reject PENDING_APPROVAL IssuanceMaintenanceActions
+    pending_maint_actions = db.query(IssuanceMaintenanceAction).filter(
+        IssuanceMaintenanceAction.status == "PENDING_APPROVAL",
+    ).all()
+
+    for action in pending_maint_actions:
+        try:
+            lg = db.query(IssuedLGRecord).filter(IssuedLGRecord.id == action.issued_lg_id).first()
+            cust_id = lg.customer_id if lg else None
+            max_days = _resolve_max_pending_days(db, cust_id, max_days_cache)
+            if not max_days:
+                continue
+            cutoff = now_utc - timedelta(days=max_days)
+
+            ref_ts = _coerce_utc(action.updated_at) or _coerce_utc(action.created_at)
+            if not ref_ts or ref_ts >= cutoff:
+                continue
+
+            expired_approvers = [int(x) for x in (action.pending_approver_users or [])]
+            reason_msg = f"Maintenance action automatically rejected as it exceeded the maximum pending duration of {max_days} days."
+            action.status = "AUTO_REJECTED_EXPIRED"
+            action.pending_approver_users = []
+
+            history = list(action.approval_history or [])
+            history.append({
+                "action": "AUTO_REJECTED_EXPIRED",
+                "step": action.current_step_number,
+                "reason": reason_msg,
+                "notes": reason_msg,
+                "expired_approver_user_ids": expired_approvers,
+                "timestamp": now_utc.isoformat(),
+            })
+            action.approval_history = history
+            flag_modified(action, "approval_history")
+            db.add(action)
+
+            if cust_id:
+                log_action(
+                    db, None, f"ISSUANCE_MAINTENANCE_{action.action_type}_AUTO_REJECTED",
+                    "IssuanceMaintenanceAction", action.id,
+                    {"lg_ref": lg.lg_ref_number if lg else None, "max_days": max_days, "reason": reason_msg},
+                    cust_id,
+                )
+
+            auto_rejected_count += 1
+            logger.info(f"Auto-rejected expired IssuanceMaintenanceAction {action.id} ({action.action_type})")
+
+        except Exception as e:
+            logger.error(f"Error auto-rejecting IssuanceMaintenanceAction {action.id}: {e}", exc_info=True)
+
+    # 6. Auto-reject PENDING AdminChangeRequests
+    pending_admin_changes = db.query(AdminChangeRequest).filter(
+        AdminChangeRequest.status == "PENDING",
+    ).all()
+
+    for change in pending_admin_changes:
+        try:
+            max_days = _resolve_max_pending_days(db, change.customer_id, max_days_cache)
+            if not max_days:
+                continue
+            cutoff = now_utc - timedelta(days=max_days)
+
+            ref_ts = _coerce_utc(change.created_at)
+            if not ref_ts or ref_ts >= cutoff:
+                continue
+
+            reason_msg = f"Admin configuration change automatically rejected as it exceeded the maximum pending duration of {max_days} days."
+            change.status = "REJECTED"
+            change.rejection_reason = reason_msg
+            db.add(change)
+
+            log_action(
+                db, None, "ADMIN_CHANGE_REQUEST_AUTO_REJECTED",
+                "AdminChangeRequest", change.id,
+                {"change_type": change.change_type, "max_days": max_days, "reason": reason_msg},
+                change.customer_id,
+            )
+
+            auto_rejected_count += 1
+            logger.info(f"Auto-rejected expired AdminChangeRequest {change.id} ({change.change_type})")
+
+        except Exception as e:
+            logger.error(f"Error auto-rejecting AdminChangeRequest {change.id}: {e}", exc_info=True)
+
     if auto_rejected_count > 0:
         db.commit()
-        logger.info(f"Auto-rejected {auto_rejected_count} expired issuance approval(s).")
+        logger.info(f"Auto-rejected {auto_rejected_count} expired issuance/maintenance/admin approval(s).")
     else:
-        logger.info("No expired issuance approvals found.")
+        logger.info("No expired issuance/maintenance/admin approvals found.")
 
 async def run_daily_auto_reject_expired_requests(db: Session):
     """

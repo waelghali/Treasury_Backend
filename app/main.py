@@ -354,6 +354,8 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, is_deleted, created_at, updated_at) VALUES ('AUTO_ACCEPT_SINGLE_QUOTE', NULL, NULL, 'false', 'boolean', 'When Auto-Accept is active, controls whether uncontested single quotes can be auto-executed (true) or halted for manual corporate sign-off (false). Invariant: cannot be true if Default Action is Auto-Reject.', '[\"quotation\", \"quotations\"]'::jsonb, false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
                     "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'FACILITY_SCORE_WEIGHT_RARITY';",
                     "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'FACILITY_SCORE_WEIGHT_URGENT_RARITY';",
+                    "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'WEEKEND_DAYS_SCHEME';",
+                    "ALTER TYPE globalconfigkey ADD VALUE IF NOT EXISTS 'DEFAULT_CALENDAR_COUNTRY';",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS encrypted_email TEXT;",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS email_blind_index VARCHAR(64);",
                     "ALTER TABLE quotation_bank_contact_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);",
@@ -983,6 +985,14 @@ def configure_app_instance(fastapi_app: FastAPI):
             sync_pending_scheduled_releases_on_startup(scheduler, SessionLocal)
         except Exception as rel_err:
             logger.warning(f"Startup sync of scheduled RFQ releases encountered error: {rel_err}")
+
+        # Catch up any expired pending approvals missed while server was offline
+        try:
+            with SessionLocal() as timeout_db:
+                await app_background_tasks.run_daily_auto_reject_expired_requests(timeout_db)
+                await app_background_tasks.run_daily_issuance_approval_timeout(timeout_db)
+        except Exception as timeout_err:
+            logger.warning(f"Startup sweep of expired approval requests encountered error: {timeout_err}")
 
         from app.core.ai_integration import _reclaim_system_memory
         _reclaim_system_memory()

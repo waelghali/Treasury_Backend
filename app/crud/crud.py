@@ -316,6 +316,7 @@ crud_reports = CRUDReports(
 )
 
 crud_system_notification = CRUDSystemNotification(models.SystemNotification)
+crud_notification = crud_system_notification
 crud_system_notification_view_log = CRUDSystemNotificationViewLog(models.SystemNotificationViewLog)
 crud_trial_registration = CRUDTrialRegistration(models.TrialRegistration)
 crud_legal_artifact = CRUDLegalArtifact(models.LegalArtifact)

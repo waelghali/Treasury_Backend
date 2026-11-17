@@ -411,7 +411,6 @@ class CRUDClassificationTaxonomy(CRUDBase):
             description=node_in.description,
             order_index=node_in.order_index,
             is_active=True,
-            created_by=user_id
         )
         db.add(db_obj)
         db.commit()
@@ -421,7 +420,6 @@ class CRUDClassificationTaxonomy(CRUDBase):
     def update_node(self, db: Session, db_obj: ClassificationTaxonomy, node_in: TaxonomyNodeUpdate, user_id: int) -> ClassificationTaxonomy:
         for field, value in node_in.model_dump(exclude_unset=True).items():
             setattr(db_obj, field, value)
-        db_obj.updated_by = user_id
         db.commit()
         db.refresh(db_obj)
         return db_obj

@@ -124,6 +124,27 @@ def check_for_read_only_mode(
         )
     return current_user
 
+# Approver-compatible subscription checks (allows both CORPORATE_ADMIN and CHECKER roles)
+def check_approver_subscription_status(
+    current_user: TokenData = Depends(get_current_approver_context)
+):
+    if current_user.subscription_status == SubscriptionStatus.EXPIRED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Subscription is expired. Access is denied. Please contact the system owner to renew."
+        )
+    return current_user
+
+def check_approver_for_read_only_mode(
+    current_user: TokenData = Depends(check_approver_subscription_status)
+):
+    if current_user.subscription_status == SubscriptionStatus.GRACE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Subscription is in grace period. Write operations are disabled. Access is read-only."
+        )
+    return current_user
+
 # --- Corporate Admin API Status ---
 @router.get("/status", dependencies=[Depends(check_subscription_status)])
 def get_corporate_admin_status(
@@ -139,7 +160,7 @@ def get_corporate_admin_status(
 @router.get("/dashboard-metrics", response_model=Dict[str, Any], dependencies=[Depends(check_subscription_status)])
 def get_dashboard_metrics(
     db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(HasPermission("corporate_admin:view_dashboard"))
+    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
     Retrieves key metrics for the Corporate Admin dashboard, providing an overview of their organization's status.
@@ -157,8 +178,9 @@ def get_dashboard_metrics(
         LGCategory.customer_id == customer_id,
         LGCategory.is_deleted == False
     ).count()
-    total_universal_categories = db.query(UniversalCategory).filter(
-        UniversalCategory.is_deleted == False
+    total_universal_categories = db.query(LGCategory).filter(
+        LGCategory.customer_id.is_(None),
+        LGCategory.is_deleted == False
     ).count()
     total_lg_categories = total_customer_categories + total_universal_categories
 
@@ -1650,7 +1672,7 @@ def restore_customer_email_settings(
 @router.get(
     "/approval-requests/",
     response_model=List[ApprovalRequestOut],
-    dependencies=[Depends(check_subscription_status)],
+    dependencies=[Depends(check_approver_subscription_status)],
     summary="List approval requests for the Corporate Admin's customer"
 )
 def list_approval_requests(
@@ -1682,7 +1704,7 @@ def list_approval_requests(
 @router.get(
     "/approval-requests/{request_id}",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(check_subscription_status)],
+    dependencies=[Depends(check_approver_subscription_status)],
     summary="Get details of a specific approval request"
 )
 def get_approval_request_details(
@@ -1707,7 +1729,7 @@ def get_approval_request_details(
 @router.post(
     "/approval-requests/{request_id}/approve",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(check_for_read_only_mode)],
+    dependencies=[Depends(check_approver_for_read_only_mode)],
     summary="Approve a pending approval request"
 )
 async def approve_approval_request(
@@ -1762,7 +1784,7 @@ async def approve_approval_request(
 @router.post(
     "/approval-requests/{request_id}/reject",
     response_model=ApprovalRequestOut,
-    dependencies=[Depends(check_for_read_only_mode)],
+    dependencies=[Depends(check_approver_for_read_only_mode)],
     summary="Reject a pending approval request"
 )
 def reject_approval_request(
@@ -2709,6 +2731,7 @@ def approve_quotation_request(
                 has_execution = any(c.get("role") == "EXECUTION" for c in contacts)
 
                 bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                from app.services.unified_email_builder import build_quotation_rfq_bank_email
 
                 if assignment.approval_status == "PENDING" and has_approver and has_execution:
                     # Bank Approver authorization needed
@@ -2868,6 +2891,7 @@ def approve_quotation_cancellation(
 
             if target_emails:
                 bank_display_name = bank_row.bank.name if bank_row.bank else "Bank Partner"
+                from app.services.unified_email_builder import build_quotation_rfq_bank_email
                 subject, body = build_quotation_withdrawn_bank_email(
                     rfq=rfq,
                     bank_name=bank_display_name,

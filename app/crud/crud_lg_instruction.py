@@ -241,6 +241,7 @@ class CRUDLGInstruction(CRUDBase):
              logger.warning(f"[CRUDLGInstruction.record_instruction_delivery] Delivery date already set for instruction {instruction_id}. Overwriting.")
         db_instruction.delivery_date = obj_in.delivery_date
         db_instruction.status = "Instruction Delivered"
+        db_instruction.sent_to_bank = True
         db.add(db_instruction)
         db.flush()
 

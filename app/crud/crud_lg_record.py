@@ -948,7 +948,7 @@ class CRUDLGRecord(CRUDBase):
 
         total_original_documents = db.query(models.LGDocument).filter(
             models.LGDocument.lg_record_id == lg_record.id,
-            models.LGDocument.document_type == "ORIGINAL_BANK_DOCUMENT",
+            models.LGDocument.document_type.in_(["ORIGINAL_BANK_DOCUMENT", "Original LG", "LG_SCAN"]),
             models.LGDocument.is_deleted == False
         ).count()
         pending_replies_count = db.query(models.LGInstruction).filter(
@@ -1236,7 +1236,7 @@ class CRUDLGRecord(CRUDBase):
 
         total_original_documents = db.query(models.LGDocument).filter(
             models.LGDocument.lg_record_id == lg_record.id,
-            models.LGDocument.document_type == "ORIGINAL_BANK_DOCUMENT",
+            models.LGDocument.document_type.in_(["ORIGINAL_BANK_DOCUMENT", "Original LG", "LG_SCAN"]),
             models.LGDocument.is_deleted == False
         ).count()
         pending_replies_count = db.query(models.LGInstruction).filter(

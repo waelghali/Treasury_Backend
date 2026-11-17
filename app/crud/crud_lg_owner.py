@@ -419,7 +419,10 @@ class CRUDLGOwner(CRUDBase):
 
                 if not lgs_to_update:
                     logger.warning(f"[{self.__class__.__name__}.change_lg_internal_owner_single_or_bulk] No active LG Records found for the specified old owner to perform bulk change.")
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No active LG records found for old internal owner '{old_owner_contact.email}'.")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot change owner: '{old_owner_contact.email}' currently has 0 LG records in their ownership.",
+                    )
 
                 logger.debug(f"[{self.__class__.__name__}.change_lg_internal_owner_single_or_bulk] Found {len(lgs_to_update)} LGs to update for bulk change.")
                 for lg_record in lgs_to_update:

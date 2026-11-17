@@ -229,9 +229,16 @@ class IssuanceRequestDraftCreate(BaseModel):
     custom_field_1_value: Optional[str] = None
     custom_field_2_value: Optional[str] = None
 
-class IssuanceRequestUpdate(IssuanceRequestBase):
-    __annotations__ = {k: Optional[v] for k, v in IssuanceRequestBase.__annotations__.items()}
-    __annotations__['change_reason'] = Optional[str]
+class IssuanceRequestUpdate(IssuanceRequestDraftCreate):
+    department: Optional[str] = None
+    expiry_type: Optional[str] = None
+    is_open_ended: Optional[bool] = None
+    lg_language: Optional[str] = None
+    is_auto_reducing: Optional[bool] = None
+    is_third_party: Optional[bool] = None
+    is_cross_border: Optional[bool] = None
+    requires_special_wording: Optional[bool] = None
+    is_urgent: Optional[bool] = None
     change_reason: Optional[str] = None
 
 class CorporateProjectOut(BaseModel):

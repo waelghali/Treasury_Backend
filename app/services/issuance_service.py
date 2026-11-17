@@ -96,7 +96,7 @@ class IssuanceService:
             func.coalesce(func.sum(IssuedLGRecord.current_amount), 0)
         ).filter(
             IssuedLGRecord.facility_sub_limit_id == sub_limit.id,
-            IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING"])
+            IssuedLGRecord.status.in_(["ACTIVE", "INTERNAL_PROCESSING", "PENDING_CLOSE"])
         ).group_by(IssuedLGRecord.currency_id).all()
 
         lg_used_fac_ccy = Decimal("0")
@@ -118,11 +118,12 @@ class IssuanceService:
             func.coalesce(func.sum(IssuanceExposureEntry.facility_equivalent_delta), 0)
         ).filter(
             IssuanceExposureEntry.sub_limit_id == sub_limit.id,
+            IssuanceExposureEntry.entry_type == "RESERVATION",
             IssuanceExposureEntry.is_active == True
         ).scalar()
         pending_dec = Decimal(str(pending_exposure or 0))
 
-        base_used = max(lg_used_fac_ccy, pending_dec)
+        base_used = lg_used_fac_ccy + pending_dec
         init_util = Decimal(str(getattr(sub_limit, "initial_utilization", 0) or 0))
         return base_used + init_util
 
@@ -914,6 +915,43 @@ class IssuanceService:
             raise HTTPException(status_code=404, detail="Request not found")
         if request.status != "PENDING_APPROVAL":
             raise HTTPException(status_code=400, detail="Request is not pending approval")
+
+        # Enforce APPROVAL_REQUEST_MAX_PENDING_DAYS at approval time
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        from app.core.background_tasks import _resolve_max_pending_days, _coerce_utc
+        max_days = _resolve_max_pending_days(db, request.customer_id, {})
+        ref_ts = _coerce_utc(request.updated_at) or _coerce_utc(request.created_at)
+        now_utc = _dt.now(_tz.utc)
+        if max_days and ref_ts and ref_ts < now_utc - _td(days=max_days):
+            expired_approvers = [int(x) for x in (request.pending_approver_users or [])]
+            reason_msg = f"Request automatically rejected as it exceeded the maximum pending duration of {max_days} days."
+            request.status = "REJECTED"
+            request.pending_approver_users = []
+            request.signatures_collected = 0
+            request.revision_notes = reason_msg
+            audit = list(request.approval_chain_audit or [])
+            audit.append({
+                "action": "AUTO_REJECTED_EXPIRED",
+                "step": request.current_approval_step,
+                "notes": reason_msg,
+                "reason": reason_msg,
+                "expired_approver_user_ids": expired_approvers,
+                "timestamp": now_utc.isoformat(),
+            })
+            request.approval_chain_audit = audit
+            flag_modified(request, "approval_chain_audit")
+            db.add(request)
+            log_action(
+                db, user_id=None, action_type="ISSUANCE_REQUEST_AUTO_REJECTED",
+                entity_type="IssuanceRequest", entity_id=request.id,
+                details={"serial_number": request.serial_number, "max_days": max_days, "reason": reason_msg},
+                customer_id=request.customer_id,
+            )
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=f"This issuance request has expired (exceeded {max_days}-day approval window) and was automatically rejected.",
+            )
             
         # 1. Verify Authorization (type-safe: cast JSONB values to int)
         allowed_users = [int(uid) for uid in (request.pending_approver_users or [])]
@@ -2446,14 +2484,14 @@ class IssuanceService:
                             detail=f"Amount exceeds maximum per LG ({float(sub_limit.max_amount_per_lg):,.2f}) for this sub-limit."
                         )
 
-                    # Create Exposure Entry (RESERVATION)
+                    # Create Exposure Entry (ISSUANCE)
                     from datetime import date as date_cls
 
                     exposure_entry = IssuanceExposureEntry(
                         facility_id=sub_limit.facility_id,
                         sub_limit_id=sub_limit_id,
                         request_id=request_id,
-                        entry_type="RESERVATION",
+                        entry_type="ISSUANCE",
                         original_amount_delta=request.amount,
                         original_currency_id=request.currency_id,
                         fx_rate_used=fx_rate,
@@ -2530,6 +2568,17 @@ class IssuanceService:
             )
             db.add(new_lg_record)
             db.flush()  # Get the ID
+
+            # Promote any active RESERVATION exposure entries for this request to ISSUANCE and bind lg_record_id
+            active_req_exposures = db.query(IssuanceExposureEntry).filter(
+                IssuanceExposureEntry.request_id == request_id,
+                IssuanceExposureEntry.is_active == True,
+            ).all()
+            for exp_row in active_req_exposures:
+                if exp_row.entry_type == "RESERVATION":
+                    exp_row.entry_type = "ISSUANCE"
+                exp_row.lg_record_id = new_lg_record.id
+            db.flush()
 
             # --- STEP 5b: Generate Internal Serial Number ---
             try:

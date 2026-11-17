@@ -201,13 +201,16 @@ def get_my_approval_history(
             if not is_admin:
                 continue
         else:
-            # For completed/rejected: show only if this user participated in the audit trail
+            # For completed/rejected/expired: show if this user participated or was an assigned approver when it expired
             audit = req.approval_chain_audit or []
             participated = any(
-                entry.get("user_id") == uid
+                (
+                    entry.get("user_id") == uid
+                    or uid in [int(x) for x in (entry.get("expired_approver_user_ids") or [])]
+                )
                 for entry in audit
                 if isinstance(entry, dict) and entry.get("action") in (
-                    "APPROVED_STEP", "REJECTED", "REVISION_REQUIRED", "EDIT_RESOLVED", "CANCELLATION_RESOLVED"
+                    "APPROVED_STEP", "REJECTED", "REVISION_REQUIRED", "EDIT_RESOLVED", "CANCELLATION_RESOLVED", "AUTO_REJECTED_EXPIRED"
                 )
             )
             if not participated:

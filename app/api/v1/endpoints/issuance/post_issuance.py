@@ -2179,10 +2179,11 @@ def get_maintenance_approval_history(
             if uid not in approvers:
                 continue
         else:
-            # For completed/rejected/executed: only show if user participated
+            # For completed/rejected/executed/expired: show if user participated OR was an assigned approver when it expired
             history = a.approval_history or []
             participated = any(
                 entry.get("user_id") == uid
+                or uid in [int(x) for x in (entry.get("expired_approver_user_ids") or [])]
                 for entry in history
                 if isinstance(entry, dict)
             )

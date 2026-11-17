@@ -679,8 +679,8 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
         }
 
     # base_kind == "M"
-    from app.models.models_issuance import IssuedLGMaintenanceAction
-    maint = db.query(IssuedLGMaintenanceAction).filter(IssuedLGMaintenanceAction.id == record_id).first()
+    from app.models.models_issuance import IssuanceMaintenanceAction
+    maint = db.query(IssuanceMaintenanceAction).filter(IssuanceMaintenanceAction.id == record_id).first()
     if not maint:
         return {"valid_token": False, "reason": "Maintenance instruction record not found."}
     db_ts = _to_epoch_seconds(getattr(maint, "created_at", None))
@@ -1013,18 +1013,18 @@ def verify_instruction_with_code(
             "delivery_status": delivery_info,
         }
 
-    # kind == "M" (IssuedLGMaintenanceAction)
-    from app.models.models_issuance import IssuedLGMaintenanceAction, IssuedLGRecord
+    # kind == "M" (IssuanceMaintenanceAction)
+    from app.models.models_issuance import IssuanceMaintenanceAction, IssuedLGRecord
     from sqlalchemy.orm import selectinload
 
     maint = (
-        db.query(IssuedLGMaintenanceAction)
+        db.query(IssuanceMaintenanceAction)
         .options(
-            selectinload(IssuedLGMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.currency),
-            selectinload(IssuedLGMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.bank),
-            selectinload(IssuedLGMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.customer),
+            selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.currency),
+            selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.bank),
+            selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.customer),
         )
-        .filter(IssuedLGMaintenanceAction.id == record_id)
+        .filter(IssuanceMaintenanceAction.id == record_id)
         .first()
     )
     if not maint or not maint.issued_lg:
@@ -1064,10 +1064,11 @@ def verify_instruction_with_code(
     issue_dt = getattr(maint, "created_at", None)
     issue_date_str = issue_dt.strftime("%d-%b-%Y") if isinstance(issue_dt, datetime) else "N/A"
 
+    is_canceled_maint = (maint.status or "").upper() in ("CANCELLED", "CANCELED", "REJECTED")
     return {
         "verified": True,
-        "status_category": "VALID",
-        "status_label": maint.status or "Executed",
+        "status_category": "CANCELED" if is_canceled_maint else "VALID",
+        "status_label": "CANCELED / REVOKED — Do Not Execute" if is_canceled_maint else (maint.status or "Executed"),
         "instruction_serial": maint.letter_serial_number,
         "action_type": f"LG {(maint.action_type or '').replace('_', ' ').title()}",
         "issue_date": issue_date_str,
@@ -1078,6 +1079,6 @@ def verify_instruction_with_code(
         "lg_amount_formatted": amt_str,
         "authorized_parameter_label": "Maintenance Action",
         "authorized_parameter_value": (maint.action_type or "").replace("_", " ").title(),
-        "delivery_status": maint.delivery_status or "Issued",
+        "delivery_status": maint.instruction_status or "Instruction Issued",
     }
 
