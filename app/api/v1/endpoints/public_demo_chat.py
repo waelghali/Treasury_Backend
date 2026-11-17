@@ -9,7 +9,10 @@ Public AI Product Expert Chat Endpoint (`/api/v1/public-demo/chat`).
   for reviewing real anonymous prospect questions.
 """
 
-from typing import Any, Dict, List, Optional
+import threading
+import time
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -18,10 +21,48 @@ from app.core.security import TokenData, get_current_system_owner
 from app.services.public_product_expert_service import (
     ask_public_product_expert,
     detect_response_language,
+    hash_client_ip,
     public_demo_chat_logger,
 )
 
 router = APIRouter()
+
+_ALLOWED_TELEMETRY_EVENTS = {
+    "page_view",
+    "story_start",
+    "story_complete",
+    "module_expand",
+    "tour_open",
+    "foundation_open",
+    "chatbot_open",
+    "cta_click",
+    "lang_switch",
+}
+
+_TELEMETRY_BURST_PER_MIN = 120
+_telemetry_ip_buckets: Dict[str, Deque[float]] = {}
+_telemetry_lock = threading.Lock()
+
+
+def _allow_telemetry_write(ip_hash: str) -> bool:
+    """Silent anti-flood shield for `/telemetry` (120 events/min/IP) so bots cannot bloat disk."""
+    now = time.monotonic()
+    cutoff = now - 60.0
+    with _telemetry_lock:
+        if len(_telemetry_ip_buckets) > 4000:
+            stale = [k for k, dq in _telemetry_ip_buckets.items() if not dq or dq[-1] < cutoff]
+            for k in stale:
+                _telemetry_ip_buckets.pop(k, None)
+        dq = _telemetry_ip_buckets.get(ip_hash)
+        if dq is None:
+            dq = deque()
+            _telemetry_ip_buckets[ip_hash] = dq
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= _TELEMETRY_BURST_PER_MIN:
+            return False
+        dq.append(now)
+        return True
 
 
 def _extract_client_ip(request: Request) -> str:
@@ -33,6 +74,14 @@ def _extract_client_ip(request: Request) -> str:
     if request.client and request.client.host:
         return request.client.host[:64]
     return "unknown"
+
+
+def _extract_country_header(request: Request) -> str:
+    for hdr in ("cf-ipcountry", "x-appengine-country", "x-country-code", "x-geo-country"):
+        val = (request.headers.get(hdr) or "").strip()
+        if val and len(val) <= 8:
+            return val.upper()
+    return ""
 
 
 # ==============================================================================
@@ -133,6 +182,59 @@ async def public_product_expert_chat(
     )
 
 
+class PublicTelemetryEventRequest(BaseModel):
+    event_type: str = Field(default="page_view")
+    session_id: Optional[str] = Field(default="anon")
+    visitor_id: Optional[str] = Field(default="")
+    page: Optional[str] = Field(default="")
+    path: Optional[str] = Field(default="")
+    referrer_source: Optional[str] = Field(default="Direct")
+    utm_campaign: Optional[str] = Field(default="")
+    device_type: Optional[str] = Field(default="desktop")
+    lang: Optional[str] = Field(default="en")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+
+@router.post("/telemetry")
+def record_public_telemetry_event(
+    payload: PublicTelemetryEventRequest,
+    request: Request,
+) -> Dict[str, bool]:
+    """
+    Lightweight, zero-cookie first-party event beacon for `/`, `/demo`, `/know-more`,
+    and `/free-trial-register`. Runs in FastAPI threadpool (never blocking asyncio loop),
+    never touches customer DB tables, and never stores raw IPs.
+    """
+    evt = (payload.event_type or "").strip().lower()
+    if evt not in _ALLOWED_TELEMETRY_EVENTS:
+        return {"ok": False}
+
+    client_ip = _extract_client_ip(request)
+    ip_hash = hash_client_ip(client_ip)
+    if not _allow_telemetry_write(ip_hash):
+        return {"ok": True}
+
+    user_agent = request.headers.get("user-agent", "")[:200]
+    country = _extract_country_header(request)
+
+    public_demo_chat_logger.log_telemetry_event(
+        event_type=evt,
+        session_id=(payload.session_id or "anon")[:64],
+        visitor_id=(payload.visitor_id or "")[:64],
+        page=(payload.page or "")[:40],
+        path=(payload.path or "")[:160],
+        referrer_source=(payload.referrer_source or "Direct")[:80],
+        utm_campaign=(payload.utm_campaign or "")[:80],
+        device_type=(payload.device_type or "desktop")[:20],
+        lang=(payload.lang or "en")[:8],
+        country=country,
+        metadata=payload.metadata if isinstance(payload.metadata, dict) else {},
+        ip_hash=ip_hash,
+        user_agent=user_agent,
+    )
+    return {"ok": True}
+
+
 @router.get("/admin/logs")
 def get_public_demo_chat_logs(
     days: int = Query(default=14, ge=1, le=90),
@@ -144,3 +246,22 @@ def get_public_demo_chat_logs(
     collected from `/` and `/demo`.
     """
     return public_demo_chat_logger.read_recent_logs(days=days, limit=limit)
+
+
+@router.get("/admin/analytics")
+def get_public_website_and_demo_analytics(
+    days: int = Query(default=14, ge=1, le=90),
+    chat_limit: int = Query(default=300, ge=1, le=500),
+    session_limit: int = Query(default=150, ge=1, le=300),
+    current_owner: TokenData = Depends(get_current_system_owner),
+) -> Dict[str, Any]:
+    """
+    System-Owner-only unified analytics endpoint returning Website Visits,
+    Demo Story & Workflow Engagement, AI Chatbot Conversion & Q&A Inbox,
+    and Visitor Session Journeys.
+    """
+    return public_demo_chat_logger.compute_public_analytics(
+        days=days,
+        chat_limit=chat_limit,
+        session_limit=session_limit,
+    )

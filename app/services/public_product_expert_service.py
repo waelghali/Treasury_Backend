@@ -642,17 +642,63 @@ def validate_and_hydrate_actions(raw_actions: Any, lang: str = "en") -> List[Dic
 
 
 # ==============================================================================
-# 5. ANONYMOUS PROSPECT QUESTION LOGGER (LOCAL JSONL + TXT + ASYNC GCS)
+# 5. FIRST-PARTY TELEMETRY & PROSPECT QUESTION LOGGER (LOCAL JSONL + ASYNC GCS)
 # ==============================================================================
+
+_BOT_UA_RE = re.compile(
+    r"(googlebot|bingbot|slurp|duckduckbot|baiduspider|yandexbot|ahrefsbot|semrushbot|"
+    r"mj12bot|dotbot|bytespider|petalbot|facebookexternalhit|linkedinbot|twitterbot|"
+    r"whatsapp|telegrambot|discordbot|uptimerobot|pingdom|headlesschrome|phantomjs|"
+    r"python-urllib|python-requests|curl/|wget/|go-http-client)",
+    re.IGNORECASE,
+)
+
+_MODULE_DISPLAY_LABELS = {
+    "custody": "01 · LG Custody (Inbound)",
+    "issuance": "02 · LG Issuance (Outbound)",
+    "quotations": "03 · FX & T-Bill Quotations",
+    "reconciliation": "04 · Bank Auto-Reconciliation",
+}
+
+_STORY_DISPLAY_LABELS = {
+    "platform_intro": "65s Full Platform Intro",
+    "custody": "75s LG Custody Story",
+    "issuance": "75s LG Issuance Story",
+    "quotations": "75s FX & T-Bill Story",
+    "reconciliation": "75s Bank Auto-Recon Story",
+}
+
+_PAGE_DISPLAY_LABELS = {
+    "landing": "Main Website (/)",
+    "demo": "Interactive Demo (/demo)",
+    "know_more": "Platform Overview (/know-more)",
+    "free_trial": "Free Trial Page (/free-trial-register)",
+}
+
+
+def is_bot_user_agent(ua: str) -> bool:
+    if not ua:
+        return False
+    return bool(_BOT_UA_RE.search(ua))
+
+
+_MAX_DAILY_EVENTS_BYTES = 15 * 1024 * 1024  # 15 MB/day hard disk-safety ceiling
+
 
 class PublicDemoChatLogger:
     """
-    Logs every public visitor question & AI response locally (JSONL + readable TXT)
-    and syncs asynchronously to GCS so the founder can inspect real prospect questions.
+    Logs anonymous public website/demo telemetry events + AI Product Expert Q&A
+    locally (`private_storage/public_demo_chat_logs/`) and syncs asynchronously to GCS,
+    with single-call manifest GCS hydration so Cloud Run restarts keep full history with zero latency spikes.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._gcs_checked_at: Dict[str, float] = {}
+        self._gcs_remote_files: Optional[set] = None
+        self._gcs_manifest_ts: float = 0.0
+        self._pending_event_dates: set = set()
+        self._event_sync_scheduled: bool = False
         self._ensure_dir()
 
     def _ensure_dir(self) -> None:
@@ -660,6 +706,212 @@ class PublicDemoChatLogger:
             os.makedirs(PUBLIC_CHAT_LOG_DIR, exist_ok=True)
         except Exception as exc:
             logger.warning(f"Could not create public demo chat log dir: {exc}")
+
+    def _get_gcs_bucket(self):
+        import socket
+        try:
+            socket.gethostbyname("oauth2.googleapis.com")
+        except Exception:
+            return None
+
+        from google.cloud import storage
+
+        bucket_name = os.getenv("GCS_BUCKET_NAME", "")
+        if not bucket_name:
+            return None
+
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip("'\"")
+        if credentials_path and os.path.exists(credentials_path):
+            client = storage.Client.from_service_account_json(credentials_path)
+        else:
+            client = storage.Client()
+        return client.bucket(bucket_name)
+
+    def _get_gcs_remote_filenames(self, bucket) -> set:
+        """Fetches the list of existing GCS log filenames in 1 single API call (cached 10 min)."""
+        now_mono = time.monotonic()
+        if self._gcs_remote_files is not None and (now_mono - self._gcs_manifest_ts) < 600.0:
+            return self._gcs_remote_files
+        try:
+            prefix = "public_demo_chat_logs/"
+            names = {
+                b.name[len(prefix):]
+                for b in bucket.list_blobs(prefix=prefix, timeout=4)
+                if b.name.startswith(prefix)
+            }
+            self._gcs_remote_files = names
+            self._gcs_manifest_ts = now_mono
+            return names
+        except Exception:
+            self._gcs_remote_files = set()
+            self._gcs_manifest_ts = now_mono
+            return set()
+
+    def _hydrate_local_file_from_gcs_if_missing(self, filename: str, local_path: str) -> None:
+        """If a daily JSONL file does not exist locally, pull from GCS only if present in the cached manifest."""
+        if os.path.exists(local_path):
+            return
+        now_mono = time.monotonic()
+        last_check = self._gcs_checked_at.get(filename, 0.0)
+        if now_mono - last_check < 600.0:
+            return
+        self._gcs_checked_at[filename] = now_mono
+
+        try:
+            bucket = self._get_gcs_bucket()
+            if bucket is None:
+                return
+            remote_names = self._get_gcs_remote_filenames(bucket)
+            if filename not in remote_names:
+                return
+            blob = bucket.blob(f"public_demo_chat_logs/{filename}")
+            remote_text = blob.download_as_text(encoding="utf-8", timeout=5)
+            if remote_text and remote_text.strip():
+                with self._lock:
+                    if not os.path.exists(local_path):
+                        with open(local_path, "w", encoding="utf-8") as f:
+                            f.write(remote_text if remote_text.endswith("\n") else remote_text + "\n")
+        except Exception as exc:
+            logger.debug(f"GCS hydration skipped for {filename}: {exc}")
+
+    def log_telemetry_event(
+        self,
+        *,
+        event_type: str,
+        session_id: str,
+        visitor_id: str = "",
+        page: str = "",
+        path: str = "",
+        referrer_source: str = "Direct",
+        utm_campaign: str = "",
+        device_type: str = "desktop",
+        lang: str = "en",
+        country: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        ip_hash: str = "",
+        user_agent: str = "",
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime("%Y-%m-%d")
+        timestamp_iso = now.isoformat()
+        event_id = hashlib.sha1(
+            f"{timestamp_iso}:{session_id}:{event_type}:{os.urandom(4).hex()}".encode("utf-8")
+        ).hexdigest()[:16]
+
+        safe_meta: Dict[str, Any] = {}
+        if isinstance(metadata, dict):
+            for k, v in list(metadata.items())[:12]:
+                safe_key = str(k)[:40]
+                if isinstance(v, (int, float, bool)):
+                    safe_meta[safe_key] = v
+                elif v is not None:
+                    safe_meta[safe_key] = str(v)[:120]
+
+        payload = {
+            "event_id": event_id,
+            "timestamp": timestamp_iso,
+            "event_type": (event_type or "page_view")[:40],
+            "session_id": (session_id or "anon")[:64],
+            "visitor_id": (visitor_id or session_id or ip_hash or "anon")[:64],
+            "page": (page or "")[:40],
+            "path": (path or "")[:160],
+            "referrer_source": (referrer_source or "Direct")[:80],
+            "utm_campaign": (utm_campaign or "")[:80],
+            "device_type": (device_type or "desktop")[:20],
+            "lang": "ar" if (lang or "").lower().startswith("ar") else "en",
+            "country": (country or "")[:8].upper(),
+            "metadata": safe_meta,
+            "ip_hash": ip_hash,
+            "is_bot": is_bot_user_agent(user_agent),
+        }
+
+        try:
+            self._ensure_dir()
+            events_path = os.path.join(PUBLIC_CHAT_LOG_DIR, f"public_events_{date_str}.jsonl")
+            with self._lock:
+                if os.path.exists(events_path) and os.path.getsize(events_path) >= _MAX_DAILY_EVENTS_BYTES:
+                    return
+                with open(events_path, "a", encoding="utf-8") as ef:
+                    ef.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                self._pending_event_dates.add(date_str)
+                should_spawn = not self._event_sync_scheduled
+                if should_spawn:
+                    self._event_sync_scheduled = True
+
+            if should_spawn:
+                timer = threading.Timer(12.0, self._flush_pending_events_to_gcs)
+                timer.daemon = True
+                timer.start()
+        except Exception as exc:
+            logger.debug(f"Failed writing local public telemetry event: {exc}")
+
+    def _flush_pending_events_to_gcs(self) -> None:
+        with self._lock:
+            dates_to_sync = list(self._pending_event_dates)
+            self._pending_event_dates.clear()
+            self._event_sync_scheduled = False
+
+        if not dates_to_sync:
+            return
+
+        try:
+            bucket = self._get_gcs_bucket()
+            if bucket is None:
+                return
+
+            for date_str in dates_to_sync:
+                filename = f"public_events_{date_str}.jsonl"
+                local_path = os.path.join(PUBLIC_CHAT_LOG_DIR, filename)
+                if not os.path.exists(local_path):
+                    continue
+
+                with self._lock:
+                    with open(local_path, "r", encoding="utf-8") as lf:
+                        local_lines = [ln.strip() for ln in lf if ln.strip()]
+
+                blob = bucket.blob(f"public_demo_chat_logs/{filename}")
+                merged_by_id: Dict[str, str] = {}
+                ordered_lines: List[str] = []
+
+                if blob.exists(timeout=3):
+                    remote_text = blob.download_as_text(encoding="utf-8", timeout=5)
+                    for rline in remote_text.splitlines():
+                        rline = rline.strip()
+                        if not rline:
+                            continue
+                        try:
+                            robj = json.loads(rline)
+                            eid = robj.get("event_id") or rline[:48]
+                            if eid not in merged_by_id:
+                                merged_by_id[eid] = rline
+                                ordered_lines.append(rline)
+                        except Exception:
+                            pass
+
+                new_added = 0
+                for lline in local_lines:
+                    try:
+                        lobj = json.loads(lline)
+                        eid = lobj.get("event_id") or lline[:48]
+                        if eid not in merged_by_id:
+                            merged_by_id[eid] = lline
+                            ordered_lines.append(lline)
+                            new_added += 1
+                    except Exception:
+                        pass
+
+                if new_added > 0 or not blob.exists(timeout=3):
+                    merged_body = "\n".join(ordered_lines) + "\n"
+                    blob.upload_from_string(
+                        merged_body,
+                        content_type="application/x-jsonlines",
+                        timeout=6,
+                    )
+                    with self._lock:
+                        with open(local_path, "w", encoding="utf-8") as wf:
+                            wf.write(merged_body)
+        except Exception as exc:
+            logger.debug(f"Public telemetry GCS batch sync skipped: {exc}")
 
     def log_exchange(
         self,
@@ -744,25 +996,10 @@ class PublicDemoChatLogger:
 
     def _sync_to_gcs_background(self, date_str: str, payload: Dict[str, Any]) -> None:
         try:
-            import socket
-            try:
-                socket.gethostbyname("oauth2.googleapis.com")
-            except Exception:
+            bucket = self._get_gcs_bucket()
+            if bucket is None:
                 return
 
-            from google.cloud import storage
-
-            bucket_name = os.getenv("GCS_BUCKET_NAME", "")
-            if not bucket_name:
-                return
-
-            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip("'\"")
-            if credentials_path and os.path.exists(credentials_path):
-                client = storage.Client.from_service_account_json(credentials_path)
-            else:
-                client = storage.Client()
-
-            bucket = client.bucket(bucket_name)
             blob_name = f"public_demo_chat_logs/public_chat_{date_str}.jsonl"
             blob = bucket.blob(blob_name)
             new_line = json.dumps(payload, ensure_ascii=False) + "\n"
@@ -795,7 +1032,9 @@ class PublicDemoChatLogger:
 
         for offset in range(days):
             d_str = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
-            j_path = os.path.join(PUBLIC_CHAT_LOG_DIR, f"public_chat_{d_str}.jsonl")
+            fname = f"public_chat_{d_str}.jsonl"
+            j_path = os.path.join(PUBLIC_CHAT_LOG_DIR, fname)
+            self._hydrate_local_file_from_gcs_if_missing(fname, j_path)
             if not os.path.exists(j_path):
                 continue
             try:
@@ -819,6 +1058,494 @@ class PublicDemoChatLogger:
             "days": days,
             "topic_breakdown": topic_counts,
             "entries": entries,
+        }
+
+    def compute_public_analytics(
+        self,
+        days: int = 14,
+        chat_limit: int = 300,
+        session_limit: int = 150,
+    ) -> Dict[str, Any]:
+        """
+        Aggregates Website Visits, Demo Engagement (Stories & 15 Workflows),
+        AI Chatbot Usage, High-Intent Conversions, Unified Visitor Journeys,
+        and Full Searchable AI Q&A Transcripts across the requested day window.
+        """
+        self._ensure_dir()
+        days = max(1, min(days, 90))
+        chat_limit = max(1, min(chat_limit, 500))
+        session_limit = max(1, min(session_limit, 300))
+
+        now = datetime.now(timezone.utc)
+        date_keys = [
+            (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in reversed(range(days))
+        ]
+
+        daily_visitors: Dict[str, set] = {d: set() for d in date_keys}
+        daily_demo_visitors: Dict[str, set] = {d: set() for d in date_keys}
+        daily_chat_questions: Dict[str, int] = {d: 0 for d in date_keys}
+
+        unique_visitors: set = set()
+        unique_sessions: set = set()
+        landing_visitors: set = set()
+        demo_visitors: set = set()
+        story_viewers: set = set()
+        story_completers: set = set()
+        workflow_explorers: set = set()
+        chatbot_openers: set = set()
+        chatbot_active_users: set = set()
+        high_intent_visitors: set = set()
+
+        total_pageviews = 0
+        bot_events_filtered = 0
+        meeting_submissions = 0
+        trial_submissions = 0
+        brochure_downloads = 0
+
+        page_views_count: Dict[str, int] = {k: 0 for k in _PAGE_DISPLAY_LABELS}
+        page_unique_visitors: Dict[str, set] = {k: set() for k in _PAGE_DISPLAY_LABELS}
+
+        module_stats: Dict[str, Dict[str, int]] = {
+            m: {"story_plays": 0, "story_completions": 0, "workflow_opens": 0, "chat_questions": 0}
+            for m in _MODULE_DISPLAY_LABELS
+        }
+        story_stats: Dict[str, Dict[str, int]] = {
+            s: {"plays": 0, "completions": 0}
+            for s in _STORY_DISPLAY_LABELS
+        }
+        workflow_opens: Dict[str, int] = {}
+
+        source_sessions: Dict[str, set] = {}
+        device_sessions: Dict[str, set] = {}
+        country_sessions: Dict[str, set] = {}
+        lang_sessions: Dict[str, set] = {"en": set(), "ar": set()}
+        topic_counts: Dict[str, int] = {}
+
+        sessions_map: Dict[str, Dict[str, Any]] = {}
+        chat_logs_newest_first: List[Dict[str, Any]] = []
+        total_chat_questions = 0
+
+        def _get_or_init_session(
+            sess_id: str,
+            vis_id: str,
+            ts: str,
+            source: str = "Direct",
+            device: str = "desktop",
+            lang_val: str = "en",
+            country_val: str = "",
+        ) -> Dict[str, Any]:
+            rec = sessions_map.get(sess_id)
+            if rec is None:
+                short_seed = vis_id if vis_id and vis_id != "anon" else sess_id
+                short_hash = hashlib.md5(short_seed.encode("utf-8")).hexdigest()[:6]
+                rec = {
+                    "session_id": sess_id,
+                    "visitor_id": vis_id,
+                    "short_id": f"#{short_hash}",
+                    "first_seen": ts,
+                    "last_seen": ts,
+                    "source": source or "Direct",
+                    "device": device or "desktop",
+                    "lang": "ar" if (lang_val or "").startswith("ar") else "en",
+                    "country": country_val or "",
+                    "pages_visited": [],
+                    "stories_played": [],
+                    "stories_completed": [],
+                    "tours_opened": [],
+                    "opened_chat": False,
+                    "chat_count": 0,
+                    "conversions": [],
+                }
+                sessions_map[sess_id] = rec
+            else:
+                if ts and ts < rec["first_seen"]:
+                    rec["first_seen"] = ts
+                if ts and ts > rec["last_seen"]:
+                    rec["last_seen"] = ts
+                if rec["source"] in ("", "Direct", "Unknown") and source and source not in ("Direct", "Unknown"):
+                    rec["source"] = source
+                if not rec["country"] and country_val:
+                    rec["country"] = country_val
+                if lang_val == "ar":
+                    rec["lang"] = "ar"
+            return rec
+
+        # 1. Read Telemetry Events (chronological oldest -> newest)
+        for d_str in date_keys:
+            ev_fname = f"public_events_{d_str}.jsonl"
+            ev_path = os.path.join(PUBLIC_CHAT_LOG_DIR, ev_fname)
+            self._hydrate_local_file_from_gcs_if_missing(ev_fname, ev_path)
+            if not os.path.exists(ev_path):
+                continue
+
+            try:
+                with open(ev_path, "r", encoding="utf-8") as ef:
+                    ev_lines = ef.readlines()
+                for raw_line in ev_lines:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        ev = json.loads(raw_line)
+                    except Exception:
+                        continue
+
+                    if ev.get("is_bot"):
+                        bot_events_filtered += 1
+                        continue
+
+                    etype = str(ev.get("event_type") or "")
+                    sess_id = str(ev.get("session_id") or "anon")
+                    vis_id = str(ev.get("visitor_id") or sess_id)
+                    if vis_id == "anon" and ev.get("ip_hash"):
+                        vis_id = f"ip_{ev['ip_hash']}"
+                    ts = str(ev.get("timestamp") or "")
+                    source = str(ev.get("referrer_source") or "Direct")
+                    device = str(ev.get("device_type") or "desktop").lower()
+                    lang_val = "ar" if str(ev.get("lang") or "").lower().startswith("ar") else "en"
+                    country_val = str(ev.get("country") or "").upper()
+                    meta = ev.get("metadata") if isinstance(ev.get("metadata"), dict) else {}
+
+                    unique_visitors.add(vis_id)
+                    unique_sessions.add(sess_id)
+                    if d_str in daily_visitors:
+                        daily_visitors[d_str].add(vis_id)
+
+                    source_sessions.setdefault(source, set()).add(sess_id)
+                    device_sessions.setdefault(device, set()).add(sess_id)
+                    lang_sessions.setdefault(lang_val, set()).add(sess_id)
+                    if country_val and country_val not in ("XX", "ZZ", "UNKNOWN"):
+                        country_sessions.setdefault(country_val, set()).add(sess_id)
+
+                    srec = _get_or_init_session(
+                        sess_id=sess_id,
+                        vis_id=vis_id,
+                        ts=ts,
+                        source=source,
+                        device=device,
+                        lang_val=lang_val,
+                        country_val=country_val,
+                    )
+
+                    if etype == "page_view":
+                        total_pageviews += 1
+                        pg = str(ev.get("page") or "landing")
+                        if pg not in page_views_count:
+                            path_val = str(ev.get("path") or "")
+                            if "/demo" in path_val:
+                                pg = "demo"
+                            elif "/know-more" in path_val:
+                                pg = "know_more"
+                            elif "/free-trial" in path_val:
+                                pg = "free_trial"
+                            else:
+                                pg = "landing"
+                        page_views_count[pg] = page_views_count.get(pg, 0) + 1
+                        page_unique_visitors.setdefault(pg, set()).add(vis_id)
+
+                        if pg not in srec["pages_visited"]:
+                            srec["pages_visited"].append(pg)
+                        if pg == "landing":
+                            landing_visitors.add(vis_id)
+                        elif pg == "demo":
+                            demo_visitors.add(vis_id)
+                            if d_str in daily_demo_visitors:
+                                daily_demo_visitors[d_str].add(vis_id)
+
+                    elif etype == "story_start":
+                        demo_visitors.add(vis_id)
+                        story_viewers.add(vis_id)
+                        if d_str in daily_demo_visitors:
+                            daily_demo_visitors[d_str].add(vis_id)
+                        sid = str(meta.get("story_id") or "")
+                        if sid in story_stats:
+                            story_stats[sid]["plays"] += 1
+                            if sid not in srec["stories_played"]:
+                                srec["stories_played"].append(sid)
+                        if sid in module_stats:
+                            module_stats[sid]["story_plays"] += 1
+
+                    elif etype == "story_complete":
+                        demo_visitors.add(vis_id)
+                        story_viewers.add(vis_id)
+                        story_completers.add(vis_id)
+                        sid = str(meta.get("story_id") or "")
+                        if sid in story_stats:
+                            story_stats[sid]["completions"] += 1
+                            if sid not in srec["stories_completed"]:
+                                srec["stories_completed"].append(sid)
+                        if sid in module_stats:
+                            module_stats[sid]["story_completions"] += 1
+
+                    elif etype == "module_expand":
+                        demo_visitors.add(vis_id)
+                        mid = str(meta.get("module_id") or "")
+                        if mid in module_stats:
+                            module_stats[mid]["workflow_opens"] += 1
+
+                    elif etype == "tour_open":
+                        demo_visitors.add(vis_id)
+                        workflow_explorers.add(vis_id)
+                        if d_str in daily_demo_visitors:
+                            daily_demo_visitors[d_str].add(vis_id)
+                        bid = str(meta.get("branch_id") or "")
+                        mid = str(meta.get("module_id") or "")
+                        if not mid and bid in SHOWCASE_TOURS:
+                            mid = SHOWCASE_TOURS[bid]["module_id"]
+                        if mid in module_stats:
+                            module_stats[mid]["workflow_opens"] += 1
+                        if bid:
+                            workflow_opens[bid] = workflow_opens.get(bid, 0) + 1
+                            code_lbl = SHOWCASE_TOURS[bid]["code"] if bid in SHOWCASE_TOURS else bid
+                            if code_lbl not in srec["tours_opened"]:
+                                srec["tours_opened"].append(code_lbl)
+
+                    elif etype == "chatbot_open":
+                        chatbot_openers.add(vis_id)
+                        srec["opened_chat"] = True
+
+                    elif etype == "cta_click":
+                        target = str(meta.get("target") or "")
+                        if target in (
+                            "book_meeting_submit",
+                            "book_meeting_click",
+                            "free_trial_submit",
+                            "free_trial_click",
+                            "brochure_download",
+                        ):
+                            high_intent_visitors.add(vis_id)
+                            if target not in srec["conversions"]:
+                                srec["conversions"].append(target)
+                        if target == "book_meeting_submit":
+                            meeting_submissions += 1
+                        elif target == "free_trial_submit":
+                            trial_submissions += 1
+                        elif target == "brochure_download":
+                            brochure_downloads += 1
+            except Exception as exc:
+                logger.warning(f"Failed reading public telemetry {ev_path}: {exc}")
+
+        # 2. Read AI Chatbot Q&A Logs (newest days first for chat_logs list, while merging into sessions!)
+        for d_str in reversed(date_keys):
+            ch_fname = f"public_chat_{d_str}.jsonl"
+            ch_path = os.path.join(PUBLIC_CHAT_LOG_DIR, ch_fname)
+            self._hydrate_local_file_from_gcs_if_missing(ch_fname, ch_path)
+            if not os.path.exists(ch_path):
+                continue
+
+            try:
+                with open(ch_path, "r", encoding="utf-8") as cf:
+                    ch_lines = cf.readlines()
+                for raw_line in reversed(ch_lines):
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        rec = json.loads(raw_line)
+                    except Exception:
+                        continue
+
+                    ua = str(rec.get("user_agent") or "")
+                    if is_bot_user_agent(ua):
+                        continue
+
+                    sess_id = str(rec.get("session_id") or "anon")
+                    existing_sess = sessions_map.get(sess_id)
+                    vis_id = (
+                        existing_sess["visitor_id"]
+                        if existing_sess
+                        else (sess_id if sess_id != "anon" else f"ip_{rec.get('ip_hash', 'anon')}")
+                    )
+                    ts = str(rec.get("timestamp") or "")
+                    lang_val = "ar" if str(rec.get("lang") or "").lower().startswith("ar") else "en"
+                    ctx_val = str(rec.get("page_context") or "demo").lower()
+
+                    total_chat_questions += 1
+                    if d_str in daily_chat_questions:
+                        daily_chat_questions[d_str] += 1
+
+                    unique_visitors.add(vis_id)
+                    unique_sessions.add(sess_id)
+                    if d_str in daily_visitors:
+                        daily_visitors[d_str].add(vis_id)
+
+                    chatbot_openers.add(vis_id)
+                    chatbot_active_users.add(vis_id)
+                    lang_sessions.setdefault(lang_val, set()).add(sess_id)
+
+                    if "demo" in ctx_val or any(m in ctx_val for m in _MODULE_DISPLAY_LABELS):
+                        demo_visitors.add(vis_id)
+                        if d_str in daily_demo_visitors:
+                            daily_demo_visitors[d_str].add(vis_id)
+
+                    for m_key in _MODULE_DISPLAY_LABELS:
+                        if m_key in ctx_val or m_key in str(rec.get("topic") or "").lower():
+                            module_stats[m_key]["chat_questions"] += 1
+
+                    t_key = str(rec.get("topic") or "general")
+                    topic_counts[t_key] = topic_counts.get(t_key, 0) + 1
+
+                    srec = _get_or_init_session(
+                        sess_id=sess_id,
+                        vis_id=vis_id,
+                        ts=ts,
+                        source="Direct",
+                        device="desktop",
+                        lang_val=lang_val,
+                    )
+                    srec["opened_chat"] = True
+                    srec["chat_count"] += 1
+                    if "demo" in ctx_val and "demo" not in srec["pages_visited"]:
+                        srec["pages_visited"].append("demo")
+                    elif "landing" in ctx_val and "landing" not in srec["pages_visited"]:
+                        srec["pages_visited"].append("landing")
+
+                    if len(chat_logs_newest_first) < chat_limit:
+                        chat_logs_newest_first.append({
+                            **rec,
+                            "short_id": srec["short_id"],
+                        })
+            except Exception as exc:
+                logger.warning(f"Failed reading public chat log {ch_path}: {exc}")
+
+        u_count = len(unique_visitors)
+        d_count = len(demo_visitors)
+        sv_count = len(story_viewers)
+        sc_count = len(story_completers)
+        ca_count = len(chatbot_active_users)
+
+        total_story_plays = sum(v["plays"] for v in story_stats.values())
+        total_story_completions = sum(v["completions"] for v in story_stats.values())
+
+        sorted_sessions = sorted(
+            sessions_map.values(),
+            key=lambda s: s.get("last_seen") or "",
+            reverse=True,
+        )[:session_limit]
+
+        module_interest = sorted(
+            [
+                {
+                    "module_id": m_id,
+                    "label": m_lbl,
+                    **module_stats[m_id],
+                    "total_interactions": (
+                        module_stats[m_id]["story_plays"]
+                        + module_stats[m_id]["workflow_opens"]
+                        + module_stats[m_id]["chat_questions"]
+                    ),
+                }
+                for m_id, m_lbl in _MODULE_DISPLAY_LABELS.items()
+            ],
+            key=lambda item: item["total_interactions"],
+            reverse=True,
+        )
+
+        story_breakdown = [
+            {
+                "story_id": s_id,
+                "label": s_lbl,
+                "plays": story_stats[s_id]["plays"],
+                "completions": story_stats[s_id]["completions"],
+                "completion_pct": (
+                    round(min(100.0, (story_stats[s_id]["completions"] / story_stats[s_id]["plays"]) * 100.0), 1)
+                    if story_stats[s_id]["plays"] > 0
+                    else 0.0
+                ),
+            }
+            for s_id, s_lbl in _STORY_DISPLAY_LABELS.items()
+        ]
+
+        top_workflows = sorted(
+            [
+                {
+                    "branch_id": b_id,
+                    "code": SHOWCASE_TOURS[b_id]["code"] if b_id in SHOWCASE_TOURS else "",
+                    "title": SHOWCASE_TOURS[b_id]["title_en"] if b_id in SHOWCASE_TOURS else b_id,
+                    "opens": cnt,
+                }
+                for b_id, cnt in workflow_opens.items()
+            ],
+            key=lambda item: item["opens"],
+            reverse=True,
+        )[:10]
+
+        return {
+            "days": days,
+            "kpis": {
+                "unique_visitors": u_count,
+                "total_sessions": len(unique_sessions),
+                "total_pageviews": total_pageviews,
+                "landing_visitors": len(landing_visitors),
+                "demo_visitors": d_count,
+                "demo_visit_rate_pct": round((d_count / u_count) * 100.0, 1) if u_count > 0 else 0.0,
+                "story_viewers": sv_count,
+                "story_completers": sc_count,
+                "story_completion_rate_pct": (
+                    round(min(100.0, (total_story_completions / total_story_plays) * 100.0), 1)
+                    if total_story_plays > 0
+                    else 0.0
+                ),
+                "workflow_explorers": len(workflow_explorers),
+                "chatbot_openers": len(chatbot_openers),
+                "chatbot_active_users": ca_count,
+                "chatbot_interaction_rate_pct": round((ca_count / u_count) * 100.0, 1) if u_count > 0 else 0.0,
+                "total_chat_questions": total_chat_questions,
+                "avg_questions_per_chatter": round(total_chat_questions / ca_count, 1) if ca_count > 0 else 0.0,
+                "high_intent_leads": len(high_intent_visitors),
+                "meeting_submissions": meeting_submissions,
+                "trial_submissions": trial_submissions,
+                "brochure_downloads": brochure_downloads,
+                "bot_events_filtered": bot_events_filtered,
+            },
+            "daily_series": [
+                {
+                    "date": d_str,
+                    "visitors": len(daily_visitors[d_str]),
+                    "demo_visitors": len(daily_demo_visitors[d_str]),
+                    "chat_questions": daily_chat_questions[d_str],
+                }
+                for d_str in date_keys
+            ],
+            "page_breakdown": [
+                {
+                    "page": pg_id,
+                    "label": pg_lbl,
+                    "views": page_views_count.get(pg_id, 0),
+                    "unique_visitors": len(page_unique_visitors.get(pg_id, set())),
+                }
+                for pg_id, pg_lbl in _PAGE_DISPLAY_LABELS.items()
+            ],
+            "module_interest": module_interest,
+            "story_breakdown": story_breakdown,
+            "top_workflows": top_workflows,
+            "source_breakdown": sorted(
+                [{"source": k, "sessions": len(v)} for k, v in source_sessions.items()],
+                key=lambda x: x["sessions"],
+                reverse=True,
+            )[:10],
+            "device_breakdown": sorted(
+                [{"device": k, "sessions": len(v)} for k, v in device_sessions.items()],
+                key=lambda x: x["sessions"],
+                reverse=True,
+            ),
+            "language_breakdown": {
+                "en": len(lang_sessions.get("en", set())),
+                "ar": len(lang_sessions.get("ar", set())),
+            },
+            "country_breakdown": sorted(
+                [{"country": k, "sessions": len(v)} for k, v in country_sessions.items()],
+                key=lambda x: x["sessions"],
+                reverse=True,
+            )[:10],
+            "topic_breakdown": sorted(
+                [{"topic": k, "count": v} for k, v in topic_counts.items()],
+                key=lambda x: x["count"],
+                reverse=True,
+            )[:12],
+            "recent_sessions": sorted_sessions,
+            "chat_logs": chat_logs_newest_first,
         }
 
 
