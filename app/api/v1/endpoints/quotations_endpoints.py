@@ -1898,6 +1898,8 @@ def create_rfq(
     request: Request = None
 ):
     """Creates a new RFQ and generates secure tokens for external Banks."""
+    from app.core.trial_guard import enforce_trial_quota
+    enforce_trial_quota(db, current_user.customer_id, "rfq")
     # Add file path parsing here if files are uploaded.
     # For now, it accepts JSON. If files are needed, this endpoint will need to use Form/File Fastapi constructs.
     

@@ -196,6 +196,8 @@ def get_current_user(
         )
 
     # 4. Synchronize live password policy, subscription status & module entitlements from DB
+    from app.core.trial_guard import is_trial_customer, is_trial_plan_name, set_request_trial_context
+    set_request_trial_context(False, None)
     is_so = (token_data.role == UserRole.SYSTEM_OWNER)
     if not is_so:
         token_data.must_change_password = bool(user.must_change_password)
@@ -217,6 +219,10 @@ def get_current_user(
             token_data.has_quotation_module = is_so or bool(plan.has_quotation_module)
             token_data.has_reconciliation_module = is_so or bool(plan.has_reconciliation_module)
             token_data.can_email_inbox = is_so or bool(getattr(plan, 'can_email_inbox', True))
+            if not is_so and (is_trial_plan_name(getattr(plan, "name", None)) or is_trial_customer(db, user.customer.id)):
+                set_request_trial_context(True, user.customer.id)
+        elif not is_so and is_trial_customer(db, user.customer.id):
+            set_request_trial_context(True, user.customer.id)
         if not token_data.customer_name and user.customer.name:
             token_data.customer_name = user.customer.name
     

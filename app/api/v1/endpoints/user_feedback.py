@@ -5,13 +5,14 @@ Provides review, filtering, and status updates on user feedback and feature requ
 """
 
 from typing import Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime
+import os
 
 from app.database import get_db
-from app.models.models import User
+from app.models.models import Customer, User
 from app.models.models_feedback import UserFeedback, FeedbackType, FeedbackSentiment, FeedbackStatus
 from app.core.security import get_current_user, TokenData
 
@@ -50,14 +51,18 @@ class FeedbackCreateRequest(BaseModel):
 
 
 @router.post("/", response_model=FeedbackResponse)
-def create_user_feedback(
+async def create_user_feedback(
     payload: FeedbackCreateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_user)
 ) -> Any:
     """
     Submit a new user feedback, issue report, or AI response evaluation.
+    Tags Free Trial feedback automatically and alerts System Owner if a trial user hits friction.
     """
+    from app.core.trial_guard import is_trial_customer
+
     user = db.query(User).filter(User.id == current_user.user_id).first()
     u_email = user.email if user else (current_user.email if hasattr(current_user, 'email') else None)
 
@@ -66,7 +71,18 @@ def create_user_feedback(
     
     f_type = payload.feedback_type.upper() if payload.feedback_type else "GENERAL_FEEDBACK"
     sentiment_val = payload.sentiment.upper() if payload.sentiment else "NEUTRAL"
-    
+    in_trial = bool(current_user.customer_id and is_trial_customer(db, current_user.customer_id))
+
+    summary_val = payload.ai_summary
+    if in_trial:
+        cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+        co_label = cust.name if cust else f"Customer #{current_user.customer_id}"
+        prefix = f"[FREE TRIAL · {co_label}]"
+        if not summary_val:
+            summary_val = prefix
+        elif "[FREE TRIAL" not in summary_val:
+            summary_val = f"{prefix} {summary_val}"
+
     entry = UserFeedback(
         customer_id=current_user.customer_id,
         user_id=current_user.user_id,
@@ -74,12 +90,55 @@ def create_user_feedback(
         feedback_type=f_type,
         sentiment=sentiment_val,
         message=payload.message,
-        ai_summary=payload.ai_summary,
+        ai_summary=summary_val,
         status="NEW"
     )
     db.add(entry)
     db.commit()
     db.refresh(entry)
+
+    # Instant Rescue Alert to System Owner if a Free Trial evaluator reports confusion or friction
+    if in_trial and (sentiment_val == "NEGATIVE" or f_type in ("USABILITY_PAIN_POINT", "BUG_REPORT")):
+        try:
+            from app.core.email_service import get_global_email_settings, send_email
+            from app.services.unified_email_builder import build_standard_email_html
+
+            email_settings = get_global_email_settings()
+            alert_to = (
+                os.getenv("ADMIN_LEAD_ALERT_EMAIL")
+                or getattr(email_settings, "sender_email", None)
+                or os.getenv("SMTP_FROM_EMAIL")
+            )
+            if alert_to and "@" in alert_to:
+                cust = db.query(Customer).filter(Customer.id == current_user.customer_id).first()
+                co_name = cust.name if cust else f"Trial #{current_user.customer_id}"
+                subj = f"[Trial Rescue Alert] {co_name} shared feedback ({sentiment_val})"
+                html_body = build_standard_email_html(
+                    title="Free Trial Evaluator Feedback Alert",
+                    body_html=(
+                        f"<p>A Free Trial evaluator just reported feedback that may need a quick personal check-in:</p>"
+                        f"<ul>"
+                        f"<li><strong>Company:</strong> {co_name}</li>"
+                        f"<li><strong>User Email:</strong> {u_email or 'N/A'}</li>"
+                        f"<li><strong>Category:</strong> {f_type} ({sentiment_val})</li>"
+                        f"</ul>"
+                        f"<blockquote style='padding:12px 16px; background:#f8fafc; border-left:3px solid #f59e0b;'>"
+                        f"{payload.message}"
+                        f"</blockquote>"
+                    ),
+                )
+                background_tasks.add_task(
+                    send_email,
+                    None,
+                    [alert_to],
+                    subj,
+                    html_body,
+                    {},
+                    email_settings,
+                )
+        except Exception:
+            pass
+
     return entry.to_dict()
 
 

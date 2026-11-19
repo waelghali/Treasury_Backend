@@ -1486,6 +1486,8 @@ def auto_fill_bank_form(
                     lg_language=fill_lang,
                 )
             
+            from app.core.trial_guard import stamp_trial_pdf_bytes_watermark
+            filled_pdf = stamp_trial_pdf_bytes_watermark(filled_pdf)
             filename = f"Filled_{form_template.name}_{request.serial_number}.pdf"
             return StreamingResponse(
                 io.BytesIO(filled_pdf),
@@ -1604,6 +1606,8 @@ def auto_fill_bank_form(
             lg_language=fill_lang,
         )
     
+    from app.core.trial_guard import stamp_trial_pdf_bytes_watermark
+    filled_pdf = stamp_trial_pdf_bytes_watermark(filled_pdf)
     filename = f"Filled_{form_template.name}_{request.serial_number}.pdf"
     
     return StreamingResponse(

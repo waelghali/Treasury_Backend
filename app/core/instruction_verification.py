@@ -996,8 +996,10 @@ def verify_instruction_with_code(
         elif inst.delivery_date:
             delivery_info = f"Delivered to Bank ({inst.delivery_date.strftime('%d-%b-%Y')})"
 
+        from app.core.trial_guard import is_trial_customer
         return {
             "verified": True,
+            "is_trial_document": is_trial_customer(db, getattr(lg, "customer_id", None)),
             "status_category": status_category,
             "status_label": raw_status,
             "instruction_serial": inst.serial_number,
@@ -1064,9 +1066,11 @@ def verify_instruction_with_code(
     issue_dt = getattr(maint, "created_at", None)
     issue_date_str = issue_dt.strftime("%d-%b-%Y") if isinstance(issue_dt, datetime) else "N/A"
 
+    from app.core.trial_guard import is_trial_customer
     is_canceled_maint = (maint.status or "").upper() in ("CANCELLED", "CANCELED", "REJECTED")
     return {
         "verified": True,
+        "is_trial_document": is_trial_customer(db, getattr(ilg, "customer_id", None)),
         "status_category": "CANCELED" if is_canceled_maint else "VALID",
         "status_label": "CANCELED / REVOKED — Do Not Execute" if is_canceled_maint else (maint.status or "Executed"),
         "instruction_serial": maint.letter_serial_number,

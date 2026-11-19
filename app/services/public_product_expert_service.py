@@ -13,15 +13,19 @@ SECURITY & GROUNDING ARCHITECTURE (100% AIR-GAPPED & 500-QUESTION AUDITED):
   and syncs asynchronously to Google Cloud Storage without blocking HTTP responses.
 """
 
+import asyncio
 import hashlib
+import io
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
+import wave
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.ai_integration import (
     GEMINI_AVAILABLE,
@@ -35,6 +39,8 @@ from app.core.ai_integration import (
 logger = logging.getLogger(__name__)
 
 PUBLIC_CHAT_LOG_DIR = os.path.join(os.getcwd(), "private_storage", "public_demo_chat_logs")
+PUBLIC_VOICE_STATE_FILENAME = "public_voice_state.json"
+GEMINI_TTS_MODEL_NAME = os.getenv("GEMINI_TTS_MODEL_NAME", "gemini-2.5-flash-tts")
 
 # ==============================================================================
 # 1. VALIDATED SHOWCASE DEEP-LINK REGISTRY (100% SYNCED WITH showcaseCatalog.js)
@@ -1546,10 +1552,323 @@ class PublicDemoChatLogger:
             )[:12],
             "recent_sessions": sorted_sessions,
             "chat_logs": chat_logs_newest_first,
+            "voice_control": public_voice_control.get_admin_status(),
         }
 
 
 public_demo_chat_logger = PublicDemoChatLogger()
+
+
+# ==============================================================================
+# 5B. VOICE AI MASTER KILL-SWITCH, MONTHLY 1,000-Q&A QUOTA & NEAR-CAP ALERTS
+# ==============================================================================
+
+class PublicVoiceControlManager:
+    """
+    Manages the System Owner's 1-click Voice AI master switch (`voice_enabled`),
+    monthly Voice Q&A quota counter (default `1,000` Q&As/month), optional auto-shutoff
+    at cap, and automated 80% Near-Cap & 100% Cap email alerts to System Owners.
+    Persists locally and syncs/hydrates with GCS across Cloud Run container restarts.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._state: Dict[str, Any] = {
+            "voice_enabled": True,
+            "monthly_cap": 1000,
+            "alert_at_pct": 80,
+            "auto_disable_at_cap": False,
+            "usage_by_month": {},
+        }
+
+    def _local_path(self) -> str:
+        os.makedirs(PUBLIC_CHAT_LOG_DIR, exist_ok=True)
+        return os.path.join(PUBLIC_CHAT_LOG_DIR, PUBLIC_VOICE_STATE_FILENAME)
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        with self._lock:
+            if self._loaded:
+                return
+            local_p = self._local_path()
+            if not os.path.exists(local_p):
+                # Attempt 1-time hydration from GCS on fresh container boot
+                try:
+                    bucket = public_demo_chat_logger._get_gcs_bucket()
+                    if bucket is not None:
+                        blob = bucket.blob(f"public_demo_chat_logs/{PUBLIC_VOICE_STATE_FILENAME}")
+                        if blob.exists(timeout=3):
+                            raw_remote = blob.download_as_text(encoding="utf-8", timeout=4)
+                            if raw_remote and raw_remote.strip():
+                                with open(local_p, "w", encoding="utf-8") as wf:
+                                    wf.write(raw_remote)
+                except Exception as exc:
+                    logger.debug(f"Voice state GCS hydration skipped: {exc}")
+
+            if os.path.exists(local_p):
+                try:
+                    with open(local_p, "r", encoding="utf-8") as rf:
+                        loaded_obj = json.load(rf)
+                    if isinstance(loaded_obj, dict):
+                        self._state.update(loaded_obj)
+                except Exception as exc:
+                    logger.warning(f"Failed loading {local_p}: {exc}")
+
+            if not isinstance(self._state.get("usage_by_month"), dict):
+                self._state["usage_by_month"] = {}
+            self._loaded = True
+
+    def _persist_locked(self) -> str:
+        """Must be called while holding `self._lock`. Returns serialized JSON string."""
+        raw_json = json.dumps(self._state, ensure_ascii=False, indent=2)
+        try:
+            with open(self._local_path(), "w", encoding="utf-8") as wf:
+                wf.write(raw_json)
+        except Exception as exc:
+            logger.warning(f"Failed saving local voice state: {exc}")
+        return raw_json
+
+    def _sync_gcs_async(self, raw_json: str) -> None:
+        def _worker():
+            try:
+                bucket = public_demo_chat_logger._get_gcs_bucket()
+                if bucket is None:
+                    return
+                blob = bucket.blob(f"public_demo_chat_logs/{PUBLIC_VOICE_STATE_FILENAME}")
+                blob.upload_from_string(raw_json, content_type="application/json", timeout=5)
+            except Exception as exc:
+                logger.debug(f"Voice state GCS sync skipped: {exc}")
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+    def _current_month_key(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m")
+
+    def _get_or_init_month_locked(self, month_key: str) -> Dict[str, Any]:
+        usage_map = self._state.setdefault("usage_by_month", {})
+        m = usage_map.get(month_key)
+        if not isinstance(m, dict):
+            m = {
+                "voice_qa_count": 0,
+                "voice_input_count": 0,
+                "tts_output_count": 0,
+                "tts_chars_total": 0,
+                "near_cap_alert_sent": False,
+                "cap_reached_alert_sent": False,
+            }
+            usage_map[month_key] = m
+        return m
+
+    def is_voice_enabled(self) -> bool:
+        self._ensure_loaded()
+        return bool(self._state.get("voice_enabled", True))
+
+    def get_public_status(self) -> Dict[str, bool]:
+        return {"voice_enabled": self.is_voice_enabled()}
+
+    def get_admin_status(self) -> Dict[str, Any]:
+        self._ensure_loaded()
+        month_key = self._current_month_key()
+        with self._lock:
+            m = dict(self._get_or_init_month_locked(month_key))
+            cap = max(10, int(self._state.get("monthly_cap") or 1000))
+            alert_pct = max(50, min(99, int(self._state.get("alert_at_pct") or 80)))
+            enabled = bool(self._state.get("voice_enabled", True))
+            auto_disable = bool(self._state.get("auto_disable_at_cap", False))
+
+        qa_count = int(m.get("voice_qa_count") or 0)
+        near_threshold = math.ceil(cap * (alert_pct / 100.0))
+        usage_pct = round((qa_count / cap) * 100.0, 1) if cap > 0 else 0.0
+        est_cost_usd = round((int(m.get("voice_input_count") or 0) * 0.0005) + (int(m.get("tts_chars_total") or 0) * 0.000015), 2)
+
+        return {
+            "voice_enabled": enabled,
+            "monthly_cap": cap,
+            "alert_at_pct": alert_pct,
+            "near_cap_threshold": near_threshold,
+            "auto_disable_at_cap": auto_disable,
+            "current_month": month_key,
+            "voice_qa_count": qa_count,
+            "voice_input_count": int(m.get("voice_input_count") or 0),
+            "tts_output_count": int(m.get("tts_output_count") or 0),
+            "tts_chars_total": int(m.get("tts_chars_total") or 0),
+            "usage_pct": usage_pct,
+            "near_cap": qa_count >= near_threshold and qa_count < cap,
+            "at_or_over_cap": qa_count >= cap,
+            "near_cap_alert_sent": bool(m.get("near_cap_alert_sent", False)),
+            "cap_reached_alert_sent": bool(m.get("cap_reached_alert_sent", False)),
+            "estimated_voice_cost_usd": est_cost_usd,
+        }
+
+    def update_settings(
+        self,
+        *,
+        voice_enabled: Optional[bool] = None,
+        monthly_cap: Optional[int] = None,
+        auto_disable_at_cap: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_loaded()
+        month_key = self._current_month_key()
+        with self._lock:
+            if voice_enabled is not None:
+                self._state["voice_enabled"] = bool(voice_enabled)
+            if monthly_cap is not None:
+                new_cap = max(10, min(100000, int(monthly_cap)))
+                self._state["monthly_cap"] = new_cap
+                # Reset alert flags if System Owner raised the cap above current usage
+                m = self._get_or_init_month_locked(month_key)
+                alert_pct = int(self._state.get("alert_at_pct") or 80)
+                if int(m.get("voice_qa_count") or 0) < math.ceil(new_cap * (alert_pct / 100.0)):
+                    m["near_cap_alert_sent"] = False
+                if int(m.get("voice_qa_count") or 0) < new_cap:
+                    m["cap_reached_alert_sent"] = False
+            if auto_disable_at_cap is not None:
+                self._state["auto_disable_at_cap"] = bool(auto_disable_at_cap)
+            raw_json = self._persist_locked()
+
+        self._sync_gcs_async(raw_json)
+        return self.get_admin_status()
+
+    def record_usage(
+        self,
+        *,
+        increment_qa: bool,
+        is_voice_input: bool = False,
+        tts_chars: int = 0,
+    ) -> None:
+        self._ensure_loaded()
+        month_key = self._current_month_key()
+        alert_kind: Optional[str] = None
+        snapshot_for_alert: Dict[str, Any] = {}
+
+        with self._lock:
+            m = self._get_or_init_month_locked(month_key)
+            if increment_qa:
+                m["voice_qa_count"] = int(m.get("voice_qa_count") or 0) + 1
+            if is_voice_input:
+                m["voice_input_count"] = int(m.get("voice_input_count") or 0) + 1
+            if tts_chars > 0:
+                m["tts_output_count"] = int(m.get("tts_output_count") or 0) + 1
+                m["tts_chars_total"] = int(m.get("tts_chars_total") or 0) + int(tts_chars)
+
+            cap = max(10, int(self._state.get("monthly_cap") or 1000))
+            alert_pct = max(50, min(99, int(self._state.get("alert_at_pct") or 80)))
+            near_threshold = math.ceil(cap * (alert_pct / 100.0))
+            qa_count = int(m.get("voice_qa_count") or 0)
+
+            auto_disabled_now = False
+            if qa_count >= cap:
+                if bool(self._state.get("auto_disable_at_cap", False)) and bool(self._state.get("voice_enabled", True)):
+                    self._state["voice_enabled"] = False
+                    auto_disabled_now = True
+                if not m.get("cap_reached_alert_sent"):
+                    m["cap_reached_alert_sent"] = True
+                    m["near_cap_alert_sent"] = True
+                    alert_kind = "CAP_REACHED"
+            elif qa_count >= near_threshold and not m.get("near_cap_alert_sent"):
+                m["near_cap_alert_sent"] = True
+                alert_kind = "NEAR_CAP"
+
+            if alert_kind:
+                snapshot_for_alert = {
+                    "alert_kind": alert_kind,
+                    "month_key": month_key,
+                    "qa_count": qa_count,
+                    "cap": cap,
+                    "near_threshold": near_threshold,
+                    "voice_input_count": int(m.get("voice_input_count") or 0),
+                    "tts_output_count": int(m.get("tts_output_count") or 0),
+                    "auto_disabled_now": auto_disabled_now,
+                    "voice_enabled": bool(self._state.get("voice_enabled", True)),
+                }
+
+            raw_json = self._persist_locked()
+
+        self._sync_gcs_async(raw_json)
+        if alert_kind and snapshot_for_alert:
+            t = threading.Thread(
+                target=self._send_system_owner_cap_email_worker,
+                args=(snapshot_for_alert,),
+                daemon=True,
+            )
+            t.start()
+
+    def _send_system_owner_cap_email_worker(self, snap: Dict[str, Any]) -> None:
+        """Sends an automated Near-Cap (80%) or Cap-Reached (100%) email to all active System Owners."""
+        try:
+            from app.constants import UserRole
+            from app.core.email_service import get_global_email_settings, send_email
+            from app.database import SessionLocal
+            from app.models import User
+
+            recipients: List[str] = []
+            env_owner = (os.getenv("SYSTEM_OWNER_ALERT_EMAIL") or "").strip()
+            if env_owner and "@" in env_owner:
+                recipients.append(env_owner)
+
+            db = SessionLocal()
+            try:
+                owner_rows = (
+                    db.query(User.email)
+                    .filter(User.role == UserRole.SYSTEM_OWNER, User.is_deleted == False)  # noqa: E712
+                    .all()
+                )
+                for (email_val,) in owner_rows:
+                    if email_val and "@" in email_val and email_val not in recipients:
+                        recipients.append(email_val)
+            finally:
+                db.close()
+
+            if not recipients:
+                logger.info(f"[VoiceCapAlert] {snap['alert_kind']} reached ({snap['qa_count']}/{snap['cap']}), no non-test System Owner email found.")
+                return
+
+            is_full_cap = snap["alert_kind"] == "CAP_REACHED"
+            subject = (
+                f"Grow Voice AI Alert: Monthly Quota Reached ({snap['qa_count']}/{snap['cap']} Voice Q&As)"
+                if is_full_cap
+                else f"Grow Voice AI Near-Cap Notice: {snap['qa_count']}/{snap['cap']} Monthly Voice Q&As Used"
+            )
+
+            status_line = (
+                "Voice AI has been <strong>automatically disabled</strong> (Mic & Listen buttons are now hidden from all visitors)."
+                if snap.get("auto_disabled_now")
+                else (
+                    "Voice AI is currently <strong>still active</strong>. You can disable it with <strong>1 click</strong> anytime (completely hiding the Mic and Listen icons from visitors) in <strong>System Owner &rarr; User Feedback &amp; Public Insights &rarr; Website, Demo &amp; AI Chatbot</strong>."
+                )
+            )
+
+            body_html = (
+                f"<p>Your public <strong>Grow AI Product Expert Voice Assistant</strong> on <code>/</code> and <code>/demo</code> "
+                f"has reached <strong>{snap['qa_count']} out of {snap['cap']}</strong> monthly Voice Q&amp;As for <strong>{snap['month_key']}</strong>.</p>"
+                f"<ul>"
+                f"<li><strong>Spoken Mic Questions:</strong> {snap['voice_input_count']}</li>"
+                f"<li><strong>Studio Voice Replies Generated:</strong> {snap['tts_output_count']}</li>"
+                f"</ul>"
+                f"<p>{status_line}</p>"
+            )
+
+            settings = get_global_email_settings()
+            asyncio.run(
+                send_email(
+                    db=None,
+                    to_emails=recipients,
+                    subject_template=subject,
+                    body_template=body_html,
+                    template_data={},
+                    email_settings=settings,
+                    sender_name="Grow System Owner Alerts",
+                )
+            )
+            logger.info(f"[VoiceCapAlert] Sent {snap['alert_kind']} notification to System Owners.")
+        except Exception as exc:
+            logger.warning(f"[VoiceCapAlert] Could not send System Owner voice quota email: {exc}")
+
+
+public_voice_control = PublicVoiceControlManager()
 
 
 # ==============================================================================
@@ -1897,6 +2216,7 @@ STRICT FACTUAL & EXECUTIVE COMMUNICATION RULES (NON-NEGOTIABLE):
 Return ONLY valid JSON matching this exact schema:
 {{
   "answer": "markdown string (concise, direct, 100% accurate)",
+  "spoken_summary": "1 to 2 short plain-text spoken executive sentences (max 240 chars, NO markdown asterisks or bullets; if Arabic, include clear diacritics/تشكيل on tricky word endings like ة vs ه and keep Grow in Latin script)",
   "topic": "short_snake_case_topic_tag",
   "actions": [
     {{ "type": "tour" | "story" | "foundation", "id": "exact_valid_id_from_catalog", "step": 1 }}
@@ -1922,7 +2242,7 @@ Return ONLY valid JSON matching this exact schema:
                 config_kwargs: Dict[str, Any] = {
                     "system_instruction": system_instruction,
                     "temperature": 0.15,
-                    "max_output_tokens": 1050,
+                    "max_output_tokens": 1150,
                     "response_mime_type": "application/json",
                 }
                 if hasattr(genai_types, "ThinkingConfig"):
@@ -1955,8 +2275,12 @@ Return ONLY valid JSON matching this exact schema:
                         if isinstance(raw_follow_ups, list)
                         else []
                     )
+                    answer_str = parsed["answer"].strip()
+                    spoken_raw = str(parsed.get("spoken_summary") or "").strip()
+                    spoken_clean = _clean_text_for_speech(spoken_raw or answer_str, max_chars=280)
                     result_payload = {
-                        "answer": parsed["answer"].strip(),
+                        "answer": answer_str,
+                        "spoken_summary": spoken_clean,
                         "lang": lang,
                         "topic": str(parsed.get("topic") or "product_qa")[:64],
                         "actions": hydrated_actions,
@@ -1971,6 +2295,7 @@ Return ONLY valid JSON matching this exact schema:
         fallback = _build_curated_fallback_response(clean_q, lang)
         result_payload = {
             "answer": fallback["answer"],
+            "spoken_summary": _clean_text_for_speech(fallback["answer"], max_chars=260),
             "lang": lang,
             "topic": fallback["topic"],
             "actions": fallback["actions"],
@@ -1994,3 +2319,320 @@ Return ONLY valid JSON matching this exact schema:
         latency_ms=latency_ms,
     )
     return result_payload
+
+
+# ==============================================================================
+# 8. STUDIO VOICE INPUT (MULTIMODAL AUDIO) & STUDIO NEURAL TTS (`gemini-2.5-flash-tts`)
+# ==============================================================================
+
+def _clean_text_for_speech(text: str, max_chars: int = 320) -> str:
+    """Strips markdown formatting and enforces Arabic `Grow` brand preservation for clean studio TTS."""
+    if not text:
+        return ""
+    cleaned = str(text)
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"^\s*[-*•]\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s*\d+[.)]\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = cleaned.replace("جرو", "Grow")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    clipped = cleaned[:max_chars]
+    for sep in (". ", "؟ ", "! ", "، ", "; "):
+        idx = clipped.rfind(sep)
+        if idx >= max_chars // 2:
+            return clipped[: idx + 1].strip()
+    return clipped.rsplit(" ", 1)[0].strip() + "."
+
+
+def _wrap_pcm_l16_as_wav(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    """Wraps raw 16-bit mono PCM bytes from Gemini TTS into a standard universal RIFF WAV buffer."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+async def ask_public_product_expert_voice(
+    *,
+    audio_bytes: bytes,
+    audio_mime_type: str = "audio/webm",
+    history: Optional[List[Dict[str, str]]] = None,
+    preferred_lang: str = "en",
+    page_context: str = "demo",
+    session_id: str = "anon",
+    client_ip: str = "",
+    user_agent: str = "",
+) -> Dict[str, Any]:
+    """
+    Multimodal voice-in handler: listens directly to spoken English, Modern Standard Arabic,
+    or Egyptian/regional Arabic mixed with treasury terms, transcribes `heard_question`,
+    answers from the 500-question verified knowledge base, and prepares a studio `spoken_summary`.
+    """
+    t0 = time.perf_counter()
+    ip_hash = hash_client_ip(client_ip)
+
+    history_lines: List[str] = []
+    for turn in (history or [])[-6:]:
+        if not isinstance(turn, dict):
+            continue
+        role = "Visitor" if turn.get("role") == "user" else "Grow AI"
+        content = str(turn.get("content") or "").strip()[:450]
+        if content:
+            history_lines.append(f"{role}: {content}")
+    history_block = "\n".join(history_lines) if history_lines else "(First question in session)"
+
+    system_instruction = f"""You are the **Grow AI Product Expert** listening to a visitor's spoken voice question on Grow's public website and interactive demo showcase.
+
+VOICE LISTENING & RESPONSE RULES:
+1. Listen carefully to the visitor's spoken audio. They may speak in English, Modern Standard Arabic, or conversational Egyptian/Gulf Arabic (often mixing English financial terms like LG, FX Spot, T-Bills, CBE, MT940, SAP, OTP).
+2. Transcribe their exact question cleanly into `"heard_question"` (if silent, unintelligible, or pure background noise, set `"heard_question": ""` and politely ask them to repeat).
+3. Detect the language they spoke (`"ar"` if primarily Arabic, `"en"` if primarily English; fall back to `"{'ar' if (preferred_lang or '').startswith('ar') else 'en'}"` if unclear) and answer in that SAME language:
+   - If Arabic (`"ar"`): Respond in natural, executive Modern Standard Arabic. Always write `Grow` in Latin letters (`Grow`—NEVER `جرو`) and write `أذون الخزانة` for T-Bills. In `"spoken_summary"`, include clear Arabic vowelization/diacritics (`تشكيل`) on key endings (`ة` vs `ه`) so text-to-speech reads it with studio precision.
+   - If English (`"en"`): Respond in crisp, authoritative executive B2B SaaS English.
+4. Rely EXCLUSIVELY on `CORE_PLATFORM_TRUTH` and `VERIFIED_DOMAIN_PACKS` below—100% factual accuracy, zero invented features or prices, constructive honesty on unsupported items, clean business terms (`Corporate Admin`, `End User`) instead of raw database identifiers. Keep `"answer"` 70–150 words.
+
+{CORE_PLATFORM_TRUTH}
+
+# VERIFIED_DOMAIN_PACKS (COMPLETE 8-DOMAIN AUDITED REFERENCE)
+{ALL_VERIFIED_DOMAIN_PACKS_TEXT}
+
+{SHOWCASE_LINK_CATALOG_FOR_PROMPT}
+
+Return ONLY valid JSON matching this exact schema:
+{{
+  "heard_question": "clean transcription of the visitor's spoken question (or empty string if silent/inaudible)",
+  "lang": "en" | "ar",
+  "answer": "markdown string (concise, direct, 100% accurate)",
+  "spoken_summary": "1 to 2 short plain-text spoken executive sentences (max 240 chars, NO markdown; vowelized if Arabic, keeping Grow in Latin script)",
+  "topic": "short_snake_case_topic_tag",
+  "actions": [
+    {{ "type": "tour" | "story" | "foundation", "id": "exact_valid_id_from_catalog", "step": 1 }}
+  ],
+  "follow_ups": ["short natural follow-up question 1", "short natural follow-up question 2"],
+  "show_commercial_cta": false
+}}"""
+
+    prompt_text = (
+        f"Current Visitor Page Context: {page_context}\n"
+        f"Recent Conversation:\n{history_block}\n\n"
+        "Listen to the attached visitor audio clip and return the JSON response."
+    )
+
+    client = _get_genai_client() or _get_api_genai_client()
+    if not GEMINI_AVAILABLE or client is None:
+        raise RuntimeError("Voice AI service is temporarily unavailable.")
+
+    clean_mime = (audio_mime_type or "audio/webm").split(";")[0].strip().lower()
+    if clean_mime not in ("audio/webm", "audio/wav", "audio/x-wav", "audio/mp4", "audio/mpeg", "audio/mp3", "audio/ogg"):
+        clean_mime = "audio/webm"
+
+    audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=clean_mime)
+
+    config_kwargs: Dict[str, Any] = {
+        "system_instruction": system_instruction,
+        "temperature": 0.15,
+        "max_output_tokens": 1200,
+        "response_mime_type": "application/json",
+    }
+    if hasattr(genai_types, "ThinkingConfig"):
+        try:
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass
+    if hasattr(genai_types, "AutomaticFunctionCallingConfig"):
+        try:
+            config_kwargs["automatic_function_calling"] = (
+                genai_types.AutomaticFunctionCallingConfig(disable=True)
+            )
+        except Exception:
+            pass
+
+    gen_config = genai_types.GenerateContentConfig(**config_kwargs)
+    resp = await _safe_generate_content_async(
+        client,
+        GEMINI_MODEL_NAME,
+        [audio_part, prompt_text],
+        config=gen_config,
+    )
+    raw_text = getattr(resp, "text", "") or ""
+    parsed = _extract_json_object(raw_text) or {}
+
+    heard_q = str(parsed.get("heard_question") or "").strip()[:600]
+    out_lang = "ar" if str(parsed.get("lang") or preferred_lang).lower().startswith("ar") else "en"
+    is_ar = out_lang == "ar"
+
+    if not heard_q:
+        polite_retry = (
+            "لم أتمكن من سماع السؤال بوضوح. يرجى التحدث بالقرب من الميكروفون أو كتابة سؤالك مباشرة."
+            if is_ar
+            else "I couldn't hear a clear question in that recording. Please speak closer to your microphone or type your question below."
+        )
+        return {
+            "heard_question": "",
+            "answer": polite_retry,
+            "spoken_summary": "",
+            "lang": out_lang,
+            "topic": "voice_inaudible",
+            "actions": [],
+            "follow_ups": [],
+            "show_commercial_cta": False,
+        }
+
+    if _ADVERSARIAL_REGEX.search(heard_q):
+        refusal = (
+            "أنا المساعد الذكي التعريفي لمنصة **Grow**، ومهمتي الإجابة عن استفساراتكم حول وحدات المنصة وسيناريوهات إدارة الخزانة والأمان والترحيل."
+            if is_ar
+            else "I am the **Grow Product Expert**, here to answer questions about Grow's treasury modules, workflows, governance, security, and onboarding."
+        )
+        return {
+            "heard_question": heard_q,
+            "answer": refusal,
+            "spoken_summary": _clean_text_for_speech(refusal, 220),
+            "lang": out_lang,
+            "topic": "security_guardrail_refusal",
+            "actions": validate_and_hydrate_actions([{"type": "story", "id": "platform_intro"}], out_lang),
+            "follow_ups": [],
+            "show_commercial_cta": False,
+        }
+
+    answer_str = str(parsed.get("answer") or "").strip()
+    if not answer_str:
+        fb = _build_curated_fallback_response(heard_q, out_lang)
+        answer_str = fb["answer"]
+        hydrated_actions = fb["actions"]
+        follow_ups = fb["follow_ups"]
+        show_cta = fb["show_commercial_cta"]
+        topic_str = fb["topic"]
+    else:
+        hydrated_actions = validate_and_hydrate_actions(parsed.get("actions"), out_lang)
+        raw_f = parsed.get("follow_ups")
+        follow_ups = (
+            [str(x).strip()[:110] for x in raw_f if str(x).strip()][:3]
+            if isinstance(raw_f, list)
+            else []
+        )
+        show_cta = bool(parsed.get("show_commercial_cta", False))
+        topic_str = str(parsed.get("topic") or "voice_product_qa")[:64]
+
+    spoken_clean = _clean_text_for_speech(
+        str(parsed.get("spoken_summary") or "").strip() or answer_str,
+        max_chars=280,
+    )
+
+    public_voice_control.record_usage(increment_qa=True, is_voice_input=True, tts_chars=0)
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    public_demo_chat_logger.log_exchange(
+        session_id=session_id,
+        page_context=page_context,
+        lang=out_lang,
+        question=f"🎙️ {heard_q}",
+        answer=answer_str,
+        topic=topic_str,
+        source_mode="gemini_voice",
+        actions=hydrated_actions,
+        show_commercial_cta=show_cta,
+        ip_hash=ip_hash,
+        user_agent=user_agent,
+        latency_ms=latency_ms,
+    )
+
+    return {
+        "heard_question": heard_q,
+        "answer": answer_str,
+        "spoken_summary": spoken_clean,
+        "lang": out_lang,
+        "topic": topic_str,
+        "actions": hydrated_actions,
+        "follow_ups": follow_ups,
+        "show_commercial_cta": show_cta,
+    }
+
+
+async def synthesize_public_expert_speech(
+    *,
+    text: str,
+    lang: str = "en",
+    is_auto_reply: bool = False,
+) -> Tuple[bytes, str]:
+    """
+    Synthesizes studio-grade executive voiceover via Vertex AI `gemini-2.5-flash-tts` (`Kore`).
+    - Applies Arabic phonetic protection (`Grow` in English, natural tā’ marbūṭa endings).
+    - Wraps 24kHz 16-bit PCM into universal `audio/wav` playable in Chrome, Safari iOS, Edge, and Firefox.
+    - Increments `voice_qa_count` ONLY when `is_auto_reply=False` (manual Listen click on a typed turn)
+      so a spoken Mic question + its automatic voice reply counts as 1 single Voice Q&A.
+    """
+    clean_text = _clean_text_for_speech(text, max_chars=340)
+    if not clean_text:
+        raise ValueError("Nothing to synthesize.")
+
+    is_ar = detect_response_language(clean_text, lang) == "ar"
+
+    director_prompt = (
+        "Read the following corporate treasury summary aloud in a warm, confident, natural Modern Standard Arabic executive voice. "
+        "Pronounce the English brand name 'Grow' naturally in English as 'Grow' (never as Arabic 'جرو'), "
+        "articulate Arabic endings clearly and naturally, and speak only the text below:\n\n"
+        f"{clean_text}"
+        if is_ar
+        else (
+            "Read the following corporate treasury summary aloud in a crisp, warm, authoritative executive advisor voice at a natural pace, "
+            "speaking only the text below:\n\n"
+            f"{clean_text}"
+        )
+    )
+
+    client = _get_genai_client() or _get_api_genai_client()
+    if not GEMINI_AVAILABLE or client is None:
+        raise RuntimeError("Studio TTS service is unavailable.")
+
+    tts_config_kwargs: Dict[str, Any] = {
+        "response_modalities": ["AUDIO"],
+        "speech_config": genai_types.SpeechConfig(
+            voice_config=genai_types.VoiceConfig(
+                prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Kore")
+            )
+        ),
+    }
+    if hasattr(genai_types, "AutomaticFunctionCallingConfig"):
+        try:
+            tts_config_kwargs["automatic_function_calling"] = genai_types.AutomaticFunctionCallingConfig(disable=True)
+        except Exception:
+            pass
+
+    tts_config = genai_types.GenerateContentConfig(**tts_config_kwargs)
+    resp = await _safe_generate_content_async(
+        client,
+        GEMINI_TTS_MODEL_NAME,
+        director_prompt,
+        config=tts_config,
+    )
+
+    candidates = getattr(resp, "candidates", None) or []
+    if not candidates or not getattr(candidates[0], "content", None):
+        raise RuntimeError("Empty audio response from TTS model.")
+
+    parts = getattr(candidates[0].content, "parts", None) or []
+    inline_data = getattr(parts[0], "inline_data", None) if parts else None
+    raw_audio: Optional[bytes] = getattr(inline_data, "data", None) if inline_data else None
+    mime_str: str = str(getattr(inline_data, "mime_type", "") or "audio/L16;rate=24000")
+
+    if not raw_audio:
+        raise RuntimeError("No audio bytes returned by TTS model.")
+
+    public_voice_control.record_usage(
+        increment_qa=(not is_auto_reply),
+        is_voice_input=False,
+        tts_chars=len(clean_text),
+    )
+
+    if "l16" in mime_str.lower() or "pcm" in mime_str.lower():
+        rate_match = re.search(r"rate=(\d+)", mime_str)
+        sample_rate = int(rate_match.group(1)) if rate_match else 24000
+        return _wrap_pcm_l16_as_wav(raw_audio, sample_rate=sample_rate), "audio/wav"
+
+    return raw_audio, mime_str.split(";")[0].strip() or "audio/wav"

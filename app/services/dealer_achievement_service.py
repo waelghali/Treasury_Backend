@@ -139,6 +139,9 @@ class DealerAchievementService:
                     QuotationRequest.id.in_(rfq_ids),
                     QuotationRequest.ref_no.like('RFQ-202%')
                 ).all() if rfq_ids else []
+                from app.core.trial_guard import is_trial_customer, is_trial_mode
+                if not is_trial_mode():
+                    rfqs = [r for r in rfqs if not is_trial_customer(db, getattr(r, 'customer_id', None))]
 
                 # Scope assignments, offers, and OTPs strictly to authentic corporate RFQs
                 valid_rfq_ids = set([r.id for r in rfqs])
@@ -399,6 +402,9 @@ class DealerAchievementService:
                     QuotationRequest.id.in_(rfq_ids),
                     QuotationRequest.ref_no.like('RFQ-202%')
                 ).all() if rfq_ids else []
+                from app.core.trial_guard import is_trial_customer, is_trial_mode
+                if not is_trial_mode():
+                    rfqs = [r for r in rfqs if not is_trial_customer(db, getattr(r, 'customer_id', None))]
 
                 # Scope assignments, offers, and OTPs strictly to authentic corporate RFQs
                 valid_rfq_ids = set([r.id for r in rfqs])

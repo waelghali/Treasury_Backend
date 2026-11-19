@@ -129,8 +129,10 @@ class SLAActualizationService:
             updated_metrics["facility_new_avg_sla"] = new_fac_sla
             updated_metrics["facility_commitment_pct"] = new_comm
 
-        # 2. Update Bank Moving Metrics
-        if bank:
+        # 2. Update Bank Moving Metrics (Strictly skipped for Trial / Sandbox tenants to protect global Bank SLA integrity)
+        from app.core.trial_guard import is_trial_customer
+        owner_cust_id = getattr(facility, "customer_id", None) if facility else getattr(issued_lg, "customer_id", None)
+        if bank and not is_trial_customer(db, owner_cust_id):
             prev_bank_sla = float(bank.actual_avg_sla_days) if bank.actual_avg_sla_days is not None else None
             prev_bank_count = bank.total_completed_issuances or 0
             new_bank_count = prev_bank_count + 1

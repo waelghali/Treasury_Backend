@@ -180,7 +180,7 @@ The Quotation Module provides institutional multi-bank rate discovery, digital R
 * **Timeout Actions**:
   - `AUTO_ACCEPT`: Automatically awards the deal to the best valid compliant quote when the timer reaches zero, immediately dispatching trade confirmations.
   - `AUTO_REJECT`: Declines trade execution when the timer hits zero while preserving all quotes for audit and re-tender.
-* **Tolerance Limits**: If the winning quote deviates from the Central Bank (CBE) benchmark by more than `max_tolerance_percent`, the trade is flagged `INCONCLUSIVE` to safeguard against off-market execution.
+* **Tolerance Limits**: If the winning quote deviates from the active market/indicative/CBE benchmark by more than `max_tolerance_percent`, the trade is flagged `INCONCLUSIVE` to safeguard against off-market execution.
 
 --- E. DEAL EXECUTION RECEIPTS & AUDIT EVIDENCE ---
 * Upon trade acceptance, the system automatically generates an official **Deal Confirmation Receipt (PDF)**.

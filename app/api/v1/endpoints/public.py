@@ -114,6 +114,31 @@ def get_legal_content(
             detail="An unexpected error occurred while fetching legal content."
         )
 
+_PERSONAL_OR_DISPOSABLE_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "yahoo.fr", "ymail.com",
+    "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com", "msn.com",
+    "icloud.com", "me.com", "mac.com", "aol.com", "protonmail.com", "proton.me",
+    "yandex.com", "mail.com", "gmx.com", "mailinator.com", "guerrillamail.com",
+    "tempmail.com", "10minutemail.com", "yopmail.com", "sharklasers.com", "trashmail.com",
+}
+
+
+def _validate_corporate_work_email(email_str: str) -> str:
+    clean = (email_str or "").strip().lower()
+    if "@" not in clean:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please provide a valid corporate work email address.",
+        )
+    domain = clean.rsplit("@", 1)[1].strip()
+    if not domain or "." not in domain or domain in _PERSONAL_OR_DISPOSABLE_EMAIL_DOMAINS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please register using your corporate work email address (e.g. name@yourcompany.com) rather than a personal inbox.",
+        )
+    return clean
+
+
 @router.post(
     "/register-free-trial/",
     response_model=TrialRegistrationOut,
@@ -129,48 +154,100 @@ async def register_free_trial(
     contact_phone: str = Form(...),
     admin_email: str = Form(...),
     entities_count: str = Form(...),
-    requested_modules: str = Form("custody", description="Comma-separated list of requested modules: custody, issuance, or both"),
-    commercial_register_document: UploadFile = File(...),
+    requested_modules: str = Form("custody", description="Comma-separated list of requested modules"),
+    commercial_register_document: Optional[UploadFile] = File(None),
     accepted_terms: str = Form(...),
     website_url: Optional[str] = Form(None),
 ):
     """
     Handles a new free trial registration from a public user.
+    Commercial Register document is optional for Sandbox Trial evaluation (required only before live production go-live).
     """
     # Perimeter Anti-Bot Honeypot Defense (§2.8)
     await verify_honeypot(
         website_url,
         request=request,
         context="free_trial_registration",
-        legitimate_values=[admin_email, contact_admin_name, organization_name, contact_phone]
+        legitimate_values=[
+            admin_email,
+            contact_admin_name,
+            organization_name,
+            organization_address,
+            contact_phone,
+        ],
     )
+
+    admin_email = _validate_corporate_work_email(admin_email)
 
     if accepted_terms.lower() != 'true':
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Terms and Conditions must be accepted.")
-        
-    if not commercial_register_document.filename.endswith(('.pdf', '.jpg', '.jpeg', '.png')):
+
+    has_cr_file = bool(
+        commercial_register_document
+        and getattr(commercial_register_document, "filename", None)
+        and str(commercial_register_document.filename).strip()
+    )
+    if has_cr_file and not commercial_register_document.filename.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Commercial register document must be a PDF, JPG, or PNG.")
 
-    # Check for existing registrations with this email
+    # Reject ONLY if (a) an active non-deleted customer/corporate user already exists, or
+    # (b) a free trial request is currently pending approval. Deleted customers can re-apply freely!
+    from sqlalchemy import func
     from app.models import TrialRegistration
-    existing = db.query(TrialRegistration).filter(
-        TrialRegistration.admin_email == admin_email,
-        TrialRegistration.is_deleted == False
-    ).first()
-    
-    if existing:
-        if existing.status in ("pending", "approved"):
+    from app.models.models import Customer, User
+
+    admin_domain = admin_email.rsplit("@", 1)[1].strip().lower()
+    active_cust_conflict = (
+        db.query(Customer)
+        .filter(
+            Customer.is_deleted == False,
+            (
+                (func.lower(Customer.contact_email) == admin_email)
+                | (func.lower(Customer.name) == organization_name.strip().lower())
+                | (Customer.domains.contains([admin_domain]))
+            ),
+        )
+        .first()
+    )
+    active_corp_user_conflict = (
+        db.query(User)
+        .filter(
+            User.is_deleted == False,
+            User.customer_id.isnot(None),
+            func.lower(User.email) == admin_email,
+        )
+        .first()
+    )
+    if active_cust_conflict or active_corp_user_conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An active corporate account for this organization or email already exists. Please sign in or contact support.",
+        )
+
+    existing_regs = (
+        db.query(TrialRegistration)
+        .filter(
+            func.lower(TrialRegistration.admin_email) == admin_email,
+            TrialRegistration.is_deleted == False,
+        )
+        .all()
+    )
+    for reg_row in existing_regs:
+        if reg_row.status == "pending":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"A {existing.status} registration with this email already exists."
+                detail="A free trial request for this email is already pending approval.",
             )
-        else:
-            # Rejected or failed — allow re-application by removing the old record
-            db.delete(existing)
-            db.flush()
 
-    # *** CHANGE: Use GCS upload function ***
-    file_path = await upload_file_to_gcs(commercial_register_document, "commercial_registers")
+    # Any remaining rows are either rejected or belonged to a deleted customer — clear them so re-registration succeeds cleanly
+    for reg_row in existing_regs:
+        db.delete(reg_row)
+    if existing_regs:
+        db.flush()
+
+    file_path = None
+    if has_cr_file:
+        file_path = await upload_file_to_gcs(commercial_register_document, "commercial_registers")
     
     latest_tc = crud_legal_artifact.get_by_artifact_type(db, artifact_type=LegalArtifactType.TERMS_AND_CONDITIONS)
     tc_version = latest_tc.version if latest_tc else 0.0
@@ -203,36 +280,86 @@ async def register_free_trial(
 
     db_registration = crud_trial_registration.create(db, obj_in=registration_in)
 
-    # Build module-aware email text
+    # Build clean module list for branded SaaS confirmation email + founder lead alert
     module_names = []
-    if "custody" in parsed_modules:
-        module_names.append("LG Custody")
-    if "issuance" in parsed_modules:
-        module_names.append("LG Issuance")
-    if "quotations" in parsed_modules:
-        module_names.append("FX & T-Bill Quotations")
     if "reconciliation" in parsed_modules:
         module_names.append("Bank Auto-Reconciliation")
-    modules_text = " & ".join(module_names) if module_names else "Treasury Platform"
+    if "custody" in parsed_modules:
+        module_names.append("LG Custody & Lifecycle")
+    if "issuance" in parsed_modules:
+        module_names.append("LG Issuance & Risk Shield")
+    if "quotations" in parsed_modules:
+        module_names.append("FX & T-Bill Sealed Bidding")
+    if not module_names:
+        module_names = ["Grow Corporate Treasury Suite"]
+
+    from app.core.routing import get_frontend_base_url
+    from app.services.unified_email_builder import build_standard_email_html
+
+    base_url = get_frontend_base_url(request=request)
+    bullets_html = "".join(f"<li style='margin-bottom:4px;'>{m}</li>" for m in module_names)
 
     email_settings = get_global_email_settings()
-    subject = f"{modules_text} Free Trial Registration Confirmation"
-    body = f"""
-        <html><body>
-            <p>Dear {contact_admin_name},</p>
-            <p>Thank you for registering for a free trial of our <strong>{modules_text}</strong> platform.</p>
-            <p>Your registration has been submitted and will be reviewed and activated within 2 working days. We will notify you via email as soon as your account is ready.</p>
-            <p>Please find a copy of our Terms & Conditions and Free Trial Disclaimer attached for your records.</p>
-            <p>Best regards,</p>
-            <p>The Grow Business Development Team</p>
-        </body></html>
-    """
+    subject = f"Grow Treasury — Guided Trial Sandbox Request Received ({organization_name})"
+    body = build_standard_email_html(
+        customer_name=organization_name,
+        title="Guided Trial Sandbox Request Received",
+        recipient_name=contact_admin_name,
+        content_html=(
+            f"<p>Thank you for requesting Guided Trial Sandbox access for <strong>{organization_name}</strong>.</p>"
+            f"<div style='margin: 16px 0; padding: 12px 16px; background-color: #f8fafc; border-left: 3px solid #1e40af; border-radius: 6px;'>"
+            f"<strong style='font-size:12px; color:#0f172a; text-transform:uppercase; letter-spacing:0.5px;'>Selected Modules:</strong>"
+            f"<ul style='margin:8px 0 0 0; padding-left:18px; color:#334155; font-size:13px;'>{bullets_html}</ul>"
+            f"</div>"
+            f"<p><strong>What happens next:</strong> A treasury specialist will reach out briefly to align on your evaluation focus and send your private workspace activation link. No Commercial Register or bank setup is required to test inside the sandbox.</p>"
+            f"<p style='color:#64748b; font-size:12.5px;'>A copy of our Terms of Service (v{tc_version}) is attached for your records. In the meantime, you can explore live platform workflows anytime below.</p>"
+        ),
+        cta_text="Explore Interactive Demo",
+        cta_url=f"{base_url}/demo",
+        platform_name="Grow Treasury Platform",
+        footer_subtitle="Guided Sandbox Onboarding",
+    )
 
-    tc_content = latest_tc.content if latest_tc else "Terms and Conditions not found."
+    tc_content = latest_tc.content if latest_tc else "Terms of Service not found."
     pdf_content = await generate_pdf_from_html(tc_content)
-    attachment = EmailAttachment("Terms_and_Conditions.pdf", pdf_content, "application/pdf")
+    attachment = EmailAttachment("Grow_Terms_of_Service.pdf", pdf_content, "application/pdf")
 
     background_tasks.add_task(send_email, db, [admin_email], subject, body, {}, email_settings, attachments=[attachment])
+
+    # Notify System Owner(s) immediately of the new corporate trial lead
+    try:
+        from app.constants import UserRole
+        from app.models.models import User
+        so_emails = [
+            u_email for (u_email,) in db.query(User.email).filter(
+                User.role == UserRole.SYSTEM_OWNER,
+                User.is_deleted == False,
+            ).all() if u_email
+        ]
+        if so_emails:
+            so_subject = f"New Trial Lead — {organization_name} ({contact_admin_name})"
+            so_body = build_standard_email_html(
+                customer_name="Grow Platform Admin",
+                title=f"New Guided Trial Request: {organization_name}",
+                content_html=(
+                    f"<p>A new corporate prospect submitted a Guided Trial Sandbox request:</p>"
+                    f"<ul style='line-height:1.7; color:#1e293b;'>"
+                    f"<li><strong>Company:</strong> {organization_name} ({entities_count} entity structure)</li>"
+                    f"<li><strong>Contact:</strong> {contact_admin_name}</li>"
+                    f"<li><strong>Work Email:</strong> {admin_email}</li>"
+                    f"<li><strong>Phone / WhatsApp:</strong> {contact_phone}</li>"
+                    f"<li><strong>Commercial Register:</strong> {'Attached' if has_cr_file else 'Skipped (Sandbox Mode)'}</li>"
+                    f"<li><strong>Modules:</strong> {', '.join(module_names)}</li>"
+                    f"</ul>"
+                ),
+                cta_text="Review in System Owner Console",
+                cta_url=f"{base_url}/system-owner/customers",
+                platform_name="Grow Lead Alerts",
+                footer_subtitle="System Owner Notification",
+            )
+            background_tasks.add_task(send_email, db, so_emails, so_subject, so_body, {}, email_settings)
+    except Exception as so_err:
+        logger.warning(f"System Owner trial lead notification skipped: {so_err}")
     
     return db_registration
 

@@ -31,7 +31,10 @@ async def send_corporate_admin_activation_email(
     user: User,
     customer_name: str,
     request: Optional[object] = None,
-    custom_role_label: Optional[str] = None
+    custom_role_label: Optional[str] = None,
+    is_trial: bool = False,
+    recipient_name: Optional[str] = None,
+    module_labels: Optional[list] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Issues a single-use 24-hour activation token for a Corporate Admin or Customer User
@@ -50,7 +53,8 @@ async def send_corporate_admin_activation_email(
         # 2. Generate secure single-use token (only token_hash is stored in DB)
         plain_token = str(uuid.uuid4())
         token_hash = get_password_hash(plain_token)
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        valid_hours = 48 if is_trial else 24
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=valid_hours)
 
         token_rec = PasswordResetToken(
             user_id=user.id,
@@ -59,7 +63,7 @@ async def send_corporate_admin_activation_email(
             is_used=False
         )
         db.add(token_rec)
-        db.flush()
+        db.commit()
 
         # 3. Format activation link with mode=activation
         frontend_url = get_frontend_base_url(request=request)
@@ -85,22 +89,54 @@ async def send_corporate_admin_activation_email(
             else:
                 role_label = str(user.role.value).replace('_', ' ').title()
 
-        subject = f"Welcome to Grow Treasury — Activate Your Account ({customer_name})"
-        body = build_security_email_html(
-            title="Welcome to Grow Treasury",
-            user_email=user.email,
-            message=(
-                f"Your account has been configured under organization <strong>{customer_name}</strong> in Grow Treasury "
-                f"with the role of <strong>{role_label}</strong>.<br><br>"
-                f"Please click below to activate your account and establish your private, confidential password. "
-                f"For institutional privacy, this activation link is strictly confidential and neither platform administrators "
-                f"nor your organization's administrators have access to your credentials.<br><br>"
-                f"<em>This link is valid for 24 hours.</em>"
-            ),
-            action_url=activation_link,
-            action_text="Activate Account & Set Password",
-            platform_name="Grow Treasury Onboarding"
-        )
+        if is_trial:
+            greeting_line = f"Hello <strong>{recipient_name}</strong>,<br><br>" if recipient_name else ""
+            modules_html = ""
+            if module_labels:
+                items = "".join(f"<li style='margin-bottom:4px;'>{m}</li>" for m in module_labels)
+                modules_html = (
+                    f"<div style='margin: 14px 0; padding: 12px 16px; background-color: #f8fafc; "
+                    f"border-left: 3px solid #0284c7; border-radius: 6px;'>"
+                    f"<strong style='font-size:12px; color:#0f172a; text-transform:uppercase; letter-spacing:0.5px;'>"
+                    f"Unlocked Modules in Your Workspace:</strong>"
+                    f"<ul style='margin:8px 0 0 0; padding-left:18px; color:#334155; font-size:13px;'>{items}</ul>"
+                    f"</div>"
+                )
+            subject = f"Welcome to Grow Treasury — Activate Your 14-Day Free Trial ({customer_name})"
+            body = build_security_email_html(
+                title="Your 14-Day Free Trial is Ready",
+                user_email=user.email,
+                message=(
+                    f"{greeting_line}"
+                    f"Your private Free Trial account for <strong>{customer_name}</strong> is ready on "
+                    f"<strong>Grow Corporate Treasury Platform</strong>."
+                    f"{modules_html}"
+                    f"We already loaded sample Letters of Guarantee, 3 bank credit lines, and sample test files "
+                    f"so you can start testing in 2 minutes — or upload your own files safely (encrypted for your company only).<br><br>"
+                    f"<strong>Note:</strong> Your 14-day trial timer starts only after you set your password and sign in.<br><br>"
+                    f"<em>This private activation link is valid for {valid_hours} hours.</em>"
+                ),
+                action_url=activation_link,
+                action_text="Set Password & Start Free Trial",
+                platform_name="Grow Treasury Platform",
+            )
+        else:
+            subject = f"Welcome to Grow Treasury — Activate Your Account ({customer_name})"
+            body = build_security_email_html(
+                title="Welcome to Grow Treasury",
+                user_email=user.email,
+                message=(
+                    f"Your account has been configured under organization <strong>{customer_name}</strong> in Grow Treasury "
+                    f"with the role of <strong>{role_label}</strong>.<br><br>"
+                    f"Please click below to activate your account and establish your private, confidential password. "
+                    f"For institutional privacy, this activation link is strictly confidential and neither platform administrators "
+                    f"nor your organization's administrators have access to your credentials.<br><br>"
+                    f"<em>This link is valid for {valid_hours} hours.</em>"
+                ),
+                action_url=activation_link,
+                action_text="Activate Account & Set Password",
+                platform_name="Grow Treasury Onboarding"
+            )
 
         # 6. Send email with save_copy=False (SendOnly - Never saved to Sent Items!)
         success, err = await send_email(

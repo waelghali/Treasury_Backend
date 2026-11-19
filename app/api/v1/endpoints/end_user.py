@@ -650,6 +650,9 @@ async def create_lg_record(
     Performs comprehensive validation and links associated documents.
     Now accepts JSON data as a form field and files as UploadFile objects.
     """
+    from app.core.trial_guard import enforce_trial_quota
+    enforce_trial_quota(db, end_user_context.customer_id, "lg")
+
     client_host = get_client_ip(request) if request else None
 
     # Parse the JSON string back into a Pydantic model
@@ -4551,6 +4554,8 @@ def view_bank_reply_discrepancy_letter(
         customer_id=end_user_context.customer_id,
         lg_record_id=lg.id,
     )
+    from app.core.trial_guard import inject_trial_html_watermark
+    discrepancy_html = inject_trial_html_watermark(discrepancy_html)
     return HTMLResponse(content=discrepancy_html, status_code=status.HTTP_200_OK)
 
         

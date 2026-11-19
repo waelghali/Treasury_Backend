@@ -109,11 +109,19 @@ def validate_portal_access(token: str = Query(...), db: Session = Depends(get_db
 
 @router.post("/verify-domain")
 def public_verify_domain(
+    request: Request,
     payload: dict,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
+    from app.core.honeypot import verify_honeypot_sync
     email = payload.get("email", "").lower()
+    verify_honeypot_sync(
+        payload.get("website_url"),
+        request=request,
+        context="public_issuance_verify_domain",
+        legitimate_values=[email],
+    )
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid email format")
     

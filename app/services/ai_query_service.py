@@ -1813,10 +1813,10 @@ class AIQueryAssistantService:
             "tolerance limit", "tolerance percent", "cbe benchmark", "inconclusive", "max tolerance"
         ]):
             return (
-                f"**How Tolerance Limits & Central Bank (CBE) Benchmarks Work**:\n\n"
+                f"**How Tolerance Limits & Live Market / CBE Benchmarks Work**:\n\n"
                 f"To protect corporate treasury from executing trades at off-market spreads, the system enforces **Tolerance Limit Controls**:\n\n"
                 f"1. **Benchmark Reference**:\n"
-                f"   - The RFQ compares incoming quotes against the Central Bank (CBE) benchmark rate or indicative reference pricing.\n\n"
+                f"   - The RFQ compares incoming quotes against live intraday interbank market rates, historical execution spreads, indicative bank pricing, and Central Bank (CBE) reference rates.\n\n"
                 f"2. **Tolerance Threshold (`max_tolerance_percent`)**:\n"
                 f"   - If the best submitted execution rate deviates from the benchmark by more than the allowed tolerance percentage (e.g. > 0.5%), the trade is automatically flagged as **INCONCLUSIVE**.\n\n"
                 f"3. **Execution Safeguard**:\n"

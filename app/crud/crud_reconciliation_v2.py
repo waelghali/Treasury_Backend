@@ -216,7 +216,7 @@ class CRUDCounterparty(CRUDBase):
 
     def create_counterparty(self, db: Session, obj_in: CounterpartyCreate, 
                             customer_id: Optional[int], user_id: int) -> Counterparty:
-        company_id = obj_in.company_id if obj_in.company_id is not None else customer_id
+        company_id = customer_id if customer_id is not None else obj_in.company_id
         clean_name = obj_in.name.strip()
         dek = reconciliation_confidentiality.get_tenant_dek(db, company_id) if company_id else None
         blind_tok = reconciliation_confidentiality.compute_blind_token(clean_name, dek, prefix="ENT_TOK")
@@ -244,16 +244,14 @@ class CRUDCounterparty(CRUDBase):
                             obj_in: CounterpartyUpdate, customer_id: int) -> Counterparty:
         db_obj = db.query(self.model).filter(
             self.model.id == counterparty_id,
-            or_(
-                self.model.company_id == customer_id,
-                self.model.company_id == None
-            ),
+            self.model.company_id == customer_id,
             self.model.is_deleted == False
         ).first()
         if not db_obj:
             raise HTTPException(status_code=404, detail="Counterparty not found")
             
         update_data = obj_in.model_dump(exclude_unset=True)
+        update_data.pop("company_id", None)
         for field, value in update_data.items():
             setattr(db_obj, field, value)
 
@@ -400,6 +398,15 @@ class CRUDClassificationTaxonomy(CRUDBase):
         return classes
 
     def create_node(self, db: Session, node_in: TaxonomyNodeCreate, customer_id: int, user_id: int) -> ClassificationTaxonomy:
+        if node_in.parent_id is not None:
+            parent_node = db.query(self.model).filter(
+                self.model.id == node_in.parent_id,
+                or_(self.model.company_id == customer_id, self.model.company_id == None),
+                self.model.is_deleted == False,
+            ).first()
+            if not parent_node:
+                raise HTTPException(status_code=404, detail="Parent taxonomy class not found")
+
         db_obj = ClassificationTaxonomy(
             company_id=customer_id,
             parent_id=node_in.parent_id,

@@ -53,11 +53,48 @@ class CRUDCustomer(CRUDBase):
         ).first()
 
     def onboard_customer(self, db: Session, customer_in: CustomerCreate, user_id_caller: int) -> models.Customer:
-        # Validate uniqueness of customer name and email
+        # Validate uniqueness against ACTIVE customers only
         if self.get_by_name(db, customer_in.name):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Customer with this name already exists.")
         if self.get_by_contact_email(db, customer_in.contact_email):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Customer with this contact email already exists.")
+
+        admin_email_lower = customer_in.initial_corporate_admin.email.strip().lower()
+        active_user_conflict = db.query(models.User).filter(
+            func.lower(models.User.email) == admin_email_lower,
+            models.User.is_deleted == False,
+        ).first()
+        if active_user_conflict:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"An active user with email '{admin_email_lower}' already exists.")
+
+        # Archive unique keys on any previously SOFT-DELETED customers/users so deleted accounts never block re-onboarding or repeat trials
+        stale_deleted_customers = db.query(models.Customer).filter(
+            models.Customer.is_deleted == True,
+            (
+                (func.lower(models.Customer.name) == func.lower(customer_in.name))
+                | (func.lower(models.Customer.contact_email) == func.lower(customer_in.contact_email))
+            ),
+        ).all()
+        for stale_c in stale_deleted_customers:
+            suffix = f" [deleted-{stale_c.id}]"
+            if not str(stale_c.name or "").endswith(suffix):
+                stale_c.name = f"{stale_c.name}{suffix}"[:150]
+            if not str(stale_c.contact_email or "").startswith(f"deleted.{stale_c.id}."):
+                stale_c.contact_email = f"deleted.{stale_c.id}.{stale_c.contact_email}"[:250]
+            stale_c.domains = []
+            db.add(stale_c)
+
+        stale_deleted_users = db.query(models.User).filter(
+            models.User.is_deleted == True,
+            func.lower(models.User.email) == admin_email_lower,
+        ).all()
+        for stale_u in stale_deleted_users:
+            if not str(stale_u.email or "").startswith(f"deleted.{stale_u.id}."):
+                stale_u.email = f"deleted.{stale_u.id}.{stale_u.email}"[:250]
+                db.add(stale_u)
+
+        if stale_deleted_customers or stale_deleted_users:
+            db.flush()
 
         # Validate subscription plan
         subscription_plan = db.query(models.SubscriptionPlan).filter(models.SubscriptionPlan.id == customer_in.subscription_plan_id, models.SubscriptionPlan.is_deleted == False).first()
@@ -104,12 +141,14 @@ class CRUDCustomer(CRUDBase):
 
         # Create initial entities
         if not customer_in.initial_entities:
-            customer_prefix = customer_in.name.replace(" ", "").upper()[:3].ljust(3, 'X')
+            import re
+            customer_prefix = re.sub(r"[^A-Z0-9]", "", (customer_in.name or "").upper())[:3].ljust(3, 'X')
             default_entity_code = f"{customer_prefix}1"
             main_entity_in = CustomerEntityCreate(
                 entity_name="Main Entity",
+                address=(customer_in.address or "Corporate Headquarters")[:250],
                 code=default_entity_code,
-                contact_person=customer_in.name,
+                contact_person=(customer_in.name or "Main Contact")[:100],
                 contact_email=customer_in.contact_email,
             )
             self.crud_customer_entity_instance.create(db, main_entity_in, db_customer.id, user_id_caller)

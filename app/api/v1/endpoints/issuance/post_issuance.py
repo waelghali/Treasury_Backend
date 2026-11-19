@@ -2393,6 +2393,54 @@ async def analyze_supporting_document_endpoint(
     return result
 
 
+@router.post("/analyze-special-wording-preview")
+async def preview_special_wording_traps_endpoint(
+    wording_text: Optional[str] = Form(None),
+    lg_type: Optional[str] = Form(None),
+    beneficiary_name: Optional[str] = Form(None),
+    currency: Optional[str] = Form(None),
+    lg_value: Optional[float] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_issuance_read_context),
+):
+    """
+    Pre-submission inline Special Wording Trap Detector (runs directly on Step 4 of New LG Request
+    as soon as a user attaches a Special Wording PDF/DOCX or clicks 'Do It For Me', before saving a request ID).
+    """
+    from app.services.wording_risk_service import analyze_special_wording_traps
+
+    file_bytes: Optional[bytes] = None
+    filename = "special_wording.pdf"
+    if file:
+        filename = file.filename or "special_wording.pdf"
+        file_bytes = await file.read()
+
+    clean_text = (wording_text or "").strip()
+    if not file_bytes and not clean_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Please attach a Special Wording document or provide wording text to scan.",
+        )
+
+    request_context = {
+        "currency": currency,
+        "beneficiary_name": beneficiary_name,
+        "lg_type": lg_type,
+        "lg_value": lg_value,
+        "issuance_country": "Egypt",
+    }
+    return await analyze_special_wording_traps(
+        wording_text=clean_text if clean_text else None,
+        file_bytes=file_bytes,
+        filename=filename,
+        request_context=request_context,
+        db=db,
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+    )
+
+
 @router.post("/requests/{request_id}/analyze-special-wording")
 async def analyze_request_special_wording_endpoint(
     request_id: int,

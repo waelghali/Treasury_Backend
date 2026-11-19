@@ -12,8 +12,14 @@ from app.models.models_reconciliation_v2 import (
     BankStatement, BankTransaction, InternalLedgerRecord, ClassificationTaxonomy, Counterparty,
     ReconciliationMatch, ClassificationRule, ReconciliationExportProfile, MatchingToleranceRule
 )
-# Fix: get_current_corporate_admin is often a proxy or defined in security
-from app.api.v1.endpoints.corporate_admin import get_current_corporate_admin_context as get_current_corporate_admin
+from app.core.security import (
+    TokenData,
+    check_subscription_status,
+    get_current_corporate_admin_context,
+)
+from app.constants import UserRole
+from app.schemas.all_schemas import BankOut
+from app.crud.crud import crud_bank
 from app.schemas.schemas_reconciliation_v2 import (
     BankStatementOut, BankTransactionOut, 
     ClassificationRuleCreate, ClassificationRuleUpdate, ClassificationRuleOut,
@@ -32,9 +38,35 @@ from app.crud.crud_reconciliation_v2 import (
     crud_internal_ledger, crud_taxonomy, crud_export_profile, crud_matching_tolerance_rule
 )
 from app.services.bank_reconciliation_service import bank_reconcile_service
-from app.core.security import TokenData
+
+
+def get_reconciliation_user_context(
+    current_user: TokenData = Depends(check_subscription_status),
+) -> TokenData:
+    """Allows End Users (makers) and Corporate Admins (oversight/governance) to access Bank Reconciliation."""
+    if current_user.role not in (UserRole.END_USER, UserRole.CORPORATE_ADMIN):
+        raise HTTPException(
+            status_code=403,
+            detail="Not enough privileges: Requires End User or Corporate Admin role.",
+        )
+    if current_user.customer_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="User is not associated with a customer.",
+        )
+    return current_user
+
 
 router = APIRouter()
+
+
+@router.get("/banks", response_model=List[BankOut])
+def list_reconciliation_banks(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """Returns active banks for statement ingestion and filtering (accessible to End Users and Corporate Admins)."""
+    return crud_bank.get_all(db, skip=0, limit=200)
 
 @router.post("/statements/upload", response_model=BankStatementOut)
 async def upload_bank_statement(
@@ -45,12 +77,15 @@ async def upload_bank_statement(
     end_date: Optional[str] = Form(None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Ingests a bank statement file with optional metadata.
     Auto-detects values if not provided.
     """
+    from app.core.trial_guard import enforce_trial_quota
+    enforce_trial_quota(db, current_user.customer_id, "statement")
+
     content = await file.read()
     file_type = file.filename.split('.')[-1]
     
@@ -76,7 +111,7 @@ async def upload_bank_statement(
 @router.get("/statements", response_model=List[BankStatementOut])
 def get_statements(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     return crud_bank_statement.get_by_customer(db, customer_id=current_user.customer_id)
 
@@ -85,7 +120,7 @@ def get_statements(
 def get_statement_transactions(
     statement_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Retrieves all transactions for a specific bank statement.
@@ -101,7 +136,7 @@ def get_statement_transactions(
 def delete_bank_statement(
     statement_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Soft-deletes a bank statement.
@@ -122,7 +157,7 @@ def delete_bank_statement(
 @router.post("/auto-match")
 def run_global_auto_match(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Runs the auto-matching engine for all unmatched transactions of the customer.
@@ -137,11 +172,15 @@ def run_global_auto_match(
 def run_auto_match(
     statement_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Runs the auto-matching engine for a specific statement.
     """
+    stmt = crud_bank_statement.get(db, id=statement_id)
+    if not stmt or stmt.company_id != current_user.customer_id:
+        raise HTTPException(status_code=404, detail="Statement not found")
+
     return bank_reconcile_service.run_matching_engine(
         db, 
         statement_id=statement_id, 
@@ -153,7 +192,7 @@ def run_auto_match(
 def manual_match_records(
     req: MatchActionRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Manually reconciles selected Bank Transactions with selected ERP Ledger Records (1:1, 1:M, M:1, M:N).
@@ -260,7 +299,7 @@ def manual_match_records(
 def unmatch_records(
     req: UnmatchActionRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Unlinks / resets reconciled bank transactions and ERP records back to OPEN / unmatched status.
@@ -326,7 +365,7 @@ def get_reconciliation_matches(
     skip: int = 0,
     search: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Returns all cleared / matched transaction pairs (Bank Transaction <-> ERP Record)
@@ -392,7 +431,7 @@ def get_reconciliation_matches(
 async def run_relationship_detection(
 
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Detects reversals and inter-account transfers.
@@ -406,7 +445,7 @@ async def run_relationship_detection(
 def unlink_transaction(
     transaction_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Unlinks a paired sweep or reversal transaction.
@@ -434,7 +473,7 @@ def unlink_transaction(
 @router.post("/classify")
 def run_global_auto_classification(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Runs the classification rules for all unclassified transactions of the customer.
@@ -448,11 +487,15 @@ def run_global_auto_classification(
 def run_auto_classification(
     statement_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Runs the classification rules for a specific statement.
     """
+    stmt = crud_bank_statement.get(db, id=statement_id)
+    if not stmt or stmt.company_id != current_user.customer_id:
+        raise HTTPException(status_code=404, detail="Statement not found")
+
     return bank_reconcile_service.apply_classification_rules(
         db, 
         statement_id=statement_id, 
@@ -471,7 +514,7 @@ def get_all_transactions(
     skip: int = 0,
     limit: int = 1000,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Unified transaction feed with advanced filtering.
@@ -495,7 +538,7 @@ def learn_from_history(
     statement_id: Optional[int] = None,
     limit: int = 2000,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Bulk Historical Learning:
@@ -513,7 +556,7 @@ def learn_from_history(
 @router.post("/seed-foundational-knowledge")
 def seed_foundational_knowledge(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Idempotently seeds Foundational Banking Standards Rules (SWIFT MT940, ISO 20022,
@@ -528,7 +571,7 @@ def seed_foundational_knowledge(
 @router.get("/rules", response_model=List[ClassificationRuleOut])
 def get_rules(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     return crud_classification_rule.get_by_customer(db, customer_id=current_user.customer_id)
 
@@ -536,7 +579,7 @@ def get_rules(
 def create_rule(
     rule_in: ClassificationRuleCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     return crud_classification_rule.create_rule(
         db, 
@@ -550,7 +593,7 @@ def update_rule(
     rule_id: int,
     rule_in: ClassificationRuleUpdate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     return crud_classification_rule.update_rule(
         db, 
@@ -563,7 +606,7 @@ def update_rule(
 def delete_rule(
     rule_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     crud_classification_rule.delete_rule(
         db, 
@@ -584,7 +627,7 @@ def get_counterparties(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Returns registered counterparties (both tenant-specific and global system entities).
@@ -602,7 +645,7 @@ def get_counterparties(
 def create_counterparty(
     cp_in: CounterpartyCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Creates a new counterparty in the registry.
@@ -619,7 +662,7 @@ def update_counterparty(
     counterparty_id: int,
     cp_in: CounterpartyUpdate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Updates a counterparty definition.
@@ -635,7 +678,7 @@ def update_counterparty(
 def delete_counterparty(
     counterparty_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Deletes / deactivates a counterparty.
@@ -651,7 +694,7 @@ def delete_counterparty(
 def discover_counterparties(
     limit: int = 500,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Scans customer historical transactions to discover recurring counterparties,
@@ -671,7 +714,7 @@ def confirm_and_learn_transaction(
     category: Optional[str] = Form(None),
     gl_account: Optional[str] = Form(None),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Confirms or manually classifies a transaction and automatically reinforces/learns
@@ -692,7 +735,7 @@ def confirm_and_learn_transaction(
 def run_concept_matching(
     statement_id: Optional[int] = None,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Executes concept matching (Counterparties -> Collections / Supplier payments)
@@ -707,7 +750,7 @@ def run_concept_matching(
 @router.get("/collaborative-stats")
 def get_collaborative_intelligence_stats(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Returns platform-wide federated collaborative intelligence metrics.
@@ -720,7 +763,7 @@ def get_collaborative_intelligence_stats(
 def trigger_collaborative_decay(
     inactive_days: int = 180,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
     Triggers dynamic decay of stale signatures that haven't received confirmations.
@@ -735,7 +778,7 @@ def trigger_collaborative_decay(
 @router.get("/taxonomy", response_model=List[TaxonomyNodeOut])
 def get_classification_taxonomy(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Returns full hierarchy of Classes and Subclasses for the company.
@@ -747,7 +790,7 @@ def get_classification_taxonomy(
 def create_taxonomy_node(
     node_in: TaxonomyNodeCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Creates a new Class (parent_id=None) or Subclass (parent_id specified).
@@ -761,7 +804,7 @@ def update_taxonomy_node(
     node_id: int,
     node_in: TaxonomyNodeUpdate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
     Updates a taxonomy node (name, GL account, direction, description).
@@ -775,7 +818,7 @@ def update_taxonomy_node(
 def delete_taxonomy_node(
     node_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
     Deactivates/soft-deletes a taxonomy node.
@@ -793,7 +836,7 @@ def inline_classify_transaction(
     txn_id: int,
     req: ClassifyTransactionRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Inline classification action:
@@ -828,7 +871,7 @@ def inline_classify_transaction(
 def bulk_classify_transactions(
     req: BulkClassifyRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Bulk Classification Action:
@@ -893,7 +936,7 @@ def bulk_classify_transactions(
 def bulk_clear_classification(
     req: BulkClearClassificationRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Resets / un-classifies selected transactions in bulk.
@@ -945,7 +988,7 @@ def bulk_clear_classification(
 async def upload_erp_file(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Inward ERP File Ingestion:
@@ -966,7 +1009,7 @@ async def upload_erp_file(
 def ingest_erp_records_bulk(
     records: List[dict],
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     REST API / Webhook Entry Point for direct ERP integration (SAP, Oracle, NetSuite).
@@ -987,7 +1030,7 @@ def get_erp_records(
     status: Optional[str] = None,
     search: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Retrieves internal ERP ledger records for dual-pane matching.
@@ -1019,7 +1062,7 @@ def promote_or_toggle_rule_lifecycle(
     rule_id: int,
     lifecycle_state: str = "AUTO_CONFIRMED",
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
     Promotes an online-learned rule from SUGGESTED to AUTO_CONFIRMED (or demotes to SUGGESTED).
@@ -1046,7 +1089,7 @@ def promote_or_toggle_rule_lifecycle(
 @router.get("/tolerance-rules", response_model=List[MatchingToleranceRuleOut])
 def get_tolerance_rules(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     return crud_matching_tolerance_rule.get_by_customer(db, customer_id=current_user.customer_id)
 
@@ -1055,7 +1098,7 @@ def get_tolerance_rules(
 def create_tolerance_rule(
     rule_in: MatchingToleranceRuleCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     return crud_matching_tolerance_rule.create_rule(
         db, obj_in=rule_in, customer_id=current_user.customer_id, user_id=current_user.user_id
@@ -1069,7 +1112,7 @@ def create_tolerance_rule(
 @router.get("/export-profiles", response_model=List[ReconciliationExportProfileOut])
 def get_export_profiles(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """Returns all saved custom export profiles for the customer."""
     return crud_export_profile.get_by_customer(db, customer_id=current_user.customer_id)
@@ -1079,7 +1122,7 @@ def get_export_profiles(
 def create_export_profile(
     profile_in: ReconciliationExportProfileCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """Creates a new customizable export template (custom column selection, order, headers, format)."""
     return crud_export_profile.create_profile(
@@ -1092,7 +1135,7 @@ def update_export_profile(
     profile_id: int,
     profile_in: ReconciliationExportProfileUpdate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     return crud_export_profile.update_profile(
         db, profile_id=profile_id, obj_in=profile_in, customer_id=current_user.customer_id
@@ -1103,7 +1146,7 @@ def update_export_profile(
 def delete_export_profile(
     profile_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     crud_export_profile.delete_profile(db, profile_id=profile_id, customer_id=current_user.customer_id)
     return {"status": "success"}
@@ -1112,7 +1155,7 @@ def delete_export_profile(
 @router.get("/export/available-fields")
 def get_available_export_fields(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Returns all standard fields plus any dynamic custom columns (`custom_fields.<col>`)
@@ -1174,7 +1217,7 @@ def get_available_export_fields(
 def preview_custom_export(
     req: CustomExportExecuteRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Returns live export summary stats and the first 50 formatted rows for preview.
@@ -1210,7 +1253,7 @@ def preview_custom_export(
 def download_custom_export(
     req: CustomExportExecuteRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin)
+    current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Generates and streams the user-customized CSV or Excel (.xlsx) export file.
@@ -1276,6 +1319,351 @@ def download_custom_export(
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="reconciliation_export_{timestamp}.csv"'}
         )
+
+
+@router.get("/admin-overview")
+def get_reconciliation_admin_overview(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Executive Bank Reconciliation Oversight & Progress Telemetry for Corporate Admin.
+    Provides real-time visibility into statement ingestion, balance continuity integrity,
+    matching & GL classification completion, aged unreconciled backlogs, variance write-offs,
+    automation rule health, and team maker productivity strictly from factual DB records.
+    """
+    from datetime import date as date_cls, timedelta
+    from sqlalchemy import func as sqla_func
+    from sqlalchemy.orm import joinedload
+    from app.models.models import User, Bank
+
+    cid = current_user.customer_id
+    today = date_cls.today()
+    d7_ago = today - timedelta(days=7)
+    d30_ago = today - timedelta(days=30)
+
+    # 1. Load all non-deleted BankStatements for this company
+    statements: List[BankStatement] = (
+        db.query(BankStatement)
+        .options(joinedload(BankStatement.bank), joinedload(BankStatement.currency))
+        .filter(BankStatement.company_id == cid, BankStatement.is_deleted == False)
+        .order_by(BankStatement.created_at.desc())
+        .all()
+    )
+    stmt_ids = [s.id for s in statements]
+
+    # 2. Load all non-deleted BankTransactions across those statements
+    txns: List[BankTransaction] = []
+    if stmt_ids:
+        txns = (
+            db.query(BankTransaction)
+            .filter(
+                BankTransaction.statement_id.in_(stmt_ids),
+                BankTransaction.is_deleted == False,
+            )
+            .all()
+        )
+
+    # 3. Load ERP Ledger records
+    erp_records: List[InternalLedgerRecord] = (
+        db.query(InternalLedgerRecord)
+        .filter(
+            InternalLedgerRecord.company_id == cid,
+            InternalLedgerRecord.is_deleted == False,
+        )
+        .all()
+    )
+
+    # 4. Load Matches across those transactions
+    txn_ids = [t.id for t in txns]
+    matches: List[ReconciliationMatch] = []
+    if txn_ids:
+        matches = (
+            db.query(ReconciliationMatch)
+            .filter(
+                ReconciliationMatch.bank_txn_id.in_(txn_ids),
+                ReconciliationMatch.is_deleted == False,
+            )
+            .all()
+        )
+
+    # 5. Rules, Tolerance Rules & Counterparties
+    rules: List[ClassificationRule] = (
+        db.query(ClassificationRule)
+        .filter(ClassificationRule.company_id == cid, ClassificationRule.is_deleted == False)
+        .all()
+    )
+    tolerance_rules_count = (
+        db.query(sqla_func.count(MatchingToleranceRule.id))
+        .filter(MatchingToleranceRule.company_id == cid, MatchingToleranceRule.is_deleted == False)
+        .scalar()
+        or 0
+    )
+    counterparties_count = (
+        db.query(sqla_func.count(Counterparty.id))
+        .filter(Counterparty.company_id == cid, Counterparty.is_deleted == False)
+        .scalar()
+        or 0
+    )
+
+    # User lookup cache for team activity & uploader attribution
+    tenant_users = db.query(User).filter(User.customer_id == cid).all()
+    user_map = {u.id: {"email": u.email, "role": u.role.value if hasattr(u.role, "value") else str(u.role)} for u in tenant_users}
+
+    # --- Aggregate Statement & Transaction Metrics ---
+    txns_by_stmt: dict = {}
+    for t in txns:
+        txns_by_stmt.setdefault(t.statement_id, []).append(t)
+
+    total_txns = len(txns)
+    reconciled_txns = 0
+    classified_txns = 0
+    ready_for_export = 0
+    exported_txns = 0
+    manual_overrides_count = 0
+    dup_or_rev_count = 0
+    aged_7d_count = 0
+    aged_30d_count = 0
+
+    unreconciled_by_ccy: dict = {}
+    source_counts: dict = {}
+
+    for t in txns:
+        ccy = (t.currency or "EGP").upper()
+        if t.is_reconciled:
+            reconciled_txns += 1
+        else:
+            b_date = t.booking_date.date() if isinstance(t.booking_date, datetime) else t.booking_date
+            if b_date:
+                if b_date <= d7_ago:
+                    aged_7d_count += 1
+                if b_date <= d30_ago:
+                    aged_30d_count += 1
+            ub = unreconciled_by_ccy.setdefault(ccy, {"currency": ccy, "unreconciled_count": 0, "debit_total": 0.0, "credit_total": 0.0})
+            ub["unreconciled_count"] += 1
+            ub["debit_total"] += float(t.debit_amount or 0)
+            ub["credit_total"] += float(t.credit_amount or 0)
+
+        if t.is_classified:
+            classified_txns += 1
+            src = (t.classification_source or "MANUAL").upper()
+            source_counts[src] = source_counts.get(src, 0) + 1
+
+        if t.is_exported:
+            exported_txns += 1
+        elif t.is_reconciled and t.is_classified:
+            ready_for_export += 1
+
+        if t.manual_override:
+            manual_overrides_count += 1
+        if t.is_duplicate or t.is_reversal:
+            dup_or_rev_count += 1
+
+    unreconciled_txns = total_txns - reconciled_txns
+    unclassified_txns = total_txns - classified_txns
+    reconciled_pct = round((reconciled_txns / total_txns) * 100.0, 1) if total_txns > 0 else 0.0
+    classified_pct = round((classified_txns / total_txns) * 100.0, 1) if total_txns > 0 else 0.0
+
+    # Continuity Warnings & Recent Statements
+    continuity_warnings = []
+    recent_statements_out = []
+    bank_agg: dict = {}
+
+    for s in statements:
+        s_txns = txns_by_stmt.get(s.id, [])
+        s_tot = len(s_txns)
+        s_rec = sum(1 for x in s_txns if x.is_reconciled)
+        s_cls = sum(1 for x in s_txns if x.is_classified)
+        b_name = s.bank.name if s.bank else f"Bank #{s.bank_id}"
+        b_short = (s.bank.short_name if s.bank and s.bank.short_name else b_name)
+        s_ccy = (
+            s.currency.iso_code.upper()
+            if s.currency and s.currency.iso_code
+            else (s_txns[0].currency.upper() if s_txns and s_txns[0].currency else "EGP")
+        )
+        has_cont_warn = (
+            (s.balance_continuity_status or "").upper() == "CONTINUITY_WARNING"
+            or (s.status or "").upper() == "CONTINUITY_WARNING"
+            or abs(float(s.balance_variance_amount or 0)) > 0.01
+        )
+        if has_cont_warn:
+            continuity_warnings.append({
+                "statement_id": s.id,
+                "bank_name": b_name,
+                "file_name": s.file_name,
+                "start_date": s.statement_start_date.isoformat() if s.statement_start_date else None,
+                "end_date": s.statement_end_date.isoformat() if s.statement_end_date else None,
+                "variance_amount": round(float(s.balance_variance_amount or 0), 2),
+                "currency": s_ccy,
+            })
+
+        uploader = user_map.get(s.created_by, {}).get("email") if s.created_by else "System"
+        if len(recent_statements_out) < 15:
+            recent_statements_out.append({
+                "id": s.id,
+                "file_name": s.file_name,
+                "bank_id": s.bank_id,
+                "bank_name": b_name,
+                "bank_short": b_short,
+                "start_date": s.statement_start_date.isoformat() if s.statement_start_date else None,
+                "end_date": s.statement_end_date.isoformat() if s.statement_end_date else None,
+                "opening_balance": round(float(s.opening_balance or 0), 2),
+                "closing_balance": round(float(s.closing_balance or 0), 2),
+                "currency": s_ccy,
+                "status": s.status,
+                "has_continuity_warning": has_cont_warn,
+                "uploaded_by": uploader,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "total_txns": s_tot,
+                "reconciled_txns": s_rec,
+                "reconciled_pct": round((s_rec / s_tot) * 100.0, 1) if s_tot > 0 else 0.0,
+                "classified_txns": s_cls,
+                "classified_pct": round((s_cls / s_tot) * 100.0, 1) if s_tot > 0 else 0.0,
+            })
+
+        bg = bank_agg.setdefault(s.bank_id, {
+            "bank_id": s.bank_id,
+            "bank_name": b_name,
+            "bank_short": b_short,
+            "statements_count": 0,
+            "latest_end_date": None,
+            "latest_closing_balance": 0.0,
+            "currency": s_ccy,
+            "total_txns": 0,
+            "reconciled_txns": 0,
+            "classified_txns": 0,
+            "has_continuity_warning": False,
+        })
+        bg["statements_count"] += 1
+        bg["total_txns"] += s_tot
+        bg["reconciled_txns"] += s_rec
+        bg["classified_txns"] += s_cls
+        if has_cont_warn:
+            bg["has_continuity_warning"] = True
+        end_iso = s.statement_end_date.isoformat() if s.statement_end_date else None
+        if end_iso and (bg["latest_end_date"] is None or end_iso > bg["latest_end_date"]):
+            bg["latest_end_date"] = end_iso
+            bg["latest_closing_balance"] = round(float(s.closing_balance or 0), 2)
+            bg["currency"] = s_ccy
+
+    bank_progress = []
+    for bg in sorted(bank_agg.values(), key=lambda x: x["total_txns"], reverse=True):
+        btot = bg["total_txns"]
+        brec = bg["reconciled_txns"]
+        bcls = bg["classified_txns"]
+        bg["unreconciled_txns"] = btot - brec
+        bg["unclassified_txns"] = btot - bcls
+        bg["reconciled_pct"] = round((brec / btot) * 100.0, 1) if btot > 0 else 0.0
+        bg["classified_pct"] = round((bcls / btot) * 100.0, 1) if btot > 0 else 0.0
+        bank_progress.append(bg)
+
+    # ERP Ledger Open vs Reconciled
+    open_erp_count = sum(1 for e in erp_records if (e.status or "OPEN").upper() == "OPEN")
+    reconciled_erp_count = len(erp_records) - open_erp_count
+    erp_open_by_type: dict = {}
+    for e in erp_records:
+        if (e.status or "OPEN").upper() == "OPEN":
+            rt = e.record_type or "OTHER"
+            erp_open_by_type[rt] = erp_open_by_type.get(rt, 0) + 1
+
+    # Variance Write-Offs across Matches
+    variance_matches_count = 0
+    variance_by_disp: dict = {}
+    for m in matches:
+        v = float(m.variance_amount or 0)
+        if v > 0.005:
+            variance_matches_count += 1
+            disp = m.variance_disposition or "UNSPECIFIED"
+            variance_by_disp[disp] = round(variance_by_disp.get(disp, 0.0) + v, 2)
+
+    # Team Maker Activity
+    team_stats: dict = {}
+
+    def _touch_actor(uid, ts, field):
+        if not uid:
+            return
+        uinfo = user_map.get(uid, {"email": f"User #{uid}", "role": "end_user"})
+        entry = team_stats.setdefault(uid, {
+            "user_id": uid,
+            "email": uinfo["email"],
+            "role": uinfo["role"],
+            "statements_uploaded": 0,
+            "matches_created": 0,
+            "erp_ingested": 0,
+            "last_activity_at": None,
+        })
+        entry[field] += 1
+        ts_iso = ts.isoformat() if isinstance(ts, datetime) else (str(ts) if ts else None)
+        if ts_iso and (entry["last_activity_at"] is None or ts_iso > entry["last_activity_at"]):
+            entry["last_activity_at"] = ts_iso
+
+    for s in statements:
+        _touch_actor(s.created_by, s.created_at, "statements_uploaded")
+    for m in matches:
+        _touch_actor(m.created_by, m.created_at, "matches_created")
+    for e in erp_records:
+        _touch_actor(e.created_by, e.created_at, "erp_ingested")
+
+    team_activity = sorted(
+        team_stats.values(),
+        key=lambda x: (x["matches_created"] + x["statements_uploaded"] + x["erp_ingested"]),
+        reverse=True,
+    )
+
+    # Automation & Rule Governance
+    confirmed_rules_count = sum(1 for r in rules if (r.lifecycle_state or "").upper() == "AUTO_CONFIRMED" and r.is_active)
+    suggested_rules_count = sum(1 for r in rules if (r.lifecycle_state or "").upper() in ("CANDIDATE", "SUGGESTED"))
+
+    return {
+        "as_of": datetime.utcnow().isoformat(),
+        "kpis": {
+            "total_statements": len(statements),
+            "validated_statements": len(statements) - len(continuity_warnings),
+            "continuity_warning_statements": len(continuity_warnings),
+            "total_transactions": total_txns,
+            "reconciled_transactions": reconciled_txns,
+            "unreconciled_transactions": unreconciled_txns,
+            "reconciliation_rate_pct": reconciled_pct,
+            "classified_transactions": classified_txns,
+            "unclassified_transactions": unclassified_txns,
+            "classification_rate_pct": classified_pct,
+            "ready_for_export_count": ready_for_export,
+            "exported_count": exported_txns,
+            "open_erp_records_count": open_erp_count,
+            "reconciled_erp_records_count": reconciled_erp_count,
+            "erp_open_by_type": erp_open_by_type,
+            "unreconciled_by_currency": [
+                {
+                    "currency": v["currency"],
+                    "unreconciled_count": v["unreconciled_count"],
+                    "debit_total": round(v["debit_total"], 2),
+                    "credit_total": round(v["credit_total"], 2),
+                }
+                for v in unreconciled_by_ccy.values()
+            ],
+        },
+        "exceptions": {
+            "continuity_warnings": continuity_warnings,
+            "aged_unreconciled_7d_count": aged_7d_count,
+            "aged_unreconciled_30d_count": aged_30d_count,
+            "variance_matches_count": variance_matches_count,
+            "variance_by_disposition": variance_by_disp,
+            "manual_overrides_count": manual_overrides_count,
+            "duplicates_or_reversals_count": dup_or_rev_count,
+            "suggested_rules_pending_count": suggested_rules_count,
+        },
+        "bank_progress": bank_progress,
+        "recent_statements": recent_statements_out,
+        "team_activity": team_activity,
+        "automation_health": {
+            "active_confirmed_rules": confirmed_rules_count,
+            "suggested_rules_pending": suggested_rules_count,
+            "tolerance_rules_count": tolerance_rules_count,
+            "counterparties_count": counterparties_count,
+            "classification_sources": source_counts,
+        },
+    }
+
 
 
 

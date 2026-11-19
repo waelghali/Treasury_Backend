@@ -224,7 +224,7 @@ def get_customer_email_settings(
 TEST_DOMAINS = ("@acmecorp.com", "@example.com", "@example.org", "@example.net")
 
 def process_recipients(recipient_list: Optional[List[str]]) -> List[str]:
-    """Filters out placeholder/dummy domain email addresses (e.g. example.com, acmecorp.com)."""
+    """Filters out placeholder/dummy and trial sandbox simulated email addresses."""
     if not recipient_list:
         return []
     clean_list = []
@@ -232,7 +232,16 @@ def process_recipients(recipient_list: Optional[List[str]]) -> List[str]:
         if not email_addr or not isinstance(email_addr, str):
             continue
         lower_addr = email_addr.lower().strip()
-        if any(lower_addr.endswith(domain) or f"@{domain}" in lower_addr for domain in ("acmecorp.com", "example.com", "example.org", "example.net")):
+        if (
+            ".sandbox@" in lower_addr
+            or lower_addr.startswith("fx.desk.sandbox@")
+            or lower_addr.endswith("-sandbox-bank.com")
+            or lower_addr.endswith("@sandbox.growbusinessdevelopment.com")
+            or any(
+                lower_addr.endswith(domain) or f"@{domain}" in lower_addr
+                for domain in ("acmecorp.com", "example.com", "example.org", "example.net", "sandbox-bank.com")
+            )
+        ):
             continue
         clean_list.append(email_addr)
     return clean_list
@@ -270,9 +279,10 @@ async def send_email(
         logger.warning("Email delivery skipped: email_settings is None.")
         return EmailSendResult(False, "Email settings not configured")
 
-    to_emails = process_recipients(to_emails)
-    cc_emails = process_recipients(cc_emails or [])
-    bcc_emails = process_recipients(bcc_emails or [])
+    from app.core.trial_guard import filter_trial_outbound_emails
+    to_emails = filter_trial_outbound_emails(db, process_recipients(to_emails))
+    cc_emails = filter_trial_outbound_emails(db, process_recipients(cc_emails or []))
+    bcc_emails = filter_trial_outbound_emails(db, process_recipients(bcc_emails or []))
 
     if not to_emails and not cc_emails and not bcc_emails:
         logger.info("Email delivery suppressed: All recipients belong to dummy/test domains.")
@@ -708,4 +718,4 @@ def verify_imap_connection(
                 mail.logout()
             except Exception:
                 pass
-
+

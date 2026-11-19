@@ -7,12 +7,12 @@ import io
 import csv
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query, Body, BackgroundTasks, UploadFile, File
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import select, func
 from typing import List, Optional, Any, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import uuid
 from app.core.ai_integration import _upload_to_gcs, generate_signed_gcs_url, GCS_BUCKET_NAME
@@ -4433,6 +4433,91 @@ def read_legal_artifact(
         )
     return db_artifact
     
+def _build_trial_sales_touchpoint(reg: Any, snap: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Generates consultative, non-pushy Day 1 / Day 3 / Day 7 / Day 12 human follow-up
+    guidance and 1-click WhatsApp / Email drafts based on live trial telemetry.
+    """
+    contact = (reg.contact_admin_name or "there").strip()
+    first_name = contact.split()[0] if contact else "there"
+    company = (reg.organization_name or "your company").strip()
+    mod_names = {
+        "custody": "LG Custody & Renewals",
+        "issuance": "LG Issuance & Bank Forms",
+        "reconciliation": "Bank Statement Reconciliation",
+        "quotations": "Multi-Bank FX & T-Bill Quotes",
+    }
+    primary_label = mod_names.get(snap.get("primary_module") or "custody", "LG Management")
+    is_activated = bool(snap.get("is_activated"))
+    days_active = int(snap.get("days_since_activation") or 0)
+    days_left = snap.get("days_remaining")
+    steps = snap.get("steps_completed") or {}
+    done_list = [mod_names[k] for k, v in steps.items() if v and k in mod_names]
+    own_uploaded = bool(snap.get("own_documents_uploaded"))
+
+    if not is_activated:
+        return {
+            "code": "ACTIVATE_WELCOME",
+            "label": "Welcome & Activation Check",
+            "timing": "Before 1st Login",
+            "whatsapp_text": (
+                f"Hello {first_name}, this is Grow Business Development. Your Free Trial for {company} "
+                f"is ready (focused on {primary_label}) — your 14-day timer only starts once you sign in. "
+                f"Let me know if you received your activation email or need a fresh link!"
+            ),
+            "email_subject": f"Your Grow Free Trial for {company} is ready (14 days start on first login)",
+        }
+
+    if not done_list and days_active >= 2:
+        return {
+            "code": "DAY3_FIRST_TEST",
+            "label": "Day 3 · Help With 1st Test",
+            "timing": f"Day {max(1, days_active + 1)}",
+            "whatsapp_text": (
+                f"Hello {first_name}, checking in on {company}'s Grow trial! I noticed you signed in — "
+                f"would you like a quick 10-minute walkthrough to test {primary_label} on one of your own sample files?"
+            ),
+            "email_subject": f"Quick help testing {primary_label} on Grow ({company})",
+        }
+
+    if days_left is not None and days_left <= 4:
+        return {
+            "code": "DAY12_VALUE_REVIEW",
+            "label": "Day 12 · CFO Value & Go-Live",
+            "timing": f"{days_left}d left",
+            "whatsapp_text": (
+                f"Hello {first_name}, hope your team enjoyed testing {', '.join(done_list) or primary_label} on Grow! "
+                f"With {days_left} days left on the trial, I would be happy to share a 1-page business value summary "
+                f"for management or extend your trial if your team is still reviewing."
+            ),
+            "email_subject": f"{company} — Grow Trial Summary & Next Steps",
+        }
+
+    if done_list and not own_uploaded:
+        return {
+            "code": "DAY7_OWN_DOCS",
+            "label": "Day 7 · Test Own Document",
+            "timing": f"Day {max(1, days_active + 1)}",
+            "whatsapp_text": (
+                f"Hello {first_name}, great to see you tested {', '.join(done_list)} in Grow! "
+                f"Whenever you're ready, try uploading one of {company}'s own files (everything is private, encrypted, "
+                f"and can be deleted in 1 click), or let's jump on a 15-min call to review your workflow together."
+            ),
+            "email_subject": f"How is {company}'s Grow trial going?",
+        }
+
+    return {
+        "code": "CONSULTATION_OFFER",
+        "label": "15-Min Workflow Consultation",
+        "timing": f"Day {max(1, days_active + 1)}",
+        "whatsapp_text": (
+            f"Hello {first_name}, glad to see {company} actively testing Grow! "
+            f"Happy to arrange a short 15-minute call with you and your team to review how Grow fits your bank setup and answer any security or pricing questions."
+        ),
+        "email_subject": f"15-minute workflow review for {company} — Grow Treasury",
+    }
+
+
 @trial_router.get("/trial-registrations/", response_model=List[TrialRegistrationOut])
 def read_trial_registrations(
     status: Optional[str] = Query(None, description="Filter by registration status (e.g., 'pending', 'approved', 'rejected')"),
@@ -4440,18 +4525,26 @@ def read_trial_registrations(
     current_user: TokenData = Depends(HasPermission("system_owner:view_trial_registrations"))
 ):
     """
-    Retrieves a list of trial registrations, with optional status filtering.
+    Retrieves trial registrations enriched with live 7-stage funnel milestones & sales touchpoint guidance.
     """
-    # Fetch all registrations with the requested status.
-    registrations = crud_trial_registration.get_by_status(db, status=status)
+    from app.core.trial_guard import get_trial_usage_snapshot
 
-    # Use a list comprehension to explicitly validate and return the data
-    # against the Pydantic schema. This ensures all fields, including the
-    # IP and date, are included in the JSON response.
-    return [TrialRegistrationOut.model_validate(reg) for reg in registrations]
+    registrations = crud_trial_registration.get_by_status(db, status=status)
+    out_list: List[TrialRegistrationOut] = []
+    for reg in registrations:
+        item = TrialRegistrationOut.model_validate(reg)
+        if reg.status == "approved" and reg.customer_id:
+            try:
+                snap = get_trial_usage_snapshot(db, int(reg.customer_id))
+                snap["recommended_touchpoint"] = _build_trial_sales_touchpoint(reg, snap)
+                item.trial_insights = snap
+            except Exception as snap_err:
+                logger.debug(f"Could not compute trial_insights for reg {reg.id}: {snap_err}")
+        out_list.append(item)
+    return out_list
 
 @trial_router.post("/trial-registrations/{registration_id}/approve", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
-def approve_trial_registration(
+async def approve_trial_registration(
     registration_id: int,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(HasPermission("system_owner:approve_trial_registration")),
@@ -4467,131 +4560,109 @@ def approve_trial_registration(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or not in pending state.")
 
     try:
-        # Step 1: Dynamically find a subscription plan matching the requested modules
+        # Step 1: Assign a dedicated $0 'Guided Trial Sandbox' plan (never a 12-month commercial plan)
         requested = registration.requested_modules or ["custody"]
         wants_custody = "custody" in requested
         wants_issuance = "issuance" in requested
         wants_quotations = "quotations" in requested or "quotation" in requested
         wants_reconciliation = "reconciliation" in requested
 
-        # Query all active plans and find the best match
-        from app.models import SubscriptionPlan
-        query = db.query(SubscriptionPlan).filter(
-            SubscriptionPlan.is_deleted == False,
-            SubscriptionPlan.has_custody_module == wants_custody,
-            SubscriptionPlan.has_issuance_module == wants_issuance,
+        from app.core.trial_guard import get_trial_caps
+        from app.services.trial_sandbox_seeder import (
+            ensure_trial_sandbox_seeded,
+            get_or_create_trial_sandbox_plan,
         )
-        if hasattr(SubscriptionPlan, "has_quotation_module"):
-            query = query.filter(SubscriptionPlan.has_quotation_module == wants_quotations)
-        if hasattr(SubscriptionPlan, "has_reconciliation_module"):
-            query = query.filter(SubscriptionPlan.has_reconciliation_module == wants_reconciliation)
-        all_plans = query.all()
 
-        if not all_plans:
-            # Fallback: try the legacy "Free Trial Plan" for backward compatibility
-            subscription_plan = crud_subscription_plan.get_by_name(db, name="Free Trial Plan")
-            if not subscription_plan:
-                module_desc = " & ".join(
-                    m.replace("custody", "LG Custody")
-                     .replace("issuance", "LG Issuance")
-                     .replace("quotations", "FX & T-Bill Quotations")
-                     .replace("reconciliation", "Bank Auto-Reconciliation")
-                    for m in requested
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"No subscription plan found matching the requested modules ({module_desc}). "
-                           f"Please create a plan with matching module toggles first."
-                )
-        else:
-            # Pick the cheapest plan (lowest monthly_price) — free trial plans would be 0
-            subscription_plan = sorted(all_plans, key=lambda p: p.monthly_price)[0]
+        subscription_plan = get_or_create_trial_sandbox_plan(
+            db,
+            wants_custody=wants_custody,
+            wants_issuance=wants_issuance,
+            wants_quotations=wants_quotations,
+            wants_reconciliation=wants_reconciliation,
+        )
+        logger.info(
+            f"Assigned trial sandbox plan '{subscription_plan.name}' (ID: {subscription_plan.id}) for trial registration {registration_id}"
+        )
 
-        logger.info(f"Matched subscription plan '{subscription_plan.name}' (ID: {subscription_plan.id}) for trial registration {registration_id}")
+        import secrets as _secrets
+        unusable_initial_pw = _secrets.token_urlsafe(24) + "Aa1!"
 
-        # NEW: Generate a random password for the new user
-        generated_password = 'Password123!'
-
+        safe_org_address = (registration.organization_address or "Cairo, Egypt").strip()[:250]
         customer_in = CustomerCreate(
             name=registration.organization_name,
-            address=registration.organization_address,
+            address=safe_org_address,
             contact_email=registration.admin_email,
             contact_phone=registration.contact_phone,
             subscription_plan_id=subscription_plan.id,
             initial_corporate_admin=UserCreate(
                 email=registration.admin_email,
-                password=generated_password,
+                password=unusable_initial_pw,
                 role=UserRole.CORPORATE_ADMIN,
-                must_change_password=True,
+                must_change_password=False,
                 has_all_entity_access=True,
                 entity_ids=[],
             ),
             initial_entities=[]
         )
         if registration.entities_count == 'One':
-            entity_name = registration.organization_name + " Main Entity"
+            entity_name = (registration.organization_name + " Main Entity")[:100]
             customer_in.initial_entities.append(CustomerEntityCreate(
                 entity_name=entity_name,
+                address=safe_org_address,
                 code="TEMP", # This will be replaced with a generated code in the CRUD layer
-                contact_person=registration.contact_admin_name,
+                contact_person=(registration.contact_admin_name or registration.organization_name)[:100],
                 contact_email=registration.admin_email
             ))
 
         db_customer = crud_customer.onboard_customer(db, customer_in, user_id_caller=current_user.user_id)
-        
-        # Step 2: Update the registration status
-        crud_trial_registration.update(db, registration, {"status": "approved", "customer_id": db_customer.id})
 
-        # Build module-aware text for the email
+        # Hold a 30-day pre-activation grace buffer; the exact 14-day trial countdown starts ONLY
+        # upon the user's first password activation / first login (`ensure_trial_activated_clock`)!
+        db_customer.end_date = db_customer.start_date + timedelta(days=30)
+        db.add(db_customer)
+        db.flush()
+
+        # Step 2: Link registration & pre-seed entities, facilities, FX desks & companion personas
+        crud_trial_registration.update(db, registration, {"status": "approved", "customer_id": db_customer.id})
+        try:
+            ensure_trial_sandbox_seeded(db, db_customer.id)
+        except Exception as seed_exc:
+            logger.warning(f"Trial sandbox pre-seed warning for customer {db_customer.id}: {seed_exc}", exc_info=True)
+
+        # Build clean module list for the branded zero-touch activation email
         module_names = []
         if wants_custody:
-            module_names.append("LG Custody")
+            module_names.append("LG Custody & Lifecycle Governance")
         if wants_issuance:
-            module_names.append("LG Issuance")
-        modules_text = " & ".join(module_names)
+            module_names.append("Outbound LG Issuance & Smart Bank Scoring")
+        if wants_quotations:
+            module_names.append("Sealed-Bid FX & Sovereign T-Bill Quotations")
+        if wants_reconciliation:
+            module_names.append("Cash & Bank Statement Auto-Reconciliation")
 
-        # Step 3: Send approval email
-        from app.core.routing import get_frontend_base_url
-        base_url = get_frontend_base_url(request=request)
-        subject = f"Your {modules_text} Free Trial is Ready!"
-        body = f"""
-            <html><body>
-                <p>Hello {registration.contact_admin_name},</p>
-                <p>We're excited to confirm that your free trial account for <strong>{modules_text}</strong> is now active!</p>
-                <p>To get started, please use the following temporary password to log in: <strong>{generated_password}</strong>. We highly recommend that you change this password immediately after your first login.</p>
-                <p><strong>Login Link:</strong> <a href="{base_url}/login">{base_url}/login</a></p>
-                <p>Your free trial will be active for {subscription_plan.duration_months} months, expiring on {db_customer.end_date.strftime('%Y-%m-%d')}.</p>
-                <p><strong>Plan:</strong> {subscription_plan.name}</p>
-                <p><strong>Quick Start Guide:</strong> Please find a quick-start guide attached to help you get started with the platform's core features.</p>
-                <p>Best regards,</p>
-                <p>The Grow Business Development Team</p>
-            </body></html>
-        """
-        if registration.entities_count == 'Multiple':
-            body = body.replace("</body>", f"""
-                <p>Since you indicated multiple entities, please reply to this email with the details and documents for each additional entity (similar to the documents you submitted for the main entity). Once received, we will add them to your account.</p>
-                </body>
-            """)
+        # Step 3: Dispatch Zero-Touch Branded Activation Email (No plain-text password!)
+        admin_user = next(
+            (u for u in db_customer.users if not u.is_deleted and u.email.lower() == registration.admin_email.lower()),
+            next((u for u in db_customer.users if not u.is_deleted), None),
+        )
+        if admin_user:
+            from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+            try:
+                await send_corporate_admin_activation_email(
+                    db=db,
+                    user=admin_user,
+                    customer_name=db_customer.name,
+                    request=request,
+                    is_trial=True,
+                    recipient_name=registration.contact_admin_name,
+                    module_labels=module_names,
+                )
+            except Exception as email_err:
+                logger.error(f"Failed to dispatch trial activation email to {admin_user.email}: {email_err}", exc_info=True)
 
-        # NEW CODE: Define a dynamic path to the PDF guide
-        # NEW CODE: Define a dynamic path to the PDF guide
-        current_file_dir = os.path.dirname(os.path.abspath(__file__))
-        # From c:\Grow\app\api\v1\endpoints, go up 3 levels to get to c:\Grow\app
-        app_root = os.path.abspath(os.path.join(current_file_dir, '..', '..', '..'))
-        pdf_path = os.path.join(app_root, 'templates', 'quick_start_guide.pdf')
-
-        logger.info(f"Looking for PDF at: {pdf_path}")
-
-        email_settings = get_global_email_settings()
-        try:
-            with open(pdf_path, "rb") as f:
-                attachment = EmailAttachment("Quick_Start_Guide.pdf", f.read(), "application/pdf")
-                background_tasks.add_task(send_email, db, [registration.admin_email], subject, body, {}, email_settings, attachments=[attachment])
-                logger.info(f"Successfully found PDF at: {pdf_path}")
-        except FileNotFoundError:
-            logger.warning(f"Quick start guide PDF not found at: {pdf_path}. Sending email without attachment.")
-            background_tasks.add_task(send_email, db, [registration.admin_email], subject, body, {}, email_settings)
-
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to approve registration: {e}")
@@ -4619,6 +4690,56 @@ def reject_trial_registration(
 
     log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_REJECTED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name})
     return {"message": "Registration rejected successfully."}
+
+
+class ExtendTrialRequestIn(BaseModel):
+    days: int = Field(7, ge=1, le=60, description="Additional evaluation days to grant (e.g. 7 or 14)")
+
+
+@trial_router.post("/trial-registrations/{registration_id}/extend", status_code=status.HTTP_200_OK)
+def extend_trial_registration_duration(
+    registration_id: int,
+    payload: ExtendTrialRequestIn,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_owner:approve_trial_registration")),
+):
+    """
+    Extends an active or expired Free Trial's `end_date` by `+days` (e.g. +7d or +14d)
+    when a genuine corporate evaluation is underway with management / CFO stakeholders.
+    """
+    registration = crud_trial_registration.get(db, id=registration_id)
+    if not registration or not registration.customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approved trial customer not found.")
+
+    from app.constants import SubscriptionStatus
+
+    cust = db.query(Customer).filter(Customer.id == int(registration.customer_id)).first()
+    if not cust:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer record not found.")
+
+    use_tz = bool(cust.end_date and cust.end_date.tzinfo)
+    now_dt = datetime.now(timezone.utc) if use_tz else datetime.utcnow()
+    base_dt = cust.end_date if (cust.end_date and cust.end_date > now_dt) else now_dt
+    cust.end_date = base_dt + timedelta(days=int(payload.days))
+    if getattr(cust, "status", None) != SubscriptionStatus.ACTIVE:
+        cust.status = SubscriptionStatus.ACTIVE
+    db.add(cust)
+    db.commit()
+    db.refresh(cust)
+
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="TRIAL_DURATION_EXTENDED",
+        entity_type="Customer",
+        entity_id=cust.id,
+        details={"added_days": int(payload.days), "new_end_date": cust.end_date.isoformat()},
+        customer_id=cust.id,
+    )
+    return {
+        "message": f"Extended {cust.name}'s trial by +{payload.days} days.",
+        "new_end_date": cust.end_date.isoformat(),
+    }
 
 
 @trial_router.get("/get-document-url/") # Renamed for clarity

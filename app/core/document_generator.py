@@ -344,13 +344,19 @@ def _render_and_merge_pdfs_worker(html_segments: List[str], filename_hint: str =
 async def generate_pdf_from_html(html_content: str, filename_hint: str = "document") -> Optional[bytes]:
     """
     Generates a PDF from HTML content using WeasyPrint (isolated fork on Linux, thread on Windows).
+    Stamps non-bypassable Trial Sandbox vector watermarks onto every page when in a Trial session.
     Returns the PDF as bytes.
     """
-    logger.debug(f"generate_pdf_from_html: Attempting to generate PDF for '{filename_hint}' (length: {len(html_content)} chars).")
+    from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
+
+    in_trial = is_active_trial_context()
+    logger.debug(f"generate_pdf_from_html: Attempting to generate PDF for '{filename_hint}' (length: {len(html_content)} chars, trial={in_trial}).")
 
     try:
         pdf_bytes = await asyncio.to_thread(_render_pdf_worker, html_content, filename_hint)
         if pdf_bytes:
+            if in_trial:
+                pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)
             logger.info(f"generate_pdf_from_html: Successfully generated PDF bytes for '{filename_hint}' (size: {len(pdf_bytes)} bytes).")
             return pdf_bytes
         return None
@@ -363,11 +369,17 @@ async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_
     """
     Renders a list of independent HTML documents into individual PDFs and merges them into one PDF,
     preserving isolated @page counters and headers/footers per letter.
+    Stamps Trial Sandbox vector watermarks onto every page when in a Trial session.
     """
-    logger.debug(f"generate_merged_pdf_from_html_list: Rendering and merging {len(html_segments)} letters for '{filename_hint}'.")
+    from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
+
+    in_trial = is_active_trial_context()
+    logger.debug(f"generate_merged_pdf_from_html_list: Rendering and merging {len(html_segments)} letters for '{filename_hint}' (trial={in_trial}).")
     try:
         pdf_bytes = await asyncio.to_thread(_render_and_merge_pdfs_worker, html_segments, filename_hint)
         if pdf_bytes:
+            if in_trial:
+                pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)
             logger.info(f"generate_merged_pdf_from_html_list: Successfully generated merged PDF for '{filename_hint}' ({len(html_segments)} letters, size: {len(pdf_bytes)} bytes).")
             return pdf_bytes
         return None

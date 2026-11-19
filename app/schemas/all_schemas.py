@@ -272,8 +272,8 @@ class TrialRegistrationBase(BaseModel):
     contact_phone: str = Field(..., description="Contact phone number.")
     admin_email: EmailStr = Field(..., description="Email of the super admin.")
     entities_count: str = Field(..., description="Number of entities ('One' or 'Multiple').")
-    requested_modules: List[str] = Field(default=["custody"], description="List of requested modules: 'custody', 'issuance', or both.")
-    commercial_register_document_path: str = Field(..., description="Path to the uploaded commercial register document.")
+    requested_modules: List[str] = Field(default=["custody"], description="List of requested modules: 'custody', 'issuance', 'quotations', 'reconciliation'.")
+    commercial_register_document_path: Optional[str] = Field(default=None, description="Path to the uploaded commercial register document (optional for trial sandbox).")
     accepted_terms_version: float = Field(..., description="Version of the terms accepted by the user.")
 
 class TrialRegistrationCreate(TrialRegistrationBase):
@@ -281,10 +281,11 @@ class TrialRegistrationCreate(TrialRegistrationBase):
 
 class TrialRegistrationOut(TrialRegistrationBase, BaseSchema):
     status: str
-    commercial_register_document_path: str
+    commercial_register_document_path: Optional[str] = None
     customer_id: Optional[int] = None
     accepted_terms_version: float
     accepted_terms_ip: Optional[str] = None
+    trial_insights: Optional[Dict[str, Any]] = None
 
 class CustomerCoreCreate(BaseModel):
     name: str = Field(..., min_length=3, max_length=150, description="Customer organization name")

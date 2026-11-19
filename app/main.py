@@ -277,7 +277,9 @@ def configure_app_instance(fastapi_app: FastAPI):
     )
 
     from app.core.security_headers import SecurityHeadersMiddleware
+    from app.core.trial_guard import TrialRequestStateMiddleware
     fastapi_app.add_middleware(SecurityHeadersMiddleware)
+    fastapi_app.add_middleware(TrialRequestStateMiddleware)
 
     # --- Module Imports ---
     # Imports are placed here to ensure app structure is ready or to avoid circular deps.
@@ -477,10 +479,12 @@ def configure_app_instance(fastapi_app: FastAPI):
                 try:
                     from sqlalchemy.orm import Session as DBSession
                     from app.services.banking_standards_ontology import banking_standards_ontology
+                    from app.core.legal_seed import ensure_legal_artifacts_seeded_in_place
                     with DBSession(engine) as seed_db:
                         banking_standards_ontology.ensure_foundational_knowledge_seeded(seed_db)
+                        ensure_legal_artifacts_seeded_in_place(seed_db)
                 except Exception as seed_err:
-                    logger.debug(f"Foundational banking standards seed skipped: {seed_err}")
+                    logger.debug(f"Foundational banking standards / legal seed skipped: {seed_err}")
             except Exception as e:
                 logger.warning(f"Startup schema migration check: {e}")
 
@@ -614,6 +618,8 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
     fastapi_app.include_router(public_demo_chat.router, prefix="/api/v1/public-demo", tags=["Public Demo AI Product Expert"])
+    from app.api.v1.endpoints import trial_sandbox
+    fastapi_app.include_router(trial_sandbox.router, prefix="/api/v1/trial-sandbox", tags=["Trial Sandbox Experience"])
     from app.core.security import require_issuance_module, require_custody_module, require_issuance_or_custody_module
     fastapi_app.include_router(issuance_package.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_or_custody_module)])
     fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])

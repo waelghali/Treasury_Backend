@@ -308,6 +308,8 @@ def fill_pdf_form(
     output.seek(0)
     
     filled_bytes = output.read()
+    from app.core.trial_guard import stamp_trial_pdf_bytes_watermark
+    filled_bytes = stamp_trial_pdf_bytes_watermark(filled_bytes)
     logger.info(
         f"Successfully filled PDF form: {len(field_values)} text fields, "
         f"{len(checkbox_values)} checkboxes ({len(filled_bytes)} bytes)"
@@ -972,6 +974,8 @@ def generate_scanned_fill_pdf(
     writer.write(output)
     output.seek(0)
     merged_bytes = output.read()
+    from app.core.trial_guard import stamp_trial_pdf_bytes_watermark
+    merged_bytes = stamp_trial_pdf_bytes_watermark(merged_bytes)
     
     logger.info(f"Generated scanned-fill PDF: merged overlay onto {len(original_reader.pages)} pages ({len(merged_bytes)} bytes)")
     return merged_bytes

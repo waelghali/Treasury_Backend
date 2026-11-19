@@ -213,6 +213,17 @@ class AuthService:
 
         plan = customer.subscription_plan if (customer and customer.subscription_plan) else None
 
+        is_trial_account = False
+        if not is_so and user.customer_id:
+            try:
+                from app.core.trial_guard import is_trial_customer, is_trial_plan_name
+                is_trial_account = bool(
+                    (plan and is_trial_plan_name(getattr(plan, "name", None)))
+                    or is_trial_customer(db, user.customer_id)
+                )
+            except Exception:
+                is_trial_account = False
+
         sub_status = None
         if customer and customer.status:
             sub_status = customer.status.value if hasattr(customer.status, 'value') else str(customer.status)
@@ -228,6 +239,7 @@ class AuthService:
             "permissions": permission_names,
             "customer_id": user.customer_id,
             "customer_name": customer_name,
+            "is_trial": is_trial_account,
             "has_all_entity_access": user.has_all_entity_access,
             "entity_ids": [assoc.customer_entity_id for assoc in user.entity_associations] if (hasattr(user, 'entity_associations') and user.entity_associations and not user.has_all_entity_access) else [],
             "must_change_password": user.must_change_password,
@@ -714,6 +726,19 @@ class AuthService:
         db.add(user)
         db.add(reset_token_record)
         db.flush() # Flush to persist changes before logging
+
+        # Start 14-day Free Trial clock strictly upon first password activation (never at approval time!)
+        if user.customer_id:
+            try:
+                from app.core.trial_guard import ensure_trial_activated_clock
+                ensure_trial_activated_clock(
+                    db,
+                    customer_id=user.customer_id,
+                    user_id=user.id,
+                    trigger="password_activation",
+                )
+            except Exception as _act_err:
+                logger.debug(f"Trial activation clock hook skipped: {_act_err}")
 
         # MODIFIED: Call log_action utility
         log_action(

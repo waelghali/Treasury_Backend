@@ -86,6 +86,11 @@ class CollaborativeLearningService:
         Processes the raw narrative through the Counterparty-Aware Privacy Sanitizer,
         qualifies by amount_tier, and records the consensus vote.
         """
+        from app.core.trial_guard import is_trial_customer
+        if is_trial_customer(db, company_id):
+            logger.debug(f"[TrialGuard] Quarantined collaborative vote from trial company_id={company_id}")
+            return None
+
         # Load tenant's known counterparty names so none of them can ever leak into collaborative signatures
         known_entities = []
         try:

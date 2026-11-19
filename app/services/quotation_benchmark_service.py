@@ -52,6 +52,10 @@ def record_anonymous_rfq_outcome(db: Session, rfq: QuotationRequest) -> Optional
     if not rfq:
         return None
 
+    from app.core.trial_guard import is_trial_customer
+    if is_trial_customer(db, getattr(rfq, "customer_id", None)):
+        return None
+
     # Determine product & currency pair
     if rfq.type == 'TBILL':
         pair = "EGP_TBILL"
@@ -291,8 +295,14 @@ def get_system_owner_telemetry(db: Session) -> Dict[str, Any]:
     Computes macro velocity, bank participation rankings, and governance bottlenecks across the platform.
     Guarantees 0% customer data leakage: system owner never sees customer names, invoices, or deal terms.
     """
-    # 1. Macro Velocity
-    all_rfqs = db.query(QuotationRequest).all()
+    # 1. Macro Velocity (Exclude trial/sandbox customers from global benchmark telemetry)
+    from app.core.trial_guard import is_trial_customer, is_trial_mode
+    raw_rfqs = db.query(QuotationRequest).all()
+    all_rfqs = (
+        raw_rfqs
+        if is_trial_mode()
+        else [r for r in raw_rfqs if not is_trial_customer(db, getattr(r, "customer_id", None))]
+    )
     total_rfqs = len(all_rfqs)
     
     completed_rfqs = [r for r in all_rfqs if r.status in ['COMPLETED', 'EVALUATING']]
