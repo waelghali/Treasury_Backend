@@ -14,6 +14,7 @@ import threading
 import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
@@ -24,6 +25,8 @@ from app.services.public_product_expert_service import (
     ask_public_product_expert_voice,
     detect_response_language,
     hash_client_ip,
+    is_loopback_ip,
+    is_production_public_telemetry_env,
     public_demo_chat_logger,
     public_voice_control,
     synthesize_public_expert_speech,
@@ -112,6 +115,20 @@ def _extract_country_header(request: Request) -> str:
         if val and len(val) <= 8:
             return val.upper()
     return ""
+
+
+def _is_localhost_origin(request: Request) -> bool:
+    for hdr in ("origin", "referer"):
+        raw = (request.headers.get(hdr) or "").strip()
+        if not raw:
+            continue
+        try:
+            host = (urlparse(raw).hostname or "").strip("[]").lower()
+            if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local"):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # ==============================================================================
@@ -265,6 +282,9 @@ def record_public_telemetry_event(
         return {"ok": False}
 
     client_ip = _extract_client_ip(request)
+    if is_production_public_telemetry_env() and (is_loopback_ip(client_ip) or _is_localhost_origin(request)):
+        return {"ok": True}
+
     ip_hash = hash_client_ip(client_ip)
     if not _allow_telemetry_write(ip_hash):
         return {"ok": True}

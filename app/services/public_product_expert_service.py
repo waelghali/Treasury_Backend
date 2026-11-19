@@ -690,6 +690,66 @@ def is_bot_user_agent(ua: str) -> bool:
 
 _MAX_DAILY_EVENTS_BYTES = 15 * 1024 * 1024  # 15 MB/day hard disk-safety ceiling
 
+_LOOPBACK_RAW_IPS = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0", "testclient", "testserver"})
+
+
+def is_loopback_ip(raw_ip: str) -> bool:
+    """Returns True when the raw IP string represents a local loopback or test client address."""
+    cleaned = (raw_ip or "").strip().lower()
+    if cleaned.startswith("::ffff:"):
+        cleaned = cleaned[len("::ffff:"):]
+    return cleaned in _LOOPBACK_RAW_IPS or cleaned.startswith("127.")
+
+
+def is_production_public_telemetry_env() -> bool:
+    """
+    Returns True ONLY when running in the live production deployment that owns
+    `gs://<bucket>/public_demo_chat_logs/`. Local dev, tests, and staging return False
+    so they never pollute production analytics or overwrite Voice AI state.
+    """
+    explicit_sync = os.getenv("PUBLIC_TELEMETRY_GCS_SYNC", "").strip("'\"").lower()
+    if explicit_sync in ("false", "0", "no", "off"):
+        return False
+    if explicit_sync in ("true", "1", "yes", "on"):
+        return True
+
+    db_url = os.getenv("DATABASE_URL", "").strip("'\"").lower()
+    if any(tok in db_url for tok in ("localhost", "127.0.0.1", "sqlite", "staging")):
+        return False
+
+    for env_key in ("ENVIRONMENT", "ENVIRONMENT_NAME", "APP_ENV", "STORAGE_ENV", "FLASK_ENV"):
+        val = os.getenv(env_key, "").strip("'\"").lower()
+        if not val:
+            continue
+        if val in ("prod", "production"):
+            return True
+        if val in ("dev", "development", "local", "test", "testing", "stage", "staging", "uat"):
+            return False
+
+    render_service = os.getenv("RENDER_SERVICE_NAME", "").strip().lower()
+    render_branch = os.getenv("RENDER_GIT_BRANCH", "").strip().lower()
+    if any(tok in render_service for tok in ("stage", "staging", "dev", "uat", "test")) or any(
+        tok in render_branch for tok in ("stage", "staging", "dev")
+    ):
+        return False
+
+    if os.getenv("RENDER") or os.getenv("K_SERVICE") or "grow_xl8z" in db_url:
+        return True
+
+    return False
+
+
+def _loopback_ip_hashes() -> set:
+    """Computes the set of current-month salted hashes for loopback/test client IPs."""
+    return {hash_client_ip(ip) for ip in _LOOPBACK_RAW_IPS}
+
+
+def _is_local_or_loopback_entry(entry: Dict[str, Any], loopback_hashes: set) -> bool:
+    """Returns True if a telemetry/chat JSONL record originated from local dev or a loopback IP."""
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("is_local_dev") is True or entry.get("ip_hash") in loopback_hashes
+
 
 class PublicDemoChatLogger:
     """
@@ -714,6 +774,9 @@ class PublicDemoChatLogger:
             logger.warning(f"Could not create public demo chat log dir: {exc}")
 
     def _get_gcs_bucket(self):
+        if not is_production_public_telemetry_env():
+            return None
+
         import socket
         try:
             socket.gethostbyname("oauth2.googleapis.com")
@@ -797,6 +860,10 @@ class PublicDemoChatLogger:
         ip_hash: str = "",
         user_agent: str = "",
     ) -> None:
+        is_prod = is_production_public_telemetry_env()
+        if is_prod and ip_hash in _loopback_ip_hashes():
+            return
+
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%Y-%m-%d")
         timestamp_iso = now.isoformat()
@@ -813,7 +880,7 @@ class PublicDemoChatLogger:
                 elif v is not None:
                     safe_meta[safe_key] = str(v)[:120]
 
-        payload = {
+        payload: Dict[str, Any] = {
             "event_id": event_id,
             "timestamp": timestamp_iso,
             "event_type": (event_type or "page_view")[:40],
@@ -830,6 +897,8 @@ class PublicDemoChatLogger:
             "ip_hash": ip_hash,
             "is_bot": is_bot_user_agent(user_agent),
         }
+        if not is_prod:
+            payload["is_local_dev"] = True
 
         try:
             self._ensure_dir()
@@ -865,6 +934,8 @@ class PublicDemoChatLogger:
             if bucket is None:
                 return
 
+            loopback_hashes = _loopback_ip_hashes()
+
             for date_str in dates_to_sync:
                 filename = f"public_events_{date_str}.jsonl"
                 local_path = os.path.join(PUBLIC_CHAT_LOG_DIR, filename)
@@ -879,7 +950,9 @@ class PublicDemoChatLogger:
                 merged_by_id: Dict[str, str] = {}
                 ordered_lines: List[str] = []
 
-                if blob.exists(timeout=3):
+                blob_exists = blob.exists(timeout=3)
+                removed_remote = 0
+                if blob_exists:
                     remote_text = blob.download_as_text(encoding="utf-8", timeout=5)
                     for rline in remote_text.splitlines():
                         rline = rline.strip()
@@ -887,6 +960,9 @@ class PublicDemoChatLogger:
                             continue
                         try:
                             robj = json.loads(rline)
+                            if _is_local_or_loopback_entry(robj, loopback_hashes):
+                                removed_remote += 1
+                                continue
                             eid = robj.get("event_id") or rline[:48]
                             if eid not in merged_by_id:
                                 merged_by_id[eid] = rline
@@ -898,6 +974,8 @@ class PublicDemoChatLogger:
                 for lline in local_lines:
                     try:
                         lobj = json.loads(lline)
+                        if _is_local_or_loopback_entry(lobj, loopback_hashes):
+                            continue
                         eid = lobj.get("event_id") or lline[:48]
                         if eid not in merged_by_id:
                             merged_by_id[eid] = lline
@@ -906,8 +984,8 @@ class PublicDemoChatLogger:
                     except Exception:
                         pass
 
-                if new_added > 0 or not blob.exists(timeout=3):
-                    merged_body = "\n".join(ordered_lines) + "\n"
+                if new_added > 0 or removed_remote > 0 or (not blob_exists and ordered_lines):
+                    merged_body = ("\n".join(ordered_lines) + "\n") if ordered_lines else ""
                     blob.upload_from_string(
                         merged_body,
                         content_type="application/x-jsonlines",
@@ -935,11 +1013,15 @@ class PublicDemoChatLogger:
         user_agent: str,
         latency_ms: float,
     ) -> None:
+        is_prod = is_production_public_telemetry_env()
+        if is_prod and ip_hash in _loopback_ip_hashes():
+            return
+
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%Y-%m-%d")
         timestamp_iso = now.isoformat()
 
-        payload = {
+        payload: Dict[str, Any] = {
             "timestamp": timestamp_iso,
             "session_id": (session_id or "anon")[:64],
             "page_context": (page_context or "unknown")[:120],
@@ -957,6 +1039,8 @@ class PublicDemoChatLogger:
             "user_agent": (user_agent or "")[:160],
             "latency_ms": round(latency_ms, 1),
         }
+        if not is_prod:
+            payload["is_local_dev"] = True
 
         try:
             self._write_local(date_str, payload)
@@ -1002,6 +1086,8 @@ class PublicDemoChatLogger:
 
     def _sync_to_gcs_background(self, date_str: str, payload: Dict[str, Any]) -> None:
         try:
+            if _is_local_or_loopback_entry(payload, _loopback_ip_hashes()):
+                return
             bucket = self._get_gcs_bucket()
             if bucket is None:
                 return
@@ -1032,6 +1118,9 @@ class PublicDemoChatLogger:
         days = max(1, min(days, 90))
         limit = max(1, min(limit, 500))
 
+        is_prod = is_production_public_telemetry_env()
+        prod_loopback_hashes = _loopback_ip_hashes() if is_prod else set()
+
         entries: List[Dict[str, Any]] = []
         topic_counts: Dict[str, int] = {}
         now = datetime.now(timezone.utc)
@@ -1051,6 +1140,8 @@ class PublicDemoChatLogger:
                     if not raw_line:
                         continue
                     rec = json.loads(raw_line)
+                    if is_prod and _is_local_or_loopback_entry(rec, prod_loopback_hashes):
+                        continue
                     t_key = rec.get("topic") or "general"
                     topic_counts[t_key] = topic_counts.get(t_key, 0) + 1
                     if len(entries) < limit:
@@ -1081,6 +1172,9 @@ class PublicDemoChatLogger:
         days = max(1, min(days, 90))
         chat_limit = max(1, min(chat_limit, 500))
         session_limit = max(1, min(session_limit, 300))
+
+        is_prod = is_production_public_telemetry_env()
+        prod_loopback_hashes = _loopback_ip_hashes() if is_prod else set()
 
         now = datetime.now(timezone.utc)
         date_keys = [
@@ -1199,6 +1293,8 @@ class PublicDemoChatLogger:
 
                     if ev.get("is_bot"):
                         bot_events_filtered += 1
+                        continue
+                    if is_prod and _is_local_or_loopback_entry(ev, prod_loopback_hashes):
                         continue
 
                     etype = str(ev.get("event_type") or "")
@@ -1350,6 +1446,9 @@ class PublicDemoChatLogger:
                     try:
                         rec = json.loads(raw_line)
                     except Exception:
+                        continue
+
+                    if is_prod and _is_local_or_loopback_entry(rec, prod_loopback_hashes):
                         continue
 
                     ua = str(rec.get("user_agent") or "")
