@@ -28,6 +28,8 @@ logger = logging.getLogger("app.inbox_polling")
 
 ALLOWED_ATTACHMENT_EXTENSIONS = {".xlsx", ".xls", ".csv", ".pdf"}
 STORAGE_BASE_DIR = os.path.join("private_storage", "inbox")
+IMAP_SOCKET_TIMEOUT = 30
+MAX_NEW_EMAILS_PER_CYCLE = 15
 
 
 class InboxPollingService:
@@ -151,6 +153,15 @@ class InboxPollingService:
         file_size = len(content)
         return dest_path, file_hash, file_size
 
+    @staticmethod
+    def _normalize_message_id(raw_val: Optional[str]) -> Tuple[str, List[str]]:
+        """Normalizes a Message-ID header and returns (canonical_id, lookup_variants)."""
+        raw = raw_val or ""
+        norm = raw.strip().strip("<>").strip()
+        legacy = raw.strip("<>")
+        variants = list(dict.fromkeys(v for v in (norm, legacy) if v))
+        return norm, variants
+
     def _connect_imap(self, settings: CustomerEmailSetting) -> Optional[imaplib.IMAP4]:
         """Establishes authenticated IMAP connection."""
         if not settings.imap_host or not settings.imap_username or not settings.imap_password_encrypted:
@@ -179,9 +190,9 @@ class InboxPollingService:
             mail = None
             try:
                 if settings.imap_use_ssl:
-                    mail = imaplib.IMAP4_SSL(settings.imap_host, port, timeout=15)
+                    mail = imaplib.IMAP4_SSL(settings.imap_host, port, timeout=IMAP_SOCKET_TIMEOUT)
                 else:
-                    mail = imaplib.IMAP4(settings.imap_host, port, timeout=15)
+                    mail = imaplib.IMAP4(settings.imap_host, port, timeout=IMAP_SOCKET_TIMEOUT)
                 
                 mail.login(settings.imap_username, password)
                 AccountLockoutTracker.record_success(account_key)
@@ -242,45 +253,101 @@ class InboxPollingService:
                 return []
 
             msg_ids = message_nums[0].split()
-            # Process up to 50 newest messages per cycle
-            for msg_id in msg_ids[-50:]:
-                try:
-                    # 1. Ultra-fast header check: Fetch ONLY Message-ID header (takes ~1ms per email)
-                    header_status, header_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-                    if header_status == "OK" and header_data and header_data[0] and isinstance(header_data[0], tuple):
-                        raw_hdr = header_data[0][1]
-                        hdr_msg = email.message_from_bytes(raw_hdr)
-                        msg_id_hdr = hdr_msg.get("Message-ID", "").strip("<>")
-                        if msg_id_hdr:
-                            existing = db.query(InboxItem.id).filter(
-                                InboxItem.customer_id == customer_id,
-                                InboxItem.message_id == msg_id_hdr,
-                                InboxItem.is_deleted == False
-                            ).first()
-                            if existing:
-                                # Already ingested - skip without downloading large body/attachments!
-                                continue
+            recent_msg_ids = msg_ids[-50:]
+            if not recent_msg_ids:
+                return []
 
-                    # 2. Only fetch full RFC822 for genuinely NEW uningested messages
-                    fetch_status, msg_data = mail.fetch(msg_id, "(RFC822)")
-                    if fetch_status != "OK" or not msg_data:
+            # 1. Batch-fetch Message-ID headers (1 IMAP roundtrip + 1 DB query instead of 50+50)
+            seq_to_variants: Dict[bytes, List[str]] = {}
+            all_variants: List[str] = []
+            try:
+                batch_seq = b",".join(m if isinstance(m, bytes) else str(m).encode() for m in recent_msg_ids)
+                header_status, header_data = mail.fetch(batch_seq, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                if header_status == "OK" and header_data:
+                    for entry in header_data:
+                        if isinstance(entry, tuple) and len(entry) >= 2:
+                            meta_bytes, raw_hdr = entry[0], entry[1]
+                            if not meta_bytes or not raw_hdr:
+                                continue
+                            meta_parts = (meta_bytes if isinstance(meta_bytes, bytes) else str(meta_bytes).encode()).split()
+                            if not meta_parts:
+                                continue
+                            seq_id = meta_parts[1] if meta_parts[0] == b"*" and len(meta_parts) >= 2 else meta_parts[0]
+                            raw_hdr_bytes = raw_hdr if isinstance(raw_hdr, bytes) else str(raw_hdr).encode("utf-8", errors="replace")
+                            hdr_msg = email.message_from_bytes(raw_hdr_bytes)
+                            _, variants = self._normalize_message_id(hdr_msg.get("Message-ID"))
+                            if variants:
+                                seq_to_variants[seq_id] = variants
+                                all_variants.extend(variants)
+            except (TimeoutError, OSError, imaplib.IMAP4.abort, imaplib.IMAP4.error) as batch_err:
+                logger.warning(f"IMAP connection interrupted during batch header fetch for customer {customer_id}: {batch_err}")
+                return []
+
+            existing_mids: set = set()
+            if all_variants:
+                unique_variants = list(dict.fromkeys(all_variants))
+                rows = db.query(InboxItem.message_id).filter(
+                    InboxItem.customer_id == customer_id,
+                    InboxItem.message_id.in_(unique_variants),
+                    InboxItem.is_deleted == False
+                ).all()
+                existing_mids = {row[0] for row in rows if row and row[0]}
+
+            unseen_msg_ids = []
+            for mid in recent_msg_ids:
+                mid_bytes = mid if isinstance(mid, bytes) else str(mid).encode()
+                variants = seq_to_variants.get(mid_bytes, [])
+                if variants and any(v in existing_mids for v in variants):
+                    continue
+                unseen_msg_ids.append(mid)
+
+            if not unseen_msg_ids:
+                return []
+
+            target_unseen = unseen_msg_ids[:MAX_NEW_EMAILS_PER_CYCLE]
+
+            for msg_id in target_unseen:
+                try:
+                    # 2. Fetch full RFC822 for genuinely NEW uningested messages, with single reconnect on transient EOF/timeout
+                    try:
+                        fetch_status, msg_data = mail.fetch(msg_id, "(RFC822)")
+                    except (TimeoutError, OSError, imaplib.IMAP4.abort) as fetch_err:
+                        logger.info(
+                            f"IMAP connection interrupted while fetching msg {msg_id} for customer {customer_id} "
+                            f"({fetch_err}); attempting single reconnect."
+                        )
+                        try:
+                            if mail:
+                                mail.logout()
+                        except Exception:
+                            pass
+                        mail = self._connect_imap(settings)
+                        if not mail:
+                            raise fetch_err
+                        sel_status, _ = mail.select(inbox_folder)
+                        if sel_status != "OK":
+                            raise imaplib.IMAP4.abort(f"Could not re-select folder '{inbox_folder}'")
+                        fetch_status, msg_data = mail.fetch(msg_id, "(RFC822)")
+
+                    if fetch_status != "OK" or not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple):
                         continue
 
                     raw_email = msg_data[0][1]
                     email_message = email.message_from_bytes(raw_email)
 
-                    # Extract Message-ID
-                    message_id_header = email_message.get("Message-ID", "")
-                    if not message_id_header:
+                    # Extract and normalize Message-ID
+                    norm_msg_id, lookup_variants = self._normalize_message_id(email_message.get("Message-ID"))
+                    if not norm_msg_id:
                         # Fallback unique hash
                         message_id_header = f"gen-{hashlib.md5(raw_email[:500]).hexdigest()}@grow"
+                        lookup_variants = [message_id_header]
                     else:
-                        message_id_header = message_id_header.strip("<>")
+                        message_id_header = norm_msg_id
 
                     # Dedup Check: Skip if message_id already exists for this customer
                     existing = db.query(InboxItem.id).filter(
                         InboxItem.customer_id == customer_id,
-                        InboxItem.message_id == message_id_header,
+                        InboxItem.message_id.in_(lookup_variants),
                         InboxItem.is_deleted == False
                     ).first()
                     if existing:
@@ -340,7 +407,12 @@ class InboxPollingService:
                                         blob_path = build_customer_blob_path(customer_id, "inbox", f"msg_{clean_msg_id}/{filename}")
                                         mime_type = "application/pdf" if ext == ".pdf" else "application/octet-stream"
                                         try:
-                                            file_path = upload_bytes_to_gcs_sync(blob_path, payload, content_type=mime_type)
+                                            file_path = upload_bytes_to_gcs_sync(
+                                                blob_path,
+                                                payload,
+                                                content_type=mime_type,
+                                                timeout=25,
+                                            )
                                         except Exception as upload_err:
                                             logger.error(f"Failed to upload inbox attachment {filename} to GCS: {upload_err}")
                                             file_path = f"gs://lg_custody_bucket/{blob_path}"
@@ -418,11 +490,12 @@ class InboxPollingService:
                 pass
 
         finally:
-            try:
-                mail.close()
-                mail.logout()
-            except Exception:
-                pass
+            if mail:
+                try:
+                    mail.close()
+                    mail.logout()
+                except Exception:
+                    pass
 
         return new_items
 

@@ -209,7 +209,8 @@ def upload_bytes_to_gcs_sync(
     blob_name: str,
     data: bytes,
     content_type: str = "application/octet-stream",
-    bucket_name: Optional[str] = None
+    bucket_name: Optional[str] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """
     Synchronously uploads raw bytes to GCS.
@@ -224,7 +225,10 @@ def upload_bytes_to_gcs_sync(
 
     bucket = client.bucket(target_bucket)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(data, content_type=content_type)
+    if timeout is not None:
+        blob.upload_from_string(data, content_type=content_type, timeout=timeout)
+    else:
+        blob.upload_from_string(data, content_type=content_type)
     logger.info(f"[Sync] Uploaded {len(data)} bytes to gs://{target_bucket}/{blob_name}")
     return f"gs://{target_bucket}/{blob_name}"
 

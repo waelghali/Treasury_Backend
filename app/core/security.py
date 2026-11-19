@@ -356,6 +356,8 @@ class HasPermission:
         self.permission_name = permission_name
 
     def __call__(self, current_user: TokenData = Depends(get_current_active_user)) -> TokenData:
+        if current_user.role == UserRole.SYSTEM_OWNER and self.permission_name.startswith("system_owner:"):
+            return current_user
         if self.permission_name not in current_user.permissions:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

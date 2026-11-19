@@ -409,6 +409,17 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS encrypted_entity_name TEXT;",
                     "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS custom_fields_json JSON;",
                     "ALTER TABLE internal_ledger_records ADD COLUMN IF NOT EXISTS encrypted_custom_fields TEXT;",
+                    """CREATE TABLE IF NOT EXISTS scheduler_paused_jobs (
+                        job_id VARCHAR(128) PRIMARY KEY,
+                        paused_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        paused_by_user_id INTEGER NULL
+                    );""",
+                    "SELECT setval(pg_get_serial_sequence('permissions', 'id'), COALESCE((SELECT MAX(id) FROM permissions), 1), true);",
+                    "SELECT setval(pg_get_serial_sequence('role_permissions', 'id'), COALESCE((SELECT MAX(id) FROM role_permissions), 1), true);",
+                    "INSERT INTO permissions (name, description) SELECT 'system_owner:pause_scheduler_job', 'Allows pausing scheduled background jobs.' WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE name = 'system_owner:pause_scheduler_job');",
+                    "INSERT INTO permissions (name, description) SELECT 'legal_artifact:view', 'Allows viewing legal artifacts.' WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE name = 'legal_artifact:view');",
+                    "INSERT INTO role_permissions (role, permission_id) SELECT 'system_owner', p.id FROM permissions p WHERE p.name = 'system_owner:pause_scheduler_job' AND NOT EXISTS (SELECT 1 FROM role_permissions rp WHERE rp.role = 'system_owner' AND rp.permission_id = p.id);",
+                    "INSERT INTO role_permissions (role, permission_id) SELECT 'system_owner', p.id FROM permissions p WHERE p.name = 'legal_artifact:view' AND NOT EXISTS (SELECT 1 FROM role_permissions rp WHERE rp.role = 'system_owner' AND rp.permission_id = p.id);",
                 ]
                 with engine.connect() as conn:
                     for stmt in migrations:
@@ -966,6 +977,22 @@ def configure_app_instance(fastapi_app: FastAPI):
 
         scheduler.start()
         logger.info("APScheduler started.")
+
+        try:
+            from sqlalchemy import text as _text
+            with SessionLocal() as pause_db:
+                paused_rows = pause_db.execute(
+                    _text("SELECT job_id FROM scheduler_paused_jobs")
+                ).fetchall()
+                restored_paused = 0
+                for (paused_job_id,) in paused_rows:
+                    if scheduler.get_job(paused_job_id):
+                        scheduler.pause_job(paused_job_id)
+                        restored_paused += 1
+                if restored_paused:
+                    logger.info(f"Restored paused state for {restored_paused} scheduled job(s).")
+        except Exception as pause_err:
+            logger.warning(f"Startup restore of paused scheduler jobs skipped: {pause_err}")
 
         # Web Push (Notifications Q3). Misconfigured VAPID keys raise here on
         # purpose (fail fast); missing keys just leave push disabled.

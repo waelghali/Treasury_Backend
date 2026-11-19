@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query, Body, BackgroundTasks, UploadFile, File
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
 
@@ -4250,14 +4250,16 @@ async def get_scheduled_jobs(current_user: Any = Depends(HasPermission("system_o
     from app.main import app as fastapi_app
     jobs = []
     for job in fastapi_app.state.scheduler.get_jobs():
-        # Corrected code to manually serialize only the necessary attributes.
+        is_wrapped = getattr(job.func, "__name__", "") == "job_wrapper" and job.args and callable(job.args[0])
+        target_func = job.args[0] if is_wrapped else job.func
+        display_args = job.args[1:] if is_wrapped else (job.args or [])
         job_details = {
             "id": job.id,
             "name": job.name,
             "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
             "trigger": str(job.trigger),
-            "func": job.func.__name__,
-            "args": [str(arg) for arg in job.args] if job.args else [], # Convert args to strings
+            "func": getattr(target_func, "__name__", str(target_func)),
+            "args": [str(arg) for arg in display_args], # Convert args to strings
             "kwargs": {k: str(v) for k, v in job.kwargs.items()} if job.kwargs else {}, # Convert kwargs values to strings
             "misfire_grace_time": job.misfire_grace_time,
         }
@@ -4320,7 +4322,11 @@ async def reschedule_job(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to reschedule job '{job_id}'. Error: {e}")
 
 @router.post("/scheduler/pause_job/{job_id}")
-async def pause_job(job_id: str, current_user: Any = Depends(HasPermission("system_owner:pause_scheduler_job"))):
+async def pause_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: Any = Depends(HasPermission("system_owner:pause_scheduler_job")),
+):
     """
     Pauses a scheduled job.
     Requires System Owner role with 'system_owner:pause_scheduler_job' permission.
@@ -4328,12 +4334,26 @@ async def pause_job(job_id: str, current_user: Any = Depends(HasPermission("syst
     from app.main import app as fastapi_app
     try:
         fastapi_app.state.scheduler.pause_job(job_id)
+        if isinstance(db, Session):
+            db.execute(
+                text(
+                    "INSERT INTO scheduler_paused_jobs (job_id, paused_at, paused_by_user_id) "
+                    "VALUES (:job_id, CURRENT_TIMESTAMP, :uid) "
+                    "ON CONFLICT (job_id) DO UPDATE SET paused_at = CURRENT_TIMESTAMP, paused_by_user_id = EXCLUDED.paused_by_user_id"
+                ),
+                {"job_id": job_id, "uid": getattr(current_user, "user_id", None)},
+            )
+            db.commit()
         return {"message": f"Job '{job_id}' paused successfully."}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found or could not be paused. Error: {e}")
 
 @router.post("/scheduler/resume_job/{job_id}")
-async def resume_job(job_id: str, current_user: Any = Depends(HasPermission("system_owner:resume_scheduler_job"))):
+async def resume_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: Any = Depends(HasPermission("system_owner:resume_scheduler_job")),
+):
     """
     Resumes a paused job.
     Requires System Owner role with 'system_owner:resume_scheduler_job' permission.
@@ -4341,6 +4361,12 @@ async def resume_job(job_id: str, current_user: Any = Depends(HasPermission("sys
     from app.main import app as fastapi_app
     try:
         fastapi_app.state.scheduler.resume_job(job_id)
+        if isinstance(db, Session):
+            db.execute(
+                text("DELETE FROM scheduler_paused_jobs WHERE job_id = :job_id"),
+                {"job_id": job_id},
+            )
+            db.commit()
         return {"message": f"Job '{job_id}' resumed successfully."}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found or could not be resumed. Error: {e}")

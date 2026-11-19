@@ -1,5 +1,6 @@
 # app/core/background_tasks.py
 
+import asyncio
 import logging
 import json
 import os
@@ -753,10 +754,12 @@ async def run_hourly_cbe_news_sync(db: Session):
     url = "https://www.cbe.org.eg/ar/news-publications/news"
     base_url = "https://www.cbe.org.eg"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+    response = soup = news_items = None
 
     try:
         # 1. Get the news from the website
-        response = requests.get(url, headers=headers, timeout=10)
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         news_items = soup.find_all("h3")
 
@@ -839,6 +842,9 @@ async def run_hourly_cbe_news_sync(db: Session):
         db.commit()
         logger.info("CBE News Sync complete.")
 
+    except requests.exceptions.RequestException as req_err:
+        db.rollback()
+        logger.warning(f"CBE news sync skipped (network/HTTP unavailable): {req_err}")
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to sync CBE news: {e}")
@@ -872,7 +878,7 @@ async def run_daily_exchange_rate_sync(db: Session):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=20)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, "html.parser")
         
@@ -931,6 +937,9 @@ async def run_daily_exchange_rate_sync(db: Session):
         except Exception as breach_err:
             logger.error(f"FX breach check failed (non-blocking): {breach_err}", exc_info=True)
 
+    except requests.exceptions.RequestException as req_err:
+        db.rollback()
+        logger.warning(f"CBE exchange rate sync skipped (network/HTTP unavailable): {req_err}")
     except Exception as e:
         db.rollback()
         logger.error(f"Error syncing CBE exchange rates: {e}", exc_info=True)
@@ -983,7 +992,7 @@ async def run_daily_cbe_lending_rate_sync(db: Session):
     scraped_deposit = None
     for url in urls:
         try:
-            response = requests.get(url, headers=headers, timeout=15)
+            response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, "html.parser")
                 tables = soup.find_all("table")
