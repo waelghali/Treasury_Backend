@@ -288,10 +288,9 @@ def _apply_defaults_and_autofill(
         record_data["lg_category_id"] = cat_obj.id
     else:
         default_cat = (
-            crud_lg_category.get_default_category(db, None)
-            or crud_lg_category.get_default_category(db, customer_id)
-            or db.query(LGCategory).filter(LGCategory.customer_id.is_(None), LGCategory.is_deleted == False).order_by(LGCategory.id.asc()).first()
+            crud_lg_category.get_effective_default_category(db, customer_id)
             or db.query(LGCategory).filter(LGCategory.customer_id == customer_id, LGCategory.is_deleted == False).order_by(LGCategory.id.asc()).first()
+            or db.query(LGCategory).filter(LGCategory.customer_id.is_(None), LGCategory.is_deleted == False).order_by(LGCategory.id.asc()).first()
         )
         record_data["lg_category_id"] = default_cat.id if default_cat else None
 

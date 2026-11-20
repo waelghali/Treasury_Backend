@@ -23,6 +23,8 @@ from app.schemas.all_schemas import (
     CustomerCreate, CustomerUpdate, CustomerOut, CustomerCoreCreate,
     UserCreate, UserOut, UserUpdate, CustomerEntityCreate, CustomerEntityUpdate, CustomerEntityOut,
     GlobalConfigurationCreate, GlobalConfigurationUpdate, GlobalConfigurationOut,
+    CustomerConfigurationUpdate, CustomerConfigurationOut,
+    EmergencyForcePasswordChangeRequest,
     BankCreate, BankUpdate, BankOut,
     TemplateCreate, TemplateUpdate, TemplateOut,
     CurrencyCreate, CurrencyUpdate, CurrencyOut,
@@ -40,7 +42,7 @@ from app.schemas.all_schemas import (
 )
 from app.crud.crud import (
     crud_subscription_plan, crud_customer, crud_customer_entity, crud_user,
-    crud_global_configuration, crud_bank, crud_template,
+    crud_global_configuration, crud_customer_configuration, crud_bank, crud_template,
     crud_currency, crud_lg_type, crud_rule, crud_issuing_method,
     crud_lg_status, crud_lg_operational_status,
     crud_lg_category,
@@ -74,7 +76,14 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 
-from app.constants import UserRole, LegalArtifactType, GlobalConfigKey
+from app.constants import (
+    UserRole,
+    LegalArtifactType,
+    GlobalConfigKey,
+    ConfigScope,
+    AUDIT_ACTION_TYPE_EMERGENCY_PASSWORD_RESET,
+)
+from app.crud.crud_config import resolve_config_scope
 
 router = APIRouter()
 trial_router = APIRouter()
@@ -2459,6 +2468,171 @@ def restore_global_configuration(
     client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="GlobalConfiguration", entity_id=restored_config.id, details={"key": restored_config.key, "ip_address": client_host})
     return restored_config
+
+
+# --- System Owner: Per-Customer Security & Platform Overrides + Emergency Password Reset ---
+
+@router.get("/customers/{customer_id}/security-configurations", response_model=List[CustomerConfigurationOut])
+def read_customer_security_configurations(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Lists all SYSTEM_CUSTOMER_OVERRIDE configurations for a customer with effective values."""
+    customer = crud_customer.get(db, id=customer_id)
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+    return crud_customer_configuration.get_all_customer_configs_for_customer(
+        db,
+        customer_id=customer_id,
+        allowed_scopes=[ConfigScope.SYSTEM_CUSTOMER_OVERRIDE],
+    )
+
+
+@router.put("/customers/{customer_id}/security-configurations/{global_config_key}", response_model=CustomerConfigurationOut)
+def update_customer_security_configuration(
+    customer_id: int,
+    global_config_key: str,
+    config_in: CustomerConfigurationUpdate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+    request: Request = None,
+):
+    """Sets or updates a per-customer security/platform override on behalf of a tenant."""
+    customer = crud_customer.get(db, id=customer_id)
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+
+    key_for_db = global_config_key.upper()
+    try:
+        config_key_enum = GlobalConfigKey(key_for_db)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Configuration key '{global_config_key}' is invalid or not recognized.",
+        )
+
+    global_config = crud_global_configuration.get_by_key(db, config_key_enum)
+    if not global_config:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Global configuration key not found.")
+
+    if resolve_config_scope(global_config) == ConfigScope.PLATFORM_GLOBAL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Platform-global configurations cannot be overridden per customer.",
+        )
+
+    crud_customer_configuration.set_customer_config(
+        db,
+        customer_id=customer_id,
+        global_config_id=global_config.id,
+        configured_value=config_in.configured_value,
+        user_id=current_user.user_id,
+    )
+    cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, customer_id, config_key_enum
+    )
+    return CustomerConfigurationOut(**cfg)
+
+
+@router.delete("/customers/{customer_id}/security-configurations/{global_config_key}", response_model=CustomerConfigurationOut)
+def reset_customer_security_configuration(
+    customer_id: int,
+    global_config_key: str,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+):
+    """Removes a per-customer override so the customer reverts to the global default."""
+    customer = crud_customer.get(db, id=customer_id)
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+
+    key_for_db = global_config_key.upper()
+    try:
+        config_key_enum = GlobalConfigKey(key_for_db)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Configuration key '{global_config_key}' is invalid or not recognized.",
+        )
+
+    global_config = crud_global_configuration.get_by_key(db, config_key_enum)
+    if not global_config:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Global configuration key not found.")
+
+    crud_customer_configuration.reset_customer_config(
+        db,
+        customer_id=customer_id,
+        global_config_id=global_config.id,
+        user_id=current_user.user_id,
+    )
+    cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, customer_id, config_key_enum
+    )
+    return CustomerConfigurationOut(**cfg)
+
+
+@router.post("/security/force-password-change", status_code=status.HTTP_200_OK)
+def emergency_force_password_change(
+    payload: EmergencyForcePasswordChangeRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_system_owner),
+    request: Request = None,
+):
+    """
+    Emergency Option C action: flags active non-System-Owner customer users
+    (either for a single customer or across all customers) with must_change_password=True.
+    """
+    client_host = get_client_ip(request) if request else None
+    if payload.customer_id is not None:
+        customer = crud_customer.get(db, id=payload.customer_id)
+        if not customer:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+
+    user_query = db.query(User).filter(
+        User.is_deleted == False,
+        User.role != UserRole.SYSTEM_OWNER,
+        User.customer_id.isnot(None),
+    )
+    if payload.customer_id is not None:
+        user_query = user_query.filter(User.customer_id == payload.customer_id)
+
+    affected_user_count = user_query.count()
+    newly_flagged_count = user_query.filter(User.must_change_password == False).count()
+
+    if affected_user_count > 0:
+        user_query.update(
+            {"must_change_password": True, "updated_at": func.now()},
+            synchronize_session=False,
+        )
+        db.flush()
+
+    scope_label = "customer" if payload.customer_id is not None else "all_customers"
+    reason_text = (payload.reason or "").strip() or "Emergency password rotation enforced by System Owner"
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type=AUDIT_ACTION_TYPE_EMERGENCY_PASSWORD_RESET,
+        entity_type="Customer" if payload.customer_id is not None else "GlobalSecurity",
+        entity_id=payload.customer_id,
+        details={
+            "scope": scope_label,
+            "customer_id": payload.customer_id,
+            "affected_user_count": affected_user_count,
+            "newly_flagged_count": newly_flagged_count,
+            "reason": reason_text,
+        },
+        customer_id=payload.customer_id,
+        ip_address=client_host,
+    )
+
+    return {
+        "message": f"Forced password change enforced for {affected_user_count} active user(s) ({newly_flagged_count} newly flagged).",
+        "scope": scope_label,
+        "customer_id": payload.customer_id,
+        "affected_user_count": affected_user_count,
+        "newly_flagged_count": newly_flagged_count,
+    }
 
 
 @router.post("/currencies/", response_model=CurrencyOut, status_code=status.HTTP_201_CREATED)

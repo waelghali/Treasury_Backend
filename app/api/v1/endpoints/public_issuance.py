@@ -190,21 +190,53 @@ def public_verify_otp(payload: dict, db: Session = Depends(get_db)):
     otp_code = str(payload.get("otp") or "").strip()
 
     # --- OTP Rate Limiting (brute-force protection) ---
-    # Configurable thresholds via GlobalConfig (defaults: 5 attempts, 15 min lockout)
+    # Configurable thresholds via CustomerConfig fallback to GlobalConfig (defaults: 5 attempts, 15 min lockout)
     max_attempts = 5
     lockout_minutes = 15
     try:
         from app.models import GlobalConfiguration
-        max_cfg = db.query(GlobalConfiguration).filter(
-            GlobalConfiguration.key == GlobalConfigKey.OTP_MAX_FAILED_ATTEMPTS
-        ).first()
-        if max_cfg and max_cfg.value_default:
-            max_attempts = int(max_cfg.value_default)
-        lock_cfg = db.query(GlobalConfiguration).filter(
-            GlobalConfiguration.key == GlobalConfigKey.OTP_LOCKOUT_DURATION_MINUTES
-        ).first()
-        if lock_cfg and lock_cfg.value_default:
-            lockout_minutes = int(lock_cfg.value_default)
+        customer_id_for_otp = None
+        latest_otp_row = (
+            db.query(ExternalOTP.customer_id)
+            .filter(ExternalOTP.email == email)
+            .order_by(ExternalOTP.id.desc())
+            .first()
+        )
+        if latest_otp_row and latest_otp_row[0] is not None:
+            customer_id_for_otp = latest_otp_row[0]
+        elif "@" in email:
+            domain = email.split("@")[-1]
+            from sqlalchemy import cast
+            from sqlalchemy.dialects.postgresql import JSONB
+            cust_row = db.query(Customer.id).filter(
+                cast(Customer.domains, JSONB).contains([domain]),
+                Customer.is_deleted == False,
+            ).first()
+            if cust_row:
+                customer_id_for_otp = cust_row[0]
+
+        if customer_id_for_otp is not None:
+            max_cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id_for_otp, GlobalConfigKey.OTP_MAX_FAILED_ATTEMPTS
+            )
+            if max_cfg and max_cfg.get("effective_value") is not None:
+                max_attempts = int(max_cfg["effective_value"])
+            lock_cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                db, customer_id_for_otp, GlobalConfigKey.OTP_LOCKOUT_DURATION_MINUTES
+            )
+            if lock_cfg and lock_cfg.get("effective_value") is not None:
+                lockout_minutes = int(lock_cfg["effective_value"])
+        else:
+            max_cfg = db.query(GlobalConfiguration).filter(
+                GlobalConfiguration.key == GlobalConfigKey.OTP_MAX_FAILED_ATTEMPTS
+            ).first()
+            if max_cfg and max_cfg.value_default:
+                max_attempts = int(max_cfg.value_default)
+            lock_cfg = db.query(GlobalConfiguration).filter(
+                GlobalConfiguration.key == GlobalConfigKey.OTP_LOCKOUT_DURATION_MINUTES
+            ).first()
+            if lock_cfg and lock_cfg.value_default:
+                lockout_minutes = int(lock_cfg.value_default)
     except Exception:
         db.rollback()
 

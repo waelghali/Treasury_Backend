@@ -1,6 +1,7 @@
 # app/crud/crud_config.py
 
 import json
+import logging
 from typing import Any, Dict, List, Optional, Type, TypeVar
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, selectinload
@@ -16,9 +17,22 @@ from app.schemas.all_schemas import (
     GlobalConfigurationOut,
     GlobalConfigurationUpdate,
 )
-from app.constants import GlobalConfigKey, AUDIT_ACTION_TYPE_UPDATE
+from app.constants import GlobalConfigKey, ConfigScope, get_default_config_scope, AUDIT_ACTION_TYPE_UPDATE
 
-from sqlalchemy import cast, String 
+from sqlalchemy import cast, String
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_config_scope(gc: GlobalConfiguration) -> ConfigScope:
+    """Returns the authoritative ConfigScope for a GlobalConfiguration row."""
+    raw_scope = getattr(gc, "config_scope", None)
+    if raw_scope:
+        try:
+            return raw_scope if isinstance(raw_scope, ConfigScope) else ConfigScope(str(raw_scope))
+        except ValueError:
+            pass
+    return get_default_config_scope(getattr(gc, "key", None))
 
 
 class CRUDGlobalConfiguration(CRUDBase):
@@ -118,6 +132,11 @@ class CRUDGlobalConfiguration(CRUDBase):
             value_default=data.get('value_default'),
             key=data.get('key')
         )
+        scope_val = data.get('config_scope')
+        resolved_scope = (
+            scope_val.value if hasattr(scope_val, 'value') else str(scope_val)
+        ) if scope_val is not None else get_default_config_scope(data.get('key')).value
+        kwargs.setdefault('config_scope', resolved_scope)
         db_obj = super().create(db, obj_in, **kwargs)
         log_action(
             db,
@@ -125,7 +144,7 @@ class CRUDGlobalConfiguration(CRUDBase):
             action_type="CREATE",
             entity_type="GlobalConfiguration",
             entity_id=db_obj.id,
-            details={"key": db_obj.key.value, "value_default": db_obj.value_default},
+            details={"key": db_obj.key.value, "value_default": db_obj.value_default, "config_scope": db_obj.config_scope},
         )
         return db_obj
 
@@ -166,7 +185,14 @@ class CRUDGlobalConfiguration(CRUDBase):
         old_value_min = db_obj.value_min
         old_value_max = db_obj.value_max
 
-        updated_obj = super().update(db, db_obj, obj_in, **kwargs)
+        update_payload = dict(data)
+        if 'config_scope' in update_payload:
+            if update_payload['config_scope'] is None:
+                update_payload.pop('config_scope')
+            elif hasattr(update_payload['config_scope'], 'value'):
+                update_payload['config_scope'] = update_payload['config_scope'].value
+
+        updated_obj = super().update(db, db_obj, update_payload, **kwargs)
         if hasattr(updated_obj, "_changed_fields_for_log") and updated_obj._changed_fields_for_log:
             log_action(
                 db,
@@ -304,10 +330,18 @@ class CRUDCustomerConfiguration(CRUDBase):
             "global_unit": global_config.unit,
             "global_description": global_config.description,
             "effective_value": effective_value,
+            "global_module_tags": global_config.module_tags,
+            "global_config_scope": resolve_config_scope(global_config),
             "source": source, # Not part of schema, but useful for debugging
         }
 
-    def get_all_customer_configs_for_customer(self, db: Session, customer_id: int) -> List[CustomerConfigurationOut]:
+    def get_all_customer_configs_for_customer(
+        self,
+        db: Session,
+        customer_id: int,
+        allowed_scopes: Optional[List[ConfigScope]] = None,
+        include_cbe_benchmarks: bool = False,
+    ) -> List[CustomerConfigurationOut]:
         all_global_configs = self.global_config_crud.get_all(db)
         customer_configs_map = {
             cc.global_config_id: cc
@@ -330,8 +364,14 @@ class CRUDCustomerConfiguration(CRUDBase):
 
         result = []
         for gc in all_global_configs:
-            customer_config = customer_configs_map.get(gc.id)
+            gc_scope = resolve_config_scope(gc)
             gc_key_str = gc_key_by_id.get(gc.id, "")
+            if allowed_scopes is not None:
+                is_cbe = include_cbe_benchmarks and gc_key_str.startswith("CBE_")
+                if gc_scope not in allowed_scopes and not is_cbe:
+                    continue
+
+            customer_config = customer_configs_map.get(gc.id)
             if customer_config and customer_config.configured_value is not None:
                 effective_value = customer_config.configured_value
             elif gc_key_str == GlobalConfigKey.FACILITY_SCORE_WEIGHT_RARITY.value and has_custom_normal_weights:
@@ -369,6 +409,7 @@ class CRUDCustomerConfiguration(CRUDBase):
                     global_description=gc.description,
                     effective_value=effective_value,
                     global_module_tags=gc.module_tags,
+                    global_config_scope=gc_scope,
                 )
             )
         result.sort(key=lambda x: x.global_config_key) # Sort by the string value
@@ -383,28 +424,21 @@ class CRUDCustomerConfiguration(CRUDBase):
                 detail="Global configuration not found.",
             )
 
-        try:
-            if global_config.unit in ["days", "percentage"] or global_config.key == GlobalConfigKey.GRACE_PERIOD_DAYS:
-                # Corrected logic for parsing numeric values, handling both int and float
-                if "." in configured_value or "e" in configured_value.lower():
-                    val = float(configured_value)
-                else:
-                    val = int(configured_value)
-                
-                min_val = float(global_config.value_min) if global_config.value_min is not None else None
-                max_val = float(global_config.value_max) if global_config.value_max is not None else None
+        is_numeric_unit = global_config.unit in [
+            "days", "percentage", "characters", "minutes", "hours", "attempts", "months", "number", "count"
+        ]
+        has_numeric_bounds = False
+        if global_config.unit not in ("boolean", "json", "emails_json_array") and getattr(global_config.key, 'value', str(global_config.key)) != "ISSUED_LG_VERIFICATION_POLICY":
+            for b in (global_config.value_min, global_config.value_max):
+                if b is not None and str(b).strip() != "":
+                    try:
+                        float(b)
+                        has_numeric_bounds = True
+                    except (ValueError, TypeError):
+                        pass
 
-                if min_val is not None and val < min_val:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Configured value {configured_value} is below the minimum allowed value of {global_config.value_min} {global_config.unit}.",
-                    )
-                if max_val is not None and val > max_val:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Configured value {configured_value} exceeds the maximum allowed value of {global_config.value_max} {global_config.unit}.",
-                    )
-            elif global_config.unit == "boolean" or global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+        try:
+            if global_config.unit == "boolean" or global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
                 val_clean = configured_value.strip().lower()
                 if global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
                     if val_clean in ['auto_accept', 'accept', 'true', '1']:
@@ -479,6 +513,26 @@ class CRUDCustomerConfiguration(CRUDBase):
                             )
                 except json.JSONDecodeError:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Value must be valid JSON for verification policy.")
+            elif is_numeric_unit or has_numeric_bounds or global_config.key == GlobalConfigKey.GRACE_PERIOD_DAYS:
+                # Corrected logic for parsing numeric values, handling both int and float
+                if "." in configured_value or "e" in configured_value.lower():
+                    val = float(configured_value)
+                else:
+                    val = int(configured_value)
+                
+                min_val = float(global_config.value_min) if global_config.value_min is not None else None
+                max_val = float(global_config.value_max) if global_config.value_max is not None else None
+
+                if min_val is not None and val < min_val:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Configured value {configured_value} is below the minimum allowed value of {global_config.value_min} {global_config.unit or ''}".strip() + ".",
+                    )
+                if max_val is not None and val > max_val:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Configured value {configured_value} exceeds the maximum allowed value of {global_config.value_max} {global_config.unit or ''}".strip() + ".",
+                    )
 
         except (ValueError, TypeError) as e:
             raise HTTPException(
@@ -567,14 +621,21 @@ class CRUDCustomerConfiguration(CRUDBase):
                 except Exception as ex:
                     logger.warning(f"Could not cascade reset AUTO_ACCEPT_SINGLE_QUOTE: {ex}")
         
-        customer_config = self.get_by_customer_and_global_config_id(
-            db, customer_id, global_config_id
+        # Query including soft-deleted rows so UniqueConstraint (_customer_global_config_uc) is respected on revive
+        existing_any = (
+            db.query(self.model)
+            .filter(
+                self.model.customer_id == customer_id,
+                self.model.global_config_id == global_config_id,
+            )
+            .first()
         )
 
-        if customer_config:
+        if existing_any and not existing_any.is_deleted:
+            old_value = existing_any.configured_value
             updated_config = super().update(
                 db,
-                db_obj=customer_config,
+                db_obj=existing_any,
                 obj_in=CustomerConfigurationUpdate(configured_value=configured_value),
             )
             log_action(
@@ -585,12 +646,34 @@ class CRUDCustomerConfiguration(CRUDBase):
                 entity_id=updated_config.id,
                 details={
                     "global_config_key": global_config.key.value,
-                    "old_value": customer_config.configured_value,
+                    "old_value": old_value,
                     "new_value": configured_value,
                 },
                 customer_id=customer_id,
             )
             target_config = updated_config
+        elif existing_any and existing_any.is_deleted:
+            existing_any.is_deleted = False
+            existing_any.deleted_at = None
+            existing_any.configured_value = configured_value
+            existing_any.updated_at = func.now()
+            db.add(existing_any)
+            db.flush()
+            db.refresh(existing_any)
+            log_action(
+                db,
+                user_id=user_id,
+                action_type="CREATE",
+                entity_type="CustomerConfiguration",
+                entity_id=existing_any.id,
+                details={
+                    "global_config_key": global_config.key.value,
+                    "new_value": configured_value,
+                    "restored_from_reset": True,
+                },
+                customer_id=customer_id,
+            )
+            target_config = existing_any
         else:
             new_config = super().create(
                 db,
@@ -632,6 +715,36 @@ class CRUDCustomerConfiguration(CRUDBase):
                 pass
 
         return target_config
+
+    def reset_customer_config(self, db: Session, customer_id: int, global_config_id: int, user_id: int) -> bool:
+        """Soft-deletes a customer override so the customer falls back to the global default."""
+        customer_config = self.get_by_customer_and_global_config_id(
+            db, customer_id, global_config_id
+        )
+        if not customer_config:
+            return False
+        old_value = customer_config.configured_value
+        global_config = self.global_config_crud.get(db, global_config_id)
+        key_str = (
+            global_config.key.value
+            if global_config and hasattr(global_config.key, "value")
+            else str(global_config.key if global_config else global_config_id)
+        )
+        self.soft_delete(db, customer_config)
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="DELETE",
+            entity_type="CustomerConfiguration",
+            entity_id=customer_config.id,
+            details={
+                "global_config_key": key_str,
+                "old_value": old_value,
+                "reason": "Override reset to global default",
+            },
+            customer_id=customer_id,
+        )
+        return True
 
     def revalidate_customer_configs_for_global_change(
         self, db: Session, global_config_id: int

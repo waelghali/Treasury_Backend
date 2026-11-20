@@ -8,7 +8,7 @@ import os
 import logging
 from decimal import Decimal
 import re
-from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus, DOCUMENT_TYPE_ORIGINAL_LG, LegalArtifactType
+from app.constants import UserRole, GlobalConfigKey, ConfigScope, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, SubscriptionStatus, DOCUMENT_TYPE_ORIGINAL_LG, LegalArtifactType
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +349,7 @@ class GlobalConfigurationBase(BaseModel):
     unit: Optional[str] = Field(None, max_length=50, description="Unit of the setting (e.g., 'days', 'percentage', 'boolean')")
     description: Optional[str] = Field(None, max_length=500, description="Description of the configuration setting")
     module_tags: Optional[List[str]] = Field(None, description="Module tags: null=system, e.g. ['custody'], ['issuance'], ['custody','issuance']")
+    config_scope: Optional[ConfigScope] = Field(None, description="Ownership/visibility scope of the configuration")
 
 class GlobalConfigurationCreate(GlobalConfigurationBase):
     pass
@@ -360,6 +361,7 @@ class GlobalConfigurationUpdate(GlobalConfigurationBase):
     value_default: Optional[str] = None
     unit: Optional[str] = None
     description: Optional[str] = None
+    config_scope: Optional[ConfigScope] = None
 
 class GlobalConfigurationOut(GlobalConfigurationBase, BaseSchema):
     pass
@@ -394,6 +396,12 @@ class CustomerConfigurationOut(BaseSchema):
     
     effective_value: str = Field(..., description="The effective value for the customer (configured_value if present, else global_value_default)")
     global_module_tags: Optional[List[str]] = Field(None, description="Module tags from the global configuration")
+    global_config_scope: Optional[ConfigScope] = Field(None, description="Ownership/visibility scope from global configuration")
+
+
+class EmergencyForcePasswordChangeRequest(BaseModel):
+    customer_id: Optional[int] = Field(None, description="Target customer ID, or null for all customer users across the platform.")
+    reason: Optional[str] = Field(None, max_length=500, description="Reason recorded in audit logs.")
 
 class BankBase(BaseModel):
     name: str = Field(..., min_length=3, max_length=150, description="Name of the bank")
@@ -567,23 +575,33 @@ class LGCategoryBase(BaseModel):
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this category applies to (if has_all_entity_access is False)")
 
     @model_validator(mode='after')
+    def normalize_extra_field(self):
+        if self.extra_field_name is not None:
+            cleaned = self.extra_field_name.strip()
+            self.extra_field_name = cleaned if cleaned else None
+        if not self.extra_field_name:
+            self.is_mandatory = False
+        return self
+
+    @model_validator(mode='after')
     def validate_code_format(self):
-        if self.code and (not self.code.isalnum() or not (1 <= len(self.code) <= 2)):
-            raise ValueError("Category code must be 1 or 2 alphanumeric characters.")
-        if self.code:
-            self.code = self.code.upper()
+        if self.code is not None:
+            cleaned = self.code.strip()
+            if not cleaned:
+                self.code = None
+            elif not cleaned.isalnum() or not (1 <= len(cleaned) <= 2):
+                raise ValueError("Category code must be 1 or 2 alphanumeric characters.")
+            else:
+                self.code = cleaned.upper()
         return self
 
     @model_validator(mode='after')
     def validate_entity_access(self):
-        # Universal categories must have all entity access, and cannot have entity IDs.
-        if self.customer_id is None:
-            if not self.has_all_entity_access:
-                raise ValueError("Universal categories must have 'has_all_entity_access' set to True.")
-            if self.entity_ids:
-                raise ValueError("Universal categories cannot have 'entity_ids'.")
+        # Default categories must apply to all entities
+        if self.is_default and self.has_all_entity_access is False:
+            raise ValueError("A default category must apply to all entities ('has_all_entity_access' must be True).")
 
-        # All other validation logic remains the same for customer-specific categories.
+        # Consistency check between has_all_entity_access and entity_ids
         if self.has_all_entity_access is not None:
             if self.has_all_entity_access and self.entity_ids:
                 raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
@@ -596,8 +614,8 @@ class LGCategoryCreate(LGCategoryBase):
 
 class LGCategoryUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
-    code: Optional[str] = Field(None, min_length=1, max_length=2)
-    extra_field_name: Optional[str] = None
+    code: Optional[str] = Field(None, max_length=2)
+    extra_field_name: Optional[str] = Field(None, max_length=100)
     is_mandatory: Optional[bool] = None
     communication_list: Optional[List[EmailStr]] = None
     
@@ -608,15 +626,30 @@ class LGCategoryUpdate(BaseModel):
     entity_ids: Optional[List[int]] = Field(None, description="List of customer entity IDs this category applies to (if has_all_entity_access is False)")
 
     @model_validator(mode='after')
+    def normalize_extra_field(self):
+        if self.extra_field_name is not None:
+            cleaned = self.extra_field_name.strip()
+            self.extra_field_name = cleaned if cleaned else None
+            if not self.extra_field_name:
+                self.is_mandatory = False
+        return self
+
+    @model_validator(mode='after')
     def validate_code_format(self):
-        if self.code:
-            if not self.code.isalnum() or not (1 <= len(self.code) <= 2):
+        if self.code is not None:
+            cleaned = self.code.strip()
+            if not cleaned:
+                self.code = None
+            elif not cleaned.isalnum() or not (1 <= len(cleaned) <= 2):
                 raise ValueError("Category code must be 1 or 2 alphanumeric characters.")
-            self.code = self.code.upper()
+            else:
+                self.code = cleaned.upper()
         return self
 
     @model_validator(mode='after')
     def validate_entity_access(self):
+        if self.is_default is True and self.has_all_entity_access is False:
+            raise ValueError("A default category must apply to all entities ('has_all_entity_access' must be True).")
         if self.has_all_entity_access is not None:
             if self.has_all_entity_access and self.entity_ids:
                 raise ValueError("Cannot provide specific entity_ids when has_all_entity_access is True.")
@@ -1277,6 +1310,32 @@ class LGRecordChangeOwner(BaseModel):
            (self.new_internal_owner_contact_id is not None and self.new_internal_owner_contact_details is not None):
             raise ValueError("Exactly one of 'new_internal_owner_contact_id' or 'new_internal_owner_contact_details' must be provided.")
         
+        return self
+
+class LGCategoryChangeScope(str, Enum):
+    SINGLE = "single"
+    MULTIPLE = "multiple"
+    ALL = "all"
+
+class LGRecordChangeCategory(BaseModel):
+    change_scope: LGCategoryChangeScope = Field(..., description="Scope of the change: 'single', 'multiple', or 'all'.")
+    lg_record_id: Optional[int] = Field(None, description="ID of the specific LG record (required for 'single' scope).")
+    lg_record_ids: Optional[List[int]] = Field(None, description="List of LG record IDs (required for 'multiple' scope).")
+    source_category_id: Optional[int] = Field(None, description="Optional source category ID to filter LGs when change_scope is 'all'.")
+    new_lg_category_id: int = Field(..., description="ID of the target LG category.")
+    extra_field_value: Optional[str] = Field(None, description="Optional uniform value for the target category's extra field.")
+    per_lg_extra_field_values: Optional[Dict[str, str]] = Field(None, description="Optional map of LG record ID (as string) to extra field value.")
+    carry_over_old_extra_field: bool = Field(False, description="Whether to carry over the previous category's extra field value if target has an extra field.")
+    reason: Optional[str] = Field(None, description="Optional reason for changing the LG category.")
+
+    @model_validator(mode='after')
+    def validate_change_scope_fields(self):
+        if self.change_scope == LGCategoryChangeScope.SINGLE:
+            if self.lg_record_id is None:
+                raise ValueError("lg_record_id is required for 'single' change scope.")
+        elif self.change_scope == LGCategoryChangeScope.MULTIPLE:
+            if not self.lg_record_ids or len(self.lg_record_ids) == 0:
+                raise ValueError("lg_record_ids must be a non-empty list for 'multiple' change scope.")
         return self
 
 class LGInstructionRecordDelivery(BaseModel):

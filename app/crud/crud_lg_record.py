@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Type, Tuple
 from fastapi import HTTPException, status, UploadFile, BackgroundTasks
 from sqlalchemy import func, desc, exists, and_
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.attributes import flag_modified
 import decimal
 from dateutil.relativedelta import relativedelta
 
@@ -26,7 +27,8 @@ from app.schemas.all_schemas import (
     InternalOwnerContactCreate, LGDocumentCreate, LGCategoryCreate, LGCategoryUpdate,
     LGInstructionCreate, LGRecordCreate, LGRecordUpdate, LGActivateNonOperativeRequest,
     LGRecordAmendRequest, # New schema for amendment
-    LGAutoRenewalItemIn, AutoRenewalCandidateOut, AutoRenewalPreviewOut # Auto-renewal schemas
+    LGAutoRenewalItemIn, AutoRenewalCandidateOut, AutoRenewalPreviewOut, # Auto-renewal schemas
+    LGRecordChangeCategory, LGCategoryChangeScope,
 )
 from app.constants import (
     GlobalConfigKey, ApprovalRequestStatusEnum, ACTION_TYPE_LG_DECREASE_AMOUNT, AUDIT_ACTION_TYPE_LG_DECREASED_AMOUNT,
@@ -38,6 +40,7 @@ from app.constants import (
     ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE, ACTION_TYPE_LG_AMEND,
     ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION,
     ACTION_TYPE_LG_CHANGE_OWNER_DETAILS, ACTION_TYPE_LG_CHANGE_SINGLE_LG_OWNER, ACTION_TYPE_LG_CHANGE_BULK_LG_OWNER,
+    AUDIT_ACTION_TYPE_LG_SINGLE_CATEGORY_CHANGED, AUDIT_ACTION_TYPE_LG_BULK_CATEGORY_CHANGED,
     AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED,
     AUDIT_ACTION_TYPE_LG_AMENDED, AUDIT_ACTION_TYPE_LG_ACTIVATED,
     LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, # Corrected to models.LgOperationalStatusEnum
@@ -222,6 +225,13 @@ class CRUDLGRecord(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid LG Category ID provided or category not accessible for your customer.",
             )
+        if lg_category.customer_id is not None and not lg_category.has_all_entity_access:
+            cat_entity_ids = {assoc.customer_entity_id for assoc in (lg_category.entity_associations or [])}
+            if obj_in.beneficiary_corporate_id not in cat_entity_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected LG Category does not apply to the chosen Beneficiary Entity.",
+                )
 
         # --- MODIFIED LOGIC START ---
         if lg_type.id == models.LgTypeEnum.ADVANCE_PAYMENT_GUARANTEE.value:
@@ -4079,3 +4089,250 @@ class CRUDLGRecord(CRUDBase):
             return f"{delta_days} Days"
         except Exception:
             return "N/A"
+
+    async def change_lg_category(
+        self,
+        db: Session,
+        change_in: LGRecordChangeCategory,
+        user_id: int,
+        customer_id: int,
+        user_has_all_access: bool = True,
+        user_allowed_entity_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Directly changes/migrates the LGCategory (and bidirectional extra field values)
+        for a single LG, multiple selected LGs, or all accessible LGs (optionally filtered by source category).
+        Works across all LG statuses with no approval workflow and no bank instruction generation.
+        """
+        target_cat = (
+            db.query(models.LGCategory)
+            .options(selectinload(models.LGCategory.entity_associations))
+            .filter(
+                models.LGCategory.id == change_in.new_lg_category_id,
+                models.LGCategory.is_deleted == False,
+            )
+            .first()
+        )
+        if not target_cat or (target_cat.customer_id is not None and target_cat.customer_id != customer_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Target LG Category not found or not accessible for your customer.",
+            )
+
+        target_allowed_entities: Optional[set] = None
+        if target_cat.customer_id is not None and not target_cat.has_all_entity_access:
+            target_allowed_entities = {
+                assoc.customer_entity_id for assoc in (target_cat.entity_associations or [])
+            }
+            if not user_has_all_access:
+                user_ent_set = set(user_allowed_entity_ids or [])
+                if not target_allowed_entities.intersection(user_ent_set):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You do not have entity access to the target LG Category.",
+                    )
+
+        if not user_has_all_access and not (user_allowed_entity_ids or []):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No accessible LG records found.",
+            )
+
+        base_query = (
+            db.query(self.model)
+            .options(selectinload(self.model.lg_category))
+            .filter(
+                self.model.customer_id == customer_id,
+                self.model.is_deleted == False,
+            )
+        )
+        if not user_has_all_access:
+            base_query = base_query.filter(
+                self.model.beneficiary_corporate_id.in_(list(user_allowed_entity_ids or []))
+            )
+
+        if change_in.change_scope == LGCategoryChangeScope.SINGLE:
+            lg_rec = base_query.filter(self.model.id == change_in.lg_record_id).first()
+            if not lg_rec:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="LG Record not found or not accessible.",
+                )
+            candidate_lgs = [lg_rec]
+        elif change_in.change_scope == LGCategoryChangeScope.MULTIPLE:
+            dedup_ids = list(dict.fromkeys(change_in.lg_record_ids or []))
+            candidate_lgs = base_query.filter(self.model.id.in_(dedup_ids)).all()
+            if len(candidate_lgs) != len(dedup_ids):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="One or more selected LG Records were not found or are not accessible.",
+                )
+            by_id = {lg.id: lg for lg in candidate_lgs}
+            candidate_lgs = [by_id[i] for i in dedup_ids]
+        else:  # LGCategoryChangeScope.ALL
+            if change_in.source_category_id is not None:
+                if change_in.source_category_id == target_cat.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Source category and target category cannot be the same.",
+                    )
+                base_query = base_query.filter(
+                    self.model.lg_category_id == change_in.source_category_id
+                )
+            candidate_lgs = base_query.order_by(self.model.id.asc()).all()
+            if not candidate_lgs:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No accessible LG records found for the selected scope.",
+                )
+
+        if target_allowed_entities is not None:
+            incompatible = [
+                lg.lg_number
+                for lg in candidate_lgs
+                if lg.beneficiary_corporate_id not in target_allowed_entities
+            ]
+            if incompatible:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Target category '{target_cat.name}' is restricted and does not apply to the "
+                        f"beneficiary entity of {len(incompatible)} LG(s): {', '.join(incompatible[:5])}."
+                    ),
+                )
+
+        target_extra_name = (target_cat.extra_field_name or "").strip() or None
+        per_lg_map = change_in.per_lg_extra_field_values or {}
+        uniform_val = (change_in.extra_field_value or "").strip()
+
+        resolved_plan: List[Tuple[models.LGRecord, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]] = []
+        missing_mandatory: List[str] = []
+
+        for lg in candidate_lgs:
+            old_extra_dict = (
+                dict(lg.additional_field_values)
+                if isinstance(lg.additional_field_values, dict) and lg.additional_field_values
+                else None
+            )
+            old_single_val = None
+            if old_extra_dict:
+                old_cat_field = (
+                    (lg.lg_category.extra_field_name or "").strip()
+                    if getattr(lg, "lg_category", None)
+                    else None
+                )
+                if old_cat_field and old_extra_dict.get(old_cat_field) not in (None, ""):
+                    old_single_val = str(old_extra_dict[old_cat_field]).strip()
+                else:
+                    for v in old_extra_dict.values():
+                        if v is not None and str(v).strip():
+                            old_single_val = str(v).strip()
+                            break
+
+            if target_extra_name is None:
+                new_extra_dict = None
+            else:
+                lg_key = str(lg.id)
+                if lg_key in per_lg_map and per_lg_map[lg_key] is not None:
+                    val = str(per_lg_map[lg_key]).strip()
+                elif uniform_val:
+                    val = uniform_val
+                elif old_extra_dict and old_extra_dict.get(target_extra_name) not in (None, ""):
+                    val = str(old_extra_dict[target_extra_name]).strip()
+                elif change_in.carry_over_old_extra_field and old_single_val:
+                    val = old_single_val
+                else:
+                    val = ""
+
+                if target_cat.is_mandatory and not val:
+                    missing_mandatory.append(lg.lg_number)
+                new_extra_dict = {target_extra_name: val} if val else None
+
+            resolved_plan.append((lg, old_extra_dict, new_extra_dict))
+
+        if missing_mandatory:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Custom field '{target_extra_name}' is mandatory for category '{target_cat.name}'. "
+                    f"Missing value for {len(missing_mandatory)} LG(s): {', '.join(missing_mandatory[:5])}."
+                ),
+            )
+
+        eligible_updates = [
+            (lg, old_extra_dict, new_extra_dict)
+            for (lg, old_extra_dict, new_extra_dict) in resolved_plan
+            if not (lg.lg_category_id == target_cat.id and old_extra_dict == new_extra_dict)
+        ]
+
+        if not eligible_updates:
+            msg = (
+                "Selected LG record(s) are already assigned to this category with identical custom field values."
+                if change_in.change_scope != LGCategoryChangeScope.ALL
+                else "No eligible LG records found to migrate to this category."
+            )
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
+
+        audit_action = (
+            AUDIT_ACTION_TYPE_LG_SINGLE_CATEGORY_CHANGED
+            if change_in.change_scope == LGCategoryChangeScope.SINGLE
+            else AUDIT_ACTION_TYPE_LG_BULK_CATEGORY_CHANGED
+        )
+        cleaned_reason = (change_in.reason or "").strip() or None
+        updated_lgs: List[models.LGRecord] = []
+
+        for lg, old_extra_dict, new_extra_dict in eligible_updates:
+            old_cat = getattr(lg, "lg_category", None)
+            old_cat_id = lg.lg_category_id
+            old_cat_name = old_cat.name if old_cat else None
+            old_cat_code = old_cat.code if old_cat else None
+
+            lg.lg_category_id = target_cat.id
+            lg.additional_field_values = new_extra_dict
+            flag_modified(lg, "additional_field_values")
+            db.add(lg)
+            updated_lgs.append(lg)
+
+            log_action(
+                db,
+                user_id=user_id,
+                action_type=audit_action,
+                entity_type="LGRecord",
+                entity_id=lg.id,
+                details={
+                    "lg_number": lg.lg_number,
+                    "scope": change_in.change_scope.value,
+                    "old_category_id": old_cat_id,
+                    "old_category_name": old_cat_name,
+                    "old_category_code": old_cat_code,
+                    "new_category_id": target_cat.id,
+                    "new_category_name": target_cat.name,
+                    "new_category_code": target_cat.code,
+                    "old_additional_field_values": old_extra_dict,
+                    "new_additional_field_values": new_extra_dict,
+                    "reason": cleaned_reason,
+                },
+                customer_id=customer_id,
+                lg_record_id=lg.id,
+            )
+
+        db.flush()
+        for lg in updated_lgs:
+            db.expire(lg)
+
+        refreshed_single = None
+        if change_in.change_scope == LGCategoryChangeScope.SINGLE and len(updated_lgs) == 1:
+            refreshed_single = self.get_lg_record_with_relations(
+                db,
+                updated_lgs[0].id,
+                customer_id,
+                user_has_all_access=user_has_all_access,
+                user_allowed_entity_ids=user_allowed_entity_ids or [],
+            )
+
+        return {
+            "affected_lgs_count": len(updated_lgs),
+            "affected_lg_ids": [lg.id for lg in updated_lgs],
+            "affected_lg_numbers": [lg.lg_number for lg in updated_lgs],
+            "lg_record": refreshed_single,
+        }

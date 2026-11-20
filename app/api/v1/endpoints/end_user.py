@@ -37,6 +37,8 @@ from app.schemas.all_schemas import (
     InternalOwnerChangeScope,
     InternalOwnerContactUpdateDetails,
     LGRecordChangeOwner,
+    LGCategoryChangeScope,
+    LGRecordChangeCategory,
     LGInstructionRecordDelivery,
     LGInstructionRecordBankReply,
     LGRecordAmendRequest,
@@ -100,6 +102,7 @@ from app.constants import (
     ACTION_TYPE_LG_BULK_REMINDER_TO_BANKS,
     AUDIT_ACTION_TYPE_LG_BULK_REMINDER_INITIATED,
     GlobalConfigKey,
+    ConfigScope,
     ACTION_TYPE_LG_EXTEND,
     ACTION_TYPE_LG_LIQUIDATE,
     ACTION_TYPE_LG_RELEASE,
@@ -116,6 +119,7 @@ from app.constants import (
     ACTION_TYPE_LG_CANCEL_LAST_INSTRUCTION,
     # New constants for audit log
     AUDIT_ACTION_TYPE_LG_INSTRUCTION_CANCELLATION_FAILED,
+    UserRole,
 )
 from app.core.ai_integration import generate_signed_gcs_url
 
@@ -3097,6 +3101,81 @@ async def change_lg_owner_api(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"An unexpected error occurred during direct change: {e}"
             )
+
+
+# --------------------------------------------------------------------------------------
+# 8. /lg-records/change-category (Single, Multiple, or All — Direct execution)
+# --------------------------------------------------------------------------------------
+@router.post(
+    "/lg-records/change-category",
+    response_model=Dict[str, Any],
+    dependencies=[Depends(HasPermission("lg_record:amend")), Depends(check_for_read_only_mode)],
+    summary="Change LG category for single, multiple, or all LG records directly (no approval workflow)"
+)
+async def change_lg_category_api(
+    change_in: LGRecordChangeCategory,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    """
+    Directly changes/migrates the category (and bidirectional extra field values)
+    for a single LG, multiple selected LGs, or all accessible LGs (optionally by source category).
+    Allowed across all LG statuses with full audit logging and no approval workflow.
+    """
+    fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    try:
+        result = await crud_lg_record.change_lg_category(
+            db,
+            change_in=change_in,
+            user_id=end_user_context.user_id,
+            customer_id=end_user_context.customer_id,
+            user_has_all_access=fresh_has_all_access,
+            user_allowed_entity_ids=fresh_entity_ids,
+        )
+        affected_count = result["affected_lgs_count"]
+        affected_numbers = result["affected_lg_numbers"]
+        single_rec = result.get("lg_record")
+        msg = (
+            f"LG category changed for LG '{affected_numbers[0]}'."
+            if change_in.change_scope == LGCategoryChangeScope.SINGLE and affected_numbers
+            else f"LG category changed for {affected_count} LG record(s)."
+        )
+        response_payload: Dict[str, Any] = {
+            "message": msg,
+            "affected_lgs_count": affected_count,
+            "affected_lg_ids": result["affected_lg_ids"],
+            "affected_lg_numbers": affected_numbers,
+        }
+        if single_rec is not None:
+            response_payload["lg_record"] = LGRecordOut.model_validate(single_rec)
+        return response_payload
+    except HTTPException as e:
+        log_action(
+            db,
+            user_id=end_user_context.user_id,
+            action_type="LG_CATEGORY_CHANGE_FAILED",
+            entity_type="LGRecord",
+            entity_id=change_in.lg_record_id,
+            details={"scope": change_in.change_scope.value, "reason": str(e.detail)},
+            customer_id=end_user_context.customer_id,
+            lg_record_id=change_in.lg_record_id if change_in.change_scope == LGCategoryChangeScope.SINGLE else None,
+        )
+        raise
+    except Exception as e:
+        log_action(
+            db,
+            user_id=end_user_context.user_id,
+            action_type="LG_CATEGORY_CHANGE_FAILED",
+            entity_type="LGRecord",
+            entity_id=change_in.lg_record_id,
+            details={"scope": change_in.change_scope.value, "reason": f"An unexpected error occurred: {e}"},
+            customer_id=end_user_context.customer_id,
+            lg_record_id=change_in.lg_record_id if change_in.change_scope == LGCategoryChangeScope.SINGLE else None,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred while changing LG category: {e}",
+        )
             
 def _collect_alternate_bank_names(lg_record: Optional[models.LGRecord]) -> List[str]:
     """Return advising/communication bank and foreign bank names for AI counterparty matching."""
@@ -4835,6 +4914,13 @@ def get_customer_configuration_for_end_user(
     
     if not config: # Handle case where global_config_crud.get_by_key might return None
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Configuration key '{config_key}' not found or accessible.")
+
+    key_str = config_key.value if hasattr(config_key, "value") else str(config_key)
+    if config.get("global_config_scope") != ConfigScope.CUSTOMER_CONFIGURABLE and not key_str.startswith("CBE_"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Configuration key '{key_str}' is not accessible to end users."
+        )
     
     # The crud function now returns a dict that matches CustomerConfigurationOut
     # We use **config to unpack the dictionary into keyword arguments for the Pydantic model
@@ -4966,21 +5052,60 @@ def get_lg_operational_statuses_for_end_user(
 @router.get("/lg-categories/", response_model=List[LGCategoryOut], dependencies=[Depends(check_subscription_status)])
 def get_lg_categories_for_end_user(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(HasPermission("lg_record:create")),
     end_user_context: TokenData = Depends(get_current_end_user_context),
     skip: int = 0,
     limit: int = 100
 ):
     """
     Retrieves a list of all active LG categories relevant to the authenticated End User's customer,
-    including Universal Categories (managed by the system) as default options.
+    including Universal Categories (managed by the system), with effective default flag and LG counts.
     """
-    # CRITICAL CHANGE: Use the new unified CRUD method that handles both customer and universal categories
+    allowed_perms = {"lg_record:view_own", "lg_record:create", "lg_record:amend", "corporate_category:view"}
+    if end_user_context.role != UserRole.SYSTEM_OWNER and not allowed_perms.intersection(set(end_user_context.permissions or [])):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough permissions to view LG categories.",
+        )
+
+    fresh_has_all_access, fresh_entity_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    fresh_entity_set = set(fresh_entity_ids or [])
+
     all_categories_from_db = crud_lg_category.get_all_for_customer(db, end_user_context.customer_id, skip=skip, limit=limit)
     
     all_categories = []
     customer = crud_customer.get(db, end_user_context.customer_id)
     customer_name = customer.name if customer else "Unknown Customer"
+    effective_default = crud_lg_category.get_effective_default_category(db, end_user_context.customer_id)
+    effective_default_id = effective_default.id if effective_default else None
+
+    customer_entities_query = db.query(models.CustomerEntity).filter(
+        models.CustomerEntity.customer_id == end_user_context.customer_id,
+        models.CustomerEntity.is_deleted == False,
+    )
+    if not fresh_has_all_access:
+        customer_entities_all = (
+            customer_entities_query.filter(models.CustomerEntity.id.in_(fresh_entity_ids)).all()
+            if fresh_entity_ids else []
+        )
+    else:
+        customer_entities_all = customer_entities_query.all()
+    entities_by_id = {e.id: CustomerEntityOut.model_validate(e) for e in customer_entities_all}
+
+    lg_counts_map: Dict[int, int] = {}
+    if fresh_has_all_access or fresh_entity_ids:
+        lg_counts_query = db.query(models.LGRecord.lg_category_id, func.count(models.LGRecord.id)).filter(
+            models.LGRecord.customer_id == end_user_context.customer_id,
+            models.LGRecord.is_deleted == False,
+        )
+        if not fresh_has_all_access:
+            lg_counts_query = lg_counts_query.filter(
+                models.LGRecord.beneficiary_corporate_id.in_(fresh_entity_ids)
+            )
+        lg_counts_map = {
+            cid: int(cnt)
+            for cid, cnt in lg_counts_query.group_by(models.LGRecord.lg_category_id).all()
+            if cid is not None
+        }
 
     for cat in all_categories_from_db:
         # Check if the user has access to this category's entities
@@ -4989,9 +5114,9 @@ def get_lg_categories_for_end_user(
             has_access = True
         else:
             category_entity_ids = {assoc.customer_entity_id for assoc in cat.entity_associations}
-            if end_user_context.has_all_entity_access or not end_user_context.entity_ids:
+            if fresh_has_all_access:
                 has_access = True
-            elif category_entity_ids.intersection(set(end_user_context.entity_ids)):
+            elif category_entity_ids.intersection(fresh_entity_set):
                 has_access = True
 
         if not has_access:
@@ -4999,30 +5124,17 @@ def get_lg_categories_for_end_user(
 
         entities_with_access_for_cat = []
         if cat.customer_id is not None and not cat.has_all_entity_access:
-            entity_ids_with_access = set(end_user_context.entity_ids).intersection(
-                {assoc.customer_entity.id for assoc in cat.entity_associations if assoc.customer_entity}
-            )
-            entities_with_access_for_cat = [
-                CustomerEntityOut.model_validate(db.query(models.CustomerEntity).get(entity_id))
-                for entity_id in entity_ids_with_access
-                if db.query(models.CustomerEntity).get(entity_id) is not None and not db.query(models.CustomerEntity).get(entity_id).is_deleted
-            ]
+            cat_ent_ids = {assoc.customer_entity_id for assoc in cat.entity_associations if assoc.customer_entity and not assoc.customer_entity.is_deleted}
+            allowed_cat_ids = cat_ent_ids if fresh_has_all_access else cat_ent_ids.intersection(fresh_entity_set)
+            entities_with_access_for_cat = [entities_by_id[eid] for eid in allowed_cat_ids if eid in entities_by_id]
         elif cat.customer_id is not None and cat.has_all_entity_access:
-             entities_with_access_for_cat = [
-                CustomerEntityOut.model_validate(entity)
-                for entity in db.query(models.CustomerEntity).filter(models.CustomerEntity.customer_id == end_user_context.customer_id, models.CustomerEntity.is_deleted == False).all()
-            ]
+            entities_with_access_for_cat = list(entities_by_id.values())
 
-        # CRITICAL FIX: Pass the ORM object directly to Pydantic's model_validate.
-        # We pass extra arguments as a dictionary to handle the computed fields.
-        category_out = LGCategoryOut.model_validate(
-            cat,
-            context={
-                'name': cat.name,
-                'customer_name': customer_name if cat.customer_id is not None else "System Default",
-                'entities_with_access': entities_with_access_for_cat
-            }
-        )
+        category_out = LGCategoryOut.model_validate(cat)
+        category_out.customer_name = customer_name if cat.customer_id is not None else "System Default"
+        category_out.entities_with_access = entities_with_access_for_cat
+        category_out.is_default = bool(effective_default_id is not None and cat.id == effective_default_id)
+        category_out.lg_count = int(lg_counts_map.get(cat.id, 0))
         all_categories.append(category_out)
 
     all_categories.sort(key=lambda x: (0 if x.customer_id is None else 1, x.name.lower()))

@@ -88,10 +88,32 @@ class AuthService:
     def __init__(self):
         pass # No explicit dependencies injected in init for this design, rely on late imports
 
-    async def _get_password_policy_config(self, db: Session) -> Dict[str, Any]:
-        """Fetches password policy settings from GlobalConfiguration."""
-        from app.crud.crud import crud_global_configuration # Late import
-        
+    def _resolve_effective_config_value(
+        self,
+        db: Session,
+        key_enum: GlobalConfigKey,
+        default_value: str,
+        customer_id: Optional[int] = None,
+    ) -> str:
+        """Resolves a config value using per-customer override if customer_id is given, falling back to global default."""
+        from app.crud.crud import crud_global_configuration, crud_customer_configuration
+        try:
+            if customer_id is not None:
+                cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+                    db, customer_id, key_enum
+                )
+                if cfg and cfg.get("effective_value") is not None:
+                    return str(cfg["effective_value"])
+            else:
+                config_value = crud_global_configuration.get_by_key(db, key_enum)
+                if config_value and config_value.value_default is not None:
+                    return str(config_value.value_default)
+        except Exception as e:
+            logger.warning(f"Error fetching policy config {key_enum} (customer_id={customer_id}): {e}")
+        return default_value
+
+    async def _get_password_policy_config(self, db: Session, customer_id: Optional[int] = None) -> Dict[str, Any]:
+        """Fetches password policy settings from CustomerConfiguration with fallback to GlobalConfiguration."""
         policy_config = {}
         for key_enum, default_value in [
             (GlobalConfigKey.PASSWORD_MIN_LENGTH, "8"),
@@ -100,36 +122,34 @@ class AuthService:
             (GlobalConfigKey.PASSWORD_REQUIRE_DIGIT, "true"),
             (GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES, "15")
         ]:
+            value = self._resolve_effective_config_value(db, key_enum, default_value, customer_id=customer_id)
             try:
-                config_value = crud_global_configuration.get_by_key(db, key_enum)
-                value = config_value.value_default if config_value and config_value.value_default is not None else default_value
-            except Exception as e:
-                logger.warning(f"Error fetching password policy config {key_enum}: {e}")
-                value = default_value
-            
-            if key_enum == GlobalConfigKey.PASSWORD_MIN_LENGTH:
-                policy_config[key_enum.value] = int(value)
-            elif key_enum == GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES:
-                policy_config[key_enum.value] = int(value)
-            else:
-                policy_config[key_enum.value] = str(value).lower() == 'true'
+                if key_enum == GlobalConfigKey.PASSWORD_MIN_LENGTH:
+                    policy_config[key_enum.value] = max(4, int(value))
+                elif key_enum == GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES:
+                    policy_config[key_enum.value] = max(1, int(value))
+                else:
+                    policy_config[key_enum.value] = str(value).strip().lower() == 'true'
+            except (ValueError, TypeError):
+                if key_enum == GlobalConfigKey.PASSWORD_MIN_LENGTH:
+                    policy_config[key_enum.value] = int(default_value)
+                elif key_enum == GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES:
+                    policy_config[key_enum.value] = int(default_value)
+                else:
+                    policy_config[key_enum.value] = default_value == 'true'
         return policy_config
 
-    async def _get_login_policy_config(self, db: Session) -> Dict[str, Any]:
-        """NEW: Fetches login policy settings from GlobalConfiguration."""
-        from app.crud.crud import crud_global_configuration
-        
+    async def _get_login_policy_config(self, db: Session, customer_id: Optional[int] = None) -> Dict[str, Any]:
+        """Fetches login policy settings from CustomerConfiguration with fallback to GlobalConfiguration."""
         policy_config = {}
         for key_enum, default_value in [
             (GlobalConfigKey.LOGIN_MAX_FAILED_ATTEMPTS, "5"),
             (GlobalConfigKey.LOGIN_LOCKOUT_DURATION_MINUTES, "15")
         ]:
+            value = self._resolve_effective_config_value(db, key_enum, default_value, customer_id=customer_id)
             try:
-                config_value = crud_global_configuration.get_by_key(db, key_enum)
-                value = config_value.value_default if config_value and config_value.value_default is not None else default_value
-                policy_config[key_enum.value] = int(value)
-            except Exception as e:
-                logger.warning(f"Error fetching login policy config {key_enum}: {e}")
+                policy_config[key_enum.value] = max(1, int(value))
+            except (ValueError, TypeError):
                 policy_config[key_enum.value] = int(default_value)
         return policy_config
 
@@ -156,9 +176,9 @@ class AuthService:
             "pp_version": pp_version,
         }
 
-    async def _validate_password_policy(self, password: str, db: Session) -> None:
-        """Validates a password against the configured policy."""
-        policy = await self._get_password_policy_config(db)
+    async def _validate_password_policy(self, password: str, db: Session, customer_id: Optional[int] = None) -> None:
+        """Validates a password against the configured policy (customer override or global default)."""
+        policy = await self._get_password_policy_config(db, customer_id=customer_id)
         
         min_length = policy.get(GlobalConfigKey.PASSWORD_MIN_LENGTH.value, 8)
         require_uppercase = policy.get(GlobalConfigKey.PASSWORD_REQUIRE_UPPERCASE.value, True)
@@ -311,7 +331,7 @@ class AuthService:
         # 4. Verify password
         if not verify_password(password, user.password_hash):
             user.failed_login_attempts += 1
-            login_policy = await self._get_login_policy_config(db)
+            login_policy = await self._get_login_policy_config(db, customer_id=user.customer_id)
             max_attempts = login_policy.get(GlobalConfigKey.LOGIN_MAX_FAILED_ATTEMPTS.value, 5)
             lockout_duration = login_policy.get(GlobalConfigKey.LOGIN_LOCKOUT_DURATION_MINUTES.value, 15)
 
@@ -481,8 +501,14 @@ class AuthService:
             )
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect current password.")
 
+        if verify_password(request_body.new_password, db_user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password must be different from your current password."
+            )
+
         # The password policy is now enforced here, using the business logic layer.
-        await self._validate_password_policy(request_body.new_password, db)
+        await self._validate_password_policy(request_body.new_password, db, customer_id=db_user.customer_id)
 
         # Update password using crud_user's internal logic or directly if no custom logic is there
         # We need to make sure crud_user.update_user handles the password hashing internally
@@ -541,7 +567,7 @@ class AuthService:
             return # Return success to prevent enumeration attacks
 
         # Get token expiry from config
-        policy_config = await self._get_password_policy_config(db)
+        policy_config = await self._get_password_policy_config(db, customer_id=user.customer_id)
         token_expiry_minutes = policy_config.get(GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES.value, 15)
 
         # Enforce 60-second cooldown so rapid re-requests do not invalidate an email link in flight
@@ -714,7 +740,7 @@ class AuthService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Associated user not found or inactive.")
 
         # The password policy is now enforced here, using the business logic layer.
-        await self._validate_password_policy(request_body.new_password, db)
+        await self._validate_password_policy(request_body.new_password, db, customer_id=user.customer_id)
 
         # Update user's password and mark token as used
         user.set_password(request_body.new_password)
@@ -821,7 +847,7 @@ class AuthService:
         # --- End Role Hierarchy Enforcement ---
 
         # The password policy is now enforced here, using the business logic layer.
-        await self._validate_password_policy(request_body.new_password, db)
+        await self._validate_password_policy(request_body.new_password, db, customer_id=db_target_user.customer_id)
 
         # Update password
         db_target_user.set_password(request_body.new_password)

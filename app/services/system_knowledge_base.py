@@ -119,18 +119,15 @@ Calculates a 0-100 score for each available bank facility when recommending opti
 - `REFERENCE_EXPIRY_REMINDER_DAYS` (Default: `30` days):
   * Reminder threshold before underlying commercial contracts/references expire.
 
---- GROUP 5: SECURITY, AUTHENTICATION & PLATFORM POLICIES ---
-- `PASSWORD_MIN_LENGTH` (Default: `8`)
-- `PASSWORD_REQUIRE_UPPERCASE` (Default: `true`)
-- `PASSWORD_REQUIRE_LOWERCASE` (Default: `true`)
-- `PASSWORD_REQUIRE_DIGIT` (Default: `true`)
-- `PASSWORD_RESET_TOKEN_EXPIRY_MINUTES` (Default: `15` min)
-- `GRACE_PERIOD_DAYS` (Default: `14` days)
-- `STORAGE_BUCKET_NAME` (Tenant-specific Cloud Storage Bucket):
+--- GROUP 5: ENTERPRISE CLOUD STORAGE & SYSTEM-OWNER SECURITY POLICIES ---
+- `STORAGE_BUCKET_NAME` (Tenant-specific Cloud Storage Bucket — Corporate Admin configurable):
   * Allows an enterprise organization to store all uploaded LG scans, amendment copies, and supporting documents in their own dedicated private Google Cloud Storage (GCS) bucket for full data residency and compliance.
-  * Configured via **Sidebar ➔ Configuration ➔ Settings (`/corporate-admin/module-configs`)** or by System Owner during customer onboarding.
+  * Configured via **Sidebar ➔ Configuration ➔ Settings (`/corporate-admin/module-configs`)** under **Enterprise Cloud Storage & General Settings** or by System Owner during customer onboarding.
   * In the cloud provider console (Bucket Permissions / IAM), grant the designated **Grow Platform Service Account Email** (obtainable from Grow Support / Onboarding Lead) the **`Storage Object Admin`** role.
-- `TC_VERSION` & `PP_VERSION` (Terms & Conditions, Privacy Policy versions)
+- Platform & Security Policies (Managed exclusively by the **System Owner** globally or per-customer, not editable by Corporate Admins):
+  * `PASSWORD_MIN_LENGTH` (Default: `8`), `PASSWORD_REQUIRE_UPPERCASE` (`true`), `PASSWORD_REQUIRE_LOWERCASE` (`true`), `PASSWORD_REQUIRE_DIGIT` (`true`), `PASSWORD_RESET_TOKEN_EXPIRY_MINUTES` (`15` min)
+  * `LOGIN_MAX_FAILED_ATTEMPTS` (`5`), `LOGIN_LOCKOUT_DURATION_MINUTES` (`15` min), `OTP_MAX_FAILED_ATTEMPTS` (`5`), `OTP_LOCKOUT_DURATION_MINUTES` (`15` min)
+  * `GRACE_PERIOD_DAYS` (`30` days), `TC_VERSION` & `PP_VERSION` (Terms & Conditions, Privacy Policy versions)
 
 4. LG CUSTODY LIFECYCLE ACTIONS & WORKFLOWS
 Available from LG Details page -> Actions Menu:

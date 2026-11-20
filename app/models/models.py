@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 from app.database import Base
-from app.constants import UserRole, GlobalConfigKey, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus, AdvisingStatus
+from app.constants import UserRole, GlobalConfigKey, ConfigScope, get_default_config_scope, ApprovalRequestStatusEnum, LgStatusEnum, LgTypeEnum, LgOperationalStatusEnum, DOCUMENT_TYPE_ORIGINAL_LG, SubscriptionStatus, AdvisingStatus
 from app.schemas.migration_schemas import MigrationRecordStatusEnum, MigrationTypeEnum
 from datetime import datetime
 
@@ -103,7 +103,9 @@ class Customer(BaseModel):
     subscription_plan = relationship("SubscriptionPlan", back_populates="customers")
     entities = relationship("CustomerEntity", back_populates="customer", cascade="all, delete-orphan")
     users = relationship("User", back_populates="customer", cascade="all, delete-orphan")
-    lg_categories = relationship("LGCategory", back_populates="customer", cascade="all, delete-orphan")
+    lg_categories = relationship("LGCategory", back_populates="customer", foreign_keys="LGCategory.customer_id", cascade="all, delete-orphan")
+    default_lg_category_id = Column(Integer, ForeignKey("lg_categories.id", ondelete="SET NULL"), nullable=True, comment="Customer-level default LG Category (customer-specific or universal)")
+    default_lg_category = relationship("LGCategory", foreign_keys=[default_lg_category_id], post_update=True)
     internal_owner_contacts = relationship("InternalOwnerContact", back_populates="customer", cascade="all, delete-orphan")
     customer_configurations = relationship("CustomerConfiguration", back_populates="customer", cascade="all, delete-orphan")
     customer_email_settings = relationship("CustomerEmailSetting", back_populates="customer", uselist=False, cascade="all, delete-orphan")
@@ -251,12 +253,24 @@ class GlobalConfiguration(BaseModel):
     unit = Column(String, nullable=True, comment="Unit of the setting (e.g., 'days', 'percentage', 'boolean')")
     description = Column(String, nullable=True, comment="Description of the configuration setting")
     module_tags = Column(JSONB, nullable=True, comment="Module tags: null=system, e.g. ['custody'], ['issuance'], ['custody','issuance']")
+    config_scope = Column(
+        String(40),
+        nullable=False,
+        server_default="CUSTOMER_CONFIGURABLE",
+        comment="Ownership scope: PLATFORM_GLOBAL, SYSTEM_CUSTOMER_OVERRIDE, or CUSTOMER_CONFIGURABLE",
+    )
 
     customer_configurations = relationship("CustomerConfiguration", back_populates="global_configuration")
 
+    def __init__(self, **kwargs):
+        if kwargs.get("config_scope") is None:
+            kwargs["config_scope"] = get_default_config_scope(kwargs.get("key")).value
+        elif hasattr(kwargs["config_scope"], "value"):
+            kwargs["config_scope"] = kwargs["config_scope"].value
+        super().__init__(**kwargs)
 
     def __repr__(self: GlobalConfiguration):
-        return f"<GlobalConfiguration(id={self.id}, key='{self.key}')>"
+        return f"<GlobalConfiguration(id={self.id}, key='{self.key}', scope='{self.config_scope}')>"
 
 class CustomerConfiguration(BaseModel):
     __tablename__ = "customer_configurations"
@@ -406,7 +420,7 @@ class LGCategory(BaseModel):
     
     # CRITICAL CHANGE: customer_id is now nullable. NULL means it is a universal category.
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, comment="The ID of the customer. NULL for universal categories.")
-    customer = relationship("Customer", back_populates="lg_categories")
+    customer = relationship("Customer", back_populates="lg_categories", foreign_keys=[customer_id])
     
     # NEW FIELD: to mark a category as the default for its scope (global or customer-specific)
     is_default = Column(Boolean, default=False, nullable=False, comment="Whether this is the default category for its scope (global or customer-specific).")

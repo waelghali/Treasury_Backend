@@ -119,6 +119,62 @@ class GlobalConfigKey(str, Enum):
     WEEKEND_DAYS_SCHEME = "WEEKEND_DAYS_SCHEME"
     DEFAULT_CALENDAR_COUNTRY = "DEFAULT_CALENDAR_COUNTRY"
 
+
+class ConfigScope(str, Enum):
+    """
+    Identifies who owns and can view/override a GlobalConfiguration key.
+    - PLATFORM_GLOBAL: System Owner only, platform-wide (never per-customer).
+    - SYSTEM_CUSTOMER_OVERRIDE: System Owner only, global default + optional per-customer override.
+    - CUSTOMER_CONFIGURABLE: System Owner sets bounds/default; Corporate Admin configures within bounds.
+    """
+    PLATFORM_GLOBAL = "PLATFORM_GLOBAL"
+    SYSTEM_CUSTOMER_OVERRIDE = "SYSTEM_CUSTOMER_OVERRIDE"
+    CUSTOMER_CONFIGURABLE = "CUSTOMER_CONFIGURABLE"
+
+
+PLATFORM_GLOBAL_CONFIG_KEYS = {
+    GlobalConfigKey.TC_VERSION,
+    GlobalConfigKey.PP_VERSION,
+    GlobalConfigKey.WEEKEND_DAYS_SCHEME,
+    GlobalConfigKey.DEFAULT_CALENDAR_COUNTRY,
+    GlobalConfigKey.INBOX_POLL_INTERVAL_MINUTES,
+    GlobalConfigKey.INBOX_GENERIC_DOMAIN_BLACKLIST,
+    GlobalConfigKey.CBE_OVERNIGHT_LENDING_RATE,
+    GlobalConfigKey.CBE_OVERNIGHT_DEPOSIT_RATE,
+    GlobalConfigKey.CBE_MID_CORRIDOR_RATE,
+    GlobalConfigKey.TEMP_DOC_TEST,
+}
+
+SYSTEM_CUSTOMER_OVERRIDE_CONFIG_KEYS = {
+    GlobalConfigKey.PASSWORD_MIN_LENGTH,
+    GlobalConfigKey.PASSWORD_REQUIRE_UPPERCASE,
+    GlobalConfigKey.PASSWORD_REQUIRE_LOWERCASE,
+    GlobalConfigKey.PASSWORD_REQUIRE_DIGIT,
+    GlobalConfigKey.PASSWORD_RESET_TOKEN_EXPIRY_MINUTES,
+    GlobalConfigKey.LOGIN_MAX_FAILED_ATTEMPTS,
+    GlobalConfigKey.LOGIN_LOCKOUT_DURATION_MINUTES,
+    GlobalConfigKey.OTP_MAX_FAILED_ATTEMPTS,
+    GlobalConfigKey.OTP_LOCKOUT_DURATION_MINUTES,
+    GlobalConfigKey.PUBLIC_ISSUANCE_SESSION_EXPIRY_MINUTES,
+    GlobalConfigKey.INVITE_LINK_EXPIRY_HOURS,
+    GlobalConfigKey.GRACE_PERIOD_DAYS,
+}
+
+
+def get_default_config_scope(key) -> ConfigScope:
+    """Returns the canonical ConfigScope for a GlobalConfigKey or key string."""
+    if key is None:
+        return ConfigScope.CUSTOMER_CONFIGURABLE
+    try:
+        key_enum = key if isinstance(key, GlobalConfigKey) else GlobalConfigKey(str(key).upper())
+    except ValueError:
+        return ConfigScope.CUSTOMER_CONFIGURABLE
+    if key_enum in PLATFORM_GLOBAL_CONFIG_KEYS:
+        return ConfigScope.PLATFORM_GLOBAL
+    if key_enum in SYSTEM_CUSTOMER_OVERRIDE_CONFIG_KEYS:
+        return ConfigScope.SYSTEM_CUSTOMER_OVERRIDE
+    return ConfigScope.CUSTOMER_CONFIGURABLE
+
 # NEW: Defines the types of subscription-related email notifications.
 class SubscriptionNotificationType(str, Enum):
     RENEWAL_REMINDER_30_DAYS = "SUBSCRIPTION_RENEWAL_REMINDER_30_DAYS"
@@ -270,6 +326,10 @@ AUDIT_ACTION_TYPE_LG_OWNER_DETAILS_UPDATED = "LG_OWNER_DETAILS_UPDATED"
 AUDIT_ACTION_TYPE_LG_SINGLE_OWNER_CHANGED = "LG_SINGLE_OWNER_CHANGED"
 AUDIT_ACTION_TYPE_LG_BULK_OWNER_CHANGED = "LG_BULK_OWNER_CHANGED"
 
+# Audit Actions for Category Change / Migration
+AUDIT_ACTION_TYPE_LG_SINGLE_CATEGORY_CHANGED = "LG_SINGLE_CATEGORY_CHANGED"
+AUDIT_ACTION_TYPE_LG_BULK_CATEGORY_CHANGED = "LG_BULK_CATEGORY_CHANGED"
+
 # NEW Audit Actions for Instruction Delivery/Reply and Reminders
 AUDIT_ACTION_TYPE_LG_INSTRUCTION_DELIVERED = "LG_INSTRUCTION_DELIVERED"
 AUDIT_ACTION_TYPE_LG_BANK_REPLY_RECORDED = "LG_BANK_REPLY_RECORDED"
@@ -303,6 +363,7 @@ AUDIT_ACTION_TYPE_PASSWORD_RESET_COMPLETED = "PASSWORD_RESET_COMPLETED"
 AUDIT_ACTION_TYPE_PASSWORD_RESET_FAILED = "PASSWORD_RESET_FAILED"
 AUDIT_ACTION_TYPE_ADMIN_PASSWORD_SET = "ADMIN_PASSWORD_SET"
 AUDIT_ACTION_TYPE_ADMIN_PASSWORD_RESET = "ADMIN_PASSWORD_RESET"
+AUDIT_ACTION_TYPE_EMERGENCY_PASSWORD_RESET = "EMERGENCY_FORCE_PASSWORD_CHANGE"
 
 # NEW Audit actions for instruction cancellation
 AUDIT_ACTION_TYPE_LG_INSTRUCTION_CANCELED = "LG_INSTRUCTION_CANCELED"

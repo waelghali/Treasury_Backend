@@ -2165,7 +2165,7 @@ class AIQueryAssistantService:
                 f"   - Assign the role **`Storage Object Admin`** (allows uploading, OCR scanning, and secure viewing of LG documents).\n\n"
                 f"3. **Link the Bucket in Grow**:\n"
                 f"   - Navigate to **Sidebar ➔ Configuration ➔ Settings** (`{nav_base}/module-configs`).\n"
-                f"   - Locate **Group 5: Security, Authentication & Platform Policies**.\n"
+                f"   - Locate **Enterprise Cloud Storage & General Settings**.\n"
                 f"   - Enter your bucket name in **`STORAGE_BUCKET_NAME`**.\n"
                 f"   - Click **Save Changes** at the bottom of the page.{role_note}\n\n"
                 f"👉 [Open Platform Settings]({nav_base}/module-configs)"

@@ -2,7 +2,7 @@
 import logging
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response, Query
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
@@ -309,10 +309,64 @@ async def accept_policies(
         )
 
 
+@router.get("/password-policy", status_code=status.HTTP_200_OK)
+async def get_password_policy(
+    reset_token: Optional[str] = Query(None),
+    token: Optional[str] = Depends(security.oauth2_scheme),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns the effective password policy (customer-specific override if known, else global default)
+    for dynamic UI hints and validation on password reset / forced change pages.
+    """
+    from app.models import User, PasswordResetToken
+    from app.core.hashing import verify_password
+    from sqlalchemy.sql import func
+
+    customer_id: Optional[int] = None
+    if token:
+        try:
+            payload = security.jwt.decode(
+                token, security.SECRET_KEY, algorithms=[security.ALGORITHM]
+            )
+            customer_id = payload.get("customer_id")
+            if customer_id is None and payload.get("user_id"):
+                u = db.query(User.customer_id).filter(User.id == payload["user_id"]).first()
+                if u:
+                    customer_id = u[0]
+        except Exception:
+            pass
+    elif reset_token:
+        try:
+            valid_tokens = db.query(PasswordResetToken).filter(
+                PasswordResetToken.is_used == False,
+                PasswordResetToken.expires_at > func.now(),
+            ).all()
+            for token_rec in valid_tokens:
+                if verify_password(reset_token, token_rec.token_hash):
+                    u = db.query(User.customer_id).filter(
+                        User.id == token_rec.user_id,
+                        User.is_deleted == False,
+                    ).first()
+                    if u:
+                        customer_id = u[0]
+                    break
+        except Exception:
+            pass
+
+    policy = await auth_service._get_password_policy_config(db, customer_id=customer_id)
+    return {
+        "min_length": policy.get("PASSWORD_MIN_LENGTH", 8),
+        "require_uppercase": policy.get("PASSWORD_REQUIRE_UPPERCASE", True),
+        "require_lowercase": policy.get("PASSWORD_REQUIRE_LOWERCASE", True),
+        "require_digit": policy.get("PASSWORD_REQUIRE_DIGIT", True),
+    }
+
+
 @router.post("/refresh-token", response_model=Token)
 async def refresh_token(
     db: Session = Depends(get_db),
-    current_user: security.TokenData = Depends(security.get_current_active_user)
+    current_user: security.TokenData = Depends(security.get_current_user)
 ):
     """
     Generates a fresh JWT for an already MFA-verified active user,

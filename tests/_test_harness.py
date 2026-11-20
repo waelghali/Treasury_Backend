@@ -762,6 +762,7 @@ def purge_test_customers_by_ids(
         "DELETE FROM lg_records WHERE customer_id = ANY(:cids)",
         "DELETE FROM internal_owner_contacts WHERE customer_id = ANY(:cids)",
         "DELETE FROM lg_category_customer_entity_association WHERE lg_category_id IN (SELECT id FROM lg_categories WHERE customer_id = ANY(:cids)) OR customer_entity_id IN (SELECT id FROM customer_entities WHERE customer_id = ANY(:cids))",
+        "UPDATE customers SET default_lg_category_id = NULL WHERE id = ANY(:cids)",
         "DELETE FROM lg_categories WHERE customer_id = ANY(:cids)",
         "DELETE FROM admin_change_requests WHERE customer_id = ANY(:cids)",
         "DELETE FROM customer_configurations WHERE customer_id = ANY(:cids)",

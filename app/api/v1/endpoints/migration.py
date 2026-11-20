@@ -686,12 +686,11 @@ def _apply_defaults_and_autofill(db: Session, record_data: Dict[str, Any], custo
         record_data["lg_category_id"] = resolved_category.id
         logger.debug(f"Autofilled lg_category_id from input '{lg_category_input}' to: {resolved_category.id}")
     else:
-        # Fallback to the default universal/customer category or first available active category
+        # Fallback to the effective default category (customer default > universal default) or first active category
         default_category = (
-            crud_lg_category.get_default_category(db, None)
-            or crud_lg_category.get_default_category(db, customer_id)
-            or db.query(models.LGCategory).filter(models.LGCategory.customer_id.is_(None), models.LGCategory.is_deleted == False).order_by(models.LGCategory.id.asc()).first()
+            crud_lg_category.get_effective_default_category(db, customer_id)
             or db.query(models.LGCategory).filter(models.LGCategory.customer_id == customer_id, models.LGCategory.is_deleted == False).order_by(models.LGCategory.id.asc()).first()
+            or db.query(models.LGCategory).filter(models.LGCategory.customer_id.is_(None), models.LGCategory.is_deleted == False).order_by(models.LGCategory.id.asc()).first()
         )
         if default_category:
             record_data["lg_category_id"] = default_category.id
