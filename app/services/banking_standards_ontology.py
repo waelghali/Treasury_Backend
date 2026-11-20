@@ -480,16 +480,27 @@ class BankingStandardsOntology:
         return bool(re.search(r':20:|(?::60[FM]:)|(?::61:)', sample))
 
     def is_camt053_content(self, content: bytes) -> bool:
-        sample = content[:4096].decode("utf-8", errors="ignore")
-        return any(
+        if not content:
+            return False
+        sample_bytes = content[:4096]
+        if sample_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+            even_len = len(sample_bytes) - (len(sample_bytes) % 2)
+            sample = sample_bytes[:even_len].decode("utf-16", errors="ignore")
+        else:
+            sample = sample_bytes.decode("utf-8", errors="ignore")
+        if any(
             marker in sample
             for marker in (
-                "<BkToCstmrStmt",
                 "urn:iso:std:iso:20022:tech:xsd:camt.053",
-                "<BkToCstmrAcctRpt",
                 "urn:iso:std:iso:20022:tech:xsd:camt.052",
-                "<BkToCstmrDbtCdtNtfctn",
                 "urn:iso:std:iso:20022:tech:xsd:camt.054",
+            )
+        ):
+            return True
+        return bool(
+            re.search(
+                r"<(?:[A-Za-z0-9_.-]+:)?BkToCstmr(?:Stmt|AcctRpt|DbtCdtNtfctn)\b",
+                sample,
             )
         )
 
@@ -665,9 +676,27 @@ class BankingStandardsOntology:
         Indicator, ISO `<BkTxCd>`, Counterparties, and Remittance Info.
         """
         try:
-            root = SafeET.fromstring(content)
+            root = SafeET.fromstring(content, forbid_dtd=True)
         except (DefusedXmlException, XMLParseError) as exc:
             raise ValueError(f"Invalid or unsafe XML bank statement file: {exc}") from exc
+
+        def _parse_decimal(raw: Optional[str], field_label: str) -> Optional[Decimal]:
+            cleaned = (raw or "").strip()
+            if not cleaned:
+                return None
+            try:
+                return Decimal(cleaned)
+            except InvalidOperation as exc:
+                raise ValueError(f"Invalid decimal value for {field_label}: {cleaned!r}") from exc
+
+        def _parse_iso_dt(raw: Optional[str]) -> Optional[datetime]:
+            cleaned = (raw or "").strip()
+            if not cleaned:
+                return None
+            try:
+                return datetime.fromisoformat(cleaned[:10])
+            except ValueError:
+                return None
 
         # Strip XML namespaces for universal camt.052 / camt.053 / camt.054 compatibility
         for elem in root.iter():
@@ -700,91 +729,128 @@ class BankingStandardsOntology:
         if not containers:
             return [], metadata
 
+        primary_acct: Optional[str] = None
+        seen_accounts: List[str] = []
         has_currency = False
         has_opening_bal = False
         has_closing_bal = False
+        cre_dt_fallback: Optional[datetime] = None
+        primary_running_bal = Decimal("0.00")
+        transactions: List[Dict[str, Any]] = []
+
+        grp_cre_dt = _parse_iso_dt(root.findtext(".//GrpHdr/CreDtTm"))
 
         for container in containers:
-            if not metadata["account_number"]:
-                iban_text = container.findtext(".//Acct/Id/IBAN") or container.findtext(".//Acct/Id/Othr/Id")
-                if iban_text:
-                    metadata["account_number"] = iban_text.strip()
+            container_acct_raw = (
+                container.findtext("./Acct/Id/IBAN")
+                or container.findtext("./Acct/Id/Othr/Id")
+                or container.findtext(".//Acct/Id/IBAN")
+                or container.findtext(".//Acct/Id/Othr/Id")
+            )
+            container_acct = (container_acct_raw or "").strip() or None
+            if container_acct:
+                if primary_acct is None:
+                    primary_acct = container_acct
+                    metadata["account_number"] = container_acct
+                if container_acct not in seen_accounts:
+                    seen_accounts.append(container_acct)
 
-            if not has_currency:
-                ccy_text = container.findtext(".//Acct/Ccy")
-                if ccy_text:
-                    metadata["currency"] = ccy_text.strip()
-                    has_currency = True
+            container_ccy_raw = container.findtext("./Acct/Ccy") or container.findtext(".//Acct/Ccy")
+            container_ccy = (container_ccy_raw or "").strip() or None
+            if container_ccy and not has_currency:
+                metadata["currency"] = container_ccy
+                has_currency = True
 
-            if metadata["start_date"] is None:
-                cre_dt_text = container.findtext("./CreDtTm") or container.findtext(".//CreDtTm")
-                if cre_dt_text:
-                    try:
-                        metadata["start_date"] = datetime.fromisoformat(cre_dt_text[:10])
-                    except Exception:
-                        pass
+            container_cre_dt = _parse_iso_dt(container.findtext("./CreDtTm") or container.findtext(".//CreDtTm")) or grp_cre_dt
+            if cre_dt_fallback is None and container_cre_dt is not None:
+                cre_dt_fallback = container_cre_dt
+
+            is_primary_container = (not primary_acct) or (not container_acct) or (container_acct == primary_acct)
+
+            container_has_open = False
+            container_open_bal = Decimal("0.00")
 
             for bal in container.findall(".//Bal"):
-                code = (bal.findtext(".//Tp/CdOrPrtry/Cd") or "").strip()
+                code = (bal.findtext(".//Tp/CdOrPrtry/Cd") or "").strip().upper()
                 amt_text = bal.findtext(".//Amt")
-                cdt_dbt = bal.findtext(".//CdtDbtInd")
+                cdt_dbt = (bal.findtext(".//CdtDbtInd") or "").strip().upper()
                 dt_text = bal.findtext(".//Dt/Dt") or bal.findtext(".//Dt/DtTm")
-                if code and amt_text:
-                    val = Decimal(amt_text.strip())
+                val = _parse_decimal(amt_text, f"Bal/{code or 'UNKNOWN'}/Amt")
+                if code and val is not None:
                     if cdt_dbt == "DBIT":
                         val = -val
-                    if code in ("OPBD", "PRCD", "ITOP") and not has_opening_bal:
-                        has_opening_bal = True
-                        metadata["opening_balance"] = val
-                        if dt_text:
-                            try:
-                                metadata["start_date"] = datetime.fromisoformat(dt_text[:10])
-                            except Exception:
-                                pass
+                    bal_dt = _parse_iso_dt(dt_text)
+                    if code in ("OPBD", "PRCD", "ITOP") and not container_has_open:
+                        container_has_open = True
+                        container_open_bal = val
+                        if is_primary_container and not has_opening_bal:
+                            has_opening_bal = True
+                            metadata["opening_balance"] = val
+                            if bal_dt is not None:
+                                metadata["start_date"] = bal_dt
                     elif code in ("CLBD", "ITBD"):
-                        has_closing_bal = True
-                        metadata["closing_balance"] = val
-                        if dt_text:
-                            try:
-                                metadata["end_date"] = datetime.fromisoformat(dt_text[:10])
-                            except Exception:
-                                pass
+                        if is_primary_container:
+                            has_closing_bal = True
+                            metadata["closing_balance"] = val
+                            if bal_dt is not None:
+                                metadata["end_date"] = bal_dt
 
-        transactions: List[Dict[str, Any]] = []
-        running_bal = metadata["opening_balance"] or Decimal("0.00")
+            container_running_bal = (
+                container_open_bal
+                if container_has_open
+                else (primary_running_bal if is_primary_container else Decimal("0.00"))
+            )
 
-        for container in containers:
             for ntry in container.findall(".//Ntry"):
                 amt_el = ntry.find("./Amt")
-                if amt_el is None or not amt_el.text:
+                if amt_el is None or not (amt_el.text or "").strip():
                     continue
-                amt = Decimal(amt_el.text.strip()).quantize(Decimal("1.00"))
-                ccy = amt_el.attrib.get("Ccy") or metadata["currency"]
-                is_credit = (ntry.findtext("./CdtDbtInd") == "CRDT")
-                is_reversal = (str(ntry.findtext("./RvslInd") or "").lower() == "true")
+                parsed_amt = _parse_decimal(amt_el.text, "Ntry/Amt")
+                if parsed_amt is None:
+                    continue
+                amt = parsed_amt.quantize(Decimal("1.00"))
+                ccy = (amt_el.attrib.get("Ccy") or container_ccy or metadata["currency"]).strip()
+                is_credit = (ntry.findtext("./CdtDbtInd") or "").strip().upper() == "CRDT"
+                is_reversal = (ntry.findtext("./RvslInd") or "").strip().lower() == "true"
 
                 book_text = ntry.findtext("./BookgDt/Dt") or ntry.findtext("./BookgDt/DtTm")
                 val_text = ntry.findtext("./ValDt/Dt") or ntry.findtext("./ValDt/DtTm")
-                booking_dt = datetime.fromisoformat(book_text[:10]) if book_text else (metadata["start_date"] or datetime.utcnow())
-                value_dt = datetime.fromisoformat(val_text[:10]) if val_text else booking_dt
+                booking_dt = _parse_iso_dt(book_text) or container_cre_dt or cre_dt_fallback or datetime.utcnow()
+                value_dt = _parse_iso_dt(val_text) or booking_dt
 
-                domn = ntry.findtext(".//BkTxCd/Domn/Cd") or ""
-                fmly = ntry.findtext(".//BkTxCd/Domn/Fmly/Cd") or ""
-                subfmly = ntry.findtext(".//BkTxCd/Domn/Fmly/SubFmlyCd") or ""
+                domn = (ntry.findtext(".//BkTxCd/Domn/Cd") or "").strip()
+                fmly = (ntry.findtext(".//BkTxCd/Domn/Fmly/Cd") or "").strip()
+                subfmly = (ntry.findtext(".//BkTxCd/Domn/Fmly/SubFmlyCd") or "").strip()
                 iso_code = f"{domn}-{fmly}" if (domn and fmly) else ""
 
-                e2e_id = ntry.findtext(".//NtryDtls/TxDtls/Refs/EndToEndId")
-                acct_svcr_ref = ntry.findtext("./AcctSvcrRef") or ntry.findtext(".//NtryDtls/TxDtls/Refs/AcctSvcrRef")
-                ustrd = ntry.findtext(".//NtryDtls/TxDtls/RmtInf/Ustrd") or ntry.findtext("./AddtlNtryInf") or ""
+                e2e_id = (ntry.findtext(".//NtryDtls/TxDtls/Refs/EndToEndId") or "").strip() or None
+                acct_svcr_ref = (
+                    ntry.findtext("./AcctSvcrRef")
+                    or ntry.findtext(".//NtryDtls/TxDtls/Refs/AcctSvcrRef")
+                    or ""
+                ).strip() or None
+                ustrd = (
+                    ntry.findtext(".//NtryDtls/TxDtls/RmtInf/Ustrd")
+                    or ntry.findtext("./AddtlNtryInf")
+                    or ""
+                ).strip()
 
                 if is_credit:
-                    cp_name = ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Dbtr/Nm")
+                    cp_name = (
+                        ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Dbtr/Nm")
+                        or ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Dbtr/Pty/Nm")
+                        or ""
+                    ).strip() or None
                     credit, debit, signed, direction = amt, Decimal("0.00"), amt, "CREDIT"
                 else:
-                    cp_name = ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Cdtr/Nm")
+                    cp_name = (
+                        ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Cdtr/Nm")
+                        or ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Cdtr/Pty/Nm")
+                        or ""
+                    ).strip() or None
                     debit, credit, signed, direction = amt, Decimal("0.00"), -amt, "DEBIT"
 
-                running_bal += signed
+                container_running_bal += signed
                 raw_desc = f"[{iso_code}-{subfmly}] {ustrd} {cp_name or ''}".strip(" -[]")
                 std_info = self.decode_narrative_standards(raw_desc, direction=direction, amount=amt)
                 cls_info = std_info.get("classification")
@@ -803,8 +869,8 @@ class BankingStandardsOntology:
                     "credit_amount": credit,
                     "raw_description": raw_desc or f"{label_prefix} {iso_code}".strip(),
                     "currency": ccy,
-                    "running_balance": running_bal,
-                    "account_number": metadata["account_number"],
+                    "running_balance": container_running_bal,
+                    "account_number": container_acct or metadata["account_number"],
                     "e2e_id": e2e_id if e2e_id not in ("NOTPROVIDED", None) else std_info.get("extracted_e2e_ref"),
                     "back_office_ref": acct_svcr_ref,
                     "counterparty_name": cp_name or std_info.get("extracted_counterparty"),
@@ -827,13 +893,29 @@ class BankingStandardsOntology:
 
                 transactions.append(txn)
 
-        if transactions:
+            if is_primary_container:
+                primary_running_bal = container_running_bal
+
+        if len(seen_accounts) > 1:
+            metadata["continuity_warnings"].append(
+                f"Multi-account CAMT file detected ({len(seen_accounts)} accounts); statement summary metadata reflects primary account {primary_acct}."
+            )
+            metadata["detected_mapping"]["multi_account_count"] = len(seen_accounts)
+
+        primary_txns = [
+            t for t in transactions
+            if (not primary_acct) or (t.get("account_number") == primary_acct)
+        ] or transactions
+
+        if primary_txns:
             if not metadata["start_date"]:
-                metadata["start_date"] = min(t["booking_date"] for t in transactions)
+                metadata["start_date"] = min(t["booking_date"] for t in primary_txns)
             if not metadata["end_date"]:
-                metadata["end_date"] = max(t["booking_date"] for t in transactions)
+                metadata["end_date"] = max(t["booking_date"] for t in primary_txns)
             if not has_closing_bal:
-                metadata["closing_balance"] = running_bal
+                metadata["closing_balance"] = primary_running_bal
+        elif not metadata["start_date"] and cre_dt_fallback is not None:
+            metadata["start_date"] = cre_dt_fallback
 
         return transactions, metadata
 

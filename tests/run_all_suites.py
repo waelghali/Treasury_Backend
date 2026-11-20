@@ -78,12 +78,16 @@ def run_suite_subprocess(label: str, script_path: str, verbose: bool = False) ->
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = REPO_ROOT
+    env["NONINTERACTIVE"] = "1"
+    env["RUN_STRESS_BENCHMARK"] = "0"
+    env["PRESERVE_TEST_DATA"] = "0"
 
     t0 = time.perf_counter()
     proc = subprocess.Popen(
         [sys.executable, script_path],
         cwd=REPO_ROOT,
         env=env,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

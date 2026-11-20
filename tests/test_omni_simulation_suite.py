@@ -486,7 +486,7 @@ def run_omni_simulation_suite():
     is_full_stress: bool = False
     if "--stress" in sys.argv or os.getenv("RUN_STRESS_BENCHMARK", "").strip().lower() in ("1", "true", "yes"):
         is_full_stress = True
-    elif "--fast" in sys.argv:
+    elif "--fast" in sys.argv or os.getenv("NONINTERACTIVE") == "1":
         is_full_stress = False
     elif hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
         try:
@@ -2117,7 +2117,7 @@ def run_omni_simulation_suite():
         preserve_data = False
         if "--preserve" in sys.argv or os.getenv("PRESERVE_TEST_DATA", "").strip().lower() in ("1", "true", "yes"):
             preserve_data = True
-        elif "--clean" in sys.argv:
+        elif "--clean" in sys.argv or os.getenv("NONINTERACTIVE") == "1":
             preserve_data = False
         elif hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
             try:

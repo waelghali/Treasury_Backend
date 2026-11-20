@@ -504,9 +504,25 @@ class CRUDLGInstruction(CRUDBase):
 
         result_tuples = final_query.order_by(self.model.instruction_date).all()
 
+        orig_id_strs = [str(inst_obj.id) for inst_obj, _ in result_tuples if inst_obj and inst_obj.id is not None]
+        reminder_by_orig_id = {}
+        if orig_id_strs:
+            reminder_rows = db.query(models.LGInstruction).filter(
+                models.LGInstruction.instruction_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
+                models.LGInstruction.is_deleted == False,
+                models.LGInstruction.details['original_instruction_id'].astext.in_(orig_id_strs),
+            ).order_by(models.LGInstruction.instruction_date.desc(), models.LGInstruction.id.desc()).all()
+            for rem in reminder_rows:
+                orig_key = str((rem.details or {}).get('original_instruction_id', ''))
+                if orig_key and orig_key not in reminder_by_orig_id:
+                    reminder_by_orig_id[orig_key] = rem
+
         instructions_with_flags = []
         for instruction_obj, has_reminder_sent_flag in result_tuples:
-            instruction_obj.has_reminder_sent = has_reminder_sent_flag
+            rem_obj = reminder_by_orig_id.get(str(instruction_obj.id))
+            instruction_obj.has_reminder_sent = bool(has_reminder_sent_flag or rem_obj is not None)
+            instruction_obj.reminder_instruction_id = rem_obj.id if rem_obj else None
+            instruction_obj.reminder_sent_at = (rem_obj.instruction_date or rem_obj.created_at) if rem_obj else None
             instructions_with_flags.append(instruction_obj)
 
         logger.debug(f"[CRUDLGInstruction.get_instructions_for_bank_reminders] Found {len(instructions_with_flags)} instructions meeting reminder criteria for customer {customer_id}.")
@@ -586,64 +602,18 @@ class CRUDLGInstruction(CRUDBase):
         
         instruction_type_code = InstructionTypeCode.REM
         sub_instruction_code = SubInstructionCode.BANK_REMINDER
-        
-        reminder_serial_number, global_seq_val, type_seq_val = await self.get_next_serial_number(
-            db,
-            lg_record_id=lg_record.id,
-            entity_code=beneficiary_entity_code,
-            lg_category_code=lg_category_code,
-            lg_sequence_number=lg_sequence_number_str,
-            instruction_type_code=instruction_type_code,
-            sub_instruction_code=sub_instruction_code
-        )
-        
+
         # Determine the correct recipient using the helper from crud_lg_record
         from app.crud.crud import crud_lg_record
+        from app.core.document_generator import escape_html_placeholder
+        from app.core.instruction_verification import (
+            register_instruction_for_verification,
+            attach_verification_marker,
+        )
+
         recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record)
 
-        # Get entity and customer details with fallback
-        customer = lg_record.customer
-        entity = lg_record.beneficiary_corporate
-        customer_address = entity.address if entity.address else customer.address
-        customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
-
-        template_data = {
-            "lg_number": lg_record.lg_number,
-            "lg_serial_number": lg_record.lg_number,
-            "lg_amount": float(lg_record.lg_amount),
-            "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
-            "lg_currency": lg_record.lg_currency.iso_code,
-            "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record),
-            "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-            "customer_name": lg_record.customer.name,
-            "customer_address": customer_address,
-            "customer_contact_email": customer_contact_email,
-            "current_date": date.today().strftime("%Y-%m-%d"),
-            "platform_name": "Treasury Management Platform",
-            "original_instruction_type": original_instruction.instruction_type,
-            "original_instruction_serial": original_instruction.serial_number,
-            "original_instruction_date": original_instruction.instruction_date.strftime("%Y-%m-%d"),
-            "original_instruction_delivery_date": original_instruction.delivery_date.strftime("%Y-%m-%d") if original_instruction.delivery_date else "N/A",
-            "days_overdue": days_overdue,
-            "original_instruction_details_summary": str(original_instruction.details)[:200] if original_instruction.details else "No specific details.",
-            "original_instruction_template_name": original_instruction.template.name if original_instruction.template else "N/A",
-            "recipient_name": recipient_name,
-            "recipient_address": recipient_address,
-            "delivery_clause": delivery_clause_text, # Correctly added to template data
-            "instruction_serial": reminder_serial_number or "",
-            "serial_number": reminder_serial_number or "",
-            "lg_issuer_name": lg_record.issuer_name,
-            "issuance_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
-            "issue_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
-            "expiry_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
-            "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
-            "notes_section": "",
-        }
-        from app.core.document_generator import escape_html_placeholder
-        generated_html = reminder_template.content
-        for key, value in template_data.items():
-            str_value = escape_html_placeholder(key, value)
-            generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
+        # Create the reminder record FIRST so template rendering and PDF verification use its real serial & ID
         generated_content_path = None
         new_reminder_instruction = await self.create(
             db,
@@ -674,6 +644,66 @@ class CRUDLGInstruction(CRUDBase):
             sub_instruction_code_enum=sub_instruction_code
         )
         db.flush()
+
+        rem_serial = new_reminder_instruction.serial_number or ""
+
+        # Get entity and customer details with fallback
+        customer = lg_record.customer
+        entity = lg_record.beneficiary_corporate
+        customer_address = entity.address if entity.address else customer.address
+        customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
+
+        template_data = {
+            "lg_number": lg_record.lg_number,
+            "lg_serial_number": lg_record.lg_number,
+            "lg_amount": float(lg_record.lg_amount),
+            "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
+            "lg_currency": lg_record.lg_currency.iso_code,
+            "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record),
+            "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
+            "customer_name": lg_record.customer.name,
+            "customer_address": customer_address,
+            "customer_contact_email": customer_contact_email,
+            "current_date": date.today().strftime("%Y-%m-%d"),
+            "platform_name": "Treasury Management Platform",
+            "original_instruction_type": original_instruction.instruction_type,
+            "original_instruction_serial": original_instruction.serial_number,
+            "original_instruction_date": original_instruction.instruction_date.strftime("%Y-%m-%d"),
+            "original_instruction_delivery_date": original_instruction.delivery_date.strftime("%Y-%m-%d") if original_instruction.delivery_date else "N/A",
+            "days_overdue": days_overdue,
+            "original_instruction_details_summary": str(original_instruction.details)[:200] if original_instruction.details else "No specific details.",
+            "original_instruction_template_name": original_instruction.template.name if original_instruction.template else "N/A",
+            "recipient_name": recipient_name,
+            "recipient_address": recipient_address,
+            "delivery_clause": delivery_clause_text, # Correctly added to template data
+            "instruction_serial": rem_serial,
+            "serial_number": rem_serial,
+            "lg_issuer_name": lg_record.issuer_name,
+            "issuance_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+            "issue_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+            "expiry_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+            "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+            "notes_section": "",
+        }
+        generated_html = reminder_template.content
+        for key, value in template_data.items():
+            str_value = escape_html_placeholder(key, value)
+            generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
+
+        register_instruction_for_verification(
+            new_reminder_instruction.id,
+            rem_serial,
+            lg_record.lg_number or "",
+            getattr(new_reminder_instruction, "created_at", None) or getattr(new_reminder_instruction, "instruction_date", None),
+            "I",
+        )
+        generated_html = attach_verification_marker(
+            generated_html,
+            serial_number=rem_serial,
+            record_kind="I",
+            record_id=new_reminder_instruction.id,
+        )
+
         log_action(
             db,
             user_id=user_id,
@@ -695,7 +725,7 @@ class CRUDLGInstruction(CRUDBase):
         try:
             generated_pdf_bytes = await generate_pdf_from_html(
                 generated_html,
-                filename_hint=f"lg_bank_reminder_{new_reminder_instruction.serial_number or reminder_serial_number}"
+                filename_hint=f"lg_bank_reminder_{rem_serial}"
             )
         except Exception as e:
             logger.error(f"Failed to generate reminder PDF for original instruction {original_instruction_id}: {e}", exc_info=True)
@@ -706,8 +736,12 @@ class CRUDLGInstruction(CRUDBase):
         return lg_record, new_reminder_instruction.id, generated_pdf_bytes
         
     async def generate_all_eligible_bank_reminders_pdf(
-        self, db: Session, customer_id: int, user_id: int
-        ) -> Tuple[Optional[bytes], int, List[int]]:
+        self,
+        db: Session,
+        customer_id: int,
+        user_id: int,
+        pad_for_duplex: bool = False,
+    ) -> Tuple[Optional[bytes], int, List[int]]:
         logger.info(f"[CRUDLGInstruction.generate_all_eligible_bank_reminders_pdf] Initiating bulk bank reminder PDF generation for customer {customer_id}.")
         
         # 1. Validation: Time Window Check
@@ -812,28 +846,44 @@ class CRUDLGInstruction(CRUDBase):
         customer_contact_email = customer_obj.contact_email
         
         from app.crud.crud import crud_lg_record
+        from app.core.document_generator import escape_html_placeholder
+        from app.core.instruction_verification import register_instruction_for_verification, attach_verification_marker
+
+        # Batch-load existing reminder mappings once instead of querying inside the loop
+        eligible_lg_ids = list({orig.lg_record_id for orig in eligible_instructions if orig.lg_record_id is not None})
+        eligible_orig_id_strs = {str(orig.id) for orig in eligible_instructions}
+        existing_reminded_orig_ids: set = set()
+        if eligible_lg_ids and eligible_orig_id_strs:
+            existing_reminders_rows = (
+                db.query(self.model.details['original_instruction_id'].astext)
+                .filter(
+                    self.model.instruction_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
+                    self.model.lg_record_id.in_(eligible_lg_ids),
+                    self.model.is_deleted == False,
+                    self.model.details['original_instruction_id'].astext.in_(eligible_orig_id_strs),
+                )
+                .all()
+            )
+            existing_reminded_orig_ids = {row[0] for row in existing_reminders_rows if row and row[0]}
+
+        today_date = date.today()
+        today_str = today_date.strftime("%Y-%m-%d")
 
         for original_instruction in eligible_instructions:
             # Check for existing reminders
-            existing_reminder = db.query(self.model).filter(
-                self.model.instruction_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
-                self.model.lg_record_id == original_instruction.lg_record.id,
-                self.model.is_deleted == False,
-                self.model.details['original_instruction_id'].astext == func.cast(original_instruction.id, String)
-            ).first()
-            if existing_reminder:
+            if str(original_instruction.id) in existing_reminded_orig_ids:
                 continue
 
             lg_record = original_instruction.lg_record
             
             # Determine days overdue
             if original_instruction.delivery_date:
-                days_overdue = (date.today() - original_instruction.delivery_date.date()).days
+                days_overdue = (today_date - original_instruction.delivery_date.date()).days
                 # Skip if not yet overdue based on DELIVERY config
                 if days_overdue < days_since_delivery:
                     continue
             else:
-                days_overdue = (date.today() - original_instruction.instruction_date.date()).days
+                days_overdue = (today_date - original_instruction.instruction_date.date()).days
                 # Skip if not yet overdue based on ISSUANCE config
                 if days_overdue < days_since_issuance:
                     continue
@@ -855,62 +905,10 @@ class CRUDLGInstruction(CRUDBase):
                 delivery_clause_text = ""
             # ------------------------------------------
 
-            # Serial Number Generation
-            beneficiary_entity_code = lg_record.beneficiary_corporate.code
+            beneficiary_entity_code = entity.code
             lg_category_code = lg_record.lg_category.code
             lg_sequence_number_str = str(lg_record.lg_sequence_number).zfill(4)
-            
-            reminder_serial_number, global_seq_val, type_seq_val = await self.get_next_serial_number(
-                db,
-                lg_record_id=lg_record.id,
-                entity_code=beneficiary_entity_code,
-                lg_category_code=lg_category_code,
-                lg_sequence_number=lg_sequence_number_str,
-                instruction_type_code=InstructionTypeCode.REM,
-                sub_instruction_code=SubInstructionCode.BANK_REMINDER
-            )
 
-            template_data = {
-                "lg_number": lg_record.lg_number,
-                "lg_serial_number": lg_record.lg_number,
-                "lg_amount": float(lg_record.lg_amount),
-                "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
-                "lg_currency": lg_record.lg_currency.iso_code,
-                "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record),
-                "lg_beneficiary_name": lg_record.beneficiary_corporate.entity_name,
-                "customer_name": lg_record.customer.name,
-                "customer_address": customer_address_final,
-                "customer_contact_email": customer_contact_email_final,
-                "current_date": date.today().strftime("%Y-%m-%d"),
-                "platform_name": "Treasury Management Platform",
-                "original_instruction_type": original_instruction.instruction_type,
-                "original_instruction_serial": original_instruction.serial_number,
-                "original_instruction_date": original_instruction.instruction_date.strftime("%Y-%m-%d"),
-                "original_instruction_delivery_date": original_instruction.delivery_date.strftime("%Y-%m-%d") if original_instruction.delivery_date else "N/A",
-                "days_overdue": days_overdue,
-                "original_instruction_details_summary": str(original_instruction.details)[:200] if original_instruction.details else "No specific details.",
-                "original_instruction_template_name": original_instruction.template.name if original_instruction.template else "N/A",
-                "recipient_name": recipient_name,
-                "recipient_address": recipient_address,
-                "delivery_clause": delivery_clause_text, # Passed to template
-                "instruction_serial": reminder_serial_number or "",
-                "serial_number": reminder_serial_number or "",
-                "lg_issuer_name": lg_record.issuer_name,
-                "issuance_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
-                "issue_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
-                "expiry_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
-                "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
-                "notes_section": "",
-            }
-            
-            from app.core.document_generator import escape_html_placeholder
-            generated_html = reminder_template.content
-            for key, value in template_data.items():
-                str_value = escape_html_placeholder(key, value)
-                generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
-            
-            consolidated_html_content.append(generated_html)
-            
             new_reminder_instruction = await self.create(
                 db,
                 obj_in=LGInstructionCreate(
@@ -940,6 +938,63 @@ class CRUDLGInstruction(CRUDBase):
                 sub_instruction_code_enum=SubInstructionCode.BANK_REMINDER
             )
             db.flush()
+
+            rem_serial = new_reminder_instruction.serial_number or ""
+
+            template_data = {
+                "lg_number": lg_record.lg_number,
+                "lg_serial_number": lg_record.lg_number,
+                "lg_amount": float(lg_record.lg_amount),
+                "lg_amount_formatted": f"{lg_record.lg_currency.symbol} {float(lg_record.lg_amount):,.2f}",
+                "lg_currency": lg_record.lg_currency.iso_code,
+                "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record),
+                "lg_beneficiary_name": entity.entity_name,
+                "customer_name": lg_record.customer.name,
+                "customer_address": customer_address_final,
+                "customer_contact_email": customer_contact_email_final,
+                "current_date": today_str,
+                "platform_name": "Treasury Management Platform",
+                "original_instruction_type": original_instruction.instruction_type,
+                "original_instruction_serial": original_instruction.serial_number,
+                "original_instruction_date": original_instruction.instruction_date.strftime("%Y-%m-%d"),
+                "original_instruction_delivery_date": original_instruction.delivery_date.strftime("%Y-%m-%d") if original_instruction.delivery_date else "N/A",
+                "days_overdue": days_overdue,
+                "original_instruction_details_summary": str(original_instruction.details)[:200] if original_instruction.details else "No specific details.",
+                "original_instruction_template_name": original_instruction.template.name if original_instruction.template else "N/A",
+                "recipient_name": recipient_name,
+                "recipient_address": recipient_address,
+                "delivery_clause": delivery_clause_text, # Passed to template
+                "instruction_serial": rem_serial,
+                "serial_number": rem_serial,
+                "lg_issuer_name": lg_record.issuer_name,
+                "issuance_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+                "issue_date": lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record, "issuance_date", None) else "N/A",
+                "expiry_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+                "maturity_date": lg_record.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record, "expiry_date", None) else "N/A",
+                "notes_section": "",
+            }
+
+            generated_html = reminder_template.content
+            for key, value in template_data.items():
+                str_value = escape_html_placeholder(key, value)
+                generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
+
+            register_instruction_for_verification(
+                new_reminder_instruction.id,
+                rem_serial,
+                lg_record.lg_number or "",
+                getattr(new_reminder_instruction, "created_at", None) or getattr(new_reminder_instruction, "instruction_date", None),
+                "I",
+            )
+            consolidated_html_content.append(
+                attach_verification_marker(
+                    generated_html,
+                    serial_number=rem_serial,
+                    record_kind="I",
+                    record_id=new_reminder_instruction.id,
+                )
+            )
+            existing_reminded_orig_ids.add(str(original_instruction.id))
             log_action(
                 db,
                 user_id=user_id,
@@ -968,7 +1023,8 @@ class CRUDLGInstruction(CRUDBase):
         try:
             consolidated_pdf_bytes = await generate_merged_pdf_from_html_list(
                 consolidated_html_content,
-                f"consolidated_bank_reminders_customer_{customer_id}_{date.today().isoformat()}"
+                f"consolidated_bank_reminders_customer_{customer_id}_{today_date.isoformat()}",
+                pad_for_duplex=pad_for_duplex,
             )
         except Exception as e:
             logger.error(f"[CRUDLGInstruction.generate_all_eligible_bank_reminders_pdf] Failed to generate consolidated PDF: {e}", exc_info=True)
@@ -987,7 +1043,8 @@ class CRUDLGInstruction(CRUDBase):
                 "source_api": "generate_all_bank_reminders_pdf",
                 "remind_since_delivery_days": days_since_delivery,
                 "remind_since_issuance_days": days_since_issuance,
-                "max_days_since_issuance": max_days_since_issuance
+                "max_days_since_issuance": max_days_since_issuance,
+                "pad_for_duplex": pad_for_duplex,
             },
             customer_id=customer_id,
             lg_record_id=None,

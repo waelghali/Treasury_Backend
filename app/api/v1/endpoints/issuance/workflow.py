@@ -659,9 +659,15 @@ async def record_delivery(
     delivery_proof_file = None
     if "multipart/form-data" in content_type:
         form = await request.form()
-        data_str = form.get("data", "{}")
-        payload = json.loads(data_str)
-        delivery_proof_file = form.get("delivery_proof")
+        data_str = form.get("data")
+        payload = json.loads(data_str) if data_str else {}
+        if not payload.get("delivery_date") and form.get("delivery_date"):
+            payload["delivery_date"] = form.get("delivery_date")
+        if not payload.get("delivery_method") and form.get("delivery_method"):
+            payload["delivery_method"] = form.get("delivery_method")
+        if not payload.get("delivery_notes") and form.get("delivery_notes"):
+            payload["delivery_notes"] = form.get("delivery_notes")
+        delivery_proof_file = form.get("delivery_proof") or form.get("delivery_document_file")
     else:
         payload = await request.json()
 

@@ -1738,6 +1738,7 @@ def restore_customer(
             detail="Customer not found or not in a soft-deleted state."
         )
     
+    client_host = get_client_ip(request) if request else None
     restored_customer = crud_customer.restore(db, db_customer, user_id=current_user.user_id)
 
     all_entities_of_customer = db.query(CustomerEntity).filter(CustomerEntity.customer_id == restored_customer.id).all()
@@ -1751,12 +1752,11 @@ def restore_customer(
                 ).count()
                 if active_entities_count >= 1:
                     logger.debug(f"Not reactivating entity ID {entity.id} during restore due to single-entity plan limit.")
-                    restored_entity = crud_customer_entity.restore(db, entity, user_id=current_user.user_id)
-                    restored_entity.is_active = False
-                    db.add(restored_entity)
-                    db.commit()
-                    db.refresh(restored_entity)
-                    log_action(db, user_id=current_user.user_id, action_type="RESTORE_INACTIVE", entity_type="CustomerEntity", entity_id=restored_entity.id, details={"name": restored_entity.entity_name, "reason": "Single-entity plan limit met", "ip_address": client_host})
+                    entity.restore()
+                    entity.is_active = False
+                    db.add(entity)
+                    db.flush()
+                    log_action(db, user_id=current_user.user_id, action_type="RESTORE_INACTIVE", entity_type="CustomerEntity", entity_id=entity.id, details={"name": entity.entity_name, "reason": "Single-entity plan limit met", "ip_address": client_host})
                     continue
             
             crud_customer_entity.restore(db, entity, user_id=current_user.user_id)
@@ -1766,7 +1766,6 @@ def restore_customer(
         if user.is_deleted:
             crud_user.restore(db, user, user_id=current_user.user_id)
 
-    client_host = get_client_ip(request) if request else None
     log_action(db, user_id=current_user.user_id, action_type="RESTORE", entity_type="Customer", entity_id=restored_customer.id, details={"name": restored_customer.name, "ip_address": client_host})
 
     db.refresh(restored_customer)

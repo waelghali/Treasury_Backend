@@ -333,6 +333,7 @@ def issuance_action_center_unified_pending_bank_reply(
             "lg_number": lg.bank_lg_number or lg.lg_ref_number,
             "beneficiary": lg.beneficiary_name,
             "delivery_date": lg.delivery_date.isoformat() if lg.delivery_date else None,
+            "created_at": lg.created_at.isoformat() if lg.created_at else None,
             "days_waiting": days_waiting,
             "action_type": "NEW_ISSUANCE",
         })
@@ -341,9 +342,11 @@ def issuance_action_center_unified_pending_bank_reply(
         results.append({
             "id": a.id,
             "source": "maintenance",
+            "issued_lg_id": a.issued_lg_id,
             "lg_number": (a.issued_lg.bank_lg_number or a.issued_lg.lg_ref_number) if a.issued_lg else None,
             "beneficiary": a.issued_lg.beneficiary_name if a.issued_lg else None,
             "delivery_date": a.delivery_date.isoformat() if a.delivery_date else None,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
             "days_waiting": days_waiting,
             "action_type": a.action_type,
             "serial_number": a.letter_serial_number,

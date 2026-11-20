@@ -18,6 +18,7 @@ import hmac
 import hashlib
 import base64
 import logging
+import threading
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple
@@ -26,11 +27,41 @@ from app.core.routing import get_frontend_base_url
 
 logger = logging.getLogger(__name__)
 
-_SECRET_KEY = (os.getenv("SECRET_KEY") or "grow-bd-fallback-secret").encode("utf-8")
+_RAW_SECRET = os.getenv("SECRET_KEY")
+if not _RAW_SECRET:
+    logger.warning(
+        "SECRET_KEY is not set: instruction QR tokens/security codes are signed with a public fallback "
+        "key and are FORGEABLE. Set SECRET_KEY in the environment."
+    )
+_SECRET_KEY = (_RAW_SECRET or "grow-bd-fallback-secret").encode("utf-8")
 
 # Thread-safe bounded cache for newly flushed instructions (before outer transaction commits)
 _RECENT_INSTRUCTIONS_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_CACHE_LOCK = threading.Lock()
 _MAX_CACHE_SIZE = 500
+
+# PDF filename hints for documents that have NO verification record by design, so they always get a
+# sample QR footer. No warning is logged for these (it would fire on every print).
+# NOTE: "lg_issuance_letter_" and "cancellation_notice_" ARE sent to banks but currently cannot be
+# verified — supporting them needs a new record kind in this module.
+_NON_LETTER_HINT_PREFIXES = (
+    "Grow_Terms_of_Service",
+    "application_",
+    "req_",
+    "document",
+    "lg_issuance_letter_",
+    "cancellation_notice_",
+)
+
+# Shown when someone scans a sample QR code (Template Studio preview, or a document type that has
+# no verifiable instruction record). Must never say "verified", but also must not call a genuine
+# issuance letter / cancellation notice "fake".
+_PREVIEW_REJECTION_REASON = (
+    "SAMPLE QR CODE – CANNOT BE VERIFIED. This QR code is not linked to an issued instruction record, "
+    "so it cannot confirm that this letter is genuine. Do not rely on this QR code; contact the issuing "
+    "company directly to confirm the letter."
+)
+_PREVIEW_STATUS_LABEL = "SAMPLE QR CODE – CANNOT BE VERIFIED"
 
 
 def _to_epoch_seconds(dt: Any) -> int:
@@ -54,23 +85,78 @@ def register_instruction_for_verification(
     record_kind: str = "I",
 ) -> None:
     """
-    Registers a newly flushed LGInstruction ('I') or IssuedLGMaintenanceAction ('M') in memory
+    Registers a newly flushed LGInstruction ('I') or IssuanceMaintenanceAction ('M') in memory
     so `document_generator.py` can resolve its exact ID and secret issuance timestamp immediately,
     even before the outer database transaction commits.
     """
-    if not serial_number or not record_id:
+    if not record_id:
         return
     secret_ts = _to_epoch_seconds(created_at) or int(datetime.now(timezone.utc).timestamp())
-    key = serial_number.strip()
-    _RECENT_INSTRUCTIONS_CACHE[key] = {
-        "kind": record_kind,
+    clean_serial = (serial_number or "").strip()
+    clean_kind = (record_kind or "I").strip().upper()
+    meta = {
+        "kind": clean_kind,
         "id": int(record_id),
-        "serial_number": key,
+        "serial_number": clean_serial,
         "lg_number": (lg_number or "").strip(),
         "secret_ts": secret_ts,
     }
-    while len(_RECENT_INSTRUCTIONS_CACHE) > _MAX_CACHE_SIZE:
-        _RECENT_INSTRUCTIONS_CACHE.popitem(last=False)
+    _cache_put(f"{clean_kind}:{int(record_id)}", meta)
+    if clean_serial:
+        _cache_put(clean_serial, meta)
+
+
+def attach_verification_marker(
+    html_content: str,
+    serial_number: Optional[str] = None,
+    record_kind: Optional[str] = None,
+    record_id: Optional[int] = None,
+) -> str:
+    """
+    Embeds an invisible verification metadata comment in rendered letter HTML so merged/bulk
+    WeasyPrint pipelines can always resolve the exact database instruction record even when
+    a customer uses a global or custom template without a visible serial line.
+    """
+    if not html_content or (not serial_number and not record_id):
+        return html_content
+    if "<!-- GROW_VERIFY_META:" in html_content:
+        return html_content
+    clean_kind = (record_kind or "").strip().upper()
+    clean_id = int(record_id) if record_id else 0
+    clean_serial = (serial_number or "").replace("-->", "").strip()
+    marker = f"<!-- GROW_VERIFY_META:kind={clean_kind}|id={clean_id}|serial={clean_serial} -->"
+    if re.search(r"</body>", html_content, flags=re.IGNORECASE):
+        return re.sub(r"</body>", f"{marker}</body>", html_content, count=1, flags=re.IGNORECASE)
+    return f"{html_content}\n{marker}"
+
+
+def _extract_embedded_verify_marker(html_content: str) -> Optional[Dict[str, Any]]:
+    if not html_content:
+        return None
+    m = re.search(
+        r"<!--\s*GROW_VERIFY_META:kind=([A-Za-z]*)\|id=(\d+)\|serial=([^>]*?)\s*-->",
+        html_content,
+    )
+    if not m:
+        return None
+    return {
+        "kind": m.group(1).strip().upper(),
+        "id": int(m.group(2)),
+        "serial": m.group(3).strip(),
+    }
+
+
+def _cache_put(key: str, meta: Dict[str, Any]) -> None:
+    with _CACHE_LOCK:
+        _RECENT_INSTRUCTIONS_CACHE[key] = meta
+        _RECENT_INSTRUCTIONS_CACHE.move_to_end(key)
+        while len(_RECENT_INSTRUCTIONS_CACHE) > _MAX_CACHE_SIZE:
+            _RECENT_INSTRUCTIONS_CACHE.popitem(last=False)
+
+
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    with _CACHE_LOCK:
+        return _RECENT_INSTRUCTIONS_CACHE.get(key)
 
 
 def _compute_hmac_sig(payload: str, length: int = 16) -> str:
@@ -178,10 +264,10 @@ def _extract_serial_from_html_or_hint(html_content: str, filename_hint: str = ""
     """
     Extracts the instruction serial number from the rendered HTML or filename_hint.
     """
-    # 1. Check common HTML patterns: Ref: <strong>...</strong> or Instruction Ref: <strong>...</strong>
+    # 1. Check common HTML patterns: Ref: <strong>...</strong>, Instruction Ref: <strong>...</strong>, or Serial: ...
     patterns = [
-        r"(?:Instruction\s+Ref|Original\s+Ref|Internal\s+Ref|Ref)\s*:\s*<strong[^>]*>\s*([A-Za-z0-9_\-/]+)\s*</strong>",
-        r"(?:Instruction\s+Ref|Original\s+Ref|Internal\s+Ref|Ref)\s*:\s*([A-Za-z0-9_\-/]{6,40})",
+        r"(?:Instruction\s+Ref|Original\s+Ref|Internal\s+Ref|Ref|Serial)\s*:\s*<strong[^>]*>\s*([A-Za-z0-9_\-/]+)\s*</strong>",
+        r"(?:Instruction\s+Ref|Original\s+Ref|Internal\s+Ref|Ref|Serial)\s*:\s*([A-Za-z0-9_\-/]{6,40})",
     ]
     for pat in patterns:
         m = re.search(pat, html_content, flags=re.IGNORECASE)
@@ -203,12 +289,89 @@ def _extract_serial_from_html_or_hint(html_content: str, filename_hint: str = ""
 
 def _resolve_instruction_meta(html_content: str, filename_hint: str = "") -> Dict[str, Any]:
     """
-    Resolves (kind, id, serial_number, lg_number, secret_ts) from the in-memory cache or database.
-    Falls back to a deterministic preview token if rendering a studio preview / non-persisted sample.
+    Resolves (kind, id, serial_number, lg_number, secret_ts) from the embedded marker, in-memory cache,
+    or database. Falls back to a deterministic preview token if rendering a studio preview.
     """
-    serial = _extract_serial_from_html_or_hint(html_content, filename_hint)
-    if serial and serial in _RECENT_INSTRUCTIONS_CACHE:
-        return _RECENT_INSTRUCTIONS_CACHE[serial]
+    embedded = _extract_embedded_verify_marker(html_content)
+    serial_from_marker: Optional[str] = None
+    if embedded:
+        emb_kind = embedded["kind"]
+        emb_id = embedded["id"]
+        emb_serial = embedded["serial"]
+
+        if emb_kind and emb_id > 0:
+            cached_by_id = _cache_get(f"{emb_kind}:{emb_id}")
+            if cached_by_id:
+                return cached_by_id
+
+        if emb_serial:
+            cached_by_serial = _cache_get(emb_serial)
+            if cached_by_serial and (emb_id <= 0 or cached_by_serial.get("id") == emb_id):
+                return cached_by_serial
+
+        if emb_kind in ("I", "M") and emb_id > 0:
+            try:
+                from app.database import SessionLocal
+                from sqlalchemy.orm import selectinload
+
+                db = SessionLocal()
+                try:
+                    if emb_kind == "I":
+                        from app.models.models import LGInstruction
+                        inst = (
+                            db.query(LGInstruction)
+                            .options(selectinload(LGInstruction.lg_record))
+                            .filter(LGInstruction.id == emb_id, LGInstruction.is_deleted == False)
+                            .first()
+                        )
+                        if inst and inst.lg_record and not inst.lg_record.is_deleted:
+                            ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
+                            lg_num = inst.lg_record.lg_number or ""
+                            meta = {
+                                "kind": "I",
+                                "id": int(inst.id),
+                                "serial_number": inst.serial_number or "",
+                                "lg_number": lg_num or "",
+                                "secret_ts": ts,
+                            }
+                            _cache_put(f"I:{inst.id}", meta)
+                            if inst.serial_number:
+                                _cache_put(inst.serial_number.strip(), meta)
+                            return meta
+                    elif emb_kind == "M":
+                        from app.models.models_issuance import IssuanceMaintenanceAction
+                        maint = (
+                            db.query(IssuanceMaintenanceAction)
+                            .options(selectinload(IssuanceMaintenanceAction.issued_lg))
+                            .filter(IssuanceMaintenanceAction.id == emb_id, IssuanceMaintenanceAction.is_deleted == False)
+                            .first()
+                        )
+                        if maint and maint.issued_lg and not getattr(maint.issued_lg, "is_deleted", False):
+                            ts = _to_epoch_seconds(getattr(maint, "created_at", None))
+                            lg_num = maint.issued_lg.bank_lg_number or maint.issued_lg.lg_ref_number or ""
+                            meta = {
+                                "kind": "M",
+                                "id": int(maint.id),
+                                "serial_number": maint.letter_serial_number or "",
+                                "lg_number": lg_num or "",
+                                "secret_ts": ts,
+                            }
+                            _cache_put(f"M:{maint.id}", meta)
+                            if maint.letter_serial_number:
+                                _cache_put(maint.letter_serial_number.strip(), meta)
+                            return meta
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.debug(f"Could not query DB via embedded verification marker ({embedded}): {e}")
+
+        if emb_serial:
+            serial_from_marker = emb_serial
+
+    serial = serial_from_marker or _extract_serial_from_html_or_hint(html_content, filename_hint)
+    cached = _cache_get(serial) if serial else None
+    if cached:
+        return cached
 
     if serial:
         try:
@@ -225,9 +388,9 @@ def _resolve_instruction_meta(html_content: str, filename_hint: str = "") -> Dic
                     .order_by(LGInstruction.id.desc())
                     .first()
                 )
-                if inst:
+                if inst and inst.lg_record and not inst.lg_record.is_deleted:
                     ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
-                    lg_num = inst.lg_record.lg_number if inst.lg_record else ""
+                    lg_num = inst.lg_record.lg_number or ""
                     meta = {
                         "kind": "I",
                         "id": int(inst.id),
@@ -235,26 +398,25 @@ def _resolve_instruction_meta(html_content: str, filename_hint: str = "") -> Dic
                         "lg_number": lg_num or "",
                         "secret_ts": ts,
                     }
-                    _RECENT_INSTRUCTIONS_CACHE[serial] = meta
+                    _cache_put(serial, meta)
                     return meta
 
-                # Also check IssuedLGMaintenanceAction for Issuance module letters
+                # Also check IssuanceMaintenanceAction for Issuance module letters
                 try:
-                    from app.models.models_issuance import IssuedLGMaintenanceAction
+                    from app.models.models_issuance import IssuanceMaintenanceAction
                     maint = (
-                        db.query(IssuedLGMaintenanceAction)
-                        .options(selectinload(IssuedLGMaintenanceAction.issued_lg))
-                        .filter(IssuedLGMaintenanceAction.letter_serial_number == serial)
-                        .order_by(IssuedLGMaintenanceAction.id.desc())
+                        db.query(IssuanceMaintenanceAction)
+                        .options(selectinload(IssuanceMaintenanceAction.issued_lg))
+                        .filter(
+                            IssuanceMaintenanceAction.letter_serial_number == serial,
+                            IssuanceMaintenanceAction.is_deleted == False,
+                        )
+                        .order_by(IssuanceMaintenanceAction.id.desc())
                         .first()
                     )
-                    if maint:
+                    if maint and maint.issued_lg and not getattr(maint.issued_lg, "is_deleted", False):
                         ts = _to_epoch_seconds(getattr(maint, "created_at", None))
-                        lg_num = (
-                            (maint.issued_lg.bank_lg_number or maint.issued_lg.lg_ref_number)
-                            if maint.issued_lg
-                            else ""
-                        )
+                        lg_num = maint.issued_lg.bank_lg_number or maint.issued_lg.lg_ref_number or ""
                         meta = {
                             "kind": "M",
                             "id": int(maint.id),
@@ -262,7 +424,7 @@ def _resolve_instruction_meta(html_content: str, filename_hint: str = "") -> Dic
                             "lg_number": lg_num or "",
                             "secret_ts": ts,
                         }
-                        _RECENT_INSTRUCTIONS_CACHE[serial] = meta
+                        _cache_put(serial, meta)
                         return meta
                 except Exception:
                     pass
@@ -271,7 +433,21 @@ def _resolve_instruction_meta(html_content: str, filename_hint: str = "") -> Dic
         except Exception as e:
             logger.debug(f"Could not query DB for instruction verification meta ({serial}): {e}")
 
-    # Fallback for Template Studio live previews or sample renders
+    # Fallback for Template Studio live previews or sample renders.
+    # Warn when this happens during real PDF generation (a filename_hint is passed) or when a
+    # serial WAS found but no matching record exists — that means a real letter is about to be
+    # printed with a SAMPLE QR code that will fail verification at the bank.
+    # Template Studio in-browser previews pass no hint and no real serial, so they stay quiet.
+    hint = (filename_hint or "").strip()
+    is_known_non_letter = hint.startswith(_NON_LETTER_HINT_PREFIXES)
+    if (serial or hint) and not is_known_non_letter:
+        logger.warning(
+            "Instruction verification: could not resolve a real instruction record "
+            f"(extracted serial={serial!r}, filename_hint={hint!r}). The document will carry a SAMPLE "
+            "QR code that will NOT verify. Check that the template prints the instruction serial as "
+            "'Ref: <strong>SERIAL</strong>' and that the record was saved/registered before rendering."
+        )
+
     return {
         "kind": "P",
         "id": 0,
@@ -342,41 +518,6 @@ def strip_legacy_template_footers(html_content: str) -> str:
     )
     # 7. Remove @bottom-center / @bottom-left / @bottom-right CSS margin boxes (e.g., Page X of Y)
     cleaned = re.sub(
-        r'\s*<em\b[^>]*>\s*For and on behalf of[^<]*Platform\s*</em>',
-        "",
-        cleaned,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    # 4. Expand cramped signature spacing (.signature { margin-top: 0.8em; }) in standard/custom templates
-    cleaned = re.sub(
-        r'(\.signature\s*\{\s*)margin-top:\s*0\.8em;',
-        r'\1margin-top: 4.5em;',
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(
-        r'(\.closing\s*\{\s*margin-top:\s*2em;\s*text-align:\s*left;)(\s*\})',
-        r'\1\n            margin-bottom: 2.2em;\2',
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    # 5. Expand cramped signature spacing in Bank Companion Letter (25px/40px -> 56px)
-    if "Bank Instruction Letter & Annex" in cleaned:
-        cleaned = re.sub(
-            r'margin-top:\s*(?:25|40)px;\s*border-top:\s*1px\s+solid\s+#94a3b8;',
-            'margin-top: 56px; border-top: 1px solid #94a3b8;',
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-    # 6. Expand cramped "<br/><p>Sincerely,<br/>{{customer_name}}</p>" in Issuance maintenance letters
-    cleaned = re.sub(
-        r'<br\s*/?>\s*<p>\s*Sincerely,\s*<br\s*/?>\s*\{\{customer_name\}\}\s*</p>',
-        '<div style="margin-top: 24px; margin-bottom: 32px;"><p style="margin-bottom: 52px;">Sincerely,</p><p style="font-weight: bold; margin: 0;">{{customer_name}}</p><p style="margin: 2px 0 0 0; font-size: 9pt; color: #475569;">Authorized Signatory</p></div>',
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    # 7. Remove @bottom-center / @bottom-left / @bottom-right CSS margin boxes (e.g., Page X of Y)
-    cleaned = re.sub(
         r'\s*@bottom-(?:center|left|right)\s*\{[^}]*\}',
         "",
         cleaned,
@@ -388,7 +529,7 @@ def strip_legacy_template_footers(html_content: str) -> str:
 def inject_mandatory_verification_footer(html_content: str, filename_hint: str = "") -> str:
     """
     Enforces the platform-wide Grow Business Development security footer with QR code and
-    6-digit Verification Code on any letter HTML. Strips any template-level `.footer` or
+    4-digit Security Code (v2) on any letter HTML. Strips any template-level `.footer` or
     `.footer-note` so templates cannot duplicate or bypass it.
     """
     if not html_content or "</body>" not in html_content.lower():
@@ -485,12 +626,96 @@ def _mask_lg_number(lg_number: str) -> str:
 _FREE_TYPO_ATTEMPTS = 2
 _COOLDOWN_SCHEDULE_SECONDS = [60, 180, 300, 600, 900, 1800]
 _INACTIVITY_RESET_SECONDS = 3600  # Reset failure counter after 1 hour of no failed tries
+# Per-letter limit (shared by ALL visitors, regardless of IP) — defeats IP rotation/spoofing.
+# Slightly more generous than the per-IP limit so a genuine bank is rarely affected.
+import tempfile
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+
+from contextlib import contextmanager
+
+_LETTER_FREE_ATTEMPTS = 5
 _COOLDOWN_MEMORY_STORE: Dict[str, Dict[str, float]] = {}
+_COOLDOWN_LOCK = threading.Lock()
+
+
+def _at_fork_prepare() -> None:
+    _CACHE_LOCK.acquire()
+    _COOLDOWN_LOCK.acquire()
+
+
+def _at_fork_parent() -> None:
+    try:
+        _COOLDOWN_LOCK.release()
+    finally:
+        _CACHE_LOCK.release()
+
+
+def _at_fork_child() -> None:
+    global _CACHE_LOCK, _COOLDOWN_LOCK
+    _CACHE_LOCK = threading.Lock()
+    _COOLDOWN_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_at_fork_prepare,
+        after_in_parent=_at_fork_parent,
+        after_in_child=_at_fork_child,
+    )
+
+
+def _canonical_token_key(token: str) -> str:
+    """Normalizes a token so v1, v2, 4-part legacy, whitespace, and forged signatures for one letter share one bucket."""
+    clean = (token or "").strip()
+    if clean and clean.isascii() and clean.count(".") in (2, 3):
+        parts = clean.split(".")
+        base_kind = parts[0].rstrip("2")
+        if base_kind in ("I", "M") and parts[1].isdigit():
+            return f"{base_kind}:{int(parts[1])}"
+    return f"raw:{hashlib.sha256(clean.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _letter_key(token: str) -> str:
+    return f"letter:{_canonical_token_key(token)}"
 
 
 def _get_cooldown_file_path() -> str:
-    import tempfile
     return os.path.join(tempfile.gettempdir(), "grow_verify_ip_cooldown.json")
+
+
+@contextmanager
+def _cooldown_file_lock():
+    """Cross-process file lock on POSIX (no-op on Windows where thread lock already serializes)."""
+    if _fcntl is None:
+        yield
+        return
+    lock_path = f"{_get_cooldown_file_path()}.lock"
+    lock_fh = None
+    try:
+        lock_fh = open(lock_path, "a+", encoding="utf-8")
+        _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX)
+    except Exception:
+        if lock_fh is not None:
+            try:
+                lock_fh.close()
+            except Exception:
+                pass
+            lock_fh = None
+    try:
+        yield
+    finally:
+        if lock_fh is not None:
+            try:
+                _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                lock_fh.close()
+            except Exception:
+                pass
 
 
 def _load_cooldown_store() -> Dict[str, Dict[str, float]]:
@@ -526,11 +751,27 @@ def _save_cooldown_store(store: Dict[str, Dict[str, float]]) -> None:
     _COOLDOWN_MEMORY_STORE.clear()
     _COOLDOWN_MEMORY_STORE.update(store)
     path = _get_cooldown_file_path()
+    target_dir = os.path.dirname(path) or tempfile.gettempdir()
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(store, f)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_dir,
+            prefix=".grow_verify_cd_",
+            suffix=".tmp",
+            delete=False,
+        ) as tf:
+            tmp_path = tf.name
+            json.dump(store, tf)
+            tf.flush()
+        os.replace(tmp_path, path)
     except Exception:
-        pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def _format_duration_human(seconds: int) -> str:
@@ -546,14 +787,19 @@ def _check_cooldown_status(client_ip: str, token: str) -> int:
     or 0 if allowed to proceed.
     """
     ip = (client_ip or "unknown").strip()
-    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    canon = _canonical_token_key(token)
+    tok_key = f"ip_tok:{ip}:{canon}"
     ip_key = f"ip_all:{ip}"
+    l_key = _letter_key(token)
     now = datetime.now(timezone.utc).timestamp()
-    store = _load_cooldown_store()
 
-    rem_tok = int(max(0.0, float(store.get(tok_key, {}).get("locked_until", 0.0)) - now))
-    rem_ip = int(max(0.0, float(store.get(ip_key, {}).get("locked_until", 0.0)) - now))
-    return max(rem_tok, rem_ip)
+    with _COOLDOWN_LOCK:
+        with _cooldown_file_lock():
+            store = _load_cooldown_store()
+            rem_tok = int(max(0.0, float(store.get(tok_key, {}).get("locked_until", 0.0)) - now))
+            rem_ip = int(max(0.0, float(store.get(ip_key, {}).get("locked_until", 0.0)) - now))
+            rem_letter = int(max(0.0, float(store.get(l_key, {}).get("locked_until", 0.0)) - now))
+            return max(rem_tok, rem_ip, rem_letter)
 
 
 def _record_failed_attempt(client_ip: str, token: str) -> Tuple[int, int, int]:
@@ -562,50 +808,77 @@ def _record_failed_attempt(client_ip: str, token: str) -> Tuple[int, int, int]:
     (fail_count, cooldown_seconds_applied, free_attempts_remaining).
     """
     ip = (client_ip or "unknown").strip()
-    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    canon = _canonical_token_key(token)
+    tok_key = f"ip_tok:{ip}:{canon}"
     ip_key = f"ip_all:{ip}"
+    letter_key = _letter_key(token)
     now = datetime.now(timezone.utc).timestamp()
-    store = _load_cooldown_store()
 
-    # 1. Update per-(IP + Token) counter
-    entry = store.get(tok_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0})
-    fails = int(entry.get("fails", 0)) + 1
-    cooldown_sec = 0
-    if fails > _FREE_TYPO_ATTEMPTS:
-        idx = min(fails - _FREE_TYPO_ATTEMPTS - 1, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
-        cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[idx]
+    with _COOLDOWN_LOCK:
+        with _cooldown_file_lock():
+            store = _load_cooldown_store()
 
-    entry["fails"] = fails
-    entry["last_fail"] = now
-    entry["locked_until"] = (now + cooldown_sec) if cooldown_sec > 0 else 0.0
-    store[tok_key] = entry
+            # 1. Update per-(IP + Canonical Token) counter
+            entry = dict(store.get(tok_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0}))
+            fails = int(entry.get("fails", 0)) + 1
+            cooldown_sec = 0
+            if fails > _FREE_TYPO_ATTEMPTS:
+                idx = min(fails - _FREE_TYPO_ATTEMPTS - 1, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
+                cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[idx]
 
-    # 2. Update broader per-IP counter across all tokens (allows 5 free tries across tokens before cooldown)
-    ip_entry = store.get(ip_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0})
-    ip_fails = int(ip_entry.get("fails", 0)) + 1
-    ip_cooldown_sec = 0
-    if ip_fails > 5:
-        ip_idx = min(ip_fails - 6, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
-        ip_cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[ip_idx]
-    ip_entry["fails"] = ip_fails
-    ip_entry["last_fail"] = now
-    ip_entry["locked_until"] = max(float(ip_entry.get("locked_until", 0.0)), (now + ip_cooldown_sec) if ip_cooldown_sec > 0 else 0.0)
-    store[ip_key] = ip_entry
+            entry["fails"] = fails
+            entry["last_fail"] = now
+            entry["locked_until"] = (now + cooldown_sec) if cooldown_sec > 0 else 0.0
+            store[tok_key] = entry
 
-    _save_cooldown_store(store)
-    effective_cooldown = max(cooldown_sec, ip_cooldown_sec)
-    free_remaining = max(0, _FREE_TYPO_ATTEMPTS - fails)
-    return fails, effective_cooldown, free_remaining
+            # 2. Update broader per-IP counter across all tokens (allows 5 free tries across tokens before cooldown)
+            ip_entry = dict(store.get(ip_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0}))
+            ip_fails = int(ip_entry.get("fails", 0)) + 1
+            ip_cooldown_sec = 0
+            if ip_fails > 5:
+                ip_idx = min(ip_fails - 6, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
+                ip_cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[ip_idx]
+            ip_entry["fails"] = ip_fails
+            ip_entry["last_fail"] = now
+            ip_entry["locked_until"] = max(
+                float(ip_entry.get("locked_until", 0.0)),
+                (now + ip_cooldown_sec) if ip_cooldown_sec > 0 else 0.0,
+            )
+            store[ip_key] = ip_entry
+
+            # 3. Update per-LETTER counter (independent of IP)
+            letter_entry = dict(store.get(letter_key, {"fails": 0, "last_fail": 0.0, "locked_until": 0.0}))
+            letter_fails = int(letter_entry.get("fails", 0)) + 1
+            letter_cooldown_sec = 0
+            if letter_fails > _LETTER_FREE_ATTEMPTS:
+                l_idx = min(letter_fails - _LETTER_FREE_ATTEMPTS - 1, len(_COOLDOWN_SCHEDULE_SECONDS) - 1)
+                letter_cooldown_sec = _COOLDOWN_SCHEDULE_SECONDS[l_idx]
+            letter_entry["fails"] = letter_fails
+            letter_entry["last_fail"] = now
+            letter_entry["locked_until"] = (now + letter_cooldown_sec) if letter_cooldown_sec > 0 else 0.0
+            store[letter_key] = letter_entry
+
+            _save_cooldown_store(store)
+            effective_cooldown = max(cooldown_sec, ip_cooldown_sec, letter_cooldown_sec)
+            free_remaining = max(0, min(_FREE_TYPO_ATTEMPTS - fails, _LETTER_FREE_ATTEMPTS - letter_fails))
+            return fails, effective_cooldown, free_remaining
 
 
 def _reset_cooldown_on_success(client_ip: str, token: str) -> None:
-    """Clears the per-(IP + Token) failure counter upon a valid 6-digit verification."""
+    """Clears the per-(IP + Token) and per-letter failure counters upon a valid verification."""
     ip = (client_ip or "unknown").strip()
-    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
-    store = _load_cooldown_store()
-    if tok_key in store:
-        del store[tok_key]
-        _save_cooldown_store(store)
+    tok_key = f"ip_tok:{ip}:{_canonical_token_key(token)}"
+    l_key = _letter_key(token)
+    with _COOLDOWN_LOCK:
+        with _cooldown_file_lock():
+            store = _load_cooldown_store()
+            changed = False
+            for key in (tok_key, l_key):
+                if key in store:
+                    del store[key]
+                    changed = True
+            if changed:
+                _save_cooldown_store(store)
 
 
 def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") -> Dict[str, Any]:
@@ -613,9 +886,12 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
     Validates the QR token signature and returns minimal gate prompt info (without revealing LG details
     until the Security Code is entered). Supports both v1 (6-digit footer code) and v2 (2 LG chars + 4-digit footer code).
     """
+    token = (token or "").strip()
     rem_cooldown = _check_cooldown_status(client_ip, token)
 
-    if not token or token.count(".") not in (2, 3):
+    # ASCII-only guard: hmac.compare_digest raises TypeError on non-ASCII str, and str.isdigit()
+    # accepts Unicode digits (e.g. '²') that int() rejects -> both would surface as HTTP 500.
+    if not token or not token.isascii() or token.count(".") not in (2, 3):
         return {"valid_token": False, "reason": "Malformed verification link."}
 
     parts = token.split(".")
@@ -631,17 +907,14 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
     version = 2 if is_v2 else 1
 
     if base_kind == "P":
+        # Sample/preview QR codes (Template Studio) must NEVER be presented as a valid instruction,
+        # otherwise a fraudster could copy a sample QR + code onto a fake letter.
         return {
-            "valid_token": True,
+            "valid_token": False,
             "is_preview": True,
             "version": version,
-            "masked_serial": "SAMPLE-REF-0001",
             "cooldown_seconds": rem_cooldown,
-            "prompt": (
-                "Enter the last 2 characters of the LG Number (from the letter body) and the 4-digit Security Code (from the footer)."
-                if version == 2
-                else "Enter the 6-digit Security Code printed at the bottom of the instruction letter."
-            ),
+            "reason": _PREVIEW_REJECTION_REASON,
         }
 
     if base_kind not in ("I", "M") or not id_str.isdigit():
@@ -651,8 +924,14 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
 
     if base_kind == "I":
         from app.models.models import LGInstruction
-        inst = db.query(LGInstruction).filter(LGInstruction.id == record_id, LGInstruction.is_deleted == False).first()
-        if not inst:
+        from sqlalchemy.orm import selectinload
+        inst = (
+            db.query(LGInstruction)
+            .options(selectinload(LGInstruction.lg_record))
+            .filter(LGInstruction.id == record_id, LGInstruction.is_deleted == False)
+            .first()
+        )
+        if not inst or not inst.lg_record or inst.lg_record.is_deleted:
             return {"valid_token": False, "reason": "Instruction record not found."}
         db_ts = _to_epoch_seconds(getattr(inst, "created_at", None) or getattr(inst, "instruction_date", None))
         expected_sig = _compute_hmac_sig(
@@ -680,8 +959,14 @@ def inspect_verification_token(db: Any, token: str, client_ip: str = "unknown") 
 
     # base_kind == "M"
     from app.models.models_issuance import IssuanceMaintenanceAction
-    maint = db.query(IssuanceMaintenanceAction).filter(IssuanceMaintenanceAction.id == record_id).first()
-    if not maint:
+    from sqlalchemy.orm import selectinload
+    maint = (
+        db.query(IssuanceMaintenanceAction)
+        .options(selectinload(IssuanceMaintenanceAction.issued_lg))
+        .filter(IssuanceMaintenanceAction.id == record_id, IssuanceMaintenanceAction.is_deleted == False)
+        .first()
+    )
+    if not maint or not maint.issued_lg or getattr(maint.issued_lg, "is_deleted", False):
         return {"valid_token": False, "reason": "Maintenance instruction record not found."}
     db_ts = _to_epoch_seconds(getattr(maint, "created_at", None))
     expected_sig = _compute_hmac_sig(
@@ -759,23 +1044,25 @@ def _trigger_honeypot_lockout(client_ip: str, token: str) -> Dict[str, Any]:
     Returns a standard cooldown response so the bot does not know a honeypot was triggered.
     """
     ip = (client_ip or "unknown").strip()
-    tok_key = f"ip_tok:{ip}:{(token or '')[:32]}"
+    tok_key = f"ip_tok:{ip}:{_canonical_token_key(token)}"
     ip_key = f"ip_all:{ip}"
     now = datetime.now(timezone.utc).timestamp()
     max_cooldown = _COOLDOWN_SCHEDULE_SECONDS[-1]  # 1800s (30 minutes)
-    store = _load_cooldown_store()
 
-    store[tok_key] = {
-        "fails": _FREE_TYPO_ATTEMPTS + len(_COOLDOWN_SCHEDULE_SECONDS),
-        "last_fail": now,
-        "locked_until": now + max_cooldown,
-    }
-    store[ip_key] = {
-        "fails": 12,
-        "last_fail": now,
-        "locked_until": now + max_cooldown,
-    }
-    _save_cooldown_store(store)
+    with _COOLDOWN_LOCK:
+        with _cooldown_file_lock():
+            store = _load_cooldown_store()
+            store[tok_key] = {
+                "fails": _FREE_TYPO_ATTEMPTS + len(_COOLDOWN_SCHEDULE_SECONDS),
+                "last_fail": now,
+                "locked_until": now + max_cooldown,
+            }
+            store[ip_key] = {
+                "fails": 12,
+                "last_fail": now,
+                "locked_until": now + max_cooldown,
+            }
+            _save_cooldown_store(store)
 
     return {
         "verified": False,
@@ -804,6 +1091,7 @@ def verify_instruction_with_code(
     - For v2 tokens ('I2.', 'M2.', 'P2.'): verifies the 4-digit footer code AND the last 2 characters
       of the LG Number from the letter body, triggering a Tamper Warning if the footer was copied onto a different LG.
     """
+    token = (token or "").strip()
     rem_cooldown = _check_cooldown_status(client_ip, token)
     if rem_cooldown > 0:
         return {
@@ -821,7 +1109,7 @@ def verify_instruction_with_code(
     ):
         return _trigger_honeypot_lockout(client_ip, token)
 
-    if not token or token.count(".") not in (2, 3):
+    if not token or not token.isascii() or token.count(".") not in (2, 3):
         return {"verified": False, "reason": "Invalid verification token."}
 
     parts = token.split(".")
@@ -835,6 +1123,16 @@ def verify_instruction_with_code(
     is_v2 = kind.endswith("2")
     base_kind = kind.rstrip("2")
 
+    if base_kind == "P":
+        # Sample/preview QR codes are never "verified", whatever code is entered.
+        return {
+            "verified": False,
+            "is_preview": True,
+            "status_category": "SAMPLE",
+            "status_label": _PREVIEW_STATUS_LABEL,
+            "reason": _PREVIEW_REJECTION_REASON,
+        }
+
     # Normalize inputs for v1 vs v2
     entered_lg_tail = (lg_tail or "").strip()
     clean_code = re.sub(r"[^0-9]", "", entered_code or "")
@@ -845,42 +1143,17 @@ def verify_instruction_with_code(
             compact = re.sub(r"[\s\-]", "", entered_code or "")
             entered_lg_tail = compact[:2]
             clean_code = re.sub(r"[^0-9]", "", compact[2:])
-        if len(re.sub(r"\s+", "", entered_lg_tail)) < 2:
+        tail_len = len(re.sub(r"\s+", "", entered_lg_tail))
+        if tail_len < 2:
             return {"verified": False, "reason": "Please enter the last 2 characters of the LG Number from the top of the letter."}
+        if tail_len > 2:
+            # Without this, a correct code + over-long tail would be reported as a false TAMPER alert.
+            return {"verified": False, "reason": "Please enter only the last 2 characters of the LG Number."}
         if len(clean_code) != 4:
             return {"verified": False, "reason": "Please enter the 4-digit Security Code printed in the letter footer."}
     else:
         if len(clean_code) != 6:
             return {"verified": False, "reason": "Please enter the complete 6-digit numeric Security Code."}
-
-    if base_kind == "P":
-        if is_v2:
-            _, expected_code = generate_verification_token_and_code("P", 0, "SAMPLE-REF-0001", "LG-2026-4120", 1762600000)
-            if not hmac.compare_digest(clean_code, expected_code):
-                return _build_failed_code_response(client_ip, token)
-            if not _matches_lg_last2("LG-2026-4120", entered_lg_tail):
-                return _build_tamper_lg_mismatch_response(client_ip, token, entered_lg_tail)
-        else:
-            _, expected_code = _generate_v1_token_and_6digit_code("P", 0, "SAMPLE-REF-0001", "SAMPLE-LG", 1762600000)
-            if not hmac.compare_digest(clean_code, expected_code.replace("-", "")):
-                return _build_failed_code_response(client_ip, token)
-        _reset_cooldown_on_success(client_ip, token)
-        return {
-            "verified": True,
-            "status_Category": "ACTIVE",
-            "status_label": "Verified Sample Preview",
-            "instruction_serial": "SAMPLE-REF-0001",
-            "action_type": "LG EXTENSION (SAMPLE)",
-            "issue_date": "08-Nov-2026",
-            "customer_masked": "Or****e Egypt",
-            "beneficiary_masked": "Or****e Egypt",
-            "bank_name": "Commercial International Bank (CIB)",
-            "lg_number_masked": "******4120",
-            "lg_amount_formatted": "EGP 2,500,000.00",
-            "authorized_parameter_label": "New Expiry Date",
-            "authorized_parameter_value": "30-Jun-2027",
-            "delivery_status": "Sample Preview Mode",
-        }
 
     if base_kind not in ("I", "M") or not id_str.isdigit():
         return {"verified": False, "reason": "Invalid verification token."}
@@ -902,7 +1175,7 @@ def verify_instruction_with_code(
             .filter(LGInstruction.id == record_id, LGInstruction.is_deleted == False)
             .first()
         )
-        if not inst or not inst.lg_record:
+        if not inst or not inst.lg_record or inst.lg_record.is_deleted:
             return {"verified": False, "reason": "Instruction record not found."}
 
         lg = inst.lg_record
@@ -1026,10 +1299,13 @@ def verify_instruction_with_code(
             selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.bank),
             selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.customer),
         )
-        .filter(IssuanceMaintenanceAction.id == record_id)
+        .filter(
+            IssuanceMaintenanceAction.id == record_id,
+            IssuanceMaintenanceAction.is_deleted == False,
+        )
         .first()
     )
-    if not maint or not maint.issued_lg:
+    if not maint or not maint.issued_lg or getattr(maint.issued_lg, "is_deleted", False):
         return {"verified": False, "reason": "Maintenance instruction record not found."}
 
     ilg = maint.issued_lg

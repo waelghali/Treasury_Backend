@@ -60,7 +60,9 @@ CURRENCY_ALIASES: Dict[str, str] = {
 }
 
 CURRENCY_REGEX = (
-    r"(?:EGP|USD|EUR|GBP|SAR|AED|US\$|L\.E\.?|LE|ج\.م|جنيه(?:\s+مصري)?|دولار(?:\s+[اأ]مريكي)?|"
+    r"(?:(?<![A-Za-z])(?:EGP|USD|EUR|GBP|SAR|AED|LE)(?![A-Za-z])"
+    r"|(?<![A-Za-z])US\$|(?<![A-Za-z])L\.E\.?(?![A-Za-z])"
+    r"|ج\.م|جنيه(?:\s+مصري)?|دولار(?:\s+[اأ]مريكي)?|"
     r"يورو|ريال(?:\s+سعودي)?|درهم(?:\s+[إا]ماراتي)?|[إا]سترليني|[\$€£])"
 )
 
@@ -94,6 +96,15 @@ ACCOUNT_PATTERN = re.compile(
 DATE_PATTERN = re.compile(
     r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})"
 )
+
+_BALANCE_NUM_PAT = (
+    r"(?P<num>"
+    r"\([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,4})?\)"
+    r"|[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,4})?"
+    r")(?!\d)"
+)
+_LABEL_SEP_PAT = r"(?:\s*[:=]|\s+[-–—]\s+)?\s*"
+_DC_PAT = r"(?P<dc>(?:DR|CR|debit|credit)(?![A-Za-z])|مدين|دائن)"
 
 
 def normalize_arabic_digits(text: str) -> str:
@@ -245,6 +256,7 @@ def unlock_pdf_bytes(
     Returns (resulting_pdf_bytes, was_encrypted, is_unlocked).
     """
     passwords = candidate_passwords or []
+    fitz_needs_pass = False
 
     # Try PyMuPDF first
     try:
@@ -253,6 +265,7 @@ def unlock_pdf_bytes(
             if not doc.needs_pass:
                 return pdf_bytes, False, True
 
+            fitz_needs_pass = True
             for pwd in passwords:
                 if doc.authenticate(pwd) > 0:
                     unlocked = doc.tobytes()
@@ -266,6 +279,8 @@ def unlock_pdf_bytes(
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if not reader.is_encrypted:
+            if fitz_needs_pass:
+                return pdf_bytes, True, False
             return pdf_bytes, False, True
 
         for pwd in passwords:
@@ -283,7 +298,7 @@ def unlock_pdf_bytes(
         return pdf_bytes, True, False
     except Exception as pypdf_err:
         logger.warning(f"PDF unlock inspection failed: {pypdf_err}")
-        return pdf_bytes, False, False
+        return pdf_bytes, fitz_needs_pass, False
 
 
 def _extract_account_from_segment(segment: str) -> Optional[str]:
@@ -291,11 +306,15 @@ def _extract_account_from_segment(segment: str) -> Optional[str]:
     iban_m = re.search(r"\b(EG\d{25,27})\b", segment, re.IGNORECASE)
     if iban_m:
         return iban_m.group(1).upper()
-    m = ACCOUNT_PATTERN.search(segment)
-    if m:
+    for m in ACCOUNT_PATTERN.finditer(segment):
         grp = m.group(1) if m.lastindex else m.group(0)
-        if grp and any(ch.isdigit() for ch in grp):
-            return grp.strip()
+        if not grp:
+            continue
+        cleaned = grp.strip()
+        if DATE_PATTERN.fullmatch(cleaned):
+            continue
+        if any(ch.isdigit() for ch in cleaned):
+            return cleaned
     return None
 
 
@@ -322,21 +341,18 @@ def extract_cash_balances_from_text(
     global_date_match = DATE_PATTERN.search(norm_text)
     global_date = global_date_match.group(1) if global_date_match else default_date
 
-    # Number token pattern (requires digit, allows commas and decimals, optional parens/sign)
-    num_pat = r"(?P<num>\(?[+-]?\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,4})?\)?|\(?[+-]?\d+(?:\.\d{1,4})?\)?)"
-
     # Patterns matching labeled balances on a segment
     avail_re = re.compile(
-        rf"(?:{AVAILABLE_BALANCE_LABELS})\s*(?:\([^\)]*\))?\s*[:=\-]?\s*(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{num_pat}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*(?P<dc>DR|CR|debit|credit|مدين|دائن))?",
+        rf"(?:{AVAILABLE_BALANCE_LABELS})\s*(?:\([^\)]*\))?{_LABEL_SEP_PAT}(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{_BALANCE_NUM_PAT}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*{_DC_PAT})?",
         re.IGNORECASE,
     )
     ledger_re = re.compile(
-        rf"(?:{LEDGER_BALANCE_LABELS})\s*(?:\([^\)]*\))?\s*[:=\-]?\s*(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{num_pat}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*(?P<dc>DR|CR|debit|credit|مدين|دائن))?",
+        rf"(?:{LEDGER_BALANCE_LABELS})\s*(?:\([^\)]*\))?{_LABEL_SEP_PAT}(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{_BALANCE_NUM_PAT}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*{_DC_PAT})?",
         re.IGNORECASE,
     )
     # Also handle currency-prefixed / post-labeled lines like "USD Available Balance: USD 85,200.50"
     generic_ccy_bal_re = re.compile(
-        rf"(?:^|\b)(?:(?P<ccy_lead>{CURRENCY_REGEX})\s+)?(?:{GENERIC_BALANCE_LABELS})\s*[:=\-]?\s*(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{num_pat}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*(?P<dc>DR|CR|debit|credit|مدين|دائن))?",
+        rf"(?:^|\b)(?:(?P<ccy_lead>{CURRENCY_REGEX})\s+)?(?:{GENERIC_BALANCE_LABELS}){_LABEL_SEP_PAT}(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{_BALANCE_NUM_PAT}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*{_DC_PAT})?",
         re.IGNORECASE,
     )
 
@@ -382,8 +398,8 @@ def extract_cash_balances_from_text(
         if date_hit:
             current_date = date_hit.group(1)
 
-        # Look for leading currency hint on the line (e.g. "USD Available Balance: ...")
-        leading_ccy_m = re.search(rf"(?:^|\s)({CURRENCY_REGEX})(?:\s|$)", line, re.IGNORECASE)
+        # Look for leading currency hint on the line (e.g. "USD Available Balance: ..." or "Available Balance (USD): ...")
+        leading_ccy_m = re.search(rf"(?:^|[\s(])({CURRENCY_REGEX})(?:[\s):,]|$)", line, re.IGNORECASE)
         line_ccy_hint = normalize_currency_token(leading_ccy_m.group(1), default_currency) if leading_ccy_m else default_currency
 
         matched_this_line = False
@@ -441,13 +457,12 @@ def _extract_opening_closing_meta_from_text(text: str) -> Dict[str, Any]:
     if acct:
         meta["account_number"] = acct
 
-    num_pat = r"(?P<num>\(?[+-]?\d{1,3}(?:,\d{3})*(?:\.\d{1,4})?\)?|\(?[+-]?\d+(?:\.\d{1,4})?\)?)"
     open_re = re.compile(
-        rf"(?:{OPENING_BALANCE_LABELS})\s*(?:\([^\)]*\))?\s*[:=\-]?\s*(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{num_pat}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*(?P<dc>DR|CR|مدين|دائن))?",
+        rf"(?:{OPENING_BALANCE_LABELS})\s*(?:\([^\)]*\))?{_LABEL_SEP_PAT}(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{_BALANCE_NUM_PAT}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*{_DC_PAT})?",
         re.IGNORECASE,
     )
     close_re = re.compile(
-        rf"(?:{LEDGER_BALANCE_LABELS})\s*(?:\([^\)]*\))?\s*[:=\-]?\s*(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{num_pat}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*(?P<dc>DR|CR|debit|credit|مدين|دائن))?",
+        rf"(?:{LEDGER_BALANCE_LABELS})\s*(?:\([^\)]*\))?{_LABEL_SEP_PAT}(?:(?P<ccy_pre>{CURRENCY_REGEX})\s*)?{_BALANCE_NUM_PAT}(?:\s*(?P<ccy_post>{CURRENCY_REGEX}))?(?:\s*{_DC_PAT})?",
         re.IGNORECASE,
     )
 
@@ -486,7 +501,9 @@ def _fallback_extract_lines_table(doc: fitz.Document) -> List[List[str]]:
     date_line_re = re.compile(
         r"(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4})"
     )
-    amt_re = re.compile(r"\(?[+-]?\d{1,3}(?:,\d{3})*\.\d{2}\)?")
+    amt_re = re.compile(
+        r"(?<![\d,.])(?:\([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}\)|[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})(?!\d)"
+    )
 
     for page in doc:
         page_text = normalize_arabic_digits(page.get_text("text") or "")
@@ -556,7 +573,10 @@ def extract_statement_from_pdf(
     an UNLOCKED PDF byte stream.
     Returns (df, pdf_meta, summary_balances).
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise ValueError(f"Invalid or unreadable PDF statement file: {exc}") from exc
     try:
         full_text_parts: List[str] = []
         table_rows: List[List[str]] = []

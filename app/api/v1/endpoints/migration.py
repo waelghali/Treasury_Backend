@@ -480,25 +480,6 @@ def _get_id_by_name(db: Session, model: Any, name: str) -> Optional[int]:
     # Generic lookup for other models
     obj = db.query(model).filter(func.lower(model.name) == func.lower(name)).first()
     return obj.id if obj else None
-    if isinstance(record_data.get("lg_type_id"), str):
-        lg_type_name = record_data.pop("lg_type_id")
-        lg_type_obj = _get_id_by_name(db, models.LgType, lg_type_name)
-        if lg_type_obj:
-            record_data["lg_type_id"] = lg_type_obj
-        else:
-            record_data["lg_type_id"] = lg_type_name
-
-    if isinstance(record_data.get("lg_operational_status_id"), str):
-        operational_status_name = record_data.pop("lg_operational_status_id")
-        operational_status_obj = _get_id_by_name(db, models.LgOperationalStatus, operational_status_name)
-        if operational_status_obj:
-            record_data["lg_operational_status_id"] = operational_status_obj
-        else:
-            record_data["lg_operational_status_id"] = operational_status_name
-        
-    # Generic lookup for other models
-    obj = db.query(model).filter(func.lower(model.name) == func.lower(name)).first()
-    return obj.id if obj else None
 
 def _get_entity_id_from_name(db: Session, customer_id: int, entity_name: str) -> Optional[int]:
     """Finds a customer entity ID by its name for a given customer."""
@@ -1667,6 +1648,39 @@ async def import_ready_records(
 class DeleteRecordsIn(BaseModel):
     ids: List[int]
 
+@router.delete("/staged/delete-all", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
+def delete_all_staged_records(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Deletes all staged records for the current customer, unlinking any references first.
+    """
+    customer_id = current_user.customer_id
+    staged_ids = [
+        r.id for r in db.query(models.LGMigrationStaging.id).filter(
+            models.LGMigrationStaging.customer_id == customer_id
+        ).all()
+    ]
+    if not staged_ids:
+        return {"deleted_count": 0, "message": "No staged records found."}
+
+    db.query(models.LGRecord).filter(
+        models.LGRecord.customer_id == customer_id,
+        models.LGRecord.migrated_from_staging_id.in_(staged_ids),
+    ).update({"migrated_from_staging_id": None}, synchronize_session=False)
+
+    db.query(models.LGChangeLog).filter(
+        models.LGChangeLog.staging_id.in_(staged_ids)
+    ).update({"staging_id": None}, synchronize_session=False)
+
+    deleted_count = db.query(models.LGMigrationStaging).filter(
+        models.LGMigrationStaging.customer_id == customer_id
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted_count": deleted_count, "message": f"Deleted {deleted_count} staged records."}
+
+
 @router.delete("/staged/{record_id}", status_code=status.HTTP_200_OK, response_model=Dict[str, str])
 def delete_staged_record(
     record_id: int,
@@ -1724,39 +1738,6 @@ def delete_multiple_staged_records(
         migration_service._cleanup_migration_staging_file(str(att_url), current_user.customer_id, db=None)
 
     return {"deleted_count": deleted_count}
-
-
-@router.delete("/staged/delete-all", status_code=status.HTTP_200_OK, response_model=Dict[str, Any])
-def delete_all_staged_records(
-    current_user: TokenData = Depends(get_current_corporate_admin_context),
-    db: Session = Depends(get_db),
-):
-    """
-    Deletes all staged records for the current customer, unlinking any references first.
-    """
-    customer_id = current_user.customer_id
-    staged_ids = [
-        r.id for r in db.query(models.LGMigrationStaging.id).filter(
-            models.LGMigrationStaging.customer_id == customer_id
-        ).all()
-    ]
-    if not staged_ids:
-        return {"deleted_count": 0, "message": "No staged records found."}
-
-    db.query(models.LGRecord).filter(
-        models.LGRecord.customer_id == customer_id,
-        models.LGRecord.migrated_from_staging_id.in_(staged_ids),
-    ).update({"migrated_from_staging_id": None}, synchronize_session=False)
-
-    db.query(models.LGChangeLog).filter(
-        models.LGChangeLog.staging_id.in_(staged_ids)
-    ).update({"staging_id": None}, synchronize_session=False)
-
-    deleted_count = db.query(models.LGMigrationStaging).filter(
-        models.LGMigrationStaging.customer_id == customer_id
-    ).delete(synchronize_session=False)
-    db.commit()
-    return {"deleted_count": deleted_count, "message": f"Deleted {deleted_count} staged records."}
 
 
 def _evaluate_migration_reset_eligibility(

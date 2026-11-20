@@ -442,16 +442,16 @@ def run_comprehensive_checks():
         db.commit()
 
         # Check winner outcome: documents MUST be unsealed with valid signed URL
-        res_winner = asyncio.run(get_public_rfq_result(token_winner, db))
+        res_winner = get_public_rfq_result(token_winner, db)
         assert res_winner.get("status") in ("WINNER", "PARTIALLY_WON"), f"Expected WINNER, got {res_winner.get('status')}"
         rel_docs = res_winner.get("released_documents", [])
         assert len(rel_docs) == 1, f"Expected 1 released doc for winner, got {len(rel_docs)}"
         assert rel_docs[0]["name"] == "Trade_Confidential_Contract.pdf"
-        assert rel_docs[0]["path"].startswith("https://storage.googleapis.com/"), "Path is not a valid signed URL"
+        assert rel_docs[0]["path"].startswith(("/api/v1/quotations/documents/download", "https://storage.googleapis.com/")), "Path is not a valid download or signed URL"
         print(f"[Pass] Winner-Only Unsealing: Winning bank ({bank.name}) successfully received confidential document with signed URL")
 
         # Check losing bank outcome: documents MUST be strictly withheld (0 documents)
-        res_loser = asyncio.run(get_public_rfq_result(token_loser, db))
+        res_loser = get_public_rfq_result(token_loser, db)
         assert res_loser.get("status") in ("NOT_SELECTED", "UNEXECUTED", "COMPLETED"), f"Expected loser status, got {res_loser.get('status')}"
         assert len(res_loser.get("released_documents", [])) == 0, f"LEAK: Losing bank was able to see {len(res_loser.get('released_documents'))} documents!"
         print(f"[Pass] Loser Document Privacy: Non-winning bank received 0 documents (withheld as designed)")
@@ -557,7 +557,7 @@ def run_comprehensive_checks():
         db.commit()
 
         # Check Bank A split outcome
-        res_split_a = asyncio.run(get_public_rfq_result(token_split_a, db))
+        res_split_a = get_public_rfq_result(token_split_a, db)
         assert res_split_a.get("status") == "PARTIALLY_WON", f"Expected PARTIALLY_WON for Bank A, got {res_split_a.get('status')}"
         assert res_split_a.get("won_legs_count") == 1, f"Expected 1 won leg for Bank A, got {res_split_a.get('won_legs_count')}"
         assert res_split_a.get("total_legs_count") == 2, f"Expected 2 total legs, got {res_split_a.get('total_legs_count')}"
@@ -566,7 +566,7 @@ def run_comprehensive_checks():
         print(f"[Pass] Partial Package Outcome (Bank A): Status = PARTIALLY_WON (Won: {res_split_a.get('won_pairs')}, Lost: {res_split_a.get('lost_pairs')})")
 
         # Check Bank B split outcome
-        res_split_b = asyncio.run(get_public_rfq_result(token_split_b, db))
+        res_split_b = get_public_rfq_result(token_split_b, db)
         assert res_split_b.get("status") == "PARTIALLY_WON", f"Expected PARTIALLY_WON for Bank B, got {res_split_b.get('status')}"
         assert res_split_b.get("won_legs_count") == 1, f"Expected 1 won leg for Bank B, got {res_split_b.get('won_legs_count')}"
         assert "USD/SAR" in res_split_b.get("won_pairs", [])

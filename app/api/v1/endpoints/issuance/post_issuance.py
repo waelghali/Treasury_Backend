@@ -11,7 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from app.database import get_db
-from app.core.security import get_current_corporate_admin_context, get_current_approver_context, get_current_treasury_context, get_issuance_read_context, check_subscription_status, TokenData
+from app.core.security import get_current_corporate_admin_context, get_current_approver_context, get_current_treasury_context, get_issuance_read_context, check_subscription_status, check_for_read_only_mode, TokenData
 from app.core.document_generator import generate_pdf_from_html
 from app.core.encryption import encrypt_data 
 
@@ -2216,7 +2216,9 @@ def get_maintenance_pending_print(
         IssuanceMaintenanceAction.instruction_status == "Instruction Issued",
         IssuanceMaintenanceAction.is_deleted == False,
     ).options(
-        selectinload(IssuanceMaintenanceAction.issued_lg),
+        selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.bank),
+        selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.issuing_entity),
+        selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.currency),
     ).order_by(IssuanceMaintenanceAction.created_at.asc()).all()
 
     results = []
@@ -2231,7 +2233,12 @@ def get_maintenance_pending_print(
             "executed_at": str(a.updated_at) if a.updated_at else None,
             "issued_lg_id": a.issued_lg_id,
             "lg_ref_number": lg.lg_ref_number if lg else None,
+            "bank_lg_number": lg.bank_lg_number if lg else None,
             "lg_beneficiary": lg.beneficiary_name if lg else None,
+            "bank_name": lg.bank.name if lg and lg.bank else None,
+            "entity_name": lg.issuing_entity.entity_name if lg and lg.issuing_entity else None,
+            "amount": float(lg.current_amount) if lg and lg.current_amount is not None else None,
+            "currency_code": lg.currency.iso_code if lg and lg.currency else None,
             "initiated_by_user_id": a.initiated_by_user_id,
             # Normalized fields for action center display
             "source": "issuance_maintenance",
@@ -2245,23 +2252,29 @@ def mark_maintenance_printed(
     action_id: int,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_treasury_context),
+    _: TokenData = Depends(check_for_read_only_mode),
 ):
     """Mark a maintenance instruction as printed (advances instruction_status)."""
     action = db.query(IssuanceMaintenanceAction).join(
         IssuedLGRecord, IssuedLGRecord.id == IssuanceMaintenanceAction.issued_lg_id
     ).filter(
         IssuanceMaintenanceAction.id == action_id,
+        IssuanceMaintenanceAction.is_deleted == False,
         IssuedLGRecord.customer_id == current_user.customer_id,
     ).first()
 
     if not action:
         raise HTTPException(status_code=404, detail="Maintenance action not found")
 
+    if action.status != "EXECUTED":
+        raise HTTPException(status_code=400, detail="Only EXECUTED maintenance actions can be marked printed")
+
     if action.instruction_status != "Instruction Issued":
         raise HTTPException(status_code=400, detail="Action is not in 'Instruction Issued' status")
 
     # Advance to next status (printed but not yet delivered)
     action.instruction_status = "Printed"
+    action.is_printed = True
     db.commit()
     db.refresh(action)
 

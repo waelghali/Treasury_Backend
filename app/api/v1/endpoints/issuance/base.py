@@ -43,7 +43,7 @@ from app.crud.crud_facility import crud_facility
 from app.crud.crud_bank_methods import crud_bank_methods
 from fastapi.responses import StreamingResponse
 from app.constants import GlobalConfigKey
-from app.crud.crud_config import crud_customer_configuration
+from app.crud.crud_config import crud_customer_configuration, crud_global_configuration
 
 router = APIRouter()
 def _read_bank_form_pdf_bytes(form_template) -> bytes:
@@ -1555,17 +1555,19 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
             config.issued_lg_scan_mandatory = bool(new_val["issued_lg_scan_mandatory"])
         if "verification_policy" in new_val:
             config.verification_policy = new_val["verification_policy"]
+            db.flush()
             try:
-                import json
-                crud_customer_configuration.set_customer_config(
-                    db,
-                    customer_id=change_req.customer_id,
-                    config_key=GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY,
-                    configured_value=json.dumps(new_val["verification_policy"]),
-                    user_id=change_req.requested_by_user_id
-                )
-            except Exception:
-                pass
+                gc = crud_global_configuration.get_by_key(db, GlobalConfigKey.ISSUED_LG_VERIFICATION_POLICY)
+                if gc:
+                    crud_customer_configuration.set_customer_config(
+                        db,
+                        customer_id=change_req.customer_id,
+                        global_config_id=gc.id,
+                        configured_value=json.dumps(new_val["verification_policy"]),
+                        user_id=change_req.requested_by_user_id,
+                    )
+            except Exception as sync_err:
+                logger.warning(f"Failed to sync ISSUED_LG_VERIFICATION_POLICY to CustomerConfiguration: {sync_err}")
 
     elif ct == "APPROVAL_MATRIX_UPDATE":
         # Bulk-replace workflow policies
@@ -1638,7 +1640,6 @@ def _apply_admin_change(db: Session, change_req: AdminChangeRequest):
             crud_approval_group.update_group(db, grp, update_data, change_req.requested_by_user_id)
 
     elif ct == "CUSTOMER_CONFIG_UPDATE":
-        from app.crud.crud import crud_customer_configuration
         crud_customer_configuration.set_customer_config(
             db,
             customer_id=change_req.customer_id,

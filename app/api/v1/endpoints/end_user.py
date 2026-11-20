@@ -18,7 +18,7 @@ from sqlalchemy import func, and_
 from typing import List, Optional, Any, Dict, Tuple
 import asyncio
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 
 from app.schemas.all_schemas import (
     LGRecordCreate, LGRecordOut, LGDocumentOut,
@@ -49,6 +49,11 @@ from app.schemas.all_schemas import (
     AutoRenewalBatchItemOut,
     AutoRenewalBatchOut,
     BulkReprintInstructionsIn,
+    BulkPrintItemIn,
+    BulkPrintRequestIn,
+    BulkPrintBatchItemOut,
+    BulkPrintRunSummaryOut,
+    BulkPrintBatchOut,
     AutoRenewalPreviewOut,
     RunAutoRenewalRequestIn,
     CustomerConfigurationOut,
@@ -140,6 +145,7 @@ try:
     from app.core.ai_integration import process_lg_document_with_ai, generate_signed_gcs_url, process_amendment_with_ai
 
     from app.core.document_generator import generate_pdf_from_html, generate_merged_pdf_from_html_list
+    from app.core.instruction_verification import register_instruction_for_verification, attach_verification_marker
     from app.core.email_service import EmailSettings, get_global_email_settings, send_email, get_customer_email_settings
 
 except Exception as e:
@@ -318,6 +324,7 @@ def get_auto_renewal_preview_endpoint(
     summary="Run automated and forced LG renewal for eligible records"
 )
 async def run_auto_renewal_endpoint(
+    background_tasks: BackgroundTasks,
     request_payload: Optional[RunAutoRenewalRequestIn] = None,
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
@@ -334,6 +341,7 @@ async def run_auto_renewal_endpoint(
     try:
         has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
         selected_items = request_payload.renewals if request_payload and request_payload.renewals is not None else None
+        pad_for_duplex = bool(request_payload.pad_for_duplex) if request_payload else False
 
         renewed_count, combined_pdf_bytes, batch_id, renewed_items = await crud_lg_record.run_auto_renewal_process(
             db,
@@ -341,7 +349,9 @@ async def run_auto_renewal_endpoint(
             customer_id=end_user_context.customer_id,
             selected_items=selected_items,
             user_has_all_access=has_all,
-            user_allowed_entity_ids=allowed_ids
+            user_allowed_entity_ids=allowed_ids,
+            pad_for_duplex=pad_for_duplex,
+            background_tasks=background_tasks,
         )
 
         if combined_pdf_bytes:
@@ -374,7 +384,7 @@ async def run_auto_renewal_endpoint(
 
 def _render_instruction_letter_html(db: Session, db_instruction: models.LGInstruction) -> str:
     """Helper to render the populated HTML for a single LGInstruction letter."""
-    template = crud_template.get(db, db_instruction.template_id)
+    template = getattr(db_instruction, "template", None) or crud_template.get(db, db_instruction.template_id)
     if not template:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Template not found for instruction {db_instruction.id}.")
 
@@ -387,8 +397,14 @@ def _render_instruction_letter_html(db: Session, db_instruction: models.LGInstru
         expiry_date_str = lg_record_for_template.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "expiry_date", None) else "N/A"
         customer_obj = lg_record_for_template.customer
         entity_obj = lg_record_for_template.beneficiary_corporate
+        currency_obj = lg_record_for_template.lg_currency
+        owner_obj = lg_record_for_template.internal_owner_contact
         customer_address_val = (entity_obj.address if entity_obj and entity_obj.address else (customer_obj.address if customer_obj else "")) or ""
         customer_email_val = (entity_obj.contact_email if entity_obj and entity_obj.contact_email else (customer_obj.contact_email if customer_obj else "")) or ""
+        currency_code = currency_obj.iso_code if currency_obj else ""
+        currency_symbol = currency_obj.symbol if currency_obj else ""
+        beneficiary_name = entity_obj.entity_name if entity_obj else ""
+        customer_name = customer_obj.name if customer_obj else ""
 
         instruction_details.update({
             "lg_number": lg_record_for_template.lg_number,
@@ -396,14 +412,14 @@ def _render_instruction_letter_html(db: Session, db_instruction: models.LGInstru
             "instruction_serial": db_instruction.serial_number or "",
             "serial_number": db_instruction.serial_number or "",
             "lg_amount": float(lg_record_for_template.lg_amount),
-            "lg_currency": lg_record_for_template.lg_currency.iso_code if lg_record_for_template.lg_currency else "",
+            "lg_currency": currency_code,
             "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record_for_template),
             "lg_issuer_name": lg_record_for_template.issuer_name,
-            "lg_beneficiary_name": lg_record_for_template.beneficiary_corporate.entity_name if lg_record_for_template.beneficiary_corporate else "",
-            "customer_name": lg_record_for_template.customer.name if lg_record_for_template.customer else "",
+            "lg_beneficiary_name": beneficiary_name,
+            "customer_name": customer_name,
             "customer_address": customer_address_val,
             "customer_contact_email": customer_email_val,
-            "internal_owner_email": lg_record_for_template.internal_owner_contact.email if lg_record_for_template.internal_owner_contact else "",
+            "internal_owner_email": owner_obj.email if owner_obj else "",
             "current_date": (db_instruction.instruction_date.strftime("%Y-%m-%d") if getattr(db_instruction, "instruction_date", None) else date.today().strftime("%Y-%m-%d")),
             "platform_name": "Treasury Management Platform",
             "recipient_name": recipient_name,
@@ -423,14 +439,92 @@ def _render_instruction_letter_html(db: Session, db_instruction: models.LGInstru
             except Exception:
                 instruction_details["extension_period"] = "N/A"
 
-        symbol = lg_record_for_template.lg_currency.symbol if lg_record_for_template.lg_currency else ""
-        instruction_details["lg_amount_formatted"] = f"{symbol} {float(lg_record_for_template.lg_amount):,.2f}"
+        if "enclosed_documents_clause" not in instruction_details:
+            pending_cnt = instruction_details.get("pending_replies_count", 0)
+            instruction_details["enclosed_documents_clause"] = (
+                "Kindly find the original Letter of Guarantee attached herewith along with all its extension confirmation(s) received from your esteemed bank for your records and cancellation."
+                if not pending_cnt
+                else "Kindly find the original Letter of Guarantee attached herewith; however, as we have not yet received all LG extension confirmation(s) from your esteemed bank, we hereby commit to return them back to the bank immediately upon receipt."
+            )
+
+        if "settlement_instruction" not in instruction_details:
+            instruction_details["settlement_instruction"] = (
+                f"Kindly arrange to settle the proceeds of this guarantee by bank transfer or issuing a bank draft/cashier order payable to {beneficiary_name} ({customer_name}), in accordance with our standing settlement instructions."
+            )
+
+        instruction_details["lg_amount_formatted"] = f"{currency_symbol} {float(lg_record_for_template.lg_amount):,.2f}"
+        if "original_lg_amount" in instruction_details:
+            instruction_details["original_lg_amount_formatted"] = f"{currency_symbol} {float(instruction_details['original_lg_amount']):,.2f}"
+        if "new_lg_amount" in instruction_details:
+            instruction_details["new_lg_amount_formatted"] = f"{currency_symbol} {float(instruction_details['new_lg_amount']):,.2f}"
+        if "decrease_amount" in instruction_details:
+            instruction_details["decrease_amount_formatted"] = f"{currency_symbol} {float(instruction_details['decrease_amount']):,.2f}"
+        if "original_lg_amount" in instruction_details and "new_lg_amount" in instruction_details and "liquidation_amount_formatted" not in instruction_details:
+            liq_amt = float(instruction_details["original_lg_amount"]) - float(instruction_details["new_lg_amount"])
+            instruction_details["liquidation_amount"] = liq_amt
+            instruction_details["liquidation_amount_formatted"] = f"{currency_symbol} {liq_amt:,.2f}"
+
+        if db_instruction.instruction_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE and "payment_details" in instruction_details:
+            payment_details = instruction_details["payment_details"] or {}
+            payment_curr = crud_currency.get(db, payment_details.get("currency_id")) if payment_details.get("currency_id") else None
+            payment_bank = crud_bank.get(db, payment_details.get("issuing_bank_id")) if payment_details.get("issuing_bank_id") else None
+            payment_amt = float(payment_details.get("amount") or 0)
+            instruction_details["payment_method"] = payment_details.get("payment_method")
+            instruction_details["payment_amount"] = payment_amt
+            instruction_details["payment_currency_code"] = payment_curr.iso_code if payment_curr else ""
+            instruction_details["payment_reference"] = payment_details.get("payment_reference")
+            instruction_details["payment_issuing_bank_name"] = payment_bank.name if payment_bank else ""
+            instruction_details["payment_date"] = payment_details.get("payment_date")
+            instruction_details["payment_amount_formatted"] = f"{instruction_details['payment_currency_code']} {payment_amt:,.2f}"
+
+        if db_instruction.instruction_type == ACTION_TYPE_LG_REMINDER_TO_BANKS:
+            orig_inst = None
+            orig_id_raw = instruction_details.get("original_instruction_id")
+            if orig_id_raw is not None:
+                try:
+                    orig_inst = db.query(models.LGInstruction).filter(
+                        models.LGInstruction.id == int(orig_id_raw),
+                        models.LGInstruction.is_deleted == False,
+                    ).first()
+                except (ValueError, TypeError):
+                    orig_inst = None
+            orig_deliv = getattr(orig_inst, "delivery_date", None) if orig_inst else None
+            if orig_deliv:
+                orig_deliv_str = orig_deliv.strftime("%Y-%m-%d") if hasattr(orig_deliv, "strftime") else str(orig_deliv)
+                instruction_details.setdefault("original_instruction_delivery_date", orig_deliv_str)
+                instruction_details.setdefault("delivery_clause", f"(or delivered on {orig_deliv_str})")
+            else:
+                instruction_details.setdefault("original_instruction_delivery_date", "N/A")
+                instruction_details.setdefault("delivery_clause", "")
+            if orig_inst:
+                instruction_details.setdefault("original_instruction_serial", orig_inst.serial_number or "")
+                instruction_details.setdefault("original_instruction_type", orig_inst.instruction_type or "")
+                if orig_inst.instruction_date:
+                    instruction_details.setdefault("original_instruction_date", orig_inst.instruction_date.strftime("%Y-%m-%d"))
+            instruction_details.setdefault("notes_section", "")
+            instruction_details.setdefault("issuance_date", issuance_date_str)
+            instruction_details.setdefault("issue_date", issuance_date_str)
+            instruction_details.setdefault("expiry_date", expiry_date_str)
+            instruction_details.setdefault("maturity_date", expiry_date_str)
 
     for key, value in instruction_details.items():
         str_value = str(value) if value is not None else ""
         generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
 
-    return generated_html
+    lg_num_val = lg_record_for_template.lg_number if lg_record_for_template else ""
+    register_instruction_for_verification(
+        db_instruction.id,
+        db_instruction.serial_number or "",
+        lg_num_val or "",
+        getattr(db_instruction, "created_at", None) or getattr(db_instruction, "instruction_date", None),
+        "I",
+    )
+    return attach_verification_marker(
+        generated_html,
+        serial_number=db_instruction.serial_number,
+        record_kind="I",
+        record_id=db_instruction.id,
+    )
 
 
 @router.get(
@@ -592,6 +686,7 @@ async def reprint_auto_renewal_batch_endpoint(
             selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.internal_owner_contact),
             selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
             selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+            selectinload(models.LGInstruction.template),
         )
         .filter(
             models.LGInstruction.id.in_(payload.instruction_ids),
@@ -615,7 +710,8 @@ async def reprint_auto_renewal_batch_endpoint(
 
     combined_pdf_bytes = await generate_merged_pdf_from_html_list(
         html_list,
-        f"reprint_bulk_lg_renewal_customer_{end_user_context.customer_id}_{date.today().isoformat()}"
+        f"reprint_bulk_lg_renewal_customer_{end_user_context.customer_id}_{date.today().isoformat()}",
+        pad_for_duplex=payload.pad_for_duplex,
     )
     if not combined_pdf_bytes:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate combined PDF.")
@@ -4217,102 +4313,9 @@ async def view_lg_instruction_letter(
     if not db_instruction:
         logger.warning(f"Instruction ID {instruction_id} not found.")
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="LG Instruction not found.")
-    
-    template = crud_template.get(db, db_instruction.template_id)
-    if not template:
-        logger.error(f"Template ID {db_instruction.template_id} not found for instruction ID {instruction_id}.")
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Template not found.")
 
-    generated_html = template.content
-    logger.debug(f"Template content fetched for instruction ID {instruction_id}. Length: {len(generated_html)}.")
-
-    instruction_details = db_instruction.details if db_instruction.details is not None else {}
-    
-    # Use the already loaded lg_record from db_instruction to avoid another DB call.
+    generated_html = _render_instruction_letter_html(db, db_instruction)
     lg_record_for_template = db_instruction.lg_record
-    if lg_record_for_template:
-        
-        # Determine the correct recipient details using the new helper
-        recipient_name, recipient_address = crud_lg_record._get_recipient_details(db, lg_record_for_template)
-        issuance_date_str = lg_record_for_template.issuance_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "issuance_date", None) else "N/A"
-        expiry_date_str = lg_record_for_template.expiry_date.strftime("%Y-%m-%d") if getattr(lg_record_for_template, "expiry_date", None) else "N/A"
-        customer_obj = lg_record_for_template.customer
-        entity_obj = lg_record_for_template.beneficiary_corporate
-        customer_address_val = (entity_obj.address if entity_obj and entity_obj.address else (customer_obj.address if customer_obj else "")) or ""
-        customer_email_val = (entity_obj.contact_email if entity_obj and entity_obj.contact_email else (customer_obj.contact_email if customer_obj else "")) or ""
-
-        instruction_details.update({
-            "lg_number": lg_record_for_template.lg_number,
-            "lg_serial_number": lg_record_for_template.lg_number,
-            "instruction_serial": db_instruction.serial_number or "",
-            "serial_number": db_instruction.serial_number or "",
-            "lg_amount": float(lg_record_for_template.lg_amount),
-            "lg_currency": lg_record_for_template.lg_currency.iso_code,
-            "issuing_bank_name": crud_lg_record._get_effective_issuing_bank_name(lg_record_for_template),
-            "lg_issuer_name": lg_record_for_template.issuer_name,
-            "lg_beneficiary_name": lg_record_for_template.beneficiary_corporate.entity_name,
-            "customer_name": lg_record_for_template.customer.name,
-            "customer_address": customer_address_val,
-            "customer_contact_email": customer_email_val,
-            "internal_owner_email": lg_record_for_template.internal_owner_contact.email,
-            "current_date": date.today().strftime("%Y-%m-%d"),
-            "platform_name": "Treasury Management Platform",
-            "recipient_name": recipient_name,
-            "recipient_address": recipient_address,
-        })
-        instruction_details.setdefault("issuance_date", issuance_date_str)
-        instruction_details.setdefault("issue_date", issuance_date_str)
-        instruction_details.setdefault("expiry_date", instruction_details.get("old_expiry_date") or expiry_date_str)
-        instruction_details.setdefault("maturity_date", instruction_details.get("old_expiry_date") or expiry_date_str)
-        instruction_details.setdefault("notes_section", "")
-
-        if "old_expiry_date" in instruction_details and "new_expiry_date" in instruction_details and "extension_period" not in instruction_details:
-            try:
-                old_d = datetime.strptime(str(instruction_details["old_expiry_date"])[:10], "%Y-%m-%d").date()
-                new_d = datetime.strptime(str(instruction_details["new_expiry_date"])[:10], "%Y-%m-%d").date()
-                instruction_details["extension_period"] = crud_lg_record._format_extension_period(old_d, new_d)
-            except Exception:
-                instruction_details["extension_period"] = "N/A"
-
-        if "enclosed_documents_clause" not in instruction_details:
-            pending_cnt = instruction_details.get("pending_replies_count", 0)
-            instruction_details["enclosed_documents_clause"] = (
-                "Kindly find the original Letter of Guarantee attached herewith along with all its extension confirmation(s) received from your esteemed bank for your records and cancellation."
-                if not pending_cnt
-                else "Kindly find the original Letter of Guarantee attached herewith; however, as we have not yet received all LG extension confirmation(s) from your esteemed bank, we hereby commit to return them back to the bank immediately upon receipt."
-            )
-
-        if "settlement_instruction" not in instruction_details:
-            instruction_details["settlement_instruction"] = (
-                f"Kindly arrange to settle the proceeds of this guarantee by bank transfer or issuing a bank draft/cashier order payable to {lg_record_for_template.beneficiary_corporate.entity_name} ({lg_record_for_template.customer.name}), in accordance with our standing settlement instructions."
-            )
-
-        instruction_details["lg_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(lg_record_for_template.lg_amount):,.2f}"
-        if "original_lg_amount" in instruction_details:
-             instruction_details["original_lg_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(instruction_details['original_lg_amount']):,.2f}"
-        if "new_lg_amount" in instruction_details:
-             instruction_details["new_lg_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(instruction_details['new_lg_amount']):,.2f}"
-        if "decrease_amount" in instruction_details:
-             instruction_details["decrease_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {float(instruction_details['decrease_amount']):,.2f}"
-        if "original_lg_amount" in instruction_details and "new_lg_amount" in instruction_details and "liquidation_amount_formatted" not in instruction_details:
-             liq_amt = float(instruction_details["original_lg_amount"]) - float(instruction_details["new_lg_amount"])
-             instruction_details["liquidation_amount"] = liq_amt
-             instruction_details["liquidation_amount_formatted"] = f"{lg_record_for_template.lg_currency.symbol} {liq_amt:,.2f}"
-
-        if db_instruction.instruction_type == ACTION_TYPE_LG_ACTIVATE_NON_OPERATIVE and "payment_details" in instruction_details:
-            payment_details = instruction_details["payment_details"]
-            instruction_details["payment_method"] = payment_details.get("payment_method")
-            instruction_details["payment_amount"] = float(payment_details.get("amount"))
-            instruction_details["payment_currency_code"] = crud_currency.get(db, payment_details.get("currency_id")).iso_code if payment_details.get("currency_id") else ""
-            instruction_details["payment_reference"] = payment_details.get("payment_reference")
-            instruction_details["payment_issuing_bank_name"] = crud_bank.get(db, payment_details.get("issuing_bank_id")).name if payment_details.get("issuing_bank_id") else ""
-            instruction_details["payment_date"] = payment_details.get("payment_date")
-            instruction_details["payment_amount_formatted"] = f"{instruction_details['payment_currency_code']} {instruction_details['payment_amount']:,.2f}"
-
-
-    for key, value in instruction_details.items():
-        str_value = str(value) if value is not None else ""
-        generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
     logger.debug(f"Placeholders populated for instruction ID {instruction_id}.")
 
 
@@ -4401,36 +4404,55 @@ async def view_lg_instruction_letter(
 
 
 @router.get(
-    "/lg-records/instructions/{instruction_id}/view-discrepancy-letter",
-    response_class=HTMLResponse,
+    "/lg-records/instructions/{original_instruction_id}/view-reminder-letter",
     dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
-    summary="Generate and view/print a formal Bank Reply Discrepancy Notice letter after Corporate Admin rejects bank-modified terms"
+    summary="View/reprint the bank reminder letter associated with an original LG instruction.",
 )
-def view_bank_reply_discrepancy_letter(
-    instruction_id: int,
+async def view_lg_instruction_reminder_letter(
+    original_instruction_id: int,
     db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("lg_record:view_own")),
     end_user_context: TokenData = Depends(get_current_end_user_context),
-    print_flag: bool = Query(False, alias="print", description="If true, triggers print dialog."),
+    print_flag: bool = Query(False, alias="print", description="If true, attempts to trigger print dialog."),
+    raw_pdf: bool = Query(False, description="If true, streams raw PDF bytes without HTML print toolbar."),
 ):
-    db_instruction = db.query(models.LGInstruction).options(
-        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
-        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
-        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
-        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
-        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_type),
-    ).filter(
-        models.LGInstruction.id == instruction_id,
+    """
+    Fail-safe endpoint to view/reprint the LG_REMINDER_TO_BANKS letter for a given
+    original instruction ID. Never falls back to returning the original instruction letter.
+    """
+    reminder_inst = db.query(models.LGInstruction).filter(
+        models.LGInstruction.instruction_type == ACTION_TYPE_LG_REMINDER_TO_BANKS,
         models.LGInstruction.is_deleted == False,
-    ).first()
+        models.LGInstruction.details["original_instruction_id"].astext == str(original_instruction_id),
+        models.LGInstruction.lg_record.has(models.LGRecord.customer_id == end_user_context.customer_id),
+    ).order_by(models.LGInstruction.instruction_date.desc(), models.LGInstruction.id.desc()).first()
 
-    if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != end_user_context.customer_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
+    if not reminder_inst:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No bank reminder letter found for this instruction.",
+        )
 
+    return await view_lg_instruction_letter(
+        instruction_id=reminder_inst.id,
+        db=db,
+        current_user=current_user,
+        end_user_context=end_user_context,
+        print_flag=print_flag,
+        raw_pdf=raw_pdf,
+    )
+
+
+def _render_discrepancy_letter_html(
+    db_instruction: models.LGInstruction,
+    include_toolbar: bool = True,
+    print_flag: bool = False,
+) -> str:
+    """Renders the HTML for a Bank Reply Discrepancy Notice letter (browser viewer or clean WeasyPrint PDF)."""
     lg = db_instruction.lg_record
     inst_details = db_instruction.details or {}
     approval_info = inst_details.get("bank_terms_admin_approval") or {}
     amendment_details = approval_info.get("amendment_details") or {}
-    rejection_reason = approval_info.get("rejection_reason") or "Bank-modified terms do not match the corporate instruction."
 
     bank_name = lg.issuing_bank.name if lg.issuing_bank else (lg.foreign_bank_name or "Issuing Bank")
     bank_address = lg.issuing_bank.address if lg.issuing_bank and getattr(lg.issuing_bank, "address", None) else "Trade Finance / Letter of Guarantee Department"
@@ -4439,6 +4461,7 @@ def view_bank_reply_discrepancy_letter(
         if lg.beneficiary_corporate and getattr(lg.beneficiary_corporate, "entity_name", None)
         else (lg.customer.name if lg.customer else "Corporate Treasury")
     )
+
     def _fmt_full_date(val: Any, fallback: str = "N/A") -> str:
         if not val:
             return fallback
@@ -4506,43 +4529,72 @@ def view_bank_reply_discrepancy_letter(
         </tr>
         """
 
-    discrepancy_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8" />
-        <title>Discrepancy Notice - {db_instruction.serial_number}</title>
-        <style>
-            @page {{ size: A4; margin: 20mm; }}
-            body {{ font-family: 'Segoe UI', Arial, sans-serif; color: #111827; line-height: 1.6; margin: 0; padding: 0; background: #f3f4f6; }}
-            .toolbar {{ background: #1e293b; color: white; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }}
-            .toolbar button {{ background: #e11d48; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }}
-            .toolbar button:hover {{ background: #be123c; }}
-            .page {{ max-width: 210mm; margin: 24px auto; background: white; padding: 22mm; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-radius: 4px; box-sizing: border-box; }}
-            .header {{ border-bottom: 2px solid #1e3a8a; padding-bottom: 14px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: flex-start; }}
-            .corp-title {{ font-size: 18px; font-weight: 700; color: #1e3a8a; }}
-            .doc-badge {{ background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; text-transform: uppercase; }}
-            .meta-block {{ margin-bottom: 20px; font-size: 14px; }}
-            .subject-box {{ background: #f8fafc; border-left: 4px solid #b91c1c; padding: 12px 16px; margin: 20px 0; font-weight: 700; font-size: 14px; color: #111827; }}
-            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13.5px; }}
-            th, td {{ border: 1px solid #d1d5db; padding: 10px 12px; text-align: left; }}
-            th {{ background: #f1f5f9; font-weight: 700; color: #334155; }}
-            .signatures {{ margin-top: 48px; display: flex; justify-content: space-between; }}
-            .sig-line {{ width: 42%; border-top: 1px solid #374151; padding-top: 8px; font-size: 13px; color: #4b5563; }}
-            @media print {{
-                body {{ background: white; }}
-                .toolbar {{ display: none !important; }}
-                .page {{ margin: 0; padding: 0; box-shadow: none; max-width: 100%; }}
-            }}
-        </style>
-    </head>
-    <body>
+    if include_toolbar:
+        page_css = """
+            @page { size: A4; margin: 20mm; }
+            body { font-family: 'Segoe UI', Arial, sans-serif; color: #111827; line-height: 1.6; margin: 0; padding: 0; background: #f3f4f6; }
+            .toolbar { background: #1e293b; color: white; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }
+            .toolbar button { background: #e11d48; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+            .toolbar button:hover { background: #be123c; }
+            .page { max-width: 210mm; margin: 24px auto; background: white; padding: 22mm; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-radius: 4px; box-sizing: border-box; }
+            .header { border-bottom: 2px solid #1e3a8a; padding-bottom: 14px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: flex-start; }
+            .corp-title { font-size: 18px; font-weight: 700; color: #1e3a8a; }
+            .doc-badge { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+            .meta-block { margin-bottom: 20px; font-size: 14px; }
+            .subject-box { background: #f8fafc; border-left: 4px solid #b91c1c; padding: 12px 16px; margin: 20px 0; font-weight: 700; font-size: 14px; color: #111827; }
+            table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13.5px; }
+            th, td { border: 1px solid #d1d5db; padding: 10px 12px; text-align: left; }
+            th { background: #f1f5f9; font-weight: 700; color: #334155; }
+            p.body-p { font-size: 14px; }
+            .signatures { margin-top: 48px; display: flex; justify-content: space-between; }
+            .sig-line { width: 42%; border-top: 1px solid #374151; padding-top: 8px; font-size: 13px; color: #4b5563; }
+            @media print {
+                body { background: white; }
+                .toolbar { display: none !important; }
+                .page { margin: 0; padding: 0; box-shadow: none; max-width: 100%; }
+            }
+        """
+        toolbar_html = f"""
         <div class="toolbar">
             <div>
                 <strong>Bank Reply Discrepancy Notice</strong> — LG: {lg.lg_number} (Instruction: {db_instruction.serial_number})
             </div>
             <button onclick="window.print()">🖨️ Print Discrepancy Letter</button>
         </div>
+        """
+        print_script = "<script>window.onload = function() { setTimeout(function() { window.print(); }, 400); };</script>" if print_flag else ""
+    else:
+        page_css = """
+            @page { size: A4; margin: 40mm 20mm 16mm 20mm; }
+            body { font-family: 'Segoe UI', Arial, sans-serif; color: #111827; font-size: 9.5pt; line-height: 1.48; margin: 0; padding: 0; background: white; }
+            .page { margin: 0; padding: 0; box-shadow: none; max-width: 100%; box-sizing: border-box; }
+            .header { border-bottom: 2px solid #1e3a8a; padding-bottom: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: flex-start; }
+            .corp-title { font-size: 14pt; font-weight: 700; color: #1e3a8a; }
+            .doc-badge { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; padding: 3px 8px; border-radius: 4px; font-size: 8.5pt; font-weight: 700; text-transform: uppercase; }
+            .meta-block { margin-bottom: 12px; font-size: 9.5pt; }
+            .subject-box { background: #f8fafc; border-left: 4px solid #b91c1c; padding: 8px 12px; margin: 12px 0; font-weight: 700; font-size: 10pt; color: #111827; }
+            table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 9pt; }
+            th, td { border: 1px solid #d1d5db; padding: 7px 10px; text-align: left; }
+            th { background: #f1f5f9; font-weight: 700; color: #334155; }
+            p.body-p { font-size: 9.5pt; margin: 0 0 8px 0; }
+            .signatures { margin-top: 28px; display: flex; justify-content: space-between; }
+            .sig-line { width: 42%; border-top: 1px solid #374151; padding-top: 6px; font-size: 8.5pt; color: #4b5563; }
+        """
+        toolbar_html = ""
+        print_script = ""
+
+    html_out = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Discrepancy Notice - {db_instruction.serial_number}</title>
+        <style>
+            {page_css}
+        </style>
+    </head>
+    <body>
+        {toolbar_html}
         <div class="page">
             <div class="header">
                 <div>
@@ -4563,17 +4615,17 @@ def view_bank_reply_discrepancy_letter(
 
             <div class="subject-box">
                 SUBJECT: Notice of Discrepancy &amp; Non-Acceptance of Bank Amendment — Letter of Guarantee No. {lg.lg_number}<br/>
-                <span style="font-weight: 500; font-size: 13px; color: #4b5563;">
+                <span style="font-weight: 500; font-size: 12.5px; color: #4b5563;">
                     Our Instruction Ref: <strong>{db_instruction.serial_number}</strong> ({action_label}) dated {inst_date_str} (Delivered: {delivery_date_str})
                 </span>
             </div>
 
-            <p style="font-size: 14px;">Dear Trade Finance Team,</p>
-            <p style="font-size: 14px;">
+            <p class="body-p">Dear Trade Finance Team,</p>
+            <p class="body-p">
                 We refer to our official corporate instruction ref. <strong>{db_instruction.serial_number}</strong> dated <strong>{inst_date_str}</strong> regarding
                 Letter of Guarantee No. <strong>{lg.lg_number}</strong>, and to your subsequent bank advice dated <strong>{bank_reply_date_str}</strong>.
             </p>
-            <p style="font-size: 14px;">
+            <p class="body-p">
                 Upon review of your advice, we noted a discrepancy between the terms requested in our instruction
                 and the terms stated in your bank advice, as detailed below:
             </p>
@@ -4591,27 +4643,72 @@ def view_bank_reply_discrepancy_letter(
                 </tbody>
             </table>
 
-            <p style="font-size: 14px;">
+            <p class="body-p">
                 Please be formally advised that <strong>we do not accept the modified amendment terms</strong> stated in your bank advice dated <strong>{bank_reply_date_str}</strong>,
                 as they deviate from our authorized instruction ref. <strong>{db_instruction.serial_number}</strong>.
             </p>
 
-            <p style="font-size: 14px;">
+            <p class="body-p">
                 Accordingly, we request that you rectify this discrepancy immediately and issue a <strong>corrected Amendment Advice</strong> for Letter of Guarantee No. <strong>{lg.lg_number}</strong>
                 strictly reflecting the exact terms instructed in our reference <strong>{db_instruction.serial_number}</strong>, and provide us with the revised confirmation at your earliest convenience.
             </p>
 
-            <p style="font-size: 14px;">Yours faithfully,<br/><strong>For and on behalf of {customer_name}</strong></p>
+            <p class="body-p">Yours faithfully,<br/><strong>For and on behalf of {customer_name}</strong></p>
 
             <div class="signatures">
                 <div class="sig-line">Authorized Signatory (1)<br/>Name &amp; Title:</div>
                 <div class="sig-line">Authorized Signatory (2)<br/>Name &amp; Title:</div>
             </div>
         </div>
-        {"<script>window.onload = function() { setTimeout(function() { window.print(); }, 400); };</script>" if print_flag else ""}
+        {print_script}
     </body>
     </html>
     """
+    register_instruction_for_verification(
+        db_instruction.id,
+        db_instruction.serial_number or "",
+        lg.lg_number if lg else "",
+        getattr(db_instruction, "created_at", None) or getattr(db_instruction, "instruction_date", None),
+        "I",
+    )
+    return attach_verification_marker(
+        html_out,
+        serial_number=db_instruction.serial_number,
+        record_kind="I",
+        record_id=db_instruction.id,
+    )
+
+
+@router.get(
+    "/lg-records/instructions/{instruction_id}/view-discrepancy-letter",
+    response_class=HTMLResponse,
+    dependencies=[Depends(HasPermission("lg_record:view_own")), Depends(check_subscription_status)],
+    summary="Generate and view/print a formal Bank Reply Discrepancy Notice letter after Corporate Admin rejects bank-modified terms"
+)
+def view_bank_reply_discrepancy_letter(
+    instruction_id: int,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+    print_flag: bool = Query(False, alias="print", description="If true, triggers print dialog."),
+):
+    db_instruction = db.query(models.LGInstruction).options(
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_type),
+    ).filter(
+        models.LGInstruction.id == instruction_id,
+        models.LGInstruction.is_deleted == False,
+    ).first()
+
+    if not db_instruction or not db_instruction.lg_record or db_instruction.lg_record.customer_id != end_user_context.customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LG Instruction not found or not accessible.")
+
+    lg = db_instruction.lg_record
+    inst_details = db_instruction.details or {}
+    discrepancy_html = _render_discrepancy_letter_html(db_instruction, include_toolbar=True, print_flag=print_flag)
+
     if print_flag and isinstance(inst_details.get("bank_terms_admin_approval"), dict):
         updated_inst_details = dict(inst_details)
         updated_approval_info = dict(updated_inst_details.get("bank_terms_admin_approval") or {})
@@ -4638,6 +4735,221 @@ def view_bank_reply_discrepancy_letter(
     return HTMLResponse(content=discrepancy_html, status_code=status.HTTP_200_OK)
 
         
+async def _dispatch_print_confirmation_email_for_instruction(
+    db: Session,
+    db_instruction: models.LGInstruction,
+    customer_id: int,
+    user_id: int,
+    email_settings_to_use: EmailSettings,
+    email_method_for_log: str,
+    common_cc_emails: List[str],
+    notification_template: Optional[models.Template],
+) -> None:
+    """Sends a single Print Confirmation notification with null-safe contact guards."""
+    lg_rec = db_instruction.lg_record
+    if not lg_rec:
+        return
+
+    owner = lg_rec.internal_owner_contact
+    owner_email = getattr(owner, "email", None) if owner else None
+    maker_email = getattr(db_instruction.maker_user, "email", None) if db_instruction.maker_user else None
+
+    email_to_send_to: List[str] = []
+    if owner_email:
+        email_to_send_to = [owner_email]
+    elif maker_email:
+        email_to_send_to = [maker_email]
+
+    if not email_to_send_to:
+        logger.warning(f"Skipping print confirmation email for instruction {db_instruction.id}: no recipient email.")
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="NOTIFICATION_SKIPPED",
+            entity_type="LGInstruction",
+            entity_id=db_instruction.id,
+            details={"reason": "No internal owner or maker email configured for print confirmation."},
+            customer_id=customer_id,
+            lg_record_id=lg_rec.id,
+        )
+        return
+
+    cc_emails: List[str] = []
+    if owner and getattr(owner, "manager_email", None):
+        cc_emails.append(owner.manager_email)
+    if lg_rec.lg_category and getattr(lg_rec.lg_category, "communication_list", None):
+        cc_emails.extend(lg_rec.lg_category.communication_list)
+    if common_cc_emails:
+        cc_emails.extend(common_cc_emails)
+    cc_emails = list(set(cc_emails))
+
+    if not notification_template:
+        logger.error(f"Email notification template for '{NOTIFICATION_PRINT_CONFIRMATION}' not found. Cannot send print confirmation notification for Instruction {db_instruction.id}.")
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="NOTIFICATION_FAILED",
+            entity_type="LGInstruction",
+            entity_id=db_instruction.id,
+            details={"reason": f"'{NOTIFICATION_PRINT_CONFIRMATION}' template missing for print confirmation", "recipient": email_to_send_to, "cc_recipients": cc_emails},
+            customer_id=customer_id,
+            lg_record_id=lg_rec.id,
+        )
+        return
+
+    currency_sym = lg_rec.lg_currency.symbol if lg_rec.lg_currency else ""
+    template_data = {
+        "maker_email": maker_email or "N/A",
+        "lg_number": lg_rec.lg_number,
+        "instruction_serial_number": db_instruction.serial_number,
+        "action_type": (db_instruction.instruction_type or "").replace("_", " ").title(),
+        "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "platform_name": "Treasury Management Platform",
+        "customer_name": lg_rec.customer.name if lg_rec.customer else "N/A",
+        "lg_amount": f"{currency_sym} {float(lg_rec.lg_amount):,.2f}".strip() if lg_rec.lg_currency else "N/A",
+    }
+
+    email_subject = notification_template.subject if notification_template.subject else f"Confirmed: LG {{lg_number}} Instruction {{instruction_serial_number}} Printed"
+    email_body_html = notification_template.content
+    for key, value in template_data.items():
+        str_value = str(value) if value is not None else ""
+        email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
+        email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
+
+    try:
+        email_sent_successfully = await send_email(
+            db=db,
+            to_emails=email_to_send_to,
+            cc_emails=cc_emails,
+            subject_template=email_subject,
+            body_template=email_body_html,
+            template_data=template_data,
+            email_settings=email_settings_to_use,
+        )
+
+        if email_sent_successfully:
+            log_action(
+                db,
+                user_id=user_id,
+                action_type="NOTIFICATION_SENT",
+                entity_type="LGInstruction",
+                entity_id=db_instruction.id,
+                details={
+                    "recipient": email_to_send_to,
+                    "cc_recipients": cc_emails,
+                    "subject": email_subject,
+                    "method": email_method_for_log,
+                    "notification_type": "Print Confirmation"
+                },
+                customer_id=customer_id,
+                lg_record_id=lg_rec.id,
+            )
+            logger.info(f"Print confirmation notification sent successfully for Instruction ID: {db_instruction.id}.")
+        else:
+            logger.error(f"send_email returned False for 'Print Confirmation' notification for Instruction ID: {db_instruction.id}.")
+            log_action(
+                db,
+                user_id=user_id,
+                action_type="NOTIFICATION_FAILED",
+                entity_type="LGInstruction",
+                entity_id=db_instruction.id,
+                details={"reason": "Email service failed to send print confirmation notification (send_email returned False)", "recipient": email_to_send_to, "subject": email_subject, "method": email_method_for_log},
+                customer_id=customer_id,
+                lg_record_id=lg_rec.id,
+            )
+    except Exception as e:
+        logger.exception(f"Exception occurred while sending 'Print Confirmation' notification for Instruction ID: {db_instruction.id}: {e}")
+        log_action(
+            db,
+            user_id=user_id,
+            action_type="NOTIFICATION_FAILED",
+            entity_type="LGInstruction",
+            entity_id=db_instruction.id,
+            details={"reason": f"Exception during email send for 'Print Confirmation': {e}", "recipient": email_to_send_to, "subject": email_subject, "method": email_method_for_log},
+            customer_id=customer_id,
+            lg_record_id=lg_rec.id,
+        )
+
+
+async def _send_bulk_print_confirmation_emails_bg(
+    customer_id: int,
+    user_id: int,
+    instruction_ids: List[int],
+) -> None:
+    """Dispatches print confirmation emails in a dedicated DB session after bulk print returns."""
+    if not instruction_ids:
+        return
+    db = SessionLocal()
+    try:
+        try:
+            email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer_id)
+        except Exception as e:
+            email_settings_to_use = get_global_email_settings()
+            email_method_for_log = "global_fallback_due_to_error"
+            logger.warning(
+                f"Failed to retrieve customer-specific email settings for customer ID {customer_id}: {e}. Falling back to global settings for bulk print confirmation."
+            )
+
+        common_cc_emails: List[str] = []
+        common_comm_list_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+        )
+        if common_comm_list_config and common_comm_list_config.get("effective_value"):
+            try:
+                parsed_common_list = json.loads(common_comm_list_config["effective_value"])
+                if isinstance(parsed_common_list, list) and all(isinstance(e, str) and "@" in e for e in parsed_common_list):
+                    common_cc_emails.extend(parsed_common_list)
+            except json.JSONDecodeError:
+                logger.warning(f"COMMON_COMMUNICATION_LIST for customer {customer_id} is not a valid JSON list of emails.")
+
+        notification_template = db.query(models.Template).filter(
+            models.Template.action_type == NOTIFICATION_PRINT_CONFIRMATION,
+            models.Template.is_global == True,
+            models.Template.is_notification_template == True,
+            models.Template.is_deleted == False,
+        ).first()
+
+        instructions = (
+            db.query(models.LGInstruction)
+            .options(
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_category),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.internal_owner_contact),
+                selectinload(models.LGInstruction.maker_user),
+            )
+            .filter(
+                models.LGInstruction.id.in_(instruction_ids),
+                models.LGInstruction.is_deleted == False,
+            )
+            .all()
+        )
+        inst_by_id = {inst.id: inst for inst in instructions}
+        for inst_id in instruction_ids:
+            db_inst = inst_by_id.get(inst_id)
+            if not db_inst or not db_inst.lg_record:
+                continue
+            await _dispatch_print_confirmation_email_for_instruction(
+                db=db,
+                db_instruction=db_inst,
+                customer_id=customer_id,
+                user_id=user_id,
+                email_settings_to_use=email_settings_to_use,
+                email_method_for_log=email_method_for_log,
+                common_cc_emails=common_cc_emails,
+                notification_template=notification_template,
+            )
+        db.commit()
+    except Exception as e:
+        logger.exception(f"Unexpected error in _send_bulk_print_confirmation_emails_bg for customer {customer_id}: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
 @router.post(
     "/lg-records/instructions/{instruction_id}/mark-as-accessed-for-print",
     response_model=Dict[str, Any],
@@ -4662,6 +4974,7 @@ async def mark_instruction_as_accessed_for_print(
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.internal_owner_contact),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_category),
         selectinload(models.LGInstruction.maker_user),
         selectinload(models.LGInstruction.checker_user),
     ).filter(
@@ -4689,8 +5002,9 @@ async def mark_instruction_as_accessed_for_print(
     ).first()
 
     if related_approval_request:
-        related_approval_request.request_details = related_approval_request.request_details if related_approval_request.request_details else {}
+        related_approval_request.request_details = dict(related_approval_request.request_details or {})
         related_approval_request.request_details["print_notification_status"] = "PRINTED" # Set status to stop future reminders/escalations
+        flag_modified(related_approval_request, "request_details")
         db.add(related_approval_request)
         db.flush()
         logger.info(f"ApprovalRequest {related_approval_request.id} updated to PRINTED status for print reminders.")
@@ -4707,13 +5021,10 @@ async def mark_instruction_as_accessed_for_print(
         lg_record_id=db_instruction.lg_record.id,
     )
 
-
     # --- NEW: Send "Print Confirmation" Email (Email 2) ---
-
     logger.info(f"Attempting to send 'Print Confirmation' notification for Instruction ID: {instruction_id}.")
     if db_instruction.instruction_type == ACTION_TYPE_LG_EXTEND:
         logger.info(f"Skipping 'Print Confirmation' email for LG Extension Instruction ID: {instruction_id}.")
-        # Log the action that the notification was skipped
         log_action(
             db,
             user_id=end_user_context.user_id,
@@ -4724,28 +5035,18 @@ async def mark_instruction_as_accessed_for_print(
             customer_id=end_user_context.customer_id,
             lg_record_id=db_instruction.lg_record.id,
         )
-        # Immediately exit this part of the function to prevent email sending
         return {"message": "Instruction marked as accessed for print, but print confirmation email skipped for LG Extension."}
-    
-    # The rest of the email sending logic follows this block:
+
     email_settings_to_use: EmailSettings
     email_method_for_log: str
     try:
         email_settings_to_use, email_method_for_log = get_customer_email_settings(db, end_user_context.customer_id)
-
     except Exception as e:
         email_settings_to_use = get_global_email_settings()
         email_method_for_log = "global_fallback_due_to_error"
         logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {end_user_context.customer_id}: {e}. Falling back to global settings for print confirmation notification.")
 
-    # *** CRITICAL FIX: Initialize to_emails and cc_emails HERE ***
-    email_to_send_to = [db_instruction.lg_record.internal_owner_contact.email]
-    cc_emails = []
-    if db_instruction.lg_record.internal_owner_contact.manager_email:
-        cc_emails.append(db_instruction.lg_record.internal_owner_contact.manager_email)
-    if db_instruction.lg_record.lg_category and db_instruction.lg_record.lg_category.communication_list:
-        cc_emails.extend(db_instruction.lg_record.lg_category.communication_list)
-
+    common_cc_emails: List[str] = []
     common_comm_list_config = crud_customer_configuration.get_customer_config_or_global_fallback(
         db, end_user_context.customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
     )
@@ -4753,104 +5054,27 @@ async def mark_instruction_as_accessed_for_print(
         try:
             parsed_common_list = json.loads(common_comm_list_config['effective_value'])
             if isinstance(parsed_common_list, list) and all(isinstance(e, str) and "@" in e for e in parsed_common_list):
-                cc_emails.extend(parsed_common_list)
+                common_cc_emails.extend(parsed_common_list)
         except json.JSONDecodeError:
             logger.warning(f"COMMON_COMMUNICATION_LIST for customer {end_user_context.customer_id} is not a valid JSON list of emails. Skipping for print confirmation notification.")
-    cc_emails = list(set(cc_emails))
 
-    # Fetch the template for "Print Confirmation"
     notification_template = db.query(models.Template).filter(
-        models.Template.action_type == NOTIFICATION_PRINT_CONFIRMATION, # Use the new constant
+        models.Template.action_type == NOTIFICATION_PRINT_CONFIRMATION,
         models.Template.is_global == True,
         models.Template.is_notification_template == True,
         models.Template.is_deleted == False
     ).first()
 
-    if not notification_template:
-        logger.error(f"Email notification template for '{NOTIFICATION_PRINT_CONFIRMATION}' not found. Cannot send print confirmation notification for Instruction {instruction_id}.")
-        log_action(
-            db,
-            user_id=end_user_context.user_id,
-            action_type="NOTIFICATION_FAILED",
-            entity_type="LGInstruction",
-            entity_id=instruction_id,
-            # to_emails and cc_emails are now guaranteed to be defined
-            details={"reason": f"'{NOTIFICATION_PRINT_CONFIRMATION}' template missing for print confirmation", "recipient": email_to_send_to, "cc_recipients": cc_emails}, # Include cc_recipients
-            customer_id=end_user_context.customer_id,
-            lg_record_id=db_instruction.lg_record.id,
-        )
-    else:
-        template_data = {
-            "maker_email": db_instruction.maker_user.email if db_instruction.maker_user else "N/A",
-            "lg_number": db_instruction.lg_record.lg_number,
-            "instruction_serial_number": db_instruction.serial_number,
-            "action_type": db_instruction.instruction_type.replace('_', ' ').title(),
-            "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "platform_name": "Treasury Management Platform",
-            "customer_name": db_instruction.lg_record.customer.name,
-            "lg_amount": f"{db_instruction.lg_record.lg_currency.symbol} {float(db_instruction.lg_record.lg_amount):,.2f}" if db_instruction.lg_record.lg_currency else "N/A",
-        }
-
-        email_subject = notification_template.subject if notification_template.subject else f"Confirmed: LG {{lg_number}} Instruction {{instruction_serial_number}} Printed"
-        email_body_html = notification_template.content
-        for key, value in template_data.items():
-            str_value = str(value) if value is not None else ""
-            email_body_html = email_body_html.replace(f"{{{{{key}}}}}", str_value)
-            email_subject = email_subject.replace(f"{{{{{key}}}}}", str_value)
-
-        try:
-            email_sent_successfully = await send_email(
-                db=db,
-                to_emails=email_to_send_to,
-                cc_emails=cc_emails,
-                subject_template=email_subject,
-                body_template=email_body_html,
-                template_data=template_data,
-                email_settings=email_settings_to_use,
-            )
-
-            if email_sent_successfully:
-                log_action(
-                    db,
-                    user_id=end_user_context.user_id,
-                    action_type="NOTIFICATION_SENT",
-                    entity_type="LGInstruction",
-                    entity_id=instruction_id,
-                    details={
-                        "recipient": email_to_send_to,
-                        "cc_recipients": cc_emails,
-                        "subject": email_subject,
-                        "method": email_method_for_log,
-                        "notification_type": "Print Confirmation"
-                    },
-                    customer_id=end_user_context.customer_id,
-                    lg_record_id=db_instruction.lg_record.id,
-                )
-                logger.info(f"Print confirmation notification sent successfully for Instruction ID: {instruction_id}.")
-            else:
-                logger.error(f"send_email returned False for 'Print Confirmation' notification for Instruction ID: {instruction_id}.")
-                log_action(
-                    db,
-                    user_id=end_user_context.user_id,
-                    action_type="NOTIFICATION_FAILED",
-                    entity_type="LGInstruction",
-                    entity_id=instruction_id,
-                    details={"reason": "Email service failed to send print confirmation notification (send_email returned False)", "recipient": email_to_send_to, "subject": email_subject, "method": email_method_for_log}, # Use correct variable names
-                    customer_id=end_user_context.customer_id,
-                    lg_record_id=db_instruction.lg_record.id,
-                )
-        except Exception as e:
-            logger.exception(f"Exception occurred while sending 'Print Confirmation' notification for Instruction ID: {instruction_id}: {e}")
-            log_action(
-                db,
-                user_id=end_user_context.user_id,
-                action_type="NOTIFICATION_FAILED",
-                entity_type="LGInstruction",
-                entity_id=instruction_id,
-                details={"reason": f"Exception during email send for 'Print Confirmation': {e}", "recipient": email_to_send_to, "subject": email_subject, "method": email_method_for_log}, # Use correct variable names
-                customer_id=end_user_context.customer_id,
-                lg_record_id=db_instruction.lg_record.id,
-            )
+    await _dispatch_print_confirmation_email_for_instruction(
+        db=db,
+        db_instruction=db_instruction,
+        customer_id=end_user_context.customer_id,
+        user_id=end_user_context.user_id,
+        email_settings_to_use=email_settings_to_use,
+        email_method_for_log=email_method_for_log,
+        common_cc_emails=common_cc_emails,
+        notification_template=notification_template,
+    )
 
     db.refresh(db_instruction)
     return {"message": "Instruction marked as accessed for print successfully."}
@@ -5267,6 +5491,7 @@ async def send_reminder_to_bank_api(
     summary="Generate a consolidated PDF of all eligible LG bank reminder instructions for printing"
 )
 async def generate_all_eligible_bank_reminders_pdf_api(
+    pad_for_duplex: bool = Query(False, description="Insert blank back-page after odd-page letters for duplex printers"),
     db: Session = Depends(get_db),
     end_user_context: TokenData = Depends(get_current_end_user_context),
     request: Request = None
@@ -5283,7 +5508,8 @@ async def generate_all_eligible_bank_reminders_pdf_api(
         consolidated_pdf_bytes, generated_reminder_count, eligible_instruction_ids = await crud_lg_instruction.generate_all_eligible_bank_reminders_pdf(
             db,
             customer_id=end_user_context.customer_id,
-            user_id=end_user_context.user_id
+            user_id=end_user_context.user_id,
+            pad_for_duplex=pad_for_duplex,
         )
 
         if not consolidated_pdf_bytes:
@@ -5294,11 +5520,13 @@ async def generate_all_eligible_bank_reminders_pdf_api(
 
         pdf_base64 = base64.b64encode(consolidated_pdf_bytes).decode('utf-8')
 
-        log_action(db, user_id=end_user_context.user_id, action_type="GENERATE_BULK_REMINDER_PDF_SUCCESS", entity_type="LGInstruction", entity_id=None, details={"reminders_generated_count": generated_reminder_count, "eligible_instruction_ids": eligible_instruction_ids}, customer_id=end_user_context.customer_id)
+        log_action(db, user_id=end_user_context.user_id, action_type="GENERATE_BULK_REMINDER_PDF_SUCCESS", entity_type="LGInstruction", entity_id=None, details={"reminders_generated_count": generated_reminder_count, "eligible_instruction_ids": eligible_instruction_ids, "pad_for_duplex": pad_for_duplex}, customer_id=end_user_context.customer_id)
         
         return {
             "message": f"Successfully generated a consolidated PDF for {generated_reminder_count} reminders.",
-            "combined_pdf_base64": pdf_base64
+            "combined_pdf_base64": pdf_base64,
+            "reminders_generated_count": generated_reminder_count,
+            "pad_for_duplex": pad_for_duplex,
         }
 
     except HTTPException as e:
@@ -5463,6 +5691,10 @@ def get_approved_requests_pending_print(
         selectinload(models.ApprovalRequest.maker_user),
         selectinload(models.ApprovalRequest.lg_record).selectinload(models.LGRecord.lg_status),
         selectinload(models.ApprovalRequest.lg_record).selectinload(models.LGRecord.internal_owner_contact),
+        selectinload(models.ApprovalRequest.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+        selectinload(models.ApprovalRequest.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.ApprovalRequest.lg_record).selectinload(models.LGRecord.communication_bank),
+        selectinload(models.ApprovalRequest.lg_record).selectinload(models.LGRecord.lg_currency),
         selectinload(models.ApprovalRequest.related_instruction).selectinload(models.LGInstruction.template)
     ).order_by(models.ApprovalRequest.created_at.asc()).offset(skip).limit(limit).all()
 
@@ -5493,6 +5725,8 @@ def get_discrepancy_letters_pending_print(
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_status),
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+        selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
         selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.instructions),
         selectinload(models.LGInstruction.maker_user),
     ).filter(
@@ -5526,6 +5760,592 @@ def get_discrepancy_letters_pending_print(
             continue
         results.append(inst)
     return results
+
+
+def _get_bulk_print_bank_name(lg_record: Optional[models.LGRecord]) -> Optional[str]:
+    """Resolves the display/grouping recipient bank name for a Custody LG record."""
+    if not lg_record:
+        return None
+    if lg_record.issuing_bank and lg_record.issuing_bank.name and lg_record.issuing_bank.name.strip().upper() != "FOREIGN BANK":
+        return lg_record.issuing_bank.name
+    if lg_record.advising_status in (models.AdvisingStatus.ADVISED, models.AdvisingStatus.CONFIRMED) and lg_record.communication_bank:
+        return lg_record.communication_bank.name
+    return crud_lg_record._get_effective_issuing_bank_name(lg_record)
+
+
+def _resolve_and_render_bulk_print_items(
+    db: Session,
+    end_user_context: TokenData,
+    items: List[BulkPrintItemIn],
+    is_reprint: bool = False,
+) -> List[Tuple[str, Any, str, BulkPrintBatchItemOut]]:
+    """
+    Validates tenant/entity/module access, warms QR verification cache, and renders HTML
+    for mixed pending-print items in exact requested order.
+    """
+    from app.models.models_issuance import IssuanceMaintenanceAction, IssuedLGRecord
+    from app.services.issuance_maintenance_service import maintenance_service
+
+    seen_keys = set()
+    ordered_unique: List[BulkPrintItemIn] = []
+    for item in items:
+        key = (item.source, item.id)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            ordered_unique.append(item)
+
+    custody_inst_ids = [i.id for i in ordered_unique if i.source in ("custody", "custody_discrepancy")]
+    maint_ids = [i.id for i in ordered_unique if i.source == "issuance_maintenance"]
+
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    allowed_ids_set = set(allowed_ids) if not has_all else set()
+    can_custody = bool(getattr(end_user_context, "has_custody_module", True) or end_user_context.role == UserRole.SYSTEM_OWNER)
+    can_issuance = bool(end_user_context.has_issuance_module or end_user_context.role == UserRole.SYSTEM_OWNER)
+
+    inst_map: Dict[int, models.LGInstruction] = {}
+    if custody_inst_ids and can_custody:
+        inst_rows = (
+            db.query(models.LGInstruction)
+            .options(
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_currency),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.issuing_bank),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.beneficiary_corporate),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.internal_owner_contact),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.customer),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.communication_bank),
+                selectinload(models.LGInstruction.lg_record).selectinload(models.LGRecord.lg_type),
+                selectinload(models.LGInstruction.maker_user),
+                selectinload(models.LGInstruction.template),
+            )
+            .filter(
+                models.LGInstruction.id.in_(custody_inst_ids),
+                models.LGInstruction.is_deleted == False,
+                models.LGInstruction.lg_record.has(
+                    and_(
+                        models.LGRecord.customer_id == end_user_context.customer_id,
+                        models.LGRecord.is_deleted == False,
+                    )
+                ),
+            )
+            .all()
+        )
+        inst_map = {inst.id: inst for inst in inst_rows}
+
+    maint_map: Dict[int, IssuanceMaintenanceAction] = {}
+    if maint_ids and can_issuance:
+        maint_rows = (
+            db.query(IssuanceMaintenanceAction)
+            .join(IssuedLGRecord, IssuedLGRecord.id == IssuanceMaintenanceAction.issued_lg_id)
+            .options(
+                selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.bank),
+                selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.issuing_entity),
+                selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.currency),
+                selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.customer),
+                selectinload(IssuanceMaintenanceAction.issued_lg).selectinload(IssuedLGRecord.lg_type),
+            )
+            .filter(
+                IssuanceMaintenanceAction.id.in_(maint_ids),
+                IssuanceMaintenanceAction.is_deleted == False,
+                IssuanceMaintenanceAction.status == "EXECUTED",
+                IssuedLGRecord.customer_id == end_user_context.customer_id,
+            )
+            .all()
+        )
+        maint_map = {m.id: m for m in maint_rows}
+
+    maint_template_cache: Dict[Any, Any] = {}
+    resolved: List[Tuple[str, Any, str, BulkPrintBatchItemOut]] = []
+    for item in ordered_unique:
+        if item.source == "custody":
+            if not can_custody:
+                continue
+            inst = inst_map.get(item.id)
+            if not inst or not inst.lg_record:
+                continue
+            if not is_reprint and inst.status == "Canceled":
+                continue
+            lg = inst.lg_record
+            if not has_all and lg.beneficiary_corporate_id not in allowed_ids_set:
+                continue
+            register_instruction_for_verification(
+                inst.id,
+                inst.serial_number or "",
+                lg.lg_number or "",
+                inst.created_at or inst.instruction_date,
+                "I",
+            )
+            html_seg = _render_instruction_letter_html(db, inst)
+            entity_name = lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else None
+            item_out = BulkPrintBatchItemOut(
+                source="custody",
+                id=inst.id,
+                lg_record_id=lg.id,
+                lg_number=lg.lg_number,
+                entity_name=entity_name,
+                bank_name=_get_bulk_print_bank_name(lg),
+                beneficiary_name=entity_name,
+                action_type=inst.instruction_type,
+                serial_number=inst.serial_number,
+                amount=float(lg.lg_amount) if lg.lg_amount is not None else None,
+                currency_code=lg.lg_currency.iso_code if lg.lg_currency else None,
+                instruction_status=inst.status,
+                delivery_date=inst.delivery_date,
+                bank_reply_date=inst.bank_reply_date,
+            )
+            resolved.append(("custody", inst, html_seg, item_out))
+
+        elif item.source == "custody_discrepancy":
+            if not can_custody:
+                continue
+            inst = inst_map.get(item.id)
+            if not inst or not inst.lg_record:
+                continue
+            lg = inst.lg_record
+            if not has_all and lg.beneficiary_corporate_id not in allowed_ids_set:
+                continue
+            approval_info = (inst.details or {}).get("bank_terms_admin_approval")
+            if not isinstance(approval_info, dict):
+                continue
+            if not is_reprint and (
+                inst.status == "Canceled"
+                or approval_info.get("status") != "REJECTED_BY_ADMIN"
+            ):
+                continue
+            register_instruction_for_verification(
+                inst.id,
+                inst.serial_number or "",
+                lg.lg_number or "",
+                inst.created_at or inst.instruction_date,
+                "I",
+            )
+            html_seg = _render_discrepancy_letter_html(inst, include_toolbar=False)
+            entity_name = lg.beneficiary_corporate.entity_name if lg.beneficiary_corporate else None
+            item_out = BulkPrintBatchItemOut(
+                source="custody_discrepancy",
+                id=inst.id,
+                lg_record_id=lg.id,
+                lg_number=lg.lg_number,
+                entity_name=entity_name,
+                bank_name=_get_bulk_print_bank_name(lg),
+                beneficiary_name=entity_name,
+                action_type="BANK_DISCREPANCY_NOTICE",
+                serial_number=inst.serial_number,
+                amount=float(lg.lg_amount) if lg.lg_amount is not None else None,
+                currency_code=lg.lg_currency.iso_code if lg.lg_currency else None,
+                instruction_status=inst.status,
+                delivery_date=inst.delivery_date,
+                bank_reply_date=inst.bank_reply_date,
+            )
+            resolved.append(("custody_discrepancy", inst, html_seg, item_out))
+
+        elif item.source == "issuance_maintenance":
+            if not can_issuance:
+                continue
+            action = maint_map.get(item.id)
+            if not action or not action.issued_lg:
+                continue
+            lg = action.issued_lg
+            if not has_all and lg.issuing_entity_id is not None and lg.issuing_entity_id not in allowed_ids_set:
+                continue
+            if not is_reprint and action.instruction_status != "Instruction Issued":
+                continue
+            if is_reprint and action.instruction_status is None:
+                continue
+            lg_num = lg.bank_lg_number or lg.lg_ref_number or f"LG-{lg.id}"
+            register_instruction_for_verification(
+                action.id,
+                action.letter_serial_number or "",
+                lg_num,
+                action.created_at,
+                "M",
+            )
+            html_seg = maintenance_service.regenerate_maintenance_letter_html(
+                db, action, lg, template_cache=maint_template_cache
+            )
+            if not html_seg:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Could not generate instruction letter for maintenance action {action.id} — template not found.",
+                )
+            item_out = BulkPrintBatchItemOut(
+                source="issuance_maintenance",
+                id=action.id,
+                lg_record_id=action.issued_lg_id,
+                lg_number=lg_num,
+                entity_name=lg.issuing_entity.entity_name if lg.issuing_entity else None,
+                bank_name=lg.bank.name if lg.bank else None,
+                beneficiary_name=lg.beneficiary_name,
+                action_type=action.action_type,
+                serial_number=action.letter_serial_number,
+                amount=float(lg.current_amount) if lg.current_amount is not None else None,
+                currency_code=lg.currency.iso_code if lg.currency else None,
+                instruction_status=action.instruction_status,
+                delivery_date=action.delivery_date,
+                bank_reply_date=action.bank_reply_date,
+            )
+            resolved.append(("issuance_maintenance", action, html_seg, item_out))
+
+    return resolved
+
+
+@router.post(
+    "/action-center/bulk-print",
+    response_model=BulkPrintRunSummaryOut,
+    dependencies=[Depends(get_current_end_user_context), Depends(check_for_read_only_mode)],
+    summary="Generate consolidated PDF for selected pending-print letters and mark them as printed"
+)
+async def execute_action_center_bulk_print(
+    payload: BulkPrintRequestIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    if end_user_context.role not in (UserRole.END_USER, UserRole.SYSTEM_OWNER):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough privileges to execute bulk print.",
+        )
+
+    resolved_items = _resolve_and_render_bulk_print_items(db, end_user_context, payload.items, is_reprint=False)
+    if not resolved_items:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No accessible instruction letters found to print.",
+        )
+
+    batch_id = f"BULK-PRT-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{end_user_context.customer_id}"
+    html_segments = [entry[2] for entry in resolved_items]
+
+    combined_pdf_bytes = await generate_merged_pdf_from_html_list(
+        html_segments,
+        filename_hint=f"bulk_print_{batch_id}",
+        pad_for_duplex=payload.pad_for_duplex,
+    )
+    if not combined_pdf_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate consolidated bulk print PDF.",
+        )
+
+    custody_ids_to_check = [
+        entry[1].id for entry in resolved_items if entry[0] == "custody" and not entry[1].is_printed
+    ]
+    approval_req_by_inst_id: Dict[int, models.ApprovalRequest] = {}
+    if custody_ids_to_check:
+        approvals = (
+            db.query(models.ApprovalRequest)
+            .filter(
+                models.ApprovalRequest.related_instruction_id.in_(custody_ids_to_check),
+                models.ApprovalRequest.status == ApprovalRequestStatusEnum.APPROVED,
+            )
+            .all()
+        )
+        for req in approvals:
+            if req.related_instruction_id is not None:
+                approval_req_by_inst_id[req.related_instruction_id] = req
+
+    printed_items_out: List[BulkPrintBatchItemOut] = []
+    email_inst_ids: List[int] = []
+
+    for source, obj, _, item_out in resolved_items:
+        if source == "custody":
+            inst: models.LGInstruction = obj
+            if not inst.is_printed:
+                inst.is_printed = True
+                db.add(inst)
+                req = approval_req_by_inst_id.get(inst.id)
+                if req:
+                    req.request_details = dict(req.request_details or {})
+                    req.request_details["print_notification_status"] = "PRINTED"
+                    flag_modified(req, "request_details")
+                    db.add(req)
+                log_action(
+                    db,
+                    user_id=end_user_context.user_id,
+                    action_type="INSTRUCTION_ACCESSED_FOR_PRINT",
+                    entity_type="LGInstruction",
+                    entity_id=inst.id,
+                    details={
+                        "serial_number": inst.serial_number,
+                        "lg_record_id": inst.lg_record_id,
+                        "bulk_print_batch_id": batch_id,
+                    },
+                    customer_id=end_user_context.customer_id,
+                    lg_record_id=inst.lg_record_id,
+                )
+                if inst.instruction_type != ACTION_TYPE_LG_EXTEND:
+                    email_inst_ids.append(inst.id)
+
+        elif source == "custody_discrepancy":
+            inst = obj
+            inst_details = dict(inst.details or {})
+            approval_info = dict(inst_details.get("bank_terms_admin_approval") or {})
+            if approval_info.get("discrepancy_letter_printed") is not True:
+                approval_info["discrepancy_letter_printed"] = True
+                approval_info["discrepancy_letter_printed_at"] = datetime.utcnow().isoformat()
+                inst_details["bank_terms_admin_approval"] = approval_info
+                inst.details = inst_details
+                flag_modified(inst, "details")
+                db.add(inst)
+                log_action(
+                    db,
+                    user_id=end_user_context.user_id,
+                    action_type="DISCREPANCY_LETTER_GENERATED",
+                    entity_type="LGInstruction",
+                    entity_id=inst.id,
+                    details={
+                        "serial_number": inst.serial_number,
+                        "lg_record_id": inst.lg_record_id,
+                        "bulk_print_batch_id": batch_id,
+                    },
+                    customer_id=end_user_context.customer_id,
+                    lg_record_id=inst.lg_record_id,
+                )
+
+        elif source == "issuance_maintenance":
+            if obj.status == "EXECUTED" and obj.instruction_status == "Instruction Issued":
+                obj.instruction_status = "Printed"
+                obj.is_printed = True
+                db.add(obj)
+                item_out.instruction_status = "Printed"
+
+        printed_items_out.append(item_out)
+
+    log_action(
+        db,
+        user_id=end_user_context.user_id,
+        action_type="BULK_PRINT_EXECUTED",
+        entity_type="Customer",
+        entity_id=end_user_context.customer_id,
+        details={
+            "batch_id": batch_id,
+            "printed_count": len(printed_items_out),
+            "pad_for_duplex": payload.pad_for_duplex,
+            "items": [i.model_dump(mode="json") for i in printed_items_out],
+        },
+        customer_id=end_user_context.customer_id,
+        lg_record_id=None,
+    )
+    db.commit()
+
+    if email_inst_ids:
+        background_tasks.add_task(
+            _send_bulk_print_confirmation_emails_bg,
+            end_user_context.customer_id,
+            end_user_context.user_id,
+            email_inst_ids,
+        )
+
+    pdf_base64 = base64.b64encode(combined_pdf_bytes).decode("utf-8")
+    return BulkPrintRunSummaryOut(
+        printed_count=len(printed_items_out),
+        message=f"Successfully prepared consolidated PDF for {len(printed_items_out)} letter(s).",
+        combined_pdf_base64=pdf_base64,
+        batch_id=batch_id,
+        pad_for_duplex=payload.pad_for_duplex,
+        printed_items=printed_items_out,
+    )
+
+
+@router.get(
+    "/action-center/bulk-print-history",
+    response_model=List[BulkPrintBatchOut],
+    dependencies=[Depends(get_current_end_user_context)],
+    summary="Get history of Action Center bulk print batches for re-printing"
+)
+def get_bulk_print_history(
+    limit: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    from app.models.models_issuance import IssuanceMaintenanceAction, IssuedLGRecord
+
+    has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
+    allowed_ids_set = set(allowed_ids) if not has_all else set()
+    can_custody = bool(getattr(end_user_context, "has_custody_module", True) or end_user_context.role == UserRole.SYSTEM_OWNER)
+    can_issuance = bool(end_user_context.has_issuance_module or end_user_context.role == UserRole.SYSTEM_OWNER)
+
+    logs = (
+        db.query(models.AuditLog)
+        .options(selectinload(models.AuditLog.user))
+        .filter(
+            models.AuditLog.customer_id == end_user_context.customer_id,
+            models.AuditLog.action_type == "BULK_PRINT_EXECUTED",
+        )
+        .order_by(models.AuditLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+
+    all_inst_ids: List[int] = []
+    all_maint_ids: List[int] = []
+    for log_entry in logs:
+        det = log_entry.details if isinstance(log_entry.details, dict) else {}
+        for raw_item in (det.get("items") or []):
+            if not isinstance(raw_item, dict):
+                continue
+            src = raw_item.get("source")
+            iid = raw_item.get("id")
+            if iid is None:
+                continue
+            if src in ("custody", "custody_discrepancy"):
+                all_inst_ids.append(int(iid))
+            elif src == "issuance_maintenance":
+                all_maint_ids.append(int(iid))
+
+    inst_map: Dict[int, models.LGInstruction] = {}
+    if all_inst_ids and can_custody:
+        inst_rows = (
+            db.query(models.LGInstruction)
+            .options(selectinload(models.LGInstruction.lg_record))
+            .filter(
+                models.LGInstruction.id.in_(list(set(all_inst_ids))),
+                models.LGInstruction.is_deleted == False,
+                models.LGInstruction.lg_record.has(
+                    and_(
+                        models.LGRecord.customer_id == end_user_context.customer_id,
+                        models.LGRecord.is_deleted == False,
+                    )
+                ),
+            )
+            .all()
+        )
+        inst_map = {inst.id: inst for inst in inst_rows}
+
+    maint_map: Dict[int, IssuanceMaintenanceAction] = {}
+    if all_maint_ids and can_issuance:
+        maint_rows = (
+            db.query(IssuanceMaintenanceAction)
+            .join(IssuedLGRecord, IssuedLGRecord.id == IssuanceMaintenanceAction.issued_lg_id)
+            .options(selectinload(IssuanceMaintenanceAction.issued_lg))
+            .filter(
+                IssuanceMaintenanceAction.id.in_(list(set(all_maint_ids))),
+                IssuanceMaintenanceAction.is_deleted == False,
+                IssuanceMaintenanceAction.status == "EXECUTED",
+                IssuedLGRecord.customer_id == end_user_context.customer_id,
+            )
+            .all()
+        )
+        maint_map = {m.id: m for m in maint_rows}
+
+    batches: List[BulkPrintBatchOut] = []
+    for log_entry in logs:
+        det = log_entry.details if isinstance(log_entry.details, dict) else {}
+        batch_id = det.get("batch_id") or f"BULK-PRT-{log_entry.id}"
+        raw_items = det.get("items") or []
+        items_out: List[BulkPrintBatchItemOut] = []
+
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            src = raw_item.get("source")
+            iid = raw_item.get("id")
+            if not src or iid is None:
+                continue
+            iid_int = int(iid)
+
+            hydrated_status = raw_item.get("instruction_status")
+            hydrated_delivery = raw_item.get("delivery_date")
+            hydrated_reply = raw_item.get("bank_reply_date")
+
+            if src in ("custody", "custody_discrepancy"):
+                if not can_custody:
+                    continue
+                inst = inst_map.get(iid_int)
+                if not inst or not inst.lg_record:
+                    continue
+                if not has_all and inst.lg_record.beneficiary_corporate_id not in allowed_ids_set:
+                    continue
+                hydrated_status = inst.status
+                hydrated_delivery = inst.delivery_date
+                hydrated_reply = inst.bank_reply_date
+            elif src == "issuance_maintenance":
+                if not can_issuance:
+                    continue
+                act = maint_map.get(iid_int)
+                if not act or not act.issued_lg:
+                    continue
+                if not has_all and act.issued_lg.issuing_entity_id is not None and act.issued_lg.issuing_entity_id not in allowed_ids_set:
+                    continue
+                hydrated_status = act.instruction_status
+                hydrated_delivery = act.delivery_date
+                hydrated_reply = act.bank_reply_date
+            else:
+                continue
+
+            items_out.append(
+                BulkPrintBatchItemOut(
+                    source=src,
+                    id=iid_int,
+                    lg_record_id=raw_item.get("lg_record_id"),
+                    lg_number=raw_item.get("lg_number") or "N/A",
+                    entity_name=raw_item.get("entity_name"),
+                    bank_name=raw_item.get("bank_name"),
+                    beneficiary_name=raw_item.get("beneficiary_name"),
+                    action_type=raw_item.get("action_type") or "",
+                    serial_number=raw_item.get("serial_number"),
+                    amount=raw_item.get("amount"),
+                    currency_code=raw_item.get("currency_code"),
+                    instruction_status=hydrated_status,
+                    delivery_date=hydrated_delivery,
+                    bank_reply_date=hydrated_reply,
+                )
+            )
+
+        if not items_out and raw_items:
+            continue
+
+        batches.append(
+            BulkPrintBatchOut(
+                batch_id=batch_id,
+                audit_log_id=log_entry.id,
+                created_at=log_entry.timestamp,
+                triggered_by_email=log_entry.user.email if log_entry.user else None,
+                printed_count=len(items_out) if items_out else int(det.get("printed_count") or 0),
+                pad_for_duplex=bool(det.get("pad_for_duplex", False)),
+                items=items_out,
+            )
+        )
+
+    return batches
+
+
+@router.post(
+    "/action-center/bulk-print-reprint",
+    response_model=Dict[str, Any],
+    dependencies=[Depends(get_current_end_user_context)],
+    summary="Regenerate and merge PDFs for a previous Action Center bulk print batch without altering states"
+)
+async def reprint_action_center_bulk_print(
+    payload: BulkPrintRequestIn,
+    db: Session = Depends(get_db),
+    end_user_context: TokenData = Depends(get_current_end_user_context),
+):
+    resolved_items = _resolve_and_render_bulk_print_items(db, end_user_context, payload.items, is_reprint=True)
+    if not resolved_items:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No accessible instruction letters found to reprint.",
+        )
+
+    html_segments = [entry[2] for entry in resolved_items]
+    combined_pdf_bytes = await generate_merged_pdf_from_html_list(
+        html_segments,
+        filename_hint=f"reprint_bulk_print_customer_{end_user_context.customer_id}_{date.today().isoformat()}",
+        pad_for_duplex=payload.pad_for_duplex,
+    )
+    if not combined_pdf_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate consolidated reprint PDF.",
+        )
+
+    pdf_base64 = base64.b64encode(combined_pdf_bytes).decode("utf-8")
+    return {
+        "count": len(html_segments),
+        "message": f"Successfully regenerated consolidated PDF for {len(html_segments)} instruction letter(s).",
+        "combined_pdf_base64": pdf_base64,
+    }
 
 @router.get(
     "/users/me_dashboard_info",

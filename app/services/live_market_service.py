@@ -39,6 +39,7 @@ _LAST_FETCH_ATTEMPT: Optional[datetime] = None
 _ARCHIVE_THROTTLE: Dict[str, datetime] = {}
 _EMPIRICAL_CACHE: Dict[str, Dict[str, Any]] = {}
 _TWELVE_DATA_CACHE: Dict[str, Dict[str, Any]] = {}
+_LAST_TWELVE_DATA_FETCH_ATTEMPT: Optional[datetime] = None
 CACHE_TTL_SECONDS = 300
 RETRY_BACKOFF_SECONDS = 60
 EMPIRICAL_CACHE_TTL_SECONDS = 30
@@ -148,7 +149,11 @@ class LiveMarketService:
         if not api_key:
             return {}
 
+        global _LAST_TWELVE_DATA_FETCH_ATTEMPT
         now = datetime.now(timezone.utc)
+        if _LAST_TWELVE_DATA_FETCH_ATTEMPT and (now - _LAST_TWELVE_DATA_FETCH_ATTEMPT).total_seconds() < RETRY_BACKOFF_SECONDS:
+            return {}
+
         normalized_pairs = [p.upper().strip() for p in pairs if p and "/" in p]
         if not normalized_pairs:
             return {}
@@ -193,6 +198,7 @@ class LiveMarketService:
                                 results[pair] = rate_val
                                 _TWELVE_DATA_CACHE[pair] = {"rate": rate_val, "timestamp": now}
         except Exception as e:
+            _LAST_TWELVE_DATA_FETCH_ATTEMPT = now
             logger.warning(f"Twelve Data live FX batch fetch failed or timed out: {e}. Falling back gracefully.")
 
         return results

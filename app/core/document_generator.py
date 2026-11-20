@@ -100,87 +100,138 @@ def _apply_template_date_formatting(html_content: str) -> str:
         flags=re.DOTALL,
     )
 
-def _render_single_html_one_page(html_content: str, filename_hint: str = "") -> bytes:
+# Progressive compacting CSS rules that preserve @page margin-top (40mm letterhead clearance).
+# Kept as plain strings at module level so WeasyPrint is only imported inside worker/child processes.
+_COMPACT_PRESET_STRINGS = (
+    # Step 1: Slightly tighter vertical spacing & table padding
+    """
+    body { font-size: 9.2pt !important; line-height: 1.4 !important; padding-top: 0 !important; }
+    .header-table { padding-bottom: 6px !important; margin-bottom: 11px !important; }
+    .recipient-block { margin-bottom: 10px !important; }
+    .subject-line { margin-bottom: 10px !important; padding: 3px 0 3px 10px !important; font-size: 10pt !important; }
+    .salutation { margin-bottom: 6px !important; }
+    p { margin-bottom: 7px !important; }
+    .spec-table { margin: 7px 0 9px 0 !important; font-size: 9pt !important; }
+    .spec-table th, .spec-table td { padding: 4px 10px !important; }
+    .notes-wrapper { margin: 6px 0 !important; }
+    .signature-section { margin-top: 12px !important; }
+    .sig-table { margin-top: 52px !important; }
+    #grow-mandatory-security-footer { margin-top: 10px !important; padding-top: 5px !important; }
+    """,
+    # Step 2: Medium compacting for letters with multi-line notes / declarations
+    """
+    @page { margin-bottom: 10mm !important; }
+    body { font-size: 8.6pt !important; line-height: 1.32 !important; padding-top: 0 !important; }
+    .company-title { font-size: 12.5pt !important; }
+    .header-table { padding-bottom: 5px !important; margin-bottom: 8px !important; }
+    .recipient-block { margin-bottom: 7px !important; font-size: 9pt !important; }
+    .recipient-name { font-size: 9.5pt !important; }
+    .subject-line { margin-bottom: 7px !important; padding: 2px 0 2px 8px !important; font-size: 9.5pt !important; }
+    .salutation { margin-bottom: 5px !important; }
+    p { margin-bottom: 5px !important; }
+    .spec-table { margin: 5px 0 7px 0 !important; font-size: 8.4pt !important; }
+    .spec-table th, .spec-table td { padding: 3.5px 8px !important; }
+    .notes-wrapper { margin: 5px 0 !important; }
+    .notes-wrapper h3 { font-size: 8.5pt !important; margin: 3px 0 2px 0 !important; }
+    .signature-section { margin-top: 8px !important; }
+    .sig-table { margin-top: 40px !important; }
+    #grow-mandatory-security-footer { margin-top: 8px !important; padding-top: 4px !important; }
+    """,
+    # Step 3: High-density fallback for very long custom notes
+    """
+    @page { margin-bottom: 8mm !important; }
+    body { font-size: 7.8pt !important; line-height: 1.22 !important; padding-top: 0 !important; }
+    .company-title { font-size: 11.5pt !important; }
+    .header-table { padding-bottom: 4px !important; margin-bottom: 6px !important; }
+    .recipient-block { margin-bottom: 5px !important; font-size: 8.2pt !important; }
+    .recipient-name { font-size: 8.8pt !important; }
+    .subject-line { margin-bottom: 5px !important; padding: 2px 0 2px 8px !important; font-size: 8.8pt !important; }
+    .salutation { margin-bottom: 4px !important; }
+    p { margin-bottom: 4px !important; }
+    .spec-table { margin: 4px 0 5px 0 !important; font-size: 7.8pt !important; }
+    .spec-table th, .spec-table td { padding: 2.5px 6px !important; }
+    .notes-wrapper { margin: 4px 0 !important; }
+    .notes-wrapper h3 { font-size: 8pt !important; margin: 2px 0 !important; }
+    .signature-section { margin-top: 6px !important; }
+    .sig-table { margin-top: 30px !important; }
+    #grow-mandatory-security-footer { margin-top: 6px !important; padding-top: 3px !important; }
+    """,
+)
+
+
+def _make_batch_cached_url_fetcher():
+    """
+    Returns a per-batch URL fetcher wrapping _safe_weasyprint_url_fetcher with a bounded
+    in-memory cache so repeated external stylesheets/fonts/static assets across letters in
+    the same batch are fetched only once, and discarded as soon as the batch completes.
+    """
+    cache: dict[str, Any] = {}
+    max_entries = 128
+
+    def _cached_fetcher(url: str):
+        if not url or url.startswith("data:"):
+            return _safe_weasyprint_url_fetcher(url)
+        if url in cache:
+            return dict(cache[url])
+
+        res = _safe_weasyprint_url_fetcher(url)
+        if isinstance(res, dict) and len(cache) < max_entries:
+            cached = dict(res)
+            file_obj = cached.pop("file_obj", None)
+            if file_obj is not None:
+                try:
+                    cached["string"] = file_obj.read()
+                finally:
+                    try:
+                        file_obj.close()
+                    except Exception:
+                        pass
+            cache[url] = cached
+            return dict(cached)
+        return res
+
+    return _cached_fetcher
+
+
+def _render_single_html_one_page(
+    html_content: str,
+    filename_hint: str = "",
+    *,
+    font_config: Any = None,
+    compact_css_list: Optional[List[Any]] = None,
+    url_fetcher: Any = None,
+) -> bytes:
     """
     Renders an HTML document via WeasyPrint and guarantees it fits on a single A4 page
     (while strictly preserving the top letterhead margin, e.g. 40mm) by progressively
     compacting vertical spacing and font size if content (such as long notes or addresses)
     would otherwise spill onto page 2.
-    Also enforces the mandatory platform QR & 6-digit Security Code footer.
+    Also enforces the mandatory platform QR & 4-digit Security Code footer.
     """
     from weasyprint import HTML, CSS
     from app.core.instruction_verification import inject_mandatory_verification_footer
 
     formatted_html = _apply_template_date_formatting(html_content)
     formatted_html = inject_mandatory_verification_footer(formatted_html, filename_hint=filename_hint)
-    html_obj = HTML(string=formatted_html, url_fetcher=_safe_weasyprint_url_fetcher)
-    doc = html_obj.render()
+    fetcher = url_fetcher or _safe_weasyprint_url_fetcher
+    html_obj = HTML(string=formatted_html, url_fetcher=fetcher)
+    render_kwargs = {"font_config": font_config} if font_config is not None else {}
+    doc = html_obj.render(**render_kwargs)
 
     if len(doc.pages) <= 1:
         pdf_bytes = doc.write_pdf()
         del doc, html_obj
         return pdf_bytes
 
-    # Progressive compacting steps that preserve @page margin-top (40mm letterhead clearance)
-    compact_presets = [
-        # Step 1: Slightly tighter vertical spacing & table padding
-        """
-        body { font-size: 9.2pt !important; line-height: 1.4 !important; padding-top: 0 !important; }
-        .header-table { padding-bottom: 6px !important; margin-bottom: 11px !important; }
-        .recipient-block { margin-bottom: 10px !important; }
-        .subject-line { margin-bottom: 10px !important; padding: 3px 0 3px 10px !important; font-size: 10pt !important; }
-        .salutation { margin-bottom: 6px !important; }
-        p { margin-bottom: 7px !important; }
-        .spec-table { margin: 7px 0 9px 0 !important; font-size: 9pt !important; }
-        .spec-table th, .spec-table td { padding: 4px 10px !important; }
-        .notes-wrapper { margin: 6px 0 !important; }
-        .signature-section { margin-top: 12px !important; }
-        .sig-table { margin-top: 52px !important; }
-        #grow-mandatory-security-footer { margin-top: 10px !important; padding-top: 5px !important; }
-        """,
-        # Step 2: Medium compacting for letters with multi-line notes / declarations
-        """
-        @page { margin-bottom: 10mm !important; }
-        body { font-size: 8.6pt !important; line-height: 1.32 !important; padding-top: 0 !important; }
-        .company-title { font-size: 12.5pt !important; }
-        .header-table { padding-bottom: 5px !important; margin-bottom: 8px !important; }
-        .recipient-block { margin-bottom: 7px !important; font-size: 9pt !important; }
-        .recipient-name { font-size: 9.5pt !important; }
-        .subject-line { margin-bottom: 7px !important; padding: 2px 0 2px 8px !important; font-size: 9.5pt !important; }
-        .salutation { margin-bottom: 5px !important; }
-        p { margin-bottom: 5px !important; }
-        .spec-table { margin: 5px 0 7px 0 !important; font-size: 8.4pt !important; }
-        .spec-table th, .spec-table td { padding: 3.5px 8px !important; }
-        .notes-wrapper { margin: 5px 0 !important; }
-        .notes-wrapper h3 { font-size: 8.5pt !important; margin: 3px 0 2px 0 !important; }
-        .signature-section { margin-top: 8px !important; }
-        .sig-table { margin-top: 40px !important; }
-        #grow-mandatory-security-footer { margin-top: 8px !important; padding-top: 4px !important; }
-        """,
-        # Step 3: High-density fallback for very long custom notes
-        """
-        @page { margin-bottom: 8mm !important; }
-        body { font-size: 7.8pt !important; line-height: 1.22 !important; padding-top: 0 !important; }
-        .company-title { font-size: 11.5pt !important; }
-        .header-table { padding-bottom: 4px !important; margin-bottom: 6px !important; }
-        .recipient-block { margin-bottom: 5px !important; font-size: 8.2pt !important; }
-        .recipient-name { font-size: 8.8pt !important; }
-        .subject-line { margin-bottom: 5px !important; padding: 2px 0 2px 8px !important; font-size: 8.8pt !important; }
-        .salutation { margin-bottom: 4px !important; }
-        p { margin-bottom: 4px !important; }
-        .spec-table { margin: 4px 0 5px 0 !important; font-size: 7.8pt !important; }
-        .spec-table th, .spec-table td { padding: 2.5px 6px !important; }
-        .notes-wrapper { margin: 4px 0 !important; }
-        .notes-wrapper h3 { font-size: 8pt !important; margin: 2px 0 !important; }
-        .signature-section { margin-top: 6px !important; }
-        .sig-table { margin-top: 30px !important; }
-        #grow-mandatory-security-footer { margin-top: 6px !important; padding-top: 3px !important; }
-        """,
-    ]
+    if compact_css_list is None:
+        compact_css_list = [
+            CSS(string=css_rules, font_config=font_config) if font_config is not None else CSS(string=css_rules)
+            for css_rules in _COMPACT_PRESET_STRINGS
+        ]
 
-    for css_rules in compact_presets:
+    for css_obj in compact_css_list:
         del doc
-        doc = html_obj.render(stylesheets=[CSS(string=css_rules)])
+        doc = html_obj.render(stylesheets=[css_obj], **render_kwargs)
         if len(doc.pages) <= 1:
             break
 
@@ -205,18 +256,53 @@ def _prewarm_verification_cache_for_segments(html_segments: List[str], filename_
         logger.debug(f"Verification cache pre-warm skipped: {e}")
 
 
-def _merge_html_segments_to_pdf_bytes(html_segments: List[str], filename_hint: str = "") -> Optional[bytes]:
+def _merge_html_segments_to_pdf_bytes(
+    html_segments: List[str],
+    filename_hint: str = "",
+    pad_for_duplex: bool = False,
+) -> Optional[bytes]:
     from pypdf import PdfReader, PdfWriter
+    from weasyprint import CSS
+    from weasyprint.text.fonts import FontConfiguration
+
+    valid_segments = [s for s in html_segments if s and s.strip()]
+    if not valid_segments:
+        return None
+
+    shared_font_config = FontConfiguration()
+    shared_compact_css = [
+        CSS(string=css_rules, font_config=shared_font_config)
+        for css_rules in _COMPACT_PRESET_STRINGS
+    ]
+    batch_fetcher = _make_batch_cached_url_fetcher()
 
     writer = PdfWriter()
-    for segment in html_segments:
-        if not segment or not segment.strip():
-            continue
-        seg_bytes = _render_single_html_one_page(segment, filename_hint=filename_hint)
-        if seg_bytes:
-            reader = PdfReader(io.BytesIO(seg_bytes))
-            for page in reader.pages:
-                writer.add_page(page)
+    try:
+        for idx, segment in enumerate(valid_segments):
+            seg_bytes = _render_single_html_one_page(
+                segment,
+                filename_hint=filename_hint,
+                font_config=shared_font_config,
+                compact_css_list=shared_compact_css,
+                url_fetcher=batch_fetcher,
+            )
+            if seg_bytes:
+                reader = PdfReader(io.BytesIO(seg_bytes))
+                for page in reader.pages:
+                    writer.add_page(page)
+                if (
+                    pad_for_duplex
+                    and idx < len(valid_segments) - 1
+                    and len(reader.pages) > 0
+                    and (len(reader.pages) % 2 == 1)
+                ):
+                    last_page = reader.pages[-1]
+                    writer.add_blank_page(
+                        width=float(last_page.mediabox.width),
+                        height=float(last_page.mediabox.height),
+                    )
+    finally:
+        del shared_compact_css, shared_font_config, batch_fetcher
 
     if len(writer.pages) == 0:
         return None
@@ -318,7 +404,11 @@ def _render_pdf_worker(html_content: str, filename_hint: str = "") -> Optional[b
             pass
 
 
-def _render_and_merge_pdfs_worker(html_segments: List[str], filename_hint: str = "") -> Optional[bytes]:
+def _render_and_merge_pdfs_worker(
+    html_segments: List[str],
+    filename_hint: str = "",
+    pad_for_duplex: bool = False,
+) -> Optional[bytes]:
     """
     Renders each HTML segment as an independent PDF (so each letter has its own @page headers,
     footers, and independent Page 1 of 1 numbering) and merges the resulting PDFs into a single PDF stream.
@@ -327,12 +417,19 @@ def _render_and_merge_pdfs_worker(html_segments: List[str], filename_hint: str =
     if _should_use_isolated_pdf_fork():
         _prewarm_verification_cache_for_segments(html_segments, filename_hint=filename_hint)
         try:
-            return _execute_pdf_in_forked_worker_sync(_merge_html_segments_to_pdf_bytes, (html_segments, filename_hint))
+            return _execute_pdf_in_forked_worker_sync(
+                _merge_html_segments_to_pdf_bytes,
+                (html_segments, filename_hint, pad_for_duplex),
+            )
         except OSError as fork_err:
             logger.warning(f"os.fork() unavailable for merged PDF render ({fork_err}); falling back to in-process render.")
 
     try:
-        return _merge_html_segments_to_pdf_bytes(html_segments, filename_hint=filename_hint)
+        return _merge_html_segments_to_pdf_bytes(
+            html_segments,
+            filename_hint=filename_hint,
+            pad_for_duplex=pad_for_duplex,
+        )
     finally:
         gc.collect()
         try:
@@ -365,7 +462,11 @@ async def generate_pdf_from_html(html_content: str, filename_hint: str = "docume
         return None
 
 
-async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_hint: str = "consolidated_documents") -> Optional[bytes]:
+async def generate_merged_pdf_from_html_list(
+    html_segments: List[str],
+    filename_hint: str = "consolidated_documents",
+    pad_for_duplex: bool = False,
+) -> Optional[bytes]:
     """
     Renders a list of independent HTML documents into individual PDFs and merges them into one PDF,
     preserving isolated @page counters and headers/footers per letter.
@@ -374,9 +475,9 @@ async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_
     from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
 
     in_trial = is_active_trial_context()
-    logger.debug(f"generate_merged_pdf_from_html_list: Rendering and merging {len(html_segments)} letters for '{filename_hint}' (trial={in_trial}).")
+    logger.debug(f"generate_merged_pdf_from_html_list: Rendering and merging {len(html_segments)} letters for '{filename_hint}' (trial={in_trial}, pad_for_duplex={pad_for_duplex}).")
     try:
-        pdf_bytes = await asyncio.to_thread(_render_and_merge_pdfs_worker, html_segments, filename_hint)
+        pdf_bytes = await asyncio.to_thread(_render_and_merge_pdfs_worker, html_segments, filename_hint, pad_for_duplex)
         if pdf_bytes:
             if in_trial:
                 pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)

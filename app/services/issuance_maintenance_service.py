@@ -542,7 +542,7 @@ class IssuanceMaintenanceService:
         ).first()
         if not action:
             raise HTTPException(status_code=404, detail="Action not found")
-        if action.instruction_status not in ("Instruction Issued", "Instruction Delivered"):
+        if action.instruction_status not in ("Instruction Issued", "Printed", "Instruction Delivered"):
             raise HTTPException(status_code=400, detail="Cannot record bank reply for this action")
 
         # F3: AI verification on bank reply document (optional)
@@ -569,6 +569,7 @@ class IssuanceMaintenanceService:
         else:
             action.bank_reply_date = datetime.utcnow()
 
+        lg = None
         # Upload bank reply document to GCS for later access (separate from AI verification)
         if bank_reply_file_bytes and len(bank_reply_file_bytes) > 0:
             try:
@@ -633,9 +634,6 @@ class IssuanceMaintenanceService:
                 logger.info(f"record_bank_reply: Changes applied")
 
         db.add(action)
-        db.commit()
-        db.refresh(action)
-
         log_action(
             db, user_id=user_id,
             action_type=f"ISSUANCE_MAINTENANCE_{action.action_type}_BANK_REPLY_RECORDED",
@@ -649,6 +647,8 @@ class IssuanceMaintenanceService:
             },
             customer_id=customer_id
         )
+        db.commit()
+        db.refresh(action)
         logger.info(f"record_bank_reply: DONE")
 
         return action
@@ -1899,13 +1899,18 @@ class IssuanceMaintenanceService:
     # F1a: Regenerate Maintenance Letter HTML (on-the-fly)
     # ──────────────────────────────────────────────────
     def regenerate_maintenance_letter_html(
-        self, db: Session, action: IssuanceMaintenanceAction, lg: IssuedLGRecord
+        self,
+        db: Session,
+        action: IssuanceMaintenanceAction,
+        lg: IssuedLGRecord,
+        template_cache: Optional[Dict[Any, Any]] = None,
     ) -> str:
         """
         Regenerates the instruction letter HTML from template + action_data.
         Mirrors the LG custody pattern: no file storage, regenerate on demand.
         Returns rendered HTML string, or None if template not found.
         """
+        from sqlalchemy import inspect as sa_inspect
         from app.crud.crud import crud_template
         from sqlalchemy.orm import selectinload
 
@@ -1919,32 +1924,42 @@ class IssuanceMaintenanceService:
         }
 
         specific_action_type = TEMPLATE_MAP.get(action.action_type, f"LG_{action.action_type}_REQUEST")
+        cache_key = (getattr(lg, "customer_id", None), specific_action_type)
 
-        template = None
-        for action_type_key in [specific_action_type, "LG_CANCEL_LIQUIDATION", "LG_MAINTENANCE_REQUEST"]:
-            template = crud_template.get_single_template(
-                db, action_type=action_type_key, is_global=False,
-                customer_id=lg.customer_id, is_notification_template=False,
-            )
-            if not template:
+        if template_cache is not None and cache_key in template_cache:
+            template = template_cache[cache_key]
+        else:
+            template = None
+            for action_type_key in [specific_action_type, "LG_CANCEL_LIQUIDATION", "LG_MAINTENANCE_REQUEST"]:
                 template = crud_template.get_single_template(
-                    db, action_type=action_type_key, is_global=True,
-                    is_notification_template=False,
+                    db, action_type=action_type_key, is_global=False,
+                    customer_id=lg.customer_id, is_notification_template=False,
                 )
-            if template:
-                break
+                if not template:
+                    template = crud_template.get_single_template(
+                        db, action_type=action_type_key, is_global=True,
+                        is_notification_template=False,
+                    )
+                if template:
+                    break
+            if template_cache is not None:
+                template_cache[cache_key] = template
 
         if not template:
             logger.warning(f"No template found for maintenance letter regeneration: {action.action_type}")
             return None
 
-        lg_with_rels = db.query(IssuedLGRecord).options(
-            selectinload(IssuedLGRecord.currency),
-            selectinload(IssuedLGRecord.bank),
-            selectinload(IssuedLGRecord.customer),
-            selectinload(IssuedLGRecord.issuing_entity),
-            selectinload(IssuedLGRecord.lg_type),
-        ).filter(IssuedLGRecord.id == lg.id).first()
+        needed_rels = {"currency", "bank", "customer", "issuing_entity", "lg_type"}
+        if not (needed_rels & sa_inspect(lg).unloaded):
+            lg_with_rels = lg
+        else:
+            lg_with_rels = db.query(IssuedLGRecord).options(
+                selectinload(IssuedLGRecord.currency),
+                selectinload(IssuedLGRecord.bank),
+                selectinload(IssuedLGRecord.customer),
+                selectinload(IssuedLGRecord.issuing_entity),
+                selectinload(IssuedLGRecord.lg_type),
+            ).filter(IssuedLGRecord.id == lg.id).first()
 
         data = action.action_data or {}
 
@@ -2065,12 +2080,26 @@ class IssuanceMaintenanceService:
 
         # Fill template
         from app.core.document_generator import escape_html_placeholder
+        from app.core.instruction_verification import register_instruction_for_verification, attach_verification_marker
         generated_html = template.content
         for key, value in placeholder_data.items():
             str_value = escape_html_placeholder(key, value)
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
 
-        return generated_html
+        lg_num_val = lg_with_rels.bank_lg_number or lg_with_rels.lg_ref_number or ""
+        register_instruction_for_verification(
+            action.id,
+            action.letter_serial_number or "",
+            lg_num_val,
+            action.created_at,
+            "M",
+        )
+        return attach_verification_marker(
+            generated_html,
+            serial_number=action.letter_serial_number,
+            record_kind="M",
+            record_id=action.id,
+        )
 
     # ──────────────────────────────────────────────────
     # F1b: Maintenance Letter PDF Generation (used during _execute_action)
@@ -2242,10 +2271,26 @@ class IssuanceMaintenanceService:
 
         # Fill template
         from app.core.document_generator import escape_html_placeholder
+        from app.core.instruction_verification import register_instruction_for_verification, attach_verification_marker
         generated_html = template.content
         for key, value in placeholder_data.items():
             str_value = escape_html_placeholder(key, value)
             generated_html = generated_html.replace(f"{{{{{key}}}}}", str_value)
+
+        lg_num_val = lg_with_rels.bank_lg_number or lg_with_rels.lg_ref_number or ""
+        register_instruction_for_verification(
+            action.id,
+            action.letter_serial_number or "",
+            lg_num_val,
+            action.created_at,
+            "M",
+        )
+        generated_html = attach_verification_marker(
+            generated_html,
+            serial_number=action.letter_serial_number,
+            record_kind="M",
+            record_id=action.id,
+        )
 
         # Generate PDF (synchronous call via asyncio for background context)
         import asyncio

@@ -1,7 +1,7 @@
 # app/schemas/all_schemas.py
 from pydantic import BaseModel, EmailStr, Field, model_validator, computed_field, field_validator, ConfigDict
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Literal
 from enum import Enum
 from uuid import UUID
 import os
@@ -1121,6 +1121,10 @@ class LGRecordMinimalOut(BaseSchema):
     lg_type: 'LgTypeOut'
     lg_status: 'LgStatusOut'
     lg_operational_status: Optional['LgOperationalStatusOut'] = None
+    foreign_bank_name: Optional[str] = None
+    advising_status: Optional[str] = None
+    communication_bank_id: Optional[int] = None
+    communication_bank: Optional['BankOut'] = None
 
     class Config:
         from_attributes = True
@@ -1137,6 +1141,9 @@ class LGInstructionOut(LGInstructionBase, BaseSchema):
     # Expose new sequence numbers for potential UI display or debugging
     global_seq_per_lg: int # NEW field
     type_seq_per_lg: int # NEW field
+    has_reminder_sent: Optional[bool] = False
+    reminder_instruction_id: Optional[int] = None
+    reminder_sent_at: Optional[datetime] = None
 
 class LGRecordOut(LGRecordBase, BaseSchema):
     customer_id: int
@@ -1385,6 +1392,48 @@ class AutoRenewalBatchOut(BaseModel):
 
 class BulkReprintInstructionsIn(BaseModel):
     instruction_ids: List[int] = Field(..., description="List of LGInstruction IDs to merge and reprint as a single PDF.")
+    pad_for_duplex: bool = False
+
+class BulkPrintItemIn(BaseModel):
+    source: Literal["custody", "custody_discrepancy", "issuance_maintenance"]
+    id: int
+
+class BulkPrintRequestIn(BaseModel):
+    items: List[BulkPrintItemIn] = Field(..., min_length=1)
+    pad_for_duplex: bool = False
+
+class BulkPrintBatchItemOut(BaseModel):
+    source: str
+    id: int
+    lg_record_id: Optional[int] = None
+    lg_number: str
+    entity_name: Optional[str] = None
+    bank_name: Optional[str] = None
+    beneficiary_name: Optional[str] = None
+    action_type: str
+    serial_number: Optional[str] = None
+    amount: Optional[float] = None
+    currency_code: Optional[str] = None
+    instruction_status: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    bank_reply_date: Optional[datetime] = None
+
+class BulkPrintRunSummaryOut(BaseModel):
+    printed_count: int
+    message: str
+    combined_pdf_base64: str
+    batch_id: str
+    pad_for_duplex: bool = False
+    printed_items: List[BulkPrintBatchItemOut] = []
+
+class BulkPrintBatchOut(BaseModel):
+    batch_id: str
+    audit_log_id: Optional[int] = None
+    created_at: datetime
+    triggered_by_email: Optional[str] = None
+    printed_count: int
+    pad_for_duplex: bool = False
+    items: List[BulkPrintBatchItemOut] = []
 
 class AutoRenewalRunSummaryOut(BaseModel):
     renewed_count: int
@@ -1399,6 +1448,7 @@ class LGAutoRenewalItemIn(BaseModel):
 
 class RunAutoRenewalRequestIn(BaseModel):
     renewals: Optional[List[LGAutoRenewalItemIn]] = Field(None, description="Optional list of specific LG renewals with custom dates. If omitted, runs default automatic renewal.")
+    pad_for_duplex: bool = False
 
 class AutoRenewalCandidateOut(BaseModel):
     id: int

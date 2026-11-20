@@ -75,6 +75,62 @@ from app.core.ai_integration import process_lg_document_with_ai, GCS_BUCKET_NAME
 import logging
 logger = logging.getLogger(__name__)
 
+
+async def _dispatch_extension_emails_bg(email_jobs: List[Dict[str, Any]]) -> None:
+    """
+    Sends LG extension stakeholder notifications in a FastAPI background task using a fresh
+    SessionLocal() after the main request transaction has already committed.
+    """
+    if not email_jobs:
+        return
+    from app.database import SessionLocal
+
+    bg_db = SessionLocal()
+    try:
+        for job in email_jobs:
+            try:
+                email_sent_successfully, _ = await send_email(
+                    db=bg_db,
+                    to_emails=job["to_emails"],
+                    cc_emails=job["cc_emails"],
+                    subject_template=job["subject"],
+                    body_template=job["body_html"],
+                    template_data={},
+                    email_settings=job["email_settings"],
+                    sender_name=job["sender_name"],
+                )
+                details: Dict[str, Any] = {
+                    "recipient": job["to_emails"],
+                    "cc_recipients": job["cc_emails"],
+                    "subject": job["subject"],
+                    "method": job["email_method_for_log"],
+                }
+                if not email_sent_successfully:
+                    details["reason"] = "Email service failed to send notification"
+                log_action(
+                    bg_db,
+                    user_id=job["user_id"],
+                    action_type="NOTIFICATION_SENT" if email_sent_successfully else "NOTIFICATION_FAILED",
+                    entity_type="LGRecord",
+                    entity_id=job["lg_record_id"],
+                    details=details,
+                    customer_id=job["customer_id"],
+                    lg_record_id=job["lg_record_id"],
+                )
+                bg_db.commit()
+            except Exception as job_err:
+                logger.error(
+                    f"Background extension email dispatch failed for LG id={job.get('lg_record_id')}: {job_err}",
+                    exc_info=True,
+                )
+                try:
+                    bg_db.rollback()
+                except Exception:
+                    pass
+    finally:
+        bg_db.close()
+
+
 class CRUDLGRecord(CRUDBase):
     # CRITICAL CHANGE: Accept other CRUD instances needed in its methods
     def __init__(self, model: Type[LGRecord], crud_internal_owner_contact_instance: Any, crud_lg_instruction_instance: Any, crud_lg_document_instance: Any, crud_customer_configuration_instance: Any):
@@ -621,18 +677,31 @@ class CRUDLGRecord(CRUDBase):
         )
         return db_lg_record
         
-    async def extend_lg(self, db: Session, lg_record_id: int, new_expiry_date: date, user_id: int, notes: Optional[str] = None, background_tasks: Optional[BackgroundTasks] = None) -> Tuple[models.LGRecord, int, str]:
-        db_lg_record = self.get_lg_record_with_relations(db, lg_record_id, None)
+    async def extend_lg(
+        self,
+        db: Session,
+        lg_record_id: int,
+        new_expiry_date: date,
+        user_id: int,
+        notes: Optional[str] = None,
+        background_tasks: Optional[BackgroundTasks] = None,
+        *,
+        prefetched_lg_record: Optional[models.LGRecord] = None,
+        prefetched_template: Optional[models.Template] = None,
+        prefetched_email_ctx: Optional[Tuple[EmailSettings, str, List[str]]] = None,
+        deferred_email_jobs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[models.LGRecord, int, str]:
+        db_lg_record = prefetched_lg_record or self.get_lg_record_with_relations(db, lg_record_id, None)
         if not db_lg_record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="LG Record not found or is deleted."
             )
-        recipient_name, recipient_address = self._get_recipient_details(db, db_lg_record)
 
         if db_lg_record.lg_status_id != models.LgStatusEnum.VALID.value:
+            status_name = db_lg_record.lg_status.name if getattr(db_lg_record, "lg_status", None) else str(db_lg_record.lg_status_id)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Only LGs with status 'Valid' can be extended. Current status: {db_lg_record.lg_status.name}.",
+                detail=f"Only LGs with status 'Valid' can be extended. Current status: {status_name}.",
             )
 
         if new_expiry_date <= db_lg_record.expiry_date.date():
@@ -640,39 +709,52 @@ class CRUDLGRecord(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"New expiry date ({new_expiry_date}) must be strictly after the current expiry date ({db_lg_record.expiry_date.date()}).",
             )
-        old_expiry_date_for_log = db_lg_record.expiry_date.date().isoformat()
 
-        issue_date_from_db = db_lg_record.issuance_date.date()
-        delta_days = (new_expiry_date - issue_date_from_db).days
-        new_lg_period_months = max(1, round(delta_days / 30.44))
-
-        update_dict = {
-            "expiry_date": datetime.combine(new_expiry_date, datetime.min.time()),
-        }
-        updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
-
-        # --- START TEMPLATE SEARCH ---
-        instruction_template = self._resolve_instruction_template(db, "LG_EXTENSION", db_lg_record.customer_id)
+        # Resolve template & capture loaded relations BEFORE super().update (which calls db.refresh)
+        instruction_template = prefetched_template or self._resolve_instruction_template(db, "LG_EXTENSION", db_lg_record.customer_id)
         if not instruction_template:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="LG Extension Instruction template not found."
             )
-        # --- END TEMPLATE SEARCH ---
-        
-        customer = db.query(models.Customer).filter(models.Customer.id == db_lg_record.customer_id).first()
-        entity = db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
-        
+
+        recipient_name, recipient_address = self._get_recipient_details(db, db_lg_record)
+        customer = db_lg_record.customer or db.query(models.Customer).filter(models.Customer.id == db_lg_record.customer_id).first()
+        entity = db_lg_record.beneficiary_corporate or db.query(models.CustomerEntity).filter(models.CustomerEntity.id == db_lg_record.beneficiary_corporate_id).first()
         if not customer or not entity:
-             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Customer or entity record not found for LG.")
+
+        currency_obj = db_lg_record.lg_currency
+        owner_obj = db_lg_record.internal_owner_contact
+        category_obj = db_lg_record.lg_category
+        effective_bank_name = self._get_effective_issuing_bank_name(db_lg_record)
+        lg_record_id_val = db_lg_record.id
+        customer_id_val = db_lg_record.customer_id
+        lg_number_val = db_lg_record.lg_number
+        lg_amount_float = float(db_lg_record.lg_amount)
+        lg_sequence_number_str = str(db_lg_record.lg_sequence_number).zfill(4)
+        issuer_name_val = db_lg_record.issuer_name
+        issuance_date_str = db_lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(db_lg_record, "issuance_date", None) else "N/A"
+
+        old_expiry_date_for_log = db_lg_record.expiry_date.date().isoformat()
+        update_dict = {
+            "expiry_date": datetime.combine(new_expiry_date, datetime.min.time()),
+        }
+        updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
         customer_name = customer.name if customer else "N/A"
         current_date_str = datetime.now().strftime("%Y-%m-%d")
-        issuance_date_str = db_lg_record.issuance_date.strftime("%Y-%m-%d") if getattr(db_lg_record, "issuance_date", None) else "N/A"
         old_expiry_date_obj = datetime.strptime(old_expiry_date_for_log, "%Y-%m-%d").date()
         extension_period_str = self._format_extension_period(old_expiry_date_obj, new_expiry_date)
+        currency_iso = currency_obj.iso_code if currency_obj else ""
+        currency_symbol = currency_obj.symbol if currency_obj else ""
+        owner_email = owner_obj.email if owner_obj else ""
+        owner_phone = owner_obj.phone_number if owner_obj else None
+        owner_internal_id = owner_obj.internal_id if owner_obj else None
+        owner_manager_email = owner_obj.manager_email if owner_obj else None
+        beneficiary_entity_name = entity.entity_name
 
         instruction_details = {
             "old_expiry_date": old_expiry_date_for_log,
@@ -682,16 +764,16 @@ class CRUDLGRecord(CRUDBase):
             "issue_date": issuance_date_str,
             "expiry_date": old_expiry_date_for_log,
             "maturity_date": old_expiry_date_for_log,
-            "lg_number": db_lg_record.lg_number,
-            "lg_amount": f"{float(db_lg_record.lg_amount):,.2f}",
-            "lg_currency": db_lg_record.lg_currency.iso_code,
-            "issuing_bank_name": self._get_effective_issuing_bank_name(db_lg_record),
-            "internal_owner_email": db_lg_record.internal_owner_contact.email,
-            "internal_owner_phone": db_lg_record.internal_owner_contact.phone_number,
-            "internal_owner_id": db_lg_record.internal_owner_contact.internal_id,
-            "manager_email": db_lg_record.internal_owner_contact.manager_email,
-            "lg_issuer_name": updated_lg_record.issuer_name,
-            "lg_beneficiary_name": updated_lg_record.beneficiary_corporate.entity_name,
+            "lg_number": lg_number_val,
+            "lg_amount": f"{lg_amount_float:,.2f}",
+            "lg_currency": currency_iso,
+            "issuing_bank_name": effective_bank_name,
+            "internal_owner_email": owner_email,
+            "internal_owner_phone": owner_phone,
+            "internal_owner_id": owner_internal_id,
+            "manager_email": owner_manager_email,
+            "lg_issuer_name": issuer_name_val,
+            "lg_beneficiary_name": beneficiary_entity_name,
             "customer_name": customer_name,
             "customer_address": customer_address,
             "customer_contact_email": customer_contact_email,
@@ -700,16 +782,15 @@ class CRUDLGRecord(CRUDBase):
             "recipient_name": recipient_name,
             "recipient_address": recipient_address,
         }
-        
+
         notes_html = ""
         if notes:
             notes_html = f"""
             <h3>Additional Notes</h3>
             <p>{__import__("html").escape(str(notes), quote=True)}</p>
             """
-        instruction_details["notes_section"] = notes_html # NEW: Use the notes_section key
-
-        instruction_details["lg_amount_formatted"] = f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}"
+        instruction_details["notes_section"] = notes_html
+        instruction_details["lg_amount_formatted"] = f"{currency_symbol} {lg_amount_float:,.2f}"
 
         from app.core.document_generator import escape_html_placeholder
         generated_instruction_html = instruction_template.content
@@ -719,7 +800,7 @@ class CRUDLGRecord(CRUDBase):
 
         try:
             instruction_create_payload_for_schema = {
-                "lg_record_id": db_lg_record.id,
+                "lg_record_id": lg_record_id_val,
                 "instruction_type": "EXTENSION",
                 "template_id": instruction_template.id,
                 "status": "Instruction Issued",
@@ -728,112 +809,133 @@ class CRUDLGRecord(CRUDBase):
                 "serial_number": None,
             }
 
-            instruction_type_code_enum = InstructionTypeCode.EXT
-            sub_instruction_code_enum = SubInstructionCode.ORIGINAL
+            if category_obj is not None:
+                db_lg_instruction = await self.crud_lg_instruction_instance.create(
+                    db,
+                    obj_in=LGInstructionCreate(**instruction_create_payload_for_schema),
+                    entity_code=entity.code,
+                    lg_category_code=category_obj.code,
+                    lg_sequence_number_str=lg_sequence_number_str,
+                    instruction_type_code_enum=InstructionTypeCode.EXT,
+                    sub_instruction_code_enum=SubInstructionCode.ORIGINAL,
+                )
+            else:
+                instruction_id = await self._create_instruction_with_retry(
+                    db,
+                    instruction_create_payload=instruction_create_payload_for_schema,
+                    lg_record_id=lg_record_id_val,
+                    instruction_type_code=InstructionTypeCode.EXT,
+                    sub_instruction_code=SubInstructionCode.ORIGINAL,
+                    user_id=user_id,
+                )
+                db_lg_instruction = db.get(models.LGInstruction, instruction_id)
+                if not db_lg_instruction:
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
 
-            serial_generation_params = {
-                'lg_record_id': db_lg_record.id,
-                'instruction_type_code': instruction_type_code_enum,
-                'sub_instruction_code': sub_instruction_code_enum,
-                'user_id': user_id
-            }
+            inst_serial = getattr(db_lg_instruction, "serial_number", None) or ""
+            if inst_serial:
+                instruction_details["instruction_serial"] = inst_serial
+                instruction_details["serial_number"] = inst_serial
+                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", inst_serial)
+                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", inst_serial)
 
-            instruction_id = await self._create_instruction_with_retry(
-                db,
-                instruction_create_payload=instruction_create_payload_for_schema,
-                **serial_generation_params
+            from app.core.instruction_verification import register_instruction_for_verification, attach_verification_marker
+            register_instruction_for_verification(
+                db_lg_instruction.id,
+                inst_serial,
+                lg_number_val or "",
+                getattr(db_lg_instruction, "created_at", None) or getattr(db_lg_instruction, "instruction_date", None),
+                "I",
             )
-            
-            db_lg_instruction = db.query(models.LGInstruction).filter(models.LGInstruction.id == instruction_id).first()
-            if not db_lg_instruction:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
-
-            db_lg_instruction_in_current_session = db.merge(db_lg_instruction)
-            db.refresh(updated_lg_record)
-            db.refresh(db_lg_instruction_in_current_session)
-            if getattr(db_lg_instruction_in_current_session, "serial_number", None):
-                instruction_details["instruction_serial"] = db_lg_instruction_in_current_session.serial_number
-                instruction_details["serial_number"] = db_lg_instruction_in_current_session.serial_number
-                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", db_lg_instruction_in_current_session.serial_number)
-                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", db_lg_instruction_in_current_session.serial_number)
+            generated_instruction_html = attach_verification_marker(
+                generated_instruction_html,
+                serial_number=inst_serial,
+                record_kind="I",
+                record_id=db_lg_instruction.id,
+            )
 
         except Exception as e:
             db.rollback()
-            logger.exception(f"An unexpected error occurred during LG extension for LG id={db_lg_record.id}: {e}")
+            logger.exception(f"An unexpected error occurred during LG extension for LG id={lg_record_id_val}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG extension: {e}")
 
-        customer_with_email_settings = db.query(models.Customer).options(selectinload(models.Customer.customer_email_settings)).filter(models.Customer.id == db_lg_record.customer_id).first()
-
-        email_settings_to_use: EmailSettings
-        email_method_for_log: str
-        try:
-            email_settings_to_use, email_method_for_log = get_customer_email_settings(db, db_lg_record.customer_id)
-        except Exception as e:
-            email_settings_to_use = get_global_email_settings()
-            email_method_for_log = "global_fallback_due_to_error"
-            logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {db_lg_record.customer_id}: {e}. Falling back to global settings.")
-
-        email_to_send_to = [db_lg_record.internal_owner_contact.email]
-        cc_emails = []
-        if db_lg_record.internal_owner_contact.manager_email:
-            cc_emails.append(db_lg_record.internal_owner_contact.manager_email)
-        if db_lg_record.lg_category and db_lg_record.lg_category.communication_list:
-            cc_emails.extend(db_lg_record.lg_category.communication_list)
-
-        common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
-            db, db_lg_record.customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
-        )
-        if common_comm_list_config and common_comm_list_config.get('effective_value'):
+        if prefetched_email_ctx is not None:
+            email_settings_to_use, email_method_for_log, common_cc_list = prefetched_email_ctx
+        else:
             try:
-                parsed_common_list = json.loads(common_comm_list_config['effective_value'])
-                if isinstance(parsed_common_list, list) and all(
-                    isinstance(e, str) and "@" in e for e in parsed_common_list
-                ):
-                    cc_emails.extend(parsed_common_list)
-            except json.JSONDecodeError:
-                logger.warning(
-                    f"COMMON_COMMUNICATION_LIST for customer {db_lg_record.customer_id} is not a valid JSON list of emails. Skipping."
-                )
+                email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer_id_val)
+            except Exception as e:
+                email_settings_to_use = get_global_email_settings()
+                email_method_for_log = "global_fallback_due_to_error"
+                logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {customer_id_val}: {e}. Falling back to global settings.")
+
+            common_cc_list = []
+            common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+                db, customer_id_val, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+            )
+            if common_comm_list_config and common_comm_list_config.get('effective_value'):
+                try:
+                    parsed_common_list = json.loads(common_comm_list_config['effective_value'])
+                    if isinstance(parsed_common_list, list) and all(
+                        isinstance(e, str) and "@" in e for e in parsed_common_list
+                    ):
+                        common_cc_list = parsed_common_list
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"COMMON_COMMUNICATION_LIST for customer {customer_id_val} is not a valid JSON list of emails. Skipping."
+                    )
+
+        email_to_send_to = [owner_email] if owner_email else []
+        cc_emails = []
+        if owner_manager_email:
+            cc_emails.append(owner_manager_email)
+        if category_obj and category_obj.communication_list:
+            cc_emails.extend(category_obj.communication_list)
+        if common_cc_list:
+            cc_emails.extend(common_cc_list)
         cc_emails = list(set(cc_emails))
 
-        _lg_mask = f"...{str(updated_lg_record.lg_number)[-4:]}" if updated_lg_record.lg_number and len(str(updated_lg_record.lg_number)) > 4 else updated_lg_record.lg_number
+        _lg_mask = f"...{str(lg_number_val)[-4:]}" if lg_number_val and len(str(lg_number_val)) > 4 else lg_number_val
         email_subject = f"LG {_lg_mask} · Extension Instruction Issued"
-        
+
         email_body_html = build_transaction_email_html(
-            customer_name=customer.name if customer else "Grow Treasury",
+            customer_name=customer_name if customer else "Grow Treasury",
             title="📋 LG Extension Instruction Issued",
-            transaction_ref=updated_lg_record.lg_number,
+            transaction_ref=lg_number_val,
             transaction_type="LG Extension",
             key_value_dict={
-                "LG Number": updated_lg_record.lg_number,
-                "Instruction Serial": db_lg_instruction.serial_number,
-                "Issuing Bank": self._get_effective_issuing_bank_name(updated_lg_record),
-                "Beneficiary": updated_lg_record.beneficiary_corporate.entity_name if updated_lg_record.beneficiary_corporate else "N/A",
-                "Amount": f"{db_lg_record.lg_currency.symbol} {float(db_lg_record.lg_amount):,.2f}",
+                "LG Number": lg_number_val,
+                "Instruction Serial": inst_serial,
+                "Issuing Bank": effective_bank_name,
+                "Beneficiary": beneficiary_entity_name or "N/A",
+                "Amount": f"{currency_symbol} {lg_amount_float:,.2f}",
                 "Previous Expiry Date": instruction_details["old_expiry_date"],
                 "New Expiry Date": f"<span style='color: #16a34a; font-weight: 700;'>{instruction_details['new_expiry_date']}</span>",
                 "Notes": notes if notes else "None"
             },
-            summary_text=f"An official LG Extension instruction has been generated and issued to {recipient_name or self._get_effective_issuing_bank_name(updated_lg_record)}.",
+            summary_text=f"An official LG Extension instruction has been generated and issued to {recipient_name or effective_bank_name}.",
             cta_text="View LG in System",
-            cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{updated_lg_record.id}",
-            recipient_name=db_lg_record.internal_owner_contact.email if db_lg_record.internal_owner_contact else "Internal Owner"
+            cta_url=f"{get_frontend_base_url()}/end-user/lg-records/{lg_record_id_val}",
+            recipient_name=owner_email or "Internal Owner"
         )
 
+        email_job = {
+            "to_emails": email_to_send_to,
+            "cc_emails": cc_emails,
+            "subject": email_subject,
+            "body_html": email_body_html,
+            "email_settings": email_settings_to_use,
+            "sender_name": customer_name,
+            "email_method_for_log": email_method_for_log,
+            "user_id": user_id,
+            "customer_id": customer_id_val,
+            "lg_record_id": lg_record_id_val,
+        }
 
-        if background_tasks:
-            background_tasks.add_task(
-                send_email,
-                db=db,
-                to_emails=email_to_send_to,
-                subject_template=email_subject,
-                body_template=email_body_html,
-                template_data={},
-                email_settings=email_settings_to_use,
-                cc_emails=cc_emails,
-                sender_name=customer.name
-            )
-            email_sent_successfully = True
+        if deferred_email_jobs is not None:
+            deferred_email_jobs.append(email_job)
+        elif background_tasks is not None:
+            background_tasks.add_task(_dispatch_extension_emails_bg, [email_job])
         else:
             email_sent_successfully, _ = await send_email(
                 db=db,
@@ -843,66 +945,62 @@ class CRUDLGRecord(CRUDBase):
                 body_template=email_body_html,
                 template_data={},
                 email_settings=email_settings_to_use,
-                sender_name=customer.name
+                sender_name=customer_name
             )
-
-
-        if not email_sent_successfully:
-            log_action(
-                db,
-                user_id=user_id,
-                action_type="NOTIFICATION_FAILED",
-                entity_type="LGRecord",
-                entity_id=updated_lg_record.id,
-                details={
-                    "recipient": email_to_send_to,
-                    "cc_recipients": cc_emails,
-                    "subject": email_subject,
-                    "reason": "Email service failed to send notification",
-                    "method": email_method_for_log,
-                },
-                customer_id=updated_lg_record.customer_id,
-                lg_record_id=updated_lg_record.id,
-            )
-            logger.error(f"LG extended (ID: {updated_lg_record.id}), but failed to send email notification.")
-        else:
-            log_action(
-                db,
-                user_id=user_id,
-                action_type="NOTIFICATION_SENT",
-                entity_type="LGRecord",
-                entity_id=updated_lg_record.id,
-                details={
-                    "recipient": email_to_send_to,
-                    "cc_recipients": cc_emails,
-                    "subject": email_subject,
-                    "method": email_method_for_log,
-                },
-                customer_id=updated_lg_record.customer_id,
-                lg_record_id=updated_lg_record.id,
-            )
-
+            if not email_sent_successfully:
+                log_action(
+                    db,
+                    user_id=user_id,
+                    action_type="NOTIFICATION_FAILED",
+                    entity_type="LGRecord",
+                    entity_id=lg_record_id_val,
+                    details={
+                        "recipient": email_to_send_to,
+                        "cc_recipients": cc_emails,
+                        "subject": email_subject,
+                        "reason": "Email service failed to send notification",
+                        "method": email_method_for_log,
+                    },
+                    customer_id=customer_id_val,
+                    lg_record_id=lg_record_id_val,
+                )
+                logger.error(f"LG extended (ID: {lg_record_id_val}), but failed to send email notification.")
+            else:
+                log_action(
+                    db,
+                    user_id=user_id,
+                    action_type="NOTIFICATION_SENT",
+                    entity_type="LGRecord",
+                    entity_id=lg_record_id_val,
+                    details={
+                        "recipient": email_to_send_to,
+                        "cc_recipients": cc_emails,
+                        "subject": email_subject,
+                        "method": email_method_for_log,
+                    },
+                    customer_id=customer_id_val,
+                    lg_record_id=lg_record_id_val,
+                )
 
         log_action(
             db,
             user_id=user_id,
             action_type="LG_EXTENDED",
             entity_type="LGRecord",
-            entity_id=updated_lg_record.id,
+            entity_id=lg_record_id_val,
             details={
-                "lg_number": updated_lg_record.lg_number,
+                "lg_number": lg_number_val,
                 "old_expiry_date": instruction_details["old_expiry_date"],
                 "new_expiry_date": instruction_details["new_expiry_date"],
-                "instruction_serial": db_lg_instruction.serial_number,
+                "instruction_serial": inst_serial,
                 "generated_instruction_id": db_lg_instruction.id,
-                "notes": notes, # NEW: Add notes to the audit log
+                "notes": notes,
             },
-            customer_id=updated_lg_record.customer_id,
-            lg_record_id=updated_lg_record.id,
+            customer_id=customer_id_val,
+            lg_record_id=lg_record_id_val,
         )
 
         db.flush()
-        db.refresh(updated_lg_record)
         return updated_lg_record, db_lg_instruction.id, generated_instruction_html
   
     async def release_lg(self, db: Session, lg_record: models.LGRecord, user_id: int, approval_request_id: Optional[int], supporting_document_id: Optional[int] = None, notes: Optional[str] = None) -> Tuple[models.LGRecord, int]: # NEW: Add notes parameter
@@ -2609,8 +2707,10 @@ class CRUDLGRecord(CRUDBase):
         customer_id: int,
         selected_items: Optional[List[LGAutoRenewalItemIn]] = None,
         user_has_all_access: bool = True,
-        user_allowed_entity_ids: List[int] = []
-    ) -> Tuple[int, Optional[bytes]]:
+        user_allowed_entity_ids: List[int] = [],
+        pad_for_duplex: bool = False,
+        background_tasks: Optional[BackgroundTasks] = None,
+    ) -> Tuple[int, Optional[bytes], Optional[str], List[Dict[str, Any]]]:
         """
         Executes the auto/forced renewal process for eligible LG records.
         If selected_items is provided:
@@ -2671,6 +2771,53 @@ class CRUDLGRecord(CRUDBase):
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs selected for renewal for customer {customer_id}.")
             return 0, None, None, []
 
+        # Batch-load all target LG records, template, email settings, and common CC list ONCE
+        target_lg_ids = [lg_id for lg_id, _ in targets_to_renew]
+        prefetched_rows = (
+            db.query(self.model)
+            .options(
+                selectinload(models.LGRecord.beneficiary_corporate),
+                selectinload(models.LGRecord.lg_currency),
+                selectinload(models.LGRecord.lg_type),
+                selectinload(models.LGRecord.lg_status),
+                selectinload(models.LGRecord.issuing_bank),
+                selectinload(models.LGRecord.communication_bank),
+                selectinload(models.LGRecord.internal_owner_contact),
+                selectinload(models.LGRecord.lg_category),
+                selectinload(models.LGRecord.customer),
+            )
+            .filter(self.model.id.in_(target_lg_ids), self.model.is_deleted == False)
+            .all()
+        )
+        prefetched_lgs = {rec.id: rec for rec in prefetched_rows}
+
+        ext_template = self._resolve_instruction_template(db, "LG_EXTENSION", customer_id)
+        try:
+            email_settings_to_use, email_method_for_log = get_customer_email_settings(db, customer_id)
+        except Exception as e:
+            email_settings_to_use = get_global_email_settings()
+            email_method_for_log = "global_fallback_due_to_error"
+            logger.warning(f"Failed to retrieve customer-specific email settings for customer ID {customer_id}: {e}. Falling back to global settings.")
+
+        common_cc_list: List[str] = []
+        common_comm_list_config = self.crud_customer_configuration_instance.get_customer_config_or_global_fallback(
+            db, customer_id, GlobalConfigKey.COMMON_COMMUNICATION_LIST
+        )
+        if common_comm_list_config and common_comm_list_config.get('effective_value'):
+            try:
+                parsed_common_list = json.loads(common_comm_list_config['effective_value'])
+                if isinstance(parsed_common_list, list) and all(
+                    isinstance(e, str) and "@" in e for e in parsed_common_list
+                ):
+                    common_cc_list = parsed_common_list
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"COMMON_COMMUNICATION_LIST for customer {customer_id} is not a valid JSON list of emails. Skipping."
+                )
+
+        prefetched_email_ctx = (email_settings_to_use, email_method_for_log, common_cc_list)
+        deferred_email_jobs: Optional[List[Dict[str, Any]]] = [] if background_tasks is not None else None
+
         batch_id = f"BULK-EXT-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{customer_id}"
         batch_timestamp = datetime.now().isoformat()
         renewed_lg_count = 0
@@ -2681,37 +2828,57 @@ class CRUDLGRecord(CRUDBase):
 
         for lg_id, new_expiry_date_as_date in targets_to_renew:
             cand = candidate_map.get(lg_id)
-            lg_num_label = cand.lg_number if cand else str(lg_id)
+            pref_lg = prefetched_lgs.get(lg_id)
+            pref_lg_number = pref_lg.lg_number if pref_lg else (cand.lg_number if cand else str(lg_id))
+            pref_bank_name = self._get_effective_issuing_bank_name(pref_lg) if pref_lg else (cand.bank_name if cand else None)
+            pref_beneficiary_name = (
+                pref_lg.beneficiary_corporate.entity_name
+                if (pref_lg and pref_lg.beneficiary_corporate)
+                else (cand.beneficiary_name if cand else None)
+            )
+            pref_amount = (
+                float(pref_lg.lg_amount)
+                if (pref_lg and pref_lg.lg_amount is not None)
+                else (float(cand.amount) if (cand and cand.amount is not None) else None)
+            )
+            pref_currency_code = (
+                pref_lg.lg_currency.iso_code
+                if (pref_lg and pref_lg.lg_currency)
+                else (cand.currency_code if cand else None)
+            )
             try:
                 updated_lg, instruction_id, generated_html = await self.extend_lg(
                     db,
                     lg_id,
                     new_expiry_date_as_date,
-                    user_id
+                    user_id,
+                    prefetched_lg_record=pref_lg,
+                    prefetched_template=ext_template,
+                    prefetched_email_ctx=prefetched_email_ctx,
+                    deferred_email_jobs=deferred_email_jobs,
                 )
                 all_generated_instruction_htmls.append(generated_html)
                 renewed_lg_count += 1
-                renewed_lg_numbers.append(updated_lg.lg_number)
+                renewed_lg_numbers.append(pref_lg_number)
                 renewed_instruction_ids.append(instruction_id)
 
-                db_inst = db.query(models.LGInstruction).filter(models.LGInstruction.id == instruction_id).first()
+                db_inst = db.get(models.LGInstruction, instruction_id)
                 inst_details = dict(db_inst.details or {}) if db_inst else {}
                 if db_inst:
                     inst_details["is_bulk_renewal"] = True
                     inst_details["bulk_renewal_batch_id"] = batch_id
                     inst_details["bulk_renewal_timestamp"] = batch_timestamp
                     db_inst.details = inst_details
-                    from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(db_inst, "details")
                     db.add(db_inst)
 
                 renewed_items.append({
                     "lg_record_id": updated_lg.id,
-                    "lg_number": updated_lg.lg_number,
-                    "beneficiary_name": updated_lg.beneficiary_corporate.entity_name if updated_lg.beneficiary_corporate else (cand.beneficiary_name if cand else None),
-                    "bank_name": self._get_effective_issuing_bank_name(updated_lg),
-                    "amount": float(updated_lg.lg_amount) if updated_lg.lg_amount is not None else None,
-                    "currency_code": updated_lg.lg_currency.iso_code if updated_lg.lg_currency else (cand.currency_code if cand else None),
+                    "lg_number": pref_lg_number,
+                    "beneficiary_name": pref_beneficiary_name,
+                    "bank_name": pref_bank_name,
+                    "amount": pref_amount,
+                    "currency_code": pref_currency_code,
                     "old_expiry_date": inst_details.get("old_expiry_date") or (cand.current_expiry_date.isoformat() if cand else None),
                     "new_expiry_date": new_expiry_date_as_date.isoformat(),
                     "instruction_id": instruction_id,
@@ -2721,7 +2888,7 @@ class CRUDLGRecord(CRUDBase):
                     "bank_reply_date": db_inst.bank_reply_date.isoformat() if (db_inst and db_inst.bank_reply_date) else None,
                     "is_printed": bool(db_inst.is_printed) if db_inst else False,
                 })
-                logger.info(f"Successfully renewed LG id={updated_lg.id} to {updated_lg.expiry_date.date()}. Instruction ID: {instruction_id}.")
+                logger.info(f"Successfully renewed LG id={updated_lg.id} to {new_expiry_date_as_date}. Instruction ID: {instruction_id}.")
             except HTTPException as e:
                 logger.error(f"Skipping LG id={lg_id} due to error during extension: {e.detail}", exc_info=True)
             except Exception as e:
@@ -2737,7 +2904,8 @@ class CRUDLGRecord(CRUDBase):
         try:
             combined_pdf_bytes = await generate_merged_pdf_from_html_list(
                 all_generated_instruction_htmls,
-                f"bulk_lg_renewal_customer_{customer_id}_{date.today().isoformat()}"
+                f"bulk_lg_renewal_customer_{customer_id}_{date.today().isoformat()}",
+                pad_for_duplex=pad_for_duplex,
             )
             if not combined_pdf_bytes:
                 raise Exception("generate_pdf_from_html returned None for combined PDF.")
@@ -2762,11 +2930,17 @@ class CRUDLGRecord(CRUDBase):
                 "auto_renewal_threshold_days": preview.auto_renewal_days_threshold,
                 "force_renewal_threshold_days": preview.forced_renew_days_threshold,
                 "combined_pdf_generated": combined_pdf_bytes is not None,
+                "pad_for_duplex": pad_for_duplex,
                 "triggered_by_user": user_id
             },
             customer_id=customer_id,
             lg_record_id=None,
         )
+
+        if background_tasks is not None and deferred_email_jobs:
+            db.commit()
+            background_tasks.add_task(_dispatch_extension_emails_bg, deferred_email_jobs)
+
         logger.info(f"Bulk LG Renewal process completed for customer {customer_id} (Batch {batch_id}). {renewed_lg_count} LGs renewed.")
 
         return renewed_lg_count, combined_pdf_bytes, batch_id, renewed_items
@@ -3986,8 +4160,8 @@ class CRUDLGRecord(CRUDBase):
         if lg_record.advising_status in [models.AdvisingStatus.ADVISED, models.AdvisingStatus.CONFIRMED]:
             if lg_record.communication_bank_id:
                 try:
-                    # Use the provided 'db' session to query the database.
-                    communication_bank = db.query(models.Bank).get(lg_record.communication_bank_id)
+                    # Reuse eager-loaded communication_bank when available before hitting DB.
+                    communication_bank = getattr(lg_record, "communication_bank", None) or db.query(models.Bank).get(lg_record.communication_bank_id)
                     if communication_bank:
                         recipient_name = communication_bank.name
                         recipient_address = communication_bank.address

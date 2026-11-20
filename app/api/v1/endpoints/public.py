@@ -2,6 +2,7 @@
 import os
 # import shutil  <-- REMOVED: No longer needed for local copy
 import uuid
+from html import escape as html_escape
 from typing import Optional
 from datetime import datetime
 import pytz
@@ -297,22 +298,51 @@ async def register_free_trial(
     from app.services.unified_email_builder import build_standard_email_html
 
     base_url = get_frontend_base_url(request=request)
-    bullets_html = "".join(f"<li style='margin-bottom:4px;'>{m}</li>" for m in module_names)
+    bullets_html = "".join(f"<li style='margin-bottom:4px;'>{html_escape(str(m))}</li>" for m in module_names)
+
+    safe_org = html_escape(str(organization_name))
+    safe_contact = html_escape(str(contact_admin_name))
+    safe_phone = html_escape(str(contact_phone))
+    safe_entities = html_escape(str(entities_count))
+
+    attachments = None
+    try:
+        tc_content = latest_tc.content if latest_tc else "<p>Terms of Service not found.</p>"
+        wrapped_tc_html = wrap_legal_artifact_for_pdf(
+            tc_content,
+            document_title="Terms of Service — Grow Corporate Treasury Platform",
+            version=tc_version,
+        )
+        pdf_content = await generate_multipage_pdf_from_html(
+            wrapped_tc_html,
+            filename_hint="Grow_Terms_of_Service",
+        )
+        if isinstance(pdf_content, (bytes, bytearray)) and len(pdf_content) > 0:
+            attachments = [EmailAttachment("Grow_Terms_of_Service.pdf", bytes(pdf_content), "application/pdf")]
+    except Exception as pdf_err:
+        logger.warning(f"Failed to generate Terms of Service PDF attachment for trial request: {pdf_err}")
+        attachments = None
+
+    tos_note_html = (
+        f"A copy of our Terms of Service (v{tc_version}) is attached for your records. "
+        if attachments
+        else ""
+    )
 
     email_settings = get_global_email_settings()
     subject = f"Grow Treasury — Guided Trial Sandbox Request Received ({organization_name})"
     body = build_standard_email_html(
-        customer_name=organization_name,
+        customer_name=safe_org,
         title="Guided Trial Sandbox Request Received",
-        recipient_name=contact_admin_name,
+        recipient_name=safe_contact,
         content_html=(
-            f"<p>Thank you for requesting Guided Trial Sandbox access for <strong>{organization_name}</strong>.</p>"
+            f"<p>Thank you for requesting Guided Trial Sandbox access for <strong>{safe_org}</strong>.</p>"
             f"<div style='margin: 16px 0; padding: 12px 16px; background-color: #f8fafc; border-left: 3px solid #1e40af; border-radius: 6px;'>"
             f"<strong style='font-size:12px; color:#0f172a; text-transform:uppercase; letter-spacing:0.5px;'>Selected Modules:</strong>"
             f"<ul style='margin:8px 0 0 0; padding-left:18px; color:#334155; font-size:13px;'>{bullets_html}</ul>"
             f"</div>"
             f"<p><strong>What happens next:</strong> A treasury specialist will reach out briefly to align on your evaluation focus and send your private workspace activation link. No Commercial Register or bank setup is required to test inside the sandbox.</p>"
-            f"<p style='color:#64748b; font-size:12.5px;'>A copy of our Terms of Service (v{tc_version}) is attached for your records. In the meantime, you can explore live platform workflows anytime below.</p>"
+            f"<p style='color:#64748b; font-size:12.5px;'>{tos_note_html}In the meantime, you can explore live platform workflows anytime below.</p>"
         ),
         cta_text="Explore Interactive Demo",
         cta_url=f"{base_url}/demo",
@@ -320,31 +350,20 @@ async def register_free_trial(
         footer_subtitle="Guided Sandbox Onboarding",
     )
 
-    tc_content = latest_tc.content if latest_tc else "<p>Terms of Service not found.</p>"
-    wrapped_tc_html = wrap_legal_artifact_for_pdf(
-        tc_content,
-        document_title="Terms of Service — Grow Corporate Treasury Platform",
-        version=tc_version,
-    )
-    pdf_content = await generate_multipage_pdf_from_html(
-        wrapped_tc_html,
-        filename_hint="Grow_Terms_of_Service",
-    )
-    attachment = EmailAttachment("Grow_Terms_of_Service.pdf", pdf_content, "application/pdf")
-
     support_cc = "support@growbusinessdevelopment.com"
     cc_emails = [support_cc] if admin_email.lower() != support_cc else []
-    background_tasks.add_task(
-        send_email,
-        db,
-        [admin_email],
-        subject,
-        body,
-        {},
-        email_settings,
-        cc_emails=cc_emails,
-        attachments=[attachment],
-    )
+    if background_tasks:
+        background_tasks.add_task(
+            send_email,
+            db,
+            [admin_email],
+            subject,
+            body,
+            {},
+            email_settings,
+            cc_emails=cc_emails,
+            attachments=attachments,
+        )
 
     # Notify System Owner(s) immediately of the new corporate trial lead
     try:
@@ -356,20 +375,20 @@ async def register_free_trial(
                 User.is_deleted == False,
             ).all() if u_email
         ]
-        if so_emails:
+        if so_emails and background_tasks:
             so_subject = f"New Trial Lead — {organization_name} ({contact_admin_name})"
             so_body = build_standard_email_html(
                 customer_name="Grow Platform Admin",
-                title=f"New Guided Trial Request: {organization_name}",
+                title=f"New Guided Trial Request: {safe_org}",
                 content_html=(
                     f"<p>A new corporate prospect submitted a Guided Trial Sandbox request:</p>"
                     f"<ul style='line-height:1.7; color:#1e293b;'>"
-                    f"<li><strong>Company:</strong> {organization_name} ({entities_count} entity structure)</li>"
-                    f"<li><strong>Contact:</strong> {contact_admin_name}</li>"
-                    f"<li><strong>Work Email:</strong> {admin_email}</li>"
-                    f"<li><strong>Phone / WhatsApp:</strong> {contact_phone}</li>"
+                    f"<li><strong>Company:</strong> {safe_org} ({safe_entities} entity structure)</li>"
+                    f"<li><strong>Contact:</strong> {safe_contact}</li>"
+                    f"<li><strong>Work Email:</strong> {html_escape(admin_email)}</li>"
+                    f"<li><strong>Phone / WhatsApp:</strong> {safe_phone}</li>"
                     f"<li><strong>Commercial Register:</strong> {'Attached' if has_cr_file else 'Skipped (Sandbox Mode)'}</li>"
-                    f"<li><strong>Modules:</strong> {', '.join(module_names)}</li>"
+                    f"<li><strong>Modules:</strong> {', '.join(html_escape(str(m)) for m in module_names)}</li>"
                     f"</ul>"
                 ),
                 cta_text="Review in System Owner Console",
@@ -460,14 +479,37 @@ class InstructionVerifyConfirmIn(BaseModel):
     elapsed_ms: Optional[int] = None
 
 
+def _valid_ip_or_none(value: Optional[str]) -> Optional[str]:
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address((value or "").strip()))
+    except ValueError:
+        return None
+
+
 def _extract_client_ip(request: Request) -> str:
-    """Extracts the originating client IP behind reverse proxies (Render / Cloudflare)."""
+    """
+    Extracts the originating client IP behind reverse proxies (Render / Cloudflare).
+
+    Order matters for anti-spoofing:
+    1. `CF-Connecting-IP` — set/overwritten by Cloudflare's edge (which fronts Render), so a
+       visitor cannot fake it.
+    2. `X-Forwarded-For` / `X-Real-IP` — fallback only; the left-most XFF entry can be supplied
+       by the visitor, so it is NOT trusted when the Cloudflare header is available.
+    3. Direct socket address.
+    Anything that is not a syntactically valid IP is ignored (prevents junk/oversized keys).
+    """
+    cf_ip = _valid_ip_or_none(request.headers.get("cf-connecting-ip"))
+    if cf_ip:
+        return cf_ip
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
-    xrip = request.headers.get("x-real-ip")
+        xff_ip = _valid_ip_or_none(xff.split(",")[0])
+        if xff_ip:
+            return xff_ip
+    xrip = _valid_ip_or_none(request.headers.get("x-real-ip"))
     if xrip:
-        return xrip.strip()
+        return xrip
     return request.client.host if request.client else "unknown"
 
 

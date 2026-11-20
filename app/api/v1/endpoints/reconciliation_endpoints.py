@@ -6,6 +6,9 @@ from datetime import datetime
 from decimal import Decimal
 import io
 import csv
+import logging
+
+logger = logging.getLogger(__name__)
 
 from app.database import get_db
 from app.models.models_reconciliation_v2 import (
@@ -108,6 +111,7 @@ async def upload_bank_statement(
         overrides=overrides
     )
 
+    stmt_id = db_statement.id
     try:
         from app.services.inbox_action_service import inbox_action_service
         first_txn = (
@@ -131,8 +135,10 @@ async def upload_bank_statement(
             notes=f"Manual statement upload '{file.filename}'",
             auto_commit=True,
         )
-    except Exception:
-        pass
+    except Exception as snap_err:
+        logger.warning(f"Failed to record cash balance snapshot for statement {stmt_id}: {snap_err}")
+        db.rollback()
+        db_statement = db.query(BankStatement).filter(BankStatement.id == stmt_id).first() or db_statement
     
     return db_statement
 

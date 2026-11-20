@@ -1609,17 +1609,18 @@ def public_create_maintenance_action(
         raise HTTPException(status_code=404, detail="Issued LG not found")
 
     # Check requestor owns this LG via request
-    if lg.request_id:
-        req = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
-        if req and req.requestor_email and req.requestor_email.lower() != email.lower():
-            raise HTTPException(status_code=403, detail="Not authorized to modify this LG")
+    if not lg.request_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this LG")
+    req = db.query(IssuanceRequest).filter(IssuanceRequest.id == lg.request_id).first()
+    if not req or not req.requestor_email or req.requestor_email.lower() != email.lower():
+        raise HTTPException(status_code=403, detail="Not authorized to modify this LG")
 
-    action_type = payload.get("action_type", "").upper()
+    action_type = (payload.get("action_type") or "").upper()
     allowed_types = ["EXTEND", "INCREASE_AMOUNT", "AMENDMENT"]
     if action_type not in allowed_types:
         raise HTTPException(status_code=400, detail=f"action_type must be one of: {', '.join(allowed_types)}")
 
-    action_data = payload.get("action_data", {})
+    action_data = dict(payload.get("action_data") or {})
     notes = payload.get("notes")
 
     # Store requestor email in action_data for traceability (no internal user ID)
@@ -1703,62 +1704,6 @@ def public_get_my_maintenance_actions(
         ]
     }
 
-
-@router.post("/issued-lgs/{lg_id}/maintenance")
-def public_submit_maintenance_action(
-    lg_id: int,
-    payload: dict = Body(...),
-    token: str = Query(...),
-    db: Session = Depends(get_db),
-):
-    """
-    External requestor submits a maintenance action on their issued LG.
-    Allowed actions: EXTEND, INCREASE_AMOUNT, CLOSE, AMENDMENT.
-    """
-    from app.models.models_issuance import IssuanceRequest, IssuedLGRecord
-    from app.services.issuance_maintenance_service import IssuanceMaintenanceService
-
-    access_data = verify_portal_token(token)
-    customer_id = access_data["customer_id"]
-    email = access_data.get("email")
-
-    if not email:
-        raise HTTPException(status_code=400, detail="Email not available in token.")
-
-    # Verify the LG belongs to a request made by this email
-    lg = db.query(IssuedLGRecord).filter(
-        IssuedLGRecord.id == lg_id,
-        IssuedLGRecord.customer_id == customer_id,
-    ).first()
-    if not lg:
-        raise HTTPException(status_code=404, detail="LG not found")
-
-    request = db.query(IssuanceRequest).filter(
-        IssuanceRequest.id == lg.request_id,
-    ).first()
-    if not request or (request.requestor_email or "").lower() != email.lower():
-        raise HTTPException(status_code=403, detail="You can only manage LGs from your own requests")
-
-    # Validate allowed action types for external requestors
-    allowed_types = {"EXTEND", "INCREASE_AMOUNT", "AMENDMENT"}
-    action_type = payload.get("action_type")
-    if action_type not in allowed_types:
-        raise HTTPException(status_code=400, detail=f"Action type '{action_type}' is not available from the portal")
-
-    svc = IssuanceMaintenanceService()
-    ext_action_data = payload.get("action_data", {})
-    ext_action_data["requestor_email"] = email
-    action = svc.create_action(
-        db=db,
-        issued_lg_id=lg_id,
-        action_type=action_type,
-        action_data=ext_action_data,
-        user_id=None,  # No internal user — external requestor
-        customer_id=customer_id,
-        notes=payload.get("notes"),
-        initiation_source="EXTERNAL_REQUESTOR",
-    )
-    return {"id": action.id, "status": action.status, "action_type": action.action_type}
 
 # ==============================================================================
 # OWNERSHIP HANDOVER ENDPOINTS

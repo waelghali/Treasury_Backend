@@ -394,9 +394,14 @@ class InboxPollingService:
                             if part.get("Content-Disposition") is None:
                                 continue
 
-                            filename = part.get_filename()
-                            if filename:
-                                filename = self._decode_mime_header(filename)
+                            raw_filename = part.get_filename()
+                            if raw_filename:
+                                decoded_filename = self._decode_mime_header(raw_filename)
+                                filename = os.path.basename(
+                                    decoded_filename.replace("\\", "/")
+                                ).replace("\x00", "").strip()
+                                if not filename or filename in (".", ".."):
+                                    continue
                                 ext = os.path.splitext(filename)[1].lower()
                                 if ext in ALLOWED_ATTACHMENT_EXTENSIONS:
                                     payload = part.get_payload(decode=True)

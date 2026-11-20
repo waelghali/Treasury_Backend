@@ -303,23 +303,6 @@ class InboxClassificationService:
                     }
 
         # ----------------------------------------------------------------------
-        # SIGNAL 4: NIL / Zero Position Detection (Text Statement in Body/Subject)
-        # ----------------------------------------------------------------------
-        full_text_to_search = f"{item.subject or ''} {body_text}"
-        for pattern in NIL_POSITION_PATTERNS:
-            m = re.search(pattern, full_text_to_search, flags=re.IGNORECASE)
-            if m:
-                is_nil_detected = True
-                item.is_nil_position = True
-                score += 6
-                detected_category = "LG_POSITION_REPORT"
-                signals["nil_position_detected"] = {
-                    "points": 6,
-                    "statement": m.group(0).strip()
-                }
-                break
-
-        # ----------------------------------------------------------------------
         # SIGNAL 5: Attachment Structure Analysis (GCS + Local + PDF Unlock)
         # ----------------------------------------------------------------------
         has_structured_statement_or_lg_att = False
@@ -366,10 +349,6 @@ class InboxClassificationService:
                     "detected_type": att_category,
                     "matched_columns": matched_cols,
                 }
-        elif detected_category == "LG_POSITION_REPORT" and not item.has_attachment and not is_nil_detected:
-            # LG position without attachment and without NIL text gets a minor penalty
-            score -= 1
-            signals["missing_attachment_penalty"] = -1
 
         # ----------------------------------------------------------------------
         # SIGNAL 5b: Inline Bilingual Cash Balance Extraction from Email Body
@@ -378,7 +357,7 @@ class InboxClassificationService:
         if inline_balances:
             if not item.extracted_balances_json:
                 item.extracted_balances_json = inline_balances
-            if not has_structured_statement_or_lg_att and not is_nil_detected:
+            if not has_structured_statement_or_lg_att:
                 if detected_category in ("UNCLASSIFIED", "CASH_POSITION_SNAPSHOT"):
                     detected_category = "CASH_POSITION_SNAPSHOT"
                 score += 6
@@ -420,15 +399,47 @@ class InboxClassificationService:
             signals["subject_keyword_match"] = {"points": 4, "category": "PROGRESS_REPORT"}
 
         # ----------------------------------------------------------------------
+        # SIGNAL 4: NIL / Zero Position Detection (Text Statement in Body/Subject)
+        # ----------------------------------------------------------------------
+        if (
+            detected_category in ("UNCLASSIFIED", "LG_POSITION_REPORT")
+            and not has_structured_statement_or_lg_att
+            and not inline_balances
+        ):
+            full_text_to_search = f"{item.subject or ''} {body_text}"
+            for pattern in NIL_POSITION_PATTERNS:
+                m = re.search(pattern, full_text_to_search, flags=re.IGNORECASE)
+                if m:
+                    is_nil_detected = True
+                    item.is_nil_position = True
+                    score += 6
+                    detected_category = "LG_POSITION_REPORT"
+                    signals["nil_position_detected"] = {
+                        "points": 6,
+                        "statement": m.group(0).strip()
+                    }
+                    break
+
+        if detected_category == "LG_POSITION_REPORT" and not item.has_attachment and not is_nil_detected:
+            # LG position without attachment and without NIL text gets a minor penalty
+            score -= 1
+            signals["missing_attachment_penalty"] = -1
+
+        # ----------------------------------------------------------------------
         # SIGNAL 7: Learning from Classification History
         # ----------------------------------------------------------------------
-        history = db.query(EmailClassificationHistory).filter(
-            EmailClassificationHistory.customer_id == item.customer_id,
-            or_(
-                EmailClassificationHistory.sender_email == item.sender_email,
-                EmailClassificationHistory.sender_domain == item.sender_domain
-            )
-        ).order_by(desc(EmailClassificationHistory.id)).first()
+        history_filters = []
+        if item.sender_email:
+            history_filters.append(EmailClassificationHistory.sender_email == item.sender_email)
+        if item.sender_domain:
+            history_filters.append(EmailClassificationHistory.sender_domain == item.sender_domain)
+
+        history = None
+        if history_filters:
+            history = db.query(EmailClassificationHistory).filter(
+                EmailClassificationHistory.customer_id == item.customer_id,
+                or_(*history_filters)
+            ).order_by(desc(EmailClassificationHistory.id)).first()
 
         if history:
             score += 3
@@ -525,19 +536,27 @@ class InboxClassificationService:
         db: Session,
         inbox_item_id: int,
         new_classification: str,
-        user_id: int
+        user_id: int,
+        customer_id: Optional[int] = None,
     ) -> InboxItem:
         """
         Allows user to override system classification.
         Saves user choice to learning history and updates item.
         """
-        item = db.query(InboxItem).filter(
+        query = db.query(InboxItem).filter(
             InboxItem.id == inbox_item_id,
             InboxItem.is_deleted == False
-        ).first()
+        )
+        if customer_id is not None:
+            query = query.filter(InboxItem.customer_id == customer_id)
+
+        item = query.first()
 
         if not item:
             raise ValueError(f"InboxItem {inbox_item_id} not found")
+
+        if item.status in ("ACTIONED", "CONFIRMED"):
+            raise PermissionError(f"Cannot reclassify an already {item.status.lower()} inbox item")
 
         original_class = item.classification
         item.user_override_classification = new_classification

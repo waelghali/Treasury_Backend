@@ -19,8 +19,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.constants import SubscriptionStatus
 from app.core.email_service import get_customer_email_settings, process_recipients
-from app.models.models import Bank, Customer
+from app.models.models import Bank, Customer, SubscriptionPlan
 from app.models.models_inbox import InboxOutboundRequest, InboxScheduleConfig
 from app.models.models_issuance import CustomerBankAccount
 from app.models.models_quotation import QuotationBank
@@ -472,10 +473,19 @@ class InboxOutboundService:
         dispatches on the same day.
         """
         today = date.today()
-        configs = db.query(InboxScheduleConfig).filter(
-            InboxScheduleConfig.is_active == True,
-            InboxScheduleConfig.is_deleted == False
-        ).all()
+        configs = (
+            db.query(InboxScheduleConfig)
+            .join(Customer, Customer.id == InboxScheduleConfig.customer_id)
+            .join(SubscriptionPlan, SubscriptionPlan.id == Customer.subscription_plan_id)
+            .filter(
+                InboxScheduleConfig.is_active == True,
+                InboxScheduleConfig.is_deleted == False,
+                Customer.is_deleted == False,
+                Customer.status == SubscriptionStatus.ACTIVE,
+                SubscriptionPlan.can_email_inbox == True,
+            )
+            .all()
+        )
 
         sent_requests = []
         for cfg in configs:
@@ -520,11 +530,13 @@ class InboxOutboundService:
                     )
                     cfg.last_sent_at = datetime.now(timezone.utc)
                     req.schedule_config_id = cfg.id
+                    db.commit()
+                    db.refresh(req)
                     sent_requests.append(req)
                 except Exception as e:
+                    db.rollback()
                     logger.error(f"Scheduled request failed for customer {cfg.customer_id}, bank {cfg.bank_id}: {e}")
 
-        db.commit()
         return sent_requests
 
 

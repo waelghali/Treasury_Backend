@@ -725,7 +725,15 @@ class BankReconciliationService:
                     status_code=400,
                     detail="PDF_PASSWORD_REQUIRED: This PDF statement is password-protected. Provide the PDF password or save it on the Bank Account.",
                 )
-            df, pdf_extra_meta, _ = extract_statement_from_pdf(unlocked_bytes)
+            if not is_unlocked:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or unreadable PDF statement file.",
+                )
+            try:
+                df, pdf_extra_meta, _ = extract_statement_from_pdf(unlocked_bytes)
+            except ValueError as pdf_err:
+                raise HTTPException(status_code=400, detail=str(pdf_err)) from pdf_err
             if df is None or df.empty:
                 raise HTTPException(
                     status_code=400,
@@ -904,11 +912,19 @@ class BankReconciliationService:
                 if txn_amount_currency == 0:
                     txn_amount_currency = amount
                 
+                default_currency = (metadata.get("currency") or "EGP").upper()
+                raw_ccy_val = row.get(mapping.get("currency")) if mapping.get("currency") else None
+                row_currency = (
+                    self._sanitize_text(raw_ccy_val).upper()[:3]
+                    if raw_ccy_val is not None and not pd.isna(raw_ccy_val) and str(raw_ccy_val).strip()
+                    else default_currency
+                ) or default_currency
+
                 txn_amount_egp = self._clean_decimal(row.get(mapping.get("amount_egp")))
                 if txn_amount_egp == 0 and rate_egp > 0:
                     txn_amount_egp = amount * rate_egp
                 elif txn_amount_egp == 0:
-                    txn_amount_egp = amount if str(row.get(mapping.get("currency"), "EGP")).upper() == "EGP" else Decimal("0.00")
+                    txn_amount_egp = amount if row_currency == "EGP" else Decimal("0.00")
 
                 txn_net = self._clean_decimal(row.get(mapping.get("net")))
                 if txn_net == 0:
@@ -966,7 +982,7 @@ class BankReconciliationService:
                     "credit_amount": credit,
                     "raw_description": desc,
                     "description_line2": desc2_clean,
-                    "currency": self._sanitize_text(row.get(mapping.get("currency"), metadata.get("currency") or "EGP")).upper()[:3] or (metadata.get("currency") or "EGP"),
+                    "currency": row_currency,
                     "running_balance": running_balance,
                     "amount_tier": amt_tier,
                     "counterparty_iban": extracted_iban,
@@ -1036,8 +1052,14 @@ class BankReconciliationService:
             sorted_txns = sorted(transactions, key=lambda x: x["booking_date"])
             metadata["start_date"] = sorted_txns[0]["booking_date"]
             metadata["end_date"] = sorted_txns[-1]["booking_date"]
-            if metadata.get("closing_balance") is None and transactions[-1].get("running_balance") is not None:
-                metadata["closing_balance"] = transactions[-1]["running_balance"]
+            is_reverse_order = transactions[0]["booking_date"] > transactions[-1]["booking_date"]
+            latest_txn = (
+                sorted(enumerate(transactions), key=lambda pair: (pair[1]["booking_date"], -pair[0]))[-1][1]
+                if is_reverse_order
+                else sorted_txns[-1]
+            )
+            if metadata.get("closing_balance") is None and latest_txn.get("running_balance") is not None:
+                metadata["closing_balance"] = latest_txn["running_balance"]
 
         del df
         _reclaim_system_memory()

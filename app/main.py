@@ -116,8 +116,14 @@ class SensitiveDataFilter(logging.Filter):
 
         # 6e. Secret-bearing query params, e.g. ?token=abc&otp=123 (anchored to ?/& to avoid prose like "code=200")
         self._patterns.append((
-            re.compile(r"([?&](?:token|access_token|refresh_token|otp|code|password|secret|signature|sig|api_key|key)=)[^&\s\"']+", re.IGNORECASE),
+            re.compile(r"([?&](?:token|token_hint|access_token|refresh_token|otp|code|password|secret|signature|sig|api_key|key)=)[^&\s\"']+", re.IGNORECASE),
             r"\1[REDACTED]",
+        ))
+
+        # 6f. Smart Inbox Sync Watcher drop tokens (gws_...)
+        self._patterns.append((
+            re.compile(r"\bgws_[A-Za-z0-9_\-]{16,}(?![A-Za-z0-9_\-])"),
+            "gws_[REDACTED]",
         ))
 
         # 6f. Secret-bearing key/value pairs in dicts/JSON/kwargs
@@ -183,12 +189,11 @@ class SensitiveDataFilter(logging.Filter):
         return text
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = self._scrub(record.msg)
-        # Also scrub formatted args if they were already interpolated
         if record.args:
             try:
                 if self._preserve_args:
+                    if isinstance(record.msg, str):
+                        record.msg = self._scrub(record.msg)
                     if isinstance(record.args, tuple):
                         record.args = tuple(self._scrub(a) if isinstance(a, str) else a for a in record.args)
                     elif isinstance(record.args, dict):
@@ -197,7 +202,10 @@ class SensitiveDataFilter(logging.Filter):
                     record.msg = self._scrub(record.getMessage())
                     record.args = None
             except Exception:
-                pass
+                if isinstance(record.msg, str):
+                    record.msg = self._scrub(record.msg)
+        elif isinstance(record.msg, str):
+            record.msg = self._scrub(record.msg)
         # Scrub tracebacks: pre-render exc_text so the handler's Formatter reuses the cleaned copy
         if record.exc_info:
             try:
@@ -316,8 +324,60 @@ def configure_app_instance(fastapi_app: FastAPI):
         import app.models.models_inbox
         import app.models.models_campaign
         
+        # Dedicated short-lived engine for startup DDL/seeding. A lock_timeout guarantees that
+        # a stale session holding locks (orphaned uvicorn worker, hung test, open pgAdmin txn)
+        # makes startup log a warning instead of blocking forever on ALTER TABLE.
+        from sqlalchemy import create_engine as _create_startup_engine
+        from sqlalchemy.pool import NullPool as _StartupNullPool
+        from app.database import sqlalchemy_json_serializer as _startup_json_default
+        import json as _startup_json
+        _startup_lock_timeout_ms = int(os.getenv("STARTUP_DB_LOCK_TIMEOUT_MS", "3000"))
+        _startup_blockers_reported = {"done": False}
+        startup_engine = _create_startup_engine(
+            engine.url,
+            poolclass=_StartupNullPool,
+            connect_args={
+                "options": f"-c lock_timeout={_startup_lock_timeout_ms}",
+                "application_name": f"grow-startup-pid{os.getpid()}",
+            },
+            json_serializer=lambda obj: _startup_json.dumps(obj, default=_startup_json_default),
+            hide_parameters=True,
+        )
+
+        def _log_startup_lock_blockers(stmt_preview: str, err: Exception) -> None:
+            """On lock timeout, surface WHO is holding the lock so it can be killed."""
+            orig = getattr(err, "orig", None)
+            if getattr(orig, "pgcode", None) != "55P03":  # lock_not_available
+                return
+            logger.warning(
+                f"Startup migration skipped (lock timeout after {_startup_lock_timeout_ms}ms): {stmt_preview}"
+            )
+            if _startup_blockers_reported["done"]:
+                return
+            _startup_blockers_reported["done"] = True
+            try:
+                with startup_engine.connect() as diag:
+                    rows = diag.execute(text(
+                        "SELECT pid, application_name, state, now() - xact_start AS xact_age, left(query, 100) AS query "
+                        "FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                        "AND state = 'idle in transaction' ORDER BY xact_start"
+                    )).fetchall()
+                for r in rows:
+                    logger.warning(
+                        f"  Possible blocker -> pg pid={r.pid} app='{r.application_name}' state={r.state} "
+                        f"xact_age={r.xact_age} last_query={r.query!r}"
+                    )
+                if rows:
+                    logger.warning(
+                        "  Stop the stale process (orphaned uvicorn worker / hung test) or run "
+                        "SELECT pg_terminate_backend(<pid>); then restart."
+                    )
+            except Exception:
+                pass
+
+        from sqlalchemy import text
         if Base.metadata.tables:
-            Base.metadata.create_all(bind=engine)
+            Base.metadata.create_all(bind=startup_engine)
             logger.info("Database tables verified/created.")
             try:
                 from sqlalchemy import text
@@ -451,8 +511,11 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS auto_ingest_statements BOOLEAN NOT NULL DEFAULT FALSE;",
                     "ALTER TABLE inbox_items ADD COLUMN IF NOT EXISTS extracted_balances_json JSON;",
                     "ALTER TABLE inbox_items ADD COLUMN IF NOT EXISTS ingestion_channel VARCHAR(30) NOT NULL DEFAULT 'IMAP_EMAIL';",
+                    "ALTER TABLE external_request_tokens ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;",
+                    "ALTER TABLE external_request_tokens ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;",
+                    "CREATE INDEX IF NOT EXISTS ix_external_request_tokens_is_deleted ON external_request_tokens (is_deleted);",
                 ]
-                with engine.connect() as conn:
+                with startup_engine.connect() as conn:
                     for stmt in migrations:
                         try:
                             conn.execute(text(stmt))
@@ -460,9 +523,10 @@ def configure_app_instance(fastapi_app: FastAPI):
                         except Exception as stmt_err:
                             conn.rollback()
                             logger.debug(f"Schema migration statement ignored ({stmt[:40]}...): {stmt_err}")
+                            _log_startup_lock_blockers(stmt[:80], stmt_err)
                 try:
                     from sqlalchemy.orm import Session as DBSession
-                    with DBSession(engine) as weight_seed_db:
+                    with DBSession(startup_engine) as weight_seed_db:
                         has_rarity = weight_seed_db.execute(
                             text("SELECT 1 FROM global_configurations WHERE key::text = 'FACILITY_SCORE_WEIGHT_RARITY' LIMIT 1")
                         ).first()
@@ -522,7 +586,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                     from sqlalchemy.orm import Session as DBSession
                     from app.services.banking_standards_ontology import banking_standards_ontology
                     from app.core.legal_seed import ensure_legal_artifacts_seeded_in_place
-                    with DBSession(engine) as seed_db:
+                    with DBSession(startup_engine) as seed_db:
                         banking_standards_ontology.ensure_foundational_knowledge_seeded(seed_db)
                         ensure_legal_artifacts_seeded_in_place(seed_db)
                 except Exception as seed_err:
@@ -539,7 +603,7 @@ def configure_app_instance(fastapi_app: FastAPI):
 
                 templates_folder = os.path.join(os.path.dirname(__file__), "templates")
                 if os.path.isdir(templates_folder):
-                    with DBSession(engine) as tpl_db:
+                    with DBSession(startup_engine) as tpl_db:
                         updated_count = 0
                         created_count = 0
                         sanitized_count = 0
@@ -632,6 +696,7 @@ def configure_app_instance(fastapi_app: FastAPI):
                 logger.warning(f"Template auto-sync skipped: {tpl_err}")
             finally:
                 # Dispose connections opened in the master process before Gunicorn forks workers
+                startup_engine.dispose()
                 engine.dispose()
         else:
             logger.critical("FATAL: No SQLAlchemy models registered. Tables cannot be created.")

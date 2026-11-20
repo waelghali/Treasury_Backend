@@ -55,7 +55,8 @@ from app.models import (
     ApprovalRequest,CustomerEntity,
     UserCustomerEntityAssociation,
     LGCategoryCustomerEntityAssociation,
-    Customer
+    Customer,
+    CustomerEmailSetting,
 )
 from app.constants import UserRole, GlobalConfigKey, ConfigScope, ApprovalRequestStatusEnum, SubscriptionStatus
 from app.crud.crud_config import resolve_config_scope
@@ -3323,18 +3324,8 @@ def delete_approval_group(
     return {"message": "Group deleted successfully."}
 
 # ==============================================================================
-# RECONCILIATION SUPPORT (Banks & Currencies)
+# RECONCILIATION SUPPORT (Currencies)
 # ==============================================================================
-
-@router.get("/banks", response_model=List[BankOut])
-def list_banks_for_reconciliation(
-    db: Session = Depends(get_db),
-    corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
-):
-    """
-    Returns the list of all active banks for reconciliation purposes.
-    """
-    return crud_bank.get_all(db)
 
 @router.get("/currencies", response_model=List[CurrencyOut])
 def list_currencies_for_reconciliation(

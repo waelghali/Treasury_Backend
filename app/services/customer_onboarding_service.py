@@ -11,6 +11,7 @@ Provides:
 import os
 import uuid
 import logging
+from html import escape as html_escape
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from sqlalchemy.orm import Session
@@ -112,11 +113,16 @@ async def send_corporate_admin_activation_email(
             else:
                 role_label = str(user.role.value).replace('_', ' ').title()
 
+        guide_attachment = _load_quick_start_guide_attachment() if attach_guide else None
+        safe_customer = html_escape(str(customer_name or ""))
+        safe_role = html_escape(str(role_label or ""))
+
         if is_trial:
-            greeting_line = f"Hello <strong>{recipient_name}</strong>,<br><br>" if recipient_name else ""
+            safe_recipient = html_escape(str(recipient_name)) if recipient_name else ""
+            greeting_line = f"Hello <strong>{safe_recipient}</strong>,<br><br>" if safe_recipient else ""
             modules_html = ""
             if module_labels:
-                items = "".join(f"<li style='margin-bottom:4px;'>{m}</li>" for m in module_labels)
+                items = "".join(f"<li style='margin-bottom:4px;'>{html_escape(str(m))}</li>" for m in module_labels)
                 modules_html = (
                     f"<div style='margin: 14px 0; padding: 12px 16px; background-color: #f8fafc; "
                     f"border-left: 3px solid #0284c7; border-radius: 6px;'>"
@@ -125,18 +131,23 @@ async def send_corporate_admin_activation_email(
                     f"<ul style='margin:8px 0 0 0; padding-left:18px; color:#334155; font-size:13px;'>{items}</ul>"
                     f"</div>"
                 )
+            guide_note_html = (
+                "<strong>Full-Suite Quick Start Guide:</strong> Attached as a PDF covering all 4 modules (LG Custody, Outbound Issuance, FX &amp; T-Bill Quotations, and Bank Auto-Reconciliation).<br><br>"
+                if guide_attachment
+                else ""
+            )
             subject = f"Welcome to Grow Treasury — Activate Your 14-Day Free Trial ({customer_name})"
             body = build_security_email_html(
                 title="Your 14-Day Free Trial is Ready",
                 user_email=user.email,
                 message=(
                     f"{greeting_line}"
-                    f"Your private Free Trial account for <strong>{customer_name}</strong> is ready on "
+                    f"Your private Free Trial account for <strong>{safe_customer}</strong> is ready on "
                     f"<strong>Grow Corporate Treasury Platform</strong>."
                     f"{modules_html}"
                     f"We already loaded sample Letters of Guarantee, 3 bank credit lines, and sample test files "
                     f"so you can start testing in 2 minutes — or upload your own files safely (encrypted for your company only).<br><br>"
-                    f"<strong>Full-Suite Quick Start Guide:</strong> Attached as a PDF covering all 4 modules (LG Custody, Outbound Issuance, FX &amp; T-Bill Quotations, and Bank Auto-Reconciliation).<br><br>"
+                    f"{guide_note_html}"
                     f"<strong>Note:</strong> Your 14-day trial timer starts only after you set your password and sign in.<br><br>"
                     f"<em>This private activation link is valid for {valid_hours} hours.</em>"
                 ),
@@ -145,25 +156,28 @@ async def send_corporate_admin_activation_email(
                 platform_name="Grow Treasury Platform",
             )
         else:
+            guide_note_html = (
+                "<strong>Full-Suite Quick Start Guide:</strong> Attached as a PDF covering Day-1 setup and all 4 treasury modules (LG Custody, Outbound Issuance, FX &amp; T-Bill Quotations, and Bank Auto-Reconciliation).<br><br>"
+                if guide_attachment
+                else ""
+            )
             subject = f"Welcome to Grow Treasury — Activate Your Account ({customer_name})"
             body = build_security_email_html(
                 title="Welcome to Grow Treasury",
                 user_email=user.email,
                 message=(
-                    f"Your account has been configured under organization <strong>{customer_name}</strong> in Grow Treasury "
-                    f"with the role of <strong>{role_label}</strong>.<br><br>"
+                    f"Your account has been configured under organization <strong>{safe_customer}</strong> in Grow Treasury "
+                    f"with the role of <strong>{safe_role}</strong>.<br><br>"
                     f"Please click below to activate your account and establish your private, confidential password. "
                     f"For institutional privacy, this activation link is strictly confidential and neither platform administrators "
                     f"nor your organization's administrators have access to your credentials.<br><br>"
-                    f"<strong>Full-Suite Quick Start Guide:</strong> Attached as a PDF covering Day-1 setup and all 4 treasury modules (LG Custody, Outbound Issuance, FX &amp; T-Bill Quotations, and Bank Auto-Reconciliation).<br><br>"
+                    f"{guide_note_html}"
                     f"<em>This link is valid for {valid_hours} hours.</em>"
                 ),
                 action_url=activation_link,
                 action_text="Activate Account & Set Password",
                 platform_name="Grow Treasury Onboarding"
             )
-
-        guide_attachment = _load_quick_start_guide_attachment() if attach_guide else None
 
         # 6. Send email with save_copy=False (SendOnly - Never saved to Sent Items!)
         success, err = await send_email(

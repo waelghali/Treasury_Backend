@@ -8,6 +8,7 @@ managing per-bank schedules, generating standing instruction letters, and
 syncing downloaded statements from a local Watched Folder.
 """
 
+import asyncio
 import hashlib
 import io
 import logging
@@ -35,11 +36,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session, joinedload
 
+from app.constants import SubscriptionStatus, UserRole
 from app.core.encryption import decrypt_data
+from app.core.routing import get_backend_base_url
 from app.core.security import (
     TokenData,
+    check_for_read_only_mode,
     get_current_corporate_admin_context,
-    get_current_user,
+    get_current_system_owner,
     require_email_inbox_feature,
     verify_access_token,
 )
@@ -49,7 +53,7 @@ from app.core.storage_service import (
     upload_bytes_to_gcs_sync,
 )
 from app.database import get_db
-from app.models.models import Bank, Customer, CustomerEmailSetting, User
+from app.models.models import Bank, Customer, CustomerEmailSetting, SubscriptionPlan, User
 from app.models.models_inbox import (
     InboxAttachment,
     InboxItem,
@@ -67,10 +71,12 @@ from app.schemas.schemas_inbox import (
     InboxStatsOut,
     OutboundRequestCreate,
     OutboundRequestOut,
+    OverrideBalanceEntry,
     ScheduleConfigCreate,
     ScheduleConfigOut,
     SyncTokenCreate,
     SyncTokenOut,
+    WatcherScriptRequest,
 )
 from app.services.inbox_action_service import inbox_action_service
 from app.services.inbox_classification_service import inbox_classification_service
@@ -82,6 +88,32 @@ from app.services.inbox_polling_service import (
 
 logger = logging.getLogger("app.inbox_api")
 router = APIRouter()
+
+MAX_SYNC_DROP_BYTES = 20 * 1024 * 1024  # 20 MB upload cap
+
+
+def require_inbox_write_user(
+    current_user: TokenData = Depends(require_email_inbox_feature),
+    _: TokenData = Depends(check_for_read_only_mode),
+) -> TokenData:
+    """Restricts Smart Inbox mutating actions to active non-Viewer tenant users."""
+    if current_user.role == UserRole.VIEWER:
+        raise HTTPException(
+            status_code=403,
+            detail="Viewer role does not have write permissions in Smart Inbox.",
+        )
+    if current_user.customer_id is None:
+        raise HTTPException(status_code=403, detail="User is not associated with a customer tenant.")
+    return current_user
+
+
+def require_corporate_admin_inbox_write(
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    _: TokenData = Depends(require_email_inbox_feature),
+    __: TokenData = Depends(check_for_read_only_mode),
+) -> TokenData:
+    """Restricts Inbox schedule configuration writes to active Corporate Admins with Smart Inbox enabled."""
+    return current_user
 
 EGYPTIAN_BANK_FILENAME_ALIASES: List[Tuple[str, List[str]]] = [
     ("cib", ["commercial international bank", "cib"]),
@@ -152,8 +184,13 @@ def _resolve_sync_actor(
 ) -> Tuple[int, int, Optional[InboxSyncToken]]:
     """
     Authenticates `/sync-drop` using either a scoped `X-Grow-Sync-Token` header
-    (for local Windows/PowerShell folder watchers) or a standard user Bearer JWT.
+    (for local Windows/PowerShell folder watchers) or a standard user Bearer JWT,
+    enforcing active tenant subscription, Smart Inbox entitlement, and non-Viewer role.
     """
+    sync_tok: Optional[InboxSyncToken] = None
+    customer_id: Optional[int] = None
+    actor_user_id: Optional[int] = None
+
     if x_grow_sync_token:
         tok_hash = hashlib.sha256(x_grow_sync_token.strip().encode("utf-8")).hexdigest()
         sync_tok = (
@@ -167,30 +204,93 @@ def _resolve_sync_actor(
         )
         if not sync_tok:
             raise HTTPException(status_code=401, detail="Invalid or revoked sync token.")
-        sync_tok.last_used_at = datetime.now(timezone.utc)
-        return sync_tok.customer_id, sync_tok.created_by_user_id, sync_tok
+        creator = (
+            db.query(User)
+            .filter(User.id == sync_tok.created_by_user_id, User.is_deleted == False)
+            .first()
+        )
+        if not creator or creator.customer_id != sync_tok.customer_id:
+            raise HTTPException(status_code=401, detail="Sync token owner account is no longer active.")
+        if creator.role == UserRole.VIEWER:
+            raise HTTPException(status_code=403, detail="Viewer role cannot execute Smart Inbox sync drops.")
+        customer_id = sync_tok.customer_id
+        actor_user_id = creator.id
+    else:
+        auth_hdr = request.headers.get("authorization") or ""
+        if auth_hdr.lower().startswith("bearer "):
+            raw_jwt = auth_hdr.split(" ", 1)[1].strip()
+            payload = verify_access_token(raw_jwt)
+            user_id = payload.get("user_id")
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Invalid access token.")
+            user = db.query(User).filter(User.id == user_id, User.is_deleted == False).first()
+            if not user or not user.customer_id:
+                raise HTTPException(status_code=403, detail="User is not associated with a corporate tenant.")
+            if user.role == UserRole.VIEWER:
+                raise HTTPException(status_code=403, detail="Viewer role does not have write permissions in Smart Inbox.")
+            customer_id = user.customer_id
+            actor_user_id = user.id
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required: supply X-Grow-Sync-Token or Bearer token.",
+            )
 
-    auth_hdr = request.headers.get("authorization") or ""
-    if auth_hdr.lower().startswith("bearer "):
-        raw_jwt = auth_hdr.split(" ", 1)[1].strip()
-        payload = verify_access_token(raw_jwt)
-        user_id = payload.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid access token.")
-        user = db.query(User).filter(User.id == user_id, User.is_deleted == False).first()
-        if not user or not user.customer_id:
-            raise HTTPException(status_code=403, detail="User is not associated with a corporate tenant.")
-        return user.customer_id, user.id, None
-
-    raise HTTPException(
-        status_code=401,
-        detail="Authentication required: supply X-Grow-Sync-Token or Bearer token.",
+    customer = (
+        db.query(Customer)
+        .filter(Customer.id == customer_id, Customer.is_deleted == False)
+        .first()
     )
+    if not customer:
+        raise HTTPException(status_code=403, detail="Customer organization is not active.")
+    if customer.status != SubscriptionStatus.ACTIVE:
+        raise HTTPException(
+            status_code=403,
+            detail="Subscription is not active; Smart Inbox write operations are disabled in grace or expired mode.",
+        )
+
+    plan = (
+        db.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.id == customer.subscription_plan_id)
+        .first()
+    )
+    if not plan or not bool(plan.can_email_inbox):
+        raise HTTPException(
+            status_code=403,
+            detail="Your subscription plan does not include the Smart Inbox feature.",
+        )
+
+    if sync_tok:
+        sync_tok.last_used_at = datetime.now(timezone.utc)
+
+    return customer_id, actor_user_id, sync_tok
 
 
 # ==============================================================================
 # 1. INBOX ITEMS & LIVE CASH POSITIONS
 # ==============================================================================
+
+@router.get("/banks")
+def get_inbox_banks(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """Lists active banks for Smart Inbox filtering and manual assignment."""
+    banks = (
+        db.query(Bank)
+        .filter(Bank.is_deleted == False)
+        .order_by(Bank.name.asc())
+        .all()
+    )
+    return [
+        {
+            "id": b.id,
+            "name": b.name,
+            "short_name": b.short_name,
+            "swift_code": b.swift_code,
+        }
+        for b in banks
+    ]
 
 @router.get("/items", response_model=List[InboxItemListOut])
 def get_inbox_items(
@@ -234,6 +334,10 @@ def get_inbox_items(
 
     result = []
     for item in items:
+        signals = item.classification_signals if isinstance(item.classification_signals, dict) else {}
+        pdf_pw_req = bool(signals.get("pdf_password_required")) or (
+            "PDF_PASSWORD_REQUIRED" in (item.error_message or "")
+        )
         out = InboxItemListOut(
             id=item.id,
             customer_id=item.customer_id,
@@ -250,6 +354,8 @@ def get_inbox_items(
             has_attachment=item.has_attachment,
             attachment_count=item.attachment_count,
             primary_attachment_name=item.primary_attachment_name,
+            primary_attachment_type=item.primary_attachment_type,
+            pdf_password_required=pdf_pw_req,
             status=item.status,
             action_summary=item.action_summary,
             error_message=item.error_message,
@@ -353,7 +459,7 @@ def download_inbox_attachment(
     item_id: int,
     attachment_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: TokenData = Depends(require_email_inbox_feature)
 ):
     """Downloads an attachment file belonging to an inbox item (supports GCS and local storage)."""
     item = db.query(InboxItem).filter(
@@ -397,7 +503,7 @@ def preview_inbox_attachment(
     item_id: int,
     attachment_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: TokenData = Depends(require_email_inbox_feature)
 ):
     """
     Parses and returns lightweight table preview data for Excel/CSV attachments,
@@ -492,7 +598,7 @@ def reclassify_inbox_item(
     item_id: int,
     payload: InboxItemReclassify,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature)
+    current_user: TokenData = Depends(require_inbox_write_user)
 ):
     """Allows user to override or correct the classification of an inbox item."""
     try:
@@ -500,11 +606,14 @@ def reclassify_inbox_item(
             db=db,
             inbox_item_id=item_id,
             new_classification=payload.classification,
-            user_id=current_user.user_id
+            user_id=current_user.user_id,
+            customer_id=current_user.customer_id,
         )
         return get_inbox_item_detail(item_id=updated_item.id, db=db, current_user=current_user)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/items/{item_id}/confirm")
@@ -514,14 +623,19 @@ async def confirm_and_action_item(
     override_position_date: Optional[date] = Body(None, embed=True),
     pdf_password: Optional[str] = Body(None, embed=True),
     save_pdf_password: bool = Body(False, embed=True),
-    override_balances: Optional[List[Dict[str, Any]]] = Body(None, embed=True),
+    override_balances: Optional[List[OverrideBalanceEntry]] = Body(None, embed=True),
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature)
+    current_user: TokenData = Depends(require_inbox_write_user)
 ):
     """
     Confirms an inbox item and executes downstream action
     (LG Reconciliation, Bank Statement Ingestion + Cash Balance Snapshot, or Inline Cash Position update).
     """
+    normalized_balances = (
+        [b.model_dump() for b in override_balances]
+        if override_balances is not None
+        else None
+    )
     return await inbox_action_service.confirm_and_execute(
         db=db,
         inbox_item_id=item_id,
@@ -531,7 +645,7 @@ async def confirm_and_action_item(
         override_position_date=override_position_date,
         pdf_password=pdf_password,
         save_pdf_password=save_pdf_password,
-        override_balances=override_balances,
+        override_balances=normalized_balances,
     )
 
 
@@ -539,7 +653,7 @@ async def confirm_and_action_item(
 def archive_inbox_item(
     item_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature)
+    current_user: TokenData = Depends(require_inbox_write_user)
 ):
     """Archives/dismisses an inbox item."""
     item = db.query(InboxItem).filter(
@@ -560,9 +674,9 @@ def archive_inbox_item(
 def unarchive_inbox_item(
     item_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature)
+    current_user: TokenData = Depends(require_inbox_write_user)
 ):
-    """Restores an archived inbox item back to active classified status."""
+    """Restores an archived inbox item back to its prior active status."""
     item = db.query(InboxItem).filter(
         InboxItem.id == item_id,
         InboxItem.customer_id == current_user.customer_id,
@@ -572,7 +686,10 @@ def unarchive_inbox_item(
     if not item:
         raise HTTPException(status_code=404, detail="Inbox item not found")
 
-    item.status = "CLASSIFIED"
+    if item.status != "ARCHIVED":
+        raise HTTPException(status_code=400, detail="Only archived inbox items can be restored.")
+
+    item.status = "ACTIONED" if (item.actioned_at or item.action_reference_id) else "CLASSIFIED"
     db.commit()
     return {"message": "Inbox item unarchived and restored successfully", "id": item_id}
 
@@ -616,7 +733,7 @@ def get_inbox_cash_positions(
 @router.post("/poll-now")
 def trigger_manual_poll(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature)
+    current_user: TokenData = Depends(require_inbox_write_user)
 ):
     """Triggers an on-demand IMAP poll for the current customer's mailbox."""
     try:
@@ -639,7 +756,7 @@ def trigger_manual_poll(
 def send_manual_position_request(
     payload: OutboundRequestCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature)
+    current_user: TokenData = Depends(require_inbox_write_user)
 ):
     """Manually triggers an LG Position, Bank Statement, or Cash Balance request email to a specific bank."""
     try:
@@ -868,7 +985,8 @@ def get_standing_instruction_letter(
 @router.get("/banks-summary")
 def get_banks_relationship_summary(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    _: TokenData = Depends(require_email_inbox_feature),
 ):
     """
     Returns smart bank directory with relationship metrics (active LG counts, facilities, bank accounts)
@@ -952,7 +1070,7 @@ def get_banks_relationship_summary(
 def bulk_create_or_update_schedules(
     payload: BulkScheduleConfigCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(require_corporate_admin_inbox_write)
 ):
     """Applies a recurring schedule to multiple banks in a single action."""
     cid = current_user.customer_id
@@ -1004,7 +1122,8 @@ def bulk_create_or_update_schedules(
 @router.get("/schedule-configs", response_model=List[ScheduleConfigOut])
 def get_schedule_configs(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+    _: TokenData = Depends(require_email_inbox_feature),
 ):
     """Lists per-bank outbound request schedules for the customer."""
     configs = db.query(InboxScheduleConfig).options(
@@ -1039,7 +1158,7 @@ def get_schedule_configs(
 def create_or_update_schedule_config(
     payload: ScheduleConfigCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(require_corporate_admin_inbox_write)
 ):
     """Creates or updates a recurring schedule config for a bank."""
     existing = db.query(InboxScheduleConfig).filter(
@@ -1099,7 +1218,7 @@ def create_or_update_schedule_config(
 def delete_schedule_config(
     config_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(require_corporate_admin_inbox_write)
 ):
     """Soft-deletes a schedule configuration."""
     cfg = db.query(InboxScheduleConfig).filter(
@@ -1125,9 +1244,9 @@ def update_bank_domain(
     bank_id: int,
     payload: BankDomainUpdate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_corporate_admin_context)
+    current_user: TokenData = Depends(get_current_system_owner)
 ):
-    """Updates the recognized corporate email domain for a bank."""
+    """Updates the recognized corporate email domain for a bank (System Owner only)."""
     bank = db.query(Bank).filter(Bank.id == bank_id, Bank.is_deleted == False).first()
     if not bank:
         raise HTTPException(status_code=404, detail="Bank not found")
@@ -1169,7 +1288,7 @@ def list_sync_tokens(
 def create_sync_token(
     payload: SyncTokenCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature),
+    current_user: TokenData = Depends(require_inbox_write_user),
 ):
     """Generates a new scoped Watched-Folder sync token (plaintext returned once)."""
     raw_token = f"gws_{secrets.token_hex(20)}"
@@ -1202,7 +1321,7 @@ def create_sync_token(
 def revoke_sync_token(
     token_id: int,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(require_email_inbox_feature),
+    current_user: TokenData = Depends(require_inbox_write_user),
 ):
     """Revokes and soft-deletes a Watched-Folder sync token."""
     tok = db.query(InboxSyncToken).filter(
@@ -1236,7 +1355,10 @@ async def sync_drop_file(
     """
     customer_id, actor_user_id, sync_tok = _resolve_sync_actor(request, x_grow_sync_token, db)
 
-    filename = file.filename or "statement.xlsx"
+    raw_name = file.filename or "statement.xlsx"
+    filename = os.path.basename(raw_name.replace("\\", "/")).replace("\x00", "").strip()
+    if not filename or filename in (".", ".."):
+        filename = "statement.xlsx"
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_ATTACHMENT_EXTENSIONS:
         raise HTTPException(
@@ -1244,7 +1366,12 @@ async def sync_drop_file(
             detail=f"Unsupported file extension '{ext}'. Allowed: {sorted(ALLOWED_ATTACHMENT_EXTENSIONS)}",
         )
 
-    raw_bytes = await file.read()
+    raw_bytes = await file.read(MAX_SYNC_DROP_BYTES + 1)
+    if len(raw_bytes) > MAX_SYNC_DROP_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Uploaded file exceeds the 20 MB maximum size limit.",
+        )
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
@@ -1273,7 +1400,13 @@ async def sync_drop_file(
     blob_path = build_customer_blob_path(customer_id, "inbox", f"sync_{clean_hash_id}/{filename}")
     mime_type = "application/pdf" if ext == ".pdf" else "application/octet-stream"
     try:
-        storage_path = upload_bytes_to_gcs_sync(blob_path, raw_bytes, content_type=mime_type, timeout=25)
+        storage_path = await asyncio.to_thread(
+            upload_bytes_to_gcs_sync,
+            blob_path,
+            raw_bytes,
+            content_type=mime_type,
+            timeout=25,
+        )
     except Exception:
         storage_path, _, _ = inbox_polling_service._save_attachment(
             customer_id, clean_hash_id, filename, raw_bytes
@@ -1335,51 +1468,57 @@ async def sync_drop_file(
                 pdf_password=pdf_password,
             )
         except HTTPException as exec_err:
+            db.rollback()
             logger.info(f"Watched-folder item #{classified_item.id} queued for manual confirmation: {exec_err.detail}")
         except Exception as exec_err:
+            db.rollback()
             logger.info(f"Watched-folder item #{classified_item.id} queued for review: {exec_err}")
 
-    db.refresh(classified_item)
+    refreshed_item = (
+        db.query(InboxItem)
+        .filter(InboxItem.id == classified_item.id, InboxItem.customer_id == customer_id)
+        .first()
+    ) or classified_item
     return {
-        "status": classified_item.status,
-        "item_id": classified_item.id,
-        "classification": classified_item.classification,
-        "matched_bank_id": classified_item.matched_bank_id,
+        "status": refreshed_item.status,
+        "item_id": refreshed_item.id,
+        "classification": refreshed_item.classification,
+        "matched_bank_id": refreshed_item.matched_bank_id,
         "action_result": action_result,
         "message": (
             action_result["message"]
             if action_result
-            else f"Synced '{filename}' into Smart Inbox (#{classified_item.id}) for review."
+            else f"Synced '{filename}' into Smart Inbox (#{refreshed_item.id}) for review."
         ),
     }
 
 
-@router.get("/sync-watcher-script")
-def download_watcher_script(
-    request: Request,
-    token_hint: Optional[str] = Query("PASTE_YOUR_GWS_SYNC_TOKEN_HERE"),
-    current_user: TokenData = Depends(require_email_inbox_feature),
-):
-    """Downloads a ready-to-run Windows PowerShell Watched-Folder Sync script."""
-    base_url = str(request.base_url).rstrip("/")
+def _ps_single_quote(value: str) -> str:
+    return (value or "").replace("'", "''")
+
+
+def _build_watcher_script_response(request: Request, token_hint: Optional[str]) -> Response:
+    base_url = get_backend_base_url(request).rstrip("/")
     api_url = f"{base_url}/api/v1/inbox/sync-drop"
-    safe_token = re.sub(r"[^A-Za-z0-9_\-]", "", token_hint or "PASTE_YOUR_GWS_SYNC_TOKEN_HERE")
+    safe_token = re.sub(r"[^A-Za-z0-9_\-]", "", token_hint or "") or "PASTE_YOUR_GWS_SYNC_TOKEN_HERE"
+    ps_token = _ps_single_quote(safe_token)
+    ps_api_url = _ps_single_quote(api_url)
 
     ps1_content = f"""# Grow Treasury - Watched Folder Auto-Sync Script (Windows PowerShell)
 # Drop any downloaded bank statement (.xlsx, .xls, .csv, .pdf, .mt940, .sta, .xml) into $WatchFolder
 # Tip: Include the bank short name in the file name (e.g. NBE_Statement_Nov.xlsx) for instant auto-routing.
 
 param(
-    [string]$WatchFolder = "$HOME\\GrowSync",
-    [string]$SyncToken   = "{safe_token}",
-    [string]$EndpointUrl = "{api_url}"
+    [string]$WatchFolder = (Join-Path $HOME 'GrowSync'),
+    [string]$SyncToken   = '{ps_token}',
+    [string]$EndpointUrl = '{ps_api_url}'
 )
 
-$SyncedFolder = Join-Path $WatchFolder "Synced"
-$FailedFolder = Join-Path $WatchFolder "Failed"
+$SyncedFolder = Join-Path $WatchFolder 'Synced'
+$FailedFolder = Join-Path $WatchFolder 'Failed'
 New-Item -ItemType Directory -Force -Path $WatchFolder, $SyncedFolder, $FailedFolder | Out-Null
 
-$AllowedExt = @(".xlsx", ".xls", ".xlsb", ".csv", ".pdf", ".mt940", ".sta", ".940", ".xml", ".txt")
+$AllowedExt = @('.xlsx', '.xls', '.xlsb', '.csv', '.pdf', '.mt940', '.sta', '.940', '.xml', '.txt')
 Write-Host "Grow Watched-Folder Sync active on: $WatchFolder" -ForegroundColor Cyan
 Write-Host "Press Ctrl+C to stop." -ForegroundColor Gray
 
@@ -1419,3 +1558,23 @@ while ($true) {{
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="Start-GrowFolderSync.ps1"'},
     )
+
+
+@router.get("/sync-watcher-script")
+def download_watcher_script(
+    request: Request,
+    token_hint: Optional[str] = Query("PASTE_YOUR_GWS_SYNC_TOKEN_HERE"),
+    current_user: TokenData = Depends(require_inbox_write_user),
+):
+    """Downloads a ready-to-run Windows PowerShell Watched-Folder Sync script."""
+    return _build_watcher_script_response(request, token_hint)
+
+
+@router.post("/sync-watcher-script")
+def download_watcher_script_post(
+    request: Request,
+    payload: WatcherScriptRequest = Body(default_factory=WatcherScriptRequest),
+    current_user: TokenData = Depends(require_inbox_write_user),
+):
+    """Downloads a ready-to-run Windows PowerShell Watched-Folder Sync script (token passed in body)."""
+    return _build_watcher_script_response(request, payload.token_hint)

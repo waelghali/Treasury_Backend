@@ -3,9 +3,10 @@
 Pydantic Schemas for the Smart Inbox Module
 """
 
-from typing import List, Optional, Any, Dict
-from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Dict, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, date
+import math
 
 
 # ==============================================================================
@@ -46,6 +47,8 @@ class InboxItemListOut(BaseModel):
     has_attachment: bool = False
     attachment_count: int = 0
     primary_attachment_name: Optional[str] = None
+    primary_attachment_type: Optional[str] = None
+    pdf_password_required: bool = False
     status: str
     action_summary: Optional[str] = None
     error_message: Optional[str] = None
@@ -104,8 +107,21 @@ class InboxItemDetailOut(BaseModel):
         from_attributes = True
 
 
+InboxClassificationLiteral = Literal[
+    "LG_POSITION_REPORT",
+    "BANK_STATEMENT",
+    "CASH_POSITION_SNAPSHOT",
+    "PROGRESS_REPORT",
+    "IRRELEVANT",
+    "UNCLASSIFIED",
+]
+
+
 class InboxItemReclassify(BaseModel):
-    classification: str = Field(..., description="Target classification, e.g. LG_POSITION_REPORT, BANK_STATEMENT, PROGRESS_REPORT, UNCLASSIFIED")
+    classification: InboxClassificationLiteral = Field(
+        ...,
+        description="Target classification: LG_POSITION_REPORT, BANK_STATEMENT, CASH_POSITION_SNAPSHOT, PROGRESS_REPORT, IRRELEVANT, or UNCLASSIFIED",
+    )
 
 
 class InboxStatsOut(BaseModel):
@@ -245,3 +261,48 @@ class SyncTokenOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class OverrideBalanceEntry(BaseModel):
+    account_number: Optional[str] = Field(None, max_length=100)
+    currency: str = Field("EGP", max_length=10)
+    available_balance: Optional[float] = None
+    ledger_balance: Optional[float] = None
+    as_of_date: Optional[Any] = None
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _normalize_currency(cls, v: Any) -> str:
+        if not v or not str(v).strip():
+            return "EGP"
+        return str(v).strip().upper()[:3]
+
+    @field_validator("available_balance", "ledger_balance", mode="before")
+    @classmethod
+    def _validate_finite_balance(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("Balance must be a finite number")
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                raise ValueError("Balance cannot be empty")
+            if "," in s:
+                raise ValueError("Commas are not allowed in numeric balance values")
+            num = float(s)
+        else:
+            num = float(v)
+        if not math.isfinite(num):
+            raise ValueError("Balance must be a finite number")
+        return num
+
+    @model_validator(mode="after")
+    def _require_at_least_one_balance(self) -> "OverrideBalanceEntry":
+        if self.available_balance is None and self.ledger_balance is None:
+            raise ValueError("At least one of available_balance or ledger_balance must be provided")
+        return self
+
+
+class WatcherScriptRequest(BaseModel):
+    token_hint: str = Field("", max_length=256)

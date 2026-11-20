@@ -4,7 +4,7 @@ import json
 import logging
 from decimal import Decimal
 from datetime import date, datetime
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 
@@ -43,6 +43,14 @@ engine = create_engine(
     # exception messages and SQL logs. Set SQL_SHOW_PARAMS=true locally to debug.
     hide_parameters=os.getenv("SQL_SHOW_PARAMS", "").lower() not in ("true", "1"),
 )
+
+
+# Tag every connection with the owning OS process id (resolved at connect time, so it is
+# correct across Gunicorn forks / Windows spawn workers). Makes stale/orphaned processes that
+# hold locks identifiable via pg_stat_activity.application_name.
+@event.listens_for(engine, "do_connect")
+def _tag_connection_with_pid(dialect, conn_rec, cargs, cparams):
+    cparams.setdefault("application_name", f"grow-app-pid{os.getpid()}")
 
 # Create a SessionLocal class to get database sessions
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -57,9 +57,20 @@ def _parse_as_of_datetime(
     if isinstance(raw_date, date):
         return datetime.combine(raw_date, datetime.min.time(), tzinfo=timezone.utc)
     if isinstance(raw_date, str) and raw_date.strip():
+        cleaned = raw_date.strip()
+        is_iso = bool(re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s].*)?$", cleaned))
+        if is_iso:
+            try:
+                iso_candidate = cleaned.replace("Z", "+00:00")
+                if "/" in iso_candidate[:10]:
+                    iso_candidate = iso_candidate[:10].replace("/", "-") + iso_candidate[10:]
+                py_dt = datetime.fromisoformat(iso_candidate)
+                return py_dt if py_dt.tzinfo else py_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
         try:
             import pandas as pd
-            dt = pd.to_datetime(raw_date.strip(), dayfirst=True, errors="coerce")
+            dt = pd.to_datetime(cleaned, dayfirst=not is_iso, errors="coerce")
             if dt is not None and not pd.isna(dt):
                 py_dt = dt.to_pydatetime()
                 return py_dt if py_dt.tzinfo else py_dt.replace(tzinfo=timezone.utc)
@@ -82,6 +93,7 @@ class InboxActionService:
         customer_id: int,
         bank_id: int,
         account_number: Optional[str] = None,
+        currency_code: Optional[str] = None,
     ) -> Optional[CustomerBankAccount]:
         accounts = (
             db.query(CustomerBankAccount)
@@ -97,21 +109,79 @@ class InboxActionService:
         if not accounts:
             return None
 
+        target_ccy = (
+            str(currency_code).strip().upper()[:3]
+            if currency_code and str(currency_code).strip()
+            else None
+        )
+
+        def _pick_by_currency(candidates: List[CustomerBankAccount]) -> Optional[CustomerBankAccount]:
+            if not candidates:
+                return None
+            if target_ccy:
+                ccy_matches = [c for c in candidates if (c.currency_code or "").upper() == target_ccy]
+                if len(ccy_matches) == 1:
+                    return ccy_matches[0]
+                if ccy_matches:
+                    for c in ccy_matches:
+                        if c.is_default:
+                            return c
+                    return None
+            if len(candidates) == 1:
+                return candidates[0]
+            for c in candidates:
+                if c.is_default:
+                    return c
+            return candidates[0]
+
         target_norm = _normalize_acct_key(account_number)
         if target_norm:
+            exact_matches = []
             for a in accounts:
                 acct_norm = _normalize_acct_key(a.account_number)
                 iban_norm = _normalize_acct_key(a.iban)
-                if acct_norm and (acct_norm == target_norm or acct_norm.endswith(target_norm) or target_norm.endswith(acct_norm)):
+                if acct_norm and (
+                    acct_norm == target_norm
+                    or (min(len(acct_norm), len(target_norm)) >= 6 and (acct_norm.endswith(target_norm) or target_norm.endswith(acct_norm)))
+                ):
+                    exact_matches.append(a)
+                elif iban_norm and (
+                    iban_norm == target_norm
+                    or (len(target_norm) >= 6 and iban_norm.endswith(target_norm))
+                ):
+                    exact_matches.append(a)
+
+            if exact_matches:
+                picked = _pick_by_currency(exact_matches)
+                if picked:
+                    return picked
+
+            if len(target_norm) >= 6:
+                tail6 = target_norm[-6:]
+                tail_matches = [
+                    a for a in accounts
+                    if _normalize_acct_key(a.account_number).endswith(tail6)
+                    or _normalize_acct_key(a.iban).endswith(tail6)
+                ]
+                if len(tail_matches) == 1:
+                    return tail_matches[0]
+                if tail_matches and target_ccy:
+                    ccy_tail = [a for a in tail_matches if (a.currency_code or "").upper() == target_ccy]
+                    if len(ccy_tail) == 1:
+                        return ccy_tail[0]
+
+            return None
+
+        if target_ccy:
+            ccy_accounts = [a for a in accounts if (a.currency_code or "").upper() == target_ccy]
+            if not ccy_accounts:
+                return None
+            if len(ccy_accounts) == 1:
+                return ccy_accounts[0]
+            for a in ccy_accounts:
+                if a.is_default:
                     return a
-                if iban_norm and (iban_norm == target_norm or iban_norm.endswith(target_norm)):
-                    return a
-            if len(target_norm) >= 4:
-                tail4 = target_norm[-4:]
-                for a in accounts:
-                    acct_norm = _normalize_acct_key(a.account_number)
-                    if acct_norm.endswith(tail4):
-                        return a
+            return ccy_accounts[0]
 
         if len(accounts) == 1:
             return accounts[0]
@@ -120,6 +190,25 @@ class InboxActionService:
             if a.is_default:
                 return a
         return accounts[0]
+
+    @staticmethod
+    def _parse_finite_decimal(val: Any, field_name: str, default_zero: bool = False) -> Decimal:
+        if val is None:
+            if default_zero:
+                return Decimal("0")
+            raise HTTPException(status_code=400, detail=f"Missing numeric value for {field_name}.")
+        if isinstance(val, bool):
+            raise HTTPException(status_code=400, detail=f"Invalid numeric value for {field_name}.")
+        try:
+            s = str(val).strip()
+            if not s or "," in s:
+                raise HTTPException(status_code=400, detail=f"Invalid numeric value for {field_name}.")
+            dec = Decimal(s)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid numeric value for {field_name}.") from exc
+        if not dec.is_finite():
+            raise HTTPException(status_code=400, detail=f"Non-finite numeric value for {field_name}.")
+        return dec
 
     def record_cash_balance_snapshot(
         self,
@@ -139,24 +228,31 @@ class InboxActionService:
         auto_commit: bool = False,
     ) -> CashBalanceSnapshot:
         """Creates and persists a point-in-time CashBalanceSnapshot linked to CustomerBankAccount when available."""
-        matched_acct = self._match_customer_bank_account(db, customer_id, bank_id, account_number)
-        effective_acct_num = (
-            str(account_number).strip()
-            if account_number and str(account_number).strip()
-            else (matched_acct.account_number if matched_acct else None)
+        raw_acct = str(account_number).strip()[:64] if account_number and str(account_number).strip() else None
+        matched_acct = self._match_customer_bank_account(
+            db, customer_id, bank_id, raw_acct, currency_code=currency_code
+        )
+        effective_acct_num = raw_acct or (
+            matched_acct.account_number[:64] if matched_acct and matched_acct.account_number else None
         )
         effective_ccy = (
             str(currency_code).strip().upper()[:3]
-            if currency_code
-            else (matched_acct.currency_code if matched_acct and matched_acct.currency_code else "EGP")
+            if currency_code and str(currency_code).strip()
+            else (
+                matched_acct.currency_code.strip().upper()[:3]
+                if matched_acct and matched_acct.currency_code
+                else "EGP"
+            )
         )
-        avail_dec = Decimal(str(available_balance if available_balance is not None else 0))
+        avail_dec = self._parse_finite_decimal(available_balance, "available_balance", default_zero=True)
         ledger_dec = (
-            Decimal(str(ledger_balance))
+            self._parse_finite_decimal(ledger_balance, "ledger_balance")
             if ledger_balance is not None
             else avail_dec
         )
         effective_dt = _parse_as_of_datetime(as_of_datetime)
+        effective_source = (str(source_channel or "EMAIL_STATEMENT").strip()[:40] or "EMAIL_STATEMENT")
+        effective_continuity = (str(continuity_status or "VALIDATED").strip()[:40] or "VALIDATED")
 
         snapshot = CashBalanceSnapshot(
             customer_id=customer_id,
@@ -167,10 +263,10 @@ class InboxActionService:
             available_balance=avail_dec,
             ledger_balance=ledger_dec,
             as_of_datetime=effective_dt,
-            source_channel=source_channel,
+            source_channel=effective_source,
             inbox_item_id=inbox_item_id,
             statement_id=statement_id,
-            continuity_status=continuity_status or "VALIDATED",
+            continuity_status=effective_continuity,
             notes=notes,
         )
         db.add(snapshot)
@@ -235,6 +331,7 @@ class InboxActionService:
                 override_position_date=override_position_date,
                 override_balances=override_balances,
                 pdf_password=pdf_password,
+                save_pdf_password=save_pdf_password,
             )
 
         elif item.classification == "PROGRESS_REPORT":
@@ -465,6 +562,25 @@ class InboxActionService:
         if not bank:
             raise HTTPException(status_code=400, detail=f"Bank ID {bank_id} not found.")
 
+        if item.status in ("ACTIONED", "CONFIRMED") or (
+            item.action_reference_type == "BankStatement" and item.action_reference_id
+        ):
+            if item.action_reference_id:
+                existing_stmt = (
+                    db.query(BankStatement)
+                    .filter(
+                        BankStatement.id == item.action_reference_id,
+                        BankStatement.customer_id == customer_id,
+                    )
+                    .first()
+                )
+                if existing_stmt:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Inbox item has already been ingested into Bank Statement #{existing_stmt.id}.",
+                    )
+            raise HTTPException(status_code=400, detail="Inbox item has already been actioned.")
+
         file_bytes = read_attachment_bytes(item.primary_attachment_path)
         if not file_bytes:
             if item.extracted_balances_json:
@@ -485,6 +601,9 @@ class InboxActionService:
         filename = item.primary_attachment_name or os.path.basename(item.primary_attachment_path or "statement.xlsx")
         ext = os.path.splitext(filename)[1].lower().lstrip(".") or (item.primary_attachment_type or "").lower()
 
+        pdf_meta: Optional[Dict[str, Any]] = None
+        should_save_pdf_pw = False
+
         if ext == "pdf":
             passwords = get_candidate_pdf_passwords(
                 db=db,
@@ -499,14 +618,20 @@ class InboxActionService:
                     status_code=400,
                     detail="PDF_PASSWORD_REQUIRED: Statement PDF is password-protected. Please enter the PDF password to unlock.",
                 )
+            if not is_unlocked:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or unreadable PDF statement file.",
+                )
 
-            if save_pdf_password and pdf_password and pdf_password.strip():
-                acct_to_save = self._match_customer_bank_account(db, customer_id, bank_id)
-                if acct_to_save:
-                    acct_to_save.statement_pdf_password_encrypted = encrypt_data(pdf_password.strip())
-                    db.flush()
+            should_save_pdf_pw = bool(
+                save_pdf_password and pdf_password and pdf_password.strip() and was_encrypted and is_unlocked
+            )
 
-            df_pdf, pdf_meta, summary_balances = extract_statement_from_pdf(unlocked_bytes)
+            try:
+                df_pdf, pdf_meta, summary_balances = extract_statement_from_pdf(unlocked_bytes)
+            except ValueError as pdf_err:
+                raise HTTPException(status_code=400, detail=str(pdf_err)) from pdf_err
             if (df_pdf is None or df_pdf.empty) and summary_balances:
                 item.extracted_balances_json = summary_balances
                 return self._execute_cash_position_snapshot_sync(
@@ -516,6 +641,9 @@ class InboxActionService:
                     customer_id=customer_id,
                     override_bank_id=bank_id,
                     override_position_date=override_position_date,
+                    pdf_password=pdf_password,
+                    save_pdf_password=should_save_pdf_pw,
+                    pdf_already_unlocked=should_save_pdf_pw,
                     source_channel="EMAIL_PDF_SUMMARY",
                     is_auto_executed=is_auto_executed,
                 )
@@ -536,12 +664,17 @@ class InboxActionService:
                 overrides=overrides,
             )
         except HTTPException:
+            db.rollback()
             raise
         except Exception as ingest_err:
             logger.error(f"Statement ingestion failed for InboxItem {item.id}: {ingest_err}")
-            item.status = "PARSE_ERROR"
-            item.error_message = str(ingest_err)
-            db.commit()
+            db.rollback()
+            if not is_auto_executed:
+                refreshed_item = db.query(InboxItem).filter(InboxItem.id == item.id).first()
+                if refreshed_item:
+                    refreshed_item.status = "PARSE_ERROR"
+                    refreshed_item.error_message = str(ingest_err)[:1000]
+                    db.commit()
             raise HTTPException(status_code=400, detail=f"Statement parsing error: {str(ingest_err)}")
 
         match_res = None
@@ -555,18 +688,30 @@ class InboxActionService:
         except Exception as match_err:
             logger.warning(f"Auto-matching warning for statement #{db_stmt.id}: {match_err}")
 
-        # Determine currency from parsed transactions or linked bank account
+        # Determine currency from parsed transactions, PDF metadata, or linked bank account
         first_txn = (
             db.query(BankTransaction.currency)
             .filter(BankTransaction.statement_id == db_stmt.id)
             .first()
         )
-        matched_acct = self._match_customer_bank_account(db, customer_id, bank_id, db_stmt.account_number)
+        pdf_ccy = pdf_meta.get("currency") if isinstance(pdf_meta, dict) else None
+        inferred_ccy = (first_txn[0] if first_txn and first_txn[0] else None) or pdf_ccy
+        matched_acct = self._match_customer_bank_account(
+            db,
+            customer_id,
+            bank_id,
+            db_stmt.account_number,
+            currency_code=inferred_ccy,
+        )
         stmt_currency = (
-            (first_txn[0] if first_txn and first_txn[0] else None)
+            inferred_ccy
             or (matched_acct.currency_code if matched_acct and matched_acct.currency_code else None)
             or "EGP"
-        ).upper()
+        ).upper()[:3]
+
+        if should_save_pdf_pw and matched_acct:
+            matched_acct.statement_pdf_password_encrypted = encrypt_data(pdf_password.strip())
+            db.flush()
 
         if item.ingestion_channel == "WATCHED_FOLDER":
             src_channel = "WATCHED_FOLDER"
@@ -653,8 +798,10 @@ class InboxActionService:
         customer_id: int,
         override_bank_id: Optional[int] = None,
         override_position_date: Optional[date] = None,
-        override_balances: Optional[List[Dict[str, Any]]] = None,
+        override_balances: Optional[List[Any]] = None,
         pdf_password: Optional[str] = None,
+        save_pdf_password: bool = False,
+        pdf_already_unlocked: bool = False,
         source_channel: Optional[str] = None,
         is_auto_executed: bool = False,
     ) -> Dict[str, Any]:
@@ -670,8 +817,20 @@ class InboxActionService:
         if not bank:
             raise HTTPException(status_code=400, detail=f"Bank ID {bank_id} not found.")
 
-        balances = override_balances if override_balances else (item.extracted_balances_json or [])
+        if item.status in ("ACTIONED", "CONFIRMED"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item has already been actioned (Ref: {item.action_reference_type} #{item.action_reference_id})",
+            )
+
+        raw_balances = override_balances if override_balances else (item.extracted_balances_json or [])
+        balances: List[Dict[str, Any]] = [
+            b.model_dump() if hasattr(b, "model_dump") else dict(b)
+            for b in raw_balances
+            if isinstance(b, dict) or hasattr(b, "model_dump")
+        ]
         effective_source = source_channel or "EMAIL_BODY"
+        was_pdf_unlocked = bool(pdf_already_unlocked)
 
         if not balances and item.has_attachment and (item.primary_attachment_type or "").lower() == "pdf":
             file_bytes = read_attachment_bytes(item.primary_attachment_path)
@@ -683,7 +842,16 @@ class InboxActionService:
                         status_code=400,
                         detail="PDF_PASSWORD_REQUIRED: Attachment PDF is password-protected. Please enter the PDF password.",
                     )
-                _, _, balances = extract_statement_from_pdf(unlocked_bytes)
+                if not is_unlocked:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid or unreadable PDF attachment file.",
+                    )
+                was_pdf_unlocked = bool(was_encrypted and is_unlocked)
+                try:
+                    _, _, balances = extract_statement_from_pdf(unlocked_bytes)
+                except ValueError as pdf_err:
+                    raise HTTPException(status_code=400, detail=str(pdf_err)) from pdf_err
                 effective_source = "EMAIL_PDF_SUMMARY"
 
         if not balances and item.body_text_encrypted:
@@ -702,6 +870,8 @@ class InboxActionService:
         snapshots: List[CashBalanceSnapshot] = []
         serialized_balances: List[Dict[str, Any]] = []
         for entry in balances:
+            if not isinstance(entry, dict):
+                continue
             avail = entry.get("available_balance")
             ledger = entry.get("ledger_balance")
             if avail is None and ledger is None:
@@ -735,6 +905,19 @@ class InboxActionService:
 
         if not snapshots:
             raise HTTPException(status_code=400, detail="No valid numeric balances provided.")
+
+        if save_pdf_password and pdf_password and pdf_password.strip() and was_pdf_unlocked:
+            first_snap = snapshots[0]
+            acct_to_save = (
+                db.query(CustomerBankAccount).filter(CustomerBankAccount.id == first_snap.bank_account_id).first()
+                if first_snap.bank_account_id
+                else self._match_customer_bank_account(
+                    db, customer_id, bank_id, first_snap.account_number, currency_code=first_snap.currency_code
+                )
+            )
+            if acct_to_save:
+                acct_to_save.statement_pdf_password_encrypted = encrypt_data(pdf_password.strip())
+                db.flush()
 
         item.extracted_balances_json = balances
         item.status = "ACTIONED"
@@ -947,9 +1130,12 @@ class InboxActionService:
         for st in statements:
             if st.id in covered_stmt_ids:
                 continue
-            matched_acct = self._match_customer_bank_account(db, customer_id, st.bank_id, st.account_number)
+            stmt_ccy = stmt_ccy_map.get(st.id)
+            matched_acct = self._match_customer_bank_account(
+                db, customer_id, st.bank_id, st.account_number, currency_code=stmt_ccy
+            )
             ccy = (
-                stmt_ccy_map.get(st.id)
+                stmt_ccy
                 or (matched_acct.currency_code if matched_acct and matched_acct.currency_code else None)
                 or "EGP"
             ).upper()
