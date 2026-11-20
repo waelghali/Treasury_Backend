@@ -1,4 +1,4 @@
-# scratch/knowledge_extractor_v4.py
+# scripts/knowledge_extractor.py
 """
 Grow Platform Master Knowledge Extractor & Compiler v4
 Synchronizes the Authoritative 5-Group Settings Architecture and Core Capabilities.
@@ -168,13 +168,6 @@ def get_system_knowledge() -> str:
     with open(target_path, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"Successfully updated master knowledge in {target_path}")
-
-    # Also update app/services/knowledge_extractor.py
-    with open(__file__, "r", encoding="utf-8") as f_src:
-        src = f_src.read()
-    with open(r"C:\Grow\app\services\knowledge_extractor.py", "w", encoding="utf-8") as f_dest:
-        f_dest.write(src)
-    print("Successfully updated C:\\Grow\\app\\services\\knowledge_extractor.py")
 
 
 if __name__ == "__main__":

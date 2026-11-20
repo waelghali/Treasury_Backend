@@ -98,22 +98,12 @@ else:
 DEFAULT_PRIMARY_MODEL = "gemini-3.8-flash"
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', DEFAULT_PRIMARY_MODEL)
 
-# Global API Studio client fallback
+# Global API Studio client fallback (intentionally disabled to enforce strict Vertex AI confidentiality)
 _genai_api_client_global = None
 
 def _get_api_genai_client():
-    """Initialize fallback Google AI Studio client using API Key."""
-    global _genai_api_client_global
-    if not GEMINI_AVAILABLE:
-        return None
-    if _genai_api_client_global is None:
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if api_key:
-            try:
-                _genai_api_client_global = genai.Client(api_key=api_key)
-            except Exception as e:
-                logger.warning(f"Failed to initialize API Key GenAI client: {e}")
-    return _genai_api_client_global
+    """Disabled: Google AI Studio fallback is turned off so all prompts/documents stay strictly inside private Vertex AI."""
+    return None
 
 def _get_model_cascade(requested_model: Optional[str] = None) -> List[str]:
     """
@@ -179,12 +169,11 @@ def _get_vertex_genai_client_for_location(location: str):
 
 def _iter_candidate_clients(primary_client, cascade: Optional[List[str]] = None):
     """
-    Lazily yields (client_label, client) one-by-one so backup clients (and their httpx/SSL pools)
-    are ONLY instantiated if the primary endpoint actually fails:
+    Lazily yields (client_label, client) one-by-one across private Vertex AI endpoints only
+    so backup clients (and their httpx/SSL pools) are ONLY instantiated if the primary endpoint fails:
     1. Vertex AI 'global' endpoint first whenever Gemini 3.x/4.x models are in the cascade
-    2. Primary configured client (if distinct from 'global')
-    3. Google AI Studio API client (supports Gemini 3.8 / 3.5 / 4-argon as independent quota fallback)
-    4. Regional Vertex AI endpoints ('us-central1', 'europe-west1', 'us-east4')
+    2. Primary configured Vertex AI client (if distinct from 'global')
+    3. Regional Vertex AI endpoints ('us-central1', 'europe-west1', 'us-east4')
     """
     seen_ids = set()
     needs_global_first = bool(
@@ -207,11 +196,6 @@ def _iter_candidate_clients(primary_client, cascade: Optional[List[str]] = None)
             seen_ids.add(id(global_client))
             yield ("vertex:global", global_client)
 
-    api_client = _get_api_genai_client()
-    if api_client is not None and id(api_client) not in seen_ids:
-        seen_ids.add(id(api_client))
-        yield ("ai_studio", api_client)
-
     for loc in ("us-central1", "europe-west1", "us-east4"):
         if loc == VERTEX_AI_LOCATION and primary_client is not None:
             continue
@@ -223,7 +207,7 @@ def _iter_candidate_clients(primary_client, cascade: Optional[List[str]] = None)
 async def _safe_generate_content_async(client, model: str, contents, config=None):
     """
     Safely executes an async generate_content call with:
-    - Lazy multi-endpoint failover (vertex:global -> ai_studio -> regional Vertex endpoints)
+    - Lazy multi-endpoint Vertex-only failover (vertex:global -> primary Vertex region -> regional Vertex endpoints)
     - Multi-model cascade (gemini-3.8-flash -> gemini-3.5-flash -> gemini-4-argon)
     - Automatic exponential backoff + jitter on 429 RESOURCE_EXHAUSTED / 503 transient errors
     """
@@ -272,7 +256,7 @@ async def _safe_generate_content_async(client, model: str, contents, config=None
 def _safe_generate_content_sync(client, model: str, contents, config=None):
     """
     Safely executes a sync generate_content call with:
-    - Lazy multi-endpoint failover (vertex:global -> ai_studio -> regional Vertex endpoints)
+    - Lazy multi-endpoint Vertex-only failover (vertex:global -> primary Vertex region -> regional Vertex endpoints)
     - Multi-model cascade (gemini-3.8-flash -> gemini-3.5-flash -> gemini-4-argon)
     - Automatic exponential backoff + jitter on 429 RESOURCE_EXHAUSTED / 503 transient errors
     """
@@ -1612,7 +1596,7 @@ async def _process_batch_migration_documents_with_ai_core(
         "total_pages_processed": 0,
     }
 
-    client = _get_genai_client() or _get_api_genai_client()
+    client = _get_genai_client()
     if not client or not items:
         return results_by_key, usage_meta
 

@@ -446,6 +446,11 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, config_scope, is_deleted, created_at, updated_at) VALUES ('OTP_MAX_FAILED_ATTEMPTS', '3', '10', '5', 'attempts', 'Maximum failed OTP verification attempts before rate-limit lockout on public portals.', NULL, 'SYSTEM_CUSTOMER_OVERRIDE', false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, config_scope, is_deleted, created_at, updated_at) VALUES ('OTP_LOCKOUT_DURATION_MINUTES', '1', '1440', '15', 'minutes', 'OTP lockout duration in minutes after exceeding failed verification attempts.', NULL, 'SYSTEM_CUSTOMER_OVERRIDE', false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, config_scope, is_deleted, created_at, updated_at) VALUES ('GRACE_PERIOD_DAYS', '0', '90', '30', 'days', 'Subscription grace period in days after expiration before read-only/lockout.', NULL, 'SYSTEM_CUSTOMER_OVERRIDE', false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
+                    "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS currency_code VARCHAR(3) DEFAULT 'EGP';",
+                    "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS statement_pdf_password_encrypted TEXT;",
+                    "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS auto_ingest_statements BOOLEAN NOT NULL DEFAULT FALSE;",
+                    "ALTER TABLE inbox_items ADD COLUMN IF NOT EXISTS extracted_balances_json JSON;",
+                    "ALTER TABLE inbox_items ADD COLUMN IF NOT EXISTS ingestion_channel VARCHAR(30) NOT NULL DEFAULT 'IMAP_EMAIL';",
                 ]
                 with engine.connect() as conn:
                     for stmt in migrations:

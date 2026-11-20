@@ -222,6 +222,9 @@ def list_bank_accounts(
             "customer_number": a.customer_number,
             "branch_name": a.branch_name,
             "iban": a.iban,
+            "currency_code": (a.currency_code or "EGP").upper(),
+            "has_statement_pdf_password": bool(a.statement_pdf_password_encrypted),
+            "auto_ingest_statements": bool(a.auto_ingest_statements),
             "is_default": a.is_default,
             "is_active": a.is_active,
         }
@@ -246,7 +249,15 @@ def create_bank_account(
         ).all()
         for d in existing_defaults:
             d.is_default = False
-    
+
+    raw_pdf_password = body.get("statement_pdf_password")
+    encrypted_pdf_pwd = (
+        encrypt_data(str(raw_pdf_password).strip())
+        if isinstance(raw_pdf_password, str) and raw_pdf_password.strip()
+        else None
+    )
+    ccy = (str(body.get("currency_code") or "EGP").strip().upper()[:3]) or "EGP"
+
     account = CustomerBankAccount(
         customer_id=current_user.customer_id,
         bank_id=body["bank_id"],
@@ -256,6 +267,9 @@ def create_bank_account(
         customer_number=body.get("customer_number"),
         branch_name=body.get("branch_name"),
         iban=body.get("iban"),
+        currency_code=ccy,
+        statement_pdf_password_encrypted=encrypted_pdf_pwd,
+        auto_ingest_statements=bool(body.get("auto_ingest_statements", False)),
         is_default=body.get("is_default", False),
     )
     db.add(account)
@@ -300,6 +314,17 @@ def update_bank_account(
     for field in ["account_name", "account_number", "customer_number", "branch_name", "iban", "is_default", "entity_id", "is_active"]:
         if field in body:
             setattr(account, field, body[field])
+
+    if "currency_code" in body and body["currency_code"]:
+        account.currency_code = str(body["currency_code"]).strip().upper()[:3] or "EGP"
+
+    if "auto_ingest_statements" in body:
+        account.auto_ingest_statements = bool(body["auto_ingest_statements"])
+
+    if body.get("clear_statement_pdf_password") is True:
+        account.statement_pdf_password_encrypted = None
+    elif isinstance(body.get("statement_pdf_password"), str) and body["statement_pdf_password"].strip():
+        account.statement_pdf_password_encrypted = encrypt_data(body["statement_pdf_password"].strip())
     
     db.commit()
     return {"message": "Bank account updated"}

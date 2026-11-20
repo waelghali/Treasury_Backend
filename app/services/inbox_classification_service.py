@@ -5,6 +5,7 @@ Scores emails based on thread tracking, domain mapping, attachment structure,
 historical user corrections, and subject keywords.
 """
 
+import io
 import os
 import re
 import logging
@@ -19,6 +20,14 @@ from app.models.models_inbox import (
     InboxItem, InboxOutboundRequest, EmailClassificationHistory
 )
 from app.services.reconciliation_service import COLUMN_KEYWORDS as LG_COLUMN_KEYWORDS
+from app.services.banking_standards_ontology import banking_standards_ontology
+from app.services.pdf_statement_parser import (
+    get_candidate_pdf_passwords,
+    unlock_pdf_bytes,
+    extract_cash_balances_from_text,
+    extract_statement_from_pdf,
+)
+from app.core.storage_service import read_attachment_bytes
 from app.core.encryption import decrypt_data
 
 logger = logging.getLogger("app.inbox_classification")
@@ -31,6 +40,12 @@ GENERIC_DOMAINS = {
 STATEMENT_KEYWORDS = [
     "statement", "bank statement", "account statement", "transactions",
     "debit", "credit", "balance", "كشف حساب", "معاملات", "رصيد"
+]
+
+CASH_POSITION_KEYWORDS = [
+    "cash position", "daily balance", "available balance", "ledger balance",
+    "account balance", "balance summary", "balances as of",
+    "موقف السيولة", "الرصيد المتاح", "الرصيد الدفتري", "بيان الأرصدة", "أرصدة الحسابات"
 ]
 
 LG_POSITION_KEYWORDS = [
@@ -63,38 +78,17 @@ class InboxClassificationService:
     Classifies ingested emails into actionable categories:
     - LG_POSITION_REPORT
     - BANK_STATEMENT
+    - CASH_POSITION_SNAPSHOT
     - PROGRESS_REPORT
     - UNCLASSIFIED
     """
 
-    def _inspect_attachment_headers(self, file_path: str, file_type: Optional[str]) -> Tuple[Optional[str], List[str]]:
-        """
-        Attempts to read headers/columns from an Excel or CSV file to identify structure.
-        Returns (detected_category, list_of_matched_columns).
-        """
-        if not file_path or not os.path.exists(file_path):
-            return None, []
-
-        file_type = (file_type or "").lower()
-        df = None
-        try:
-            import pandas as pd
-            if file_type in ("xlsx", "xls"):
-                # Read top 10 rows
-                df = pd.read_excel(file_path, nrows=10)
-            elif file_type == "csv":
-                df = pd.read_csv(file_path, nrows=10)
-        except Exception as e:
-            logger.warning(f"Could not read attachment {file_path} for header inspection: {e}")
-            return None, []
-
+    def _inspect_dataframe_headers(self, df: Any) -> Tuple[Optional[str], List[str]]:
+        """Inspects a pandas DataFrame header/top row for LG vs Bank Statement structure."""
         if df is None or df.empty:
             return None, []
 
-        # Gather all column names and string representations
         headers_str = " ".join([str(c).lower() for c in df.columns])
-        
-        # Also check row 0 in case headers are in data row
         row_0_str = ""
         try:
             row_0_str = " ".join([str(v).lower() for v in df.iloc[0].values])
@@ -108,16 +102,78 @@ class InboxClassificationService:
             if any(kw in combined_text for kw in keywords):
                 lg_matched_keys.append(field)
 
-        # If has at least 2 key LG fields (e.g. number + amount or expiry + amount)
         if len(lg_matched_keys) >= 2 or "bank_lg_number" in lg_matched_keys:
             return "LG_POSITION_REPORT", lg_matched_keys
 
         # 2. Check Statement keywords (debit, credit, balance)
         statement_matches = [kw for kw in STATEMENT_KEYWORDS if kw in combined_text]
-        if len(statement_matches) >= 2 or ("balance" in statement_matches and ("debit" in statement_matches or "credit" in statement_matches)):
+        if len(statement_matches) >= 2 or (
+            "balance" in statement_matches
+            and ("debit" in statement_matches or "credit" in statement_matches)
+        ):
             return "BANK_STATEMENT", statement_matches
 
         return None, []
+
+    def _inspect_attachment_headers(
+        self,
+        file_path: str,
+        file_type: Optional[str],
+        db: Optional[Session] = None,
+        customer_id: Optional[int] = None,
+        bank_id: Optional[int] = None,
+    ) -> Tuple[Optional[str], List[str], Optional[List[Dict[str, Any]]]]:
+        """
+        Reads attachment bytes from GCS or local disk and inspects structure across:
+        - Excel / CSV
+        - SWIFT MT940 / ISO 20022 CAMT.053
+        - PDF (unlocking using saved/CIF passwords if encrypted)
+        Returns (detected_category, list_of_matched_columns, extracted_summary_balances).
+        """
+        raw_bytes = read_attachment_bytes(file_path)
+        if not raw_bytes:
+            return None, [], None
+
+        ft = (file_type or "").lower().lstrip(".")
+
+        if ft in ("mt940", "sta", "940", "txt", "xml"):
+            if banking_standards_ontology.is_mt940_content(raw_bytes) or banking_standards_ontology.is_camt053_content(raw_bytes):
+                return "BANK_STATEMENT", ["SWIFT_MT940_OR_CAMT053"], None
+
+        if ft in ("xlsx", "xls", "xlsb", "csv"):
+            df = None
+            try:
+                import pandas as pd
+                if ft in ("xlsx", "xls", "xlsb"):
+                    df = pd.read_excel(io.BytesIO(raw_bytes), nrows=15)
+                else:
+                    df = pd.read_csv(io.BytesIO(raw_bytes), nrows=15)
+            except Exception as e:
+                logger.warning(f"Could not read attachment {file_path} for header inspection: {e}")
+                return None, [], None
+            cat, cols = self._inspect_dataframe_headers(df)
+            return cat, cols, None
+
+        if ft == "pdf":
+            try:
+                passwords = get_candidate_pdf_passwords(db, customer_id, bank_id)
+                unlocked_bytes, was_encrypted, is_unlocked = unlock_pdf_bytes(raw_bytes, passwords)
+                if was_encrypted and not is_unlocked:
+                    return "LOCKED_PDF", ["ENCRYPTED_PDF"], None
+                df, _, summary_balances = extract_statement_from_pdf(unlocked_bytes)
+                if df is not None and not df.empty:
+                    cat, cols = self._inspect_dataframe_headers(df)
+                    if cat:
+                        return cat, cols, summary_balances or None
+                    if len(df) >= 2 and df.shape[1] >= 3:
+                        return "BANK_STATEMENT", ["PDF_TABLE"], summary_balances or None
+                if summary_balances:
+                    return "CASH_POSITION_SNAPSHOT", ["PDF_BALANCE_SUMMARY"], summary_balances
+            except Exception as e:
+                logger.warning(f"Could not inspect PDF attachment {file_path}: {e}")
+                return None, [], None
+
+        return None, [], None
 
     def classify(self, db: Session, item: InboxItem) -> InboxItem:
         """
@@ -129,6 +185,7 @@ class InboxClassificationService:
         detected_category = "UNCLASSIFIED"
         matched_bank = None
         is_nil_detected = False
+        locked_pdf_detected = False
 
         # Decrypt plain text body for inspection
         body_text = ""
@@ -141,7 +198,11 @@ class InboxClassificationService:
         # ----------------------------------------------------------------------
         # SIGNAL 1: Reference Number Exact Match in Subject or Body
         # ----------------------------------------------------------------------
-        ref_match = re.search(r'POS-\d{8}-[A-Za-z0-9]+', f"{item.subject or ''} {body_text}", flags=re.IGNORECASE)
+        ref_match = re.search(
+            r'(?:POS|STM|BAL)-\d{8}-[A-Za-z0-9]+',
+            f"{item.subject or ''} {body_text}",
+            flags=re.IGNORECASE,
+        )
         if ref_match:
             found_ref = ref_match.group(0).upper()
             outbound_req = db.query(InboxOutboundRequest).filter(
@@ -170,6 +231,8 @@ class InboxClassificationService:
                     detected_category = "LG_POSITION_REPORT"
                 elif outbound_req.request_type == "BANK_STATEMENT":
                     detected_category = "BANK_STATEMENT"
+                elif outbound_req.request_type == "CASH_POSITION":
+                    detected_category = "CASH_POSITION_SNAPSHOT"
                 elif outbound_req.request_type == "PROGRESS":
                     detected_category = "PROGRESS_REPORT"
 
@@ -202,12 +265,19 @@ class InboxClassificationService:
                     detected_category = "LG_POSITION_REPORT"
                 elif outbound_req.request_type == "BANK_STATEMENT":
                     detected_category = "BANK_STATEMENT"
+                elif outbound_req.request_type == "CASH_POSITION":
+                    detected_category = "CASH_POSITION_SNAPSHOT"
                 elif outbound_req.request_type == "PROGRESS":
                     detected_category = "PROGRESS_REPORT"
 
         # ----------------------------------------------------------------------
         # SIGNAL 3: Sender Domain & Bank Association
         # ----------------------------------------------------------------------
+        if item.matched_bank_id and matched_bank is None:
+            matched_bank = db.query(Bank).filter(
+                Bank.id == item.matched_bank_id,
+                Bank.is_deleted == False,
+            ).first()
         if item.sender_domain:
             if item.sender_domain.lower() in GENERIC_DOMAINS:
                 item.is_trusted_sender = False
@@ -250,24 +320,73 @@ class InboxClassificationService:
                 break
 
         # ----------------------------------------------------------------------
-        # SIGNAL 5: Attachment Structure Analysis
+        # SIGNAL 5: Attachment Structure Analysis (GCS + Local + PDF Unlock)
         # ----------------------------------------------------------------------
+        has_structured_statement_or_lg_att = False
         if item.has_attachment and item.primary_attachment_path:
-            att_category, matched_cols = self._inspect_attachment_headers(
-                item.primary_attachment_path, item.primary_attachment_type
+            att_category, matched_cols, att_balances = self._inspect_attachment_headers(
+                item.primary_attachment_path,
+                item.primary_attachment_type,
+                db=db,
+                customer_id=item.customer_id,
+                bank_id=item.matched_bank_id,
             )
-            if att_category:
+            if att_category == "LOCKED_PDF":
+                locked_pdf_detected = True
+                score += 3
+                signals["pdf_password_required"] = {
+                    "points": 3,
+                    "reason": "Password-protected PDF attachment — enter statement password or configure on Bank Account",
+                }
+                if detected_category == "UNCLASSIFIED" and (
+                    matched_bank
+                    or any(
+                        kw in f"{item.subject or ''} {item.primary_attachment_name or ''}".lower()
+                        for kw in STATEMENT_KEYWORDS + CASH_POSITION_KEYWORDS
+                    )
+                ):
+                    detected_category = "BANK_STATEMENT"
+            elif att_category == "CASH_POSITION_SNAPSHOT":
+                score += 5
+                if detected_category == "UNCLASSIFIED":
+                    detected_category = "CASH_POSITION_SNAPSHOT"
+                if att_balances:
+                    item.extracted_balances_json = att_balances
+                signals["attachment_inspection"] = {
+                    "points": 5,
+                    "detected_type": att_category,
+                    "matched_columns": matched_cols,
+                }
+            elif att_category:
+                has_structured_statement_or_lg_att = True
                 score += 5
                 detected_category = att_category
                 signals["attachment_inspection"] = {
                     "points": 5,
                     "detected_type": att_category,
-                    "matched_columns": matched_cols
+                    "matched_columns": matched_cols,
                 }
         elif detected_category == "LG_POSITION_REPORT" and not item.has_attachment and not is_nil_detected:
             # LG position without attachment and without NIL text gets a minor penalty
             score -= 1
             signals["missing_attachment_penalty"] = -1
+
+        # ----------------------------------------------------------------------
+        # SIGNAL 5b: Inline Bilingual Cash Balance Extraction from Email Body
+        # ----------------------------------------------------------------------
+        inline_balances = extract_cash_balances_from_text(f"{item.subject or ''}\n{body_text}")
+        if inline_balances:
+            if not item.extracted_balances_json:
+                item.extracted_balances_json = inline_balances
+            if not has_structured_statement_or_lg_att and not is_nil_detected:
+                if detected_category in ("UNCLASSIFIED", "CASH_POSITION_SNAPSHOT"):
+                    detected_category = "CASH_POSITION_SNAPSHOT"
+                score += 6
+                signals["inline_balance_detected"] = {
+                    "points": 6,
+                    "accounts_found": len(inline_balances),
+                    "currencies": sorted({b["currency"] for b in inline_balances}),
+                }
 
         # ----------------------------------------------------------------------
         # SIGNAL 6: Subject & Body Keywords Match
@@ -281,6 +400,12 @@ class InboxClassificationService:
             if detected_category == "UNCLASSIFIED":
                 detected_category = "LG_POSITION_REPORT"
             signals["subject_keyword_match"] = {"points": 4, "category": "LG_POSITION_REPORT"}
+        elif any(kw in subj_lower for kw in CASH_POSITION_KEYWORDS):
+            has_treasury_keyword = True
+            score += 4
+            if detected_category == "UNCLASSIFIED":
+                detected_category = "CASH_POSITION_SNAPSHOT"
+            signals["subject_keyword_match"] = {"points": 4, "category": "CASH_POSITION_SNAPSHOT"}
         elif any(kw in subj_lower for kw in STATEMENT_KEYWORDS):
             has_treasury_keyword = True
             score += 4
@@ -319,7 +444,7 @@ class InboxClassificationService:
         # SIGNAL 8: Irrelevant / Promotional / Non-Treasury Detection
         # ----------------------------------------------------------------------
         # Guard: Never mark as IRRELEVANT if treasury keywords or reply matches exist
-        if detected_category == "UNCLASSIFIED" and not has_treasury_keyword:
+        if detected_category == "UNCLASSIFIED" and not has_treasury_keyword and not inline_balances:
             combined_search_text = f"{item.subject or ''} {body_text}".lower()
             sender_lower = (item.sender_email or "").lower()
             irrelevant_hits = [
@@ -365,7 +490,17 @@ class InboxClassificationService:
             else:
                 action_summary = f"LG Position Report from {bank_label}. Confirm to create a Reconciliation Session and run position matching."
         elif detected_category == "BANK_STATEMENT":
-            action_summary = f"Bank Statement from {bank_label}. Confirm to ingest into Bank Statement Reconciliation."
+            if locked_pdf_detected:
+                action_summary = f"Password-protected PDF Statement from {bank_label}. Confirm (and enter PDF password if not saved on Bank Account) to unlock and ingest."
+            else:
+                action_summary = f"Bank Statement from {bank_label}. Confirm to ingest transactions, update live cash position, and run auto-matching."
+        elif detected_category == "CASH_POSITION_SNAPSHOT":
+            balances_list = item.extracted_balances_json or []
+            ccys = ", ".join(sorted({b.get("currency", "EGP") for b in balances_list})) if balances_list else "EGP"
+            action_summary = (
+                f"Cash Position Snapshot from {bank_label} "
+                f"({len(balances_list)} balance(s) detected: {ccys}). Confirm to update Live Cash Positions."
+            )
         elif detected_category == "PROGRESS_REPORT":
             action_summary = f"Project progress report from {item.sender_email}. Confirm to review milestone actions."
         elif detected_category == "IRRELEVANT":
@@ -414,7 +549,9 @@ class InboxClassificationService:
         if new_classification == "LG_POSITION_REPORT":
             item.action_summary = f"LG Position Report from {bank_label}. Ready to reconcile."
         elif new_classification == "BANK_STATEMENT":
-            item.action_summary = f"Bank Statement from {bank_label}. Ready to ingest."
+            item.action_summary = f"Bank Statement from {bank_label}. Ready to ingest and reconcile."
+        elif new_classification == "CASH_POSITION_SNAPSHOT":
+            item.action_summary = f"Cash Position Snapshot from {bank_label}. Ready to update Live Cash Positions."
         elif new_classification == "PROGRESS_REPORT":
             item.action_summary = f"Progress update from {item.sender_email}. Ready to review."
         else:

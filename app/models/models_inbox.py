@@ -91,6 +91,10 @@ class InboxItem(BaseModel):
     is_duplicate = Column(Boolean, default=False)
     duplicate_of_id = Column(Integer, ForeignKey("inbox_items.id"), nullable=True)
     is_nil_position = Column(Boolean, default=False, comment="True if email body states zero/NIL outstanding position")
+
+    # Universal Ingestion & Inline Balance Extraction
+    extracted_balances_json = Column(JSON, nullable=True, comment="Extracted inline or summary balances [{account_number, currency, available_balance, ledger_balance, as_of_date}]")
+    ingestion_channel = Column(String(30), default="IMAP_EMAIL", nullable=False, comment="IMAP_EMAIL, WATCHED_FOLDER, PORTAL_UPLOAD")
     
     # Relationships
     customer = relationship("Customer")
@@ -234,3 +238,65 @@ class EmailClassificationHistory(BaseModel):
 
     def __repr__(self):
         return f"<EmailClassificationHistory(id={self.id}, sender='{self.sender_email}', class='{self.classification}', corrected={self.was_user_corrected})>"
+
+
+class CashBalanceSnapshot(BaseModel):
+    """
+    Unified point-in-time cash balance snapshot per bank account & currency,
+    populated from emailed statements, inline email bodies, PDF summaries,
+    watched-folder drops, or manual uploads.
+    """
+    __tablename__ = 'cash_balance_snapshots'
+
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    bank_id = Column(Integer, ForeignKey("banks.id"), nullable=False, index=True)
+    bank_account_id = Column(Integer, ForeignKey("customer_bank_accounts.id"), nullable=True, index=True)
+
+    account_number = Column(String(64), nullable=True, index=True)
+    currency_code = Column(String(3), nullable=False, default="EGP")
+    available_balance = Column(Numeric(precision=18, scale=2), nullable=False)
+    ledger_balance = Column(Numeric(precision=18, scale=2), nullable=True)
+    as_of_datetime = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    source_channel = Column(
+        String(40),
+        nullable=False,
+        default="EMAIL_STATEMENT",
+        comment="EMAIL_STATEMENT, EMAIL_BODY, EMAIL_PDF_SUMMARY, WATCHED_FOLDER, MANUAL_UPLOAD, MT940_FEED",
+    )
+    inbox_item_id = Column(Integer, ForeignKey("inbox_items.id"), nullable=True, index=True)
+    statement_id = Column(Integer, ForeignKey("bank_statements.id"), nullable=True, index=True)
+    continuity_status = Column(String(40), default="VALIDATED")
+    notes = Column(Text, nullable=True)
+
+    # Relationships
+    customer = relationship("Customer")
+    bank = relationship("Bank")
+    inbox_item = relationship("InboxItem")
+
+    def __repr__(self):
+        return f"<CashBalanceSnapshot(id={self.id}, bank_id={self.bank_id}, ccy='{self.currency_code}', avail={self.available_balance})>"
+
+
+class InboxSyncToken(BaseModel):
+    """
+    Scoped API sync token used by a treasury workstation Watched Folder agent
+    (e.g., PowerShell watcher) to push downloaded bank statements into Smart Inbox.
+    Only the SHA-256 token hash is stored; plaintext is returned once on creation.
+    """
+    __tablename__ = 'inbox_sync_tokens'
+
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    label = Column(String(120), nullable=False, default="Treasury Workstation Sync")
+    token_prefix = Column(String(16), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    files_synced_count = Column(Integer, default=0, nullable=False)
+
+    customer = relationship("Customer")
+    created_by = relationship("User")
+
+    def __repr__(self):
+        return f"<InboxSyncToken(id={self.id}, customer_id={self.customer_id}, prefix='{self.token_prefix}', active={self.is_active})>"

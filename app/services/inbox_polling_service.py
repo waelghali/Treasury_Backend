@@ -26,7 +26,9 @@ from app.services.inbox_classification_service import inbox_classification_servi
 
 logger = logging.getLogger("app.inbox_polling")
 
-ALLOWED_ATTACHMENT_EXTENSIONS = {".xlsx", ".xls", ".csv", ".pdf"}
+ALLOWED_ATTACHMENT_EXTENSIONS = {
+    ".xlsx", ".xls", ".xlsb", ".csv", ".pdf", ".mt940", ".sta", ".940", ".xml", ".txt"
+}
 STORAGE_BASE_DIR = os.path.join("private_storage", "inbox")
 IMAP_SOCKET_TIMEOUT = 30
 MAX_NEW_EMAILS_PER_CYCLE = 15
@@ -414,8 +416,10 @@ class InboxPollingService:
                                                 timeout=25,
                                             )
                                         except Exception as upload_err:
-                                            logger.error(f"Failed to upload inbox attachment {filename} to GCS: {upload_err}")
-                                            file_path = f"gs://lg_custody_bucket/{blob_path}"
+                                            logger.warning(f"Failed to upload inbox attachment {filename} to GCS ({upload_err}); falling back to local storage.")
+                                            file_path, _, _ = self._save_attachment(
+                                                customer_id, clean_msg_id, filename, payload
+                                            )
 
                                         att_obj = {
                                             "filename": filename,
@@ -472,6 +476,11 @@ class InboxPollingService:
 
                     # Trigger classification engine
                     classified_item = inbox_classification_service.classify(db, item)
+                    try:
+                        from app.services.inbox_action_service import inbox_action_service
+                        inbox_action_service.try_auto_execute_item(db, classified_item)
+                    except Exception as auto_err:
+                        logger.debug(f"Auto-ingest check skipped for item #{classified_item.id}: {auto_err}")
                     new_items.append(classified_item)
 
                 except (TimeoutError, OSError, imaplib.IMAP4.abort, imaplib.IMAP4.error) as sock_err:

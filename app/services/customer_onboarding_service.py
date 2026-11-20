@@ -8,6 +8,7 @@ Provides:
 4. Eager Tenant DEK envelope provisioning.
 """
 
+import os
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
@@ -18,12 +19,33 @@ from sqlalchemy import func
 from app.models.models import User, PasswordResetToken
 from app.constants import UserRole
 from app.core.hashing import get_password_hash
-from app.core.email_service import send_email, get_customer_email_settings, get_global_email_settings
+from app.core.email_service import (
+    EmailAttachment,
+    send_email,
+    get_customer_email_settings,
+    get_global_email_settings,
+)
 from app.services.unified_email_builder import build_security_email_html
 from app.core.routing import get_frontend_base_url
 from app.crud.crud import log_action
 
 logger = logging.getLogger(__name__)
+
+
+def _load_quick_start_guide_attachment() -> Optional[EmailAttachment]:
+    """Loads the illustrated Full-Suite Quick Start Guide PDF for onboarding emails."""
+    app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    pdf_path = os.path.join(app_root, "templates", "quick_start_guide.pdf")
+    try:
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        if pdf_bytes:
+            return EmailAttachment("Grow_Treasury_Quick_Start_Guide.pdf", pdf_bytes, "application/pdf")
+    except FileNotFoundError:
+        logger.warning(f"Quick start guide PDF not found at: {pdf_path}; sending activation email without attachment.")
+    except Exception as exc:
+        logger.warning(f"Could not attach quick start guide PDF ({pdf_path}): {exc}")
+    return None
 
 
 async def send_corporate_admin_activation_email(
@@ -35,6 +57,7 @@ async def send_corporate_admin_activation_email(
     is_trial: bool = False,
     recipient_name: Optional[str] = None,
     module_labels: Optional[list] = None,
+    attach_guide: bool = True,
 ) -> Tuple[bool, Optional[str]]:
     """
     Issues a single-use 24-hour activation token for a Corporate Admin or Customer User
@@ -113,6 +136,7 @@ async def send_corporate_admin_activation_email(
                     f"{modules_html}"
                     f"We already loaded sample Letters of Guarantee, 3 bank credit lines, and sample test files "
                     f"so you can start testing in 2 minutes — or upload your own files safely (encrypted for your company only).<br><br>"
+                    f"<strong>Full-Suite Quick Start Guide:</strong> Attached as a PDF covering all 4 modules (LG Custody, Outbound Issuance, FX &amp; T-Bill Quotations, and Bank Auto-Reconciliation).<br><br>"
                     f"<strong>Note:</strong> Your 14-day trial timer starts only after you set your password and sign in.<br><br>"
                     f"<em>This private activation link is valid for {valid_hours} hours.</em>"
                 ),
@@ -131,12 +155,15 @@ async def send_corporate_admin_activation_email(
                     f"Please click below to activate your account and establish your private, confidential password. "
                     f"For institutional privacy, this activation link is strictly confidential and neither platform administrators "
                     f"nor your organization's administrators have access to your credentials.<br><br>"
+                    f"<strong>Full-Suite Quick Start Guide:</strong> Attached as a PDF covering Day-1 setup and all 4 treasury modules (LG Custody, Outbound Issuance, FX &amp; T-Bill Quotations, and Bank Auto-Reconciliation).<br><br>"
                     f"<em>This link is valid for {valid_hours} hours.</em>"
                 ),
                 action_url=activation_link,
                 action_text="Activate Account & Set Password",
                 platform_name="Grow Treasury Onboarding"
             )
+
+        guide_attachment = _load_quick_start_guide_attachment() if attach_guide else None
 
         # 6. Send email with save_copy=False (SendOnly - Never saved to Sent Items!)
         success, err = await send_email(
@@ -146,6 +173,7 @@ async def send_corporate_admin_activation_email(
             body_template=body,
             template_data={"activation_link": activation_link},
             email_settings=email_settings,
+            attachments=[guide_attachment] if guide_attachment else None,
             save_copy=False  # SendOnly: Link never recorded in email Sent folder
         )
 
@@ -159,6 +187,7 @@ async def send_corporate_admin_activation_email(
                 "email": user.email,
                 "customer_name": customer_name,
                 "email_sent": success,
+                "guide_attached": bool(guide_attachment),
                 "save_copy": False
             },
             customer_id=user.customer_id

@@ -75,13 +75,14 @@ async def upload_bank_statement(
     closing_balance: Optional[Decimal] = Form(None),
     start_date: Optional[str] = Form(None),
     end_date: Optional[str] = Form(None),
+    pdf_password: Optional[str] = Form(None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
     Ingests a bank statement file with optional metadata.
-    Auto-detects values if not provided.
+    Auto-detects values if not provided (supports Excel, CSV, MT940/CAMT.053, and encrypted/plain PDFs).
     """
     from app.core.trial_guard import enforce_trial_quota
     enforce_trial_quota(db, current_user.customer_id, "statement")
@@ -95,6 +96,7 @@ async def upload_bank_statement(
         "closing_balance": closing_balance,
         "start_date": start_date,
         "end_date": end_date,
+        "pdf_password": pdf_password,
         "file_name": file.filename
     }
     
@@ -105,8 +107,44 @@ async def upload_bank_statement(
         user_id=current_user.user_id,
         overrides=overrides
     )
+
+    try:
+        from app.services.inbox_action_service import inbox_action_service
+        first_txn = (
+            db.query(BankTransaction.currency)
+            .filter(BankTransaction.statement_id == db_statement.id)
+            .first()
+        )
+        stmt_ccy = (first_txn[0] if first_txn and first_txn[0] else "EGP").upper()
+        inbox_action_service.record_cash_balance_snapshot(
+            db=db,
+            customer_id=current_user.customer_id,
+            bank_id=db_statement.bank_id,
+            available_balance=db_statement.closing_balance,
+            ledger_balance=db_statement.closing_balance,
+            currency_code=stmt_ccy,
+            account_number=db_statement.account_number,
+            as_of_datetime=db_statement.statement_end_date,
+            source_channel="MANUAL_UPLOAD",
+            statement_id=db_statement.id,
+            continuity_status=db_statement.balance_continuity_status or "VALIDATED",
+            notes=f"Manual statement upload '{file.filename}'",
+            auto_commit=True,
+        )
+    except Exception:
+        pass
     
     return db_statement
+
+
+@router.get("/cash-positions")
+def get_reconciliation_cash_positions(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """Returns live aggregated cash positions across all banks and accounts for the customer."""
+    from app.services.inbox_action_service import inbox_action_service
+    return inbox_action_service.get_live_cash_positions(db, current_user.customer_id)
 
 @router.get("/statements", response_model=List[BankStatementOut])
 def get_statements(
@@ -145,9 +183,11 @@ def delete_bank_statement(
     if not stmt or stmt.company_id != current_user.customer_id:
         raise HTTPException(status_code=404, detail="Statement not found")
         
-    # Soft delete statement and its transactions
+    # Soft delete statement, transactions, and linked cash balance snapshots
     from app.models.models_reconciliation_v2 import BankTransaction
+    from app.models.models_inbox import CashBalanceSnapshot
     db.query(BankTransaction).filter(BankTransaction.statement_id == statement_id).update({"is_deleted": True})
+    db.query(CashBalanceSnapshot).filter(CashBalanceSnapshot.statement_id == statement_id).update({"is_deleted": True})
     
     stmt.is_deleted = True
     db.commit()

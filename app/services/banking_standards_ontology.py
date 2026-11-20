@@ -14,7 +14,9 @@ Provides Day-1 institutional banking intelligence that continuously evolves onli
 import re
 import hashlib
 import logging
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as SafeET
+from defusedxml.common import DefusedXmlException
+from xml.etree.ElementTree import ParseError as XMLParseError
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, List, Optional, Tuple
@@ -479,7 +481,19 @@ class BankingStandardsOntology:
 
     def is_camt053_content(self, content: bytes) -> bool:
         sample = content[:4096].decode("utf-8", errors="ignore")
-        return "<BkToCstmrStmt" in sample or "urn:iso:std:iso:20022:tech:xsd:camt.053" in sample
+        return any(
+            marker in sample
+            for marker in (
+                "<BkToCstmrStmt",
+                "urn:iso:std:iso:20022:tech:xsd:camt.053",
+                "<BkToCstmrAcctRpt",
+                "urn:iso:std:iso:20022:tech:xsd:camt.052",
+                "<BkToCstmrDbtCdtNtfctn",
+                "urn:iso:std:iso:20022:tech:xsd:camt.054",
+            )
+        )
+
+    is_iso20022_camt_content = is_camt053_content
 
     def parse_mt940_statement(self, content: bytes) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
@@ -645,15 +659,29 @@ class BankingStandardsOntology:
 
     def parse_camt053_statement(self, content: bytes) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Native ISO 20022 (CAMT.053) XML Bank-to-Customer Statement Parser:
-        Extracts Account IBAN, Opening/Closing Balances, and Entry (`<Ntry>`) Posting Date,
-        Value Date, Reversal Indicator, ISO `<BkTxCd>`, Counterparties, and Remittance Info.
+        Native ISO 20022 (CAMT.053 / CAMT.052 / CAMT.054) XML Bank-to-Customer Parser:
+        Uses defusedxml to block entity-expansion/DTD attacks and extracts Account IBAN,
+        Opening/Closing Balances, and Entry (`<Ntry>`) Posting Date, Value Date, Reversal
+        Indicator, ISO `<BkTxCd>`, Counterparties, and Remittance Info.
         """
-        root = ET.fromstring(content)
-        # Strip XML namespaces for universal camt.053.001.02 / .04 / .08 compatibility
+        try:
+            root = SafeET.fromstring(content)
+        except (DefusedXmlException, XMLParseError) as exc:
+            raise ValueError(f"Invalid or unsafe XML bank statement file: {exc}") from exc
+
+        # Strip XML namespaces for universal camt.052 / camt.053 / camt.054 compatibility
         for elem in root.iter():
             if "}" in elem.tag:
                 elem.tag = elem.tag.split("}", 1)[1]
+
+        containers = root.findall(".//Stmt")
+        fmt_code, label_prefix = "ISO20022_CAMT053", "CAMT.053"
+        if not containers:
+            containers = root.findall(".//Rpt")
+            fmt_code, label_prefix = "ISO20022_CAMT052", "CAMT.052"
+        if not containers:
+            containers = root.findall(".//Ntfctn")
+            fmt_code, label_prefix = "ISO20022_CAMT054", "CAMT.054"
 
         metadata: Dict[str, Any] = {
             "opening_balance": Decimal("0.00"),
@@ -663,129 +691,149 @@ class BankingStandardsOntology:
             "account_number": None,
             "company_name": None,
             "currency": "EGP",
-            "detected_mapping": {"format": "ISO20022_CAMT053"},
+            "detected_mapping": {"format": fmt_code},
             "continuity_warnings": [],
             "balance_variance_amount": Decimal("0.00"),
             "balance_continuity_status": "VALIDATED",
         }
 
-        stmt = root.find(".//Stmt")
-        if stmt is None:
+        if not containers:
             return [], metadata
 
-        iban_text = stmt.findtext(".//Acct/Id/IBAN") or stmt.findtext(".//Acct/Id/Othr/Id")
-        if iban_text:
-            metadata["account_number"] = iban_text.strip()
+        has_currency = False
+        has_opening_bal = False
+        has_closing_bal = False
 
-        ccy_text = stmt.findtext(".//Acct/Ccy")
-        if ccy_text:
-            metadata["currency"] = ccy_text.strip()
+        for container in containers:
+            if not metadata["account_number"]:
+                iban_text = container.findtext(".//Acct/Id/IBAN") or container.findtext(".//Acct/Id/Othr/Id")
+                if iban_text:
+                    metadata["account_number"] = iban_text.strip()
 
-        for bal in stmt.findall(".//Bal"):
-            code = (bal.findtext(".//Tp/CdOrPrtry/Cd") or "").strip()
-            amt_text = bal.findtext(".//Amt")
-            cdt_dbt = bal.findtext(".//CdtDbtInd")
-            dt_text = bal.findtext(".//Dt/Dt") or bal.findtext(".//Dt/DtTm")
-            if code and amt_text:
-                val = Decimal(amt_text.strip())
-                if cdt_dbt == "DBIT":
-                    val = -val
-                if code in ("OPBD", "PRCD"):
-                    metadata["opening_balance"] = val
-                    if dt_text:
-                        try:
-                            metadata["start_date"] = datetime.fromisoformat(dt_text[:10])
-                        except Exception:
-                            pass
-                elif code == "CLBD":
-                    metadata["closing_balance"] = val
-                    if dt_text:
-                        try:
-                            metadata["end_date"] = datetime.fromisoformat(dt_text[:10])
-                        except Exception:
-                            pass
+            if not has_currency:
+                ccy_text = container.findtext(".//Acct/Ccy")
+                if ccy_text:
+                    metadata["currency"] = ccy_text.strip()
+                    has_currency = True
+
+            if metadata["start_date"] is None:
+                cre_dt_text = container.findtext("./CreDtTm") or container.findtext(".//CreDtTm")
+                if cre_dt_text:
+                    try:
+                        metadata["start_date"] = datetime.fromisoformat(cre_dt_text[:10])
+                    except Exception:
+                        pass
+
+            for bal in container.findall(".//Bal"):
+                code = (bal.findtext(".//Tp/CdOrPrtry/Cd") or "").strip()
+                amt_text = bal.findtext(".//Amt")
+                cdt_dbt = bal.findtext(".//CdtDbtInd")
+                dt_text = bal.findtext(".//Dt/Dt") or bal.findtext(".//Dt/DtTm")
+                if code and amt_text:
+                    val = Decimal(amt_text.strip())
+                    if cdt_dbt == "DBIT":
+                        val = -val
+                    if code in ("OPBD", "PRCD", "ITOP") and not has_opening_bal:
+                        has_opening_bal = True
+                        metadata["opening_balance"] = val
+                        if dt_text:
+                            try:
+                                metadata["start_date"] = datetime.fromisoformat(dt_text[:10])
+                            except Exception:
+                                pass
+                    elif code in ("CLBD", "ITBD"):
+                        has_closing_bal = True
+                        metadata["closing_balance"] = val
+                        if dt_text:
+                            try:
+                                metadata["end_date"] = datetime.fromisoformat(dt_text[:10])
+                            except Exception:
+                                pass
 
         transactions: List[Dict[str, Any]] = []
         running_bal = metadata["opening_balance"] or Decimal("0.00")
 
-        for ntry in stmt.findall(".//Ntry"):
-            amt_el = ntry.find("./Amt")
-            if amt_el is None or not amt_el.text:
-                continue
-            amt = Decimal(amt_el.text.strip()).quantize(Decimal("1.00"))
-            ccy = amt_el.attrib.get("Ccy") or metadata["currency"]
-            is_credit = (ntry.findtext("./CdtDbtInd") == "CRDT")
-            is_reversal = (str(ntry.findtext("./RvslInd") or "").lower() == "true")
+        for container in containers:
+            for ntry in container.findall(".//Ntry"):
+                amt_el = ntry.find("./Amt")
+                if amt_el is None or not amt_el.text:
+                    continue
+                amt = Decimal(amt_el.text.strip()).quantize(Decimal("1.00"))
+                ccy = amt_el.attrib.get("Ccy") or metadata["currency"]
+                is_credit = (ntry.findtext("./CdtDbtInd") == "CRDT")
+                is_reversal = (str(ntry.findtext("./RvslInd") or "").lower() == "true")
 
-            book_text = ntry.findtext("./BookgDt/Dt") or ntry.findtext("./BookgDt/DtTm")
-            val_text = ntry.findtext("./ValDt/Dt") or ntry.findtext("./ValDt/DtTm")
-            booking_dt = datetime.fromisoformat(book_text[:10]) if book_text else (metadata["start_date"] or datetime.utcnow())
-            value_dt = datetime.fromisoformat(val_text[:10]) if val_text else booking_dt
+                book_text = ntry.findtext("./BookgDt/Dt") or ntry.findtext("./BookgDt/DtTm")
+                val_text = ntry.findtext("./ValDt/Dt") or ntry.findtext("./ValDt/DtTm")
+                booking_dt = datetime.fromisoformat(book_text[:10]) if book_text else (metadata["start_date"] or datetime.utcnow())
+                value_dt = datetime.fromisoformat(val_text[:10]) if val_text else booking_dt
 
-            domn = ntry.findtext(".//BkTxCd/Domn/Cd") or ""
-            fmly = ntry.findtext(".//BkTxCd/Domn/Fmly/Cd") or ""
-            subfmly = ntry.findtext(".//BkTxCd/Domn/Fmly/SubFmlyCd") or ""
-            iso_code = f"{domn}-{fmly}" if (domn and fmly) else ""
+                domn = ntry.findtext(".//BkTxCd/Domn/Cd") or ""
+                fmly = ntry.findtext(".//BkTxCd/Domn/Fmly/Cd") or ""
+                subfmly = ntry.findtext(".//BkTxCd/Domn/Fmly/SubFmlyCd") or ""
+                iso_code = f"{domn}-{fmly}" if (domn and fmly) else ""
 
-            e2e_id = ntry.findtext(".//NtryDtls/TxDtls/Refs/EndToEndId")
-            acct_svcr_ref = ntry.findtext("./AcctSvcrRef") or ntry.findtext(".//NtryDtls/TxDtls/Refs/AcctSvcrRef")
-            ustrd = ntry.findtext(".//NtryDtls/TxDtls/RmtInf/Ustrd") or ntry.findtext("./AddtlNtryInf") or ""
+                e2e_id = ntry.findtext(".//NtryDtls/TxDtls/Refs/EndToEndId")
+                acct_svcr_ref = ntry.findtext("./AcctSvcrRef") or ntry.findtext(".//NtryDtls/TxDtls/Refs/AcctSvcrRef")
+                ustrd = ntry.findtext(".//NtryDtls/TxDtls/RmtInf/Ustrd") or ntry.findtext("./AddtlNtryInf") or ""
 
-            if is_credit:
-                cp_name = ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Dbtr/Nm")
-                credit, debit, signed, direction = amt, Decimal("0.00"), amt, "CREDIT"
-            else:
-                cp_name = ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Cdtr/Nm")
-                debit, credit, signed, direction = amt, Decimal("0.00"), -amt, "DEBIT"
+                if is_credit:
+                    cp_name = ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Dbtr/Nm")
+                    credit, debit, signed, direction = amt, Decimal("0.00"), amt, "CREDIT"
+                else:
+                    cp_name = ntry.findtext(".//NtryDtls/TxDtls/RltdPties/Cdtr/Nm")
+                    debit, credit, signed, direction = amt, Decimal("0.00"), -amt, "DEBIT"
 
-            running_bal += signed
-            raw_desc = f"[{iso_code}-{subfmly}] {ustrd} {cp_name or ''}".strip(" -[]")
-            std_info = self.decode_narrative_standards(raw_desc, direction=direction, amount=amt)
-            cls_info = std_info.get("classification")
+                running_bal += signed
+                raw_desc = f"[{iso_code}-{subfmly}] {ustrd} {cp_name or ''}".strip(" -[]")
+                std_info = self.decode_narrative_standards(raw_desc, direction=direction, amount=amt)
+                cls_info = std_info.get("classification")
 
-            float_days = (value_dt.date() - booking_dt.date()).days
-            custom_fields: Dict[str, Any] = {}
-            if iso_code:
-                custom_fields["iso20022_code"] = f"{iso_code}-{subfmly}".strip("-")
-            if float_days != 0:
-                custom_fields["clearing_float_days"] = str(float_days)
+                float_days = (value_dt.date() - booking_dt.date()).days
+                custom_fields: Dict[str, Any] = {}
+                if iso_code:
+                    custom_fields["iso20022_code"] = f"{iso_code}-{subfmly}".strip("-")
+                if float_days != 0:
+                    custom_fields["clearing_float_days"] = str(float_days)
 
-            txn: Dict[str, Any] = {
-                "booking_date": booking_dt,
-                "value_date": value_dt,
-                "debit_amount": debit,
-                "credit_amount": credit,
-                "raw_description": raw_desc or f"CAMT.053 {iso_code}",
-                "currency": ccy,
-                "running_balance": running_bal,
-                "account_number": metadata["account_number"],
-                "e2e_id": e2e_id if e2e_id not in ("NOTPROVIDED", None) else std_info.get("extracted_e2e_ref"),
-                "back_office_ref": acct_svcr_ref,
-                "counterparty_name": cp_name or std_info.get("extracted_counterparty"),
-                "beneficiary_name": cp_name or std_info.get("extracted_counterparty"),
-                "net_amount": signed,
-                "is_positive": signed > 0,
-                "is_reversal": is_reversal,
-                "source_system": "ISO20022_CAMT053",
-                "custom_fields_json": custom_fields or None,
-            }
-            if cls_info:
-                txn["internal_category"] = cls_info["gl_account"]
-                txn["classification_category"] = cls_info["category"]
-                txn["sub_category"] = cls_info.get("sub_category")
-                txn["classification_source"] = cls_info["source"]
-                txn["classification_confidence"] = cls_info["confidence"]
-                txn["auto_confirmed"] = cls_info["confidence"] >= 85
-                txn["classification_reasoning"] = cls_info["reason"]
-                txn["is_classified"] = True
+                txn: Dict[str, Any] = {
+                    "booking_date": booking_dt,
+                    "value_date": value_dt,
+                    "debit_amount": debit,
+                    "credit_amount": credit,
+                    "raw_description": raw_desc or f"{label_prefix} {iso_code}".strip(),
+                    "currency": ccy,
+                    "running_balance": running_bal,
+                    "account_number": metadata["account_number"],
+                    "e2e_id": e2e_id if e2e_id not in ("NOTPROVIDED", None) else std_info.get("extracted_e2e_ref"),
+                    "back_office_ref": acct_svcr_ref,
+                    "counterparty_name": cp_name or std_info.get("extracted_counterparty"),
+                    "beneficiary_name": cp_name or std_info.get("extracted_counterparty"),
+                    "net_amount": signed,
+                    "is_positive": signed > 0,
+                    "is_reversal": is_reversal,
+                    "source_system": fmt_code,
+                    "custom_fields_json": custom_fields or None,
+                }
+                if cls_info:
+                    txn["internal_category"] = cls_info["gl_account"]
+                    txn["classification_category"] = cls_info["category"]
+                    txn["sub_category"] = cls_info.get("sub_category")
+                    txn["classification_source"] = cls_info["source"]
+                    txn["classification_confidence"] = cls_info["confidence"]
+                    txn["auto_confirmed"] = cls_info["confidence"] >= 85
+                    txn["classification_reasoning"] = cls_info["reason"]
+                    txn["is_classified"] = True
 
-            transactions.append(txn)
+                transactions.append(txn)
 
         if transactions:
             if not metadata["start_date"]:
                 metadata["start_date"] = min(t["booking_date"] for t in transactions)
             if not metadata["end_date"]:
                 metadata["end_date"] = max(t["booking_date"] for t in transactions)
+            if not has_closing_bal:
+                metadata["closing_balance"] = running_bal
 
         return transactions, metadata
 

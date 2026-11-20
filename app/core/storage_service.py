@@ -258,6 +258,30 @@ def download_bytes_from_gcs_sync(gcs_uri: str) -> Tuple[bytes, str]:
     return data, content_type
 
 
+def read_attachment_bytes(storage_path: Optional[str]) -> Optional[bytes]:
+    """
+    Synchronously reads attachment bytes from either GCS (`gs://...`) or local disk.
+    Returns None if path is empty, unavailable, or cannot be read.
+    """
+    if not storage_path:
+        return None
+    if storage_path.startswith("gs://"):
+        try:
+            data, _ = download_bytes_from_gcs_sync(storage_path)
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to read GCS attachment {storage_path}: {e}")
+            return None
+    if os.path.exists(storage_path):
+        try:
+            with open(storage_path, "rb") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning(f"Failed to read local attachment {storage_path}: {e}")
+            return None
+    return None
+
+
 def open_gcs_blob_stream(gcs_uri: str) -> Tuple[BinaryIO, str, Optional[int]]:
     """
     Opens a chunked streaming reader for a GCS blob with dual-read resolution.

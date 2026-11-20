@@ -724,6 +724,8 @@ def purge_test_customers_by_ids(
         "DELETE FROM bank_form_issue_reports WHERE customer_id = ANY(:cids)",
         "DELETE FROM lg_applicant_records WHERE customer_id = ANY(:cids)",
         # Smart Inbox & Bank Statement Reconciliation v2
+        "DELETE FROM cash_balance_snapshots WHERE customer_id = ANY(:cids)",
+        "DELETE FROM inbox_sync_tokens WHERE customer_id = ANY(:cids)",
         "DELETE FROM inbox_attachments WHERE inbox_item_id IN (SELECT id FROM inbox_items WHERE customer_id = ANY(:cids))",
         "DELETE FROM inbox_items WHERE customer_id = ANY(:cids)",
         "DELETE FROM inbox_outbound_requests WHERE customer_id = ANY(:cids)",

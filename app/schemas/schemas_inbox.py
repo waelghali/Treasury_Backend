@@ -54,6 +54,8 @@ class InboxItemListOut(BaseModel):
     action_reference_id: Optional[int] = None
     is_duplicate: bool = False
     is_nil_position: bool = False
+    extracted_balances_json: Optional[Any] = None
+    ingestion_channel: Optional[str] = "IMAP_EMAIL"
     outbound_request_id: Optional[int] = None
 
     class Config:
@@ -92,6 +94,8 @@ class InboxItemDetailOut(BaseModel):
     action_reference_id: Optional[int] = None
     is_duplicate: bool = False
     is_nil_position: bool = False
+    extracted_balances_json: Optional[Any] = None
+    ingestion_channel: Optional[str] = "IMAP_EMAIL"
     duplicate_of_id: Optional[int] = None
     attachments: List[InboxAttachmentOut] = []
     created_at: Optional[datetime] = None
@@ -109,6 +113,7 @@ class InboxStatsOut(BaseModel):
     pending_action: int = 0
     lg_position_count: int = 0
     bank_statement_count: int = 0
+    cash_position_count: int = 0
     progress_report_count: int = 0
     irrelevant_count: int = 0
     unclassified_count: int = 0
@@ -218,3 +223,25 @@ class ScheduleConfigOut(BaseModel):
 
 class BankDomainUpdate(BaseModel):
     email_domain: Optional[str] = Field(None, description="Domain like 'cibeg.com' or 'qnb.com.eg'")
+
+
+# ==============================================================================
+# WATCHED-FOLDER SYNC TOKENS
+# ==============================================================================
+
+class SyncTokenCreate(BaseModel):
+    label: str = Field("Treasury Workstation Sync", min_length=2, max_length=120)
+
+
+class SyncTokenOut(BaseModel):
+    id: int
+    label: str
+    token_prefix: str
+    is_active: bool
+    last_used_at: Optional[datetime] = None
+    files_synced_count: int = 0
+    created_at: Optional[datetime] = None
+    plaintext_token: Optional[str] = None
+
+    class Config:
+        from_attributes = True

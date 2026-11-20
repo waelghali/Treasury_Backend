@@ -2173,24 +2173,35 @@ class AIQueryAssistantService:
 
         # Dynamic AI synthesis using Grounding Knowledge Base
         try:
-            from app.core.ai_integration import _get_genai_client, _safe_generate_content_sync, GEMINI_MODEL_NAME
+            from app.core.ai_integration import (
+                _get_genai_client,
+                _safe_generate_content_sync,
+                GEMINI_MODEL_NAME,
+                genai_types,
+            )
             from app.services.system_knowledge_base import get_system_knowledge
             client = _get_genai_client()
             if client:
                 kb_context = get_system_knowledge()
-                prompt = (
-                    f"You are the Grow Platform & Treasury Assistant. A user ({user_email}, role: {role_label}) asked:\n"
-                    f"\"{user_question}\"\n\n"
-                    f"Using the authoritative platform knowledge base below, give a clear, accurate, step-by-step guidance response formatted in Markdown.\n"
-                    f"Always maintain enterprise treasury professional tone and reference the appropriate navigation paths if applicable.\n\n"
-                    f"--- PLATFORM KNOWLEDGE BASE ---\n"
+                static_sys_prompt = (
+                    "You are the Grow Platform & Treasury Assistant.\n"
+                    "Using the authoritative platform knowledge base below, give a clear, accurate, step-by-step guidance response formatted in Markdown.\n"
+                    "Always maintain enterprise treasury professional tone and reference the appropriate navigation paths if applicable.\n\n"
+                    "--- PLATFORM KNOWLEDGE BASE ---\n"
                     f"{kb_context}\n"
-                    f"--- END KNOWLEDGE BASE ---"
+                    "--- END KNOWLEDGE BASE ---"
+                )
+                user_prompt = f"User Role: {role_label}\nQuestion: \"{user_question}\""
+                gen_config = (
+                    genai_types.GenerateContentConfig(system_instruction=static_sys_prompt)
+                    if genai_types is not None
+                    else None
                 )
                 res = _safe_generate_content_sync(
                     client=client,
                     model=GEMINI_MODEL_NAME,
-                    contents=prompt
+                    contents=user_prompt if gen_config is not None else f"{static_sys_prompt}\n\n{user_prompt}",
+                    config=gen_config,
                 )
                 if res and res.text and len(res.text.strip()) > 30:
                     return res.text.strip() + f"\n\n👉 [Open Platform Dashboard]({nav_base}/dashboard)"
@@ -2394,25 +2405,36 @@ class AIQueryAssistantService:
                 }
 
             try:
-                from app.core.ai_integration import _get_genai_client, _safe_generate_content_sync, GEMINI_MODEL_NAME
+                from app.core.ai_integration import (
+                    _get_genai_client,
+                    _safe_generate_content_sync,
+                    GEMINI_MODEL_NAME,
+                    genai_types,
+                )
                 client = _get_genai_client()
                 if client:
                     sanitized_q, q_token_map = privacy_tokenizer.sanitize_user_question(user_question or "")
                     tok_recs, tok_ben, tok_fac, token_map = privacy_tokenizer.tokenize_complex_payload([], {}, [])
                     token_map.update(q_token_map)
-                    genai_contents = (
+                    static_sys_prompt = (
                         "You are Grow Treasury Assistant, an institutional corporate treasury AI expert embedded in the Grow Treasury System. "
                         "You have full knowledge of Grow modules: Letter of Guarantee (Custody & Issuance), Bank Reconciliation, and "
                         "the FX & T-Bill Digital Quotation Module (multi-bank RFQs, bidding window timers, post-window corporate acceptance "
                         "windows with AUTO_ACCEPT/AUTO_REJECT policies, multi-currency basket packages with partial leg awards, bank dealer roles "
                         "[Approver, Execution Trader, View-Only], additional cost matrices [Min, %, Max, Flat], Central Bank tolerance limits, "
-                        "and neutral outcome conclusion notifications). Answer professionally, accurately, and concisely. "
-                        f"User question: {sanitized_q}"
+                        "and neutral outcome conclusion notifications). Answer professionally, accurately, and concisely."
                     )
+                    gen_config = (
+                        genai_types.GenerateContentConfig(system_instruction=static_sys_prompt)
+                        if genai_types is not None
+                        else None
+                    )
+                    user_prompt = f"User question: {sanitized_q}"
                     response = _safe_generate_content_sync(
                         client=client,
                         model=GEMINI_MODEL_NAME,
-                        contents=genai_contents
+                        contents=user_prompt if gen_config is not None else f"{static_sys_prompt}\n\n{user_prompt}",
+                        config=gen_config,
                     )
                     raw_text = response.text or ""
                     is_valid_out, _ = privacy_tokenizer.validate_ai_output_tokens(raw_text, token_map)

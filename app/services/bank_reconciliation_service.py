@@ -647,6 +647,7 @@ class BankReconciliationService:
         db: Optional[Session] = None,
         company_id: Optional[int] = None,
         bank_id: Optional[int] = None,
+        pdf_password: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Universal Schema-Agnostic Statement Parser:
@@ -656,6 +657,7 @@ class BankReconciliationService:
         - Links companion wire fees to adjacent parent transfers
         """
         ft = file_type.lower().strip().lstrip(".")
+        pdf_extra_meta: Dict[str, Any] = {}
         # 0. Check for Native SWIFT MT940 (.mt940, .sta, .940) or ISO 20022 CAMT.053 (.xml)
         if ft in ("mt940", "sta", "940") or (ft in ("txt", "dat") and banking_standards_ontology.is_mt940_content(content)):
             txns, meta = banking_standards_ontology.parse_mt940_statement(content)
@@ -668,7 +670,10 @@ class BankReconciliationService:
             self._link_companion_fees_in_batch(txns)
             return txns, meta
         elif ft == "xml" or banking_standards_ontology.is_camt053_content(content):
-            txns, meta = banking_standards_ontology.parse_camt053_statement(content)
+            try:
+                txns, meta = banking_standards_ontology.parse_camt053_statement(content)
+            except ValueError as xml_err:
+                raise HTTPException(status_code=400, detail=str(xml_err)) from xml_err
             for t in txns:
                 iban, b_code, b_name = reconciliation_confidentiality.extract_iban_and_bank_code(t.get("raw_description") or "")
                 t["counterparty_iban"] = iban
@@ -702,6 +707,30 @@ class BankReconciliationService:
                 cand_df = xl.parse(s_name, header=None).dropna(how='all')
                 if len(cand_df) > len(df):
                     df = cand_df
+        elif ft == 'pdf':
+            from app.services.pdf_statement_parser import (
+                get_candidate_pdf_passwords,
+                unlock_pdf_bytes,
+                extract_statement_from_pdf,
+            )
+            passwords = get_candidate_pdf_passwords(
+                db=db,
+                customer_id=company_id,
+                bank_id=bank_id,
+                explicit_password=pdf_password,
+            )
+            unlocked_bytes, was_encrypted, is_unlocked = unlock_pdf_bytes(content, passwords)
+            if was_encrypted and not is_unlocked:
+                raise HTTPException(
+                    status_code=400,
+                    detail="PDF_PASSWORD_REQUIRED: This PDF statement is password-protected. Provide the PDF password or save it on the Bank Account.",
+                )
+            df, pdf_extra_meta, _ = extract_statement_from_pdf(unlocked_bytes)
+            if df is None or df.empty:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No transaction table found in PDF statement.",
+                )
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_type}")
 
@@ -735,6 +764,9 @@ class BankReconciliationService:
         for k, v in metadata_pre.items():
             if metadata.get(k) is None and v is not None:
                 metadata[k] = v
+        for k in ("opening_balance", "closing_balance", "account_number", "currency"):
+            if metadata.get(k) is None and pdf_extra_meta.get(k) is not None:
+                metadata[k] = pdf_extra_meta[k]
 
         mapping = self._detect_column_mapping(df, db=db, company_id=company_id, bank_id=bank_id) or {}
         metadata["detected_mapping"] = {k: str(v) for k, v in mapping.items() if v is not None}
@@ -934,7 +966,7 @@ class BankReconciliationService:
                     "credit_amount": credit,
                     "raw_description": desc,
                     "description_line2": desc2_clean,
-                    "currency": self._sanitize_text(row.get(mapping.get("currency"), "EGP")).upper()[:3] or "EGP",
+                    "currency": self._sanitize_text(row.get(mapping.get("currency"), metadata.get("currency") or "EGP")).upper()[:3] or (metadata.get("currency") or "EGP"),
                     "running_balance": running_balance,
                     "amount_tier": amt_tier,
                     "counterparty_iban": extracted_iban,
@@ -1004,6 +1036,8 @@ class BankReconciliationService:
             sorted_txns = sorted(transactions, key=lambda x: x["booking_date"])
             metadata["start_date"] = sorted_txns[0]["booking_date"]
             metadata["end_date"] = sorted_txns[-1]["booking_date"]
+            if metadata.get("closing_balance") is None and transactions[-1].get("running_balance") is not None:
+                metadata["closing_balance"] = transactions[-1]["running_balance"]
 
         del df
         _reclaim_system_memory()
@@ -1016,7 +1050,12 @@ class BankReconciliationService:
         """
         bank_id = overrides.get("bank_id", 1)
         txns_data, detected_meta = self.parse_statement_content(
-            content, file_type, db=db, company_id=company_id, bank_id=bank_id
+            content,
+            file_type,
+            db=db,
+            company_id=company_id,
+            bank_id=bank_id,
+            pdf_password=overrides.get("pdf_password"),
         )
         logger.info(f"Parsed {len(txns_data)} transactions.")
 

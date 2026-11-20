@@ -1302,7 +1302,7 @@ def download_trial_management_value_summary_pdf(
     c.setFont("Helvetica-Bold", 9.2)
     c.drawString(54, 62, "Ready to review implementation, security, or subscription pricing for your team?")
     c.setFont("Helvetica", 8.8)
-    c.drawString(54, 48, "Contact Grow Business Development: info@growbusinessdevelopment.com  |  WhatsApp: +20 120 055 7551")
+    c.drawString(54, 48, "Contact Grow Business Development: info@growbusinessdevelopment.com  |  WhatsApp: +20 100 111 3532")
 
     c.showPage()
     c.save()

@@ -773,7 +773,7 @@ def filter_trial_outbound_emails(
                         allowed_domains.add(dom)
 
             if is_trial_mode() and not eff_cust_id:
-                for (reg_email,) in db.query(TrialRegistration.contact_email).limit(300).all():
+                for (reg_email,) in db.query(TrialRegistration.admin_email).limit(300).all():
                     if reg_email and "@" in reg_email:
                         clean_r = reg_email.strip().lower()
                         dom = clean_r.rsplit("@", 1)[1].strip()

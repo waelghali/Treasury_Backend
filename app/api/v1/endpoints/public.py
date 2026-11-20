@@ -17,7 +17,7 @@ from app.schemas.all_schemas import (
 )
 from app.crud.crud import crud_legal_artifact, crud_global_configuration, crud_trial_registration
 from app.core.email_service import get_global_email_settings, send_email, EmailAttachment
-from app.core.document_generator import generate_pdf_from_html
+from app.core.document_generator import generate_multipage_pdf_from_html, wrap_legal_artifact_for_pdf
 from app.constants import GlobalConfigKey, LegalArtifactType
 from app.core.honeypot import verify_honeypot
 
@@ -320,11 +320,31 @@ async def register_free_trial(
         footer_subtitle="Guided Sandbox Onboarding",
     )
 
-    tc_content = latest_tc.content if latest_tc else "Terms of Service not found."
-    pdf_content = await generate_pdf_from_html(tc_content)
+    tc_content = latest_tc.content if latest_tc else "<p>Terms of Service not found.</p>"
+    wrapped_tc_html = wrap_legal_artifact_for_pdf(
+        tc_content,
+        document_title="Terms of Service — Grow Corporate Treasury Platform",
+        version=tc_version,
+    )
+    pdf_content = await generate_multipage_pdf_from_html(
+        wrapped_tc_html,
+        filename_hint="Grow_Terms_of_Service",
+    )
     attachment = EmailAttachment("Grow_Terms_of_Service.pdf", pdf_content, "application/pdf")
 
-    background_tasks.add_task(send_email, db, [admin_email], subject, body, {}, email_settings, attachments=[attachment])
+    support_cc = "support@growbusinessdevelopment.com"
+    cc_emails = [support_cc] if admin_email.lower() != support_cc else []
+    background_tasks.add_task(
+        send_email,
+        db,
+        [admin_email],
+        subject,
+        body,
+        {},
+        email_settings,
+        cc_emails=cc_emails,
+        attachments=[attachment],
+    )
 
     # Notify System Owner(s) immediately of the new corporate trial lead
     try:

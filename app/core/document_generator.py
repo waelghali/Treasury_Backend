@@ -386,3 +386,149 @@ async def generate_merged_pdf_from_html_list(html_segments: List[str], filename_
     except Exception as e:
         logger.error(f"generate_merged_pdf_from_html_list: Error generating merged PDF for '{filename_hint}': {e}", exc_info=True)
         return None
+
+
+def _render_multipage_html_sync(html_content: str) -> bytes:
+    """
+    Renders a multi-page HTML document (e.g. Terms of Service, Privacy Policy, guides)
+    via WeasyPrint using natural A4 pagination without 1-page font shrinking or bank QR footers.
+    """
+    from weasyprint import HTML
+
+    html_obj = HTML(string=html_content, url_fetcher=_safe_weasyprint_url_fetcher)
+    doc = html_obj.render()
+    pdf_bytes = doc.write_pdf()
+    del doc, html_obj
+    return pdf_bytes
+
+
+def _render_multipage_pdf_worker(html_content: str) -> Optional[bytes]:
+    """
+    Worker wrapper that isolates multi-page WeasyPrint rendering into a forked child on Linux
+    and falls back to in-thread rendering with explicit memory cleanup on Windows.
+    """
+    if _should_use_isolated_pdf_fork():
+        try:
+            return _execute_pdf_in_forked_worker_sync(_render_multipage_html_sync, (html_content,))
+        except OSError as fork_err:
+            logger.warning(f"os.fork() unavailable for multi-page PDF render ({fork_err}); falling back to in-process render.")
+
+    try:
+        return _render_multipage_html_sync(html_content)
+    finally:
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+
+async def generate_multipage_pdf_from_html(html_content: str, filename_hint: str = "document") -> Optional[bytes]:
+    """
+    Generates a multi-page A4 PDF from HTML content without applying 1-page letter compression,
+    instruction QR verification footers, or Trial Sandbox watermarks.
+    """
+    logger.debug(
+        f"generate_multipage_pdf_from_html: Rendering multi-page PDF for '{filename_hint}' "
+        f"(length: {len(html_content)} chars)."
+    )
+    try:
+        pdf_bytes = await asyncio.to_thread(_render_multipage_pdf_worker, html_content)
+        if pdf_bytes:
+            logger.info(
+                f"generate_multipage_pdf_from_html: Generated '{filename_hint}' ({len(pdf_bytes)} bytes)."
+            )
+            return pdf_bytes
+        return None
+    except Exception as e:
+        logger.error(f"generate_multipage_pdf_from_html: Failed for '{filename_hint}': {e}", exc_info=True)
+        return None
+
+
+def wrap_legal_artifact_for_pdf(
+    body_html: str,
+    document_title: str = "Terms of Service",
+    version: float = 1.1,
+) -> str:
+    """
+    Wraps legal artifact HTML in a full A4 print-ready document with running footer pagination
+    and page-break safeguards for headings and callout boxes.
+    """
+    safe_title = html.escape(document_title or "Legal Document", quote=True)
+    safe_version = html.escape(str(version), quote=True)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>{safe_title}</title>
+<style>
+  @page {{
+    size: A4;
+    margin: 14mm 16mm 17mm 16mm;
+    @bottom-left {{
+      content: "Grow Business Development  ·  Grow Corporate Treasury Platform";
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 8pt;
+      color: #64748b;
+    }}
+    @bottom-right {{
+      content: "v{safe_version}  ·  Page " counter(page) " of " counter(pages);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 8pt;
+      color: #64748b;
+    }}
+  }}
+  html, body {{
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #1e293b;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 9.0pt;
+    line-height: 1.42;
+  }}
+  .grow-legal-doc {{
+    font-size: 9.0pt !important;
+    line-height: 1.42 !important;
+  }}
+  .grow-legal-doc .grow-legal-masthead {{
+    padding: 11px 14px !important;
+    margin-bottom: 10px !important;
+  }}
+  .grow-legal-doc h2 {{
+    margin: 10px 0 3.5px 0 !important;
+    font-size: 10.2pt !important;
+    break-after: avoid;
+    page-break-after: avoid;
+  }}
+  .grow-legal-doc h3 {{
+    break-after: avoid;
+    page-break-after: avoid;
+  }}
+  .grow-legal-doc p {{
+    margin: 0 0 5px 0 !important;
+  }}
+  .grow-legal-doc ul {{
+    margin: 2px 0 6px 0 !important;
+  }}
+  .grow-legal-doc li {{
+    margin-bottom: 2.5px !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+  .grow-legal-doc .grow-legal-callout {{
+    margin: 11px 0 0 0 !important;
+    padding: 11px 14px !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+  .grow-legal-doc .grow-legal-masthead {{
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+</style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""

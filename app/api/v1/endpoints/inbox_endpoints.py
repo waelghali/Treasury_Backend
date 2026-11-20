@@ -2,48 +2,194 @@
 """
 Smart Inbox API Endpoints
 Endpoints for viewing received emails, reviewing multi-signal classifications,
-confirming actions, downloading attachments, triggering outbound requests,
-and managing per-bank schedules.
+confirming actions (LG positions, bank statements, cash balances),
+downloading/previewing GCS or local attachments, triggering outbound requests,
+managing per-bank schedules, generating standing instruction letters, and
+syncing downloaded statements from a local Watched Folder.
 """
 
-import os
+import hashlib
+import io
 import logging
-from typing import List, Optional
-from datetime import date
-from decimal import Decimal
+import os
+import re
+import secrets
+from datetime import date, datetime, timezone
+from html import escape as html_escape
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, UploadFile, File, Form, Body
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import StreamingResponse
+from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_, and_, desc, func
 
-from app.database import get_db
-from app.core.security import (
-    TokenData, require_email_inbox_feature, get_current_user,
-    get_current_corporate_admin_context, UserRole
-)
 from app.core.encryption import decrypt_data
-from app.models.models import Bank, CustomerEmailSetting
+from app.core.security import (
+    TokenData,
+    get_current_corporate_admin_context,
+    get_current_user,
+    require_email_inbox_feature,
+    verify_access_token,
+)
+from app.core.storage_service import (
+    build_customer_blob_path,
+    read_attachment_bytes,
+    upload_bytes_to_gcs_sync,
+)
+from app.database import get_db
+from app.models.models import Bank, Customer, CustomerEmailSetting, User
 from app.models.models_inbox import (
-    InboxItem, InboxAttachment, InboxOutboundRequest, InboxScheduleConfig
+    InboxAttachment,
+    InboxItem,
+    InboxOutboundRequest,
+    InboxScheduleConfig,
+    InboxSyncToken,
 )
+from app.models.models_issuance import CustomerBankAccount, IssuanceFacility, IssuedLGRecord
 from app.schemas.schemas_inbox import (
-    InboxItemListOut, InboxItemDetailOut, InboxItemReclassify, InboxStatsOut,
-    OutboundRequestCreate, OutboundRequestOut,
-    ScheduleConfigCreate, ScheduleConfigUpdate, ScheduleConfigOut,
-    BankDomainUpdate
+    BankDomainUpdate,
+    BulkScheduleConfigCreate,
+    InboxItemDetailOut,
+    InboxItemListOut,
+    InboxItemReclassify,
+    InboxStatsOut,
+    OutboundRequestCreate,
+    OutboundRequestOut,
+    ScheduleConfigCreate,
+    ScheduleConfigOut,
+    SyncTokenCreate,
+    SyncTokenOut,
 )
-from app.services.inbox_polling_service import inbox_polling_service
-from app.services.inbox_classification_service import inbox_classification_service
 from app.services.inbox_action_service import inbox_action_service
+from app.services.inbox_classification_service import inbox_classification_service
 from app.services.inbox_outbound_service import inbox_outbound_service
+from app.services.inbox_polling_service import (
+    ALLOWED_ATTACHMENT_EXTENSIONS,
+    inbox_polling_service,
+)
 
 logger = logging.getLogger("app.inbox_api")
 router = APIRouter()
 
+EGYPTIAN_BANK_FILENAME_ALIASES: List[Tuple[str, List[str]]] = [
+    ("cib", ["commercial international bank", "cib"]),
+    ("nbe", ["national bank of egypt", "nbe"]),
+    ("misr", ["banque misr", "bank misr"]),
+    ("qnb", ["qnb", "qatar national"]),
+    ("hsbc", ["hsbc"]),
+    ("fab", ["first abu dhabi", "fab misr", "fab"]),
+    ("citi", ["citibank", "citi"]),
+    ("aaib", ["arab african", "aaib"]),
+    ("alex", ["bank of alexandria", "alexbank"]),
+    ("adcb", ["abu dhabi commercial", "adcb"]),
+    ("enbd", ["emirates nbd", "enbd"]),
+    ("scb", ["standard chartered"]),
+    ("credit agricole", ["credit agricole", "cae"]),
+    ("faisal", ["faisal islamic"]),
+    ("abk", ["al ahli bank of kuwait", "abk"]),
+    ("midbank", ["midbank"]),
+    ("suez", ["suez canal bank"]),
+    ("arab bank", ["arab bank"]),
+    ("hdb", ["housing and development", "hdb"]),
+    ("caire", ["banque du caire", "bdc"]),
+    ("adib", ["abu dhabi islamic", "adib"]),
+    ("attijari", ["attijariwafa"]),
+    ("egbank", ["egyptian gulf", "egbank", "egb"]),
+    ("saib", ["saib"]),
+]
+
+
+def _detect_bank_id_from_filename_or_bytes(
+    db: Session,
+    filename: str,
+    raw_bytes: bytes,
+) -> Optional[int]:
+    """Best-effort Egyptian bank auto-detection from filename tokens or SWIFT/IBAN hints."""
+    banks = db.query(Bank).filter(Bank.is_deleted == False).all()
+    fn_low = re.sub(r"[^a-z0-9]+", " ", (filename or "").lower())
+
+    for b in banks:
+        if b.short_name and re.search(rf"\b{re.escape(b.short_name.lower())}\b", fn_low):
+            return b.id
+        if b.name and b.name.lower() in fn_low:
+            return b.id
+
+    for token, name_hints in EGYPTIAN_BANK_FILENAME_ALIASES:
+        if re.search(rf"\b{re.escape(token)}\b", fn_low):
+            for b in banks:
+                b_hay = f"{b.name or ''} {b.short_name or ''}".lower()
+                if any(h in b_hay for h in name_hints):
+                    return b.id
+
+    # Fallback: check IBAN / SWIFT code inside first 4KB of text-based files
+    try:
+        head_txt = raw_bytes[:4096].decode("utf-8", errors="ignore").upper()
+        for b in banks:
+            if b.swift_code and len(b.swift_code) >= 6 and b.swift_code[:6].upper() in head_txt:
+                return b.id
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_sync_actor(
+    request: Request,
+    x_grow_sync_token: Optional[str],
+    db: Session,
+) -> Tuple[int, int, Optional[InboxSyncToken]]:
+    """
+    Authenticates `/sync-drop` using either a scoped `X-Grow-Sync-Token` header
+    (for local Windows/PowerShell folder watchers) or a standard user Bearer JWT.
+    """
+    if x_grow_sync_token:
+        tok_hash = hashlib.sha256(x_grow_sync_token.strip().encode("utf-8")).hexdigest()
+        sync_tok = (
+            db.query(InboxSyncToken)
+            .filter(
+                InboxSyncToken.token_hash == tok_hash,
+                InboxSyncToken.is_active == True,
+                InboxSyncToken.is_deleted == False,
+            )
+            .first()
+        )
+        if not sync_tok:
+            raise HTTPException(status_code=401, detail="Invalid or revoked sync token.")
+        sync_tok.last_used_at = datetime.now(timezone.utc)
+        return sync_tok.customer_id, sync_tok.created_by_user_id, sync_tok
+
+    auth_hdr = request.headers.get("authorization") or ""
+    if auth_hdr.lower().startswith("bearer "):
+        raw_jwt = auth_hdr.split(" ", 1)[1].strip()
+        payload = verify_access_token(raw_jwt)
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid access token.")
+        user = db.query(User).filter(User.id == user_id, User.is_deleted == False).first()
+        if not user or not user.customer_id:
+            raise HTTPException(status_code=403, detail="User is not associated with a corporate tenant.")
+        return user.customer_id, user.id, None
+
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required: supply X-Grow-Sync-Token or Bearer token.",
+    )
+
 
 # ==============================================================================
-# 1. INBOX ITEMS
+# 1. INBOX ITEMS & LIVE CASH POSITIONS
 # ==============================================================================
 
 @router.get("/items", response_model=List[InboxItemListOut])
@@ -86,7 +232,6 @@ def get_inbox_items(
 
     items = query.order_by(desc(InboxItem.received_at)).offset(skip).limit(limit).all()
 
-    # Format output with matched_bank_name
     result = []
     for item in items:
         out = InboxItemListOut(
@@ -112,6 +257,9 @@ def get_inbox_items(
             action_reference_type=item.action_reference_type,
             action_reference_id=item.action_reference_id,
             is_duplicate=item.is_duplicate,
+            is_nil_position=bool(item.is_nil_position),
+            extracted_balances_json=item.extracted_balances_json,
+            ingestion_channel=item.ingestion_channel or "IMAP_EMAIL",
             outbound_request_id=item.outbound_request_id
         )
         result.append(out)
@@ -138,12 +286,11 @@ def get_inbox_item_detail(
     if not item:
         raise HTTPException(status_code=404, detail="Inbox item not found")
 
-    # Decrypt body preview if available
     body_preview = None
     if item.body_text_encrypted:
         try:
             decrypted = decrypt_data(item.body_text_encrypted)
-            body_preview = decrypted[:1000]  # First 1000 characters
+            body_preview = decrypted[:2000]
         except Exception:
             body_preview = None
 
@@ -192,6 +339,9 @@ def get_inbox_item_detail(
         action_reference_type=item.action_reference_type,
         action_reference_id=item.action_reference_id,
         is_duplicate=item.is_duplicate,
+        is_nil_position=bool(item.is_nil_position),
+        extracted_balances_json=item.extracted_balances_json,
+        ingestion_channel=item.ingestion_channel or "IMAP_EMAIL",
         duplicate_of_id=item.duplicate_of_id,
         attachments=attachments_out,
         created_at=item.created_at
@@ -205,8 +355,7 @@ def download_inbox_attachment(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_current_user)
 ):
-    """Downloads an attachment file belonging to an inbox item."""
-    # Find item
+    """Downloads an attachment file belonging to an inbox item (supports GCS and local storage)."""
     item = db.query(InboxItem).filter(
         InboxItem.id == item_id,
         InboxItem.customer_id == current_user.customer_id,
@@ -216,7 +365,6 @@ def download_inbox_attachment(
     if not item:
         raise HTTPException(status_code=404, detail="Inbox item not found")
 
-    # Find specific attachment or fallback to primary/first
     att = db.query(InboxAttachment).filter(
         InboxAttachment.inbox_item_id == item_id,
         InboxAttachment.id == attachment_id,
@@ -224,28 +372,24 @@ def download_inbox_attachment(
     ).first()
 
     if not att:
-        # Fallback to primary or first attachment
         att = db.query(InboxAttachment).filter(
             InboxAttachment.inbox_item_id == item_id,
             InboxAttachment.is_deleted == False
         ).order_by(desc(InboxAttachment.is_primary)).first()
 
-    if att and att.storage_path and os.path.exists(att.storage_path):
-        return FileResponse(
-            path=att.storage_path,
-            filename=att.file_name,
-            media_type="application/octet-stream"
-        )
+    target_path = att.storage_path if att else item.primary_attachment_path
+    filename = (att.file_name if att else item.primary_attachment_name) or "attachment"
+    safe_dl_name = re.sub(r'["\\\r\n]', "_", filename)
 
-    if item.primary_attachment_path and os.path.exists(item.primary_attachment_path):
-        filename = item.primary_attachment_name or os.path.basename(item.primary_attachment_path)
-        return FileResponse(
-            path=item.primary_attachment_path,
-            filename=filename,
-            media_type="application/octet-stream"
-        )
+    raw_bytes = read_attachment_bytes(target_path)
+    if not raw_bytes:
+        raise HTTPException(status_code=404, detail="Attachment file not found in storage")
 
-    raise HTTPException(status_code=404, detail="Attachment file not found on disk")
+    return StreamingResponse(
+        io.BytesIO(raw_bytes),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{safe_dl_name}"'},
+    )
 
 
 @router.get("/items/{item_id}/attachment/{attachment_id}/preview")
@@ -257,7 +401,7 @@ def preview_inbox_attachment(
 ):
     """
     Parses and returns lightweight table preview data for Excel/CSV attachments,
-    or metadata for PDF attachments.
+    or metadata for PDF/SWIFT attachments (supports GCS and local storage).
     """
     item = db.query(InboxItem).filter(
         InboxItem.id == item_id,
@@ -278,35 +422,33 @@ def preview_inbox_attachment(
         file_path = item.primary_attachment_path
         filename = item.primary_attachment_name or "attachment"
         file_type = (item.primary_attachment_type or "unknown").lower()
-        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
     elif att:
         file_path = att.storage_path
         filename = att.file_name
         file_type = (att.file_type or "").lower()
-        file_size = att.file_size_bytes or (os.path.getsize(file_path) if file_path and os.path.exists(file_path) else 0)
     else:
         raise HTTPException(status_code=404, detail="Attachment not found")
 
-    if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Attachment file not found on disk")
+    raw_bytes = read_attachment_bytes(file_path)
+    if not raw_bytes:
+        raise HTTPException(status_code=404, detail="Attachment file not found in storage")
 
+    file_size = len(raw_bytes)
     ext = os.path.splitext(filename)[1].lower()
 
-    # Handle Excel / CSV previews
-    if ext in [".xlsx", ".xls", ".csv"] or file_type in ["xlsx", "xls", "csv"]:
+    if ext in [".xlsx", ".xls", ".xlsb", ".csv"] or file_type in ["xlsx", "xls", "xlsb", "csv"]:
         try:
             import pandas as pd
             if ext == ".csv" or file_type == "csv":
-                df = pd.read_csv(file_path, nrows=25)
+                df = pd.read_csv(io.BytesIO(raw_bytes), nrows=25)
                 sheet_names = ["CSV Data"]
                 active_sheet = "CSV Data"
             else:
-                xl = pd.ExcelFile(file_path)
+                xl = pd.ExcelFile(io.BytesIO(raw_bytes))
                 sheet_names = xl.sheet_names
                 active_sheet = sheet_names[0] if sheet_names else "Sheet1"
-                df = pd.read_excel(file_path, sheet_name=active_sheet, nrows=25)
+                df = xl.parse(active_sheet, nrows=25)
 
-            # Clean and sanitize for JSON
             df = df.fillna("")
             headers = [str(col) for col in df.columns]
             rows = [[str(val) for val in row] for row in df.values.tolist()]
@@ -333,7 +475,6 @@ def preview_inbox_attachment(
                 "error": f"Preview unavailable: {str(err)}"
             }
 
-    # Handle PDF or other files
     is_pdf = ext == ".pdf" or file_type == "pdf"
     return {
         "status": "SUCCESS",
@@ -371,17 +512,26 @@ async def confirm_and_action_item(
     item_id: int,
     override_bank_id: Optional[int] = Body(None, embed=True),
     override_position_date: Optional[date] = Body(None, embed=True),
+    pdf_password: Optional[str] = Body(None, embed=True),
+    save_pdf_password: bool = Body(False, embed=True),
+    override_balances: Optional[List[Dict[str, Any]]] = Body(None, embed=True),
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(require_email_inbox_feature)
 ):
-    """Confirms an inbox item and executes downstream action (e.g. Reconciliation Session)."""
+    """
+    Confirms an inbox item and executes downstream action
+    (LG Reconciliation, Bank Statement Ingestion + Cash Balance Snapshot, or Inline Cash Position update).
+    """
     return await inbox_action_service.confirm_and_execute(
         db=db,
         inbox_item_id=item_id,
         user_id=current_user.user_id,
         customer_id=current_user.customer_id,
         override_bank_id=override_bank_id,
-        override_position_date=override_position_date
+        override_position_date=override_position_date,
+        pdf_password=pdf_password,
+        save_pdf_password=save_pdf_password,
+        override_balances=override_balances,
     )
 
 
@@ -436,29 +586,31 @@ def get_inbox_stats(
     cid = current_user.customer_id
     base_q = db.query(InboxItem).filter(InboxItem.customer_id == cid, InboxItem.is_deleted == False)
 
-    total_received = base_q.count()
-    pending_action = base_q.filter(InboxItem.status.in_(["RECEIVED", "CLASSIFIED"]), InboxItem.classification != "IRRELEVANT").count()
-    lg_pos = base_q.filter(InboxItem.classification == "LG_POSITION_REPORT", InboxItem.status != "ARCHIVED").count()
-    stmt = base_q.filter(InboxItem.classification == "BANK_STATEMENT", InboxItem.status != "ARCHIVED").count()
-    prog = base_q.filter(InboxItem.classification == "PROGRESS_REPORT", InboxItem.status != "ARCHIVED").count()
-    irrel = base_q.filter(InboxItem.classification == "IRRELEVANT", InboxItem.status != "ARCHIVED").count()
-    unclass = base_q.filter(InboxItem.classification == "UNCLASSIFIED", InboxItem.status != "ARCHIVED").count()
-    actioned = base_q.filter(InboxItem.status == "ACTIONED").count()
-    archived = base_q.filter(InboxItem.status == "ARCHIVED").count()
-    errors = base_q.filter(InboxItem.status == "PARSE_ERROR").count()
-
     return InboxStatsOut(
-        total_received=total_received,
-        pending_action=pending_action,
-        lg_position_count=lg_pos,
-        bank_statement_count=stmt,
-        progress_report_count=prog,
-        irrelevant_count=irrel,
-        unclassified_count=unclass,
-        actioned_count=actioned,
-        archived_count=archived,
-        parse_error_count=errors
+        total_received=base_q.count(),
+        pending_action=base_q.filter(
+            InboxItem.status.in_(["RECEIVED", "CLASSIFIED"]),
+            InboxItem.classification != "IRRELEVANT",
+        ).count(),
+        lg_position_count=base_q.filter(InboxItem.classification == "LG_POSITION_REPORT", InboxItem.status != "ARCHIVED").count(),
+        bank_statement_count=base_q.filter(InboxItem.classification == "BANK_STATEMENT", InboxItem.status != "ARCHIVED").count(),
+        cash_position_count=base_q.filter(InboxItem.classification == "CASH_POSITION_SNAPSHOT", InboxItem.status != "ARCHIVED").count(),
+        progress_report_count=base_q.filter(InboxItem.classification == "PROGRESS_REPORT", InboxItem.status != "ARCHIVED").count(),
+        irrelevant_count=base_q.filter(InboxItem.classification == "IRRELEVANT", InboxItem.status != "ARCHIVED").count(),
+        unclassified_count=base_q.filter(InboxItem.classification == "UNCLASSIFIED", InboxItem.status != "ARCHIVED").count(),
+        actioned_count=base_q.filter(InboxItem.status == "ACTIONED").count(),
+        archived_count=base_q.filter(InboxItem.status == "ARCHIVED").count(),
+        parse_error_count=base_q.filter(InboxItem.status == "PARSE_ERROR").count(),
     )
+
+
+@router.get("/cash-positions")
+def get_inbox_cash_positions(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """Returns consolidated live multi-bank cash balances across all ingestion channels."""
+    return inbox_action_service.get_live_cash_positions(db, current_user.customer_id)
 
 
 @router.post("/poll-now")
@@ -480,7 +632,7 @@ def trigger_manual_poll(
 
 
 # ==============================================================================
-# 2. OUTBOUND DATA REQUESTS
+# 2. OUTBOUND DATA REQUESTS & STANDING INSTRUCTION LETTERS
 # ==============================================================================
 
 @router.post("/request-position", response_model=OutboundRequestOut)
@@ -489,7 +641,7 @@ def send_manual_position_request(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(require_email_inbox_feature)
 ):
-    """Manually triggers an LG position request email to a specific bank."""
+    """Manually triggers an LG Position, Bank Statement, or Cash Balance request email to a specific bank."""
     try:
         outbound = inbox_outbound_service.send_position_request(
             db=db,
@@ -499,7 +651,10 @@ def send_manual_position_request(
             custom_recipients=payload.custom_recipient_emails,
             custom_subject=payload.custom_subject,
             custom_notes=payload.custom_notes,
-            user_id=current_user.user_id
+            user_id=current_user.user_id,
+            request_type=payload.request_type or "LG_POSITION",
+            statement_period_start=payload.statement_period_start,
+            statement_period_end=payload.statement_period_end,
         )
 
         bank = db.query(Bank).filter(Bank.id == payload.bank_id).first()
@@ -509,6 +664,7 @@ def send_manual_position_request(
             bank_id=outbound.bank_id,
             bank_name=bank.name if bank else None,
             request_type=outbound.request_type,
+            request_reference=outbound.request_reference,
             sent_to_emails=outbound.sent_to_emails,
             subject=outbound.subject,
             message_id=outbound.message_id,
@@ -546,14 +702,14 @@ def get_outbound_requests(
 
     reqs = query.order_by(desc(InboxOutboundRequest.sent_at)).offset(skip).limit(limit).all()
 
-    result = []
-    for r in reqs:
-        result.append(OutboundRequestOut(
+    return [
+        OutboundRequestOut(
             id=r.id,
             customer_id=r.customer_id,
             bank_id=r.bank_id,
             bank_name=r.bank.name if r.bank else None,
             request_type=r.request_type,
+            request_reference=r.request_reference,
             sent_to_emails=r.sent_to_emails,
             subject=r.subject,
             message_id=r.message_id,
@@ -565,16 +721,144 @@ def get_outbound_requests(
             is_replied=r.is_replied,
             reply_received_at=r.reply_received_at,
             is_scheduled=r.is_scheduled
-        ))
-    return result
+        )
+        for r in reqs
+    ]
 
 
-from app.schemas.schemas_inbox import (
-    InboxItemListOut, InboxItemDetailOut, InboxItemReclassify, InboxStatsOut,
-    OutboundRequestCreate, OutboundRequestOut,
-    ScheduleConfigCreate, BulkScheduleConfigCreate, ScheduleConfigUpdate, ScheduleConfigOut,
-    BankDomainUpdate
-)
+@router.get("/standing-instruction-letter/{bank_id}")
+def get_standing_instruction_letter(
+    bank_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """
+    Generates a printable bilingual (English + Arabic) Corporate Standing Instruction Letter
+    for the customer's Relationship Manager at any Egyptian bank to enable automated daily
+    email statement / MT940 / balance delivery to the customer's Smart Inbox email.
+    """
+    customer = db.query(Customer).filter(
+        Customer.id == current_user.customer_id,
+        Customer.is_deleted == False,
+    ).first()
+    bank = db.query(Bank).filter(Bank.id == bank_id, Bank.is_deleted == False).first()
+    if not customer or not bank:
+        raise HTTPException(status_code=404, detail="Customer or Bank not found")
+
+    email_setting = db.query(CustomerEmailSetting).filter(
+        CustomerEmailSetting.customer_id == current_user.customer_id,
+        CustomerEmailSetting.is_deleted == False,
+    ).first()
+    target_inbox_email = (
+        (email_setting.imap_username if email_setting and email_setting.imap_username and "@" in email_setting.imap_username else None)
+        or (email_setting.sender_email if email_setting and email_setting.sender_email else None)
+        or "treasury@company.com"
+    )
+
+    accounts = db.query(CustomerBankAccount).filter(
+        CustomerBankAccount.customer_id == current_user.customer_id,
+        CustomerBankAccount.bank_id == bank_id,
+        CustomerBankAccount.is_active == True,
+        CustomerBankAccount.is_deleted == False,
+    ).all()
+
+    account_rows_html = "".join(
+        f"<tr>"
+        f"<td style='padding:8px;border:1px solid #cbd5e1;'>{html_escape(a.account_name)}</td>"
+        f"<td style='padding:8px;border:1px solid #cbd5e1;font-family:monospace;'>{html_escape(a.account_number)}</td>"
+        f"<td style='padding:8px;border:1px solid #cbd5e1;font-family:monospace;'>{html_escape(a.iban or '—')}</td>"
+        f"<td style='padding:8px;border:1px solid #cbd5e1;'>{html_escape(a.currency_code or 'EGP')}</td>"
+        f"<td style='padding:8px;border:1px solid #cbd5e1;font-family:monospace;'>{html_escape(a.customer_number or '—')}</td>"
+        f"</tr>"
+        for a in accounts
+    ) or (
+        "<tr><td colspan='5' style='padding:8px;border:1px solid #cbd5e1;color:#64748b;'>"
+        "All active corporate accounts held under our CIF at your bank / كافة الحسابات القائمة للشركة طرفكم</td></tr>"
+    )
+
+    today_str = date.today().strftime("%d %B %Y")
+    html_letter = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Standing Instruction - Automated Bank Statement Delivery ({html_escape(bank.name)})</title>
+<style>
+  body {{ font-family: 'Segoe UI', Tahoma, Arial, sans-serif; color: #0f172a; line-height: 1.55; margin: 28px; }}
+  .doc {{ max-width: 820px; margin: auto; }}
+  .hdr {{ border-bottom: 2px solid #1e3a8a; padding-bottom: 10px; margin-bottom: 18px; display:flex; justify-content:space-between; align-items:flex-end; }}
+  h1 {{ font-size: 18px; margin: 0; color: #1e3a8a; }}
+  .meta {{ font-size: 12px; color: #475569; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13px; }}
+  th {{ background: #f1f5f9; text-align: left; padding: 8px; border: 1px solid #cbd5e1; }}
+  .box {{ background: #eff6ff; border-left: 4px solid #2563eb; padding: 10px 14px; margin: 12px 0; font-size: 13px; }}
+  .ar {{ direction: rtl; text-align: right; border-top: 2px dashed #cbd5e1; margin-top: 24px; padding-top: 18px; }}
+  .sigs {{ display: flex; justify-content: space-between; margin-top: 32px; font-size: 13px; }}
+  .sig-line {{ border-top: 1px solid #334155; width: 220px; padding-top: 6px; }}
+  @media print {{ body {{ margin: 12px; }} }}
+</style>
+</head>
+<body>
+<div class="doc">
+  <div class="hdr">
+    <div>
+      <h1>STANDING INSTRUCTION: AUTOMATED DAILY STATEMENT &amp; BALANCE DELIVERY</h1>
+      <div class="meta">Company: <strong>{html_escape(customer.name)}</strong> · Date: {today_str}</div>
+    </div>
+    <div class="meta">To: <strong>{html_escape(bank.name)}</strong></div>
+  </div>
+
+  <p>Dear Corporate Relationship Manager &amp; Cash Management Operations Team at <strong>{html_escape(bank.name)}</strong>,</p>
+  <p>We kindly instruct your bank to enable automated daily End-of-Day (and intraday, where available) electronic statement and balance delivery for our company's accounts listed below:</p>
+
+  <table>
+    <thead>
+      <tr><th>Account Name</th><th>Account Number</th><th>IBAN</th><th>Currency</th><th>CIF #</th></tr>
+    </thead>
+    <tbody>{account_rows_html}</tbody>
+  </table>
+
+  <div class="box">
+    <div><strong>Authorized Delivery Email (Treasury Inbox):</strong> <span style="font-family:monospace;">{html_escape(target_inbox_email)}</span></div>
+    <div><strong>Preferred Formats:</strong> SWIFT MT940 (.sta / .mt940), Excel (.xlsx / .csv), or PDF Balance &amp; Statement Report</div>
+    <div><strong>Frequency:</strong> Automated Daily (by 08:30 AM Cairo Time)</div>
+  </div>
+
+  <p>Please ensure that any static encryption password required for PDF e-statements is shared separately with our Authorized Signatory so our Treasury Management System can ingest statements automatically.</p>
+
+  <div class="ar">
+    <h2 style="font-size:17px; color:#1e3a8a; margin-top:0;">تعليمات مستديمة: إرسال كشوف الحساب والأرصدة اليومية آلياً</h2>
+    <p>السادة / مدير علاقات الشركات وإدارة عمليات الخزانة بـ <strong>{html_escape(bank.name)}</strong>، تحية طيبة وبعد،،،</p>
+    <p>يرجى التكرم بتفعيل خدمة الإرسال الآلي اليومي لكشوف الحسابات والأرصدة الختامية الخاصة بشركة <strong>{html_escape(customer.name)}</strong> للحسابات الموضحة في الجدول أعلاه، وذلك على البريد الإلكتروني المعتمد لإدارة الخزانة:</p>
+    <p style="font-weight:bold; font-family:monospace; direction:ltr; text-align:center; background:#f8fafc; padding:8px; border:1px solid #cbd5e1;">{html_escape(target_inbox_email)}</p>
+    <p>بصيغة (MT940 / Excel / CSV / PDF) يومياً في تمام الساعة الثامنة والنصف صباحاً بتوقيت القاهرة.</p>
+  </div>
+
+  <div class="sigs">
+    <div class="sig-line">Authorized Signatory / المفوض بالتوقيع<br/>Name / الاسم:<br/>Date / التاريخ:</div>
+    <div class="sig-line">Company Stamp / ختم الشركة</div>
+  </div>
+</div>
+</body>
+</html>"""
+
+    return {
+        "bank_id": bank.id,
+        "bank_name": bank.name,
+        "customer_name": customer.name,
+        "target_inbox_email": target_inbox_email,
+        "accounts": [
+            {
+                "id": a.id,
+                "account_name": a.account_name,
+                "account_number": a.account_number,
+                "iban": a.iban,
+                "currency_code": a.currency_code or "EGP",
+                "customer_number": a.customer_number,
+            }
+            for a in accounts
+        ],
+        "html_letter": html_letter,
+    }
 
 
 # ==============================================================================
@@ -587,40 +871,66 @@ def get_banks_relationship_summary(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """
-    Returns smart bank directory with relationship metrics (active LG counts, facilities, accounts)
-    and schedule statuses for the current customer.
+    Returns smart bank directory with relationship metrics (active LG counts, facilities, bank accounts)
+    and schedule statuses per request_type for the current customer.
     """
-    from app.models.models import LGRecord
-    from app.models.models_issuance import IssuedLGRecord, IssuanceFacility
-
     cid = current_user.customer_id
     banks = db.query(Bank).filter(Bank.is_deleted == False).order_by(Bank.name.asc()).all()
     schedules = db.query(InboxScheduleConfig).filter(
         InboxScheduleConfig.customer_id == cid,
         InboxScheduleConfig.is_deleted == False
     ).all()
-    schedule_map = {s.bank_id: s for s in schedules}
 
-    # Aggregate active LG issuance counts (where customer is applicant)
+    schedules_by_bank: Dict[int, Dict[str, Any]] = {}
+    for s in schedules:
+        sched_dict = {
+            "id": s.id,
+            "request_type": s.request_type,
+            "is_active": s.is_active,
+            "frequency": s.frequency,
+            "day_of_month": s.day_of_month,
+            "day_of_week": s.day_of_week,
+            "recipient_emails": s.recipient_emails,
+            "custom_subject": s.custom_subject,
+            "custom_body": s.custom_body,
+            "last_sent_at": s.last_sent_at.isoformat() if s.last_sent_at else None,
+        }
+        schedules_by_bank.setdefault(s.bank_id, {})[s.request_type] = sched_dict
+
     issuance_counts = dict(
         db.query(IssuedLGRecord.bank_id, func.count(IssuedLGRecord.id))
         .filter(IssuedLGRecord.customer_id == cid, IssuedLGRecord.status != "CANCELLED")
         .group_by(IssuedLGRecord.bank_id).all()
     )
 
-    # Aggregate credit facility counts
     facility_counts = dict(
         db.query(IssuanceFacility.bank_id, func.count(IssuanceFacility.id))
         .filter(IssuanceFacility.customer_id == cid, IssuanceFacility.is_deleted == False)
         .group_by(IssuanceFacility.bank_id).all()
     )
 
+    account_counts = dict(
+        db.query(CustomerBankAccount.bank_id, func.count(CustomerBankAccount.id))
+        .filter(
+            CustomerBankAccount.customer_id == cid,
+            CustomerBankAccount.is_deleted == False,
+            CustomerBankAccount.is_active == True,
+        )
+        .group_by(CustomerBankAccount.bank_id).all()
+    )
+
     result = []
     for b in banks:
         i_count = issuance_counts.get(b.id, 0)
         f_count = facility_counts.get(b.id, 0)
-        total_rel = i_count + f_count
-        sched = schedule_map.get(b.id)
+        a_count = account_counts.get(b.id, 0)
+        total_rel = i_count + f_count + a_count
+        bank_scheds = schedules_by_bank.get(b.id, {})
+        primary_sched = (
+            bank_scheds.get("LG_POSITION")
+            or bank_scheds.get("BANK_STATEMENT")
+            or bank_scheds.get("CASH_POSITION")
+        )
 
         result.append({
             "id": b.id,
@@ -628,17 +938,11 @@ def get_banks_relationship_summary(
             "email_domain": b.email_domain,
             "lg_issuance_count": i_count,
             "facility_count": f_count,
+            "bank_account_count": a_count,
             "total_active_records": total_rel,
-            "has_relationship": total_rel > 0 or sched is not None,
-            "schedule": {
-                "id": sched.id,
-                "is_active": sched.is_active,
-                "frequency": sched.frequency,
-                "day_of_month": sched.day_of_month,
-                "day_of_week": sched.day_of_week,
-                "recipient_emails": sched.recipient_emails,
-                "last_sent_at": sched.last_sent_at.isoformat() if sched.last_sent_at else None
-            } if sched else None
+            "has_relationship": total_rel > 0 or bool(bank_scheds),
+            "schedule": primary_sched,
+            "schedules_by_type": bank_scheds,
         })
 
     return result
@@ -691,7 +995,7 @@ def bulk_create_or_update_schedules(
     db.commit()
     return {
         "status": "SUCCESS",
-        "message": f"Applied schedule to {len(payload.bank_ids)} banks successfully.",
+        "message": f"Applied {payload.request_type} schedule to {len(payload.bank_ids)} banks successfully.",
         "affected_bank_count": len(payload.bank_ids),
         "config_ids": updated_ids
     }
@@ -710,9 +1014,8 @@ def get_schedule_configs(
         InboxScheduleConfig.is_deleted == False
     ).all()
 
-    result = []
-    for c in configs:
-        result.append(ScheduleConfigOut(
+    return [
+        ScheduleConfigOut(
             id=c.id,
             customer_id=c.customer_id,
             bank_id=c.bank_id,
@@ -727,8 +1030,9 @@ def get_schedule_configs(
             custom_body=c.custom_body,
             last_sent_at=c.last_sent_at,
             created_at=c.created_at
-        ))
-    return result
+        )
+        for c in configs
+    ]
 
 
 @router.post("/schedule-configs", response_model=ScheduleConfigOut)
@@ -837,3 +1141,281 @@ def update_bank_domain(
         "bank_name": bank.name,
         "email_domain": bank.email_domain
     }
+
+
+# ==============================================================================
+# 5. WATCHED-FOLDER AUTO-SYNC (PORTAL-ONLY EGYPTIAN BANKS FALLBACK)
+# ==============================================================================
+
+@router.get("/sync-tokens", response_model=List[SyncTokenOut])
+def list_sync_tokens(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """Lists active Watched-Folder sync tokens for the current customer."""
+    tokens = (
+        db.query(InboxSyncToken)
+        .filter(
+            InboxSyncToken.customer_id == current_user.customer_id,
+            InboxSyncToken.is_deleted == False,
+        )
+        .order_by(desc(InboxSyncToken.id))
+        .all()
+    )
+    return tokens
+
+
+@router.post("/sync-tokens", response_model=SyncTokenOut)
+def create_sync_token(
+    payload: SyncTokenCreate,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """Generates a new scoped Watched-Folder sync token (plaintext returned once)."""
+    raw_token = f"gws_{secrets.token_hex(20)}"
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    tok = InboxSyncToken(
+        customer_id=current_user.customer_id,
+        created_by_user_id=current_user.user_id,
+        label=payload.label.strip() or "Treasury Workstation Sync",
+        token_prefix=raw_token[:12],
+        token_hash=token_hash,
+        is_active=True,
+    )
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+
+    return SyncTokenOut(
+        id=tok.id,
+        label=tok.label,
+        token_prefix=tok.token_prefix,
+        is_active=tok.is_active,
+        last_used_at=tok.last_used_at,
+        files_synced_count=tok.files_synced_count,
+        created_at=tok.created_at,
+        plaintext_token=raw_token,
+    )
+
+
+@router.delete("/sync-tokens/{token_id}")
+def revoke_sync_token(
+    token_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """Revokes and soft-deletes a Watched-Folder sync token."""
+    tok = db.query(InboxSyncToken).filter(
+        InboxSyncToken.id == token_id,
+        InboxSyncToken.customer_id == current_user.customer_id,
+        InboxSyncToken.is_deleted == False,
+    ).first()
+    if not tok:
+        raise HTTPException(status_code=404, detail="Sync token not found")
+    tok.is_active = False
+    tok.is_deleted = True
+    db.commit()
+    return {"status": "REVOKED", "id": token_id}
+
+
+@router.post("/sync-drop")
+async def sync_drop_file(
+    request: Request,
+    file: UploadFile = File(...),
+    bank_id: Optional[int] = Form(None),
+    pdf_password: Optional[str] = Form(None),
+    auto_execute: bool = Form(True),
+    x_grow_sync_token: Optional[str] = Header(None, alias="X-Grow-Sync-Token"),
+    db: Session = Depends(get_db),
+):
+    """
+    Universal Watched-Folder / Drag-and-Drop sync ingestion endpoint.
+    Accepts files downloaded manually from portal-only Egyptian banks (e.g., NBE, Banque Misr, HDB),
+    deduplicates by SHA-256 content hash, classifies via Smart Inbox, and auto-executes when bank is known.
+    Authenticates via `X-Grow-Sync-Token` or standard user Bearer JWT.
+    """
+    customer_id, actor_user_id, sync_tok = _resolve_sync_actor(request, x_grow_sync_token, db)
+
+    filename = file.filename or "statement.xlsx"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_ATTACHMENT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file extension '{ext}'. Allowed: {sorted(ALLOWED_ATTACHMENT_EXTENSIONS)}",
+        )
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Content-hash deduplication per customer
+    existing_dup = db.query(InboxItem).filter(
+        InboxItem.customer_id == customer_id,
+        InboxItem.attachment_content_hash == content_hash,
+        InboxItem.is_deleted == False,
+    ).first()
+    if existing_dup:
+        return {
+            "status": "DUPLICATE_SKIPPED",
+            "existing_item_id": existing_dup.id,
+            "message": f"File '{filename}' was already synced (Inbox Item #{existing_dup.id}).",
+        }
+
+    resolved_bank_id = bank_id or _detect_bank_id_from_filename_or_bytes(db, filename, raw_bytes)
+    if resolved_bank_id:
+        valid_bank = db.query(Bank).filter(Bank.id == resolved_bank_id, Bank.is_deleted == False).first()
+        if not valid_bank:
+            resolved_bank_id = None
+
+    clean_hash_id = f"sync-{content_hash[:16]}"
+    blob_path = build_customer_blob_path(customer_id, "inbox", f"sync_{clean_hash_id}/{filename}")
+    mime_type = "application/pdf" if ext == ".pdf" else "application/octet-stream"
+    try:
+        storage_path = upload_bytes_to_gcs_sync(blob_path, raw_bytes, content_type=mime_type, timeout=25)
+    except Exception:
+        storage_path, _, _ = inbox_polling_service._save_attachment(
+            customer_id, clean_hash_id, filename, raw_bytes
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    item = InboxItem(
+        customer_id=customer_id,
+        message_id=f"sync-{content_hash[:24]}-{int(now_utc.timestamp())}@grow.sync",
+        sender_email="folder-sync@local-workstation",
+        sender_domain=None,
+        subject=f"[Folder Sync] {filename}",
+        matched_bank_id=resolved_bank_id,
+        is_trusted_sender=True,
+        has_attachment=True,
+        attachment_count=1,
+        primary_attachment_path=storage_path,
+        primary_attachment_name=filename,
+        primary_attachment_type=ext.lstrip(".").upper(),
+        attachment_content_hash=content_hash,
+        received_at=now_utc,
+        status="RECEIVED",
+        ingestion_channel="WATCHED_FOLDER",
+    )
+    db.add(item)
+    db.flush()
+
+    att = InboxAttachment(
+        inbox_item_id=item.id,
+        file_name=filename,
+        file_type=ext.lstrip(".").upper(),
+        file_size_bytes=len(raw_bytes),
+        storage_path=storage_path,
+        content_hash=content_hash,
+        is_primary=True,
+    )
+    db.add(att)
+    if sync_tok:
+        sync_tok.files_synced_count = (sync_tok.files_synced_count or 0) + 1
+    db.commit()
+    db.refresh(item)
+
+    classified_item = inbox_classification_service.classify(db, item)
+    if classified_item.classification == "UNCLASSIFIED":
+        classified_item.classification = "BANK_STATEMENT"
+        classified_item.classification_confidence = "HIGH" if resolved_bank_id else "MEDIUM"
+        db.commit()
+        db.refresh(classified_item)
+
+    action_result = None
+    if auto_execute and resolved_bank_id and classified_item.classification in ("BANK_STATEMENT", "CASH_POSITION_SNAPSHOT"):
+        try:
+            action_result = await inbox_action_service.confirm_and_execute(
+                db=db,
+                inbox_item_id=classified_item.id,
+                user_id=actor_user_id,
+                customer_id=customer_id,
+                override_bank_id=resolved_bank_id,
+                pdf_password=pdf_password,
+            )
+        except HTTPException as exec_err:
+            logger.info(f"Watched-folder item #{classified_item.id} queued for manual confirmation: {exec_err.detail}")
+        except Exception as exec_err:
+            logger.info(f"Watched-folder item #{classified_item.id} queued for review: {exec_err}")
+
+    db.refresh(classified_item)
+    return {
+        "status": classified_item.status,
+        "item_id": classified_item.id,
+        "classification": classified_item.classification,
+        "matched_bank_id": classified_item.matched_bank_id,
+        "action_result": action_result,
+        "message": (
+            action_result["message"]
+            if action_result
+            else f"Synced '{filename}' into Smart Inbox (#{classified_item.id}) for review."
+        ),
+    }
+
+
+@router.get("/sync-watcher-script")
+def download_watcher_script(
+    request: Request,
+    token_hint: Optional[str] = Query("PASTE_YOUR_GWS_SYNC_TOKEN_HERE"),
+    current_user: TokenData = Depends(require_email_inbox_feature),
+):
+    """Downloads a ready-to-run Windows PowerShell Watched-Folder Sync script."""
+    base_url = str(request.base_url).rstrip("/")
+    api_url = f"{base_url}/api/v1/inbox/sync-drop"
+    safe_token = re.sub(r"[^A-Za-z0-9_\-]", "", token_hint or "PASTE_YOUR_GWS_SYNC_TOKEN_HERE")
+
+    ps1_content = f"""# Grow Treasury - Watched Folder Auto-Sync Script (Windows PowerShell)
+# Drop any downloaded bank statement (.xlsx, .xls, .csv, .pdf, .mt940, .sta, .xml) into $WatchFolder
+# Tip: Include the bank short name in the file name (e.g. NBE_Statement_Nov.xlsx) for instant auto-routing.
+
+param(
+    [string]$WatchFolder = "$HOME\\GrowSync",
+    [string]$SyncToken   = "{safe_token}",
+    [string]$EndpointUrl = "{api_url}"
+)
+
+$SyncedFolder = Join-Path $WatchFolder "Synced"
+$FailedFolder = Join-Path $WatchFolder "Failed"
+New-Item -ItemType Directory -Force -Path $WatchFolder, $SyncedFolder, $FailedFolder | Out-Null
+
+$AllowedExt = @(".xlsx", ".xls", ".xlsb", ".csv", ".pdf", ".mt940", ".sta", ".940", ".xml", ".txt")
+Write-Host "Grow Watched-Folder Sync active on: $WatchFolder" -ForegroundColor Cyan
+Write-Host "Press Ctrl+C to stop." -ForegroundColor Gray
+
+while ($true) {{
+    $files = Get-ChildItem -Path $WatchFolder -File | Where-Object {{ $AllowedExt -contains $_.Extension.ToLower() }}
+    foreach ($f in $files) {{
+        try {{
+            $boundary = [System.Guid]::NewGuid().ToString()
+            $LF = "`r`n"
+            $fileBytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $enc = [System.Text.Encoding]::UTF8
+            $header = "--$boundary$LF" +
+                      "Content-Disposition: form-data; name=`"file`"; filename=`"$($f.Name)`"$LF" +
+                      "Content-Type: application/octet-stream$LF$LF"
+            $footer = "$LF--$boundary--$LF"
+            $ms = New-Object System.IO.MemoryStream
+            $hdrBytes = $enc.GetBytes($header)
+            $ftrBytes = $enc.GetBytes($footer)
+            $ms.Write($hdrBytes, 0, $hdrBytes.Length)
+            $ms.Write($fileBytes, 0, $fileBytes.Length)
+            $ms.Write($ftrBytes, 0, $ftrBytes.Length)
+
+            $headers = @{{ "X-Grow-Sync-Token" = $SyncToken }}
+            $resp = Invoke-RestMethod -Uri $EndpointUrl -Method Post -Headers $headers -ContentType "multipart/form-data; boundary=$boundary" -Body $ms.ToArray()
+            Write-Host "[SYNCED] $($f.Name) -> $($resp.status): $($resp.message)" -ForegroundColor Green
+            Move-Item -Path $f.FullName -Destination (Join-Path $SyncedFolder $f.Name) -Force
+        }} catch {{
+            Write-Warning "[FAILED] $($f.Name): $_"
+            Move-Item -Path $f.FullName -Destination (Join-Path $FailedFolder $f.Name) -Force
+        }}
+    }}
+    Start-Sleep -Seconds 5
+}}
+"""
+    return Response(
+        content=ps1_content,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="Start-GrowFolderSync.ps1"'},
+    )

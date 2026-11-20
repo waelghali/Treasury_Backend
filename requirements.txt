@@ -13,6 +13,7 @@ click==8.2.1
 colorama==0.4.6
 cryptography==50.0.2
 cssselect2==0.8.0
+defusedxml==0.7.1
 dnspython==2.7.0
 ecdsa==0.19.1
 email_validator==2.2.0
@@ -20,7 +21,7 @@ et_xmlfile==2.0.0
 fastapi==0.116.0
 fonttools==4.58.5
 fuzzywuzzy==0.18.0
-google-cloud-aiplatform>=1.60.0
+google-genai==1.69.0
 google-api-core==2.25.1
 google-api-python-client==2.176.0
 google-auth==2.49.1
