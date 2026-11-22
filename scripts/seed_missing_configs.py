@@ -24,11 +24,11 @@ configs_to_seed = [
     ('LOGIN_LOCKOUT_DURATION_MINUTES', '15', '1', '1440', 'Duration of account lockout after exceeding failed attempts', 'minutes', '["AUTH"]'),
     ('OTP_MAX_FAILED_ATTEMPTS', '5', '1', '10', 'Maximum failed OTP verification attempts', 'attempts', '["AUTH", "PUBLIC_ISSUANCE"]'),
     ('OTP_LOCKOUT_DURATION_MINUTES', '15', '1', '1440', 'Lockout duration after exceeding OTP attempts', 'minutes', '["AUTH", "PUBLIC_ISSUANCE"]'),
-    ('LG_COPY_VERIFICATION_REQUIRED', 'true', None, None, 'Whether LG physical copy must be verified before handover', None, '["ISSUANCE"]'),
+    ('LG_COPY_VERIFICATION_REQUIRED', 'true', 'False', 'True', 'Whether LG physical copy must be verified before handover', 'boolean', '["ISSUANCE"]'),
     ('INBOX_POLL_INTERVAL_MINUTES', '15', '5', '1440', 'Smart Inbox polling interval', 'minutes', '["SMART_INBOX"]'),
-    ('INBOX_DEFAULT_POSITION_REQUEST_DAY', '25', '1', '28', 'Default day of month to request position confirmation', 'day', '["SMART_INBOX"]'),
+    ('INBOX_DEFAULT_POSITION_REQUEST_DAY', '25', '1', '28', 'Default day of month to request position confirmation', 'days', '["SMART_INBOX"]'),
     ('INBOX_RETENTION_MONTHS', '24', '1', '120', 'Retention period for parsed inbox emails and attachments', 'months', '["SMART_INBOX"]'),
-    ('INBOX_GENERIC_DOMAIN_BLACKLIST', 'gmail.com,yahoo.com,hotmail.com,outlook.com', None, None, 'Blacklisted generic domains for Smart Inbox banking matching', None, '["SMART_INBOX"]'),
+    ('INBOX_GENERIC_DOMAIN_BLACKLIST', 'gmail.com,yahoo.com,hotmail.com,outlook.com', None, None, 'Blacklisted generic domains for Smart Inbox banking matching', 'string', '["SMART_INBOX"]'),
 ]
 
 for name, url in target_dbs:

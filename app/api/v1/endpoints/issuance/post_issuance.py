@@ -1244,11 +1244,22 @@ def get_post_issuance_status(
                 "details": {"has_pdf": False}
             })
 
+    # Check whether LG copy verification is required before handover (default: true)
+    verif_req_config = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, current_user.customer_id, GlobalConfigKey.LG_COPY_VERIFICATION_REQUIRED
+    )
+    lg_copy_verification_required = str((verif_req_config or {}).get("effective_value", "true")).strip().lower() not in ("false", "0", "no", "off")
+    handover_ready = (
+        lg.verification_status in ("MATCHED", "ACCEPTED")
+        if lg_copy_verification_required
+        else (lg.verification_status in ("MATCHED", "ACCEPTED") or lg.bank_reply_type == "LG_ISSUED" or lg.status in ("LG_ISSUED", "ACTIVE"))
+    )
+
     # Continue with remaining steps (only for LG_ISSUED flow)
     steps.extend([
         {
             "step": "VERIFICATION",
-            "label": "LG Copy Verification",
+            "label": "LG Copy Verification" if lg_copy_verification_required else "LG Copy Verification (Optional)",
             "status": (
                 "completed" if lg.verification_status in ("MATCHED", "ACCEPTED") else
                 ("rejected" if lg.verification_status == "DISCREPANCY_REJECTED" else
@@ -1263,6 +1274,7 @@ def get_post_issuance_status(
                 "request_amount": str(request.amount) if request and request.amount else None,
                 "request_expiry": str(request.requested_expiry_date) if request else None,
                 "request_beneficiary": request.beneficiary_name if request else None,
+                "verification_required": lg_copy_verification_required,
             }
         },
         {
@@ -1270,7 +1282,7 @@ def get_post_issuance_status(
             "label": "LG Handover",
             "status": (
                 "completed" if lg.handover_date else
-                ("pending" if lg.verification_status in ("MATCHED", "ACCEPTED") else "future")
+                ("pending" if handover_ready else "future")
             ),
             "date": str(lg.handover_date) if lg.handover_date else None,
             "details": {
@@ -1393,6 +1405,7 @@ def get_post_issuance_status(
         "documents": docs,
         "recipient_field_config": recipient_field_config,
         "handover_signed_copy_required": handover_signed_copy_required,
+        "lg_copy_verification_required": lg_copy_verification_required,
         "issued_lg_scan_mandatory": scan_mandatory,
         "verification_policy": policy,
         "verification_source": lg.verification_source,

@@ -336,7 +336,7 @@ class CRUDApprovalRequest(CRUDBase):
             "lg_currency_code": lg_currency,
             "current_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "platform_name": "Treasury Management Platform",
-            "action_center_link": "/checker/action-center"
+            "action_center_link": "/approval-requests"
         }
 
         template_data["lg_amount_formatted"] = f"{lg_currency} {lg_amount:,.2f}" if isinstance(lg_amount, (float, int, decimal.Decimal)) else lg_amount

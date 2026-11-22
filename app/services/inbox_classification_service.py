@@ -279,7 +279,17 @@ class InboxClassificationService:
                 Bank.is_deleted == False,
             ).first()
         if item.sender_domain:
-            if item.sender_domain.lower() in GENERIC_DOMAINS:
+            effective_generic_domains = set(GENERIC_DOMAINS)
+            try:
+                from app.crud.crud import crud_global_configuration
+                from app.constants import GlobalConfigKey
+                blacklist_cfg = crud_global_configuration.get_by_key(db, GlobalConfigKey.INBOX_GENERIC_DOMAIN_BLACKLIST)
+                if blacklist_cfg and blacklist_cfg.value_default:
+                    extra_domains = [d.strip().lower() for d in str(blacklist_cfg.value_default).split(",") if d.strip()]
+                    effective_generic_domains.update(extra_domains)
+            except Exception:
+                pass
+            if item.sender_domain.lower() in effective_generic_domains:
                 item.is_trusted_sender = False
                 score -= 1
                 signals["generic_domain"] = {

@@ -2370,7 +2370,7 @@ class AIQueryAssistantService:
         ]):
             return (
                 f"**Bank Counterparty Roles & Quoting Portal Architecture**:\n\n"
-                f"Each invited banking institution operates with structured dealer roles configured under `{nav_base}/settings` (Bank Counterparties):\n\n"
+                f"Each invited banking institution operates with structured dealer roles configured under `{nav_base}/module-configs` (Bank Counterparties):\n\n"
                 f"1. **APPROVER (Internal Bank Authorization)**:\n"
                 f"   - An authorized bank signatory who must approve participation before the trading desk can bid. If declined, the bank's portal locks with `PARTICIPATION_DECLINED`.\n\n"
                 f"2. **EXECUTION (Active Quoting Trader)**:\n"

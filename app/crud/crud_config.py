@@ -118,7 +118,7 @@ class CRUDGlobalConfiguration(CRUDBase):
                     detail=f"Value for '{global_config.key.value}' must be 'AUTO_ACCEPT', 'AUTO_REJECT', 'true', or 'false'."
                 )
         elif global_config.unit and global_config.unit.lower() == 'boolean':
-            if configured_value.lower() not in ['true', 'false']:
+            if configured_value.strip().lower() not in ['true', 'false', '1', '0']:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Value for '{global_config.key.value}' must be 'true' or 'false'."
@@ -425,7 +425,7 @@ class CRUDCustomerConfiguration(CRUDBase):
             )
 
         is_numeric_unit = global_config.unit in [
-            "days", "percentage", "characters", "minutes", "hours", "attempts", "months", "number", "count"
+            "days", "day", "percentage", "characters", "minutes", "hours", "seconds", "attempts", "months", "number", "count"
         ]
         has_numeric_bounds = False
         if global_config.unit not in ("boolean", "json", "emails_json_array") and getattr(global_config.key, 'value', str(global_config.key)) != "ISSUED_LG_VERIFICATION_POLICY":
@@ -438,7 +438,7 @@ class CRUDCustomerConfiguration(CRUDBase):
                         pass
 
         try:
-            if global_config.unit == "boolean" or global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
+            if (global_config.unit and global_config.unit.lower() == "boolean") or global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
                 val_clean = configured_value.strip().lower()
                 if global_config.key == GlobalConfigKey.QUOTATION_ACCEPTANCE_DEFAULT_ACTION:
                     if val_clean in ['auto_accept', 'accept', 'true', '1']:
@@ -451,9 +451,12 @@ class CRUDCustomerConfiguration(CRUDBase):
                             detail="Value must be 'AUTO_ACCEPT', 'AUTO_REJECT', 'true', or 'false'."
                         )
                 else:
-                    if val_clean not in ['true', 'false']:
+                    if val_clean in ['true', '1']:
+                        configured_value = "true"
+                    elif val_clean in ['false', '0']:
+                        configured_value = "false"
+                    else:
                         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Value must be 'true' or 'false'.")
-                    configured_value = val_clean
             elif global_config.key == GlobalConfigKey.COMMON_COMMUNICATION_LIST:
                 try:
                     parsed_list = json.loads(configured_value)

@@ -87,7 +87,7 @@ async def _send_subscription_notification(
             },
             summary_text=body,
             cta_text="Manage Subscription",
-            cta_url=f"{get_frontend_base_url()}/corporate-admin/subscription",
+            cta_url=f"{get_frontend_base_url()}/corporate-admin/module-configs",
             recipient_name="Corporate Administrator"
         )
 

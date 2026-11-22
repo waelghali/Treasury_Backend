@@ -103,6 +103,18 @@ def _get_int_config(db: Session, customer_id: int, key: GlobalConfigKey, default
     return default
 
 
+def _get_bool_config(db: Session, customer_id: int, key: GlobalConfigKey, default: bool = False) -> bool:
+    """Helper to safely get a boolean configuration value (supports 'true'/'false' and legacy '1'/'0')."""
+    config = crud_customer_configuration.get_customer_config_or_global_fallback(db, customer_id, key)
+    if config and config.get('effective_value') is not None:
+        val = str(config['effective_value']).strip().lower()
+        if val in ('true', '1', 'yes', 'on'):
+            return True
+        if val in ('false', '0', 'no', 'off'):
+            return False
+    return default
+
+
 # --- Background Tasks ---
 
 async def run_daily_undelivered_instructions_report(db: Session):
@@ -313,7 +325,7 @@ async def _send_config_correction_notification(db: Session, customer_id: int, co
         message=f"Some configuration settings for {customer.name} have been automatically adjusted to comply with updated global system policies.",
         details_table_html=table_html,
         cta_text="View Settings",
-        cta_url=f"{get_frontend_base_url()}/corporate-admin/settings",
+        cta_url=f"{get_frontend_base_url()}/corporate-admin/module-configs",
         recipient_name="Corporate Administrator"
     )
 
@@ -651,7 +663,7 @@ async def _send_sub_notification(db: Session, customer: models.Customer, type_en
         },
         summary_text=body_text,
         cta_text="Manage Subscription",
-        cta_url=f"{get_frontend_base_url()}/corporate-admin/subscription",
+        cta_url=f"{get_frontend_base_url()}/corporate-admin/module-configs",
         recipient_name="Corporate Administrator"
     )
 
@@ -1365,9 +1377,10 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
     for customer in customers:
         try:
             reminder_days = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_FIRST_REMINDER_DAYS, 30)
+            second_reminder_days = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_SECOND_REMINDER_DAYS, 14)
             interval_cfg = _get_int_config(db, customer.id, GlobalConfigKey.ISSUANCE_LG_EXPIRY_REMINDER_INTERVAL, 7)
 
-            logger.info(f"[Customer: {customer.id}] Issuance expiry config: start={reminder_days}d, interval={interval_cfg}d")
+            logger.info(f"[Customer: {customer.id}] Issuance expiry config: first={reminder_days}d, second={second_reminder_days}d, interval={interval_cfg}d")
 
             eligible_lgs = db.query(IssuedLGRecord).filter(
                 IssuedLGRecord.customer_id == customer.id,
@@ -1393,13 +1406,21 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
                 if days_left > reminder_days:
                     continue
 
-                audit_type = AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_FIRST
+                is_urgent_phase = days_left <= second_reminder_days
+                audit_type = (
+                    AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_SECOND
+                    if is_urgent_phase
+                    else AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_FIRST
+                )
 
-                # Anti-spam check
+                # Anti-spam check across both reminder phases
                 last_reminder = db.query(models.AuditLog).filter(
                     models.AuditLog.entity_id == lg.id,
                     models.AuditLog.entity_type == "IssuedLGRecord",
-                    models.AuditLog.action_type == audit_type
+                    models.AuditLog.action_type.in_([
+                        AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_FIRST,
+                        AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_SECOND,
+                    ])
                 ).order_by(models.AuditLog.timestamp.desc()).first()
 
                 is_critical_daily = days_left <= 3
@@ -1409,22 +1430,30 @@ async def run_daily_issuance_lg_expiry_reminders(db: Session):
                     should_send = True
                 else:
                     last_date = last_reminder.timestamp.date() if hasattr(last_reminder.timestamp, 'date') else last_reminder.timestamp
+                    crossed_into_second_threshold = (
+                        is_urgent_phase
+                        and last_reminder.action_type == AUDIT_ACTION_TYPE_ISSUANCE_LG_EXPIRY_REMINDER_FIRST
+                        and last_date < current_date_only
+                    )
                     if is_critical_daily and last_date < current_date_only:
+                        should_send = True
+                    elif crossed_into_second_threshold:
                         should_send = True
                     elif (current_date_only - last_date).days >= interval_cfg:
                         should_send = True
 
                 if should_send:
-                    logger.info(f" -> Issued LG {lg.lg_ref_number}: Sending expiry reminder. {days_left} days left.")
+                    logger.info(f" -> Issued LG {lg.lg_ref_number}: Sending expiry reminder (urgent={is_urgent_phase}). {days_left} days left.")
                     users = db.query(models.User).filter(
                         models.User.customer_id == customer.id,
                         models.User.is_deleted == False,
                         models.User.role.in_([models.UserRole.END_USER, models.UserRole.CORPORATE_ADMIN])
                     ).all()
+                    prefix = "URGENT: " if is_urgent_phase else ""
                     for user in users:
                         user_role_path = "corporate-admin" if user.role == models.UserRole.CORPORATE_ADMIN else "end-user"
                         notif = SystemNotificationCreate(
-                            content=f"Issued LG {lg.lg_ref_number} ({lg.currency.iso_code if lg.currency else ''} {float(lg.current_amount):,.2f}) expires in {days_left} days.",
+                            content=f"{prefix}Issued LG {lg.lg_ref_number} ({lg.currency.iso_code if lg.currency else ''} {float(lg.current_amount):,.2f}) expires in {days_left} days.",
                             notification_type="ISSUANCE_LG_EXPIRY",
                             link=f"/{user_role_path}/issuance/issued-lgs",
                             start_date=start_dt,
@@ -1582,9 +1611,9 @@ async def run_daily_facility_utilization_alerts(db: Session):
     for customer in customers:
         try:
             # Get threshold configs (boolean toggles, all default to True)
-            alert_80 = _get_int_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_80, 1)
-            alert_90 = _get_int_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_90, 1)
-            alert_100 = _get_int_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_100, 1)
+            alert_80 = _get_bool_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_80, True)
+            alert_90 = _get_bool_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_90, True)
+            alert_100 = _get_bool_config(db, customer.id, GlobalConfigKey.FACILITY_UTILIZATION_ALERT_THRESHOLD_100, True)
 
             facilities = db.query(IssuanceFacility).filter(
                 IssuanceFacility.customer_id == customer.id,
@@ -1643,10 +1672,15 @@ async def run_daily_facility_utilization_alerts(db: Session):
                         ).all()
                         severity = "CRITICAL" if threshold == 100 else "WARNING"
                         for user in users:
+                            user_fac_link = (
+                                link_path
+                                if user.role == models.UserRole.CORPORATE_ADMIN
+                                else "/end-user/issuance/requests"
+                            )
                             notif = SystemNotificationCreate(
                                 content=f"{severity}: {entity_type.replace('Issuance', '')} '{entity_name}' ({facility.bank.name if facility.bank else 'N/A'}) is at {util_pct:.1f}% utilization (threshold: {threshold}%).",
                                 notification_type="FACILITY_UTILIZATION",
-                                link=link_path,
+                                link=user_fac_link,
                                 start_date=start_dt,
                                 end_date=end_dt,
                                 target_user_ids=[user.id],
@@ -1668,7 +1702,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                 _check_and_alert(
                     facility.id, "IssuanceFacility", facility.facility_name,
                     utilization_pct, total_limit, total_utilized,
-                    f"/facilities/{facility.id}"
+                    "/corporate-admin/issuance/facilities"
                 )
 
                 # --- Sub-limit level threshold alerts ---
@@ -1686,7 +1720,7 @@ async def run_daily_facility_utilization_alerts(db: Session):
                     _check_and_alert(
                         sub.id, "IssuanceFacilitySubLimit", sub.limit_name,
                         sub_util_pct, sub_limit_val, sub_utilized,
-                        f"/facilities/{facility.id}"
+                        "/corporate-admin/issuance/facilities"
                     )
 
                 # --- Facility review date / expiry date approaching alerts ---
@@ -1731,10 +1765,15 @@ async def run_daily_facility_utilization_alerts(db: Session):
                         ).all()
 
                         for user in users:
+                            exp_link = (
+                                "/corporate-admin/issuance/facilities"
+                                if user.role == models.UserRole.CORPORATE_ADMIN
+                                else "/end-user/issuance/requests"
+                            )
                             notif = SystemNotificationCreate(
                                 content=msg,
                                 notification_type="FACILITY_EXPIRY",
-                                link="/corporate-admin/issuance/facilities",
+                                link=exp_link,
                                 start_date=start_dt,
                                 end_date=end_dt,
                                 target_user_ids=[user.id],
@@ -1948,11 +1987,20 @@ async def run_daily_reservation_ttl_check(db_param: Session = None):
 
         for customer in customers:
             try:
-                # Get customer TTL config
+                # Get customer TTL config (CustomerConfiguration override -> CustomerFormConfiguration -> GlobalConfiguration default -> 14)
+                ttl_cfg_obj = crud_customer_configuration.get_customer_config_or_global_fallback(
+                    db, customer.id, GlobalConfigKey.RESERVATION_TTL_DAYS
+                )
                 config = db.query(CustomerFormConfiguration).filter(
                     CustomerFormConfiguration.customer_id == customer.id
                 ).first()
-                ttl_days = getattr(config, 'reservation_ttl_days', None) or DEFAULT_TTL_DAYS
+                form_ttl = getattr(config, 'reservation_ttl_days', None)
+                if ttl_cfg_obj and ttl_cfg_obj.get('configured_value') is not None:
+                    ttl_days = _get_int_config(db, customer.id, GlobalConfigKey.RESERVATION_TTL_DAYS, DEFAULT_TTL_DAYS)
+                elif form_ttl:
+                    ttl_days = int(form_ttl)
+                else:
+                    ttl_days = _get_int_config(db, customer.id, GlobalConfigKey.RESERVATION_TTL_DAYS, DEFAULT_TTL_DAYS)
 
                 # Find all FACILITY_RESERVED requests for this customer
                 reserved_requests = db.query(IssuanceRequest).filter(

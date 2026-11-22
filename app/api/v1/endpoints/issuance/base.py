@@ -354,9 +354,17 @@ async def record_handover(
     if not lg:
         raise HTTPException(404, "Issued LG record not found.")
 
-    # Must be verified first
-    if lg.verification_status not in ("MATCHED", "ACCEPTED"):
-        raise HTTPException(400, "LG must be verified before handover. Complete verification first.")
+    # Check whether LG physical copy verification is required before handover (default: true)
+    verif_req_cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, current_user.customer_id, GlobalConfigKey.LG_COPY_VERIFICATION_REQUIRED
+    )
+    copy_verification_required = str((verif_req_cfg or {}).get("effective_value", "true")).strip().lower() not in ("false", "0", "no", "off")
+
+    if copy_verification_required:
+        if lg.verification_status not in ("MATCHED", "ACCEPTED"):
+            raise HTTPException(400, "LG must be verified before handover. Complete verification first.")
+    elif lg.verification_status not in ("MATCHED", "ACCEPTED") and lg.bank_reply_type != "LG_ISSUED" and lg.status not in ("LG_ISSUED", "ACTIVE"):
+        raise HTTPException(400, "Bank issuance confirmation is required before recording LG handover.")
 
     if lg.handover_date:
         raise HTTPException(400, "Handover already recorded for this LG.")
@@ -379,6 +387,14 @@ async def record_handover(
         signed_copy_file = form.get("signed_copy")
     else:
         payload = await request.json()
+
+    # Enforce mandatory signed receiving copy if configured
+    handover_doc_cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+        db, current_user.customer_id, GlobalConfigKey.DOC_MANDATORY_LG_HANDOVER
+    )
+    handover_signed_copy_required = str((handover_doc_cfg or {}).get("effective_value", "false")).strip().lower() in ("true", "1", "yes", "on")
+    if handover_signed_copy_required and not signed_copy_file:
+        raise HTTPException(400, "A signed receiving copy document is required before recording handover.")
 
     # Validate required fields
     recipient_name = payload.get("recipient_name")
