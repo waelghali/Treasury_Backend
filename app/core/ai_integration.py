@@ -1008,6 +1008,7 @@ Document Text:
         response_schema = {
             "type": "OBJECT",
             "properties": {
+                "isValidLgDocument": { "type": "BOOLEAN", "description": "True ONLY if this document is an actual Letter of Guarantee, Bank Guarantee, Standby LC, or LG Amendment; False if it is an invoice, receipt, menu, bank statement, CV, or unrelated document." },
                 "issuerName": { "type": "STRING" },
                 "beneficiaryName": { "type": "STRING" },
                 "issuingBankName": { "type": "STRING" },
@@ -1043,6 +1044,9 @@ Return your output as a JSON object with the following fields, based strictly on
 ---
 
 **Fields to Extract:**
+
+0.  **isValidLgDocument**:
+    Set to `true` ONLY if the document is an actual Letter of Guarantee, Bank Guarantee, Standby LC, or guarantee instrument. Set to `false` if the document is a sales/catering invoice, bank statement, receipt, CV, menu, or unrelated document (and leave LG fields empty/0).
 
 1.  **issuerName**:  
     The applicant—the entity on whose behalf the guarantee is issued.  

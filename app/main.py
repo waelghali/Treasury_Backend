@@ -323,6 +323,7 @@ def configure_app_instance(fastapi_app: FastAPI):
         import app.models.models_push
         import app.models.models_inbox
         import app.models.models_campaign
+        import app.models.models_field_provenance
         
         # Dedicated short-lived engine for startup DDL/seeding. A lock_timeout guarantees that
         # a stale session holding locks (orphaned uvicorn worker, hung test, open pgAdmin txn)
@@ -438,6 +439,11 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS balance_variance_amount NUMERIC(18,2) DEFAULT 0;",
                     "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS continuity_warnings_json JSON;",
                     "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS detected_mapping_json JSON;",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS erp_book_closing_balance NUMERIC(18,2);",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS brs_signed_by INTEGER;",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS brs_signed_at TIMESTAMPTZ;",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS brs_signoff_notes TEXT;",
+                    "ALTER TABLE bank_statements ADD COLUMN IF NOT EXISTS brs_worm_hash VARCHAR(64);",
                     "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS tokenized_description TEXT;",
                     "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS encrypted_raw_description TEXT;",
                     "ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS encrypted_counterparty_name TEXT;",
@@ -507,13 +513,28 @@ def configure_app_instance(fastapi_app: FastAPI):
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, config_scope, is_deleted, created_at, updated_at) VALUES ('OTP_LOCKOUT_DURATION_MINUTES', '1', '1440', '15', 'minutes', 'OTP lockout duration in minutes after exceeding failed verification attempts.', NULL, 'SYSTEM_CUSTOMER_OVERRIDE', false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
                     "INSERT INTO global_configurations (key, value_min, value_max, value_default, unit, description, module_tags, config_scope, is_deleted, created_at, updated_at) VALUES ('GRACE_PERIOD_DAYS', '0', '90', '30', 'days', 'Subscription grace period in days after expiration before read-only/lockout.', NULL, 'SYSTEM_CUSTOMER_OVERRIDE', false, NOW(), NOW()) ON CONFLICT (key) DO NOTHING;",
                     "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS currency_code VARCHAR(3) DEFAULT 'EGP';",
+                    "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS erp_main_gl_account VARCHAR(100);",
+                    "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS erp_clearing_gl_account VARCHAR(100);",
                     "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS statement_pdf_password_encrypted TEXT;",
                     "ALTER TABLE customer_bank_accounts ADD COLUMN IF NOT EXISTS auto_ingest_statements BOOLEAN NOT NULL DEFAULT FALSE;",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS handoff_mode VARCHAR(40) DEFAULT 'ALL';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS offset_account_mode VARCHAR(40) DEFAULT 'MAIN_BANK_GL';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS clearing_suspense_gl_account VARCHAR(100) DEFAULT '1010999 - Bank Clearing Suspense';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS cash_in_transit_gl_account VARCHAR(100) DEFAULT '1010800 - Cash in Transit';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS suspense_gl_account VARCHAR(100) DEFAULT '1010950 - Unapplied Cash Suspense';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS wht_tax_gl_account VARCHAR(100) DEFAULT '1090300 - Withholding Tax Receivable';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS fx_variance_gl_account VARCHAR(100) DEFAULT '6060100 - FX Gain / Loss';",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS split_variance_as_fee_row BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS exclude_paired_reversals BOOLEAN DEFAULT TRUE;",
+                    "ALTER TABLE reconciliation_export_profiles ADD COLUMN IF NOT EXISTS account_gl_mappings_json JSON;",
                     "ALTER TABLE inbox_items ADD COLUMN IF NOT EXISTS extracted_balances_json JSON;",
                     "ALTER TABLE inbox_items ADD COLUMN IF NOT EXISTS ingestion_channel VARCHAR(30) NOT NULL DEFAULT 'IMAP_EMAIL';",
                     "ALTER TABLE external_request_tokens ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;",
                     "ALTER TABLE external_request_tokens ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;",
                     "CREATE INDEX IF NOT EXISTS ix_external_request_tokens_is_deleted ON external_request_tokens (is_deleted);",
+                    "ALTER TABLE lg_records DROP CONSTRAINT IF EXISTS uq_lg_record_number;",
+                    "DROP INDEX IF EXISTS uq_lg_record_number;",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_lg_record_cust_bank_num_active ON lg_records (customer_id, issuing_bank_id, lower(lg_number)) WHERE is_deleted = false;",
                 ]
                 with startup_engine.connect() as conn:
                     for stmt in migrations:
@@ -725,8 +746,9 @@ def configure_app_instance(fastapi_app: FastAPI):
     fastapi_app.include_router(reports.router, prefix="/api/v1")
     fastapi_app.include_router(public.router, prefix="/api/v1/public")
     fastapi_app.include_router(public_demo_chat.router, prefix="/api/v1/public-demo", tags=["Public Demo AI Product Expert"])
-    from app.api.v1.endpoints import trial_sandbox
+    from app.api.v1.endpoints import trial_sandbox, field_provenance_endpoints
     fastapi_app.include_router(trial_sandbox.router, prefix="/api/v1/trial-sandbox", tags=["Trial Sandbox Experience"])
+    fastapi_app.include_router(field_provenance_endpoints.router, prefix="/api/v1/field-provenance", tags=["LG Field Provenance"])
     from app.core.security import require_issuance_module, require_custody_module, require_issuance_or_custody_module
     fastapi_app.include_router(issuance_package.router, prefix="/api/v1/issuance", tags=["Issuance Module"], dependencies=[Depends(require_issuance_or_custody_module)])
     fastapi_app.include_router(facility_endpoints.router, prefix="/api/v1/facilities", tags=["Facilities"], dependencies=[Depends(require_issuance_module)])

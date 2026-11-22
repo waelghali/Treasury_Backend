@@ -177,15 +177,27 @@ class CRUDLGRecord(CRUDBase):
         # No db.flush() or db.commit() here; the main transaction will handle it.
         return db_lg_instruction.id
 
-    def get_by_lg_number(self, db: Session, lg_number: str) -> Optional[models.LGRecord]:
-        return (
-            db.query(self.model)
-            .filter(
-                func.lower(self.model.lg_number) == func.lower(lg_number),
-                self.model.is_deleted == False,
-            )
-            .first()
+    def get_by_lg_number(
+        self,
+        db: Session,
+        lg_number: str,
+        customer_id: Optional[int] = None,
+        issuing_bank_id: Optional[int] = None,
+        foreign_bank_name: Optional[str] = None,
+    ) -> Optional[models.LGRecord]:
+        query = db.query(self.model).filter(
+            func.lower(self.model.lg_number) == func.lower(lg_number),
+            self.model.is_deleted == False,
         )
+        if customer_id is not None:
+            query = query.filter(self.model.customer_id == int(customer_id))
+        if issuing_bank_id is not None:
+            query = query.filter(self.model.issuing_bank_id == int(issuing_bank_id))
+            if foreign_bank_name and foreign_bank_name.strip():
+                query = query.filter(
+                    func.lower(self.model.foreign_bank_name) == func.lower(foreign_bank_name.strip())
+                )
+        return query.first()
 
     async def create(self, db: Session, obj_in: LGRecordCreate, customer_id: int, user_id: int,
                  ai_scan_file_content: Optional[bytes] = None,
@@ -196,11 +208,17 @@ class CRUDLGRecord(CRUDBase):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot record an expired LG. The Expiry Date must be today or in the future. For historical data or LGs that have been extended, please record them through the Migration Hub."
             )
-        existing_lg = self.get_by_lg_number(db, obj_in.lg_number)
+        existing_lg = self.get_by_lg_number(
+            db,
+            obj_in.lg_number,
+            customer_id=customer_id,
+            issuing_bank_id=obj_in.issuing_bank_id,
+            foreign_bank_name=obj_in.foreign_bank_name,
+        )
         if existing_lg:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"LG with number '{obj_in.lg_number}' already exists.",
+                detail=f"An active LG with number '{obj_in.lg_number}' from this issuing bank already exists.",
             )
         # --- STEP 1: Get the bucket name using the Enum key ---
         customer_bucket_name = None
@@ -740,7 +758,6 @@ class CRUDLGRecord(CRUDBase):
         update_dict = {
             "expiry_date": datetime.combine(new_expiry_date, datetime.min.time()),
         }
-        updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
 
         customer_address = entity.address if entity.address else customer.address
         customer_contact_email = entity.contact_email if entity.contact_email else customer.contact_email
@@ -799,45 +816,52 @@ class CRUDLGRecord(CRUDBase):
             generated_instruction_html = generated_instruction_html.replace(f"{{{{{key}}}}}", str_value)
 
         try:
-            instruction_create_payload_for_schema = {
-                "lg_record_id": lg_record_id_val,
-                "instruction_type": "EXTENSION",
-                "template_id": instruction_template.id,
-                "status": "Instruction Issued",
-                "details": instruction_details,
-                "maker_user_id": user_id,
-                "serial_number": None,
-            }
+            with db.begin_nested():
+                updated_lg_record = super().update(db, db_lg_record, obj_in=update_dict)
 
-            if category_obj is not None:
-                db_lg_instruction = await self.crud_lg_instruction_instance.create(
-                    db,
-                    obj_in=LGInstructionCreate(**instruction_create_payload_for_schema),
-                    entity_code=entity.code,
-                    lg_category_code=category_obj.code,
-                    lg_sequence_number_str=lg_sequence_number_str,
-                    instruction_type_code_enum=InstructionTypeCode.EXT,
-                    sub_instruction_code_enum=SubInstructionCode.ORIGINAL,
-                )
-            else:
-                instruction_id = await self._create_instruction_with_retry(
-                    db,
-                    instruction_create_payload=instruction_create_payload_for_schema,
-                    lg_record_id=lg_record_id_val,
-                    instruction_type_code=InstructionTypeCode.EXT,
-                    sub_instruction_code=SubInstructionCode.ORIGINAL,
-                    user_id=user_id,
-                )
-                db_lg_instruction = db.get(models.LGInstruction, instruction_id)
-                if not db_lg_instruction:
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
+                instruction_create_payload_for_schema = {
+                    "lg_record_id": lg_record_id_val,
+                    "instruction_type": "EXTENSION",
+                    "template_id": instruction_template.id,
+                    "status": "Instruction Issued",
+                    "details": instruction_details,
+                    "maker_user_id": user_id,
+                    "serial_number": None,
+                }
 
-            inst_serial = getattr(db_lg_instruction, "serial_number", None) or ""
-            if inst_serial:
-                instruction_details["instruction_serial"] = inst_serial
-                instruction_details["serial_number"] = inst_serial
-                generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", inst_serial)
-                generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", inst_serial)
+                if category_obj is not None:
+                    db_lg_instruction = await self.crud_lg_instruction_instance.create(
+                        db,
+                        obj_in=LGInstructionCreate(**instruction_create_payload_for_schema),
+                        entity_code=entity.code,
+                        lg_category_code=category_obj.code,
+                        lg_sequence_number_str=lg_sequence_number_str,
+                        instruction_type_code_enum=InstructionTypeCode.EXT,
+                        sub_instruction_code_enum=SubInstructionCode.ORIGINAL,
+                    )
+                else:
+                    instruction_id = await self._create_instruction_with_retry(
+                        db,
+                        instruction_create_payload=instruction_create_payload_for_schema,
+                        lg_record_id=lg_record_id_val,
+                        instruction_type_code=InstructionTypeCode.EXT,
+                        sub_instruction_code=SubInstructionCode.ORIGINAL,
+                        user_id=user_id,
+                    )
+                    db_lg_instruction = db.get(models.LGInstruction, instruction_id)
+                    if not db_lg_instruction:
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve newly created instruction after creation.")
+
+                inst_serial = getattr(db_lg_instruction, "serial_number", None) or ""
+                if inst_serial:
+                    instruction_details["instruction_serial"] = inst_serial
+                    instruction_details["serial_number"] = inst_serial
+                    db_lg_instruction.details = dict(instruction_details)
+                    flag_modified(db_lg_instruction, "details")
+                    db.add(db_lg_instruction)
+                    db.flush()
+                    generated_instruction_html = generated_instruction_html.replace("{{instruction_serial}}", inst_serial)
+                    generated_instruction_html = generated_instruction_html.replace("{{serial_number}}", inst_serial)
 
             from app.core.instruction_verification import register_instruction_for_verification, attach_verification_marker
             register_instruction_for_verification(
@@ -854,8 +878,9 @@ class CRUDLGRecord(CRUDBase):
                 record_id=db_lg_instruction.id,
             )
 
+        except HTTPException:
+            raise
         except Exception as e:
-            db.rollback()
             logger.exception(f"An unexpected error occurred during LG extension for LG id={lg_record_id_val}: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during LG extension: {e}")
 
@@ -2710,6 +2735,7 @@ class CRUDLGRecord(CRUDBase):
         user_allowed_entity_ids: List[int] = [],
         pad_for_duplex: bool = False,
         background_tasks: Optional[BackgroundTasks] = None,
+        failed_items_out: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[int, Optional[bytes], Optional[str], List[Dict[str, Any]]]:
         """
         Executes the auto/forced renewal process for eligible LG records.
@@ -2825,6 +2851,7 @@ class CRUDLGRecord(CRUDBase):
         renewed_lg_numbers = []
         renewed_instruction_ids = []
         renewed_items = []
+        failed_items: List[Dict[str, Any]] = []
 
         for lg_id, new_expiry_date_as_date in targets_to_renew:
             cand = candidate_map.get(lg_id)
@@ -2891,10 +2918,33 @@ class CRUDLGRecord(CRUDBase):
                 logger.info(f"Successfully renewed LG id={updated_lg.id} to {new_expiry_date_as_date}. Instruction ID: {instruction_id}.")
             except HTTPException as e:
                 logger.error(f"Skipping LG id={lg_id} due to error during extension: {e.detail}", exc_info=True)
+                failed_items.append({
+                    "lg_record_id": lg_id,
+                    "lg_number": pref_lg_number,
+                    "error": str(e.detail),
+                })
             except Exception as e:
                 logger.error(f"Skipping LG id={lg_id} due to unexpected error during extension: {e}", exc_info=True)
+                failed_items.append({
+                    "lg_record_id": lg_id,
+                    "lg_number": pref_lg_number,
+                    "error": str(e),
+                })
+
+        if failed_items_out is not None:
+            failed_items_out.clear()
+            failed_items_out.extend(failed_items)
 
         if not all_generated_instruction_htmls:
+            if failed_items:
+                first_err = failed_items[0]
+                summary = f"{first_err['lg_number']}: {first_err['error']}"
+                if len(failed_items) > 1:
+                    summary += f" (+{len(failed_items) - 1} more)"
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to renew {len(failed_items)} eligible LG(s) ({summary}).",
+                )
             logger.info(f"[CRUDLGRecord.run_auto_renewal_process] No LGs were successfully renewed for customer {customer_id}.")
             return 0, None, None, []
 
@@ -4008,12 +4058,18 @@ class CRUDLGRecord(CRUDBase):
         extra_audit_details: Optional[Dict[str, Any]] = None
     ) -> models.LGRecord:
         
-        # 1. Check for duplicate LG Number
-        existing_lg = self.get_by_lg_number(db, obj_in.lg_number)
+        # 1. Check for duplicate LG Number within same customer & issuing bank
+        existing_lg = self.get_by_lg_number(
+            db,
+            obj_in.lg_number,
+            customer_id=customer_id,
+            issuing_bank_id=obj_in.issuing_bank_id,
+            foreign_bank_name=obj_in.foreign_bank_name,
+        )
         if existing_lg:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"LG with number '{obj_in.lg_number}' already exists in production. Cannot migrate."
+                detail=f"LG with number '{obj_in.lg_number}' from this issuing bank already exists in production. Cannot migrate."
             )
 
         # 2. Get the next Sequence Number

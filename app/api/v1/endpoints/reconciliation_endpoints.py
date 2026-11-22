@@ -33,7 +33,8 @@ from app.schemas.schemas_reconciliation_v2 import (
     MatchActionRequest, UnmatchActionRequest,
     MatchingToleranceRuleCreate, MatchingToleranceRuleOut,
     ReconciliationExportProfileCreate, ReconciliationExportProfileUpdate,
-    ReconciliationExportProfileOut, CustomExportExecuteRequest
+    ReconciliationExportProfileOut, CustomExportExecuteRequest,
+    BRSSignOffRequest,
 )
 
 from app.crud.crud_reconciliation_v2 import (
@@ -1198,19 +1199,141 @@ def delete_export_profile(
     return {"status": "success"}
 
 
+@router.get("/account-gl-mappings")
+def get_reconciliation_account_gl_mappings(
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Returns discovered bank statement account numbers & registered CustomerBankAccounts
+    along with their configured ERP Main Bank GL and ERP Clearing Suspense GL codes.
+    Accessible to Reconciliation users without requiring the Issuance module.
+    """
+    from app.models.models import Bank
+    cid = current_user.customer_id
+    banks_map = {b.id: (b.short_name or b.name) for b in db.query(Bank).all()}
+
+    accounts_out = {}
+
+    # 1. Registered CustomerBankAccount rows
+    try:
+        from app.models.models_issuance import CustomerBankAccount
+        cbas = db.query(CustomerBankAccount).filter(
+            CustomerBankAccount.customer_id == cid,
+            CustomerBankAccount.is_deleted == False,
+        ).all()
+        for a in cbas:
+            key = (a.account_number or "").strip()
+            if not key:
+                continue
+            accounts_out[key.upper()] = {
+                "account_id": a.id,
+                "account_number": key,
+                "account_name": a.account_name,
+                "bank_id": a.bank_id,
+                "bank_name": banks_map.get(a.bank_id, f"Bank #{a.bank_id}"),
+                "currency": (a.currency_code or "EGP").upper(),
+                "main_gl": a.erp_main_gl_account or "",
+                "clearing_gl": a.erp_clearing_gl_account or "",
+                "source": "REGISTERED_ACCOUNT",
+            }
+    except Exception:
+        pass
+
+    # 2. Accounts discovered on uploaded BankStatements
+    stmts = db.query(BankStatement).filter(
+        BankStatement.company_id == cid,
+        BankStatement.is_deleted == False,
+    ).order_by(BankStatement.id.desc()).limit(200).all()
+
+    for s in stmts:
+        acct = (s.account_number or "").strip()
+        if not acct:
+            continue
+        if acct.upper() not in accounts_out:
+            accounts_out[acct.upper()] = {
+                "account_id": None,
+                "account_number": acct,
+                "account_name": f"{banks_map.get(s.bank_id, 'Bank')} Statement Account",
+                "bank_id": s.bank_id,
+                "bank_name": banks_map.get(s.bank_id, f"Bank #{s.bank_id}"),
+                "currency": (s.currency.iso_code.upper() if getattr(s, "currency", None) and s.currency.iso_code else "EGP"),
+                "main_gl": "",
+                "clearing_gl": "",
+                "source": "DISCOVERED_STATEMENT",
+            }
+
+    return {"accounts": list(accounts_out.values())}
+
+
+@router.put("/account-gl-mappings")
+def save_reconciliation_account_gl_mappings(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Persists ERP Main Bank GL & ERP Clearing Suspense GL codes onto matching CustomerBankAccount
+    rows (creating lightweight records if needed for corporate admins) so all export profiles inherit them.
+    """
+    cid = current_user.customer_id
+    mappings = body.get("mappings") if isinstance(body, dict) else None
+    if not isinstance(mappings, dict):
+        raise HTTPException(status_code=400, detail="Invalid mappings payload")
+
+    updated_count = 0
+    try:
+        from app.models.models_issuance import CustomerBankAccount
+        for acct_no, cfg in mappings.items():
+            if not acct_no or not isinstance(cfg, dict):
+                continue
+            clean_acct = str(acct_no).strip()
+            main_gl = (str(cfg.get("main_gl") or "").strip()) or None
+            clearing_gl = (str(cfg.get("clearing_gl") or "").strip()) or None
+            cba = db.query(CustomerBankAccount).filter(
+                CustomerBankAccount.customer_id == cid,
+                CustomerBankAccount.account_number == clean_acct,
+                CustomerBankAccount.is_deleted == False,
+            ).first()
+            if cba:
+                cba.erp_main_gl_account = main_gl
+                cba.erp_clearing_gl_account = clearing_gl
+                updated_count += 1
+            elif (main_gl or clearing_gl) and cfg.get("bank_id"):
+                new_cba = CustomerBankAccount(
+                    customer_id=cid,
+                    bank_id=int(cfg["bank_id"]),
+                    account_name=str(cfg.get("account_name") or f"Account {clean_acct}"),
+                    account_number=clean_acct,
+                    currency_code=str(cfg.get("currency") or "EGP").upper()[:3],
+                    erp_main_gl_account=main_gl,
+                    erp_clearing_gl_account=clearing_gl,
+                    is_active=True,
+                )
+                db.add(new_cba)
+                updated_count += 1
+        db.commit()
+    except Exception as err:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to persist account GL mappings: {err}")
+
+    return {"status": "success", "updated_count": updated_count}
+
+
 @router.get("/export/available-fields")
 def get_available_export_fields(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
-    Returns all standard fields plus any dynamic custom columns (`custom_fields.<col>`)
-    discovered from the customer's uploaded bank statements.
+    Returns all standard fields, round-trip ERP clearing fields, and dynamic custom columns
+    discovered from both uploaded bank statements (`custom_fields.<col>`) and ERP ledgers (`erp_custom_fields.<col>`).
     """
     standard_fields = [
         {"source_field": "booking_date", "default_header": "Booking Date", "group": "Core Bank"},
         {"source_field": "value_date", "default_header": "Value Date", "group": "Core Bank"},
         {"source_field": "account_number", "default_header": "Account Number", "group": "Core Bank"},
+        {"source_field": "effective_bank_gl", "default_header": "Resolved Bank / Clearing GL", "group": "Core Bank"},
         {"source_field": "raw_description", "default_header": "Description", "group": "Core Bank"},
         {"source_field": "description_line2", "default_header": "Description Line 2", "group": "Core Bank"},
         {"source_field": "debit_amount", "default_header": "Debit", "group": "Amounts"},
@@ -1228,9 +1351,16 @@ def get_available_export_fields(
         {"source_field": "classification_confidence", "default_header": "Confidence %", "group": "Classification & GL"},
         {"source_field": "applied_rule_name", "default_header": "Applied Rule", "group": "Classification & GL"},
         {"source_field": "classification_reasoning", "default_header": "Audit Reasoning", "group": "Classification & GL"},
-        {"source_field": "is_reconciled", "default_header": "Reconciled Status", "group": "Reconciliation"},
-        {"source_field": "matched_erp_reference", "default_header": "Matched ERP Reference", "group": "Reconciliation"},
-        {"source_field": "variance_amount", "default_header": "Fee / FX Variance", "group": "Reconciliation"},
+        {"source_field": "is_reconciled", "default_header": "Reconciled Status", "group": "ERP Clearing & Variance"},
+        {"source_field": "matched_erp_reference", "default_header": "Matched ERP Reference", "group": "ERP Clearing & Variance"},
+        {"source_field": "payment_or_erp_ref", "default_header": "ERP Ref / Payment ID", "group": "ERP Clearing & Variance"},
+        {"source_field": "matched_erp_entity", "default_header": "Matched ERP Entity", "group": "ERP Clearing & Variance"},
+        {"source_field": "matched_erp_type", "default_header": "Matched ERP Doc Type", "group": "ERP Clearing & Variance"},
+        {"source_field": "matched_erp_gross_amount", "default_header": "Gross ERP Invoice Amount", "group": "ERP Clearing & Variance"},
+        {"source_field": "allocated_erp_amount", "default_header": "Allocated Clearing Amount", "group": "ERP Clearing & Variance"},
+        {"source_field": "variance_amount", "default_header": "Fee / FX Variance", "group": "ERP Clearing & Variance"},
+        {"source_field": "variance_disposition", "default_header": "Variance Disposition", "group": "ERP Clearing & Variance"},
+        {"source_field": "variance_gl_account", "default_header": "Variance GL Account", "group": "ERP Clearing & Variance"},
         {"source_field": "back_office_ref", "default_header": "Bank Reference", "group": "References"},
         {"source_field": "e2e_id", "default_header": "E2E / SWIFT ID", "group": "References"},
         {"source_field": "cheque_number", "default_header": "Cheque Number", "group": "References"},
@@ -1256,6 +1386,25 @@ def get_available_export_fields(
             "group": "Custom Uploaded Columns"
         })
 
+    # Discover round-trip custom columns preserved from uploaded ERP Open Items
+    sample_erps = db.query(InternalLedgerRecord).filter(
+        InternalLedgerRecord.company_id == current_user.customer_id,
+        InternalLedgerRecord.custom_fields_json != None,
+        InternalLedgerRecord.is_deleted == False,
+    ).order_by(InternalLedgerRecord.id.desc()).limit(100).all()
+
+    erp_custom_keys = set()
+    for e in sample_erps:
+        if isinstance(e.custom_fields_json, dict):
+            erp_custom_keys.update(e.custom_fields_json.keys())
+
+    for eck in sorted(erp_custom_keys):
+        standard_fields.append({
+            "source_field": f"erp_custom_fields.{eck}",
+            "default_header": f"ERP {eck}",
+            "group": "Round-Trip ERP Columns"
+        })
+
     return {"available_fields": standard_fields}
 
 
@@ -1266,21 +1415,69 @@ def preview_custom_export(
     current_user: TokenData = Depends(get_reconciliation_user_context)
 ):
     """
-    Returns live export summary stats and the first 50 formatted rows for preview.
+    Returns live export summary stats (including ERP-matched vs Bank-only buckets and double-entry balance proof)
+    and the first 50 formatted rows for preview.
     """
     cid = current_user.customer_id
     base_q = db.query(BankTransaction).join(BankStatement).filter(
         BankStatement.company_id == cid,
         BankTransaction.is_deleted == False
     )
-    total_count = base_q.count()
-    finalized_count = base_q.filter(
-        (BankTransaction.is_reconciled == True) | (BankTransaction.is_classified == True)
-    ).count()
-    unclassified_count = base_q.filter(BankTransaction.is_classified == False).count()
-    exported_count = base_q.filter(BankTransaction.is_exported == True).count()
+    if req.statement_id:
+        base_q = base_q.filter(BankTransaction.statement_id == req.statement_id)
+    if req.bank_id:
+        base_q = base_q.filter(BankStatement.bank_id == req.bank_id)
+
+    scoped_txns = base_q.all()
+    total_count = len(scoped_txns)
+    finalized_count = sum(1 for t in scoped_txns if t.is_reconciled or t.is_classified)
+    unclassified_count = sum(1 for t in scoped_txns if not t.is_classified)
+    exported_count = sum(1 for t in scoped_txns if t.is_exported)
+
+    scoped_ids = [t.id for t in scoped_txns]
+    erp_matched_ids = set()
+    if scoped_ids:
+        erp_match_rows = db.query(ReconciliationMatch.bank_txn_id, ReconciliationMatch.source_type).filter(
+            ReconciliationMatch.bank_txn_id.in_(scoped_ids),
+            ReconciliationMatch.is_deleted == False,
+        ).all()
+        erp_matched_ids = {
+            r[0] for r in erp_match_rows if (r[1] or "").upper() != "TREASURY (LG)"
+        }
+
+    erp_matched_count = len(erp_matched_ids)
+    paired_reversals_count = sum(1 for t in scoped_txns if t.is_reversal and t.linked_txn_id)
+    paired_sweeps_count = sum(
+        1 for t in scoped_txns
+        if not t.is_reversal and (
+            t.linked_txn_id or (t.internal_category or "").upper() in ("INTER_BANK_SWEEP", "INTERNAL_TRANSFER")
+        )
+    )
+    bank_only_count = sum(
+        1 for t in scoped_txns
+        if t.id not in erp_matched_ids and not (t.is_reversal and t.linked_txn_id)
+    )
 
     headers, rows, _, fmt = bank_reconcile_service.build_custom_export_rows(db, cid, req)
+
+    # Compute live Debit / Credit balance proof if Debit & Credit columns exist in columns_config
+    effective_cols = req.columns_config
+    if not effective_cols and req.profile_id:
+        prof = db.query(ReconciliationExportProfile).filter(
+            ReconciliationExportProfile.id == req.profile_id,
+            ReconciliationExportProfile.company_id == cid,
+            ReconciliationExportProfile.is_deleted == False,
+        ).first()
+        if prof:
+            effective_cols = prof.columns_config_json
+    effective_cols = effective_cols or bank_reconcile_service.DEFAULT_EXPORT_COLUMNS
+
+    dr_hdr = next((c.get("custom_header") or c.get("source_field") for c in effective_cols if c.get("source_field") == "debit_amount"), None)
+    cr_hdr = next((c.get("custom_header") or c.get("source_field") for c in effective_cols if c.get("source_field") == "credit_amount"), None)
+    total_dr = round(sum(float(r.get(dr_hdr) or 0) for r in rows), 2) if dr_hdr else 0.0
+    total_cr = round(sum(float(r.get(cr_hdr) or 0) for r in rows), 2) if cr_hdr else 0.0
+    is_balanced = abs(total_dr - total_cr) < 0.01 if (dr_hdr and cr_hdr) else True
+
     return {
         "summary": {
             "total_transactions": total_count,
@@ -1288,6 +1485,13 @@ def preview_custom_export(
             "unclassified_count": unclassified_count,
             "exported_count": exported_count,
             "matching_export_rows": len(rows),
+            "erp_matched_count": erp_matched_count,
+            "bank_only_count": bank_only_count,
+            "paired_sweeps_count": paired_sweeps_count,
+            "paired_reversals_count": paired_reversals_count,
+            "total_debit": total_dr,
+            "total_credit": total_cr,
+            "is_balanced": is_balanced,
         },
         "headers": headers,
         "preview_rows": rows[:50],
@@ -1565,6 +1769,8 @@ def get_reconciliation_admin_overview(
                 "reconciled_pct": round((s_rec / s_tot) * 100.0, 1) if s_tot > 0 else 0.0,
                 "classified_txns": s_cls,
                 "classified_pct": round((s_cls / s_tot) * 100.0, 1) if s_tot > 0 else 0.0,
+                "brs_signed_at": s.brs_signed_at.isoformat() if getattr(s, "brs_signed_at", None) else None,
+                "brs_worm_hash": getattr(s, "brs_worm_hash", None),
             })
 
         bg = bank_agg.setdefault(s.bank_id, {
@@ -1709,6 +1915,387 @@ def get_reconciliation_admin_overview(
             "classification_sources": source_counts,
         },
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PHASE 2: MONTH-END BRS AUDIT CERTIFICATE & DEPARTMENTAL ACTION PACKS
+# ═══════════════════════════════════════════════════════════════════
+
+@router.get("/statements/{statement_id}/brs")
+def get_statement_brs_report(
+    statement_id: int,
+    erp_book_balance: Optional[Decimal] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Computes the formal Month-End Bank Reconciliation Statement (Proof of Cash) bridge
+    for a specific bank statement, including itemized Deposits in Transit, Unpresented Payments,
+    and Unbooked Bank Statement Credits/Debits.
+    """
+    from app.services.reconciliation_brs_and_packs_service import reconciliation_brs_service
+    return reconciliation_brs_service.build_statement_brs_report(
+        db=db,
+        customer_id=current_user.customer_id,
+        statement_id=statement_id,
+        erp_book_balance_override=erp_book_balance,
+    )
+
+
+@router.post("/statements/{statement_id}/brs/sign-off")
+def sign_off_statement_brs(
+    statement_id: int,
+    req: BRSSignOffRequest,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Formally signs off & locks a Bank Reconciliation Statement, stamping a SHA-256
+    WORM Audit Chain hash onto the statement record.
+    """
+    from app.services.reconciliation_brs_and_packs_service import reconciliation_brs_service
+    return reconciliation_brs_service.sign_off_statement_brs(
+        db=db,
+        customer_id=current_user.customer_id,
+        statement_id=statement_id,
+        user_id=current_user.user_id,
+        erp_book_closing_balance=req.erp_book_closing_balance,
+        notes=req.notes,
+        lock_transactions=req.lock_transactions,
+    )
+
+
+@router.post("/statements/{statement_id}/brs/reopen")
+def reopen_statement_brs(
+    statement_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """
+    Corporate Admin governance action to reopen a signed-off BRS statement for adjustment.
+    """
+    from app.services.reconciliation_brs_and_packs_service import reconciliation_brs_service
+    return reconciliation_brs_service.reopen_statement_brs(
+        db=db,
+        customer_id=current_user.customer_id,
+        statement_id=statement_id,
+        user_id=current_user.user_id,
+    )
+
+
+@router.get("/statements/{statement_id}/brs/export")
+async def export_statement_brs_certificate(
+    statement_id: int,
+    format: str = "PDF",
+    erp_book_balance: Optional[Decimal] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Exports the Official Month-End Bank Reconciliation Statement (BRS) as either:
+    - `PDF`: Multi-page A4 Audit Certificate with signature blocks & WORM hash
+    - `XLSX`: 5-sheet Audit Schedule Workbook
+    """
+    from app.services.reconciliation_brs_and_packs_service import reconciliation_brs_service
+    brs = reconciliation_brs_service.build_statement_brs_report(
+        db=db,
+        customer_id=current_user.customer_id,
+        statement_id=statement_id,
+        erp_book_balance_override=erp_book_balance,
+    )
+    fmt = (format or "PDF").strip().upper()
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    if fmt == "XLSX":
+        xlsx_bytes = reconciliation_brs_service.render_brs_excel_bytes(brs)
+        return StreamingResponse(
+            io.BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="BRS_Statement_{statement_id}_{ts}.xlsx"'},
+        )
+
+    html_doc = reconciliation_brs_service.render_brs_certificate_html(brs)
+    from app.core.document_generator import generate_multipage_pdf_from_html
+    from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
+
+    pdf_bytes = await generate_multipage_pdf_from_html(html_doc, filename_hint=f"brs_{statement_id}")
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="Failed to render BRS PDF certificate")
+    if is_active_trial_context():
+        pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="BRS_Certificate_{statement_id}_{ts}.pdf"'},
+    )
+
+
+@router.get("/action-packs")
+def get_departmental_action_packs(
+    pack_key: Optional[str] = None,
+    bank_id: Optional[int] = None,
+    statement_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Returns summary KPIs across all 4 Departmental Exception & Action Packs
+    plus live preview rows for the selected `pack_key`.
+    """
+    from app.services.reconciliation_brs_and_packs_service import reconciliation_brs_service
+    res = reconciliation_brs_service.build_action_packs(
+        db=db,
+        customer_id=current_user.customer_id,
+        selected_pack=pack_key,
+        bank_id=bank_id,
+        statement_id=statement_id,
+    )
+    return {
+        "packs": res["packs"],
+        "selected_pack": res["selected_pack"],
+        "selected_meta": res["selected_meta"],
+        "headers": res["headers"],
+        "preview_rows": res["rows"][:100],
+        "total_rows": len(res["rows"]),
+    }
+
+
+@router.get("/action-packs/{pack_key}/export")
+async def export_departmental_action_pack(
+    pack_key: str,
+    format: str = "XLSX",
+    bank_id: Optional[int] = None,
+    statement_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Streams a ready-to-share Departmental Exception / Action Pack in XLSX, CSV, or PDF format.
+    """
+    from app.services.reconciliation_brs_and_packs_service import reconciliation_brs_service
+    pack_data = reconciliation_brs_service.build_action_packs(
+        db=db,
+        customer_id=current_user.customer_id,
+        selected_pack=pack_key,
+        bank_id=bank_id,
+        statement_id=statement_id,
+    )
+    fmt = (format or "XLSX").strip().upper()
+    if fmt == "PDF":
+        from app.core.document_generator import generate_multipage_pdf_from_html
+        from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
+
+        html_doc = reconciliation_brs_service.render_action_pack_html(pack_data)
+        pdf_bytes = await generate_multipage_pdf_from_html(html_doc, filename_hint=f"pack_{pack_key.lower()}")
+        if not pdf_bytes:
+            raise HTTPException(status_code=500, detail="Failed to render Action Pack PDF")
+        if is_active_trial_context():
+            pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="grow_{pack_key.lower()}_{ts}.pdf"'},
+        )
+
+    raw_bytes, media_type, fname = reconciliation_brs_service.export_action_pack_bytes(pack_data, file_format=fmt)
+    return StreamingResponse(
+        io.BytesIO(raw_bytes),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+# ==============================================================================
+# PHASE 3: CFO DIRECT CASH FLOW, 7/14/30D LIQUIDITY FORECAST & BANK SCORECARD
+# ==============================================================================
+
+@router.get("/cash-intelligence")
+def get_cfo_cash_intelligence_dashboard(
+    currency: Optional[str] = None,
+    bank_id: Optional[int] = None,
+    days_back: Optional[int] = None,
+    minimum_cash_buffer: float = 0.0,
+    benchmark_annual_rate_pct: float = 20.0,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Returns Phase 3 CFO Treasury Intelligence:
+    1. IAS 7 Direct-Method Cash Flow (isolating cross-bank sweeps & ghost error reversals)
+    2. 7 / 14 / 30-Day Rolling Cash Liquidity Forecast with learned counterparty lag intelligence
+    3. Bank Fee Leakage (direct + embedded deductions in bps) & Value-Date Clearing Float Scorecard
+    """
+    from app.services.reconciliation_cash_intelligence_service import (
+        reconciliation_cash_intelligence_service,
+    )
+    return reconciliation_cash_intelligence_service.build_cash_intelligence_report(
+        db=db,
+        customer_id=current_user.customer_id,
+        currency=currency,
+        bank_id=bank_id,
+        days_back=days_back,
+        minimum_cash_buffer=minimum_cash_buffer,
+        benchmark_annual_rate_pct=benchmark_annual_rate_pct,
+    )
+
+
+@router.get("/cash-intelligence/export")
+async def export_cfo_cash_intelligence_pack(
+    format: str = "PDF",
+    currency: Optional[str] = None,
+    bank_id: Optional[int] = None,
+    days_back: Optional[int] = None,
+    minimum_cash_buffer: float = 0.0,
+    benchmark_annual_rate_pct: float = 20.0,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Streams the CFO Cash Flow, Rolling 30-Day Forecast & Bank Scorecard Pack in:
+    - `PDF`: Multi-page A4 Executive Board Briefing (WeasyPrint)
+    - `XLSX`: 4-sheet Treasury Analytics Workbook
+    """
+    from app.services.reconciliation_cash_intelligence_service import (
+        reconciliation_cash_intelligence_service,
+    )
+    report = reconciliation_cash_intelligence_service.build_cash_intelligence_report(
+        db=db,
+        customer_id=current_user.customer_id,
+        currency=currency,
+        bank_id=bank_id,
+        days_back=days_back,
+        minimum_cash_buffer=minimum_cash_buffer,
+        benchmark_annual_rate_pct=benchmark_annual_rate_pct,
+    )
+    fmt = (format or "PDF").strip().upper()
+    ccy = report["selected_currency"]
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    if fmt == "XLSX":
+        xlsx_bytes = reconciliation_cash_intelligence_service.render_excel_bytes(report)
+        return StreamingResponse(
+            io.BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f'attachment; filename="CFO_Cash_Intelligence_{ccy}_{ts}.xlsx"'
+            },
+        )
+
+    from app.core.document_generator import generate_multipage_pdf_from_html
+    from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
+
+    html_doc = reconciliation_cash_intelligence_service.render_pdf_html(report)
+    pdf_bytes = await generate_multipage_pdf_from_html(
+        html_doc, filename_hint=f"cfo_cash_intel_{ccy.lower()}"
+    )
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="Failed to render CFO Cash Intelligence PDF")
+    if is_active_trial_context():
+        pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="CFO_Cash_Intelligence_{ccy}_{ts}.pdf"'
+        },
+    )
+
+
+# ==============================================================================
+# PHASE 4: CLOSED-LOOP TREASURY BRIDGE (LG FACILITY TARIFFS + RFQ DEAL SETTLEMENTS)
+# ==============================================================================
+
+@router.get("/treasury-bridge")
+def get_closed_loop_treasury_bridge(
+    currency: Optional[str] = None,
+    bank_id: Optional[int] = None,
+    minimum_cash_buffer: float = 0.0,
+    benchmark_annual_rate_pct: float = 20.0,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Phase 4 Closed-Loop Cross-Module Treasury Audit & Opportunity Engine:
+    1. Audits actual bank LG commission & cash-margin debits against agreed Facility tariffs
+       and flags unregistered Shadow LGs.
+    2. Verifies bank statement settlement of awarded FX Spot & T-Bill RFQ deals.
+    3. Generates 1-click pre-filled T-Bill / Money Market RFQ prompts from verified 30d idle cash.
+    """
+    from app.services.reconciliation_treasury_bridge_service import (
+        reconciliation_treasury_bridge_service,
+    )
+    return reconciliation_treasury_bridge_service.build_treasury_bridge_report(
+        db=db,
+        customer_id=current_user.customer_id,
+        currency=currency,
+        bank_id=bank_id,
+        minimum_cash_buffer=minimum_cash_buffer,
+        benchmark_annual_rate_pct=benchmark_annual_rate_pct,
+    )
+
+
+@router.get("/treasury-bridge/export")
+async def export_closed_loop_treasury_bridge(
+    format: str = "PDF",
+    currency: Optional[str] = None,
+    bank_id: Optional[int] = None,
+    minimum_cash_buffer: float = 0.0,
+    benchmark_annual_rate_pct: float = 20.0,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """
+    Streams the Closed-Loop Treasury Audit & Bank Claim Pack in:
+    - `PDF`: Multi-page Landscape A4 Bank Claim & Settlement Audit Pack (WeasyPrint)
+    - `XLSX`: 3-sheet Workbook (LG Tariff Audit, Shadow LGs, RFQ Deal Settlement Audit)
+    """
+    from app.services.reconciliation_treasury_bridge_service import (
+        reconciliation_treasury_bridge_service,
+    )
+    report = reconciliation_treasury_bridge_service.build_treasury_bridge_report(
+        db=db,
+        customer_id=current_user.customer_id,
+        currency=currency,
+        bank_id=bank_id,
+        minimum_cash_buffer=minimum_cash_buffer,
+        benchmark_annual_rate_pct=benchmark_annual_rate_pct,
+    )
+    fmt = (format or "PDF").strip().upper()
+    ccy = report["selected_currency"]
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    if fmt == "XLSX":
+        xlsx_bytes = reconciliation_treasury_bridge_service.render_excel_bytes(report)
+        return StreamingResponse(
+            io.BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f'attachment; filename="Treasury_Bridge_Claim_Pack_{ccy}_{ts}.xlsx"'
+            },
+        )
+
+    from app.core.document_generator import generate_multipage_pdf_from_html
+    from app.core.trial_guard import is_active_trial_context, stamp_trial_pdf_bytes_watermark
+
+    html_doc = reconciliation_treasury_bridge_service.render_pdf_html(report)
+    pdf_bytes = await generate_multipage_pdf_from_html(
+        html_doc, filename_hint=f"treasury_bridge_{ccy.lower()}"
+    )
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="Failed to render Treasury Bridge Claim PDF")
+    if is_active_trial_context():
+        pdf_bytes = stamp_trial_pdf_bytes_watermark(pdf_bytes, force_trial=True)
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="Treasury_Bridge_Claim_Pack_{ccy}_{ts}.pdf"'
+        },
+    )
 
 
 

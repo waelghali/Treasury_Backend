@@ -102,6 +102,9 @@ def create_change_request(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Submit a new admin change request requiring dual-control approval."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Dual-control configuration changes")
+
     new_req = AdminChangeRequest(
         customer_id=current_user.customer_id,
         requested_by_user_id=current_user.user_id,
@@ -130,6 +133,9 @@ def action_change_request(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Approve or reject an admin change request (dual-control)."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Dual-control configuration changes")
+
     change_req = db.query(AdminChangeRequest).filter(
         AdminChangeRequest.id == request_id,
         AdminChangeRequest.customer_id == current_user.customer_id

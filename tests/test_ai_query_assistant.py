@@ -184,8 +184,140 @@ def run_suite():
         assert "AI Document Scan" in res15_howto.get("answer") or "Manual" in res15_howto.get("answer"), "Test 15 Failed"
         print("[PASS] Step-by-step workflow for recording new LG with OCR scan instructions provided.")
 
+        # TEST 16: Page-Aware Ambiguous Query on Quotations (No Custody Hijack & No Trivia Rejection)
+        print("\n--- TEST 16: Page-Aware Ambiguous Query on Quotations ---")
+        res16_active = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="show active",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/quotations",
+        )
+        assert res16_active.get("intent") == "get_quotation_summary", (
+            f"Test 16a Failed: Expected get_quotation_summary, got {res16_active.get('intent')}"
+        )
+        res16_won = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="who won?",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/quotations",
+        )
+        assert res16_won.get("intent") == "get_top_winning_banks", (
+            f"Test 16b Failed: Expected get_top_winning_banks, got {res16_won.get('intent')}"
+        )
+        print("[PASS] Ambiguous Quotations queries routed to Quotation intents accurately.")
+
+        # TEST 17: Zero Tunnel Vision — Explicit Cross-Module Query Overrides Current Page
+        print("\n--- TEST 17: Explicit Cross-Module Query Overrides Page Context ---")
+        res17_cross = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="Which LGs expire in 60 days?",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/quotations",
+        )
+        assert res17_cross.get("intent") == "find_expiring_lgs", (
+            f"Test 17a Failed: Explicit LG query hijacked on Quotations: {res17_cross.get('intent')}"
+        )
+        res17_offtopic = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="What is the capital of France?",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/quotations",
+        )
+        assert res17_offtopic.get("intent") == "rejected_scope", "Test 17b Failed: Off-topic not rejected"
+        print("[PASS] Explicit cross-module & off-topic guardrails preserved with zero tunnel vision.")
+
+        # TEST 18: URL Record ID Deictic Resolution (`/lg-records/:id` vs Active Chat Memory)
+        print("\n--- TEST 18: URL Record ID Deictic Resolution ---")
+        sample_lg = db.query(models.LGRecord).filter(
+            models.LGRecord.customer_id == customer_id,
+            models.LGRecord.is_deleted == False
+        ).first()
+        if sample_lg:
+            # Clear prior chat memory for clean URL-only check
+            ai_query_assistant_service._last_referenced_lg_by_user.pop((int(customer_id), int(user_id)), None)
+            res18_url = ai_query_assistant_service.process_query(
+                db=db,
+                user_question="when does this expire?",
+                customer_id=customer_id,
+                user_id=user_id,
+                page_context=f"/end-user/lg-records/{sample_lg.id}",
+                history=[],
+            )
+            assert res18_url.get("intent") == "get_lg_details", f"Test 18 Failed: got {res18_url.get('intent')}"
+            assert sample_lg.lg_number in (res18_url.get("answer") or ""), "Test 18 Failed: LG number missing"
+            print(f"[PASS] Deictic question resolved LG '{sample_lg.lg_number}' directly from URL path.")
+        else:
+            cls18 = ai_query_assistant_service.classify_and_interpret(
+                "when does this expire?",
+                customer_id=customer_id,
+                user_id=user_id,
+                page_context="/end-user/lg-records/42",
+                history=[],
+            )
+            assert cls18.get("intent") == "get_lg_details" and cls18["parameters"].get("lg_id") == 42, "Test 18 Failed"
+            print("[PASS] Deictic question classified lg_id=42 from URL path.")
+
+        # TEST 19: Page-Aware Issuance & Facilities Tie-Breakers
+        print("\n--- TEST 19: Page-Aware Issuance & Facilities Tie-Breakers ---")
+        res19_iss = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="show pending",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/issuance/requests",
+        )
+        assert res19_iss.get("intent") == "get_issuance_summary", f"Test 19a Failed: got {res19_iss.get('intent')}"
+        res19_fac = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="what is available?",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/issuance/facilities",
+        )
+        assert res19_fac.get("intent") == "get_facility_analytics", f"Test 19b Failed: got {res19_fac.get('intent')}"
+        print("[PASS] Issuance & Facility page tie-breakers resolved accurately.")
+
+        # TEST 20: Level 4 How-To Disambiguation by Current Screen (Issuance Extend & LG Position Recon)
+        print("\n--- TEST 20: Level 4 Screen-Aware How-To Disambiguation ---")
+        res20_ext_iss = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="how do I extend?",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/issuance/issued-lgs",
+        )
+        assert res20_ext_iss.get("level") == 4, "Test 20a Failed"
+        assert "issuance/issued-lgs" in (res20_ext_iss.get("answer") or ""), "Test 20a Failed: Expected Issued LGs path"
+
+        res20_pos_recon = ai_query_assistant_service.process_query(
+            db=db,
+            user_question="how does reconciliation work?",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/issuance/reconciliation",
+        )
+        assert "issuance/reconciliation" in (res20_pos_recon.get("answer") or ""), "Test 20b Failed: Expected LG Position Recon"
+        print("[PASS] Level 4 guides disambiguated Custody vs Issuance & Cash Recon vs Position Recon.")
+
+        # TEST 21: Bank Reconciliation Ambiguous Question Routes to System Help (Not Custody Search)
+        print("\n--- TEST 21: Bank Reconciliation Context Routing ---")
+        cls21 = ai_query_assistant_service.classify_and_interpret(
+            "show unmatched items",
+            customer_id=customer_id,
+            user_id=user_id,
+            page_context="/corporate-admin/reconciliation/workspace",
+        )
+        assert cls21.get("intent") == "system_help" and cls21.get("suggested_level") == 4, (
+            f"Test 21 Failed: Expected Level 4 system_help on Reconciliation, got {cls21}"
+        )
+        print("[PASS] Reconciliation screen queries route to contextual guidance instead of empty LG search.")
+
         print("\n" + "=" * 75)
-        print("ALL 15 4-LEVEL TREASURY + SYSTEM + AUDIT AI ASSISTANT TESTS PASSED PERFECTLY!")
+        print("ALL 21 4-LEVEL TREASURY + PAGE-AWARE AI ASSISTANT TESTS PASSED PERFECTLY!")
         print("=" * 75)
 
     finally:

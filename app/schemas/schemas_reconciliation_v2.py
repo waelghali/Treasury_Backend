@@ -89,7 +89,18 @@ class BankStatementOut(BankStatementBase):
     id: int
     status: str
     created_at: datetime
+    erp_book_closing_balance: Optional[Decimal] = None
+    brs_signed_by: Optional[int] = None
+    brs_signed_at: Optional[datetime] = None
+    brs_signoff_notes: Optional[str] = None
+    brs_worm_hash: Optional[str] = None
     transactions: List[BankTransactionOut] = []
+
+
+class BRSSignOffRequest(BaseModel):
+    erp_book_closing_balance: Optional[Decimal] = None
+    notes: Optional[str] = None
+    lock_transactions: bool = True
 
 class ReconciliationMatchCreate(BaseModel):
     bank_txn_id: int
@@ -320,6 +331,16 @@ class ReconciliationExportProfileBase(BaseModel):
     filter_config_json: Optional[Dict[str, Any]] = None
     expand_journal_legs: bool = False
     bank_gl_account: Optional[str] = "1010010 - Cash at Bank"
+    handoff_mode: Optional[str] = "ALL" # ALL, ENRICHED_STATEMENT, SUBLEDGER_CLEARING, MISSING_GL_JOURNAL
+    offset_account_mode: Optional[str] = "MAIN_BANK_GL" # MAIN_BANK_GL, BANK_CLEARING_SUSPENSE
+    clearing_suspense_gl_account: Optional[str] = "1010999 - Bank Clearing Suspense"
+    cash_in_transit_gl_account: Optional[str] = "1010800 - Cash in Transit"
+    suspense_gl_account: Optional[str] = "1010950 - Unapplied Cash Suspense"
+    wht_tax_gl_account: Optional[str] = "1090300 - Withholding Tax Receivable"
+    fx_variance_gl_account: Optional[str] = "6060100 - FX Gain / Loss"
+    split_variance_as_fee_row: Optional[bool] = False
+    exclude_paired_reversals: Optional[bool] = True
+    account_gl_mappings_json: Optional[Dict[str, Any]] = None
     is_default: bool = False
     is_active: bool = True
 
@@ -336,6 +357,16 @@ class ReconciliationExportProfileUpdate(BaseModel):
     filter_config_json: Optional[Dict[str, Any]] = None
     expand_journal_legs: Optional[bool] = None
     bank_gl_account: Optional[str] = None
+    handoff_mode: Optional[str] = None
+    offset_account_mode: Optional[str] = None
+    clearing_suspense_gl_account: Optional[str] = None
+    cash_in_transit_gl_account: Optional[str] = None
+    suspense_gl_account: Optional[str] = None
+    wht_tax_gl_account: Optional[str] = None
+    fx_variance_gl_account: Optional[str] = None
+    split_variance_as_fee_row: Optional[bool] = None
+    exclude_paired_reversals: Optional[bool] = None
+    account_gl_mappings_json: Optional[Dict[str, Any]] = None
     is_default: Optional[bool] = None
     is_active: Optional[bool] = None
 
@@ -360,3 +391,13 @@ class CustomExportExecuteRequest(BaseModel):
     date_format: Optional[str] = None
     expand_journal_legs: Optional[bool] = None
     bank_gl_account: Optional[str] = None
+    handoff_mode: Optional[str] = None # ALL, ENRICHED_STATEMENT, SUBLEDGER_CLEARING, MISSING_GL_JOURNAL
+    offset_account_mode: Optional[str] = None # MAIN_BANK_GL, BANK_CLEARING_SUSPENSE
+    clearing_suspense_gl_account: Optional[str] = None
+    cash_in_transit_gl_account: Optional[str] = None
+    suspense_gl_account: Optional[str] = None
+    wht_tax_gl_account: Optional[str] = None
+    fx_variance_gl_account: Optional[str] = None
+    split_variance_as_fee_row: Optional[bool] = None
+    exclude_paired_reversals: Optional[bool] = None
+    account_gl_mappings: Optional[Dict[str, Any]] = None

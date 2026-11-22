@@ -632,6 +632,14 @@ def run_all_tests():
         public_ep.send_email = orig_pub_send
 
         try:
+            from app.models.models import TrialRegistration, AuditLog
+            from app.api.v1.endpoints.system_owner import _suspend_and_revoke_trial_registration_sync
+            treg_cleanup = db.query(TrialRegistration).filter(TrialRegistration.admin_email == trial_email).first()
+            if treg_cleanup:
+                treg_cid = treg_cleanup.id
+                if treg_cleanup.customer_id:
+                    _suspend_and_revoke_trial_registration_sync(db, treg_cleanup, caller_user_id=None, reason="Phase 3 test cleanup")
+                db.query(AuditLog).filter(AuditLog.entity_type == "TrialRegistration", AuditLog.entity_id == treg_cid).delete(synchronize_session=False)
             db.execute(text("DELETE FROM trial_registrations WHERE admin_email = :em"), {"em": trial_email})
             db.commit()
         except Exception:

@@ -33,6 +33,11 @@ class BankStatement(BaseModel):
     balance_variance_amount = Column(Numeric(precision=18, scale=2), default=0)
     continuity_warnings_json = Column(JSON, nullable=True)
     detected_mapping_json = Column(JSON, nullable=True)
+    erp_book_closing_balance = Column(Numeric(precision=18, scale=2), nullable=True)
+    brs_signed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    brs_signed_at = Column(DateTime(timezone=True), nullable=True)
+    brs_signoff_notes = Column(Text, nullable=True)
+    brs_worm_hash = Column(String(64), nullable=True)
     
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     
@@ -442,6 +447,16 @@ class ReconciliationExportProfile(BaseModel):
     filter_config_json = Column(JSON, nullable=True) # {"only_reconciled": false, "only_classified": false, "mark_exported": false}
     expand_journal_legs = Column(Boolean, default=False) # If True, outputs balanced Debit/Credit GL journal rows per transaction
     bank_gl_account = Column(String(100), default="1010010 - Cash at Bank")
+    handoff_mode = Column(String(40), default="ALL") # ALL, ENRICHED_STATEMENT, SUBLEDGER_CLEARING, MISSING_GL_JOURNAL
+    offset_account_mode = Column(String(40), default="MAIN_BANK_GL") # MAIN_BANK_GL, BANK_CLEARING_SUSPENSE
+    clearing_suspense_gl_account = Column(String(100), default="1010999 - Bank Clearing Suspense")
+    cash_in_transit_gl_account = Column(String(100), default="1010800 - Cash in Transit")
+    suspense_gl_account = Column(String(100), default="1010950 - Unapplied Cash Suspense")
+    wht_tax_gl_account = Column(String(100), default="1090300 - Withholding Tax Receivable")
+    fx_variance_gl_account = Column(String(100), default="6060100 - FX Gain / Loss")
+    split_variance_as_fee_row = Column(Boolean, default=False)
+    exclude_paired_reversals = Column(Boolean, default=True)
+    account_gl_mappings_json = Column(JSON, nullable=True) # Optional per-account {"<acct_no>": {"main_gl": "...", "clearing_gl": "..."}}
     
     is_default = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)

@@ -32,6 +32,36 @@ logger = logging.getLogger("app.trial_guard")
 TRIAL_WATERMARK_HEADLINE = "TRIAL SANDBOX — EVALUATION ONLY"
 TRIAL_WATERMARK_SUBLINE = "NOT VALID FOR OFFICIAL BANK SUBMISSION"
 
+PERSONAL_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "yahoo.fr", "ymail.com",
+    "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com", "msn.com",
+    "icloud.com", "me.com", "mac.com", "aol.com", "protonmail.com", "proton.me",
+    "yandex.com", "mail.com", "gmx.com", "zoho.com",
+}
+
+DISPOSABLE_EMAIL_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "tempmail.com", "10minutemail.com",
+    "yopmail.com", "sharklasers.com", "trashmail.com", "temp-mail.org",
+    "fakeinbox.com", "throwawaymail.com", "dispostable.com",
+}
+
+
+def extract_email_domain(email_or_domain: Optional[str]) -> str:
+    clean = (email_or_domain or "").strip().lower()
+    if "@" in clean:
+        return clean.rsplit("@", 1)[1].strip()
+    return clean
+
+
+def is_personal_email_domain(email_or_domain: Optional[str]) -> bool:
+    dom = extract_email_domain(email_or_domain)
+    return bool(dom and dom in PERSONAL_EMAIL_DOMAINS)
+
+
+def is_disposable_email_domain(email_or_domain: Optional[str]) -> bool:
+    dom = extract_email_domain(email_or_domain)
+    return bool(dom and dom in DISPOSABLE_EMAIL_DOMAINS)
+
 # Per-request async/thread-safe context populated at HTTP request start (`init_request_trial_state`)
 # and mutated in-place inside `get_current_user` (which FastAPI runs in `anyio.to_thread.run_sync`,
 # where `ContextVar.set()` alone would stay confined to the worker thread's copied context!).
@@ -124,7 +154,7 @@ def get_trial_caps() -> Dict[str, int]:
     return {
         "max_lgs": max_lgs,
         "max_lg_records": max_lgs,
-        "max_statements": int(os.getenv("TRIAL_MAX_STATEMENTS", "3")),
+        "max_statements": int(os.getenv("TRIAL_MAX_STATEMENTS", "5")),
         "max_rfqs": int(os.getenv("TRIAL_MAX_RFQS", "5")),
         "max_ai_calls": int(os.getenv("TRIAL_MAX_AI_CALLS", "15")),
         "duration_days": int(os.getenv("TRIAL_DURATION_DAYS", "14")),
@@ -285,6 +315,9 @@ def get_trial_usage_snapshot(db: Session, customer_id: int) -> Dict[str, Any]:
     end_date_iso: Optional[str] = None
     days_remaining: Optional[int] = caps["duration_days"]
     days_since_activation: int = 0
+    is_personal_email = False
+    review_status = "VERIFIED"
+    any_statement_present = False
 
     try:
         from app.models.models import (
@@ -299,12 +332,38 @@ def get_trial_usage_snapshot(db: Session, customer_id: int) -> Dict[str, Any]:
         )
 
         cust = db.query(Customer).filter(Customer.id == int(customer_id)).first()
+        if cust and cust.contact_email:
+            is_personal_email = is_personal_email_domain(cust.contact_email)
         if cust and cust.end_date:
             end_dt = cust.end_date
             end_date_iso = end_dt.isoformat()
             now_dt = datetime.now(timezone.utc) if end_dt.tzinfo else datetime.now()
             delta_days = (end_dt - now_dt).days + (1 if (end_dt - now_dt).seconds > 0 else 0)
             days_remaining = max(0, delta_days)
+
+        has_verified_log = (
+            db.query(AuditLog.id)
+            .filter(
+                AuditLog.customer_id == int(customer_id),
+                AuditLog.action_type == "TRIAL_POST_REVIEW_VERIFIED",
+            )
+            .first()
+            is not None
+        )
+        if has_verified_log:
+            review_status = "VERIFIED"
+        else:
+            has_needs_review_log = (
+                db.query(AuditLog.id)
+                .filter(
+                    AuditLog.customer_id == int(customer_id),
+                    AuditLog.action_type == "TRIAL_AUTO_ACTIVATED_NEEDS_REVIEW",
+                )
+                .first()
+                is not None
+            )
+            if has_needs_review_log:
+                review_status = "NEEDS_REVIEW"
 
         treg = (
             db.query(TrialRegistration)
@@ -454,16 +513,17 @@ def get_trial_usage_snapshot(db: Session, customer_id: int) -> Dict[str, Any]:
         stmts = (
             db.query(BankStatement)
             .filter(BankStatement.company_id == customer_id, BankStatement.is_deleted == False)
-            .limit(20)
+            .limit(30)
             .all()
         )
-        statement_count = len(stmts)
-        if not own_documents_uploaded:
-            for st in stmts:
-                fn = getattr(st, "file_name", None) or getattr(st, "original_filename", None) or ""
-                if fn and not _is_sample_filename(fn):
-                    own_documents_uploaded = True
-                    break
+        any_statement_present = len(stmts) > 0
+        non_sample_stmts = 0
+        for st in stmts:
+            fn = getattr(st, "file_name", None) or getattr(st, "original_filename", None) or ""
+            if not _is_sample_filename(fn):
+                non_sample_stmts += 1
+                own_documents_uploaded = True
+        statement_count = non_sample_stmts
     except Exception:
         pass
 
@@ -482,7 +542,7 @@ def get_trial_usage_snapshot(db: Session, customer_id: int) -> Dict[str, Any]:
     steps_completed = {
         "custody": custody_engaged,
         "issuance": issuance_engaged,
-        "reconciliation": statement_count > 0,
+        "reconciliation": any_statement_present,
         "quotations": rfq_count > 0,
     }
     any_test_done = any(steps_completed.values())
@@ -511,6 +571,9 @@ def get_trial_usage_snapshot(db: Session, customer_id: int) -> Dict[str, Any]:
         "end_date": end_date_iso,
         "days_remaining": days_remaining if is_activated else caps["duration_days"],
         "days_since_activation": days_since_activation,
+        "is_personal_email": is_personal_email,
+        "solo_mode": is_personal_email,
+        "review_status": review_status,
         "own_documents_uploaded": own_documents_uploaded,
         "invited_colleagues_count": len(invited_colleagues),
         "invited_colleagues": invited_colleagues,
@@ -743,10 +806,13 @@ def filter_trial_outbound_emails(
         return to_emails
 
     allowed_domains = {"growbusinessdevelopment.com"}
+    allowed_exact_emails: set = set()
     if extra_allowed_domains:
         for d in extra_allowed_domains:
             if d:
-                allowed_domains.add(str(d).strip().lower())
+                clean_d = str(d).strip().lower()
+                if not is_personal_email_domain(clean_d) and not is_disposable_email_domain(clean_d):
+                    allowed_domains.add(clean_d)
 
     def _is_simulated_addr_or_domain(addr: str, d: str) -> bool:
         return (
@@ -770,7 +836,9 @@ def filter_trial_outbound_emails(
                     clean_u = u_email.strip().lower()
                     dom = clean_u.rsplit("@", 1)[1].strip()
                     if not _is_simulated_addr_or_domain(clean_u, dom):
-                        allowed_domains.add(dom)
+                        allowed_exact_emails.add(clean_u)
+                        if not is_personal_email_domain(dom) and not is_disposable_email_domain(dom):
+                            allowed_domains.add(dom)
 
             if is_trial_mode() and not eff_cust_id:
                 for (reg_email,) in db.query(TrialRegistration.admin_email).limit(300).all():
@@ -778,7 +846,9 @@ def filter_trial_outbound_emails(
                         clean_r = reg_email.strip().lower()
                         dom = clean_r.rsplit("@", 1)[1].strip()
                         if not _is_simulated_addr_or_domain(clean_r, dom):
-                            allowed_domains.add(dom)
+                            allowed_exact_emails.add(clean_r)
+                            if not is_personal_email_domain(dom) and not is_disposable_email_domain(dom):
+                                allowed_domains.add(dom)
         except Exception:
             pass
 
@@ -791,8 +861,32 @@ def filter_trial_outbound_emails(
         if _is_simulated_addr_or_domain(clean, dom):
             logger.info(f"[TrialSandbox] Suppressed simulated recipient email: {clean}")
             continue
-        if dom in allowed_domains:
+        if clean in allowed_exact_emails or dom in allowed_domains:
             safe_recipients.append(raw)
         else:
             logger.info(f"[TrialSandbox] Blocked external domain email for trial session: {clean}")
     return safe_recipients
+
+
+def enforce_trial_setup_preview(
+    db: Optional[Session],
+    customer_id: Optional[int],
+    area: str = "System configuration",
+) -> None:
+    """
+    Protects Free Trial workspaces when evaluators switch to Full Mode + Corporate Admin:
+    allows full read/inspection of all setup screens and full Approval Center execution,
+    while blocking structural setup & governance mutations that could break pre-configured
+    trial scenarios. 100% no-op for paying commercial customers and System Owners.
+    """
+    if not customer_id or not is_trial_customer(db, customer_id):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            f"Preview Mode (Free Trial): {area} is pre-configured so your trial scenarios run smoothly. "
+            "Full customization is unlocked on live accounts."
+        ),
+    )
+

@@ -549,7 +549,7 @@ class LGRecord(BaseModel):
     instructions = relationship("LGInstruction", back_populates="lg_record")
     change_logs = relationship("LGChangeLog", back_populates="lg_record")
     __table_args__ = (
-        UniqueConstraint('lg_number', name='uq_lg_record_number'),
+        UniqueConstraint('customer_id', 'issuing_bank_id', 'lg_number', name='uq_lg_record_customer_bank_number'),
         UniqueConstraint('beneficiary_corporate_id', 'lg_sequence_number', name='uq_lg_sequence_per_entity'),
         Index('idx_lg_record_customer_id', 'customer_id'),
         Index('idx_lg_record_lg_number', 'lg_number'),

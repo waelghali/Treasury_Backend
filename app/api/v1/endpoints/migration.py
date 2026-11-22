@@ -4,7 +4,7 @@ import io
 import json
 import re
 from typing import Optional, List, Dict, Any, Tuple
-from fastapi import APIRouter, Body, Depends, HTTPException, status, UploadFile, File, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, cast
 from pydantic import BaseModel
@@ -49,10 +49,20 @@ from datetime import date, datetime
 import logging
 logger = logging.getLogger(__name__)
 
+def _guard_trial_migration_writes(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+) -> None:
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        from app.core.trial_guard import enforce_trial_setup_preview
+        enforce_trial_setup_preview(db, current_user.customer_id, "Bulk legacy data migration")
+
+
 router = APIRouter(
     prefix="/migration",
     tags=["Migration"],
-    dependencies=[Depends(get_current_corporate_admin_context)],
+    dependencies=[Depends(get_current_corporate_admin_context), Depends(_guard_trial_migration_writes)],
 )
 
 column_mapping = {

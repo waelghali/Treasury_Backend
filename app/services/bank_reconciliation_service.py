@@ -191,19 +191,58 @@ class BankReconciliationService:
         'يوليو': 7, 'اغسطس': 8, 'سبتمبر': 9, 'اكتوبر': 10, 'نوفمبر': 11, 'ديسمبر': 12
     }
 
+    _ARABIC_DIGIT_TRANS = str.maketrans(
+        "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬",
+        "01234567890123456789.,",
+    )
+
     def _clean_decimal(self, val: Any) -> Decimal:
         if pd.isna(val) or val == "" or val is None:
             return Decimal("0.00")
-        try:
-            s = str(val).strip()
-            # Handle accounting parentheses for negative numbers e.g. (1,250.00) or trailing DR
-            is_neg = False
-            if (s.startswith("(") and s.endswith(")")) or s.upper().endswith("DR") or s.endswith("-"):
-                is_neg = True
-            clean_val = re.sub(r'[^\d.-]', '', s)
-            if not clean_val or clean_val in ("-", ".", "-."):
+        if isinstance(val, (int, float, Decimal)) and not isinstance(val, bool):
+            try:
+                return Decimal(str(val)).quantize(Decimal("1.00"))
+            except (InvalidOperation, ValueError):
                 return Decimal("0.00")
-            dec = Decimal(clean_val).quantize(Decimal("1.00"))
+        try:
+            s = str(val).translate(self._ARABIC_DIGIT_TRANS).strip()
+            if not s or s.lower() in ("nan", "none", "null"):
+                return Decimal("0.00")
+            s_up = s.upper()
+            # Handle accounting parentheses (1,250.00), leading/trailing minus (15,000.00-), or DR/مدين suffix
+            is_neg = bool(
+                (s.startswith("(") and s.endswith(")"))
+                or s.startswith("-")
+                or s.startswith("−")
+                or s.endswith("-")
+                or s.endswith("−")
+                or re.search(r"(?:\bDR|\bDEBIT|مدين)\s*$", s_up)
+            )
+            num_part = re.sub(r"[^\d.,]", "", s)
+            if not num_part or not re.search(r"\d", num_part):
+                return Decimal("0.00")
+
+            # Resolve US/UK (1,250,000.50) vs European (1.250.000,50) decimal/thousand separators
+            if "." in num_part and "," in num_part:
+                if num_part.rfind(",") > num_part.rfind("."):
+                    # European format: 1.250.000,50
+                    num_part = num_part.replace(".", "").replace(",", ".")
+                else:
+                    # Standard US/UK format: 1,250,000.50
+                    num_part = num_part.replace(",", "")
+            elif "," in num_part:
+                # Single comma with 1-2 trailing digits -> decimal comma (e.g. 0,00 or 15400,25)
+                if num_part.count(",") == 1 and len(num_part.rsplit(",", 1)[1]) in (1, 2):
+                    num_part = num_part.replace(",", ".")
+                else:
+                    num_part = num_part.replace(",", "")
+            elif num_part.count(".") > 1:
+                # Multiple dots with no comma -> dot thousands (e.g. 1.250.000)
+                num_part = num_part.replace(".", "")
+
+            if not num_part or num_part == ".":
+                return Decimal("0.00")
+            dec = Decimal(num_part).quantize(Decimal("1.00"))
             if is_neg and dec > 0:
                 dec = -dec
             return dec
@@ -565,18 +604,38 @@ class BankReconciliationService:
         sample_head = df.head(50).astype(str)
         sample_tail = df.tail(50).astype(str)
         
+        def _looks_like_date_or_period_cell(raw_val: Any) -> bool:
+            s = str(raw_val or "").strip()
+            if not s or s.lower() in ("nan", "none", "nat"):
+                return True
+            low = s.lower()
+            # Reject date ranges & calendar dates (e.g. "01/10/2026 - 31/10/2026" -> would otherwise concatenate digits!)
+            if re.search(r"\b\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b", s):
+                return True
+            if any(m in low for m in ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec", "يناير", "فبراير", "مارس", "أبريل", "ابريل", "مايو", "يونيو", "يوليو", "أغسطس", "اغسطس", "سبتمبر", "أكتوبر", "اكتوبر", "نوفمبر", "ديسمبر")):
+                return True
+            # Reject long unformatted account/IBAN/reference digit strings (>12 digits with no decimal separator)
+            digits_only = re.sub(r"\D", "", s)
+            if len(digits_only) > 12 and "." not in s and "," not in s:
+                return True
+            return False
+
         for _, sample in [("head", sample_head), ("tail", sample_tail)]:
             for _, row in sample.iterrows():
                 row_str = " ".join(row.values).lower()
                 
                 if any(kw in row_str for kw in ["opening", "balance b/f", "رصيد سابق", "رصيد اول", "carried forward"]):
                     for val in row.values:
+                        if _looks_like_date_or_period_cell(val):
+                            continue
                         dec = self._clean_decimal(val)
                         if dec != 0 and metadata["opening_balance"] is None: 
                             metadata["opening_balance"] = dec
                 
                 if any(kw in row_str for kw in ["closing", "balance c/f", "رصيد حالي", "رصيد اخر", "current balance", "ending balance"]):
                     for val in row.values:
+                        if _looks_like_date_or_period_cell(val):
+                            continue
                         dec = self._clean_decimal(val)
                         if dec != 0 and metadata["closing_balance"] is None: 
                             metadata["closing_balance"] = dec
@@ -684,11 +743,14 @@ class BankReconciliationService:
             return txns, meta
         elif ft in ('csv', 'txt'):
             def _load_csv_bytes(raw_bytes: bytes, enc: str = "utf-8"):
+                text_probe = raw_bytes[:4096].decode(enc, errors="ignore")
+                first_line = next((ln for ln in text_probe.splitlines() if ln.strip()), "")
+                delim = ";" if (first_line.count(";") > first_line.count(",")) else ("\t" if (first_line.count("\t") > first_line.count(",")) else ",")
                 try:
-                    return pd.read_csv(io.BytesIO(raw_bytes), encoding=enc)
+                    return pd.read_csv(io.BytesIO(raw_bytes), encoding=enc, sep=delim)
                 except Exception:
                     text_data = raw_bytes.decode(enc, errors="replace")
-                    rows_list = list(csv.reader(io.StringIO(text_data)))
+                    rows_list = list(csv.reader(io.StringIO(text_data), delimiter=delim))
                     if not rows_list:
                         return pd.DataFrame()
                     max_cols = max(len(r) for r in rows_list)
@@ -700,13 +762,40 @@ class BankReconciliationService:
             except UnicodeDecodeError:
                 df = _load_csv_bytes(content, "cp1256")
         elif ft in ('xls', 'xlsx', 'xlsb'):
-            xl = pd.ExcelFile(io.BytesIO(content))
-            # Pick the first non-empty sheet with transaction-like rows
-            df = xl.parse(xl.sheet_names[0], header=None)
+            try:
+                xl = pd.ExcelFile(io.BytesIO(content))
+            except Exception as xl_err:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or corrupted Excel file. Please upload a valid .xlsx, .xls, or .csv bank statement.",
+                ) from xl_err
+
+            # Score worksheets by banking header cues rather than raw row count so lookup/instruction tabs never hijack ingestion
+            best_sheet_df = None
+            best_sheet_score = (-1, -1)
+            stmt_date_kws = ('date', 'booking', 'posting', 'trx', 'تاريخ', 'يوم')
+            stmt_money_kws = ('debit', 'credit', 'withdraw', 'deposit', 'balance', 'running', 'amount', 'مدين', 'دائن', 'رصيد', 'مبلغ')
             for s_name in xl.sheet_names:
                 cand_df = xl.parse(s_name, header=None).dropna(how='all')
-                if len(cand_df) > len(df):
-                    df = cand_df
+                if cand_df.empty:
+                    continue
+                s_score = 0
+                s_low = str(s_name).lower()
+                if any(w in s_low for w in ('statement', 'stmt', 'account', 'transactions', 'كشف', 'حركات')):
+                    s_score += 4
+                if any(w in s_low for w in ('instruction', 'lookup', 'readme', 'codes', 'glossary', 'تعليمات', 'دليل')):
+                    s_score -= 5
+                for r_i in range(min(25, len(cand_df))):
+                    r_txt = " ".join(str(v).lower() for v in cand_df.iloc[r_i].values if pd.notna(v))
+                    has_d = any(k in r_txt for k in stmt_date_kws)
+                    m_hits = sum(1 for k in stmt_money_kws if k in r_txt)
+                    if has_d and m_hits >= 1:
+                        s_score = max(s_score, 10 + m_hits * 3)
+                cand_rank = (s_score, len(cand_df))
+                if best_sheet_df is None or cand_rank > best_sheet_score:
+                    best_sheet_df = cand_df
+                    best_sheet_score = cand_rank
+            df = best_sheet_df if best_sheet_df is not None else pd.DataFrame()
         elif ft == 'pdf':
             from app.services.pdf_statement_parser import (
                 get_candidate_pdf_passwords,
@@ -753,6 +842,53 @@ class BankReconciliationService:
             "amt": ['amount', 'debit', 'credit', 'withdraw', 'deposit', 'value', 'balance', 'مبلغ', 'القيمة', 'مدين', 'دائن', 'رصيد']
         }
 
+        # Check for wrong-document-type / wrong-upload-box spreadsheets before header promotion
+        probe_header_cells: List[str] = [
+            str(c).lower().strip() for c in df.columns if pd.notna(c) and not str(c).startswith("Unnamed")
+        ]
+        for p_idx in range(min(10, len(df))):
+            probe_header_cells.extend(
+                str(v).lower().strip() for v in df.iloc[p_idx].values if pd.notna(v) and str(v).strip()
+            )
+        has_cash_ledger_cols = (
+            any(any(k in h for k in ('running balance', 'closing balance', 'opening balance', 'balance', 'رصيد')) for h in probe_header_cells)
+            or (
+                any(any(k in h for k in ('debit', 'withdrawal', 'مدين')) for h in probe_header_cells)
+                and any(any(k in h for k in ('credit', 'deposit', 'دائن')) for h in probe_header_cells)
+            )
+        )
+        hr_kw_hits = sum(
+            1
+            for kw in ('employee id', 'emp id', 'hire date', 'monthly salary', 'basic salary', 'net salary', 'job title', 'payroll', 'رقم الموظف', 'تاريخ التعيين', 'الراتب')
+            if any(kw in h for h in probe_header_cells)
+        )
+        if hr_kw_hits >= 2 and not has_cash_ledger_cols:
+            raise HTTPException(
+                status_code=400,
+                detail="Wrong document type: This file appears to be an HR / Payroll spreadsheet rather than a Bank Statement. Please upload a valid Bank Cash Statement.",
+            )
+        if (
+            any(any(k in h for k in ('lg number', 'lg_number', 'lg no', 'guarantee no', 'guarantee number', 'رقم الخطاب', 'خطاب ضمان')) for h in probe_header_cells)
+            and any(any(k in h for k in ('expiry', 'beneficiary', 'تاريخ الانتهاء', 'المستفيد')) for h in probe_header_cells)
+            and not has_cash_ledger_cols
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Wrong upload box: This file appears to be a Bank LG Position sheet rather than a Cash Bank Statement. Please upload it in LG Position Reconciliation instead.",
+            )
+        top_col_low = [str(c).lower().strip() for c in df.columns if pd.notna(c) and not str(c).startswith("Unnamed")]
+        if not top_col_low and len(df) > 0:
+            top_col_low = [str(v).lower().strip() for v in df.iloc[0].values if pd.notna(v)]
+        has_erp_col_or_marker = (
+            any(any(k in h for k in ('invoice date', 'bill date', 'record type', 'invoice no', 'invoice #', 'bill #', 'voucher no', 'gl account', 'رقم الفاتورة')) for h in top_col_low)
+            or any(any(k in cell for k in ('ar_invoice', 'ap_bill', 'sales invoice', 'purchase invoice', 'vendor bill', 'open invoice')) for cell in probe_header_cells)
+        )
+        if has_erp_col_or_marker and not has_cash_ledger_cols:
+            raise HTTPException(
+                status_code=400,
+                detail="Wrong upload box: This file looks like an ERP Open Invoices / Payables ledger rather than a Bank Statement. Please upload it under 'ERP Open Invoices / Payables' instead.",
+            )
+
         # Check if df.columns already represents the real table header
         existing_col_strs = [str(c).lower().strip() for c in df.columns if pd.notna(c) and not str(c).startswith("Unnamed")]
         cols_have_date = any(any(kw in c for kw in header_keywords["date"]) for c in existing_col_strs)
@@ -783,7 +919,19 @@ class BankReconciliationService:
         metadata["balance_continuity_status"] = "VALIDATED"
 
         if not mapping.get('date') or (not mapping.get('amount') and not mapping.get('creditamount') and not mapping.get('debitamount')):
-            logger.warning("Heuristic detection incomplete. Using value-based smart fallback...")
+            is_unnamed_table = all(
+                isinstance(c, (int, float))
+                or str(c).startswith(("Unnamed", "Col_"))
+                or bool(re.match(r'^[\d\s,.-]+$', str(c)))
+                for c in df.columns
+                if pd.notna(c) and str(c).strip() != ""
+            )
+            if not is_unnamed_table:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unrecognized Bank Statement format: Could not detect required Date and Amount (or Debit/Credit) columns.",
+                )
+            logger.warning("Headerless table detected. Using value-based smart fallback...")
             non_empty_cols = [c for c in df.columns if df[c].dropna().count() > 0]
             if len(non_empty_cols) >= 2:
                 detected_date = False
@@ -794,7 +942,10 @@ class BankReconciliationService:
                         detected_date = True
                         break
                 if not detected_date:
-                    mapping['date'] = non_empty_cols[0]
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unrecognized file format: Could not detect transaction dates in the uploaded file.",
+                    )
                 remaining = [c for c in non_empty_cols if c != mapping.get('date')]
                 if remaining:
                     mapping['amount'] = remaining[0]
@@ -808,10 +959,18 @@ class BankReconciliationService:
             if c not in mapped_col_names and not str(c).startswith("Unnamed") and not isinstance(c, (int, float))
         ]
 
+        summary_exact_labels = {
+            "total", "totals", "grand total", "sub total", "subtotal", "summary",
+            "page total", "statement total", "إجمالي", "اجمالي", "الإجمالي",
+            "الاجمالي", "مجموع", "المجموع", "ملخص",
+        }
+        summary_phrases = (
+            "total movements", "total transactions", "total debit", "total credit",
+            "إجمالي الحركات", "اجمالي الحركات", "مجموع الحركات",
+            "إجمالي المدين", "اجمالي المدين", "إجمالي الدائن", "اجمالي الدائن",
+        )
+
         transactions = []
-        running_balance_acc = self._clean_decimal(metadata.get("opening_balance")) if metadata.get("opening_balance") else None
-        strong_anchor = False
-        seen_row_Checksums = set()
         
         for idx, row in df.iterrows():
             try:
@@ -835,14 +994,23 @@ class BankReconciliationService:
                 )
                 if is_continuation:
                     if transactions and desc and not any(kw in desc.lower() for kw in balance_keywords):
-                        transactions[-1]["raw_description"] = f"{transactions[-1]['raw_description']} {desc}".strip()
+                        desc_cont_norm = re.sub(r"[\s:._\-]+", " ", desc.lower()).strip()
+                        if desc_cont_norm not in summary_exact_labels and not any(p in desc_cont_norm for p in summary_phrases):
+                            transactions[-1]["raw_description"] = f"{transactions[-1]['raw_description']} {desc}".strip()
                     continue
 
                 if _is_blank(date_val):
                     continue
+
+                date_str_low = str(date_val).strip().lower()
+                if any(tok in date_str_low for tok in ("total", "subtotal", "إجمالي", "اجمالي", "مجموع", "ملخص")):
+                    continue
                 
                 desc_low = desc.lower()
                 if any(kw in desc_low for kw in balance_keywords):
+                    continue
+                desc_norm = re.sub(r"[\s:._\-]+", " ", desc_low).strip()
+                if desc_norm in summary_exact_labels or any(p in desc_norm for p in summary_phrases):
                     continue
                     
                 booking_date = self._resolve_transaction_date(date_val, narrative=desc, metadata=metadata)
@@ -860,6 +1028,12 @@ class BankReconciliationService:
 
                 debit = abs(self._clean_decimal(debit_val)) if mapping.get("debitamount") else (abs(amount) if amount < 0 else Decimal("0.00"))
                 credit = abs(self._clean_decimal(credit_val)) if mapping.get("creditamount") else (amount if amount > 0 else Decimal("0.00"))
+
+                # Skip summary footer rows that aggregate both non-zero Debit and Credit totals on one line
+                if debit > 0 and credit > 0 and (
+                    not desc_norm or any(w in desc_norm for w in ("total", "sum", "إجمالي", "اجمالي", "مجموع", "ملخص"))
+                ):
+                    continue
                 
                 if mapping.get("debitamount") or mapping.get("creditamount"):
                     amount = credit - debit
@@ -867,36 +1041,10 @@ class BankReconciliationService:
                 if amount == 0 and debit == 0 and credit == 0 and not desc:
                     continue
 
-                # Running Balance Continuity Check
-                excel_balance_val = row.get(mapping.get("balance"))
+                excel_balance_val = row.get(mapping.get("balance")) if mapping.get("balance") else None
                 reported_balance = None
-                if not pd.isna(excel_balance_val) and str(excel_balance_val).strip() != "":
+                if excel_balance_val is not None and not pd.isna(excel_balance_val) and str(excel_balance_val).strip() != "":
                     reported_balance = self._clean_decimal(excel_balance_val)
-                
-                if running_balance_acc is not None:
-                    expected_balance = running_balance_acc + amount
-                    if reported_balance is not None:
-                        variance = abs(expected_balance - reported_balance)
-                        if variance > Decimal("0.02"):
-                            if strong_anchor:
-                                warn_msg = (
-                                    f"Balance continuity gap on {booking_date.strftime('%Y-%m-%d')}: "
-                                    f"Expected {expected_balance} ({running_balance_acc} + {amount}), "
-                                    f"Reported {reported_balance} (Delta: {reported_balance - expected_balance})."
-                                )
-                                metadata["continuity_warnings"].append(warn_msg)
-                                metadata["balance_variance_amount"] += (reported_balance - expected_balance)
-                                metadata["balance_continuity_status"] = "CONTINUITY_WARNING"
-                        running_balance_acc = reported_balance
-                        strong_anchor = True
-                    else:
-                        running_balance_acc = expected_balance
-                else:
-                    running_balance_acc = reported_balance if reported_balance is not None else Decimal("0.00")
-                    if reported_balance is not None:
-                        strong_anchor = True
-                
-                running_balance = running_balance_acc
 
                 # Preserve any extra customer/bank columns in custom_fields_json
                 custom_fields: Dict[str, Any] = {}
@@ -941,11 +1089,6 @@ class BankReconciliationService:
                 extracted_iban, iban_bank_code, iban_bank_name = reconciliation_confidentiality.extract_iban_and_bank_code(full_narrative)
                 amt_tier = classify_amount_tier(max(debit, credit))
 
-                # Duplicate row check within file
-                row_sig = f"{booking_date.strftime('%Y-%m-%d')}|{debit}|{credit}|{running_balance}|{desc[:40]}"
-                is_dup = row_sig in seen_row_Checksums
-                seen_row_Checksums.add(row_sig)
-
                 val_date_raw = row.get(mapping.get("value_date")) if mapping.get("value_date") else None
                 resolved_value_date = self._resolve_transaction_date(val_date_raw, narrative=desc, metadata=metadata) if val_date_raw is not None and not pd.isna(val_date_raw) else None
                 effective_value_date = resolved_value_date or booking_date
@@ -983,7 +1126,9 @@ class BankReconciliationService:
                     "raw_description": desc,
                     "description_line2": desc2_clean,
                     "currency": row_currency,
-                    "running_balance": running_balance,
+                    "running_balance": reported_balance,
+                    "_reported_balance": reported_balance,
+                    "_signed_amount": amount,
                     "amount_tier": amt_tier,
                     "counterparty_iban": extracted_iban,
                     "counterparty_bank": iban_bank_name,
@@ -991,7 +1136,7 @@ class BankReconciliationService:
                     "counterparty_name": effective_counterparty,
                     "e2e_id": std_decoded.get("extracted_e2e_ref"),
                     "custom_fields_json": custom_fields if custom_fields else None,
-                    "is_duplicate": is_dup,
+                    "is_duplicate": False,
                     
                     # Expanded fields with auto-filling defaults
                     "company_name": self._sanitize_text(row.get(mapping.get("company"))) if mapping.get("company") else metadata.get("company_name"),
@@ -1028,6 +1173,57 @@ class BankReconciliationService:
                 logger.error(f"Row {idx} mapping error: {e}")
                 continue
 
+        # Normalize reverse-chronological exports (newest-first) to chronological order BEFORE running balance audit
+        if transactions:
+            is_reverse_order = len(transactions) >= 2 and transactions[0]["booking_date"] > transactions[-1]["booking_date"]
+            if is_reverse_order:
+                transactions = [
+                    pair[1]
+                    for pair in sorted(enumerate(transactions), key=lambda pair: (pair[1]["booking_date"], -pair[0]))
+                ]
+
+            running_balance_acc = (
+                self._clean_decimal(metadata.get("opening_balance"))
+                if metadata.get("opening_balance") is not None
+                else None
+            )
+            strong_anchor = False
+            seen_row_checksums = set()
+
+            for txn in transactions:
+                amt = txn.get("_signed_amount") or Decimal("0.00")
+                rep_bal = txn.get("_reported_balance")
+                b_dt = txn["booking_date"]
+
+                if running_balance_acc is not None:
+                    expected_balance = running_balance_acc + amt
+                    if rep_bal is not None:
+                        variance = abs(expected_balance - rep_bal)
+                        if variance > Decimal("0.02") and strong_anchor:
+                            warn_msg = (
+                                f"Balance continuity gap on {b_dt.strftime('%Y-%m-%d')}: "
+                                f"Expected {expected_balance} ({running_balance_acc} + {amt}), "
+                                f"Reported {rep_bal} (Delta: {rep_bal - expected_balance})."
+                            )
+                            metadata["continuity_warnings"].append(warn_msg)
+                            metadata["balance_variance_amount"] += (rep_bal - expected_balance)
+                            metadata["balance_continuity_status"] = "CONTINUITY_WARNING"
+                        running_balance_acc = rep_bal
+                        strong_anchor = True
+                    else:
+                        running_balance_acc = expected_balance
+                else:
+                    if rep_bal is not None:
+                        running_balance_acc = rep_bal
+                        strong_anchor = True
+                    else:
+                        running_balance_acc = amt
+
+                txn["running_balance"] = running_balance_acc
+                row_sig = f"{b_dt.strftime('%Y-%m-%d')}|{txn['debit_amount']}|{txn['credit_amount']}|{running_balance_acc}|{(txn.get('raw_description') or '')[:40]}"
+                txn["is_duplicate"] = row_sig in seen_row_checksums
+                seen_row_checksums.add(row_sig)
+
         # Relational Context Pass: Link companion wire fees to adjacent parent transfers
         self._link_companion_fees_in_batch(transactions)
 
@@ -1052,14 +1248,19 @@ class BankReconciliationService:
             sorted_txns = sorted(transactions, key=lambda x: x["booking_date"])
             metadata["start_date"] = sorted_txns[0]["booking_date"]
             metadata["end_date"] = sorted_txns[-1]["booking_date"]
-            is_reverse_order = transactions[0]["booking_date"] > transactions[-1]["booking_date"]
-            latest_txn = (
-                sorted(enumerate(transactions), key=lambda pair: (pair[1]["booking_date"], -pair[0]))[-1][1]
-                if is_reverse_order
-                else sorted_txns[-1]
-            )
+            earliest_txn = transactions[0]
+            latest_txn = transactions[-1]
+            # Only back-calculate opening_balance when an explicit reported balance column exists on the earliest row
+            if metadata.get("opening_balance") is None and earliest_txn.get("_reported_balance") is not None:
+                e_credit = Decimal(str(earliest_txn.get("credit_amount") or 0))
+                e_debit = Decimal(str(earliest_txn.get("debit_amount") or 0))
+                metadata["opening_balance"] = earliest_txn["_reported_balance"] - (e_credit - e_debit)
             if metadata.get("closing_balance") is None and latest_txn.get("running_balance") is not None:
                 metadata["closing_balance"] = latest_txn["running_balance"]
+
+            for txn in transactions:
+                txn.pop("_reported_balance", None)
+                txn.pop("_signed_amount", None)
 
         del df
         _reclaim_system_memory()
@@ -1100,13 +1301,42 @@ class BankReconciliationService:
         account_number = overrides.get("account_number") or detected_meta.get("account_number")
         currency_id = overrides.get("currency_id")
 
+        if not txns_data:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid bank transactions were found in the uploaded file. Please check the file contents and format.",
+            )
+
         if not start_date or not end_date:
-            msg = "Could not detect statement dates."
-            if not txns_data:
-                msg += " No transactions were found in the file."
-            else:
-                msg += f" Found {len(txns_data)} transactions but dates were invalid."
-            raise HTTPException(status_code=400, detail=msg)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not detect valid statement dates across {len(txns_data)} rows.",
+            )
+
+        # Guard against accidental duplicate uploads of the exact same statement period & balances
+        dup_candidates = db.query(BankStatement).filter(
+            BankStatement.company_id == company_id,
+            BankStatement.bank_id == bank_id,
+            BankStatement.is_deleted == False,
+            BankStatement.statement_start_date == start_date,
+            BankStatement.statement_end_date == end_date,
+            BankStatement.opening_balance == opening_balance,
+            BankStatement.closing_balance == closing_balance,
+        ).all()
+        for dup_stmt in dup_candidates:
+            existing_txn_cnt = db.query(BankTransaction).filter(
+                BankTransaction.statement_id == dup_stmt.id,
+                BankTransaction.is_deleted == False,
+            ).count()
+            if existing_txn_cnt == len(txns_data):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Duplicate statement rejected: This bank statement "
+                        f"({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}, "
+                        f"{existing_txn_cnt} transactions) has already been uploaded (Statement #{dup_stmt.id})."
+                    ),
+                )
 
         continuity_status = detected_meta.get("balance_continuity_status", "VALIDATED")
         db_stmt = BankStatement(
@@ -2241,7 +2471,12 @@ class BankReconciliationService:
                 if txn_abs <= 0:
                     continue
 
+                txn_ccy = (txn.currency or "EGP").strip().upper()
+
                 for j, erp in enumerate(open_erp_records):
+                    erp_ccy = (erp.currency or "EGP").strip().upper()
+                    if txn_ccy != erp_ccy:
+                        continue
                     erp_amt = Decimal(str(erp.amount or 0))
                     erp_is_credit = erp_amt > Decimal("0.00")
                     if txn_is_credit != erp_is_credit:
@@ -2349,18 +2584,25 @@ class BankReconciliationService:
             direction = "CREDIT" if txn_is_credit else "DEBIT"
             bank_id = txn.statement.bank_id if txn.statement else None
 
-            # Determine applicable tolerance bounds (from learned rules or sensible defaults)
-            max_fixed = Decimal("100.00")
+            # Determine applicable tolerance bounds:
+            # - Default unlearned bank-fee tolerance is strictly capped at <= 500 AND <= 2.5% (so SWIFT/wire fees like 150 on 1.25M match, while large partial payments never auto-writeoff).
+            # - Explicit learned MatchingToleranceRule rows honor their configured max_fixed / max_pct bounds.
+            has_learned_rule = False
+            max_fixed = Decimal("500.00")
             max_pct = Decimal("0.0250")
             max_days = 7
             for tr in tolerance_rules:
                 if (tr.bank_id in (None, bank_id)) and (tr.direction in ("EITHER", direction)):
+                    has_learned_rule = True
                     max_fixed = max(max_fixed, Decimal(str(tr.max_fixed_fee_variance or 100)))
                     max_pct = max(max_pct, Decimal(str(tr.max_percentage_variance or 0.025)))
                     max_days = max(max_days, int(tr.max_date_window_days or 7))
 
+            txn_ccy_p2 = (txn.currency or "EGP").strip().upper()
             for erp in open_erp_records:
                 if erp.id in used_erp_ids:
+                    continue
+                if (erp.currency or "EGP").strip().upper() != txn_ccy_p2:
                     continue
                 erp_amt = Decimal(str(erp.amount or 0))
                 if (erp_amt > 0) != txn_is_credit:
@@ -2383,7 +2625,10 @@ class BankReconciliationService:
                 if days_diff > max_days:
                     continue
 
-                within_tolerance = (diff <= max_fixed) or (erp_abs > 0 and (diff / erp_abs) <= max_pct)
+                if has_learned_rule:
+                    within_tolerance = (diff <= max_fixed) or (erp_abs > 0 and (diff / erp_abs) <= max_pct)
+                else:
+                    within_tolerance = (diff <= max_fixed) and (erp_abs > 0 and (diff / erp_abs) <= max_pct)
                 if within_tolerance:
                     new_match = ReconciliationMatch(
                         bank_txn_id=txn.id,
@@ -2420,10 +2665,13 @@ class BankReconciliationService:
             txn_abs = txn_credit if txn_is_credit else txn_debit
             b_date = txn.booking_date.replace(tzinfo=None) if txn.booking_date else None
 
-            # Filter candidate ERP records with same sign and within 7 days
+            # Filter candidate ERP records with same currency, same sign, and within 7 days
+            txn_ccy_p3 = (txn.currency or "EGP").strip().upper()
             cand_erps = []
             for e in rem_erp:
                 if e.id in used_erp_ids:
+                    continue
+                if (e.currency or "EGP").strip().upper() != txn_ccy_p3:
                     continue
                 e_amt = Decimal(str(e.amount or 0))
                 if (e_amt > 0) != txn_is_credit or abs(e_amt) >= txn_abs:
@@ -2909,12 +3157,14 @@ class BankReconciliationService:
             tokens = set(re.findall(r'\b[A-Z0-9_]{8,}\b', desc.upper()))
             return {t for t in tokens if any(c.isdigit() for c in t) and not t.isdigit()}
 
-        # ── Pass 1: Direct Sweep Reference / Token Matching ──
+        # ── Pass 1: Direct Sweep Reference / Token Matching (Strictly Cross-Account / Cross-Statement) ──
         for i, t1 in enumerate(txns):
             if t1.id in processed_ids:
                 continue
 
             t1_desc_upper = (t1.raw_description or "").upper()
+            if any(rk in t1_desc_upper for rk in rev_keywords):
+                continue
             has_sweep_kw_1 = any(kw in t1_desc_upper for kw in sweep_keywords_upper)
             if not has_sweep_kw_1:
                 continue
@@ -2934,11 +3184,20 @@ class BankReconciliationService:
                 if t2.id in processed_ids:
                     continue
 
+                # Never classify two legs inside the exact same statement/account as an inter-bank sweep
+                same_stmt_or_acct = (t1.statement_id == t2.statement_id) or bool(
+                    t1.account_number and t2.account_number and t1.account_number == t2.account_number
+                )
+                if same_stmt_or_acct:
+                    continue
+
                 t2_is_credit = (t2.credit_amount or 0) > 0
                 if t1_is_credit == t2_is_credit:
                     continue
 
                 t2_desc_upper = (t2.raw_description or "").upper()
+                if any(rk in t2_desc_upper for rk in rev_keywords):
+                    continue
                 has_sweep_kw_2 = any(kw in t2_desc_upper for kw in sweep_keywords_upper)
                 if not has_sweep_kw_2:
                     continue
@@ -3003,22 +3262,29 @@ class BankReconciliationService:
                     continue
 
                 amt_diff = abs(t1_val - t2_val)
-                is_same_account = (t1.account_number and t2.account_number and t1.account_number == t2.account_number)
+                is_same_account = (t1.statement_id == t2.statement_id) or bool(
+                    t1.account_number and t2.account_number and t1.account_number == t2.account_number
+                )
                 date_diff = self._effective_date_distance_days(
                     t1.booking_date, getattr(t1, "value_date", None),
                     t2.booking_date, getattr(t2, "value_date", None),
                 )
 
-                # Reversals: Same Account, <= 7 days, equal amount
+                # Reversals: Same Statement / Account, <= 7 days, equal amount
                 if is_same_account and date_diff <= 7 and amt_diff == 0:
                     desc1 = (t1.raw_description or "").upper()
                     desc2 = (t2.raw_description or "").upper()
 
                     has_rev_keyword = any(kw in desc1 or kw in desc2 for kw in rev_keywords)
-                    names_match = desc1.split()[:3] == desc2.split()[:3]
-                    refs_match = t1.e2e_id and t2.e2e_id and t1.e2e_id == t2.e2e_id
+                    names_match = bool(desc1.split()[:3] and desc1.split()[:3] == desc2.split()[:3])
+                    refs_match = bool(t1.e2e_id and t2.e2e_id and t1.e2e_id == t2.e2e_id)
+                    shared_num_refs = bool(
+                        set(re.findall(r"\b\d{5,}\b", desc1)).intersection(
+                            set(re.findall(r"\b\d{5,}\b", desc2))
+                        )
+                    )
 
-                    if has_rev_keyword or names_match or refs_match:
+                    if has_rev_keyword or names_match or refs_match or shared_num_refs:
                         t1.linked_txn_id = t2.id
                         t2.linked_txn_id = t1.id
                         t1.is_reversal = True
@@ -3027,8 +3293,8 @@ class BankReconciliationService:
                         t2.is_reconciled = True
                         t1.classification_source = "BUILTIN"
                         t2.classification_source = "BUILTIN"
-                        t1.classification_confidence = 92
-                        t2.classification_confidence = 92
+                        t1.classification_confidence = 94
+                        t2.classification_confidence = 94
                         t1.auto_confirmed = True
                         t2.auto_confirmed = True
 
@@ -3043,6 +3309,8 @@ class BankReconciliationService:
                 if not is_same_account and date_diff <= 5 and is_within_fee_tolerance:
                     desc1_upper = (t1.raw_description or "").upper()
                     desc2_upper = (t2.raw_description or "").upper()
+                    if any(rk in desc1_upper or rk in desc2_upper for rk in rev_keywords):
+                        continue
 
                     refs_match = t1.e2e_id and t2.e2e_id and t1.e2e_id == t2.e2e_id
                     names_match = desc1_upper.split()[:3] == desc2_upper.split()[:3]
@@ -3101,19 +3369,75 @@ class BankReconciliationService:
     # ═══════════════════════════════════════════════════════════════════
 
     def process_erp_file_ingestion(self, db: Session, file_content: bytes, file_type: str, company_id: int, user_id: int) -> Dict[str, Any]:
+        ft_erp = (file_type or "").lower().strip().lstrip(".")
+        if ft_erp not in ("csv", "txt", "xlsx", "xls"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported ERP file format '.{ft_erp}'. Please upload a .csv or .xlsx ERP ledger/invoices file.",
+            )
+        if not file_content or file_content.lstrip().startswith(b"%PDF"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid ERP file: PDF documents cannot be uploaded as ERP Open Invoices / Payables. Please upload a .csv or .xlsx file.",
+            )
         try:
-            if file_type.lower() in ['csv', 'txt']:
+            if ft_erp in ("csv", "txt"):
+                def _read_erp_csv(raw_b: bytes, enc: str):
+                    head_s = raw_b[:4096].decode(enc, errors="ignore")
+                    first_ln = next((ln for ln in head_s.splitlines() if ln.strip()), "")
+                    sep = ","
+                    if first_ln:
+                        c_semi = first_ln.count(";")
+                        c_comma = first_ln.count(",")
+                        c_tab = first_ln.count("\t")
+                        if c_semi > c_comma and c_semi >= c_tab:
+                            sep = ";"
+                        elif c_tab > c_comma and c_tab > c_semi:
+                            sep = "\t"
+                    return pd.read_csv(io.BytesIO(raw_b), encoding=enc, sep=sep)
+
                 try:
-                    df = pd.read_csv(io.BytesIO(file_content))
+                    df = _read_erp_csv(file_content, "utf-8")
                 except UnicodeDecodeError:
-                    df = pd.read_csv(io.BytesIO(file_content), encoding='cp1256')
+                    df = _read_erp_csv(file_content, "cp1256")
             else:
                 df = pd.read_excel(io.BytesIO(file_content))
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to read ERP file: {str(e)}")
 
         if df.empty:
-            return {"imported_count": 0, "total_rows_processed": 0, "errors": ["File is empty"], "status": "Empty file"}
+            raise HTTPException(status_code=400, detail="Uploaded ERP file is empty.")
+
+        raw_erp_headers = [str(c).strip().lower() for c in df.columns if pd.notna(c) and not str(c).startswith("Unnamed")]
+        erp_hr_hits = sum(
+            1
+            for kw in ('employee id', 'emp id', 'hire date', 'monthly salary', 'basic salary', 'net salary', 'job title', 'payroll', 'department', 'رقم الموظف', 'تاريخ التعيين', 'الراتب')
+            if any(kw in h for h in raw_erp_headers)
+        )
+        if erp_hr_hits >= 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Wrong document type: This file appears to be an HR / Employee spreadsheet rather than ERP Open Invoices / Payables.",
+            )
+        if (
+            any(any(k in h for k in ('running balance', 'closing balance', 'opening balance', 'رصيد')) for h in raw_erp_headers)
+            and any(any(k in h for k in ('booking', 'value date', 'narration', 'description', 'بيان')) for h in raw_erp_headers)
+            and not any(any(k in h for k in ('invoice', 'bill', 'voucher', 'vendor', 'customer', 'gl', 'فاتورة')) for h in raw_erp_headers)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Wrong upload box: This file appears to be a Bank Cash Statement rather than ERP Open Invoices / Payables. Please upload it under 'Bank Statements' instead.",
+            )
+        if (
+            any(any(k in h for k in ('lg number', 'lg_number', 'lg no', 'guarantee no', 'guarantee number', 'رقم الخطاب')) for h in raw_erp_headers)
+            and any(any(k in h for k in ('expiry', 'beneficiary', 'تاريخ الانتهاء', 'المستفيد')) for h in raw_erp_headers)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Wrong upload box: This file appears to be a Bank LG Position list rather than ERP Open Invoices / Payables.",
+            )
 
         col_map = {}
         for c in df.columns:
@@ -3137,16 +3461,23 @@ class BankReconciliationService:
             elif not col_map.get("currency") and any(k in c_clean for k in ['currency', 'ccy', 'عملة']):
                 col_map["currency"] = c
 
-        # Value-distribution fallback if ref or amount headers had custom names
-        if not col_map.get("ref") or (not col_map.get("amount") and not (col_map.get("debit") and col_map.get("credit"))):
+        # Value-distribution fallback ONLY for headerless tables or when an explicit ERP column (ref/gl/type) was already matched
+        is_unnamed_erp = all(
+            isinstance(c, (int, float)) or str(c).startswith("Unnamed")
+            for c in df.columns
+            if pd.notna(c) and str(c).strip() != ""
+        )
+        has_erp_anchor = bool(col_map.get("ref") or col_map.get("gl") or col_map.get("type"))
+        if (is_unnamed_erp or has_erp_anchor) and (
+            not col_map.get("ref") or (not col_map.get("amount") and not (col_map.get("debit") and col_map.get("credit")))
+        ):
             for c in df.columns:
                 if c in col_map.values():
                     continue
                 sample_vals = df[c].dropna().astype(str).head(25)
                 if sample_vals.empty:
                     continue
-                # Check if numeric amount column
-                num_hits = sum(1 for v in sample_vals if re.match(r'^[-+]?[\d,]+(\.\d+)?$', v.strip()))
+                num_hits = sum(1 for v in sample_vals if re.match(r'^[-+]?[\d,.]+(\.\d+)?$', v.strip()))
                 if num_hits >= len(sample_vals) * 0.7 and not col_map.get("amount"):
                     col_map["amount"] = c
                 elif not col_map.get("ref"):
@@ -3155,7 +3486,7 @@ class BankReconciliationService:
         if not col_map.get("ref") or (not col_map.get("amount") and not (col_map.get("debit") and col_map.get("credit"))):
             raise HTTPException(
                 status_code=400,
-                detail=f"Could not reliably detect Reference and Amount columns. Detected: {list(col_map.keys())}"
+                detail=f"Could not detect required ERP Reference/Invoice and Amount columns. Detected: {list(col_map.keys())}"
             )
 
         mapped_erp_cols = set(col_map.values())
@@ -3215,6 +3546,7 @@ class BankReconciliationService:
             existing = db.query(InternalLedgerRecord).filter(
                 InternalLedgerRecord.company_id == company_id,
                 InternalLedgerRecord.reference_number == ref_str,
+                InternalLedgerRecord.currency == (ccy or "EGP"),
                 InternalLedgerRecord.is_deleted == False
             ).first()
 
@@ -3249,6 +3581,12 @@ class BankReconciliationService:
 
             imported_count += 1
 
+        if imported_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid ERP invoice or payable rows with non-zero amounts were found in the uploaded file.",
+            )
+
         db.commit()
         _reclaim_system_memory()
         return {
@@ -3272,10 +3610,12 @@ class BankReconciliationService:
             blind_ent = reconciliation_confidentiality.compute_blind_token(entity_name, dek, prefix="ENT_TOK")
             raw_date = item.get("record_date")
             rec_date = pd.to_datetime(raw_date).to_pydatetime() if raw_date else datetime.utcnow()
+            bulk_ccy = str(item.get("currency") or "EGP").strip().upper()[:3] or "EGP"
 
             existing = db.query(InternalLedgerRecord).filter(
                 InternalLedgerRecord.company_id == company_id,
                 InternalLedgerRecord.reference_number == ref_str,
+                InternalLedgerRecord.currency == bulk_ccy,
                 InternalLedgerRecord.is_deleted == False
             ).first()
 
@@ -3285,6 +3625,7 @@ class BankReconciliationService:
                 existing.entity_name = entity_name
                 existing.blind_entity_token = blind_ent
                 existing.record_type = rec_type
+                existing.currency = bulk_ccy
                 if item.get("gl_account"):
                     existing.gl_account = item.get("gl_account")
                 existing.updated_by = user_id
@@ -3304,6 +3645,12 @@ class BankReconciliationService:
                 )
                 db.add(new_rec)
             imported_count += 1
+
+        if imported_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid ERP invoice or payable rows with non-zero amounts were found in the uploaded file.",
+            )
 
         db.commit()
         _reclaim_system_memory()
@@ -3336,6 +3683,92 @@ class BankReconciliationService:
         {"source_field": "variance_amount", "custom_header": "Fee / FX Variance"},
     ]
 
+    def _resolve_variance_gl_account(
+        self,
+        disposition: Optional[str],
+        wht_gl: str = "1090300 - Withholding Tax Receivable",
+        fx_gl: str = "6060100 - FX Gain / Loss",
+        fee_gl: str = "5040100 - Bank Charges",
+    ) -> Tuple[str, str]:
+        disp = (disposition or "BANK_FEE_WRITEOFF").strip().upper()
+        if disp in ("WHT", "WHT_DEDUCTION", "WITHHOLDING_TAX", "TAX_DEDUCTION"):
+            return wht_gl, "TAX_DEDUCTION"
+        if disp in ("FX", "FX_DIFFERENCE", "FX_VARIANCE"):
+            return fx_gl, "FX_DIFFERENCE"
+        if disp == "ROUNDING":
+            return "6060900 - Rounding Differences", "ROUNDING"
+        return fee_gl, "BANK_CHARGES"
+
+    def _load_account_gl_lookup(
+        self,
+        db: Session,
+        customer_id: int,
+        profile_mappings: Optional[Dict[str, Any]] = None,
+        override_mappings: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Builds a normalized lookup table mapping account numbers (and bank_<id> fallbacks)
+        to {"main_gl": ..., "clearing_gl": ...}.
+        Priority: Request override_mappings > Profile account_gl_mappings_json > CustomerBankAccount DB rows.
+        """
+        lookup: Dict[str, Dict[str, str]] = {}
+
+        # 1. Load CustomerBankAccount rows if table is available (wrapped safely for isolated SQLite unit tests)
+        try:
+            from app.models.models_issuance import CustomerBankAccount
+            cbas = db.query(CustomerBankAccount).filter(
+                CustomerBankAccount.customer_id == customer_id,
+                CustomerBankAccount.is_deleted == False,
+            ).all()
+            for a in cbas:
+                entry = {}
+                if getattr(a, "erp_main_gl_account", None):
+                    entry["main_gl"] = a.erp_main_gl_account.strip()
+                if getattr(a, "erp_clearing_gl_account", None):
+                    entry["clearing_gl"] = a.erp_clearing_gl_account.strip()
+                if entry:
+                    if a.account_number:
+                        lookup[a.account_number.strip().upper()] = dict(entry)
+                    if a.iban:
+                        lookup[a.iban.strip().upper()] = dict(entry)
+                    if a.bank_id and a.is_default:
+                        lookup.setdefault(f"BANK_{a.bank_id}", dict(entry))
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        # 2. Merge saved profile mappings + ad-hoc request mappings
+        for src_map in (profile_mappings, override_mappings):
+            if isinstance(src_map, dict):
+                for raw_k, raw_v in src_map.items():
+                    if not raw_k or not isinstance(raw_v, dict):
+                        continue
+                    norm_k = str(raw_k).strip().upper()
+                    cur = lookup.setdefault(norm_k, {})
+                    if raw_v.get("main_gl") and str(raw_v["main_gl"]).strip():
+                        cur["main_gl"] = str(raw_v["main_gl"]).strip()
+                    if raw_v.get("clearing_gl") and str(raw_v["clearing_gl"]).strip():
+                        cur["clearing_gl"] = str(raw_v["clearing_gl"]).strip()
+
+        return lookup
+
+    def _resolve_effective_bank_gl(
+        self,
+        t: BankTransaction,
+        account_gl_lookup: Dict[str, Dict[str, str]],
+        offset_account_mode: str,
+        default_main_gl: str,
+        default_clearing_gl: str,
+    ) -> str:
+        acct_key = (t.account_number or (t.statement.account_number if t.statement else "") or "").strip().upper()
+        bank_key = f"BANK_{t.statement.bank_id}" if t.statement and t.statement.bank_id else ""
+        mapped = account_gl_lookup.get(acct_key) or account_gl_lookup.get(bank_key) or {}
+        if offset_account_mode == "BANK_CLEARING_SUSPENSE":
+            return mapped.get("clearing_gl") or default_clearing_gl
+        return mapped.get("main_gl") or default_main_gl
+
     def build_custom_export_rows(
         self,
         db: Session,
@@ -3345,8 +3778,8 @@ class BankReconciliationService:
         """
         Builds customizable export rows according to either a saved `ReconciliationExportProfile`
         or ad-hoc user parameters (columns, custom headers, column order, date format, amount mode,
-        and optional double-entry GL journal expansion).
-        Returns: (ordered_headers, rows_as_dicts, matched_txn_objects, file_format)
+        handoff_mode, offset_account_mode, per-account GL resolution, and double-entry GL journal expansion).
+        Returns: (ordered_headers, rows_as_dicts, exported_txn_objects, file_format)
         """
         profile = None
         if getattr(req, "profile_id", None):
@@ -3380,7 +3813,61 @@ class BankReconciliationService:
         )
         bank_gl = (
             getattr(req, "bank_gl_account", None)
-            or (profile.bank_gl_account if profile else "1010010 - Cash at Bank")
+            or (profile.bank_gl_account if profile else None)
+            or "1010010 - Cash at Bank"
+        )
+        handoff_mode = (
+            getattr(req, "handoff_mode", None)
+            or (getattr(profile, "handoff_mode", None) if profile else None)
+            or "ALL"
+        ).strip().upper()
+        offset_account_mode = (
+            getattr(req, "offset_account_mode", None)
+            or (getattr(profile, "offset_account_mode", None) if profile else None)
+            or "MAIN_BANK_GL"
+        ).strip().upper()
+        clearing_suspense_gl = (
+            getattr(req, "clearing_suspense_gl_account", None)
+            or (getattr(profile, "clearing_suspense_gl_account", None) if profile else None)
+            or "1010999 - Bank Clearing Suspense"
+        )
+        transit_gl = (
+            getattr(req, "cash_in_transit_gl_account", None)
+            or (getattr(profile, "cash_in_transit_gl_account", None) if profile else None)
+            or "1010800 - Cash in Transit"
+        )
+        suspense_gl = (
+            getattr(req, "suspense_gl_account", None)
+            or (getattr(profile, "suspense_gl_account", None) if profile else None)
+            or "1010950 - Unapplied Cash Suspense"
+        )
+        wht_gl = (
+            getattr(req, "wht_tax_gl_account", None)
+            or (getattr(profile, "wht_tax_gl_account", None) if profile else None)
+            or "1090300 - Withholding Tax Receivable"
+        )
+        fx_gl = (
+            getattr(req, "fx_variance_gl_account", None)
+            or (getattr(profile, "fx_variance_gl_account", None) if profile else None)
+            or "6060100 - FX Gain / Loss"
+        )
+        split_variance_row = (
+            getattr(req, "split_variance_as_fee_row", None)
+            if getattr(req, "split_variance_as_fee_row", None) is not None
+            else (bool(getattr(profile, "split_variance_as_fee_row", False)) if profile else False)
+        )
+        if getattr(req, "exclude_paired_reversals", None) is not None:
+            exclude_reversals = bool(req.exclude_paired_reversals)
+        elif profile is not None and getattr(profile, "exclude_paired_reversals", None) is not None and handoff_mode != "ALL":
+            exclude_reversals = bool(profile.exclude_paired_reversals)
+        else:
+            exclude_reversals = handoff_mode in ("ENRICHED_STATEMENT", "MISSING_GL_JOURNAL")
+
+        account_gl_lookup = self._load_account_gl_lookup(
+            db=db,
+            customer_id=customer_id,
+            profile_mappings=getattr(profile, "account_gl_mappings_json", None) if profile else None,
+            override_mappings=getattr(req, "account_gl_mappings", None),
         )
 
         # Query transactions
@@ -3399,50 +3886,180 @@ class BankReconciliationService:
         if getattr(req, "exclude_already_exported", False):
             query = query.filter(or_(BankTransaction.is_exported == False, BankTransaction.is_exported == None))
 
-        txns = query.order_by(BankTransaction.booking_date.asc(), BankTransaction.id.asc()).limit(5000).all()
-        txns = crud_bank_transaction._resolve_confidential_fields(db, txns, customer_id=customer_id)
+        all_txns = query.order_by(BankTransaction.booking_date.asc(), BankTransaction.id.asc()).limit(5000).all()
+        all_txns = crud_bank_transaction._resolve_confidential_fields(db, all_txns, customer_id=customer_id)
 
-        # Preload ERP match references for these transactions
-        txn_ids = [t.id for t in txns]
+        # Preload ERP match references & linked sweep/reversal counterparts
+        txn_ids = [t.id for t in all_txns]
         erp_ref_by_txn: Dict[int, str] = {}
         erp_gl_by_txn: Dict[int, str] = {}
+        erp_matches_by_txn: Dict[int, List[Tuple[ReconciliationMatch, InternalLedgerRecord]]] = {}
+        bank_count_per_erp: Dict[int, int] = {}
+        primary_bank_for_erp: Dict[int, int] = {}
+
         if txn_ids:
-            matches = db.query(ReconciliationMatch).filter(ReconciliationMatch.bank_txn_id.in_(txn_ids)).all()
-            erp_ids = [m.source_record_id for m in matches if m.source_record_id]
-            erp_map = {}
+            matches = db.query(ReconciliationMatch).filter(
+                ReconciliationMatch.bank_txn_id.in_(txn_ids),
+                ReconciliationMatch.is_deleted == False,
+            ).all()
+            erp_ids = [
+                m.source_record_id
+                for m in matches
+                if m.source_record_id and (m.source_type or "").upper() != "TREASURY (LG)"
+            ]
+            erp_map: Dict[int, InternalLedgerRecord] = {}
             if erp_ids:
-                erp_map = {
-                    e.id: e for e in db.query(InternalLedgerRecord).filter(InternalLedgerRecord.id.in_(erp_ids)).all()
-                }
+                erp_objs = db.query(InternalLedgerRecord).filter(
+                    InternalLedgerRecord.id.in_(erp_ids),
+                    InternalLedgerRecord.company_id == customer_id,
+                    InternalLedgerRecord.is_deleted == False,
+                ).all()
+                erp_map = {e.id: e for e in erp_objs}
+
             for m in matches:
+                if (m.source_type or "").upper() == "TREASURY (LG)":
+                    continue
                 erp_obj = erp_map.get(m.source_record_id)
                 if erp_obj:
+                    erp_matches_by_txn.setdefault(m.bank_txn_id, []).append((m, erp_obj))
+                    bank_count_per_erp[erp_obj.id] = bank_count_per_erp.get(erp_obj.id, 0) + 1
+                    primary_bank_for_erp.setdefault(erp_obj.id, m.bank_txn_id)
                     prev = erp_ref_by_txn.get(m.bank_txn_id)
                     erp_ref_by_txn[m.bank_txn_id] = f"{prev}, {erp_obj.reference_number}" if prev else erp_obj.reference_number
                     if erp_obj.gl_account:
                         erp_gl_by_txn[m.bank_txn_id] = erp_obj.gl_account
 
+        linked_ids = [t.linked_txn_id for t in all_txns if t.linked_txn_id]
+        linked_txn_map: Dict[int, BankTransaction] = {}
+        if linked_ids:
+            linked_objs = db.query(BankTransaction).filter(BankTransaction.id.in_(linked_ids)).all()
+            linked_txn_map = {lt.id: lt for lt in linked_objs}
+
+        # Filter transactions according to handoff_mode & reversal suppression
+        filtered_txns: List[BankTransaction] = []
+        for t in all_txns:
+            if exclude_reversals and t.is_reversal and t.linked_txn_id:
+                continue
+            has_erp_match = bool(erp_matches_by_txn.get(t.id))
+            if handoff_mode == "SUBLEDGER_CLEARING" and not has_erp_match:
+                continue
+            if handoff_mode == "MISSING_GL_JOURNAL" and has_erp_match:
+                continue
+            filtered_txns.append(t)
+
         ordered_headers = [c.get("custom_header") or c.get("source_field") for c in columns_config]
         output_rows: List[Dict[str, Any]] = []
 
-        def _extract_val(t: BankTransaction, field_key: str, override_vals: Dict[str, Any] = None) -> Any:
+        def _is_sweep_txn(t: BankTransaction) -> bool:
+            cats = {
+                (t.internal_category or "").strip().upper(),
+                (t.classification_category or "").strip().upper(),
+                (t.category or "").strip().upper(),
+            }
+            return bool(cats.intersection({"INTER_BANK_SWEEP", "INTERNAL_TRANSFER"})) or (
+                bool(t.linked_txn_id) and not t.is_reversal
+            )
+
+        def _get_primary_erp_meta(t: BankTransaction) -> Tuple[Optional[ReconciliationMatch], Optional[InternalLedgerRecord], Decimal, str, str]:
+            pairs = erp_matches_by_txn.get(t.id) or []
+            if not pairs:
+                disp = "BANK_FEE_WRITEOFF"
+                v_gl, _ = self._resolve_variance_gl_account(disp, wht_gl=wht_gl, fx_gl=fx_gl)
+                return None, None, Decimal("0.00"), disp, v_gl
+            first_m, first_e = pairs[0]
+            gross_sum = sum(abs(Decimal(str(e.amount or 0))) for _, e in pairs)
+            disp = (first_m.variance_disposition or "NONE").upper()
+            if disp == "NONE" and (Decimal(str(t.variance_amount or 0)) > 0 or Decimal(str(first_m.variance_amount or 0)) > 0):
+                desc_up = (t.raw_description or "").upper()
+                if any(w in desc_up for w in ("WHT", "WITHHOLDING", "خصم", "ضريبة خصم")):
+                    disp = "WHT_DEDUCTION"
+                else:
+                    disp = "BANK_FEE_WRITEOFF"
+            v_gl, _ = self._resolve_variance_gl_account(disp, wht_gl=wht_gl, fx_gl=fx_gl)
+            return first_m, first_e, gross_sum, disp, v_gl
+
+        def _extract_val(
+            t: BankTransaction,
+            field_key: str,
+            override_vals: Dict[str, Any] = None,
+            erp_ctx: Optional[InternalLedgerRecord] = None,
+            match_ctx: Optional[ReconciliationMatch] = None,
+            eff_bank_gl: str = bank_gl,
+        ) -> Any:
             if override_vals and field_key in override_vals:
-                return override_vals[field_key]
+                ov = override_vals[field_key]
+                if isinstance(ov, datetime):
+                    try:
+                        return ov.strftime(date_fmt)
+                    except Exception:
+                        return ov.strftime("%Y-%m-%d")
+                if isinstance(ov, Decimal):
+                    return float(ov)
+                return ov
+
+            first_m, first_e, gross_erp_sum, disp, v_gl = _get_primary_erp_meta(t)
+            active_erp = erp_ctx or first_e
+            active_match = match_ctx or first_m
+
+            cr_val = Decimal(str((override_vals or {}).get("credit_amount", t.credit_amount or 0)))
+            dr_val = Decimal(str((override_vals or {}).get("debit_amount", t.debit_amount or 0)))
+
             if field_key == "matched_erp_reference":
+                if erp_ctx is not None:
+                    return erp_ctx.reference_number or ""
                 return erp_ref_by_txn.get(t.id, "")
+            if field_key == "payment_or_erp_ref":
+                if erp_ctx is not None and erp_ctx.reference_number:
+                    return erp_ctx.reference_number
+                return erp_ref_by_txn.get(t.id) or t.e2e_id or t.back_office_ref or t.cheque_number or ""
+            if field_key == "matched_erp_entity":
+                if active_erp:
+                    return active_erp.entity_name or ""
+                pairs = erp_matches_by_txn.get(t.id) or []
+                return ", ".join(dict.fromkeys(e.entity_name for _, e in pairs if e.entity_name))
+            if field_key == "matched_erp_type":
+                return active_erp.record_type if active_erp and active_erp.record_type else ""
+            if field_key == "matched_erp_gross_amount":
+                if erp_ctx is not None:
+                    return float(abs(Decimal(str(erp_ctx.amount or 0))))
+                return float(gross_erp_sum) if gross_erp_sum > 0 else ""
+            if field_key == "allocated_erp_amount":
+                if erp_ctx is not None:
+                    if bank_count_per_erp.get(erp_ctx.id, 1) > 1:
+                        return float(max(cr_val, dr_val))
+                    return float(abs(Decimal(str(erp_ctx.amount or 0))))
+                return float(gross_erp_sum) if gross_erp_sum > 0 else float(max(cr_val, dr_val))
+            if field_key == "variance_disposition":
+                if active_match and active_match.variance_disposition and active_match.variance_disposition != "NONE":
+                    return active_match.variance_disposition
+                return disp if Decimal(str(t.variance_amount or 0)) > 0 else ""
+            if field_key == "variance_gl_account":
+                var_dec = Decimal(str((override_vals or {}).get("variance_amount", t.variance_amount or 0)))
+                return v_gl if var_dec > 0 else ""
+            if field_key == "effective_bank_gl":
+                return eff_bank_gl
+            if field_key == "handoff_mode":
+                return handoff_mode
             if field_key == "dc_indicator":
-                return "CR" if (t.credit_amount or 0) > 0 else "DR"
+                return "CR" if cr_val > 0 else "DR"
             if field_key == "signed_amount":
-                return float((t.credit_amount or 0) - (t.debit_amount or 0))
+                return float(cr_val - dr_val)
             if field_key == "absolute_amount":
-                return float(max(t.credit_amount or 0, t.debit_amount or 0))
+                return float(max(cr_val, dr_val))
             if field_key == "applied_rule_name":
                 return t.applied_rule_name or ""
             if field_key.startswith("custom_fields."):
                 cf_k = field_key.split(".", 1)[1]
                 return (t.custom_fields_json or {}).get(cf_k, "")
+            if field_key.startswith("erp_custom_fields."):
+                ecf_k = field_key.split(".", 1)[1]
+                if active_erp and isinstance(active_erp.custom_fields_json, dict):
+                    return active_erp.custom_fields_json.get(ecf_k, "")
+                return ""
 
             val = getattr(t, field_key, None)
+            if field_key == "account_number" and not val and t.statement:
+                val = t.statement.account_number
             if isinstance(val, datetime):
                 try:
                     return val.strftime(date_fmt)
@@ -3454,58 +4071,419 @@ class BankReconciliationService:
                 return ""
             return val
 
-        for t in txns:
-            if not expand_legs:
-                row_dict = {}
-                for col_spec in columns_config:
-                    src = col_spec.get("source_field", "")
-                    hdr = col_spec.get("custom_header") or src
-                    val = _extract_val(t, src)
-                    if val == "" and col_spec.get("default_value"):
-                        val = col_spec["default_value"]
-                    row_dict[hdr] = val
-                output_rows.append(row_dict)
-            else:
-                # Double-Entry GL Journal Expansion Mode:
-                # Leg 1: Bank GL Line
-                # Leg 2: Offset Category / ERP GL Line
-                # Leg 3 (Optional): Variance / Fee GL Line if variance_amount > 0
-                is_cr = (t.credit_amount or 0) > 0
-                bank_amt = Decimal(str(t.credit_amount if is_cr else t.debit_amount))
-                var_amt = Decimal(str(t.variance_amount or 0))
-                offset_gl = erp_gl_by_txn.get(t.id) or t.internal_category or t.classification_category or "UNMAPPED_GL"
+        def _emit_row(
+            t: BankTransaction,
+            eff_bank_gl: str,
+            override_vals: Optional[Dict[str, Any]] = None,
+            erp_ctx: Optional[InternalLedgerRecord] = None,
+            match_ctx: Optional[ReconciliationMatch] = None,
+        ) -> None:
+            row_dict: Dict[str, Any] = {}
+            for col_spec in columns_config:
+                src = col_spec.get("source_field", "")
+                hdr = col_spec.get("custom_header") or src
+                val = _extract_val(
+                    t,
+                    src,
+                    override_vals=override_vals,
+                    erp_ctx=erp_ctx,
+                    match_ctx=match_ctx,
+                    eff_bank_gl=eff_bank_gl,
+                )
+                if val == "" and col_spec.get("default_value"):
+                    val = col_spec["default_value"]
+                row_dict[hdr] = val
+            output_rows.append(row_dict)
 
-                legs = [
+        bank_leg_prefix = (
+            "[CLEARING OFFSET LEG]" if offset_account_mode == "BANK_CLEARING_SUSPENSE" else "[BANK LEG]"
+        )
+
+        for t in filtered_txns:
+            eff_bank_gl = self._resolve_effective_bank_gl(
+                t=t,
+                account_gl_lookup=account_gl_lookup,
+                offset_account_mode=offset_account_mode,
+                default_main_gl=bank_gl,
+                default_clearing_gl=clearing_suspense_gl,
+            )
+            pairs = erp_matches_by_txn.get(t.id) or []
+            first_m, first_e, gross_erp_sum, disp, var_gl = _get_primary_erp_meta(t)
+            _, var_cat = self._resolve_variance_gl_account(disp, wht_gl=wht_gl, fx_gl=fx_gl)
+            is_cr = (t.credit_amount or 0) > 0
+            bank_amt = Decimal(str(t.credit_amount if is_cr else t.debit_amount))
+            var_amt = Decimal(str(t.variance_amount or (first_m.variance_amount if first_m and first_m.variance_amount else 0) or 0))
+            is_sweep = _is_sweep_txn(t)
+
+            # Determine resolved offset GL for non-ERP or general lines
+            if handoff_mode != "ALL" and is_sweep and not pairs:
+                resolved_offset_gl = transit_gl
+            else:
+                raw_offset = erp_gl_by_txn.get(t.id) or t.internal_category or t.classification_category
+                if not raw_offset or (handoff_mode != "ALL" and raw_offset in ("INTER_BANK_SWEEP", "INTERNAL_TRANSFER")):
+                    resolved_offset_gl = transit_gl if is_sweep else (suspense_gl if handoff_mode != "ALL" else "UNMAPPED_GL")
+                else:
+                    resolved_offset_gl = raw_offset
+
+            # ── MODE 1: ENRICHED_STATEMENT ("Grow First" Clean Statement for ERP Import) ──
+            if handoff_mode == "ENRICHED_STATEMENT" and not expand_legs:
+                enriched_cp = (first_e.entity_name if first_e and first_e.entity_name else t.counterparty_name) or ""
+                enriched_ref = erp_ref_by_txn.get(t.id) or t.e2e_id or t.back_office_ref or ""
+
+                # If pre-splitting batch matches (1:M) or fee/WHT variances into clean ERP-ready statement lines:
+                if split_variance_row and pairs and (len(pairs) > 1 or var_amt > 0):
+                    signed_bank = bank_amt if is_cr else -bank_amt
+                    run_bal_end = Decimal(str(t.running_balance or 0))
+                    cursor_bal = run_bal_end - signed_bank
+
+                    # Determine whether ERP items are single/1:M (full invoice amounts) vs M:1 partial wire
+                    is_m_to_1 = len(pairs) == 1 and bank_count_per_erp.get(pairs[0][1].id, 1) > 1
+                    sub_lines: List[Tuple[Decimal, bool, str, Optional[InternalLedgerRecord], Optional[ReconciliationMatch], Dict[str, Any]]] = []
+
+                    if not is_m_to_1:
+                        for m_obj, e_obj in pairs:
+                            e_abs = abs(Decimal(str(e_obj.amount or 0)))
+                            e_gl = e_obj.gl_account or resolved_offset_gl
+                            desc_line = f"{e_obj.reference_number} | {t.raw_description}" if e_obj.reference_number and e_obj.reference_number.upper() not in (t.raw_description or "").upper() else t.raw_description
+                            sub_lines.append((
+                                e_abs,
+                                is_cr,
+                                desc_line,
+                                e_obj,
+                                m_obj,
+                                {
+                                    "counterparty_name": e_obj.entity_name or enriched_cp,
+                                    "internal_category": e_gl,
+                                    "variance_amount": 0.0,
+                                },
+                            ))
+                        # Compute exact signed residual so sum(sub_lines) == signed_bank to the penny!
+                        gross_signed = sum((amt if cr_flag else -amt) for amt, cr_flag, *_ in sub_lines)
+                        residual_signed = signed_bank - gross_signed
+                        if abs(residual_signed) >= Decimal("0.01"):
+                            fee_is_cr = residual_signed > 0
+                            fee_abs = abs(residual_signed)
+                            sub_lines.append((
+                                fee_abs,
+                                fee_is_cr,
+                                f"[{var_cat} ON {enriched_ref}] {t.raw_description}",
+                                None,
+                                first_m,
+                                {
+                                    "matched_erp_reference": "",
+                                    "payment_or_erp_ref": t.e2e_id or t.back_office_ref or "",
+                                    "counterparty_name": enriched_cp,
+                                    "classification_category": var_cat,
+                                    "internal_category": var_gl,
+                                    "is_reconciled": False,
+                                    "variance_amount": float(fee_abs),
+                                },
+                            ))
+                    else:
+                        # M:1 partial wire: keep bank wire amount intact
+                        sub_lines.append((
+                            bank_amt,
+                            is_cr,
+                            f"{enriched_ref} | {t.raw_description}" if enriched_ref else t.raw_description,
+                            first_e,
+                            first_m,
+                            {"counterparty_name": enriched_cp, "internal_category": resolved_offset_gl},
+                        ))
+
+                    for idx_s, (s_amt, s_is_cr, s_desc, s_erp, s_match, extra_ov) in enumerate(sub_lines):
+                        cursor_bal += (s_amt if s_is_cr else -s_amt)
+                        if idx_s == len(sub_lines) - 1:
+                            cursor_bal = run_bal_end
+                        ov = {
+                            "debit_amount": 0.0 if s_is_cr else float(s_amt),
+                            "credit_amount": float(s_amt) if s_is_cr else 0.0,
+                            "running_balance": float(cursor_bal),
+                            "raw_description": s_desc,
+                            **extra_ov,
+                        }
+                        _emit_row(t, eff_bank_gl=eff_bank_gl, override_vals=ov, erp_ctx=s_erp, match_ctx=s_match)
+                    continue
+
+                # Standard 1-row enriched statement output
+                enriched_desc = t.raw_description
+                if first_e and first_e.reference_number and first_e.reference_number.upper() not in (t.raw_description or "").upper():
+                    enriched_desc = f"{first_e.reference_number} | {t.raw_description}"
+                _emit_row(
+                    t,
+                    eff_bank_gl=eff_bank_gl,
+                    override_vals={
+                        "counterparty_name": enriched_cp or t.counterparty_name or "",
+                        "internal_category": resolved_offset_gl,
+                        "raw_description": enriched_desc,
+                    },
+                    erp_ctx=first_e,
+                    match_ctx=first_m,
+                )
+                continue
+
+            # ── MODE 2: SUBLEDGER_CLEARING (Flat 1-Row-Per-Invoice Cash Application Batch) ──
+            if handoff_mode == "SUBLEDGER_CLEARING" and not expand_legs:
+                if len(pairs) > 1:
+                    # 1:M Batch Match: emit 1 row per ERP record so SAP/Odoo/Oracle clears every invoice individually
+                    gross_total = sum(abs(Decimal(str(e_obj.amount or 0))) for _, e_obj in pairs)
+                    total_diff = gross_total - bank_amt  # >0 if fee/WHT deducted on AR, <0 if wire fee added on AP
+                    for p_idx, (m_obj, e_obj) in enumerate(pairs):
+                        e_abs = abs(Decimal(str(e_obj.amount or 0)))
+                        row_var = abs(total_diff) if p_idx == 0 and abs(total_diff) >= Decimal("0.01") else Decimal("0.00")
+                        if p_idx == 0 and abs(total_diff) >= Decimal("0.01"):
+                            cash_for_row = e_abs - total_diff
+                        else:
+                            cash_for_row = e_abs
+                        cash_for_row = max(Decimal("0.00"), cash_for_row)
+                        _emit_row(
+                            t,
+                            eff_bank_gl=eff_bank_gl,
+                            override_vals={
+                                "debit_amount": 0.0 if is_cr else float(cash_for_row),
+                                "credit_amount": float(cash_for_row) if is_cr else 0.0,
+                                "counterparty_name": e_obj.entity_name or t.counterparty_name or "",
+                                "internal_category": e_obj.gl_account or resolved_offset_gl,
+                                "variance_amount": float(row_var),
+                            },
+                            erp_ctx=e_obj,
+                            match_ctx=m_obj,
+                        )
+                else:
+                    m_obj, e_obj = pairs[0]
+                    is_secondary_m1 = (
+                        bank_count_per_erp.get(e_obj.id, 1) > 1
+                        and primary_bank_for_erp.get(e_obj.id) != t.id
+                    )
+                    eff_var = Decimal("0.00") if is_secondary_m1 else var_amt
+                    _emit_row(
+                        t,
+                        eff_bank_gl=eff_bank_gl,
+                        override_vals={
+                            "counterparty_name": e_obj.entity_name or t.counterparty_name or "",
+                            "internal_category": e_obj.gl_account or resolved_offset_gl,
+                            "variance_amount": float(eff_var),
+                        },
+                        erp_ctx=e_obj,
+                        match_ctx=m_obj,
+                    )
+                continue
+
+            # ── FLAT OUTPUT FOR "ALL" OR "MISSING_GL_JOURNAL" (when expand_journal_legs == False) ──
+            if not expand_legs:
+                ov_flat: Dict[str, Any] = {}
+                if handoff_mode != "ALL":
+                    ov_flat["internal_category"] = resolved_offset_gl
+                _emit_row(t, eff_bank_gl=eff_bank_gl, override_vals=ov_flat or None, erp_ctx=first_e, match_ctx=first_m)
+                continue
+
+            # ══════════════════════════════════════════════════════════════════
+            #  DOUBLE-ENTRY GL JOURNAL EXPANSION (expand_journal_legs == True)
+            # ══════════════════════════════════════════════════════════════════
+
+            # Special Case A: Paired Inter-Bank Sweep in Smart Modes -> Route via Cash-in-Transit without double-counting fee!
+            if handoff_mode != "ALL" and is_sweep and not pairs:
+                cp_txn = linked_txn_map.get(t.linked_txn_id) if t.linked_txn_id else None
+                if cp_txn is not None:
+                    cp_is_cr = (cp_txn.credit_amount or 0) > 0
+                    cp_amt = Decimal(str(cp_txn.credit_amount if cp_is_cr else cp_txn.debit_amount))
+                    outflow_amt = bank_amt if not is_cr else cp_amt
+                    inflow_amt = bank_amt if is_cr else cp_amt
+                    sweep_fee = outflow_amt - inflow_amt
+                    if sweep_fee > Decimal("0.00"):
+                        if not is_cr:
+                            # Outflow bank leg: Cr Outflow Bank (outflow_amt) = Dr Transit (inflow_amt) + Dr Bank Charges (sweep_fee)
+                            sweep_legs = [
+                                (
+                                    {
+                                        "internal_category": eff_bank_gl,
+                                        "debit_amount": 0.0,
+                                        "credit_amount": float(bank_amt),
+                                        "variance_amount": float(sweep_fee),
+                                        "raw_description": f"{bank_leg_prefix} {t.raw_description}",
+                                    },
+                                    None,
+                                    None,
+                                ),
+                                (
+                                    {
+                                        "internal_category": transit_gl,
+                                        "debit_amount": float(inflow_amt),
+                                        "credit_amount": 0.0,
+                                        "variance_amount": 0.0,
+                                        "raw_description": f"[TRANSIT LEG] {t.raw_description}",
+                                    },
+                                    None,
+                                    None,
+                                ),
+                                (
+                                    {
+                                        "internal_category": "5040100 - Bank Charges",
+                                        "classification_category": "BANK_CHARGES",
+                                        "debit_amount": float(sweep_fee),
+                                        "credit_amount": 0.0,
+                                        "variance_amount": float(sweep_fee),
+                                        "raw_description": f"[VARIANCE FEE LEG] {t.raw_description}",
+                                    },
+                                    None,
+                                    None,
+                                ),
+                            ]
+                        else:
+                            # Inflow bank leg: Dr Inflow Bank (inflow_amt) = Cr Transit (inflow_amt) (fee booked on outflow side)
+                            sweep_legs = [
+                                (
+                                    {
+                                        "internal_category": eff_bank_gl,
+                                        "debit_amount": float(bank_amt),
+                                        "credit_amount": 0.0,
+                                        "variance_amount": 0.0,
+                                        "raw_description": f"{bank_leg_prefix} {t.raw_description}",
+                                    },
+                                    None,
+                                    None,
+                                ),
+                                (
+                                    {
+                                        "internal_category": transit_gl,
+                                        "debit_amount": 0.0,
+                                        "credit_amount": float(bank_amt),
+                                        "variance_amount": 0.0,
+                                        "raw_description": f"[TRANSIT LEG] {t.raw_description}",
+                                    },
+                                    None,
+                                    None,
+                                ),
+                            ]
+                        for leg_ov, l_erp, l_m in sweep_legs:
+                            _emit_row(t, eff_bank_gl=eff_bank_gl, override_vals=leg_ov, erp_ctx=l_erp, match_ctx=l_m)
+                        continue
+
+                # Equal-amount or single-legged sweep: clean 2-leg entry against Cash-in-Transit
+                for leg_ov in (
                     {
-                        "internal_category": bank_gl,
+                        "internal_category": eff_bank_gl,
                         "debit_amount": float(bank_amt) if is_cr else 0.0,
                         "credit_amount": 0.0 if is_cr else float(bank_amt),
-                        "raw_description": f"[BANK LEG] {t.raw_description}",
+                        "variance_amount": 0.0,
+                        "raw_description": f"{bank_leg_prefix} {t.raw_description}",
                     },
                     {
-                        "internal_category": offset_gl,
-                        "debit_amount": 0.0 if is_cr else float(bank_amt + var_amt),
-                        "credit_amount": float(bank_amt + var_amt) if is_cr else 0.0,
-                        "raw_description": f"[OFFSET LEG] {t.raw_description}",
-                    }
-                ]
-                if var_amt > 0:
-                    legs.append({
-                        "internal_category": "BANK_CHARGES",
-                        "debit_amount": float(var_amt) if is_cr else 0.0,
-                        "credit_amount": 0.0 if is_cr else float(var_amt),
-                        "raw_description": f"[VARIANCE FEE LEG] {t.raw_description}",
-                    })
+                        "internal_category": transit_gl,
+                        "debit_amount": 0.0 if is_cr else float(bank_amt),
+                        "credit_amount": float(bank_amt) if is_cr else 0.0,
+                        "variance_amount": 0.0,
+                        "raw_description": f"[TRANSIT LEG] {t.raw_description}",
+                    },
+                ):
+                    _emit_row(t, eff_bank_gl=eff_bank_gl, override_vals=leg_ov)
+                continue
 
-                for leg_override in legs:
-                    row_dict = {}
-                    for col_spec in columns_config:
-                        src = col_spec.get("source_field", "")
-                        hdr = col_spec.get("custom_header") or src
-                        row_dict[hdr] = _extract_val(t, src, override_vals=leg_override)
-                    output_rows.append(row_dict)
+            # Special Case B: SUBLEDGER_CLEARING with 1:M Batch ERP Matches -> Expand 1 Subledger Leg per Invoice!
+            if handoff_mode == "SUBLEDGER_CLEARING" and len(pairs) > 1:
+                _emit_row(
+                    t,
+                    eff_bank_gl=eff_bank_gl,
+                    override_vals={
+                        "internal_category": eff_bank_gl,
+                        "debit_amount": float(bank_amt) if is_cr else 0.0,
+                        "credit_amount": 0.0 if is_cr else float(bank_amt),
+                        "matched_erp_reference": erp_ref_by_txn.get(t.id, ""),
+                        "raw_description": f"{bank_leg_prefix} {t.raw_description}",
+                    },
+                )
+                signed_bank = bank_amt if is_cr else -bank_amt
+                signed_erp_total = Decimal("0.00")
+                for m_obj, e_obj in pairs:
+                    e_abs = abs(Decimal(str(e_obj.amount or 0)))
+                    signed_erp_total += (e_abs if is_cr else -e_abs)
+                    _emit_row(
+                        t,
+                        eff_bank_gl=eff_bank_gl,
+                        override_vals={
+                            "internal_category": e_obj.gl_account or resolved_offset_gl,
+                            "counterparty_name": e_obj.entity_name or t.counterparty_name or "",
+                            "debit_amount": 0.0 if is_cr else float(e_abs),
+                            "credit_amount": float(e_abs) if is_cr else 0.0,
+                            "variance_amount": 0.0,
+                            "raw_description": f"[SUBLEDGER LEG] {e_obj.reference_number} — {t.raw_description}",
+                        },
+                        erp_ctx=e_obj,
+                        match_ctx=m_obj,
+                    )
+                # Balance any batch fee/WHT/FX variance so Total DR == Total CR!
+                # Bank leg signed = +bank_amt (DR) if is_cr else -bank_amt (CR)
+                # Subledger legs signed = -erp_total (CR) if is_cr else +erp_total (DR)
+                # Net DR - CR so far = signed_bank - signed_erp_total. Need variance leg = -(signed_bank - signed_erp_total) = signed_erp_total - signed_bank!
+                needed_dr_minus_cr = signed_erp_total - signed_bank
+                if abs(needed_dr_minus_cr) >= Decimal("0.01"):
+                    v_abs = abs(needed_dr_minus_cr)
+                    v_is_dr = needed_dr_minus_cr > 0
+                    _emit_row(
+                        t,
+                        eff_bank_gl=eff_bank_gl,
+                        override_vals={
+                            "internal_category": var_gl if handoff_mode != "ALL" else "BANK_CHARGES",
+                            "classification_category": var_cat,
+                            "debit_amount": float(v_abs) if v_is_dr else 0.0,
+                            "credit_amount": 0.0 if v_is_dr else float(v_abs),
+                            "variance_amount": float(v_abs),
+                            "matched_erp_reference": "",
+                            "raw_description": f"[VARIANCE FEE LEG] {t.raw_description}",
+                        },
+                        match_ctx=first_m,
+                    )
+                continue
 
-        return ordered_headers, output_rows, txns, file_format
+            # Standard 1:1 / Bank-Only Double-Entry GL Journal Expansion (100% balanced across AR & AP variances!)
+            # Determine exact offset amount:
+            # - If matched to a single ERP item (not M:1 partial wire), offset clears full `gross_erp_sum`!
+            # - Otherwise, on Credit (`is_cr=True`), fee was deducted (`offset = bank_amt + var_amt`),
+            #   and on Debit (`is_cr=False`), wire fee was added (`offset = bank_amt - var_amt` if bank_amt > var_amt else bank_amt).
+            is_m1_partial = len(pairs) == 1 and bank_count_per_erp.get(pairs[0][1].id, 1) > 1
+            if pairs and not is_m1_partial and gross_erp_sum > Decimal("0.00"):
+                offset_amt = gross_erp_sum
+            elif var_amt > Decimal("0.00"):
+                offset_amt = (bank_amt + var_amt) if is_cr else (bank_amt - var_amt if bank_amt > var_amt else bank_amt)
+            else:
+                offset_amt = bank_amt
+
+            offset_prefix = "[SUBLEDGER LEG]" if (handoff_mode == "SUBLEDGER_CLEARING" and pairs) else "[OFFSET LEG]"
+            legs: List[Dict[str, Any]] = [
+                {
+                    "internal_category": eff_bank_gl,
+                    "debit_amount": float(bank_amt) if is_cr else 0.0,
+                    "credit_amount": 0.0 if is_cr else float(bank_amt),
+                    "raw_description": f"{bank_leg_prefix} {t.raw_description}",
+                },
+                {
+                    "internal_category": resolved_offset_gl,
+                    "debit_amount": 0.0 if is_cr else float(offset_amt),
+                    "credit_amount": float(offset_amt) if is_cr else 0.0,
+                    "raw_description": f"{offset_prefix} {t.raw_description}",
+                },
+            ]
+
+            # Compute exact balancing variance leg:
+            # Current DR - CR = (bank_amt - offset_amt) if is_cr else (offset_amt - bank_amt)
+            dr_minus_cr = (bank_amt - offset_amt) if is_cr else (offset_amt - bank_amt)
+            if abs(dr_minus_cr) >= Decimal("0.01"):
+                v_abs = abs(dr_minus_cr)
+                # Need opposite sign of dr_minus_cr to bring DR - CR to 0.00!
+                v_is_dr = dr_minus_cr < Decimal("0.00")
+                target_var_gl = var_gl if handoff_mode != "ALL" else "BANK_CHARGES"
+                legs.append({
+                    "internal_category": target_var_gl,
+                    "classification_category": var_cat,
+                    "debit_amount": float(v_abs) if v_is_dr else 0.0,
+                    "credit_amount": 0.0 if v_is_dr else float(v_abs),
+                    "variance_amount": float(v_abs),
+                    "raw_description": f"[VARIANCE FEE LEG] {t.raw_description}",
+                })
+
+            for leg_override in legs:
+                _emit_row(t, eff_bank_gl=eff_bank_gl, override_vals=leg_override, erp_ctx=first_e, match_ctx=first_m)
+
+        return ordered_headers, output_rows, filtered_txns, file_format
 
 
 bank_reconcile_service = BankReconciliationService()

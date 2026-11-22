@@ -46,6 +46,8 @@ class CustomerBankAccount(Base):
     branch_name = Column(String, nullable=True, comment="Bank branch name (optional)")
     iban = Column(String, nullable=True, comment="IBAN (optional)")
     currency_code = Column(String(3), nullable=True, default="EGP", comment="Account currency code e.g. EGP, USD, EUR")
+    erp_main_gl_account = Column(String(100), nullable=True, comment="Optional ERP Main Cash/Bank GL account code e.g. 1010010")
+    erp_clearing_gl_account = Column(String(100), nullable=True, comment="Optional ERP Bank Statement Clearing/Suspense GL code e.g. 1010999")
     statement_pdf_password_encrypted = Column(Text, nullable=True, comment="Fernet-encrypted static PDF password for emailed statements (never online login password)")
     auto_ingest_statements = Column(Boolean, default=False, comment="If True, HIGH-confidence trusted bank statements/balances auto-execute without manual confirmation")
     is_default = Column(Boolean, default=False, comment="Default account for this customer+bank pair")

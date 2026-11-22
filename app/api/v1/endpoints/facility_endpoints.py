@@ -56,6 +56,9 @@ def create_new_facility(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Create a new bank facility with sub-limits."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank credit facility setup")
+
     return crud_facility.create_facility(
         db=db,                      # Name the db argument
         obj_in=facility_in, 
@@ -71,6 +74,9 @@ def update_facility(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Update facility details and sync sub-limits."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank credit facility setup")
+
     facility = crud_facility.get(db, id=facility_id)
     if not facility or facility.customer_id != current_user.customer_id:
         raise HTTPException(404, "Facility not found")
@@ -89,6 +95,9 @@ def archive_facility(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Soft-delete (Archive) a facility."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank credit facility setup")
+
     facility = crud_facility.get(db, id=facility_id)
     if not facility or facility.customer_id != current_user.customer_id:
         raise HTTPException(404, "Facility not found")
@@ -102,6 +111,9 @@ def restore_facility(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Restore an archived facility to ACTIVE status."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank credit facility setup")
+
     facility = crud_facility.get(db, id=facility_id)
     if not facility or facility.customer_id != current_user.customer_id:
         raise HTTPException(404, "Facility not found")

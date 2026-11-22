@@ -41,7 +41,7 @@ COLUMN_KEYWORDS: Dict[str, List[str]] = {
     "bank_lg_number": [
         "bank lg number", "bank lg ref", "bank lg#", "bank guarantee no", "bank guarantee number",
         "lg number", "lg no", "lg#", "guarantee no", "guarantee number",
-        "ref", "reference", "lg ref", "reference no", "lg reference",
+        "lg ref", "lg reference",
         "رقم خطاب الضمان", "رقم الضمان",
     ],
     "beneficiary_name": [
@@ -137,12 +137,28 @@ class ReconciliationService:
 
             session.parsing_method = method
 
-            # Archive raw uploaded file to GCS
-            from app.core.storage_service import build_customer_blob_path, upload_bytes_to_gcs
+            valid_lg_rows = [r for r in rows if self._clean_str(r.get("bank_lg_number"))]
+            if not rows or not valid_lg_rows:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No Letter of Guarantee position records were found in this file. Please upload a valid Bank LG Position Statement.",
+                )
+
+            # Archive raw uploaded file to GCS with per-company AES-256-GCM envelope encryption
+            import asyncio
+            from app.core.storage_service import build_customer_blob_path, upload_stream_to_gcs_encrypted
+            from app.services.tenant_key_service import tenant_key_service
             blob_path = build_customer_blob_path(customer_id, "reconciliation/lg_positions", f"session_{session.id}/{file_name}")
             try:
-                gcs_uri = await upload_bytes_to_gcs(blob_path, file_bytes)
-                session.uploaded_file_path = gcs_uri
+                dek = tenant_key_service.get_or_create_tenant_dek(db, customer_id)
+                gcs_uri = await asyncio.to_thread(
+                    upload_stream_to_gcs_encrypted,
+                    io.BytesIO(file_bytes),
+                    blob_name=blob_path,
+                    dek=dek,
+                    content_type="application/octet-stream",
+                )
+                session.uploaded_file_path = str(gcs_uri)
             except Exception as upload_err:
                 logger.warning(f"Could not archive reconciliation file to GCS: {upload_err}")
 
@@ -613,10 +629,10 @@ class ReconciliationService:
             if len(best_col_map) >= 2:
                 break
                 
-        if len(best_col_map) < 2:
+        if len(best_col_map) < 2 or "bank_lg_number" not in best_col_map.values():
             first_row = [str(h) for h in all_rows[0]] if all_rows else []
             raise HTTPException(status_code=400,
-                detail=f"Could not map enough columns. Best attempt mapped: {best_col_map}. First row: {first_row}")
+                detail=f"This file does not appear to be a Bank LG Position Report (missing an LG Number column). Best attempt mapped: {best_col_map}. First row: {first_row}")
 
         headers = best_headers
         col_map = best_col_map
@@ -678,9 +694,9 @@ class ReconciliationService:
             if len(best_col_map) >= 2:
                 break
                 
-        if len(best_col_map) < 2:
+        if len(best_col_map) < 2 or "bank_lg_number" not in best_col_map.values():
             raise HTTPException(status_code=400,
-                detail=f"Could not map enough columns. Best attempt mapped: {best_col_map}.")
+                detail=f"This file does not appear to be a Bank LG Position Report (missing an LG Number column). Best attempt mapped: {best_col_map}.")
 
         headers = best_headers
         col_map = best_col_map
@@ -744,16 +760,26 @@ class ReconciliationService:
                 col_map[header] = cached_map[h_lower]
                 mapped_fields.add(cached_map[h_lower])
 
-        # 2) Keyword matching for any unmapped headers
+        # 2) Keyword matching for any unmapped headers (never substring-match short headers inside longer LG keywords!)
+        h_all_low = [h.lower().strip() for h in headers if h and str(h).strip()]
+        is_cash_stmt_headers = (
+            any(k in h for h in h_all_low for k in ("running balance", "closing balance", "booking date", "رصيد"))
+            and not any(k in h for h in h_all_low for k in ("lg", "guarantee", "ضمان", "خطاب"))
+        )
+        if is_cash_stmt_headers:
+            return {}, "NONE"
+
         for header in headers:
             if header in col_map:
                 continue
             h_lower = header.lower().strip()
+            if not h_lower or h_lower.startswith("col_"):
+                continue
             for field, keywords in COLUMN_KEYWORDS.items():
                 if field in mapped_fields:
                     continue
                 for kw in keywords:
-                    if kw in h_lower or h_lower in kw:
+                    if kw in h_lower:
                         col_map[header] = field
                         mapped_fields.add(field)
                         break

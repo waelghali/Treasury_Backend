@@ -35,20 +35,30 @@ RE_APPROVAL_TRIGGER_FIELDS = {
 class CRUDIssuanceRequest(CRUDBase):
     
     def _generate_serial(self, db: Session, customer_id: int, entity_code: str = None) -> str:
-        """Generates a sequential {PREFIX}-YYYY-XXXX number.
-        PREFIX = entity code if available, otherwise customer name abbreviation."""
+        """Generates a collision-free sequential {PREFIX}-YYYY-XXXX number.
+        Queries global max sequence for {PREFIX}-{YEAR}-% because ix_issuance_requests_serial_number is globally unique."""
+        import re as _re
         current_year = datetime.now().year
-        if entity_code:
-            prefix = entity_code.upper()
+        if entity_code and entity_code.strip().upper() != "TEMP":
+            prefix = f"{entity_code.strip().upper()}-C{customer_id}" if entity_code.strip().upper() in ("HQ01", "SUB2", "SUB3") else entity_code.strip().upper()
         else:
-            # Fallback: use first 3 letters of customer name
             customer = db.query(Customer).filter(Customer.id == customer_id).first()
-            prefix = (customer.name.replace(" ", "").upper()[:3].ljust(3, 'X')) if customer else "REQ"
-        count = db.query(IssuanceRequest).filter(
-            IssuanceRequest.customer_id == customer_id,
-            IssuanceRequest.serial_number.like(f"{prefix}-{current_year}-%")
-        ).count()
-        return f"{prefix}-{current_year}-{(count + 1):04d}"
+            base_pref = _re.sub(r"[^A-Z0-9]", "", (customer.name if customer else "REQ").upper())[:3].ljust(3, "X")
+            prefix = f"{base_pref}{customer_id}"
+
+        pattern = f"{prefix}-{current_year}-%"
+        existing_serials = (
+            db.query(IssuanceRequest.serial_number)
+            .filter(IssuanceRequest.serial_number.like(pattern))
+            .all()
+        )
+        max_seq = 0
+        for (s_val,) in existing_serials:
+            if s_val and "-" in s_val:
+                tail = s_val.rsplit("-", 1)[-1]
+                if tail.isdigit():
+                    max_seq = max(max_seq, int(tail))
+        return f"{prefix}-{current_year}-{(max_seq + 1):04d}"
 
     def get_by_customer(self, db: Session, customer_id: int, skip: int = 0, limit: int = 100) -> List[IssuanceRequest]:
         return db.query(self.model).filter(self.model.customer_id == customer_id)\

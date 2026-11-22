@@ -17,8 +17,10 @@ router = APIRouter()
 
 
 class AIQueryRequest(BaseModel):
-    question: Optional[str] = Field("", max_length=500, description="Natural language question about LG data.")
+    question: Optional[str] = Field("", max_length=1000, description="Natural language question about LG data, workflows, or rules (AR/EN).")
     card_id: Optional[str] = Field(None, description="Backend-resolved card ID for Level 0 query execution.")
+    page_context: Optional[str] = Field(None, max_length=200, description="Current screen path for contextual in-app guidance.")
+    history: Optional[List[Dict[str, str]]] = Field(default=None, description="Optional short recent conversation turns.")
 
 
 class LGReferenceItem(BaseModel):
@@ -82,7 +84,9 @@ def query_ai_assistant(
         user_id=current_user.user_id,
         card_id=payload.card_id,
         has_all_entity_access=current_user.has_all_entity_access,
-        entity_ids=current_user.entity_ids
+        entity_ids=current_user.entity_ids,
+        page_context=payload.page_context,
+        history=payload.history,
     )
     elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 

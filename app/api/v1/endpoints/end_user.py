@@ -342,6 +342,7 @@ async def run_auto_renewal_endpoint(
         has_all, allowed_ids = get_fresh_entity_permissions(db, end_user_context.user_id)
         selected_items = request_payload.renewals if request_payload and request_payload.renewals is not None else None
         pad_for_duplex = bool(request_payload.pad_for_duplex) if request_payload else False
+        failed_items: List[Dict[str, Any]] = []
 
         renewed_count, combined_pdf_bytes, batch_id, renewed_items = await crud_lg_record.run_auto_renewal_process(
             db,
@@ -352,16 +353,30 @@ async def run_auto_renewal_endpoint(
             user_allowed_entity_ids=allowed_ids,
             pad_for_duplex=pad_for_duplex,
             background_tasks=background_tasks,
+            failed_items_out=failed_items,
         )
 
+        failed_suffix = f" ({len(failed_items)} LG(s) failed — review details below.)" if failed_items else ""
         if combined_pdf_bytes:
             pdf_base64 = base64.b64encode(combined_pdf_bytes).decode('utf-8')
             return AutoRenewalRunSummaryOut(
                 renewed_count=renewed_count,
-                message=f"Successfully renewed {renewed_count} eligible LG(s). Consolidated instruction letter generated.",
+                message=f"Successfully renewed {renewed_count} eligible LG(s). Consolidated instruction letter generated.{failed_suffix}",
                 combined_pdf_base64=pdf_base64,
                 batch_id=batch_id,
-                renewed_items=renewed_items
+                renewed_items=renewed_items,
+                failed_count=len(failed_items),
+                failed_items=failed_items,
+            )
+        elif renewed_count > 0:
+            return AutoRenewalRunSummaryOut(
+                renewed_count=renewed_count,
+                message=f"Renewed {renewed_count} eligible LG(s), but consolidated PDF generation failed — print individual letters below.{failed_suffix}",
+                combined_pdf_base64=None,
+                batch_id=batch_id,
+                renewed_items=renewed_items,
+                failed_count=len(failed_items),
+                failed_items=failed_items,
             )
         else:
             return AutoRenewalRunSummaryOut(
@@ -369,7 +384,9 @@ async def run_auto_renewal_endpoint(
                 message="No eligible LGs were renewed.",
                 combined_pdf_base64=None,
                 batch_id=batch_id,
-                renewed_items=renewed_items
+                renewed_items=renewed_items,
+                failed_count=0,
+                failed_items=[],
             )
     except HTTPException as e:
         logger.error(f"HTTPException during bulk renewal for customer {end_user_context.customer_id}: {e.detail}", exc_info=True)
@@ -897,6 +914,17 @@ async def scan_lg_file(
         customer_bucket = bucket_config.get("effective_value") if bucket_config else None
         # 2. Call AI with the specific bucket
         file_bytes = await file.read()
+        if not file_bytes or len(file_bytes) < 32:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty or unreadable. Please upload a valid Letter of Guarantee PDF or image.",
+            )
+        if file.content_type == "application/pdf" and not file_bytes.lstrip().startswith(b"%PDF"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or corrupted PDF file. Please upload a valid PDF or clear image scan.",
+            )
+
         # 1. FETCH THE USER OBJECT
         from app.models import User
         user_obj = db.query(User).filter(User.id == end_user_context.user_id).first()
@@ -917,10 +945,22 @@ async def scan_lg_file(
         )
 
         if not extracted_ai_data:
-            log_action(db, user_id=end_user_context.user_id, action_type="AI_SCAN_FAILED", entity_type="LGRecord", entity_id=None, details={"file_name": file.filename, "reason": "AI extraction failed or returned no data", "ai_token_usage": ai_usage_metadata}, customer_id=end_user_context.customer_id)
+            log_action(db, user_id=end_user_context.user_id, action_type="AI_SCAN_FAILED", entity_type="LGRecord", entity_id=None, details={"file_name": file.filename, "reason": "Blank or unreadable document", "ai_token_usage": ai_usage_metadata}, customer_id=end_user_context.customer_id)
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to extract data from the document using AI. Please try again or enter details manually."
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Could not extract readable text from this file (it may be blank, blurry, or corrupted). Please upload a clear LG scan or enter details manually.",
+            )
+
+        has_core_lg_signals = bool(
+            (extracted_ai_data.get("lgNumber") or "").strip()
+            or (extracted_ai_data.get("issuingBankName") or "").strip()
+            or float(extracted_ai_data.get("lgAmount") or 0) > 0
+        )
+        if extracted_ai_data.get("isValidLgDocument") is False or not has_core_lg_signals:
+            log_action(db, user_id=end_user_context.user_id, action_type="AI_SCAN_REJECTED_NON_LG", entity_type="LGRecord", entity_id=None, details={"file_name": file.filename}, customer_id=end_user_context.customer_id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="This document does not appear to be a Letter of Guarantee (for example, it may be an invoice, receipt, or unrelated file). Please upload an actual Letter of Guarantee.",
             )
 
         all_customer_entities = crud_customer_entity.get_all_for_customer(db, end_user_context.customer_id)
@@ -1188,6 +1228,8 @@ async def scan_lg_file(
 
         log_action(db, user_id=end_user_context.user_id, action_type="AI_SCAN_SUCCESS", entity_type="LGRecord", entity_id=None, details={"file_name": file.filename, "extracted_fields": list(response_data.keys()), "ai_token_usage": ai_usage_metadata}, customer_id=end_user_context.customer_id)
         return response_data
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         log_action(db, user_id=end_user_context.user_id, action_type="AI_SCAN_FAILED", entity_type="LGRecord", entity_id=None, details={"file_name": file.filename, "reason": f"Processing error: {e}", "ai_token_usage": ai_usage_metadata}, customer_id=end_user_context.customer_id)

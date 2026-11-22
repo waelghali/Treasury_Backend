@@ -1441,6 +1441,8 @@ class AutoRenewalRunSummaryOut(BaseModel):
     combined_pdf_base64: Optional[str] = None
     batch_id: Optional[str] = None
     renewed_items: Optional[List[AutoRenewalBatchItemOut]] = None
+    failed_count: int = 0
+    failed_items: List[Dict[str, Any]] = []
 
 class LGAutoRenewalItemIn(BaseModel):
     lg_record_id: int = Field(..., description="The ID of the LG record to renew.")

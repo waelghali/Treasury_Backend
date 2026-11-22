@@ -664,6 +664,8 @@ def create_quotation_bank(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Corporate Administrators are authorized to configure bank counterparty rosters."
         )
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Quotation bank dealer desk roster")
 
     # Capture previous state for structured role audit
     existing_bank = None
@@ -1013,6 +1015,8 @@ def invite_bank_contact(
     a personal tokenized welcome handshake email to the dealer.
     Enforces Zero-Knowledge storage (AES-256-GCM + HMAC blind index) and 48-hour link TTL.
     """
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Quotation bank dealer desk invitations")
     from app.models.models import Bank, Customer
     from app.core.bank_validation import validate_bank_contact_email
     from app.services.unified_email_builder import build_dealer_invitation_email
@@ -1289,6 +1293,8 @@ def delete_quotation_bank(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Corporate Administrators are authorized to remove bank counterparties."
         )
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Quotation bank dealer desk roster")
 
     success = crud_quotation.delete_quotation_bank(db, customer_id=current_user.customer_id, bank_id=bank_id)
     if not success:
@@ -1931,17 +1937,36 @@ def create_rfq(
                 if has_range and (rfq_in.evalRate is None or rfq_in.evalRate <= 0):
                     raise HTTPException(status_code=400, detail="Evaluation Interest Rate (%) is required for T-Bill Buy quotations with date ranges.")
 
-        # --- Strict Positive Amount Validation ---
+        # --- Bidding Window & Currency Sanity Validation ---
+        if rfq_in.windowStart and rfq_in.windowEnd and rfq_in.windowEnd <= rfq_in.windowStart:
+            raise HTTPException(
+                status_code=400,
+                detail="Quotation bidding window end time must be strictly after the window start time."
+            )
+
+        # --- Strict Positive Amount & Distinct Currency Pair Validation ---
         if rfq_in.type == 'FX_SPOT':
             legs_list = rfq_in.legs or rfq_in.pairs
             if legs_list:
                 for idx, leg in enumerate(legs_list):
+                    b_ccy = (leg.buyCurrency or "USD").strip().upper()
+                    s_ccy = (leg.sellCurrency or "EGP").strip().upper()
+                    if b_ccy == s_ccy:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Pair #{idx + 1} cannot have identical Buy and Sell currencies ({b_ccy}/{s_ccy})."
+                        )
                     if leg.amount is None or leg.amount <= 0:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Trade amount for Pair #{idx + 1} ({leg.buyCurrency or 'USD'}/{leg.sellCurrency or 'EGP'}) must be a positive number strictly greater than 0."
+                            detail=f"Trade amount for Pair #{idx + 1} ({b_ccy}/{s_ccy}) must be a positive number strictly greater than 0."
                         )
             else:
+                if rfq_in.buyCurrency and rfq_in.sellCurrency and rfq_in.buyCurrency.strip().upper() == rfq_in.sellCurrency.strip().upper():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Buy and Sell currencies cannot be identical ({rfq_in.buyCurrency.strip().upper()})."
+                    )
                 if rfq_in.amount is None or rfq_in.amount <= 0:
                     raise HTTPException(status_code=400, detail="Trade amount must be a positive number strictly greater than 0.")
         elif rfq_in.type == 'TBILL':

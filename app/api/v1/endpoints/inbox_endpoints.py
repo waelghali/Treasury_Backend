@@ -1073,6 +1073,9 @@ def bulk_create_or_update_schedules(
     current_user: TokenData = Depends(require_corporate_admin_inbox_write)
 ):
     """Applies a recurring schedule to multiple banks in a single action."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Automated bank schedule configuration")
+
     cid = current_user.customer_id
     updated_ids = []
 
@@ -1161,6 +1164,9 @@ def create_or_update_schedule_config(
     current_user: TokenData = Depends(require_corporate_admin_inbox_write)
 ):
     """Creates or updates a recurring schedule config for a bank."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Automated bank schedule configuration")
+
     existing = db.query(InboxScheduleConfig).filter(
         InboxScheduleConfig.customer_id == current_user.customer_id,
         InboxScheduleConfig.bank_id == payload.bank_id,
@@ -1221,6 +1227,9 @@ def delete_schedule_config(
     current_user: TokenData = Depends(require_corporate_admin_inbox_write)
 ):
     """Soft-deletes a schedule configuration."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Automated bank schedule configuration")
+
     cfg = db.query(InboxScheduleConfig).filter(
         InboxScheduleConfig.id == config_id,
         InboxScheduleConfig.customer_id == current_user.customer_id,
@@ -1291,6 +1300,9 @@ def create_sync_token(
     current_user: TokenData = Depends(require_inbox_write_user),
 ):
     """Generates a new scoped Watched-Folder sync token (plaintext returned once)."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Watched-folder workstation sync tokens")
+
     raw_token = f"gws_{secrets.token_hex(20)}"
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     tok = InboxSyncToken(
@@ -1324,6 +1336,9 @@ def revoke_sync_token(
     current_user: TokenData = Depends(require_inbox_write_user),
 ):
     """Revokes and soft-deletes a Watched-Folder sync token."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Watched-folder workstation sync tokens")
+
     tok = db.query(InboxSyncToken).filter(
         InboxSyncToken.id == token_id,
         InboxSyncToken.customer_id == current_user.customer_id,

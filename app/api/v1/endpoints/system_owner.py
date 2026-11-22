@@ -4742,6 +4742,178 @@ def read_trial_registrations(
         out_list.append(item)
     return out_list
 
+async def provision_trial_registration_workspace(
+    db: Session,
+    registration: Any,
+    request: Optional[Request] = None,
+    caller_user_id: Optional[int] = None,
+    auto_activated: bool = False,
+) -> Customer:
+    """
+    Shared zero-touch Trial Sandbox provisioning engine used by:
+      1. Instant self-serve signup (`POST /public/register-free-trial/` -> `auto_activated=True`)
+      2. Manual System Owner approval (`POST /system-owner/trial/trial-registrations/{id}/approve`)
+    Assigns the $0 Guided Trial Sandbox plan, creates the isolated Customer + Tenant DEK,
+    pre-seeds realistic sample data, holds a 30d pre-login grace buffer (14d clock starts on 1st login),
+    and sends the Zero-Touch Activation Email immediately.
+    """
+    import secrets as _secrets
+    from sqlalchemy import func as _sa_func
+    from app.core.trial_guard import is_personal_email_domain
+    from app.services.trial_sandbox_seeder import (
+        ensure_trial_sandbox_seeded,
+        get_or_create_trial_sandbox_plan,
+    )
+
+    requested = registration.requested_modules or ["custody"]
+    wants_custody = "custody" in requested
+    wants_issuance = "issuance" in requested
+    wants_quotations = "quotations" in requested or "quotation" in requested
+    wants_reconciliation = "reconciliation" in requested
+
+    subscription_plan = get_or_create_trial_sandbox_plan(
+        db,
+        wants_custody=wants_custody,
+        wants_issuance=wants_issuance,
+        wants_quotations=wants_quotations,
+        wants_reconciliation=wants_reconciliation,
+    )
+
+    is_solo_email = is_personal_email_domain(registration.admin_email)
+    org_name_clean = (registration.organization_name or "Trial Workspace").strip()[:140]
+    if is_solo_email:
+        name_collision = (
+            db.query(Customer.id)
+            .filter(
+                Customer.is_deleted == False,
+                _sa_func.lower(Customer.name) == org_name_clean.lower(),
+            )
+            .first()
+        )
+        if name_collision:
+            email_local = (registration.admin_email or "user").split("@")[0][:18]
+            org_name_clean = f"{org_name_clean[:115]} ({email_local})"
+
+    unusable_initial_pw = _secrets.token_urlsafe(24) + "Aa1!"
+    safe_org_address = (registration.organization_address or "Cairo, Egypt").strip()[:250]
+
+    customer_in = CustomerCreate(
+        name=org_name_clean,
+        address=safe_org_address,
+        contact_email=registration.admin_email,
+        contact_phone=registration.contact_phone,
+        subscription_plan_id=subscription_plan.id,
+        initial_corporate_admin=UserCreate(
+            email=registration.admin_email,
+            password=unusable_initial_pw,
+            role=UserRole.CORPORATE_ADMIN,
+            must_change_password=False,
+            has_all_entity_access=True,
+            entity_ids=[],
+        ),
+        initial_entities=[],
+    )
+    if registration.entities_count == "One":
+        from app.crud.crud_customer import generate_unique_entity_code
+        entity_name = (org_name_clean + " Main Entity")[:100]
+        customer_in.initial_entities.append(
+            CustomerEntityCreate(
+                entity_name=entity_name,
+                address=safe_org_address,
+                code=generate_unique_entity_code(db, org_name_clean),
+                contact_person=(registration.contact_admin_name or org_name_clean)[:100],
+                contact_email=registration.admin_email,
+            )
+        )
+
+    db_customer = crud_customer.onboard_customer(db, customer_in, user_id_caller=caller_user_id)
+
+    # Hold a 30-day pre-activation grace buffer; the 14-day trial countdown starts ONLY on 1st login!
+    db_customer.end_date = db_customer.start_date + timedelta(days=30)
+    db.add(db_customer)
+    db.flush()
+
+    crud_trial_registration.update(
+        db, registration, {"status": "approved", "customer_id": db_customer.id}
+    )
+    try:
+        ensure_trial_sandbox_seeded(db, db_customer.id)
+    except Exception as seed_exc:
+        logger.warning(
+            f"Trial sandbox pre-seed warning for customer {db_customer.id}: {seed_exc}",
+            exc_info=True,
+        )
+
+    if auto_activated:
+        log_action(
+            db,
+            user_id=caller_user_id,
+            action_type="TRIAL_AUTO_ACTIVATED_NEEDS_REVIEW",
+            entity_type="TrialRegistration",
+            entity_id=registration.id,
+            details={
+                "organization": registration.organization_name,
+                "customer_id": db_customer.id,
+                "solo_mode": is_solo_email,
+            },
+            customer_id=db_customer.id,
+        )
+    else:
+        log_action(
+            db,
+            user_id=caller_user_id,
+            action_type="TRIAL_REGISTRATION_APPROVED",
+            entity_type="TrialRegistration",
+            entity_id=registration.id,
+            details={
+                "organization": registration.organization_name,
+                "customer_id": db_customer.id,
+                "solo_mode": is_solo_email,
+            },
+            customer_id=db_customer.id,
+        )
+
+    module_names = []
+    if wants_custody:
+        module_names.append("LG Custody & Lifecycle Governance")
+    if wants_issuance:
+        module_names.append("Outbound LG Issuance & Smart Bank Scoring")
+    if wants_quotations:
+        module_names.append("Sealed-Bid FX & Sovereign T-Bill Quotations")
+    if wants_reconciliation:
+        module_names.append("Cash & Bank Statement Auto-Reconciliation")
+
+    admin_user = next(
+        (
+            u
+            for u in db_customer.users
+            if not u.is_deleted and u.email.lower() == registration.admin_email.lower()
+        ),
+        next((u for u in db_customer.users if not u.is_deleted), None),
+    )
+    if admin_user:
+        from app.services.customer_onboarding_service import send_corporate_admin_activation_email
+
+        try:
+            await send_corporate_admin_activation_email(
+                db=db,
+                user=admin_user,
+                customer_name=db_customer.name,
+                request=request,
+                is_trial=True,
+                recipient_name=registration.contact_admin_name,
+                module_labels=module_names,
+                attach_guide=False,
+            )
+        except Exception as email_err:
+            logger.error(
+                f"Failed to dispatch trial activation email to {admin_user.email}: {email_err}",
+                exc_info=True,
+            )
+
+    return db_customer
+
+
 @trial_router.post("/trial-registrations/{registration_id}/approve", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
 async def approve_trial_registration(
     registration_id: int,
@@ -4751,114 +4923,38 @@ async def approve_trial_registration(
     background_tasks: BackgroundTasks = None
 ):
     """
-    Approves a pending trial registration, creates a new customer and initial user,
-    and sends a welcome email.
+    Approves a pending trial registration (or marks an already-provisioned registration verified).
     """
     registration = crud_trial_registration.get(db, id=registration_id)
-    if not registration or registration.status != "pending":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or not in pending state.")
+    if not registration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found.")
+
+    if registration.status == "approved" and registration.customer_id:
+        log_action(
+            db,
+            user_id=current_user.user_id,
+            action_type="TRIAL_POST_REVIEW_VERIFIED",
+            entity_type="TrialRegistration",
+            entity_id=registration_id,
+            details={"organization": registration.organization_name, "customer_id": registration.customer_id},
+            customer_id=registration.customer_id,
+        )
+        return crud_customer.get_with_relations(db, registration.customer_id)
+
+    if registration.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Registration is currently '{registration.status}' and cannot be approved as pending.",
+        )
 
     try:
-        # Step 1: Assign a dedicated $0 'Guided Trial Sandbox' plan (never a 12-month commercial plan)
-        requested = registration.requested_modules or ["custody"]
-        wants_custody = "custody" in requested
-        wants_issuance = "issuance" in requested
-        wants_quotations = "quotations" in requested or "quotation" in requested
-        wants_reconciliation = "reconciliation" in requested
-
-        from app.core.trial_guard import get_trial_caps
-        from app.services.trial_sandbox_seeder import (
-            ensure_trial_sandbox_seeded,
-            get_or_create_trial_sandbox_plan,
+        db_customer = await provision_trial_registration_workspace(
+            db=db,
+            registration=registration,
+            request=request,
+            caller_user_id=current_user.user_id,
+            auto_activated=False,
         )
-
-        subscription_plan = get_or_create_trial_sandbox_plan(
-            db,
-            wants_custody=wants_custody,
-            wants_issuance=wants_issuance,
-            wants_quotations=wants_quotations,
-            wants_reconciliation=wants_reconciliation,
-        )
-        logger.info(
-            f"Assigned trial sandbox plan '{subscription_plan.name}' (ID: {subscription_plan.id}) for trial registration {registration_id}"
-        )
-
-        import secrets as _secrets
-        unusable_initial_pw = _secrets.token_urlsafe(24) + "Aa1!"
-
-        safe_org_address = (registration.organization_address or "Cairo, Egypt").strip()[:250]
-        customer_in = CustomerCreate(
-            name=registration.organization_name,
-            address=safe_org_address,
-            contact_email=registration.admin_email,
-            contact_phone=registration.contact_phone,
-            subscription_plan_id=subscription_plan.id,
-            initial_corporate_admin=UserCreate(
-                email=registration.admin_email,
-                password=unusable_initial_pw,
-                role=UserRole.CORPORATE_ADMIN,
-                must_change_password=False,
-                has_all_entity_access=True,
-                entity_ids=[],
-            ),
-            initial_entities=[]
-        )
-        if registration.entities_count == 'One':
-            entity_name = (registration.organization_name + " Main Entity")[:100]
-            customer_in.initial_entities.append(CustomerEntityCreate(
-                entity_name=entity_name,
-                address=safe_org_address,
-                code="TEMP", # This will be replaced with a generated code in the CRUD layer
-                contact_person=(registration.contact_admin_name or registration.organization_name)[:100],
-                contact_email=registration.admin_email
-            ))
-
-        db_customer = crud_customer.onboard_customer(db, customer_in, user_id_caller=current_user.user_id)
-
-        # Hold a 30-day pre-activation grace buffer; the exact 14-day trial countdown starts ONLY
-        # upon the user's first password activation / first login (`ensure_trial_activated_clock`)!
-        db_customer.end_date = db_customer.start_date + timedelta(days=30)
-        db.add(db_customer)
-        db.flush()
-
-        # Step 2: Link registration & pre-seed entities, facilities, FX desks & companion personas
-        crud_trial_registration.update(db, registration, {"status": "approved", "customer_id": db_customer.id})
-        try:
-            ensure_trial_sandbox_seeded(db, db_customer.id)
-        except Exception as seed_exc:
-            logger.warning(f"Trial sandbox pre-seed warning for customer {db_customer.id}: {seed_exc}", exc_info=True)
-
-        # Build clean module list for the branded zero-touch activation email
-        module_names = []
-        if wants_custody:
-            module_names.append("LG Custody & Lifecycle Governance")
-        if wants_issuance:
-            module_names.append("Outbound LG Issuance & Smart Bank Scoring")
-        if wants_quotations:
-            module_names.append("Sealed-Bid FX & Sovereign T-Bill Quotations")
-        if wants_reconciliation:
-            module_names.append("Cash & Bank Statement Auto-Reconciliation")
-
-        # Step 3: Dispatch Zero-Touch Branded Activation Email (No plain-text password!)
-        admin_user = next(
-            (u for u in db_customer.users if not u.is_deleted and u.email.lower() == registration.admin_email.lower()),
-            next((u for u in db_customer.users if not u.is_deleted), None),
-        )
-        if admin_user:
-            from app.services.customer_onboarding_service import send_corporate_admin_activation_email
-            try:
-                await send_corporate_admin_activation_email(
-                    db=db,
-                    user=admin_user,
-                    customer_name=db_customer.name,
-                    request=request,
-                    is_trial=True,
-                    recipient_name=registration.contact_admin_name,
-                    module_labels=module_names,
-                )
-            except Exception as email_err:
-                logger.error(f"Failed to dispatch trial activation email to {admin_user.email}: {email_err}", exc_info=True)
-
     except HTTPException:
         db.rollback()
         raise
@@ -4866,8 +4962,117 @@ async def approve_trial_registration(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to approve registration: {e}")
 
-    log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_APPROVED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name, "customer_id": db_customer.id})
     return crud_customer.get_with_relations(db, db_customer.id)
+
+
+@trial_router.post("/trial-registrations/{registration_id}/verify", status_code=status.HTTP_200_OK)
+def verify_auto_activated_trial_registration(
+    registration_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_owner:approve_trial_registration")),
+):
+    """
+    Post-activation review: marks an instantly-activated Free Trial registration as Verified
+    by the System Owner while keeping the prospect's workspace active without interruption.
+    """
+    registration = crud_trial_registration.get(db, id=registration_id)
+    if not registration or not registration.customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approved trial registration not found.")
+
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="TRIAL_POST_REVIEW_VERIFIED",
+        entity_type="TrialRegistration",
+        entity_id=registration.id,
+        details={"organization": registration.organization_name, "customer_id": registration.customer_id},
+        customer_id=int(registration.customer_id),
+    )
+    return {
+        "message": f"Verified trial registration for {registration.organization_name}.",
+        "review_status": "VERIFIED",
+    }
+
+
+def _suspend_and_revoke_trial_registration_sync(
+    db: Session,
+    registration: Any,
+    caller_user_id: Optional[int],
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    1-Click Kill-Switch: rejects a pending registration OR immediately suspends/revokes an
+    already-activated Trial Sandbox tenant (invalidating active JWTs and freeing corporate domains).
+    Strictly guarded so it can NEVER deactivate a non-trial commercial customer.
+    """
+    from app.constants import SubscriptionStatus
+    from app.core.trial_guard import is_trial_customer
+    from app.models.models import User
+
+    cust_id = int(registration.customer_id) if registration.customer_id else None
+    if cust_id:
+        if not is_trial_customer(db, cust_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot revoke trial access on a live commercial subscription customer.",
+            )
+        cust = db.query(Customer).filter(Customer.id == cust_id).first()
+        if cust:
+            use_tz = bool(cust.end_date and cust.end_date.tzinfo)
+            now_dt = datetime.now(timezone.utc) if use_tz else datetime.utcnow()
+            cust.status = SubscriptionStatus.EXPIRED
+            cust.end_date = now_dt - timedelta(seconds=5)
+            cust.domains = []
+            cust.is_deleted = True
+            db.add(cust)
+
+            trial_users = db.query(User).filter(User.customer_id == cust_id, User.is_deleted == False).all()
+            for u in trial_users:
+                u.is_deleted = True
+                db.add(u)
+
+    crud_trial_registration.update(db, registration, {"status": "rejected"})
+    log_action(
+        db,
+        user_id=caller_user_id,
+        action_type="TRIAL_ACCESS_REVOKED" if cust_id else "TRIAL_REGISTRATION_REJECTED",
+        entity_type="TrialRegistration",
+        entity_id=registration.id,
+        details={
+            "organization": registration.organization_name,
+            "customer_id": cust_id,
+            "reason": reason or "Revoked by System Owner",
+        },
+        customer_id=cust_id,
+    )
+    return {
+        "message": (
+            f"Trial workspace for {registration.organization_name} has been suspended and revoked immediately."
+            if cust_id
+            else "Registration rejected successfully."
+        ),
+        "status": "rejected",
+    }
+
+
+@trial_router.post("/trial-registrations/{registration_id}/revoke", status_code=status.HTTP_200_OK)
+def revoke_trial_registration(
+    registration_id: int,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(HasPermission("system_owner:reject_trial_registration")),
+):
+    """
+    Post-activation kill-switch: immediately suspends and revokes an active (or pending) Free Trial.
+    """
+    registration = crud_trial_registration.get(db, id=registration_id)
+    if not registration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trial registration not found.")
+    if registration.status == "rejected":
+        return {"message": "Trial registration is already revoked/rejected.", "status": "rejected"}
+    return _suspend_and_revoke_trial_registration_sync(
+        db=db, registration=registration, caller_user_id=current_user.user_id
+    )
+
 
 @trial_router.post("/trial-registrations/{registration_id}/reject", status_code=status.HTTP_200_OK)
 def reject_trial_registration(
@@ -4877,18 +5082,14 @@ def reject_trial_registration(
     request: Request = None
 ):
     """
-    Rejects a pending trial registration and sends a rejection email.
+    Rejects a pending trial registration or revokes an active auto-provisioned trial registration.
     """
     registration = crud_trial_registration.get(db, id=registration_id)
-    if not registration or registration.status != "pending":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or not in pending state.")
-
-    crud_trial_registration.update(db, registration, {"status": "rejected"})
-
-    # Send rejection email (logic for this will be in a later step)
-
-    log_action(db, user_id=current_user.user_id, action_type="TRIAL_REGISTRATION_REJECTED", entity_type="TrialRegistration", entity_id=registration_id, details={"organization": registration.organization_name})
-    return {"message": "Registration rejected successfully."}
+    if not registration or registration.status == "rejected":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found or already rejected.")
+    return _suspend_and_revoke_trial_registration_sync(
+        db=db, registration=registration, caller_user_id=current_user.user_id
+    )
 
 
 class ExtendTrialRequestIn(BaseModel):

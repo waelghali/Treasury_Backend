@@ -46,10 +46,13 @@ class CRUDLGInstruction(CRUDBase):
         lg_category_code: str,
         lg_sequence_number: str,
         instruction_type_code: InstructionTypeCode,
-        sub_instruction_code: SubInstructionCode
+        sub_instruction_code: SubInstructionCode,
+        collision_offset: int = 0,
     ) -> Tuple[str, int, int]:
         """
-        Generates the next unique instruction serial number and its sequence numbers.
+        Generates the next unique 20-character instruction serial number and its per-LG sequence numbers.
+        If another customer/record shares the same entity+category+LG sequence prefix, steps the serial's
+        sequence digits to the next globally unused slot while keeping per-LG sequences accurate.
         Returns: Tuple[serial_number_str, global_seq_int, type_seq_int]
         """
         entity_code = entity_code.upper()
@@ -65,32 +68,49 @@ class CRUDLGInstruction(CRUDBase):
             self.model.lg_record_id == lg_record_id
         ).scalar()
         next_global_seq = (current_max_global_seq if current_max_global_seq is not None else 0) + 1
-        global_seq_padded = str(next_global_seq).zfill(4)
 
         current_max_type_seq = db.query(func.max(self.model.type_seq_per_lg)).filter(
             self.model.lg_record_id == lg_record_id,
             self.model.instruction_type == INSTRUCTION_TYPE_CODE_TO_FULL_ACTION_MAP.get(instruction_type_code)
         ).scalar()
         next_type_seq = (current_max_type_seq if current_max_type_seq is not None else 0) + 1
-        type_seq_padded = str(next_type_seq).zfill(3)
 
         logger.debug(f"DEBUG: get_next_serial_number for LG {lg_record_id}, Type {INSTRUCTION_TYPE_CODE_TO_FULL_ACTION_MAP.get(instruction_type_code)}:")
         logger.debug(f"  current_max_global_seq: {current_max_global_seq}, next_global_seq: {next_global_seq}")
         logger.debug(f"  current_max_type_seq: {current_max_type_seq}, next_type_seq: {next_type_seq}")
 
-        new_serial = (
+        prefix = (
             f"{entity_code}"
             f"{lg_category_code.ljust(2, '_')}"
             f"{lg_sequence_number}"
             f"{instruction_type_code_val}"
-            f"{global_seq_padded}"
-            f"{type_seq_padded}"
-            f"{sub_instruction_code_val}"
         )
 
+        def _format_serial(g_seq: int, t_seq: int) -> str:
+            g_padded = str(min(max(g_seq, 1), 9999)).zfill(4)
+            t_padded = str(((max(t_seq, 1) - 1) % 999) + 1).zfill(3)
+            return f"{prefix}{g_padded}{t_padded}{sub_instruction_code_val}"
+
+        offset = max(int(collision_offset or 0), 0)
+        new_serial = _format_serial(next_global_seq + offset, next_type_seq + offset)
+
         if db.query(exists().where(self.model.serial_number == new_serial)).scalar():
-            logger.warning(f"Race condition detected: Generated serial '{new_serial}' already exists during get_next_serial_number. This should be handled by the retry loop.")
-        
+            existing_serials = {
+                row[0]
+                for row in db.query(self.model.serial_number)
+                .filter(self.model.serial_number.like(f"{prefix}%{sub_instruction_code_val}"))
+                .all()
+                if row and row[0]
+            }
+            step = max(offset, 1)
+            while new_serial in existing_serials and (next_global_seq + step) <= 9999:
+                new_serial = _format_serial(next_global_seq + step, next_type_seq + step)
+                step += 1
+            logger.info(
+                f"Stepped instruction serial to '{new_serial}' for LG {lg_record_id} to avoid global prefix collision "
+                f"(per-LG global_seq={next_global_seq}, type_seq={next_type_seq})."
+            )
+
         return new_serial, next_global_seq, next_type_seq
 
     async def create(self, db: Session, obj_in: LGInstructionCreate, **kwargs: Any) -> models.LGInstruction:
@@ -108,40 +128,42 @@ class CRUDLGInstruction(CRUDBase):
 
         for attempt in range(5):
             try:
-                serial_number_generated, global_seq_val, type_seq_val = await self.get_next_serial_number(
-                    db,
-                    lg_record_id=lg_record_id,
-                    entity_code=entity_code,
-                    lg_category_code=lg_category_code,
-                    lg_sequence_number=lg_sequence_number_str,
-                    instruction_type_code=instruction_type_code_enum,
-                    sub_instruction_code=sub_instruction_code_enum
-                )
+                with db.begin_nested():
+                    serial_number_generated, global_seq_val, type_seq_val = await self.get_next_serial_number(
+                        db,
+                        lg_record_id=lg_record_id,
+                        entity_code=entity_code,
+                        lg_category_code=lg_category_code,
+                        lg_sequence_number=lg_sequence_number_str,
+                        instruction_type_code=instruction_type_code_enum,
+                        sub_instruction_code=sub_instruction_code_enum,
+                        collision_offset=attempt,
+                    )
 
-                obj_in.serial_number = serial_number_generated
-                
-                db_obj = self.model(
-                    lg_record_id=lg_record_id,
-                    instruction_type=full_action_type_for_db,
-                    serial_number=obj_in.serial_number,
-                    global_seq_per_lg=global_seq_val,
-                    type_seq_per_lg=type_seq_val,
-                    template_id=obj_in.template_id,
-                    status=obj_in.status,
-                    instruction_date=obj_in.instruction_date if obj_in.instruction_date else func.now(),
-                    delivery_date=obj_in.delivery_date,
-                    bank_reply_date=obj_in.bank_reply_date,
-                    details=obj_in.details,
-                    generated_content_path=obj_in.generated_content_path,
-                    sent_to_bank=obj_in.sent_to_bank,
-                    is_printed=obj_in.is_printed,
-                    maker_user_id=obj_in.maker_user_id,
-                    checker_user_id=obj_in.checker_user_id,
-                    approval_request_id=obj_in.approval_request_id,
-                    bank_reply_details=obj_in.bank_reply_details
-                )
-                db.add(db_obj)
-                db.flush()
+                    obj_in.serial_number = serial_number_generated
+
+                    db_obj = self.model(
+                        lg_record_id=lg_record_id,
+                        instruction_type=full_action_type_for_db,
+                        serial_number=obj_in.serial_number,
+                        global_seq_per_lg=global_seq_val,
+                        type_seq_per_lg=type_seq_val,
+                        template_id=obj_in.template_id,
+                        status=obj_in.status,
+                        instruction_date=obj_in.instruction_date if obj_in.instruction_date else func.now(),
+                        delivery_date=obj_in.delivery_date,
+                        bank_reply_date=obj_in.bank_reply_date,
+                        details=obj_in.details,
+                        generated_content_path=obj_in.generated_content_path,
+                        sent_to_bank=obj_in.sent_to_bank,
+                        is_printed=obj_in.is_printed,
+                        maker_user_id=obj_in.maker_user_id,
+                        checker_user_id=obj_in.checker_user_id,
+                        approval_request_id=obj_in.approval_request_id,
+                        bank_reply_details=obj_in.bank_reply_details
+                    )
+                    db.add(db_obj)
+                    db.flush()
                 db.refresh(db_obj)
                 try:
                     from app.core.instruction_verification import register_instruction_for_verification
@@ -198,13 +220,13 @@ class CRUDLGInstruction(CRUDBase):
                 return db_obj
 
             except IntegrityError as e:
-                db.rollback()
                 logger.warning(f"UniqueViolation during instruction creation (Attempt {attempt+1}/5). Retrying serial generation. Error: {e.orig}")
                 if attempt == 4:
                     logger.error(f"Failed to generate unique instruction serial after 5 attempts for LG {lg_record_id}, type {full_action_type_for_db}.")
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate a unique instruction serial number after multiple attempts. Please try again.")
+            except HTTPException:
+                raise
             except Exception as e:
-                db.rollback()
                 logger.error(f"Unexpected error during instruction creation: {e}", exc_info=True)
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during instruction creation: {e}")
 

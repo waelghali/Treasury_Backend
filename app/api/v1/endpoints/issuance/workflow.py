@@ -67,6 +67,9 @@ def update_workflow_policies(
     """ Bulk replace all approval rules. Wipes old rules and sets the new sequence.
     Multi-admin: requires dual-control approval via AdminChangeRequest.
     Returns saved policies + coverage gap warnings. """
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Approval matrix & workflow policies")
+
     
     amount_based_types = {"AMOUNT_OVER", "AMOUNT_RANGE"}
     amount_currencies = set()

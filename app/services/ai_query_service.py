@@ -15,7 +15,9 @@ Levels:
 """
 
 import re
+import json
 import logging
+from urllib.parse import urlsplit, parse_qs
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.orm import Session, joinedload
@@ -104,14 +106,199 @@ class AIQueryAssistantService:
     def _get_query_params(self, customer_id: Optional[int], user_id: Optional[int]) -> Dict[str, Any]:
         return self._query_params_by_user.get((int(customer_id or 0), int(user_id or 0)), {})
 
+    @staticmethod
+    def parse_page_context(page_context: Optional[str]) -> Dict[str, Any]:
+        """
+        Deterministically parses a frontend screen path + query string into module, sub_page,
+        human-readable screen label, and any URL-embedded record identifiers (<1ms, zero DB calls).
+        """
+        info: Dict[str, Any] = {
+            "raw": (page_context or "").strip(),
+            "path": "",
+            "module": None,
+            "sub_page": "dashboard",
+            "label": "Dashboard",
+            "lg_id": None,
+            "issuance_request_id": None,
+            "rfq_id": None,
+            "statement_id": None,
+            "search_query": None,
+        }
+        if not page_context or not str(page_context).strip():
+            return info
+
+        raw_str = str(page_context).strip()[:200]
+        parsed = urlsplit(raw_str)
+        path_clean = (parsed.path or "").strip()
+        path_lower = path_clean.lower().rstrip("/")
+        info["path"] = path_clean or raw_str
+
+        if parsed.query:
+            qs = parse_qs(parsed.query)
+            if qs.get("search"):
+                info["search_query"] = str(qs["search"][0]).strip()[:80]
+
+        # 1. LG Issuance & Facilities (check `/issuance/reconciliation` BEFORE `/reconciliation`!)
+        if "/issuance/reconciliation" in path_lower:
+            info.update({"module": "issuance", "sub_page": "position_reconciliation", "label": "LG Issuance — Bank LG Position Reconciliation"})
+            return info
+        if "/issuance/facilities" in path_lower or path_lower.endswith("/facilities"):
+            info.update({"module": "issuance", "sub_page": "facilities", "label": "LG Issuance — Bank Credit Facilities"})
+            return info
+        if "/issuance/issued-lgs" in path_lower:
+            info.update({"module": "issuance", "sub_page": "issued_lgs", "label": "LG Issuance — Issued LGs Register"})
+            return info
+        req_id_match = re.search(r"/issuance/requests/(?:edit/)?(\d+)\b", path_lower)
+        if req_id_match:
+            info.update({
+                "module": "issuance",
+                "sub_page": "request_details",
+                "label": "LG Issuance — Request Details",
+                "issuance_request_id": int(req_id_match.group(1)),
+            })
+            return info
+        if "/issuance/form-config" in path_lower:
+            info.update({"module": "issuance", "sub_page": "form_config", "label": "LG Issuance — Form Configuration"})
+            return info
+        if "/issuance/migration-hub" in path_lower:
+            info.update({"module": "issuance", "sub_page": "migration_hub", "label": "LG Issuance — Migration Hub"})
+            return info
+        if "/issuance" in path_lower or "/approval-inbox" in path_lower or "/reports/issuance-intelligence" in path_lower:
+            info.update({"module": "issuance", "sub_page": "requests", "label": "LG Issuance — Outbound Requests"})
+            return info
+
+        # 2. FX & T-Bill Quotations
+        rfq_id_match = re.search(r"/quotations?/results/([A-Za-z0-9_-]+)", path_clean, re.IGNORECASE)
+        if rfq_id_match:
+            info.update({
+                "module": "quotations",
+                "sub_page": "rfq_results",
+                "label": "FX & T-Bill Quotations — RFQ Results",
+                "rfq_id": rfq_id_match.group(1),
+            })
+            return info
+        if "/quotation" in path_lower:
+            sub = "new_rfq" if ("/new" in path_lower or "/active" in path_lower) else ("history" if "/history" in path_lower else "dashboard")
+            info.update({"module": "quotations", "sub_page": sub, "label": "FX & T-Bill Quotations"})
+            return info
+
+        # 3. Bank Statement Auto-Reconciliation
+        stmt_match = re.search(r"/reconciliation/workspace/(\d+)\b", path_lower)
+        if stmt_match:
+            info.update({
+                "module": "reconciliation",
+                "sub_page": "workspace",
+                "label": "Bank Reconciliation — Statement Workspace",
+                "statement_id": int(stmt_match.group(1)),
+            })
+            return info
+        if "/reconciliation/rules" in path_lower:
+            info.update({"module": "reconciliation", "sub_page": "rules", "label": "Bank Reconciliation — Rules Engine"})
+            return info
+        if "/reconciliation/export" in path_lower:
+            info.update({"module": "reconciliation", "sub_page": "export", "label": "Bank Reconciliation — Accounting Export"})
+            return info
+        if "/reconciliation/cash-intelligence" in path_lower:
+            info.update({"module": "reconciliation", "sub_page": "cash_intelligence", "label": "Bank Reconciliation — Cash Flow Intelligence"})
+            return info
+        if "/reconciliation" in path_lower:
+            info.update({"module": "reconciliation", "sub_page": "overview", "label": "Bank Statement Auto-Reconciliation"})
+            return info
+
+        # 4. LG Custody (Inbound)
+        if "/lg-records/new" in path_lower:
+            info.update({"module": "custody", "sub_page": "new_lg", "label": "LG Custody — Record New LG"})
+            return info
+        lg_id_match = re.search(r"/lg-records/(\d+)\b", path_lower)
+        if lg_id_match:
+            info.update({
+                "module": "custody",
+                "sub_page": "lg_details",
+                "label": "LG Custody — Guarantee Details",
+                "lg_id": int(lg_id_match.group(1)),
+            })
+            return info
+        if any(seg in path_lower for seg in (
+            "/lg-records", "/expiring-lgs", "/lg-categories", "/internal-owners",
+            "/internal-data", "/migration-hub", "/reports/customer-lg-performance", "/reports/my-lg-dashboard"
+        )):
+            info.update({"module": "custody", "sub_page": "list", "label": "LG Custody — Guarantee Vault"})
+            return info
+
+        # 5. Cross-Module Operational Hubs
+        if "/action-center" in path_lower:
+            info.update({"module": "action_center", "sub_page": "overview", "label": "Operational Action Center"})
+            return info
+        if "/approval-requests" in path_lower or "/pending-approvals" in path_lower:
+            info.update({"module": "approvals", "sub_page": "overview", "label": "Approval Center"})
+            return info
+        if "/module-configs" in path_lower or "/global-configurations" in path_lower or "/entities" in path_lower:
+            info.update({"module": "settings", "sub_page": "settings", "label": "Settings & Configurations"})
+            return info
+        if "/audit-logs" in path_lower or "/activity" in path_lower:
+            info.update({"module": "audit", "sub_page": "audit", "label": "Audit Logs & Activity"})
+            return info
+        if "/users" in path_lower:
+            info.update({"module": "users", "sub_page": "users", "label": "User Management"})
+            return info
+        if "/inbox" in path_lower:
+            info.update({"module": "inbox", "sub_page": "inbox", "label": "Smart Email Inbox"})
+            return info
+
+        return info
+
+    @staticmethod
+    def _infer_history_context(history: Optional[List[Dict[str, str]]]) -> Dict[str, Any]:
+        """Extracts lightweight entity/module continuity cues from the most recent conversation turns."""
+        res: Dict[str, Any] = {"module": None, "lg_number": None, "rfq_ref": None, "req_serial": None}
+        if not history or not isinstance(history, list):
+            return res
+
+        recent = [t for t in history[-4:] if isinstance(t, dict) and t.get("content")]
+        if not recent:
+            return res
+
+        # Inspect newest turn backwards for explicit record references
+        for turn in reversed(recent):
+            txt = str(turn.get("content") or "")
+            if not res["rfq_ref"]:
+                m_rfq = re.search(r"\b((?:DEAL|RFQ|EXEC)-[A-Za-z0-9_-]+)\b", txt, re.IGNORECASE)
+                if m_rfq:
+                    res["rfq_ref"] = m_rfq.group(1)
+            if not res["req_serial"]:
+                m_req = re.search(r"\b(REQ-[A-Za-z0-9_-]+)\b", txt, re.IGNORECASE)
+                if m_req:
+                    res["req_serial"] = m_req.group(1)
+            if not res["lg_number"]:
+                m_lg = re.search(r"\b(LG-[A-Za-z0-9_-]+|ACME/[A-Za-z0-9_/-]+)\b", txt)
+                if m_lg:
+                    res["lg_number"] = m_lg.group(1)
+
+        joined_lower = " ".join(str(t.get("content") or "") for t in recent[-2:]).lower()
+        if any(w in joined_lower for w in ("rfq", "quotation", "t-bill", "tbill", "fx spot")):
+            res["module"] = "quotations"
+        elif any(w in joined_lower for w in ("issuance pipeline", "issuance request", "outbound guarantee", "credit facilit", "facility headroom")):
+            res["module"] = "issuance"
+        elif any(w in joined_lower for w in ("bank reconciliation", "statement reconciliation", "mt940", "camt.053", "cross-bank sweep")):
+            res["module"] = "reconciliation"
+        elif any(w in joined_lower for w in ("custody vault", "inbound guarantee", "lg custody")):
+            res["module"] = "custody"
+
+        return res
+
     def classify_and_interpret(
         self,
         user_question: str,
         customer_id: Optional[int] = None,
-        user_id: Optional[int] = None
+        user_id: Optional[int] = None,
+        page_context: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         q_raw = user_question.strip()
         q_lower = q_raw.lower()
+        ctx = self.parse_page_context(page_context)
+        hist_ctx = self._infer_history_context(history)
+        active_module = ctx["module"] or hist_ctx.get("module")
 
         # 0. Security, Exploitation & Malicious Intent Guardrail
         security_threat_keywords = [
@@ -130,9 +317,11 @@ class AIQueryAssistantService:
                 "parameters": {"query": q_raw}
             }
 
-        # Non-treasury rejection (guard against sports/weather/trivia, but permit treasury questions like "who won the rfq/deal")
+        # Non-treasury rejection (guard against sports/weather/trivia, while permitting "who won" on Quotations)
         is_treasury_query = any(w in q_lower for w in ["rfq", "rfqs", "deal", "trade", "bank", "quote", "quotation", "lg", "guarantee", "facility", "treasury"])
-        if not is_treasury_query and any(kw in q_lower for kw in ["capital of", "weather in", "recipe", "who won", "president of", "football", "tell me a joke"]):
+        hard_off_topic = any(kw in q_lower for kw in ["capital of", "weather in", "recipe", "president of", "football", "tell me a joke"])
+        ambiguous_who_won = ("who won" in q_lower and not is_treasury_query and active_module != "quotations")
+        if (not is_treasury_query and hard_off_topic) or ambiguous_who_won:
             return {
                 "suggested_level": 3,
                 "topic": "non_treasury",
@@ -216,22 +405,92 @@ class AIQueryAssistantService:
                 "parameters": {"scope": "all_organization", "limit": 10}
             }
 
-        # 1. Pronoun / Context continuation (strictly isolated per (customer_id, user_id))
-        last_ref_lg = self._get_last_referenced_lg(customer_id, user_id)
-        if last_ref_lg and any(kw in q_lower for kw in [
-            "this lg", "this guarantee", "it", "about it", "who is the beneficiary",
-            "which bank issued it", "what is its amount", "when does it expire",
-            "show me details", "more details", "what is the currency"
-        ]):
-            return {
-                "suggested_level": 1,
-                "topic": "treasury",
-                "intent": "get_lg_details",
-                "parameters": {
+        # 1. Pronoun / Deictic Context Continuation (Chat Memory + Current Screen URL ID Tie-Breaker)
+        # Note: Do NOT trigger single-record pronoun lookup if the user explicitly typed a literal LG/RFQ/REQ identifier
+        has_inline_id = bool(
+            re.search(r"\b((?:DEAL|RFQ|EXEC|REQ|LG)-[A-Za-z0-9_-]+|ACME/[A-Za-z0-9_/-]+)\b", q_raw, re.IGNORECASE)
+        )
+        deictic_record_cues = [
+            "this lg", "this guarantee", "this request", "this rfq", "this deal", "this quote",
+            "about it", "about this", "who is the beneficiary", "which bank issued it", "which bank",
+            "what is its amount", "what is the amount", "when does it expire", "when does this expire",
+            "what is its status", "what is the status", "show me details", "show details",
+            "more details", "what is the currency"
+        ]
+        has_bare_it = bool(re.search(r"\b(it|its)\b", q_lower)) and len(q_lower.split()) <= 8
+        is_deictic_record_q = (not has_inline_id) and (
+            any(kw in q_lower for kw in deictic_record_cues) or has_bare_it
+        )
+
+        if is_deictic_record_q:
+            # 1a. Quotation RFQ detail context (`/quotations/results/:id` or explicit `this rfq/deal` or recent RFQ turn)
+            if (
+                any(k in q_lower for k in ("this rfq", "this deal", "this quote"))
+                or (ctx["sub_page"] == "rfq_results" and "this lg" not in q_lower and "this guarantee" not in q_lower)
+                or (active_module == "quotations" and hist_ctx.get("rfq_ref") and "this lg" not in q_lower)
+            ):
+                target_rfq_id = ctx.get("rfq_id")
+                target_rfq_ref = hist_ctx.get("rfq_ref")
+                if any(k in q_lower for k in ("participat", "invited", "which banks", "banks quoted", "who quoted")):
+                    return {
+                        "suggested_level": 1,
+                        "topic": "quotation",
+                        "intent": "get_last_rfq_participants",
+                        "parameters": {"rfq_id": target_rfq_id, "rfq_ref": target_rfq_ref},
+                    }
+                if target_rfq_id or target_rfq_ref:
+                    return {
+                        "suggested_level": 1,
+                        "topic": "quotation",
+                        "intent": "lookup_deal_reference",
+                        "parameters": {"rfq_id": target_rfq_id, "ref": target_rfq_ref or ""},
+                    }
+
+            # 1b. Outbound Issuance Request detail context (`/issuance/requests/edit/:id` or `this request` or recent REQ turn)
+            if (
+                "this request" in q_lower
+                or (ctx["sub_page"] == "request_details" and "this lg" not in q_lower)
+                or (active_module == "issuance" and hist_ctx.get("req_serial") and "this lg" not in q_lower)
+            ):
+                if ctx.get("issuance_request_id") or hist_ctx.get("req_serial"):
+                    return {
+                        "suggested_level": 1,
+                        "topic": "treasury",
+                        "intent": "get_issuance_request_details",
+                        "parameters": {
+                            "request_id": ctx.get("issuance_request_id"),
+                            "serial_number": hist_ctx.get("req_serial"),
+                        },
+                    }
+
+            # 1c. Custody LG detail context: active chat session LG takes precedence; otherwise fall back to URL `/lg-records/:id`
+            last_ref_lg = self._get_last_referenced_lg(customer_id, user_id)
+            has_active_chat = bool(history and len(history) > 0)
+            resolved_lg_params: Optional[Dict[str, Any]] = None
+            if has_active_chat and last_ref_lg:
+                resolved_lg_params = {
                     "lg_id": last_ref_lg.get("lg_id"),
-                    "lg_number": last_ref_lg.get("lg_number")
+                    "lg_number": last_ref_lg.get("lg_number"),
                 }
-            }
+            elif ctx.get("lg_id"):
+                resolved_lg_params = {"lg_id": ctx["lg_id"]}
+            elif hist_ctx.get("lg_number"):
+                resolved_lg_params = {"lg_number": hist_ctx["lg_number"]}
+            elif last_ref_lg:
+                resolved_lg_params = {
+                    "lg_id": last_ref_lg.get("lg_id"),
+                    "lg_number": last_ref_lg.get("lg_number"),
+                }
+            elif ctx.get("search_query"):
+                resolved_lg_params = {"lg_number": ctx["search_query"]}
+
+            if resolved_lg_params:
+                return {
+                    "suggested_level": 1,
+                    "topic": "treasury",
+                    "intent": "get_lg_details",
+                    "parameters": resolved_lg_params,
+                }
 
         # Feedback & Problem Listener Engine (Check BEFORE guide_patterns so feedback questions are not hijacked by 'how to')
         feedback_triggers = [
@@ -261,6 +520,16 @@ class AIQueryAssistantService:
                     "message": q_raw,
                     "feedback_type": fb_type
                 }
+            }
+
+        # Issuance Data: Direct Outbound Request Serial Lookup (e.g. REQ-2026-0001)
+        req_serial_match = re.search(r'\b(REQ-[A-Za-z0-9_-]+)\b', q_raw, re.IGNORECASE)
+        if req_serial_match:
+            return {
+                "suggested_level": 1,
+                "topic": "treasury",
+                "intent": "get_issuance_request_details",
+                "parameters": {"serial_number": req_serial_match.group(1).strip()}
             }
 
         # Quotation Data: Direct Deal or RFQ Reference Lookup
@@ -324,8 +593,18 @@ class AIQueryAssistantService:
                 "parameters": {}
             }
 
-        # 2. Level 4 System Guides & Navigation (using word boundaries to prevent 'show top' colliding with 'how to')
-        is_greeting = q_lower in ["hi", "hello", "hey", "start", "help", "who are you", "what can you do", "restart", "reset"]
+        # 2. Level 4 System Guides, Rule Logic & Bilingual AR/EN Product Expert
+        has_arabic = bool(re.search(r"[\u0600-\u06FF]", q_raw))
+        ar_portfolio_data_Cues = (
+            "خطابات الضمان التي تنتهي", "الخطابات المنتهية", "تنتهي خلال", "ملخص المحفظة",
+            "رصيد التسهيلات", "سجل المراجعة", "سجلات المراجعة",
+        )
+        is_ar_portfolio_query = has_arabic and any(cue in q_raw for cue in ar_portfolio_data_Cues)
+
+        is_greeting = q_lower in [
+            "hi", "hello", "hey", "start", "help", "who are you", "what can you do", "restart", "reset",
+            "مرحبا", "اهلا", "أهلا", "السلام عليكم", "مساء الخير", "صباح الخير", "مساعدة",
+        ]
         guide_patterns = [
             r"\bhow\s+can\s+i\b", r"\bhow\s+do\s+i\b", r"\bhow\s+to\b",
             r"\bwhere\s+can\s+i\b", r"\bguide\s+me\b", r"\bsteps\s+to\b",
@@ -336,6 +615,14 @@ class AIQueryAssistantService:
             r"\bwhat\s+will\s+happen\b", r"\bif\s+i\s+change\b", r"\bif\s+i\s+did\s+not\b",
             r"\bhow\s+does\b", r"\bhow\s+do\b", r"\bhow\s+is\b", r"\bhow\s+are\b",
             r"\bhow\s+works?\b", r"\bexplain\b", r"\btell\s+me\s+about\b",
+            r"\bwhy\s+did\b", r"\bwhy\s+is\b", r"\bwhy\s+does\b", r"\bwhy\s+was\b", r"^why\b",
+            r"\blogic\s+behind\b", r"\brule\s+behind\b", r"\bscoring\s+logic\b", r"\brisk\s+score\b",
+            r"\bwording\s+trap\b", r"\bwording\s+check\b", r"\bfree\s+trial\b", r"\btrial\s+sandbox\b",
+            r"\bencrypted\b", r"\bencryption\b", r"\baes[- ]?256\b", r"\bdelete\s+my\b", r"\bpurge\b",
+            r"\bsweep\b", r"\breversal\b", r"\btolerance\b", r"\bbank\s+form\b",
+            r"\bpric(?:e|es|ing)\b", r"\bsubscription\s+(?:cost|fee|plan|price|tier)s?\b",
+            r"\bmonthly\s+(?:price|cost|fee)\b", r"\bannual\s+(?:price|cost|fee)\b",
+            r"\bhow\s+much\s+does\b", r"\bcost\s+of\s+grow\b", r"\blicens(?:e|ing)\s+(?:cost|fee|model)\b",
             r"\bwhat\s+is\s+the\s+quotation\b", r"\bwhat\s+is\s+quotation\b",
             r"\bquotation\s+module\b", r"\bquotations\s+module\b",
             r"\bacceptance\s+window\b", r"\bacceptance\s+timeout\b", r"\bauto[-_]?accept\b", r"\bauto[-_]?reject\b",
@@ -343,9 +630,25 @@ class AIQueryAssistantService:
             r"\bdealer\s+roles?\b", r"\btrader\s+takeover\b", r"\bmulti[- ]leg\b",
             r"\badditional\s+costs?\b", r"\bfinal\s+adjusted\s+price\b",
             r"\bcustody\s+module\b", r"\bissuance\s+module\b", r"\breconciliation\s+module\b",
-            r"\bmaker\s+checker\b", r"\bapproval\s+matrix\b"
+            r"\bmaker\s+checker\b", r"\bapproval\s+matrix\b",
+            r"\bwhat\s+(?:\w+\s+){0,3}controls?\b",
+            r"\bgive\s+me\s+a\s+(?:concise\s+)?(?:executive\s+)?tour\b",
+            r"\bwhat\s+is\s+this\s+(?:page|screen|section|tab|module)\b",
+            r"\bwhat\s+am\s+i\s+looking\s+at\b",
+            r"\bwhat\s+should\s+i\s+do\s+here\b",
+            r"\bhelp\s+(?:me\s+)?(?:with\s+|on\s+)?this\s+(?:page|screen)\b",
         ]
-        if is_greeting or any(re.search(pat, q_lower) for pat in guide_patterns):
+        ar_guide_keywords = (
+            "كيف", "ازاي", "إزاي", "ليه", "لماذا", "اشرح", "وضح", "ما هو", "ما هي",
+            "يعني ايه", "يعني إيه", "ايه هو", "إيه هو", "امتى", "هل يمكن", "ممكن", "فين", "أين",
+            "قواعد", "منطق", "تسوية", "خطاب ضمان", "إصدار", "تشفير", "أمان", "تجربة", "صلاحيات",
+        )
+        if (
+            is_greeting
+            or any(re.search(pat, q_lower) for pat in guide_patterns)
+            or (has_arabic and not is_ar_portfolio_query and any(kw in q_raw for kw in ar_guide_keywords))
+            or (has_arabic and not is_ar_portfolio_query)
+        ):
             return {
                 "suggested_level": 4,
                 "topic": "system_navigation",
@@ -395,13 +698,15 @@ class AIQueryAssistantService:
         if any(kw in q_lower for kw in ["subsidiary", "subsidiaries", "entity distribution", "distributed among my companies", "distributed among our companies", "entity breakdown"]):
             return {"suggested_level": 1, "topic": "treasury", "intent": "get_entity_distribution", "parameters": {}}
 
-        # 9c. Top Beneficiaries / Counterparties (Bi-Module Aware)
+        # 9c. Top Beneficiaries / Counterparties (Bi-Module Aware + Page Tie-Breaker)
         if any(kw in q_lower for kw in [
             "top beneficiaries", "show top beneficiaries", "beneficiaries", "beneficiary concentration",
             "highest beneficiary", "major beneficiaries", "top counterparty", "who are our beneficiaries",
             "outbound beneficiaries", "issuance beneficiaries"
         ]):
-            scope = "issuance" if any(w in q_lower for w in ["outbound", "issuance", "issued to"]) else "all"
+            explicit_custody = any(w in q_lower for w in ["inbound", "custody"])
+            explicit_issuance = any(w in q_lower for w in ["outbound", "issuance", "issued to"])
+            scope = "issuance" if (explicit_issuance or (active_module == "issuance" and not explicit_custody)) else "all"
             return {"suggested_level": 1, "topic": "treasury", "intent": "get_top_beneficiaries", "parameters": {"limit": 5, "scope": scope}}
 
         # 10. Bank Exposure Distribution
@@ -481,6 +786,122 @@ class AIQueryAssistantService:
                         "intent": "search_lgs",
                         "parameters": {"currency": curr_code}
                     }
+
+        # 14.5 Page-Aware Tie-Breaker for Ambiguous / Module-Implicit Queries
+        # Strictly runs ONLY when the user did NOT explicitly name a different target module (e.g. "LG", "guarantee", "custody", "RFQ").
+        has_explicit_lg_noun = bool(re.search(r"\b(lgs?|guarantees?|custody|inbound)\b", q_lower))
+        has_explicit_rfq_noun = bool(re.search(r"\b(rfqs?|quotations?|quotes?|fx|tbills?|t-bills?|deals?)\b", q_lower))
+        has_explicit_issuance_noun = bool(re.search(r"\b(issuance|outbound|issued)\b", q_lower))
+        has_explicit_facility_noun = bool(re.search(r"\b(facilit(?:y|ies)|headroom|credit\s+lines?|credit\s+limits?)\b", q_lower))
+        has_explicit_recon_noun = bool(re.search(r"\b(reconcil\w*|statements?|mt940|camt\w*|sweeps?|unmatched|journals?)\b", q_lower))
+
+        if active_module == "quotations" and not (has_explicit_lg_noun or has_explicit_issuance_noun or has_explicit_facility_noun or has_explicit_recon_noun):
+            if any(w in q_lower for w in ["who won", "winner", "winning", "leaderboard", "top bank", "best rate"]):
+                if ctx.get("rfq_id") and any(w in q_lower for w in ["who won", "winner", "best rate"]) and "most" not in q_lower:
+                    return {
+                        "suggested_level": 1,
+                        "topic": "quotation",
+                        "intent": "lookup_deal_reference",
+                        "parameters": {"rfq_id": ctx["rfq_id"]},
+                    }
+                return {
+                    "suggested_level": 1,
+                    "topic": "quotation",
+                    "intent": "get_top_winning_banks",
+                    "parameters": {"limit": 5},
+                }
+            if any(w in q_lower for w in ["who participated", "participat", "which banks", "invited", "who quoted", "quotes", "bids", "last one"]):
+                return {
+                    "suggested_level": 1,
+                    "topic": "quotation",
+                    "intent": "get_last_rfq_participants",
+                    "parameters": {"rfq_id": ctx.get("rfq_id"), "rfq_ref": hist_ctx.get("rfq_ref")},
+                }
+            q_status = None
+            for st_cand, st_code in [
+                ("open", "OPEN"), ("active", "OPEN"), ("live", "OPEN"),
+                ("evaluating", "EVALUATING"), ("pending", "PENDING_APPROVAL"),
+                ("completed", "COMPLETED"), ("executed", "COMPLETED"), ("accepted", "ACCEPTED"),
+                ("rejected", "REJECTED"), ("cancelled", "CANCELLED"), ("canceled", "CANCELLED"),
+            ]:
+                if re.search(rf"\b{st_cand}\b", q_lower):
+                    q_status = st_code
+                    break
+            if q_status or any(w in q_lower for w in [
+                "summary", "overview", "status", "how many", "total", "volume",
+                "latest", "recent", "show all", "list all", "any "
+            ]):
+                q_params: Dict[str, Any] = {}
+                if q_status:
+                    q_params["status"] = q_status
+                return {
+                    "suggested_level": 1,
+                    "topic": "quotation",
+                    "intent": "get_quotation_summary",
+                    "parameters": q_params,
+                }
+
+        if active_module == "issuance" and not (has_explicit_lg_noun and "custody" in q_lower) and not (has_explicit_rfq_noun or has_explicit_recon_noun):
+            if ctx["sub_page"] == "facilities" and not has_explicit_lg_noun:
+                if any(w in q_lower for w in [
+                    "active", "available", "utilization", "utilized", "limits", "limit",
+                    "summary", "overview", "status", "how many", "how much", "show all", "list"
+                ]):
+                    return {"suggested_level": 1, "topic": "treasury", "intent": "get_facility_analytics", "parameters": {}}
+
+            if not has_explicit_lg_noun:
+                iss_status = None
+                for st_cand, st_code in [
+                    ("draft", "DRAFT"), ("pending", "PENDING_APPROVAL"),
+                    ("approved", "APPROVED"), ("issued", "ISSUED"), ("active", "ISSUED"),
+                    ("rejected", "REJECTED"), ("cancelled", "CANCELLED"), ("canceled", "CANCELLED"),
+                ]:
+                    if re.search(rf"\b{st_cand}\b", q_lower):
+                        iss_status = st_code
+                        break
+                if iss_status or any(w in q_lower for w in [
+                    "summary", "overview", "status", "pipeline", "requests",
+                    "how many", "latest", "recent", "show all", "list all", "any "
+                ]):
+                    iss_params: Dict[str, Any] = {}
+                    if iss_status:
+                        iss_params["status"] = iss_status
+                    return {
+                        "suggested_level": 1,
+                        "topic": "treasury",
+                        "intent": "get_issuance_summary",
+                        "parameters": iss_params,
+                    }
+
+        if active_module == "action_center" and not (has_explicit_lg_noun or has_explicit_rfq_noun or has_explicit_issuance_noun or has_explicit_facility_noun):
+            if any(w in q_lower for w in [
+                "pending", "urgent", "overdue", "summary", "overview", "status",
+                "how many", "todo", "to-do", "tasks", "items", "show all", "what do i have"
+            ]):
+                return {"suggested_level": 1, "topic": "treasury", "intent": "get_action_center_summary", "parameters": {}}
+
+        if active_module == "approvals" and not (has_explicit_lg_noun or has_explicit_rfq_noun or has_explicit_facility_noun):
+            if any(w in q_lower for w in [
+                "pending", "queue", "waiting", "summary", "overview", "status",
+                "how many", "items", "show all", "approve"
+            ]):
+                return {"suggested_level": 1, "topic": "treasury", "intent": "get_pending_approvals", "parameters": {}}
+
+        if active_module == "audit" and not (has_explicit_lg_noun or has_explicit_rfq_noun or has_explicit_issuance_noun or has_explicit_facility_noun):
+            if any(w in q_lower for w in ["recent", "latest", "today", "summary", "overview", "what happened", "show all", "logs"]):
+                scope = "my_actions" if any(w in q_lower for w in ["my ", "i did", "i do"]) else "all_organization"
+                return {"suggested_level": 0, "topic": "system", "intent": "get_audit_history", "parameters": {"scope": scope}}
+
+        if active_module in ("reconciliation", "settings", "users", "inbox") and not (
+            has_explicit_lg_noun or has_explicit_rfq_noun or has_explicit_issuance_noun or has_explicit_facility_noun
+        ):
+            # Avoid falling through to Custody LG search when user asks module-contextual questions on Reconciliation/Settings/Users/Inbox
+            return {
+                "suggested_level": 4,
+                "topic": "system_navigation",
+                "intent": "system_help",
+                "parameters": {"query": q_raw},
+            }
 
         # 15. Search & Status Filters
         comp_match = re.search(r'\b(?:for|company|beneficiary)\s+([A-Za-z0-9_-]+)\b', q_raw)
@@ -640,6 +1061,22 @@ class AIQueryAssistantService:
         if intent == "get_issuance_summary":
             return issuance_base.order_by(desc(IssuanceRequest.created_at)).all()
 
+        if intent == "get_issuance_request_details":
+            req_id = params.get("request_id")
+            serial_num = (params.get("serial_number") or "").strip()
+            q = issuance_base
+            if req_id:
+                q = q.filter(IssuanceRequest.id == int(req_id))
+            elif serial_num:
+                q = q.filter(IssuanceRequest.serial_number.ilike(f"%{serial_num}%"))
+            else:
+                return None
+            req_obj = q.first()
+            if not req_obj:
+                return None
+            curr_obj = db.query(Currency).filter(Currency.id == req_obj.currency_id).first() if req_obj.currency_id else None
+            return {"request": req_obj, "currency_code": curr_obj.iso_code if curr_obj else "EGP"}
+
         if intent == "get_facility_analytics":
             return facility_base.options(
                 joinedload(IssuanceFacility.bank),
@@ -647,12 +1084,15 @@ class AIQueryAssistantService:
             ).all()
 
         if intent == "get_last_rfq_participants":
+            rfq_id = params.get("rfq_id")
             rfq_ref = params.get("rfq_ref")
             q = db.query(QuotationRequest).filter(
                 QuotationRequest.customer_id == customer_id,
                 QuotationRequest.is_deleted == False
             )
-            if rfq_ref:
+            if rfq_id:
+                rfq = q.filter(QuotationRequest.id == str(rfq_id)).first()
+            elif rfq_ref:
                 rfq = q.filter(QuotationRequest.ref_no.ilike(f"%{rfq_ref}%")).first()
             else:
                 rfq = q.order_by(desc(QuotationRequest.created_at)).first()
@@ -733,28 +1173,43 @@ class AIQueryAssistantService:
             }
 
         if intent == "lookup_deal_reference":
+            rfq_id = str(params.get("rfq_id") or "").strip()
             ref = str(params.get("ref") or "").strip()
-            leg = db.query(QuotationLeg).join(QuotationRequest).filter(
-                QuotationRequest.customer_id == customer_id,
-                QuotationRequest.is_deleted == False,
-                or_(
-                    QuotationLeg.execution_reference.ilike(f"%{ref}%"),
-                    QuotationRequest.ref_no.ilike(f"%{ref}%")
-                )
-            ).order_by(desc(QuotationLeg.created_at)).first()
-
+            leg = None
             rfq = None
-            if not leg:
+
+            if rfq_id:
                 rfq = db.query(QuotationRequest).filter(
                     QuotationRequest.customer_id == customer_id,
                     QuotationRequest.is_deleted == False,
-                    QuotationRequest.ref_no.ilike(f"%{ref}%")
+                    QuotationRequest.id == rfq_id
                 ).first()
-                if rfq and rfq.legs:
-                    leg = rfq.legs[0]
+                if rfq:
+                    leg = db.query(QuotationLeg).filter(
+                        QuotationLeg.rfq_id == rfq.id
+                    ).order_by(QuotationLeg.leg_index.asc()).first()
+
+            if not rfq and not leg and ref:
+                leg = db.query(QuotationLeg).join(QuotationRequest).filter(
+                    QuotationRequest.customer_id == customer_id,
+                    QuotationRequest.is_deleted == False,
+                    or_(
+                        QuotationLeg.execution_reference.ilike(f"%{ref}%"),
+                        QuotationRequest.ref_no.ilike(f"%{ref}%")
+                    )
+                ).order_by(desc(QuotationLeg.created_at)).first()
+
+                if not leg:
+                    rfq = db.query(QuotationRequest).filter(
+                        QuotationRequest.customer_id == customer_id,
+                        QuotationRequest.is_deleted == False,
+                        QuotationRequest.ref_no.ilike(f"%{ref}%")
+                    ).first()
+                    if rfq and rfq.legs:
+                        leg = rfq.legs[0]
 
             return {
-                "ref_searched": ref,
+                "ref_searched": ref or rfq_id,
                 "leg": leg,
                 "rfq": leg.rfq if leg else rfq
             }
@@ -1157,6 +1612,33 @@ class AIQueryAssistantService:
             ]
             return answer, references, suggested_chips
 
+        if intent == "get_issuance_request_details":
+            if not query_result or not query_result.get("request"):
+                return (
+                    "Issuance request not found or outside your authorized entity scope.\n\n"
+                    f"👉 [Open Issuance Requests Inbox]({nav_base}/issuance/requests)"
+                ), [], [{"label": "📤 View Issuance Pipeline", "query": "show issuance pipeline"}]
+            req = query_result["request"]
+            curr_code = query_result.get("currency_code") or "EGP"
+            amt_str = f"{float(req.amount or 0.0):,.2f} {curr_code}"
+            exp_str = req.requested_expiry_date.strftime("%Y-%m-%d") if req.requested_expiry_date else (req.expiry_type or "N/A")
+            answer = (
+                f"📤 **Issuance Request Details: {req.serial_number}**\n\n"
+                f"- **Amount**: **{amt_str}**\n"
+                f"- **Status**: **{req.status or 'DRAFT'}**\n"
+                f"- **Beneficiary**: {req.beneficiary_name or 'N/A'}\n"
+                f"- **Department / Requestor**: {req.department or 'General'} ({req.requestor_name or req.requestor_email or 'Internal'})\n"
+                f"- **Requested Expiry**: {exp_str}\n"
+                f"- **Purpose**: {req.lg_purpose or 'Corporate Guarantee Issuance'}\n\n"
+                f"👉 [Open Request in Issuance Workspace]({nav_base}/issuance/requests)"
+            )
+            suggested_chips = [
+                {"label": "📤 Issuance Pipeline", "query": "show issuance pipeline"},
+                {"label": "🏛️ Facility Headroom", "query": "show facility headroom"},
+                {"label": "⏳ Pending Approvals", "query": "show pending approvals"},
+            ]
+            return answer, references, suggested_chips
+
         if intent == "get_issuance_summary":
             requests = query_result or []
             if not requests:
@@ -1165,6 +1647,7 @@ class AIQueryAssistantService:
                     {"label": "🛡️ View Custody LGs", "query": "show custody LGs"}
                 ]
 
+            status_filter = (self._get_query_params(customer_id, user_id).get("status") or "").upper()
             status_counts: Dict[str, int] = {}
             for req in requests:
                 st = str(req.status or "DRAFT").upper()
@@ -1174,11 +1657,31 @@ class AIQueryAssistantService:
                 f"📤 **LG Issuance Pipeline ({len(requests)} Total Requests)**:\n",
                 f"- **Draft**: {status_counts.get('DRAFT', 0)} requests",
                 f"- **Pending Approval**: {status_counts.get('PENDING_APPROVAL', 0) + status_counts.get('PENDING', 0) + status_counts.get('SUBMITTED', 0)} requests",
-                f"- **Approved / Ready for Issuance**: {status_counts.get('APPROVED', 0)} requests",
+                f"- **Approved / Ready for Issuance**: {status_counts.get('APPROVED', 0) + status_counts.get('APPROVED_INTERNAL', 0)} requests",
                 f"- **Issued & Active**: {status_counts.get('ISSUED', 0) + status_counts.get('COMPLETED', 0)} guarantees",
                 f"- **Rejected / Cancelled**: {status_counts.get('REJECTED', 0) + status_counts.get('CANCELLED', 0)} requests\n",
-                f"👉 [Open Issuance Requests Manager]({nav_base}/issuance/requests)"
             ]
+
+            if status_filter:
+                status_group_map = {
+                    "PENDING_APPROVAL": {"PENDING_APPROVAL", "PENDING", "SUBMITTED"},
+                    "ISSUED": {"ISSUED", "COMPLETED"},
+                    "APPROVED": {"APPROVED", "APPROVED_INTERNAL"},
+                }
+                target_set = status_group_map.get(status_filter, {status_filter})
+                matched_reqs = [r for r in requests if str(r.status or "DRAFT").upper() in target_set]
+                label_clean = status_filter.replace("_", " ").title()
+                if matched_reqs:
+                    lines.append(f"🔎 **Matching {label_clean} Requests ({len(matched_reqs)})**:")
+                    for mr in matched_reqs[:8]:
+                        lines.append(
+                            f"- **{mr.serial_number or 'REQ'}**: {float(mr.amount or 0.0):,.2f} — Beneficiary: *{mr.beneficiary_name or 'N/A'}* (*{mr.status}*)"
+                        )
+                    lines.append("")
+                else:
+                    lines.append(f"ℹ️ *Currently **0** issuance requests with status **{label_clean}**.*\n")
+
+            lines.append(f"👉 [Open Issuance Requests Manager]({nav_base}/issuance/requests)")
             suggested_chips = [
                 {"label": "⏳ Pending Approvals", "query": "show pending approvals"},
                 {"label": "🏛️ Bank Facilities Headroom", "query": "show facility headroom"},
@@ -1378,6 +1881,24 @@ class AIQueryAssistantService:
             if curr_lines:
                 lines.append("💰 **Total Executed Volume**:\n" + "\n".join(curr_lines) + "\n")
 
+            q_status_filter = (self._get_query_params(customer_id, user_id).get("status") or "").upper()
+            if q_status_filter:
+                q_group_map = {
+                    "COMPLETED": {"COMPLETED", "ACCEPTED"},
+                    "PENDING_APPROVAL": {"PENDING_APPROVAL", "PENDING"},
+                }
+                q_target_set = q_group_map.get(q_status_filter, {q_status_filter})
+                matched_rfqs = [r for r in rfqs if str(r.status or "DRAFT").upper() in q_target_set]
+                q_label = q_status_filter.replace("_", " ").title()
+                if matched_rfqs:
+                    lines.append(f"🔎 **Matching {q_label} RFQs ({len(matched_rfqs)})**:")
+                    for mr in matched_rfqs[:8]:
+                        pair_txt = f"{mr.buy_currency}/{mr.sell_currency}" if mr.buy_currency else (mr.type or "RFQ")
+                        lines.append(f"- **{mr.ref_no}**: {pair_txt} — {float(mr.amount or 0.0):,.2f} (*{mr.status}*)")
+                    lines.append("")
+                else:
+                    lines.append(f"ℹ️ *Currently **0** quotation RFQs with status **{q_label}**.*\n")
+
             lines.append(f"👉 [Open Quotation Control Center]({nav_base}/quotations)")
 
             suggested_chips = [
@@ -1502,7 +2023,12 @@ class AIQueryAssistantService:
 
         if intent == "get_top_beneficiaries":
             data = query_result if isinstance(query_result, dict) else {"custody_records": query_result or [], "outbound_records": [], "inbound_issuers": []}
-            lines = ["🏢 **Beneficiary & Counterparty Intelligence (Bi-Module Analysis)**:\n"]
+            ben_scope = (self._get_query_params(customer_id, user_id).get("scope") or "all").lower()
+            lines = [
+                "🏢 **Top Outbound Beneficiaries (LG Issuance)**:\n"
+                if ben_scope == "issuance"
+                else "🏢 **Beneficiary & Counterparty Intelligence (Bi-Module Analysis)**:\n"
+            ]
 
             # 1. Outbound Issuance (External Beneficiaries)
             outbound_raw = data.get("outbound_records") or []
@@ -1517,11 +2043,19 @@ class AIQueryAssistantService:
 
             if outbound_map:
                 sorted_out = sorted(outbound_map.items(), key=lambda x: sum(x[1].values()), reverse=True)[:5]
-                lines.append("📤 **Top External Beneficiaries (LG Issuance)**:")
+                if ben_scope != "issuance":
+                    lines.append("📤 **Top External Beneficiaries (LG Issuance)**:")
                 for idx, (name, currs) in enumerate(sorted_out, 1):
                     curr_strs = [f"{amt:,.2f} {c}" for c, amt in currs.items()]
                     lines.append(f"{idx}. **{name}**: {', '.join(curr_strs)}")
                 lines.append("")
+                if ben_scope == "issuance":
+                    lines.append(f"👉 [Open LG Issuance Pipeline]({nav_base}/issuance/requests)")
+                    return "\n".join(lines).strip(), references, [
+                        {"label": "📤 Issuance Pipeline", "query": "show issuance pipeline"},
+                        {"label": "🏛️ Facility Headroom", "query": "show facility headroom"},
+                        {"label": "🛡️ Inbound Custody Entities", "query": "show subsidiary distribution"},
+                    ]
 
             # 2. Inbound Custody (Internal Subsidiaries)
             custody_recs = data.get("custody_records") or []
@@ -1774,6 +2308,12 @@ class AIQueryAssistantService:
         role_upper = str(user_role).upper() if user_role else "END_USER"
         nav_base = "/corporate-admin" if role_upper in ["CORPORATE_ADMIN", "ADMIN"] else ("/system-owner" if role_upper == "SYSTEM_OWNER" else "/end-user")
 
+        _ctx_state = getattr(self, "_req_ctx_var", None)
+        _ctx_dict = (_ctx_state.get() if _ctx_state is not None else None) or {}
+        ctx = self.parse_page_context(_ctx_dict.get("page_context"))
+        ctx_module = ctx.get("module")
+        ctx_sub_page = ctx.get("sub_page")
+
         # 0. Greeting / Fast Intro
         if any(w in q_lower for w in ["hi", "hello", "hey", "who are you", "start", "capabilities"]):
             return (
@@ -1935,11 +2475,39 @@ class AIQueryAssistantService:
                     f"👉 [Open Quotations Workspace]({nav_base}/quotations)"
                 )
 
-        # 0.6 Bank Reconciliation Module Guidance
+        # 0.6a Bank LG Position Reconciliation Guidance (Outbound Issuance `/issuance/reconciliation`)
+        if (
+            "position reconciliation" in q_lower
+            or "lg position" in q_lower
+            or (
+                ctx_sub_page == "position_reconciliation"
+                and any(w in q_lower for w in ["reconcil", "variance", "mismatch", "how does", "how to", "what is this"])
+                and not any(w in q_lower for w in ["mt940", "camt", "bank statement", "cash", "erp"])
+            )
+        ):
+            return (
+                f"**How Bank LG Position Reconciliation Works (`{nav_base}/issuance/reconciliation`)**:\n\n"
+                f"Bank LG Position Reconciliation matches official **Bank LG Position Reports** against your **Outbound Issued LG Register**:\n\n"
+                f"1. **Upload Bank Position File**:\n"
+                f"   - Supports **Excel (`.xlsx`), CSV, TXT, and AI-parsed PDF** bank guarantee position statements.\n\n"
+                f"2. **Automated 4-Bucket Classification**:\n"
+                f"   - **MATCHED**: Bank guarantee number, amount, currency, and expiry match your Issued LG register.\n"
+                f"   - **PARTIAL_MATCH**: Variances in amount, expiry date, or beneficiary are highlighted side-by-side.\n"
+                f"   - **BANK_ONLY**: Guarantees still reported open by the bank (e.g. expired LGs never formally closed, continuing to lock facility headroom).\n"
+                f"   - **SYSTEM_ONLY**: Guarantees recorded internally that are missing from the bank's report.\n\n"
+                f"3. **Controlled Variance Resolution**:\n"
+                f"   - Apply audited adjustments or generate formal bank discrepancy follow-ups to keep facility utilization 100% accurate.\n\n"
+                f"👉 [Open Bank LG Position Reconciliation]({nav_base}/issuance/reconciliation)"
+            )
+
+        # 0.6b Bank Statement Cash Reconciliation Module Guidance
         if any(w in q_lower for w in [
             "bank reconciliation", "reconciliation module", "reconcile bank",
-            "reconciliation rules", "position reconciliation", "accounting export"
-        ]):
+            "reconciliation rules", "accounting export"
+        ]) or (
+            ctx_module == "reconciliation"
+            and any(w in q_lower for w in ["how does reconciliation work", "how does this work", "explain reconciliation"])
+        ):
             return (
                 f"**How the Bank Reconciliation Module Works**:\n\n"
                 f"Grow's Bank Reconciliation Engine automates the matching of bank statement transactions against internal treasury records:\n\n"
@@ -2106,8 +2674,22 @@ class AIQueryAssistantService:
                 f"👉 [Open Document Compliance Settings]({nav_base}/module-configs)"
             )
 
-        # 9. Generic Action Guides (Extend, Record, Issue)
-        if "extend" in q_lower:
+        # 9. Generic Action Guides (Extend, Record, Issue) — Page-Aware Disambiguated
+        if "extend" in q_lower and not any(w in q_lower for w in ["extend or pay", "extend-or-pay", "wording", "trap"]):
+            wants_issuance_extend = (
+                any(w in q_lower for w in ["issued lg", "outbound", "issuance"])
+                or (ctx_module == "issuance" and not any(w in q_lower for w in ["custody", "inbound"]))
+            )
+            if wants_issuance_extend:
+                return (
+                    f"To extend an **Outbound Issued Letter of Guarantee** in Grow as **{role_label}**:\n\n"
+                    f"1. Navigate to **Sidebar -> LG Issuance -> Issued LGs** (`{nav_base}/issuance/issued-lgs`).\n"
+                    f"2. Locate the active issued guarantee and open its **Actions / Maintenance** menu.\n"
+                    f"3. Select **Extend Validity** and specify the **New Target Expiry Date** and business justification.\n"
+                    f"4. Submit the maintenance request through your organization's approval workflow.\n"
+                    f"5. Once approved, Grow generates the serialized **Bank Extension Instruction Letter** and tracks bank confirmation.\n\n"
+                    f"👉 [Open Issued LGs Register]({nav_base}/issuance/issued-lgs)"
+                )
             return (
                 f"To extend a Letter of Guarantee (LG) in Grow as **{role_label}**:\n\n"
                 f"1. Navigate to **Sidebar -> LG Custody -> All LG Records**.\n"
@@ -2118,7 +2700,21 @@ class AIQueryAssistantService:
                 f"👉 [Click here to open the LG Custody Records page]({nav_base}/lg-records)"
             )
 
-        if any(w in q_lower for w in ["record", "new lg", "add lg"]):
+        is_record_new_lg_query = (
+            any(w in q_lower for w in ["new lg", "add lg", "record a new lg", "record new lg", "record an lg", "record lg", "register lg"])
+            and not any(w in q_lower for w in ["delivery", "bank reply", "liquidation", "manual deal"])
+        )
+        if is_record_new_lg_query:
+            if ctx_module == "issuance" and not any(w in q_lower for w in ["custody", "inbound", "scan", "ocr"]):
+                return (
+                    f"To initiate a new **Outbound LG Issuance Request** in Grow as **{role_label}**:\n\n"
+                    f"1. Navigate to **Sidebar -> LG Issuance -> New Request** (`{nav_base}/issuance/requests/new`).\n"
+                    f"2. Select the **Issuing Entity** and **LG Type** (Performance, Bid Bond, Advance Payment).\n"
+                    f"3. Specify the **Amount**, **Currency**, **Requested Bank**, and **Beneficiary Details**.\n"
+                    f"4. Attach supporting tender/contract documents.\n"
+                    f"5. Click **Submit for Approval** to enter the corporate approval matrix.\n\n"
+                    f"👉 [Click here to open New Issuance Request]({nav_base}/issuance/requests/new)"
+                )
             return (
                 f"To record a new Letter of Guarantee (LG) in Grow as **{role_label}**:\n\n"
                 f"1. **Navigate to the Record Page**:\n"
@@ -2171,7 +2767,8 @@ class AIQueryAssistantService:
                 f"👉 [Open Platform Settings]({nav_base}/module-configs)"
             )
 
-        # Dynamic AI synthesis using Grounding Knowledge Base
+        # Dynamic AI synthesis using Grounding Knowledge Base + 500-Question Bilingual AR/EN Product Expert Brain
+        is_ar_q = bool(re.search(r"[\u0600-\u06FF]", user_question or ""))
         try:
             from app.core.ai_integration import (
                 _get_genai_client,
@@ -2180,20 +2777,58 @@ class AIQueryAssistantService:
                 genai_types,
             )
             from app.services.system_knowledge_base import get_system_knowledge
+            from app.services.public_product_expert_service import (
+                _STATIC_PRODUCT_EXPERT_SYSTEM_PREFIX,
+                _build_curated_fallback_response,
+            )
+
             client = _get_genai_client()
             if client:
                 kb_context = get_system_knowledge()
-                static_sys_prompt = (
-                    "You are the Grow Platform & Treasury Assistant.\n"
-                    "Using the authoritative platform knowledge base below, give a clear, accurate, step-by-step guidance response formatted in Markdown.\n"
-                    "Always maintain enterprise treasury professional tone and reference the appropriate navigation paths if applicable.\n\n"
-                    "--- PLATFORM KNOWLEDGE BASE ---\n"
-                    f"{kb_context}\n"
-                    "--- END KNOWLEDGE BASE ---"
+                lang_rule = (
+                    "Respond in clear, executive Modern Standard Arabic (العربية الفصحى السلسة لمديري الخزانة والمالية). "
+                    "Always keep the brand name `Grow` in Latin letters (`Grow`) and translate `T-Bills` as `أذون الخزانة`."
+                    if is_ar_q
+                    else "Respond in crisp, accurate enterprise treasury English formatted in clean Markdown."
                 )
-                user_prompt = f"User Role: {role_label}\nQuestion: \"{user_question}\""
+                _ctx_state = getattr(self, "_req_ctx_var", None)
+                _ctx_dict = _ctx_state.get() if _ctx_state is not None else {}
+                page_hint = (_ctx_dict or {}).get("page_context") or f"{nav_base}/dashboard"
+                page_label = ctx.get("label") or "Dashboard"
+                hist_list = (_ctx_dict or {}).get("history") or []
+                hist_lines = []
+                for turn in hist_list[-5:]:
+                    if isinstance(turn, dict) and turn.get("content"):
+                        who = "User" if turn.get("role") == "user" else "Grow Assistant"
+                        hist_lines.append(f"{who}: {str(turn.get('content'))[:320]}")
+                hist_block = "\n".join(hist_lines) if hist_lines else "(None)"
+
+                static_sys_prompt = (
+                    "You are the **Grow In-App Treasury & Platform AI Assistant** embedded directly inside an authenticated Grow workspace.\n"
+                    "Answer the user's how-to, rule-logic ('why was this flagged / matched / scored?'), workflow, security, or trial question "
+                    "using the authoritative Grow Knowledge Base & Product Architecture Reference below.\n"
+                    "IMPORTANT IN-APP RULES:\n"
+                    "- Return plain Markdown directly (do NOT wrap your answer in JSON).\n"
+                    f"- The current user's role is `{role_label}` (navigation prefix `{nav_base}`) and current screen is `{page_label}` (`{page_hint}`).\n"
+                    "- If the user's question is brief, unspecific, or refers to 'here' / 'this page' / 'this module', anchor your explanation to their current screen (`"
+                    f"{page_label}`) while staying 100% faithful to the verified platform rules.\n"
+                    "- Never pitch 'Request Demo' or external sales forms unless they explicitly ask about upgrading from Free Trial to production.\n"
+                    "- Explain deterministic business logic clearly (e.g., facility scoring weights & cash-margin preservation, URDG 758 / Advance Payment non-operative traps, bank reconciliation 4-pass matching & reversal vs. sweep rules, per-company AES-256-GCM encryption, and 1-click trial test data deletion).\n"
+                    f"- {lang_rule}\n\n"
+                    "--- PLATFORM OPERATIONAL MANUAL ---\n"
+                    f"{kb_context}\n\n"
+                    "--- PRODUCT ARCHITECTURE & TREASURY LOGIC REFERENCE ---\n"
+                    f"{_STATIC_PRODUCT_EXPERT_SYSTEM_PREFIX[:26000]}\n"
+                    "--- END REFERENCE ---"
+                )
+                user_prompt = (
+                    f"User Role: {role_label}\n"
+                    f"Current Screen: {page_label} ({page_hint})\n"
+                    f"Recent Conversation:\n{hist_block}\n\n"
+                    f"Question: \"{user_question}\""
+                )
                 gen_config = (
-                    genai_types.GenerateContentConfig(system_instruction=static_sys_prompt)
+                    genai_types.GenerateContentConfig(system_instruction=static_sys_prompt, temperature=0.15)
                     if genai_types is not None
                     else None
                 )
@@ -2203,10 +2838,30 @@ class AIQueryAssistantService:
                     contents=user_prompt if gen_config is not None else f"{static_sys_prompt}\n\n{user_prompt}",
                     config=gen_config,
                 )
-                if res and res.text and len(res.text.strip()) > 30:
-                    return res.text.strip() + f"\n\n👉 [Open Platform Dashboard]({nav_base}/dashboard)"
+                if res and res.text and len(res.text.strip()) > 25:
+                    cleaned_ans = res.text.strip()
+                    # In case model echoed JSON from reference prompt, unwrap `answer` cleanly
+                    if cleaned_ans.startswith("{") and '"answer"' in cleaned_ans:
+                        try:
+                            parsed_j = json.loads(cleaned_ans)
+                            if isinstance(parsed_j, dict) and parsed_j.get("answer"):
+                                cleaned_ans = str(parsed_j["answer"]).strip()
+                        except Exception:
+                            pass
+                    dash_lbl = "فتح لوحة التحكم" if is_ar_q else "Open Platform Dashboard"
+                    return f"{cleaned_ans}\n\n👉 [{dash_lbl}]({nav_base}/dashboard)"
         except Exception as e:
             logger.warning(f"Dynamic system help GenAI call failed: {e}")
+
+        # Bilingual curated fallback (covers Arabic & English even if Gemini API is offline!)
+        try:
+            from app.services.public_product_expert_service import _build_curated_fallback_response
+            curated = _build_curated_fallback_response(user_question or "", "ar" if is_ar_q else "en")
+            if curated and curated.get("answer") and (is_ar_q or curated.get("topic") != "general_platform_overview"):
+                dash_lbl = "فتح لوحة التحكم" if is_ar_q else "Open Platform Dashboard"
+                return f"{curated['answer']}\n\n👉 [{dash_lbl}]({nav_base}/dashboard)"
+        except Exception:
+            pass
 
         # Smart Section Matching fallback (prevents full-manual text dumps)
         from app.services.system_knowledge_base import find_relevant_section
@@ -2219,13 +2874,25 @@ class AIQueryAssistantService:
                 f"👉 [Go to Dashboard]({nav_base}/dashboard)"
             )
 
+        if is_ar_q:
+            return (
+                f"**مساعد منصة Grow الذكي لإدارة الخزانة**:\n\n"
+                f"يمكنني مساعدتك بصفتك **{role_label}** باللغتين العربية والإنجليزية في أي خطوة أو قاعدة داخل النظام:\n"
+                f"- **حفظ ومتابعة خطابات الضمان (Custody)**: مسح خطابات PDF بالذكاء الاصطناعي، التنبيهات قبل الانتهاء، وخطابات التجديد أو الإفراج المزودة بـ QR.\n"
+                f"- **إصدار خطابات الضمان وفحص الصياغة (Issuance)**: مقارنة التسهيلات البنكية والهامش النقدي (0% مقابل 10%)، كشف البنود الخطرة، وتعبئة نماذج البنوك تلقائياً.\n"
+                f"- **التسوية البنكية الذكية (Reconciliation)**: مطابقة فواتير ERP، رسوم SWIFT وInstaPay، التحويلات البينية، والقيود المرتدة.\n"
+                f"- **عروض أسعار العملات وأذون الخزانة (FX & T-Bills)**: المناقصات المغلقة المشفرة بتشفير AES-256 ومقارنتها بأسعار السوق والبنك المركزي.\n\n"
+                f"👉 [فتح لوحة التحكم]({nav_base}/dashboard)"
+            )
+
         return (
             f"**Grow Treasury & Platform Guidance**:\n\n"
-            f"I can guide you through any workflow, setting, or operational rule in Grow as **{role_label}**.\n\n"
+            f"I can guide you through any workflow, setting, or operational rule in Grow (in **English or Arabic**) as **{role_label}**.\n\n"
             f"**Common Topics You Can Ask About**:\n"
             f"- **LG Custody (Inbound)**: *\"How do I record a new LG?\"*, *\"How do I extend validity?\"*, *\"How do I share LG data?\"*\n"
-            f"- **LG Issuance (Outbound)**: *\"How do I create a new request?\"*, *\"What does Generate Invite do?\"*, *\"How do approval matrices work?\"*\n"
-            f"- **Organization Settings**: *\"How to change forced renewal days?\"*, *\"How to configure custom storage bucket?\"*, *\"How to CC manager in emails?\"*\n\n"
+            f"- **LG Issuance & Wording Rules**: *\"Why was this LG wording flagged?\"*, *\"How does bank facility scoring work?\"*\n"
+            f"- **Bank Reconciliation & FX**: *\"How do sweeps vs. reversals work?\"*, *\"How are bank quotes kept sealed?\"*\n"
+            f"- **Security & Settings**: *\"How is my company data encrypted?\"*, *\"How to change forced renewal days?\"*\n\n"
             f"👉 [Open Platform Dashboard]({nav_base}/dashboard)"
         )
 
@@ -2237,8 +2904,14 @@ class AIQueryAssistantService:
         user_id: int = 1,
         card_id: Optional[str] = None,
         has_all_entity_access: bool = True,
-        entity_ids: Optional[List[int]] = None
+        entity_ids: Optional[List[int]] = None,
+        page_context: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
+        import contextvars as _contextvars
+        if not hasattr(self, "_req_ctx_var"):
+            self._req_ctx_var = _contextvars.ContextVar("grow_ai_req_ctx", default=None)
+        self._req_ctx_var.set({"page_context": page_context, "history": history or []})
         try:
             if not is_ai_query_assistant_enabled():
                 return {
@@ -2297,8 +2970,14 @@ class AIQueryAssistantService:
                 }
 
             # LEVEL 4 / 3 / 1 / 2: Natural Language Query Pipeline
-            logger.info(f"AI Assistant NL query: user_id={user_id}, customer_id={customer_id}, q='{user_question[:60]}'")
-            classification = self.classify_and_interpret(user_question, customer_id=customer_id, user_id=user_id)
+            logger.info(f"AI Assistant NL query: user_id={user_id}, customer_id={customer_id}, page='{page_context or ''}', q='{user_question[:60]}'")
+            classification = self.classify_and_interpret(
+                user_question,
+                customer_id=customer_id,
+                user_id=user_id,
+                page_context=page_context,
+                history=history,
+            )
             suggested_level = classification.get("suggested_level", 1)
             intent = classification.get("intent", "search_lgs")
             params = classification.get("parameters", {})
@@ -2416,20 +3095,42 @@ class AIQueryAssistantService:
                     sanitized_q, q_token_map = privacy_tokenizer.sanitize_user_question(user_question or "")
                     tok_recs, tok_ben, tok_fac, token_map = privacy_tokenizer.tokenize_complex_payload([], {}, [])
                     token_map.update(q_token_map)
+
+                    # Sanitize recent conversation turns through the same privacy tokenizer
+                    sanitized_hist_lines = []
+                    for turn in (history or [])[-4:]:
+                        if isinstance(turn, dict) and turn.get("content"):
+                            who = "User" if turn.get("role") == "user" else "Assistant"
+                            san_turn, turn_tok_map = privacy_tokenizer.sanitize_user_question(str(turn.get("content"))[:300])
+                            token_map.update(turn_tok_map)
+                            sanitized_hist_lines.append(f"{who}: {san_turn}")
+                    ctx_l2 = self.parse_page_context(page_context)
+                    screen_line = (
+                        f"Current Screen: {ctx_l2['label']} ({ctx_l2['path']})\n"
+                        if ctx_l2.get("path")
+                        else ""
+                    )
+                    hist_line = (
+                        "Recent Conversation:\n" + "\n".join(sanitized_hist_lines) + "\n\n"
+                        if sanitized_hist_lines
+                        else ""
+                    )
+
                     static_sys_prompt = (
                         "You are Grow Treasury Assistant, an institutional corporate treasury AI expert embedded in the Grow Treasury System. "
                         "You have full knowledge of Grow modules: Letter of Guarantee (Custody & Issuance), Bank Reconciliation, and "
                         "the FX & T-Bill Digital Quotation Module (multi-bank RFQs, bidding window timers, post-window corporate acceptance "
                         "windows with AUTO_ACCEPT/AUTO_REJECT policies, multi-currency basket packages with partial leg awards, bank dealer roles "
                         "[Approver, Execution Trader, View-Only], additional cost matrices [Min, %, Max, Flat], Central Bank tolerance limits, "
-                        "and neutral outcome conclusion notifications). Answer professionally, accurately, and concisely."
+                        "and neutral outcome conclusion notifications). If the user's question is ambiguous, use their Current Screen and Recent "
+                        "Conversation as context. Answer professionally, accurately, and concisely."
                     )
                     gen_config = (
                         genai_types.GenerateContentConfig(system_instruction=static_sys_prompt)
                         if genai_types is not None
                         else None
                     )
-                    user_prompt = f"User question: {sanitized_q}"
+                    user_prompt = f"User Role: {user_role}\n{screen_line}{hist_line}User question: {sanitized_q}"
                     response = _safe_generate_content_sync(
                         client=client,
                         model=GEMINI_MODEL_NAME,

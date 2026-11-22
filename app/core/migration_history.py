@@ -228,8 +228,14 @@ class MigrationHistoryService:
                     sorted_snapshots = sorted(snapshots, key=self._get_snapshot_sort_key)
                     first_snapshot = sorted_snapshots[0]
                     
-                    # Proactive check against production table
-                    existing_lg_in_prod = crud_lg_record.get_by_lg_number(db, lg_num)
+                    # Proactive check against production table (scoped per tenant + issuing bank)
+                    snap_bank_id = (first_snapshot.source_data_json or {}).get("issuing_bank_id")
+                    existing_lg_in_prod = crud_lg_record.get_by_lg_number(
+                        db,
+                        lg_num,
+                        customer_id=customer_id,
+                        issuing_bank_id=snap_bank_id,
+                    )
                     if existing_lg_in_prod:
                         logger.warning(f"LG already exists in production (LG id={existing_lg_in_prod.id}). Skipping import.")
                         for snap in snapshots:

@@ -84,6 +84,8 @@ def create_bank_method(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Create a new issuance method for a bank."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank issuance methods library")
     return crud_bank_methods.create_method(db, bank_id=bank_id, obj_in=method_in.model_dump(), user_id=current_user.user_id)
 
 @router.put("/bank-methods/{method_id}", response_model=BankIssuanceOptionOut)
@@ -94,6 +96,8 @@ def update_bank_method(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Update an existing bank issuance method."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank issuance methods library")
     return crud_bank_methods.update_method(db, method_id=method_id, obj_in=method_in.model_dump(), user_id=current_user.user_id)
 
 @router.delete("/bank-methods/{method_id}", response_model=BankIssuanceOptionOut)
@@ -103,6 +107,8 @@ def deactivate_bank_method(
     current_user: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Deactivate a bank issuance method."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Bank issuance methods library")
     return crud_bank_methods.update_method(db, method_id=method_id, obj_in={"is_active": False}, user_id=current_user.user_id)
 
 # ==============================================================================
@@ -223,6 +229,8 @@ def list_bank_accounts(
             "branch_name": a.branch_name,
             "iban": a.iban,
             "currency_code": (a.currency_code or "EGP").upper(),
+            "erp_main_gl_account": a.erp_main_gl_account,
+            "erp_clearing_gl_account": a.erp_clearing_gl_account,
             "has_statement_pdf_password": bool(a.statement_pdf_password_encrypted),
             "auto_ingest_statements": bool(a.auto_ingest_statements),
             "is_default": a.is_default,
@@ -239,6 +247,9 @@ def create_bank_account(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
 ):
     """Create a new bank account for the customer."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Corporate bank account setup")
+
     # If setting as default, unset any existing default for same customer+bank
     if body.get("is_default"):
         existing_defaults = db.query(CustomerBankAccount).filter(
@@ -268,6 +279,8 @@ def create_bank_account(
         branch_name=body.get("branch_name"),
         iban=body.get("iban"),
         currency_code=ccy,
+        erp_main_gl_account=(body.get("erp_main_gl_account") or "").strip() or None,
+        erp_clearing_gl_account=(body.get("erp_clearing_gl_account") or "").strip() or None,
         statement_pdf_password_encrypted=encrypted_pdf_pwd,
         auto_ingest_statements=bool(body.get("auto_ingest_statements", False)),
         is_default=body.get("is_default", False),
@@ -290,6 +303,9 @@ def update_bank_account(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
 ):
     """Update a bank account."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Corporate bank account setup")
+
     account = db.query(CustomerBankAccount).filter(
         CustomerBankAccount.id == account_id,
         CustomerBankAccount.customer_id == current_user.customer_id,
@@ -315,6 +331,11 @@ def update_bank_account(
         if field in body:
             setattr(account, field, body[field])
 
+    for gl_field in ["erp_main_gl_account", "erp_clearing_gl_account"]:
+        if gl_field in body:
+            val = body[gl_field]
+            setattr(account, gl_field, str(val).strip() if val and str(val).strip() else None)
+
     if "currency_code" in body and body["currency_code"]:
         account.currency_code = str(body["currency_code"]).strip().upper()[:3] or "EGP"
 
@@ -337,6 +358,9 @@ def delete_bank_account(
     current_user: TokenData = Depends(get_current_corporate_admin_context),
 ):
     """Soft-delete a bank account."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Corporate bank account setup")
+
     account = db.query(CustomerBankAccount).filter(
         CustomerBankAccount.id == account_id,
         CustomerBankAccount.customer_id == current_user.customer_id,

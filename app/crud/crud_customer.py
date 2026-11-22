@@ -19,6 +19,43 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def generate_unique_entity_code(db: Session, raw_prefix: str) -> str:
+    """
+    Generates a 4-character uppercase alphanumeric entity code that is globally unique across
+    all customer_entities (active or archived), preventing cross-tenant LG instruction serial
+    prefix collisions for newly onboarded customers while never altering existing customers.
+    """
+    import re
+    clean = re.sub(r"[^A-Z0-9]", "", (raw_prefix or "").upper())
+    p3 = (clean[:3] or "ENT").ljust(3, "X")
+    p2 = (clean[:2] or "EN").ljust(2, "X")
+
+    existing_codes = {
+        str(row[0]).strip().upper()
+        for row in db.query(models.CustomerEntity.code).all()
+        if row and row[0]
+    }
+
+    for d in range(1, 10):
+        cand = f"{p3}{d}"
+        if cand not in existing_codes:
+            return cand
+
+    for n in range(1, 100):
+        cand = f"{p2}{n:02d}"
+        if cand not in existing_codes:
+            return cand
+
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for c1 in alphabet:
+        for c2 in alphabet:
+            cand = f"{p2}{c1}{c2}"
+            if cand not in existing_codes:
+                return cand
+
+    return "ENT9"
+
+
 class CRUDCustomer(CRUDBase):
     def __init__(self, model: Type[Customer], crud_customer_entity_instance: Any, crud_user_instance: Any):
         super().__init__(model)
@@ -123,27 +160,30 @@ class CRUDCustomer(CRUDBase):
             end_date=end_date,      # NEW
             status=SubscriptionStatus.ACTIVE # NEW
         )
-        # Auto-populate domains from corporate admin email
+        # Auto-populate domains from corporate admin email (Solo Mode personal emails keep domains=[])
+        from app.core.trial_guard import is_personal_email_domain
+
         admin_domain = customer_in.initial_corporate_admin.email.split("@")[-1].lower()
-        # Validate domain uniqueness across all customers
-        existing = db.query(models.Customer).filter(
-            models.Customer.domains.contains([admin_domain]),
-            models.Customer.is_deleted == False
-        ).first()
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Domain '{admin_domain}' is already associated with customer '{existing.name}'."
-            )
-        db_customer.domains = [admin_domain]
+        if is_personal_email_domain(admin_domain):
+            db_customer.domains = []
+        else:
+            # Validate domain uniqueness across all customers
+            existing = db.query(models.Customer).filter(
+                models.Customer.domains.contains([admin_domain]),
+                models.Customer.is_deleted == False
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Domain '{admin_domain}' is already associated with customer '{existing.name}'."
+                )
+            db_customer.domains = [admin_domain]
         db.add(db_customer)
         db.flush()
 
         # Create initial entities
         if not customer_in.initial_entities:
-            import re
-            customer_prefix = re.sub(r"[^A-Z0-9]", "", (customer_in.name or "").upper())[:3].ljust(3, 'X')
-            default_entity_code = f"{customer_prefix}1"
+            default_entity_code = generate_unique_entity_code(db, customer_in.name or "ENT")
             main_entity_in = CustomerEntityCreate(
                 entity_name="Main Entity",
                 address=(customer_in.address or "Corporate Headquarters")[:250],

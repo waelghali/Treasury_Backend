@@ -167,6 +167,10 @@ class IssuanceRequestBase(BaseModel):
         elif exp_type == "FIXED_DATE":
             if not self.requested_expiry_date:
                 raise ValueError("requested_expiry_date is required when expiry_type is FIXED_DATE.")
+            if self.requested_issue_date and self.requested_expiry_date <= self.requested_issue_date:
+                raise ValueError("Requested Expiry Date must be strictly after the Requested Issue Date.")
+            if self.requested_expiry_date < date.today():
+                raise ValueError("Requested Expiry Date cannot be in the past.")
         return self
 
 class IssuanceRequestCreate(IssuanceRequestBase):

@@ -885,10 +885,16 @@ class MigrationService:
         elif isinstance(lg_number, str):
             lg_number = lg_number.strip()
 
-        if lg_number and crud_lg_record.get_by_lg_number(db, lg_number):
+        staged_bank_id = source_data.get("issuing_bank_id")
+        if lg_number and crud_lg_record.get_by_lg_number(
+            db,
+            lg_number,
+            customer_id=customer_id,
+            issuing_bank_id=staged_bank_id,
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"LG number '{lg_number}' already exists in production."
+                detail=f"LG number '{lg_number}' from this issuing bank already exists in production."
             )
 
         owner_id = source_data.get("internal_owner_contact_id")
@@ -1027,7 +1033,13 @@ class MigrationService:
         if not lg_number:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="LG Number missing for instruction record.")
 
-        production_lg_record = crud_lg_record.get_by_lg_number(db, lg_number)
+        staged_inst_bank_id = source_data.get("issuing_bank_id")
+        production_lg_record = crud_lg_record.get_by_lg_number(
+            db,
+            lg_number,
+            customer_id=customer_id,
+            issuing_bank_id=staged_inst_bank_id,
+        )
         if not production_lg_record or production_lg_record.customer_id != customer_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"LG Record '{lg_number}' not found in production for instruction import.")
 

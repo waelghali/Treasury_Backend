@@ -65,6 +65,8 @@ async def upload_bank_form(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges: Requires System Owner or Corporate Admin role.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     """
     Upload a bank's PDF form template. Creates a BankFormTemplate record
     and stores the file locally. Does NOT trigger AI analysis automatically.
@@ -303,6 +305,8 @@ async def analyze_bank_form(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges: Requires System Owner or Corporate Admin role.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     """
     Triggers AI analysis on an uploaded bank form to auto-map fields.
     This is called ONCE per form upload. The result is cached and reused.
@@ -559,6 +563,8 @@ def enhance_bank_form_endpoint(
     
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form_template = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id, BankFormTemplate.is_deleted == False,
@@ -644,6 +650,8 @@ def undo_enhance_bank_form_endpoint(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form_template = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id, BankFormTemplate.is_deleted == False,
@@ -754,6 +762,8 @@ def update_bank_form_mapping(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     """Manually override/fine-tune the AI-generated field mapping."""
     form_template = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -781,6 +791,8 @@ def delete_bank_form(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -805,6 +817,8 @@ def restore_bank_form(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -828,6 +842,8 @@ def toggle_bank_form_active(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -853,6 +869,8 @@ def set_bank_form_priority(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -877,6 +895,8 @@ def set_bank_form_role(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -900,6 +920,8 @@ def toggle_bank_form_period_expiry(
     from app.constants import UserRole
     if current_user.role not in [UserRole.SYSTEM_OWNER, UserRole.CORPORATE_ADMIN]:
         raise HTTPException(403, "Not enough privileges.")
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Official bank PDF form templates")
     
     form = db.query(BankFormTemplate).filter(
         BankFormTemplate.id == form_id,
@@ -1008,6 +1030,8 @@ def update_form_configuration(
 ):
     """Updates the form layout. Validates against hiding critical fields.
     Multi-admin: requires dual-control approval via AdminChangeRequest."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, current_user.customer_id, "Issuance form layout & verification policy")
     
     # Check if department is being made optional/hidden while an active DEPT_MATCH policy exists
     dept_config = config_in.field_configurations.get("department")

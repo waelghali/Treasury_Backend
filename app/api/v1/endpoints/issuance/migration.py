@@ -16,7 +16,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 from decimal import Decimal, InvalidOperation
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 from sqlalchemy.orm.attributes import flag_modified
@@ -38,7 +38,21 @@ from app.schemas.migration_schemas import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/migration", tags=["Issuance Migration"])
+def _guard_trial_issuance_migration_writes(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+) -> None:
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        from app.core.trial_guard import enforce_trial_setup_preview
+        enforce_trial_setup_preview(db, current_user.customer_id, "Bulk legacy data migration")
+
+
+router = APIRouter(
+    prefix="/migration",
+    tags=["Issuance Migration"],
+    dependencies=[Depends(_guard_trial_issuance_migration_writes)],
+)
 
 # ==============================================================================
 # COLUMN MAPPING — Maps user-facing Excel headers to internal field names

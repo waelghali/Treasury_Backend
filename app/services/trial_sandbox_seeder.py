@@ -319,10 +319,11 @@ def ensure_trial_sandbox_seeded(db: Session, customer_id: int) -> Dict[str, Any]
     email_domain = admin_email.split("@")[1] if "@" in admin_email else "sandbox.growbusinessdevelopment.com"
 
     if len(entities) == 0:
+        from app.crud.crud_customer import generate_unique_entity_code
         e1 = CustomerEntity(
             customer_id=customer.id,
             entity_name=customer.name[:100],
-            code="HQ01",
+            code=generate_unique_entity_code(db, customer.name or "HQ"),
             address=customer.address or "Fifth Settlement, New Cairo, Egypt",
             contact_person="Treasury Desk",
             contact_email=admin_email,
@@ -339,8 +340,8 @@ def ensure_trial_sandbox_seeded(db: Session, customer_id: int) -> Dict[str, Any]
         db.flush()
 
     if len(entities) == 1:
-        existing_codes = {str(x.code or "").upper() for x in entities}
-        sub_code = "SUB2" if "SUB2" not in existing_codes else "SUB3"
+        from app.crud.crud_customer import generate_unique_entity_code
+        sub_code = generate_unique_entity_code(db, f"{(customer.name or 'SB')[:2]}S")
         e2 = CustomerEntity(
             customer_id=customer.id,
             entity_name=f"{customer.name} — Engineering & Projects Subsidiary"[:100],
@@ -365,9 +366,19 @@ def ensure_trial_sandbox_seeded(db: Session, customer_id: int) -> Dict[str, Any]
         (u for u in existing_users if "@sandbox.growbusinessdevelopment.com" not in (u.email or "").lower()),
         None,
     )
-    if primary_real_user and primary_real_user.role != UserRole.END_USER:
-        primary_real_user.role = UserRole.END_USER
-        db.add(primary_real_user)
+    if primary_real_user:
+        changed_primary = False
+        if primary_real_user.role != UserRole.END_USER:
+            primary_real_user.role = UserRole.END_USER
+            changed_primary = True
+        if primary_real_user.must_change_password:
+            primary_real_user.must_change_password = False
+            changed_primary = True
+        if (primary_real_user.last_accepted_legal_version or 0.0) < legal_ver:
+            primary_real_user.last_accepted_legal_version = legal_ver
+            changed_primary = True
+        if changed_primary:
+            db.add(primary_real_user)
 
     # Clean up any obsolete sandbox helper users (e.g. old maker/checker helpers) except corpadmin.sandbox
     companion_admin = None
@@ -421,10 +432,16 @@ def ensure_trial_sandbox_seeded(db: Session, customer_id: int) -> Dict[str, Any]
         .count()
         == 0
     ):
+        from app.core.trial_guard import is_personal_email_domain
+        owner_contact_email = (
+            admin_email
+            if is_personal_email_domain(email_domain)
+            else f"projects.owner@{email_domain}"
+        )
         db.add(
             InternalOwnerContact(
                 customer_id=customer.id,
-                email=f"projects.owner@{email_domain}",
+                email=owner_contact_email,
                 phone_number=customer.contact_phone or "+201000000000",
                 internal_id="PM-01",
                 manager_email=admin_email,
@@ -760,6 +777,57 @@ def ensure_trial_sandbox_seeded(db: Session, customer_id: int) -> Dict[str, Any]
             db.add(lg2)
             customer.active_lg_count = 2
             db.flush()
+
+            # Seed 1 Day-1 Overdue Delivered Instruction on Sample LG #2 strictly at initial sandbox creation
+            # (NEVER retroactively injected into an already-active trial workspace!)
+            from app.models.models import LGInstruction, Template
+
+            ext_template = (
+                db.query(Template)
+                .filter(
+                    Template.action_type == "LG_EXTENSION",
+                    Template.is_notification_template == False,
+                    Template.is_deleted == False,
+                )
+                .order_by(Template.is_global.desc(), Template.is_default.desc(), Template.id.desc())
+                .first()
+                or db.query(Template)
+                .filter(
+                    Template.is_notification_template == False,
+                    Template.is_deleted == False,
+                )
+                .order_by(Template.id.asc())
+                .first()
+            )
+            maker_actor = primary_real_user or companion_admin
+            if ext_template and maker_actor:
+                new_exp_dt = (today + timedelta(days=365)).isoformat()
+                old_exp_dt = (today + timedelta(days=165)).isoformat()
+                starter_inst = LGInstruction(
+                    lg_record_id=lg2.id,
+                    instruction_type="LG_EXTENSION",
+                    serial_number=f"TRIAL-EXT-{customer.id}-01",
+                    global_seq_per_lg=1,
+                    type_seq_per_lg=1,
+                    template_id=ext_template.id,
+                    status="Instruction Delivered",
+                    instruction_date=now_utc - timedelta(days=10),
+                    delivery_date=now_utc - timedelta(days=8),
+                    bank_reply_date=None,
+                    details={
+                        "old_expiry_date": old_exp_dt,
+                        "new_expiry_date": new_exp_dt,
+                        "requested_expiry_date": new_exp_dt,
+                        "extension_months": 6,
+                        "trial_sample": True,
+                        "notes": "Delivered 8 days ago — ready in Action Center to test Send Bank Reminder & Record Bank Reply!",
+                    },
+                    maker_user_id=maker_actor.id,
+                    is_printed=True,
+                    sent_to_bank=True,
+                )
+                db.add(starter_inst)
+                db.flush()
         elif existing_custody_rows and banks and existing_custody_rows[0].migration_source == "TRIAL_SAMPLE":
             changed_lg0 = False
             if existing_custody_rows[0].issuing_bank_id != banks[0].id:

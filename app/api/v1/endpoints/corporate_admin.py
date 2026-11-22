@@ -291,6 +291,8 @@ def create_customer_entity(
 ):
     client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Legal entity setup")
 
     try:
         # FIX: Call get_with_relations with positional argument for customer_id
@@ -375,6 +377,8 @@ def update_customer_entity(
 ):
     client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Legal entity setup")
 
     try:
         db_entity = crud_customer_entity.get(db, entity_id)
@@ -419,6 +423,8 @@ def delete_customer_entity(
 ):
     client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Legal entity setup")
 
     try:
         db_entity = crud_customer_entity.get(db, entity_id)
@@ -462,6 +468,8 @@ def restore_customer_entity(
 ):
     client_host = get_client_ip if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Legal entity setup")
 
     try:
         db_entity = db.query(CustomerEntity).filter(
@@ -522,6 +530,12 @@ async def create_user(
     """
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(
+        db,
+        customer_id,
+        "User & role management (to invite up to 3 teammates, use Invite Colleague on Trial Home)",
+    )
 
     log_details = {"email": user_in.email, "customer_id": customer_id}
 
@@ -606,6 +620,8 @@ def update_user(
     # FIX: Call the function with (request)
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "User & role management")
 
     try:
         db_user = db.query(User).filter(
@@ -637,6 +653,8 @@ def delete_user(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "User & role management")
 
     try:
         db_user = db.query(User).filter(
@@ -674,6 +692,8 @@ def restore_user(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "User & role management")
 
     try:
         db_user = db.query(User).filter(
@@ -714,6 +734,9 @@ async def resend_user_invitation(
     Dispatches with SendOnly (save_copy=False) so credentials remain 100% private to the user.
     """
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "User & role management")
+
     db_user = db.query(User).filter(
         User.id == user_id,
         User.customer_id == customer_id,
@@ -788,6 +811,8 @@ def create_lg_category(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "LG category & escalation routing setup")
 
     # CRITICAL FIX: Explicitly set the customer_id from the authenticated user's context.
     # This prevents the category from being created as a system-wide (NULL customer_id) category.
@@ -885,6 +910,9 @@ def clear_default_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:edit")),
 ):
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "LG category & escalation routing setup")
+
     crud_lg_category.set_customer_default_category(
         db, customer_id=customer_id, category_id=None, user_id=corporate_admin_context.user_id
     )
@@ -897,6 +925,9 @@ def set_default_lg_category(
     corporate_admin_context: TokenData = Depends(HasPermission("corporate_category:edit")),
 ):
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "LG category & escalation routing setup")
+
     cat = crud_lg_category.set_customer_default_category(
         db, customer_id=customer_id, category_id=category_id, user_id=corporate_admin_context.user_id
     )
@@ -920,6 +951,8 @@ def update_lg_category(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "LG category & escalation routing setup")
 
     try:
         db_lg_category = crud_lg_category.get(db, id=category_id)
@@ -963,6 +996,8 @@ def delete_lg_category(
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
     db_lg_category = None
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "LG category & escalation routing setup")
 
     try:
         db_lg_category = crud_lg_category.get(db, id=category_id)
@@ -1002,6 +1037,8 @@ def restore_lg_category(
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
     db_lg_category = None
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "LG category & escalation routing setup")
 
     try:
         db_lg_category = db.query(LGCategory).filter(
@@ -1074,6 +1111,9 @@ def update_customer_configuration(
     """
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "System settings & governance timers")
+
     key_for_db = global_config_key.upper()
 
     # 0. Prevent editing official CBE policy rates
@@ -1248,6 +1288,9 @@ def test_email_settings_connection(
     If password is omitted in update, uses the existing encrypted password.
     """
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Corporate SMTP & IMAP email server settings")
+
     existing_settings = crud_customer_email_setting.get_by_customer_id(db, customer_id)
 
     from app.core.email_service import verify_smtp_connection, verify_imap_connection
@@ -1332,6 +1375,8 @@ def create_customer_email_settings(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Corporate SMTP & IMAP email server settings")
 
     try:
         from app.core.encryption import encrypt_data
@@ -1503,6 +1548,8 @@ def update_customer_email_settings(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Corporate SMTP & IMAP email server settings")
 
     try:
         from app.core.encryption import encrypt_data, decrypt_data
@@ -1656,6 +1703,8 @@ def delete_customer_email_settings(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Corporate SMTP & IMAP email server settings")
 
     try:
         db_settings = crud_customer_email_setting.get(db, setting_id)
@@ -1710,6 +1759,8 @@ def restore_customer_email_settings(
 ):
     client_host = get_client_ip(request) if request else None
     customer_id = corporate_admin_context.customer_id
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, customer_id, "Corporate SMTP & IMAP email server settings")
 
     try:
         db_settings = db.query(CustomerEmailSetting).filter(
@@ -3149,6 +3200,9 @@ def create_department(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Department structure")
+
     from app.core.governance import create_governed_change
     from app.api.v1.endpoints.issuance.base import _apply_admin_change
     change_req, auto_approved = create_governed_change(
@@ -3180,6 +3234,9 @@ def update_department(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Department structure")
+
     db_dept = crud_department.get(db, id=dept_id)
     if not db_dept or db_dept.customer_id != corporate_admin_context.customer_id:
         raise HTTPException(status_code=404, detail="Department not found.")
@@ -3208,6 +3265,9 @@ def delete_department(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Department structure")
+
     db_dept = crud_department.get(db, id=dept_id)
     if not db_dept or db_dept.customer_id != corporate_admin_context.customer_id:
         raise HTTPException(status_code=404, detail="Department not found.")
@@ -3261,6 +3321,9 @@ def create_approval_group(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Approval group setup")
+
     from app.core.governance import create_governed_change
     from app.api.v1.endpoints.issuance.base import _apply_admin_change
     change_req, auto_approved = create_governed_change(
@@ -3289,6 +3352,9 @@ def update_approval_group(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Approval group setup")
+
     db_group = crud_approval_group.get(db, id=group_id)
     if not db_group or db_group.customer_id != corporate_admin_context.customer_id:
         raise HTTPException(status_code=404, detail="Group not found.")
@@ -3315,6 +3381,9 @@ def delete_approval_group(
     db: Session = Depends(get_db),
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Approval group setup")
+
     db_group = crud_approval_group.get(db, id=group_id)
     if not db_group or db_group.customer_id != corporate_admin_context.customer_id:
         raise HTTPException(status_code=404, detail="Group not found.")
@@ -3360,6 +3429,9 @@ def create_project(
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Create a new project."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Corporate project directory")
+
     project = CorporateProject(
         customer_id=corporate_admin_context.customer_id,
         name=project_data["name"],
@@ -3380,6 +3452,9 @@ def update_project(
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Update a project."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Corporate project directory")
+
     project = db.query(CorporateProject).filter(
         CorporateProject.id == project_id,
         CorporateProject.customer_id == corporate_admin_context.customer_id
@@ -3400,6 +3475,9 @@ def delete_project(
     corporate_admin_context: TokenData = Depends(get_current_corporate_admin_context)
 ):
     """Delete a project."""
+    from app.core.trial_guard import enforce_trial_setup_preview
+    enforce_trial_setup_preview(db, corporate_admin_context.customer_id, "Corporate project directory")
+
     project = db.query(CorporateProject).filter(
         CorporateProject.id == project_id,
         CorporateProject.customer_id == corporate_admin_context.customer_id

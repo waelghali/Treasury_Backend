@@ -61,6 +61,11 @@ class SwitchPersonaIn(BaseModel):
     target_role: str  # "end_user" | "checker" | "corporate_admin"
 
 
+class FastForwardCustodyIn(BaseModel):
+    instruction_id: int
+
+
+
 def _require_trial_access(db: Session, current_user: TokenData) -> int:
     if not current_user.customer_id or not is_trial_customer(db, current_user.customer_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not available for non-trial accounts.")
@@ -154,6 +159,9 @@ def _populate_simulated_bank_quotes(
     if the user fast-forwards without manually typing a quote on Bank #1) so multi-leg cherry-picking
     and All-In net ranking shine immediately.
     """
+    if not rfq or not rfq.customer_id or not is_trial_customer(db, rfq.customer_id):
+        return 0
+
     from app.models.models_quotation import (
         QuotationBank,
         QuotationBankAssignment,
@@ -257,6 +265,9 @@ def _populate_simulated_bank_quotes(
 
 
 def _build_rfq_simulator_summary(db: Session, customer_id: int, request: Request) -> Optional[Dict[str, Any]]:
+    if not customer_id or not is_trial_customer(db, customer_id):
+        return None
+
     from app.models.models_quotation import (
         QuotationBankAssignment,
         QuotationOffer,
@@ -325,6 +336,110 @@ def _build_rfq_simulator_summary(db: Session, customer_id: int, request: Request
     }
 
 
+_REMINDABLE_CUSTODY_INSTRUCTION_TYPES = (
+    "LG_ACTIVATE_NON_OPERATIVE",
+    "LG_DECREASE_AMOUNT",
+    "LG_EXTENSION",
+    "LG_LIQUIDATE",
+    "LG_RELEASE",
+)
+
+
+def _get_custody_reply_delay_threshold_days(db: Session, customer_id: int) -> int:
+    try:
+        from app.constants import GlobalConfigKey
+        from app.crud.crud_config import crud_customer_configuration
+
+        cfg = crud_customer_configuration.get_customer_config_or_global_fallback(
+            db, customer_id, GlobalConfigKey.REMINDER_TO_BANKS_DAYS_SINCE_DELIVERY
+        )
+        if cfg and cfg.get("effective_value") is not None:
+            return max(1, int(float(cfg["effective_value"])))
+    except Exception:
+        pass
+    return 7
+
+
+def _build_custody_delay_simulator_summary(db: Session, customer_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Detects a Custody LG instruction whose bank delivery was JUST recorded in the active session
+    (within the last 45 minutes, `delivery_date` inside the normal banking SLA waiting window,
+    `bank_reply_date` still null) — never surfacing stale/older historical instructions and never
+    running for non-trial customers.
+    """
+    if not customer_id or not is_trial_customer(db, customer_id):
+        return None
+
+    from app.models.models import LGInstruction, LGRecord
+    from sqlalchemy.orm import selectinload
+
+    threshold_days = _get_custody_reply_delay_threshold_days(db, customer_id)
+    cutoff_date = date.today() - timedelta(days=threshold_days)
+    recent_session_cutoff_utc = datetime.now(timezone.utc) - timedelta(minutes=45)
+    recent_session_cutoff_naive = datetime.utcnow() - timedelta(minutes=45)
+
+    open_insts = (
+        db.query(LGInstruction)
+        .join(LGRecord, LGInstruction.lg_record_id == LGRecord.id)
+        .options(selectinload(LGInstruction.lg_record))
+        .filter(
+            LGRecord.customer_id == customer_id,
+            LGRecord.is_deleted == False,
+            LGInstruction.is_deleted == False,
+            LGInstruction.bank_reply_date.is_(None),
+            LGInstruction.status != "Canceled",
+            LGInstruction.instruction_type.in_(_REMINDABLE_CUSTODY_INSTRUCTION_TYPES),
+        )
+        .order_by(LGInstruction.updated_at.desc(), LGInstruction.id.desc())
+        .all()
+    )
+
+    fresh_delivered = []
+    overdue_awaiting_reply = []
+    undelivered_open = []
+
+    for inst in open_insts:
+        if inst.delivery_date is None:
+            undelivered_open.append(inst)
+        else:
+            deliv_dt = inst.delivery_date.date() if hasattr(inst.delivery_date, "date") else inst.delivery_date
+            if deliv_dt <= cutoff_date:
+                overdue_awaiting_reply.append(inst)
+            else:
+                if (inst.serial_number or "").startswith("TRIAL-EXT-"):
+                    continue
+                ref_ts = inst.updated_at or inst.created_at
+                if ref_ts is not None:
+                    is_recent = (
+                        ref_ts >= recent_session_cutoff_utc
+                        if getattr(ref_ts, "tzinfo", None)
+                        else ref_ts >= recent_session_cutoff_naive
+                    )
+                    if is_recent:
+                        fresh_delivered.append(inst)
+
+    latest_fresh = None
+    if fresh_delivered:
+        top = fresh_delivered[0]
+        latest_fresh = {
+            "id": top.id,
+            "serial_number": top.serial_number,
+            "instruction_type": top.instruction_type,
+            "lg_id": top.lg_record_id,
+            "lg_number": top.lg_record.lg_number if top.lg_record else "",
+            "delivery_date": top.delivery_date.strftime("%Y-%m-%d") if top.delivery_date else None,
+        }
+
+    return {
+        "threshold_days": threshold_days,
+        "fresh_delivered_count": len(fresh_delivered),
+        "overdue_awaiting_reply_count": len(overdue_awaiting_reply),
+        "undelivered_count": len(undelivered_open),
+        "latest_fresh_instruction": latest_fresh,
+    }
+
+
+
 @router.get("/status")
 def get_trial_sandbox_status(
     request: Request,
@@ -350,6 +465,8 @@ def get_trial_sandbox_status(
     company_domain = ""
     if cust_obj and cust_obj.contact_email and "@" in cust_obj.contact_email:
         company_domain = cust_obj.contact_email.rsplit("@", 1)[1].strip().lower()
+    from app.core.trial_guard import is_personal_email_domain
+    is_solo_mode = is_personal_email_domain(company_domain)
 
     users = (
         db.query(User)
@@ -409,6 +526,7 @@ def get_trial_sandbox_status(
 
     snap = get_trial_usage_snapshot(db, cust_id)
     rfq_sim = _build_rfq_simulator_summary(db, cust_id, request)
+    custody_sim = _build_custody_delay_simulator_summary(db, cust_id)
 
     active_role_str = (
         current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role or "")
@@ -439,10 +557,13 @@ def get_trial_sandbox_status(
         "invited_colleagues_count": int(snap.get("invited_colleagues_count", 0)),
         "invited_colleagues": snap.get("invited_colleagues", []),
         "company_email_domain": company_domain,
+        "is_personal_email_domain": is_solo_mode,
+        "solo_mode": is_solo_mode,
         "days_remaining": snap.get("days_remaining"),
         "usage": snap["usage"],
         "steps_completed": snap["steps_completed"],
         "active_rfq_simulator": rfq_sim,
+        "active_custody_simulator": custody_sim,
     }
 
 
@@ -706,6 +827,159 @@ def download_personalized_sample_custody_lg(
     )
 
 
+@router.get("/sample-lg-position.xlsx")
+def download_personalized_sample_lg_position_excel(
+    current_user: TokenData = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """
+    Generates a personalized Bank LG Position Statement (.xlsx) for the current trial customer's
+    #1 relationship bank (`Emirates NBD Egypt`) so LG Position Reconciliation matches their
+    exact seeded `ENBD-LG-9920{cust_id}` (`EGP 8,500,000` to `EETC`) while surfacing realistic
+    expired/bank-only commission exceptions in <10ms with zero OCR wait.
+    """
+    cust_id = _require_trial_access(db, current_user)
+    ensure_trial_sandbox_seeded(db, cust_id)
+
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from app.models.models import Bank, Customer
+    from app.models.models_issuance import IssuedLGRecord
+
+    customer = db.query(Customer).filter(Customer.id == cust_id).first()
+    company_name = customer.name if customer else "Trial Corporate Group"
+
+    enbd = (
+        db.query(Bank)
+        .filter(Bank.is_deleted == False, Bank.short_name == "ENBD")
+        .first()
+        or db.query(Bank)
+        .filter(Bank.is_deleted == False, Bank.name.ilike("%Emirates NBD%"))
+        .first()
+    )
+    bank_name = enbd.name if enbd else "Emirates NBD Egypt"
+    target_bank_id = enbd.id if enbd else None
+
+    live_lgs = (
+        db.query(IssuedLGRecord)
+        .filter(
+            IssuedLGRecord.customer_id == cust_id,
+            IssuedLGRecord.bank_id == target_bank_id if target_bank_id else True,
+        )
+        .order_by(IssuedLGRecord.id.asc())
+        .all()
+    )
+
+    today = date.today()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Bank LG Position"
+
+    title_fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+    hdr_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    meta_font = Font(name="Calibri", size=10, bold=True, color="334155")
+
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"{bank_name.upper()} — OUTSTANDING LETTERS OF GUARANTEE POSITION REPORT (TRIAL SAMPLE)"
+    ws["A1"].font = white_bold
+    ws["A1"].fill = title_fill
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+    ws["A2"] = f"Customer: {company_name}"
+    ws["A2"].font = meta_font
+    ws["D2"] = f"Position Date: {today.isoformat()}"
+    ws["D2"].font = meta_font
+
+    headers = [
+        "Bank LG Number",
+        "Beneficiary Name",
+        "Guarantee Amount",
+        "Currency",
+        "Issue Date",
+        "Expiry Date",
+    ]
+    ws.append([])
+    ws.append(headers)
+    header_row = ws.max_row
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=header_row, column=col_idx)
+        cell.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+        cell.fill = hdr_fill
+
+    if live_lgs:
+        lg0 = live_lgs[0]
+        ccy0 = lg0.currency.iso_code if getattr(lg0, "currency", None) and lg0.currency.iso_code else "EGP"
+        ws.append([
+            lg0.bank_lg_number or f"ENBD-LG-9920{cust_id}",
+            lg0.beneficiary_name or "Egyptian Electricity Transmission Co. (EETC)",
+            float(lg0.current_amount or 8500000.00),
+            ccy0,
+            (lg0.issue_date or (today - timedelta(days=60))).isoformat(),
+            (lg0.expiry_date or (today + timedelta(days=305))).isoformat(),
+        ])
+        for extra_lg in live_lgs[1:3]:
+            if not extra_lg.bank_lg_number:
+                continue
+            ccy_x = extra_lg.currency.iso_code if getattr(extra_lg, "currency", None) and extra_lg.currency.iso_code else "EGP"
+            # Introduce a realistic +30d bank expiry discrepancy on 2nd LG so user sees variance handling too
+            exp_dt = (extra_lg.expiry_date or (today + timedelta(days=180))) + timedelta(days=30)
+            ws.append([
+                extra_lg.bank_lg_number,
+                extra_lg.beneficiary_name or "Project Beneficiary",
+                float(extra_lg.current_amount or 6000000.00),
+                ccy_x,
+                (extra_lg.issue_date or today).isoformat(),
+                exp_dt.isoformat(),
+            ])
+    else:
+        ws.append([
+            f"ENBD-LG-9920{cust_id}",
+            "Egyptian Electricity Transmission Co. (EETC)",
+            8500000.00,
+            "EGP",
+            (today - timedelta(days=60)).isoformat(),
+            (today + timedelta(days=305)).isoformat(),
+        ])
+
+    # Realistic Exception #1: Expired LG physically returned by client 45 days ago, but bank still charges commission & blocks facility limit!
+    ws.append([
+        f"ENBD-LG-8814{cust_id}",
+        "New Urban Communities Authority (NUCA)",
+        4200000.00,
+        "EGP",
+        (today - timedelta(days=410)).isoformat(),
+        (today - timedelta(days=45)).isoformat(),
+    ])
+    # Realistic Exception #2: Legacy branch LG open on bank books but missing from central treasury register
+    ws.append([
+        f"ENBD-LG-7709{cust_id}",
+        "Cairo Water & Wastewater Co.",
+        1750000.00,
+        "EGP",
+        (today - timedelta(days=120)).isoformat(),
+        (today + timedelta(days=245)).isoformat(),
+    ])
+
+    col_widths = [24, 44, 20, 12, 16, 16]
+    for idx, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = w
+
+    out = io.BytesIO()
+    wb.save(out)
+    wb.close()
+
+    filename = f"Sample_LG_Position_Report_ENBD_{cust_id}.xlsx"
+    return Response(
+        content=out.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.post("/switch-persona")
 async def switch_trial_persona(
     payload: SwitchPersonaIn,
@@ -713,7 +987,7 @@ async def switch_trial_persona(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    1-Click solo evaluator Persona Switcher (`Maker <-> Checker <-> Corporate Admin`).
+    1-Click solo evaluator Persona Switcher (`End User <-> Corporate Admin`).
     Strictly confined to Trial Sandbox accounts and strictly within `current_user.customer_id`.
     """
     cust_id = _require_trial_access(db, current_user)
@@ -731,7 +1005,7 @@ async def switch_trial_persona(
     from app.auth_v2.services import AuthService
     from app.models.models import User
 
-    target_user = (
+    candidates = (
         db.query(User)
         .filter(
             User.customer_id == cust_id,
@@ -739,10 +1013,40 @@ async def switch_trial_persona(
             User.is_deleted == False,
         )
         .order_by(User.id.asc())
+        .all()
+    )
+    if not candidates:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target trial persona not found.")
+
+    # 1) Keep current user if already in target role; 2) if current user is an invited colleague (not User #1),
+    # prefer the dedicated `@sandbox.growbusinessdevelopment.com` companion persona before falling back to User #1
+    primary_real_user = (
+        db.query(User.id)
+        .filter(
+            User.customer_id == cust_id,
+            User.is_deleted == False,
+            ~User.email.ilike("%@sandbox.growbusinessdevelopment.com"),
+        )
+        .order_by(User.id.asc())
         .first()
     )
-    if not target_user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target trial persona not found.")
+    is_invited_colleague = bool(
+        primary_real_user
+        and current_user.user_id != primary_real_user[0]
+        and not (current_user.email or "").lower().endswith("@sandbox.growbusinessdevelopment.com")
+    )
+
+    own_match = next((u for u in candidates if u.id == current_user.user_id), None)
+    sandbox_companion = next(
+        (u for u in candidates if (u.email or "").lower().endswith("@sandbox.growbusinessdevelopment.com")),
+        None,
+    )
+    if own_match:
+        target_user = own_match
+    elif is_invited_colleague and sandbox_companion:
+        target_user = sandbox_companion
+    else:
+        target_user = candidates[0]
 
     token_data = await AuthService().build_user_token_data(db, target_user)
     new_jwt = create_access_token(data=token_data)
@@ -848,6 +1152,87 @@ def fast_forward_trial_rfq_to_unseal(
     }
 
 
+@router.post("/custody/fast-forward-reply-delay")
+def fast_forward_trial_custody_reply_delay(
+    payload: FastForwardCustodyIn,
+    current_user: TokenData = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Simulates +8 days of elapsed banking time strictly on the ONE explicit Custody LG instruction
+    (`payload.instruction_id`) selected by the trial user, never touching any other instructions
+    and returning 404 for all non-trial commercial accounts.
+    """
+    cust_id = _require_trial_access(db, current_user)
+    from app.crud.crud import log_action
+    from app.models.models import LGInstruction, LGRecord
+
+    inst = (
+        db.query(LGInstruction)
+        .join(LGRecord, LGInstruction.lg_record_id == LGRecord.id)
+        .filter(
+            LGInstruction.id == int(payload.instruction_id),
+            LGRecord.customer_id == cust_id,
+            LGRecord.is_deleted == False,
+            LGInstruction.is_deleted == False,
+            LGInstruction.delivery_date.isnot(None),
+            LGInstruction.bank_reply_date.is_(None),
+            LGInstruction.status != "Canceled",
+            LGInstruction.instruction_type.in_(_REMINDABLE_CUSTODY_INSTRUCTION_TYPES),
+        )
+        .first()
+    )
+    if not inst:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Delivered Custody instruction not found or already replied.",
+        )
+
+    threshold_days = _get_custody_reply_delay_threshold_days(db, cust_id)
+    shift_days = max(threshold_days + 1, 8)
+    now_utc = datetime.now(timezone.utc)
+
+    use_tz_deliv = bool(getattr(inst.delivery_date, "tzinfo", None))
+    target_deliv = (now_utc if use_tz_deliv else datetime.utcnow()) - timedelta(days=shift_days)
+    inst.delivery_date = target_deliv
+
+    if inst.instruction_date:
+        use_tz_inst = bool(getattr(inst.instruction_date, "tzinfo", None))
+        min_inst_dt = (now_utc if use_tz_inst else datetime.utcnow()) - timedelta(days=shift_days + 2)
+        if inst.instruction_date > min_inst_dt:
+            inst.instruction_date = min_inst_dt
+
+    db.add(inst)
+    log_action(
+        db,
+        user_id=current_user.user_id,
+        action_type="TRIAL_CUSTODY_DELAY_FAST_FORWARDED",
+        entity_type="LGInstruction",
+        entity_id=inst.id,
+        details={
+            "shifted_instruction_ids": [inst.id],
+            "serial_number": inst.serial_number,
+            "simulated_days": shift_days,
+        },
+        customer_id=cust_id,
+    )
+    db.commit()
+
+    custody_sim = _build_custody_delay_simulator_summary(db, cust_id)
+    return {
+        "status": "ok",
+        "shifted_count": 1,
+        "instruction_id": inst.id,
+        "simulated_days": shift_days,
+        "simulator": custody_sim,
+        "message": (
+            f"Simulated +{shift_days} days for instruction #{inst.serial_number}! "
+            "It is now in Action Center → Awaiting Bank Reply — ready to Send a Bank Reminder or Record Bank Reply."
+        ),
+    }
+
+
+
 class InviteColleagueIn(BaseModel):
     email: str
     name: Optional[str] = None
@@ -898,6 +1283,39 @@ def purge_trial_uploaded_test_data(
         db.add(lg)
         deleted_counts["lgs"] += 1
 
+    # 1b. Clean up user-generated instructions on pre-loaded starter Custody LGs while resetting starter overdue sample
+    starter_lgs = (
+        db.query(LGRecord)
+        .filter(
+            LGRecord.customer_id == cust_id,
+            LGRecord.is_deleted == False,
+            LGRecord.migration_source == "TRIAL_SAMPLE",
+        )
+        .all()
+    )
+    starter_ext_serial = f"TRIAL-EXT-{cust_id}-01"
+    now_reset_utc = datetime.now(timezone.utc)
+    for s_lg in starter_lgs:
+        s_insts = (
+            db.query(LGInstruction)
+            .filter(LGInstruction.lg_record_id == s_lg.id, LGInstruction.is_deleted == False)
+            .all()
+        )
+        for s_inst in s_insts:
+            if s_inst.serial_number == starter_ext_serial:
+                s_inst.status = "Instruction Delivered"
+                s_inst.is_printed = True
+                s_inst.sent_to_bank = True
+                s_inst.bank_reply_date = None
+                s_inst.instruction_date = now_reset_utc - timedelta(days=10)
+                s_inst.delivery_date = now_reset_utc - timedelta(days=8)
+                db.add(s_inst)
+            else:
+                s_inst.serial_number = f"{s_inst.serial_number}__P_{uuid.uuid4().hex[:4]}"[:64]
+                s_inst.is_deleted = True
+                db.add(s_inst)
+
+
     # 2. User-created Issuance Requests, Documents & Issued LGs (preserve `REQ-SMPL-` & `ILG-SMPL-`)
     user_reqs = (
         db.query(IssuanceRequest)
@@ -944,14 +1362,19 @@ def purge_trial_uploaded_test_data(
         smpl_req.metadata_json = {}
         db.add(smpl_req)
 
-    # 3. Bank Statements, Reconciliation Matches, Transactions & ERP Records
+    # 3. Bank Statements, Reconciliation Matches, Transactions, Cash Balance Snapshots & ERP Records
     try:
+        from app.models.models_inbox import CashBalanceSnapshot
         from app.models.models_reconciliation_v2 import (
             BankStatement,
             BankTransaction,
             InternalLedgerRecord,
             ReconciliationMatch,
         )
+
+        db.query(CashBalanceSnapshot).filter(
+            CashBalanceSnapshot.customer_id == cust_id
+        ).delete(synchronize_session=False)
 
         stmt_ids = [
             row[0]
@@ -987,6 +1410,33 @@ def purge_trial_uploaded_test_data(
             st.is_deleted = True
             db.add(st)
             deleted_counts["statements"] += 1
+    except Exception:
+        pass
+
+    # 3b. LG Position Reconciliation Sessions, Rows & Results
+    try:
+        from app.models.models_issuance import (
+            ReconciliationBankRow,
+            ReconciliationResult,
+            ReconciliationSession,
+        )
+
+        pos_session_ids = [
+            row[0]
+            for row in db.query(ReconciliationSession.id)
+            .filter(ReconciliationSession.customer_id == cust_id)
+            .all()
+        ]
+        if pos_session_ids:
+            db.query(ReconciliationResult).filter(
+                ReconciliationResult.session_id.in_(pos_session_ids)
+            ).delete(synchronize_session=False)
+            db.query(ReconciliationBankRow).filter(
+                ReconciliationBankRow.session_id.in_(pos_session_ids)
+            ).delete(synchronize_session=False)
+            db.query(ReconciliationSession).filter(
+                ReconciliationSession.id.in_(pos_session_ids)
+            ).delete(synchronize_session=False)
     except Exception:
         pass
 
@@ -1046,11 +1496,13 @@ async def invite_trial_colleague(
     """
     Allows a Free Trial evaluator to invite up to 3 colleagues from their exact same
     corporate email domain (e.g. Manager / CFO) with a secure Zero-Touch Activation link.
+    Disabled in Solo Mode (personal email registrations) to guarantee strict isolation.
     """
     cust_id = _require_trial_access(db, current_user)
     import secrets
     from app.constants import LegalArtifactType
     from app.core.hashing import get_password_hash
+    from app.core.trial_guard import is_personal_email_domain
     from app.crud.crud import crud_legal_artifact, log_action
     from app.models.models import Customer, User
     from app.services.customer_onboarding_service import send_corporate_admin_activation_email
@@ -1065,6 +1517,14 @@ async def invite_trial_colleague(
 
     base_email = (cust.contact_email or current_user.email or "").strip().lower()
     expected_domain = base_email.rsplit("@", 1)[1] if "@" in base_email else ""
+    if is_personal_email_domain(expected_domain):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Solo Mode Notice: Team invitations are disabled for personal email accounts (@{expected_domain}) "
+                "to protect tenant isolation. Register or upgrade with your corporate domain to invite colleagues."
+            ),
+        )
     invite_domain = clean_email.rsplit("@", 1)[1]
     if not expected_domain or invite_domain != expected_domain:
         raise HTTPException(

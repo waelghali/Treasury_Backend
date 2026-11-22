@@ -210,6 +210,48 @@ def _find_bilingual_match(
     return None
 
 
+def _looks_like_guarantee_wording(raw_text: str, norm_ar_text: str) -> bool:
+    """
+    Heuristic sanity gate: returns True only if the text contains recognizable Letter of Guarantee,
+    Bank Guarantee, Standby LC, or contractual guarantee/surety terminology in English or Arabic.
+    Prevents unrelated documents (e.g. invoices, menus, CVs, bank statements) from being stamped 'GREEN — Safe'.
+    """
+    if not raw_text or len(raw_text.strip()) < 25:
+        return False
+    en_cues = (
+        r"\bletter\s+of\s+guarantee\b",
+        r"\bbank\s+guarantee\b",
+        r"\bperformance\s+(?:guarantee|bond|security)\b",
+        r"\badvance\s+payment\s+(?:guarantee|bond|security)\b",
+        r"\bbid\s+bond\b",
+        r"\btender\s+(?:guarantee|bond|security)\b",
+        r"\bretention\s+(?:money\s+)?(?:guarantee|bond)\b",
+        r"\bstandby\s+letter\s+of\s+credit\b",
+        r"\birrevocabl[ey]\s+(?:and\s+unconditionall?[ey]\s+)?undertake\b",
+        r"\bhereby\s+(?:guarantee|undertake)\b",
+        r"\bfirst\s+written\s+demand\b",
+        r"\burdg\s*758\b",
+        r"\bisp\s*98\b",
+        r"\bbeneficiary\b.*\b(?:guarantee|undertake|demand|expiry)\b",
+    )
+    if any(re.search(p, raw_text, flags=re.IGNORECASE | re.DOTALL) for p in en_cues):
+        return True
+    ar_cues = (
+        "خطاب ضمان",
+        "خطاب الضمان",
+        "ضمان بنكي",
+        "ضمان حسن التنفيذ",
+        "ضمان الدفعه المقدمه",
+        "تامين ابتدائي",
+        "تامين نهائي",
+        "نتعهد تعهدا غير قابل للالغاء",
+        "بمجرد اول طلب كتابي",
+        "يلتزم البنك بدفع",
+        "ساري المفعول حتي",
+    )
+    return any(_normalize_arabic(c) in norm_ar_text for c in ar_cues)
+
+
 def run_deterministic_wording_scan(
     wording_text: str,
     request_context: Optional[Dict[str, Any]] = None,
@@ -340,12 +382,47 @@ def run_deterministic_wording_scan(
     # --- TRAP 2: Unconditional Advance Payment Guarantee Missing Non-Operative Clause (RED) ---
     lg_type_str = str(ctx.get("lg_type") or "").lower()
     purpose_str = str(ctx.get("lg_purpose") or "").lower()
+    text_mentions_advance = bool(
+        _find_bilingual_match(
+            raw,
+            norm_ar,
+            [r"\badvance\s+payment\s+guarantee\b", r"\badvance\s+payment\b", r"\bdown\s+payment\b"],
+            ["دفعه مقدمه", "الدفعه المقدمه", "ضمان الدفعه المقدمه"],
+        )
+    )
+    text_explicitly_other_lg_type = bool(
+        not text_mentions_advance
+        and _find_bilingual_match(
+            raw,
+            norm_ar,
+            [
+                r"\bperformance\s+(?:letter\s+of\s+)?guarantee\b",
+                r"\bperformance\s+bond\b",
+                r"\bfinal\s+(?:letter\s+of\s+)?guarantee\b",
+                r"\bbid\s+bond\b",
+                r"\btender\s+(?:letter\s+of\s+)?guarantee\b",
+                r"\bretention\s+(?:money\s+)?guarantee\b",
+            ],
+            [
+                "خطاب ضمان نهائي",
+                "ضمان حسن التنفيذ",
+                "خطاب ضمان ابتدائي",
+                "تامين ابتدائي",
+                "تامين نهائي",
+            ],
+        )
+    )
     mentions_advance = bool(
-        "advance" in lg_type_str
-        or "دفعة مقدمة" in lg_type_str
-        or "دفعه مقدمه" in _normalize_arabic(lg_type_str)
-        or "advance payment" in purpose_str
-        or _find_bilingual_match(raw, norm_ar, [r"\badvance\s+payment\s+guarantee\b", r"\badvance\s+payment\b"], ["دفعه مقدمه", "الدفعه المقدمه", "ضمان الدفعه المقدمه"])
+        text_mentions_advance
+        or (
+            not text_explicitly_other_lg_type
+            and (
+                "advance" in lg_type_str
+                or "دفعة مقدمة" in lg_type_str
+                or "دفعه مقدمه" in _normalize_arabic(lg_type_str)
+                or "advance payment" in purpose_str
+            )
+        )
     )
     if mentions_advance and not has_non_operative_advance:
         findings.append({
@@ -972,6 +1049,8 @@ async def analyze_special_wording_traps(
     positive_protections: List[str] = list(det_result["positive_protections"])
     detected_lang = det_result["detected_language"]
     ai_summary: Optional[str] = None
+    ai_is_guarantee_doc: Optional[bool] = None
+    is_det_guarantee_doc = _looks_like_guarantee_wording(combined_text, _normalize_arabic(combined_text))
     analysis_engine = "DETERMINISTIC_BILINGUAL_RULES"
 
     # Attempt Gemini deep legal & multimodal analysis if configured
@@ -1028,8 +1107,9 @@ Identify any legal, documentary, or operational hurdles that could BLOCK, DELAY,
 
 Return ONLY valid JSON with this exact schema:
 {{
+  "is_guarantee_document": true | false,
   "detected_language": "AR" | "EN" | "BILINGUAL",
-  "executive_summary": "<2 concise plain-English sentences summarizing how strongly this incoming guarantee protects the Beneficiary's right to claim>",
+  "executive_summary": "<2 concise plain-English sentences summarizing how strongly this incoming guarantee protects the Beneficiary's right to claim (or explaining why is_guarantee_document is false if it is an invoice/receipt/unrelated file)>",
   "findings": [
     {{
       "clause_type": "<one of the codes above>",
@@ -1042,6 +1122,7 @@ Return ONLY valid JSON with this exact schema:
   ],
   "positive_protections": ["<short plain-English bullet of any strong Beneficiary protection confirmed in the text>"]
 }}
+IMPORTANT: Set `"is_guarantee_document": false` if the document/text is NOT a Letter of Guarantee, Bank Guarantee, Standby LC, or contractual guarantee clause (for example, if it is a sales/catering invoice, bank cash statement, CV, receipt, or unrelated text).
 """
         else:
             ctx_summary = json.dumps(
@@ -1076,8 +1157,9 @@ Identify any legal or financial traps for the Applicant (corporate customer), fo
 
 Return ONLY valid JSON with this exact schema:
 {{
+  "is_guarantee_document": true | false,
   "detected_language": "AR" | "EN" | "BILINGUAL",
-  "executive_summary": "<2 concise plain-English sentences summarizing overall wording safety for an executive approver>",
+  "executive_summary": "<2 concise plain-English sentences summarizing overall wording safety for an executive approver (or explaining why is_guarantee_document is false if the file is an invoice, receipt, bank statement, or unrelated document)>",
   "findings": [
     {{
       "clause_type": "<one of the codes above>",
@@ -1090,6 +1172,7 @@ Return ONLY valid JSON with this exact schema:
   ],
   "positive_protections": ["<short plain-English bullet of any protective clause already present>"]
 }}
+IMPORTANT: Set `"is_guarantee_document": false` if the document/text is NOT a Letter of Guarantee, Bank Guarantee draft, Standby LC, or contractual guarantee clause (for example, if it is a sales/catering invoice, bank cash statement, CV, receipt, or unrelated placeholder text).
 """
         contents: List[Any] = [prompt]
         if combined_text:
@@ -1135,6 +1218,8 @@ Return ONLY valid JSON with this exact schema:
             ai_json = json.loads(response.text or "{}")
             if isinstance(ai_json, dict):
                 analysis_engine = "HYBRID_AI_AND_RULES"
+                if "is_guarantee_document" in ai_json and isinstance(ai_json["is_guarantee_document"], bool):
+                    ai_is_guarantee_doc = ai_json["is_guarantee_document"]
                 if ai_json.get("detected_language") in ("AR", "EN", "BILINGUAL"):
                     detected_lang = ai_json["detected_language"]
                 if ai_json.get("executive_summary"):
@@ -1188,7 +1273,30 @@ Return ONLY valid JSON with this exact schema:
     if positive_protections:
         risk_score = max(8 if (red_count or amber_count) else 0, risk_score - min(15, len(positive_protections) * 5))
 
-    if eff_perspective == "BENEFICIARY":
+    is_non_lg_doc = bool(
+        ai_is_guarantee_doc is False
+        or (
+            ai_is_guarantee_doc is None
+            and not is_det_guarantee_doc
+            and red_count == 0
+            and amber_count == 0
+            and not positive_protections
+        )
+    )
+
+    if is_non_lg_doc:
+        risk_level = "INVALID"
+        risk_score = 0
+        final_findings = []
+        positive_protections = []
+        risk_label = "Invalid Document — Not a Letter of Guarantee"
+        if not ai_summary:
+            ai_summary = (
+                "The submitted file or text does not appear to be a Letter of Guarantee or guarantee clause "
+                "(for example, it may be an invoice, receipt, bank statement, or placeholder text). "
+                "Please attach a draft Letter of Guarantee to scan for wording traps."
+            )
+    elif eff_perspective == "BENEFICIARY":
         if red_count > 0 or risk_score >= 65:
             risk_level = "RED"
             risk_label = "Weak Protection — Claim-Blocking Hurdles Detected"
