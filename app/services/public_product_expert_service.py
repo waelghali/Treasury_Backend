@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 PUBLIC_CHAT_LOG_DIR = os.path.join(os.getcwd(), "private_storage", "public_demo_chat_logs")
 PUBLIC_VOICE_STATE_FILENAME = "public_voice_state.json"
+PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME = "public_telemetry_exclusions.json"
 GEMINI_TTS_MODEL_NAME = os.getenv("GEMINI_TTS_MODEL_NAME", "gemini-2.5-flash-tts")
 
 # ==============================================================================
@@ -651,10 +652,17 @@ def validate_and_hydrate_actions(raw_actions: Any, lang: str = "en") -> List[Dic
 # ==============================================================================
 
 _BOT_UA_RE = re.compile(
-    r"(googlebot|bingbot|slurp|duckduckbot|baiduspider|yandexbot|ahrefsbot|semrushbot|"
-    r"mj12bot|dotbot|bytespider|petalbot|facebookexternalhit|linkedinbot|twitterbot|"
-    r"whatsapp|telegrambot|discordbot|uptimerobot|pingdom|headlesschrome|phantomjs|"
-    r"python-urllib|python-requests|curl/|wget/|go-http-client)",
+    r"(googlebot|adsbot-google|mediapartners-google|google-inspectiontool|googleother|"
+    r"apis-google|storebot-google|bingbot|bingpreview|adidxbot|msnbot|slurp|duckduckbot|"
+    r"baiduspider|yandexbot|ahrefsbot|semrushbot|mj12bot|dotbot|bytespider|petalbot|"
+    r"gptbot|chatgpt-user|oai-searchbot|claudebot|anthropic-ai|perplexitybot|ccbot|"
+    r"amazonbot|applebot|meta-externalagent|youbot|facebookexternalhit|linkedinbot|"
+    r"twitterbot|whatsapp|telegrambot|discordbot|slackbot|skypeuripreview|"
+    r"uptimerobot|pingdom|statuscake|betteruptime|betterstack|datadog|newrelicpinger|"
+    r"site24x7|freshping|hetrixtools|lighthouse|chrome-lighthouse|pagespeed|gtmetrix|"
+    r"headlesschrome|phantomjs|playwright|puppeteer|selenium|cypress|webdriver|"
+    r"censys|shodan|zgrab|python-urllib|python-requests|httpx|aiohttp|axios/|node-fetch|"
+    r"curl/|wget/|go-http-client)",
     re.IGNORECASE,
 )
 
@@ -762,9 +770,110 @@ class PublicDemoChatLogger:
         self._gcs_checked_at: Dict[str, float] = {}
         self._gcs_remote_files: Optional[set] = None
         self._gcs_manifest_ts: float = 0.0
+        self._hydrated_files: set = set()
+        self._excluded_visitors: Optional[set] = None
         self._pending_event_dates: set = set()
         self._event_sync_scheduled: bool = False
         self._ensure_dir()
+
+    def _get_excluded_visitors(self) -> set:
+        """Returns persisted System Owner / internal `visitor_id`s excluded from prospect analytics."""
+        if self._excluded_visitors is not None:
+            return self._excluded_visitors
+
+        self._ensure_dir()
+        local_path = os.path.join(PUBLIC_CHAT_LOG_DIR, PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME)
+        loaded: set = set()
+
+        if not os.path.exists(local_path):
+            try:
+                bucket = self._get_gcs_bucket()
+                if bucket is not None:
+                    remote_names = self._get_gcs_remote_filenames(bucket)
+                    if PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME in remote_names:
+                        blob = bucket.blob(f"public_demo_chat_logs/{PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME}")
+                        raw_remote = blob.download_as_text(encoding="utf-8", timeout=4)
+                        if raw_remote and raw_remote.strip():
+                            with self._lock:
+                                if not os.path.exists(local_path):
+                                    with open(local_path, "w", encoding="utf-8") as wf:
+                                        wf.write(raw_remote)
+            except Exception as exc:
+                logger.debug(f"GCS hydration skipped for exclusions file: {exc}")
+
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, "r", encoding="utf-8") as rf:
+                    data = json.load(rf)
+                raw_ids = data.get("excluded_visitor_ids") if isinstance(data, dict) else []
+                if isinstance(raw_ids, list):
+                    for item in raw_ids[:500]:
+                        val = str(item or "").strip()[:64]
+                        if val and val not in ("anon", "ssr-anon", "ssr-vis", "unknown"):
+                            loaded.add(val)
+            except Exception as exc:
+                logger.debug(f"Could not read telemetry exclusions file: {exc}")
+
+        self._excluded_visitors = loaded
+        return self._excluded_visitors
+
+    def _persist_excluded_visitors(self) -> None:
+        vids = sorted(self._get_excluded_visitors())[:500]
+        body = json.dumps(
+            {
+                "excluded_visitor_ids": vids,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+        )
+        local_path = os.path.join(PUBLIC_CHAT_LOG_DIR, PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME)
+        try:
+            self._ensure_dir()
+            with self._lock:
+                with open(local_path, "w", encoding="utf-8") as wf:
+                    wf.write(body)
+        except Exception as exc:
+            logger.debug(f"Could not write local telemetry exclusions file: {exc}")
+
+        def _sync_exclusions():
+            try:
+                bucket = self._get_gcs_bucket()
+                if bucket is None:
+                    return
+                blob = bucket.blob(f"public_demo_chat_logs/{PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME}")
+                blob.upload_from_string(body, content_type="application/json", timeout=5)
+                if self._gcs_remote_files is not None:
+                    self._gcs_remote_files.add(PUBLIC_TELEMETRY_EXCLUSIONS_FILENAME)
+            except Exception as exc:
+                logger.debug(f"GCS sync skipped for telemetry exclusions: {exc}")
+
+        try:
+            t = threading.Thread(target=_sync_exclusions, daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+    def register_excluded_visitor(self, visitor_id: str) -> bool:
+        clean_vid = (visitor_id or "").strip()[:64]
+        if not clean_vid or clean_vid in ("anon", "ssr-anon", "ssr-vis", "unknown"):
+            return False
+        exclusions = self._get_excluded_visitors()
+        if clean_vid in exclusions:
+            return False
+        exclusions.add(clean_vid)
+        self._persist_excluded_visitors()
+        return True
+
+    def unexclude_visitor(self, visitor_id: str) -> bool:
+        clean_vid = (visitor_id or "").strip()[:64]
+        if not clean_vid:
+            return False
+        exclusions = self._get_excluded_visitors()
+        if clean_vid not in exclusions:
+            return False
+        exclusions.discard(clean_vid)
+        self._persist_excluded_visitors()
+        return True
 
     def _ensure_dir(self) -> None:
         try:
@@ -816,8 +925,11 @@ class PublicDemoChatLogger:
             return set()
 
     def _hydrate_local_file_from_gcs_if_missing(self, filename: str, local_path: str) -> None:
-        """If a daily JSONL file does not exist locally, pull from GCS only if present in the cached manifest."""
-        if os.path.exists(local_path):
+        """
+        Ensures a daily JSONL file has been merged with GCS at least once in this worker's lifetime,
+        even if a post-restart event created a 1-line local file before the first analytics read.
+        """
+        if filename in self._hydrated_files and os.path.exists(local_path):
             return
         now_mono = time.monotonic()
         last_check = self._gcs_checked_at.get(filename, 0.0)
@@ -831,14 +943,42 @@ class PublicDemoChatLogger:
                 return
             remote_names = self._get_gcs_remote_filenames(bucket)
             if filename not in remote_names:
+                self._hydrated_files.add(filename)
                 return
             blob = bucket.blob(f"public_demo_chat_logs/{filename}")
             remote_text = blob.download_as_text(encoding="utf-8", timeout=5)
             if remote_text and remote_text.strip():
+                is_prod = is_production_public_telemetry_env()
+                loopback_hashes = _loopback_ip_hashes() if is_prod else set()
                 with self._lock:
                     if not os.path.exists(local_path):
                         with open(local_path, "w", encoding="utf-8") as f:
                             f.write(remote_text if remote_text.endswith("\n") else remote_text + "\n")
+                    else:
+                        with open(local_path, "r", encoding="utf-8") as lf:
+                            local_lines = [ln.strip() for ln in lf if ln.strip()]
+                        seen_keys: set = set()
+                        merged_lines: List[str] = []
+                        for src_line in list(remote_text.splitlines()) + local_lines:
+                            sline = src_line.strip()
+                            if not sline:
+                                continue
+                            try:
+                                obj = json.loads(sline)
+                                if is_prod and _is_local_or_loopback_entry(obj, loopback_hashes):
+                                    continue
+                                dedup_key = (
+                                    obj.get("event_id")
+                                    or f"{obj.get('timestamp', '')}:{obj.get('session_id', '')}:{obj.get('question', '')[:40]}"
+                                )
+                            except Exception:
+                                dedup_key = sline[:64]
+                            if dedup_key not in seen_keys:
+                                seen_keys.add(dedup_key)
+                                merged_lines.append(sline)
+                        with open(local_path, "w", encoding="utf-8") as wf:
+                            wf.write(("\n".join(merged_lines) + "\n") if merged_lines else "")
+            self._hydrated_files.add(filename)
         except Exception as exc:
             logger.debug(f"GCS hydration skipped for {filename}: {exc}")
 
@@ -858,7 +998,14 @@ class PublicDemoChatLogger:
         metadata: Optional[Dict[str, Any]] = None,
         ip_hash: str = "",
         user_agent: str = "",
+        is_internal: bool = False,
     ) -> None:
+        if is_internal:
+            return
+        clean_vis_id = (visitor_id or "").strip()[:64]
+        if clean_vis_id and clean_vis_id in self._get_excluded_visitors():
+            return
+
         is_prod = is_production_public_telemetry_env()
         if is_prod and ip_hash in _loopback_ip_hashes():
             return
@@ -884,7 +1031,7 @@ class PublicDemoChatLogger:
             "timestamp": timestamp_iso,
             "event_type": (event_type or "page_view")[:40],
             "session_id": (session_id or "anon")[:64],
-            "visitor_id": (visitor_id or session_id or ip_hash or "anon")[:64],
+            "visitor_id": (clean_vis_id or session_id or ip_hash or "anon")[:64],
             "page": (page or "")[:40],
             "path": (path or "")[:160],
             "referrer_source": (referrer_source or "Direct")[:80],
@@ -894,6 +1041,7 @@ class PublicDemoChatLogger:
             "country": (country or "")[:8].upper(),
             "metadata": safe_meta,
             "ip_hash": ip_hash,
+            "user_agent": (user_agent or "")[:180],
             "is_bot": is_bot_user_agent(user_agent),
         }
         if not is_prod:
@@ -993,6 +1141,9 @@ class PublicDemoChatLogger:
                     with self._lock:
                         with open(local_path, "w", encoding="utf-8") as wf:
                             wf.write(merged_body)
+                    self._hydrated_files.add(filename)
+                    if self._gcs_remote_files is not None:
+                        self._gcs_remote_files.add(filename)
         except Exception as exc:
             logger.debug(f"Public telemetry GCS batch sync skipped: {exc}")
 
@@ -1000,6 +1151,8 @@ class PublicDemoChatLogger:
         self,
         *,
         session_id: str,
+        visitor_id: str = "",
+        is_internal: bool = False,
         page_context: str,
         lang: str,
         question: str,
@@ -1012,6 +1165,12 @@ class PublicDemoChatLogger:
         user_agent: str,
         latency_ms: float,
     ) -> None:
+        if is_internal:
+            return
+        clean_vis_id = (visitor_id or "").strip()[:64]
+        if clean_vis_id and clean_vis_id in self._get_excluded_visitors():
+            return
+
         is_prod = is_production_public_telemetry_env()
         if is_prod and ip_hash in _loopback_ip_hashes():
             return
@@ -1023,6 +1182,7 @@ class PublicDemoChatLogger:
         payload: Dict[str, Any] = {
             "timestamp": timestamp_iso,
             "session_id": (session_id or "anon")[:64],
+            "visitor_id": clean_vis_id,
             "page_context": (page_context or "unknown")[:120],
             "lang": lang,
             "topic": topic,
@@ -1085,29 +1245,58 @@ class PublicDemoChatLogger:
 
     def _sync_to_gcs_background(self, date_str: str, payload: Dict[str, Any]) -> None:
         try:
-            if _is_local_or_loopback_entry(payload, _loopback_ip_hashes()):
+            loopback_hashes = _loopback_ip_hashes()
+            if _is_local_or_loopback_entry(payload, loopback_hashes):
                 return
             bucket = self._get_gcs_bucket()
             if bucket is None:
                 return
 
-            blob_name = f"public_demo_chat_logs/public_chat_{date_str}.jsonl"
+            filename = f"public_chat_{date_str}.jsonl"
+            local_path = os.path.join(PUBLIC_CHAT_LOG_DIR, filename)
+            blob_name = f"public_demo_chat_logs/{filename}"
             blob = bucket.blob(blob_name)
-            new_line = json.dumps(payload, ensure_ascii=False) + "\n"
+            new_line = json.dumps(payload, ensure_ascii=False)
 
+            remote_lines: List[str] = []
             if blob.exists(timeout=3):
                 existing = blob.download_as_text(encoding="utf-8", timeout=4)
-                blob.upload_from_string(
-                    existing + new_line,
-                    content_type="application/x-jsonlines",
-                    timeout=4,
-                )
-            else:
-                blob.upload_from_string(
-                    new_line,
-                    content_type="application/x-jsonlines",
-                    timeout=4,
-                )
+                remote_lines = [ln.strip() for ln in existing.splitlines() if ln.strip()]
+
+            local_lines: List[str] = []
+            if os.path.exists(local_path):
+                with self._lock:
+                    with open(local_path, "r", encoding="utf-8") as lf:
+                        local_lines = [ln.strip() for ln in lf if ln.strip()]
+
+            seen_keys: set = set()
+            merged_lines: List[str] = []
+            for sline in remote_lines + local_lines + [new_line]:
+                if not sline:
+                    continue
+                try:
+                    obj = json.loads(sline)
+                    if _is_local_or_loopback_entry(obj, loopback_hashes):
+                        continue
+                    key = f"{obj.get('timestamp', '')}:{obj.get('session_id', '')}:{obj.get('question', '')[:40]}"
+                except Exception:
+                    key = sline[:64]
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    merged_lines.append(sline)
+
+            merged_body = ("\n".join(merged_lines) + "\n") if merged_lines else ""
+            blob.upload_from_string(
+                merged_body,
+                content_type="application/x-jsonlines",
+                timeout=4,
+            )
+            with self._lock:
+                with open(local_path, "w", encoding="utf-8") as wf:
+                    wf.write(merged_body)
+            self._hydrated_files.add(filename)
+            if self._gcs_remote_files is not None:
+                self._gcs_remote_files.add(filename)
         except Exception as exc:
             logger.debug(f"Public demo chat GCS sync skipped: {exc}")
 
@@ -1119,12 +1308,15 @@ class PublicDemoChatLogger:
 
         is_prod = is_production_public_telemetry_env()
         prod_loopback_hashes = _loopback_ip_hashes() if is_prod else set()
+        excluded_vids = self._get_excluded_visitors()
 
         entries: List[Dict[str, Any]] = []
         topic_counts: Dict[str, int] = {}
         now = datetime.now(timezone.utc)
+        cutoff_dt = (now - timedelta(hours=24)) if days == 1 else None
+        scan_offsets = [0, 1] if days == 1 else list(range(days))
 
-        for offset in range(days):
+        for offset in scan_offsets:
             d_str = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
             fname = f"public_chat_{d_str}.jsonl"
             j_path = os.path.join(PUBLIC_CHAT_LOG_DIR, fname)
@@ -1141,6 +1333,23 @@ class PublicDemoChatLogger:
                     rec = json.loads(raw_line)
                     if is_prod and _is_local_or_loopback_entry(rec, prod_loopback_hashes):
                         continue
+                    if rec.get("is_internal") is True:
+                        continue
+                    if str(rec.get("visitor_id") or "") in excluded_vids:
+                        continue
+                    if is_bot_user_agent(str(rec.get("user_agent") or "")):
+                        continue
+                    if cutoff_dt is not None:
+                        ts_raw = str(rec.get("timestamp") or "")
+                        if ts_raw:
+                            try:
+                                parsed_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                                if parsed_dt.tzinfo is None:
+                                    parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                                if parsed_dt < cutoff_dt:
+                                    continue
+                            except Exception:
+                                pass
                     t_key = rec.get("topic") or "general"
                     topic_counts[t_key] = topic_counts.get(t_key, 0) + 1
                     if len(entries) < limit:
@@ -1174,12 +1383,34 @@ class PublicDemoChatLogger:
 
         is_prod = is_production_public_telemetry_env()
         prod_loopback_hashes = _loopback_ip_hashes() if is_prod else set()
+        excluded_vids = self._get_excluded_visitors()
+        excluded_sessions: set = set()
 
         now = datetime.now(timezone.utc)
-        date_keys = [
-            (now - timedelta(days=offset)).strftime("%Y-%m-%d")
-            for offset in reversed(range(days))
-        ]
+        cutoff_dt = (now - timedelta(hours=24)) if days == 1 else None
+        today_str = now.strftime("%Y-%m-%d")
+        yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        if days == 1:
+            scan_dates = [yesterday_str, today_str]
+            date_keys = [yesterday_str, today_str]
+        else:
+            date_keys = [
+                (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+                for offset in reversed(range(days))
+            ]
+            scan_dates = date_keys
+
+        def _within_window(ts_raw: str) -> bool:
+            if cutoff_dt is None or not ts_raw:
+                return True
+            try:
+                parsed_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                if parsed_dt.tzinfo is None:
+                    parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                return parsed_dt >= cutoff_dt
+            except Exception:
+                return True
 
         daily_visitors: Dict[str, set] = {d: set() for d in date_keys}
         daily_demo_visitors: Dict[str, set] = {d: set() for d in date_keys}
@@ -1215,17 +1446,15 @@ class PublicDemoChatLogger:
         }
         workflow_opens: Dict[str, int] = {}
 
-        source_sessions: Dict[str, set] = {}
-        device_sessions: Dict[str, set] = {}
-        country_sessions: Dict[str, set] = {}
-        lang_sessions: Dict[str, set] = {"en": set(), "ar": set()}
         topic_counts: Dict[str, int] = {}
 
+        # Unified per-visitor journey map (prevents multi-tab / multi-visit duplicate rows for the same visitor)
         sessions_map: Dict[str, Dict[str, Any]] = {}
+        session_to_visitor: Dict[str, str] = {}
         chat_logs_newest_first: List[Dict[str, Any]] = []
         total_chat_questions = 0
 
-        def _get_or_init_session(
+        def _get_or_init_visitor_journey(
             sess_id: str,
             vis_id: str,
             ts: str,
@@ -1234,7 +1463,7 @@ class PublicDemoChatLogger:
             lang_val: str = "en",
             country_val: str = "",
         ) -> Dict[str, Any]:
-            rec = sessions_map.get(sess_id)
+            rec = sessions_map.get(vis_id)
             if rec is None:
                 short_seed = vis_id if vis_id and vis_id != "anon" else sess_id
                 short_hash = hashlib.md5(short_seed.encode("utf-8")).hexdigest()[:6]
@@ -1255,23 +1484,32 @@ class PublicDemoChatLogger:
                     "opened_chat": False,
                     "chat_count": 0,
                     "conversions": [],
+                    "_session_ids": {sess_id} if sess_id else set(),
                 }
-                sessions_map[sess_id] = rec
+                sessions_map[vis_id] = rec
             else:
-                if ts and ts < rec["first_seen"]:
+                if sess_id:
+                    rec["_session_ids"].add(sess_id)
+                    if not ts or ts >= (rec["last_seen"] or ""):
+                        rec["session_id"] = sess_id
+                if ts and (not rec["first_seen"] or ts < rec["first_seen"]):
                     rec["first_seen"] = ts
-                if ts and ts > rec["last_seen"]:
+                if ts and ts > (rec["last_seen"] or ""):
                     rec["last_seen"] = ts
                 if rec["source"] in ("", "Direct", "Unknown") and source and source not in ("Direct", "Unknown"):
                     rec["source"] = source
+                if device and device in ("mobile", "tablet") and rec["device"] == "desktop":
+                    rec["device"] = device
                 if not rec["country"] and country_val:
                     rec["country"] = country_val
                 if lang_val == "ar":
                     rec["lang"] = "ar"
+            if sess_id and sess_id != "anon":
+                session_to_visitor[sess_id] = vis_id
             return rec
 
         # 1. Read Telemetry Events (chronological oldest -> newest)
-        for d_str in date_keys:
+        for d_str in scan_dates:
             ev_fname = f"public_events_{d_str}.jsonl"
             ev_path = os.path.join(PUBLIC_CHAT_LOG_DIR, ev_fname)
             self._hydrate_local_file_from_gcs_if_missing(ev_fname, ev_path)
@@ -1290,36 +1528,46 @@ class PublicDemoChatLogger:
                     except Exception:
                         continue
 
-                    if ev.get("is_bot"):
+                    if ev.get("is_bot") or is_bot_user_agent(str(ev.get("user_agent") or "")):
                         bot_events_filtered += 1
                         continue
                     if is_prod and _is_local_or_loopback_entry(ev, prod_loopback_hashes):
                         continue
 
-                    etype = str(ev.get("event_type") or "")
                     sess_id = str(ev.get("session_id") or "anon")
-                    vis_id = str(ev.get("visitor_id") or sess_id)
+                    raw_vis = str(ev.get("visitor_id") or "").strip()
+                    if ev.get("is_internal") is True or (raw_vis and raw_vis in excluded_vids):
+                        if sess_id and sess_id != "anon":
+                            excluded_sessions.add(sess_id)
+                        continue
+
+                    ts = str(ev.get("timestamp") or "")
+                    if not _within_window(ts):
+                        continue
+
+                    etype = str(ev.get("event_type") or "")
+                    vis_id = raw_vis or sess_id
                     if vis_id == "anon" and ev.get("ip_hash"):
                         vis_id = f"ip_{ev['ip_hash']}"
-                    ts = str(ev.get("timestamp") or "")
+                    if vis_id in excluded_vids:
+                        if sess_id and sess_id != "anon":
+                            excluded_sessions.add(sess_id)
+                        continue
+
                     source = str(ev.get("referrer_source") or "Direct")
                     device = str(ev.get("device_type") or "desktop").lower()
                     lang_val = "ar" if str(ev.get("lang") or "").lower().startswith("ar") else "en"
                     country_val = str(ev.get("country") or "").upper()
+                    if country_val in ("XX", "ZZ", "UNKNOWN"):
+                        country_val = ""
                     meta = ev.get("metadata") if isinstance(ev.get("metadata"), dict) else {}
 
                     unique_visitors.add(vis_id)
-                    unique_sessions.add(sess_id)
+                    unique_sessions.add(sess_id if sess_id != "anon" else vis_id)
                     if d_str in daily_visitors:
                         daily_visitors[d_str].add(vis_id)
 
-                    source_sessions.setdefault(source, set()).add(sess_id)
-                    device_sessions.setdefault(device, set()).add(sess_id)
-                    lang_sessions.setdefault(lang_val, set()).add(sess_id)
-                    if country_val and country_val not in ("XX", "ZZ", "UNKNOWN"):
-                        country_sessions.setdefault(country_val, set()).add(sess_id)
-
-                    srec = _get_or_init_session(
+                    srec = _get_or_init_visitor_journey(
                         sess_id=sess_id,
                         vis_id=vis_id,
                         ts=ts,
@@ -1427,8 +1675,8 @@ class PublicDemoChatLogger:
             except Exception as exc:
                 logger.warning(f"Failed reading public telemetry {ev_path}: {exc}")
 
-        # 2. Read AI Chatbot Q&A Logs (newest days first for chat_logs list, while merging into sessions!)
-        for d_str in reversed(date_keys):
+        # 2. Read AI Chatbot Q&A Logs (newest days first for chat_logs list, while merging into visitor journeys!)
+        for d_str in reversed(scan_dates):
             ch_fname = f"public_chat_{d_str}.jsonl"
             ch_path = os.path.join(PUBLIC_CHAT_LOG_DIR, ch_fname)
             self._hydrate_local_file_from_gcs_if_missing(ch_fname, ch_path)
@@ -1455,13 +1703,27 @@ class PublicDemoChatLogger:
                         continue
 
                     sess_id = str(rec.get("session_id") or "anon")
-                    existing_sess = sessions_map.get(sess_id)
-                    vis_id = (
-                        existing_sess["visitor_id"]
-                        if existing_sess
-                        else (sess_id if sess_id != "anon" else f"ip_{rec.get('ip_hash', 'anon')}")
-                    )
+                    raw_vis = str(rec.get("visitor_id") or "").strip()
+                    if (
+                        rec.get("is_internal") is True
+                        or sess_id in excluded_sessions
+                        or (raw_vis and raw_vis in excluded_vids)
+                    ):
+                        continue
+
                     ts = str(rec.get("timestamp") or "")
+                    if not _within_window(ts):
+                        continue
+
+                    real_vis = raw_vis if (raw_vis and raw_vis != sess_id and raw_vis != "anon") else ""
+                    vis_id = (
+                        real_vis
+                        or session_to_visitor.get(sess_id)
+                        or (sess_id if sess_id != "anon" else f"ip_{rec.get('ip_hash', 'anon')}")
+                    )
+                    if vis_id in excluded_vids:
+                        continue
+
                     lang_val = "ar" if str(rec.get("lang") or "").lower().startswith("ar") else "en"
                     ctx_val = str(rec.get("page_context") or "demo").lower()
 
@@ -1470,13 +1732,12 @@ class PublicDemoChatLogger:
                         daily_chat_questions[d_str] += 1
 
                     unique_visitors.add(vis_id)
-                    unique_sessions.add(sess_id)
+                    unique_sessions.add(sess_id if sess_id != "anon" else vis_id)
                     if d_str in daily_visitors:
                         daily_visitors[d_str].add(vis_id)
 
                     chatbot_openers.add(vis_id)
                     chatbot_active_users.add(vis_id)
-                    lang_sessions.setdefault(lang_val, set()).add(sess_id)
 
                     if "demo" in ctx_val or any(m in ctx_val for m in _MODULE_DISPLAY_LABELS):
                         demo_visitors.add(vis_id)
@@ -1490,7 +1751,7 @@ class PublicDemoChatLogger:
                     t_key = str(rec.get("topic") or "general")
                     topic_counts[t_key] = topic_counts.get(t_key, 0) + 1
 
-                    srec = _get_or_init_session(
+                    srec = _get_or_init_visitor_journey(
                         sess_id=sess_id,
                         vis_id=vis_id,
                         ts=ts,
@@ -1508,10 +1769,43 @@ class PublicDemoChatLogger:
                     if len(chat_logs_newest_first) < chat_limit:
                         chat_logs_newest_first.append({
                             **rec,
+                            "visitor_id": vis_id,
                             "short_id": srec["short_id"],
                         })
             except Exception as exc:
                 logger.warning(f"Failed reading public chat log {ch_path}: {exc}")
+
+        # Finalize visitor-level breakdowns & materialize session_count so every breakdown sums to unique_visitors
+        source_visitors: Dict[str, int] = {}
+        device_visitors: Dict[str, int] = {}
+        country_visitors: Dict[str, int] = {}
+        lang_visitors: Dict[str, int] = {"en": 0, "ar": 0}
+        finalized_journeys: List[Dict[str, Any]] = []
+
+        for vrec in sessions_map.values():
+            sess_set = vrec.pop("_session_ids", set())
+            s_cnt = max(1, len(sess_set))
+            journey_out = {
+                **vrec,
+                "session_count": s_cnt,
+            }
+            finalized_journeys.append(journey_out)
+
+            src_lbl = vrec.get("source") or "Direct"
+            dev_lbl = vrec.get("device") or "desktop"
+            lng_lbl = "ar" if vrec.get("lang") == "ar" else "en"
+            ctry_lbl = vrec.get("country") or ""
+
+            source_visitors[src_lbl] = source_visitors.get(src_lbl, 0) + 1
+            device_visitors[dev_lbl] = device_visitors.get(dev_lbl, 0) + 1
+            lang_visitors[lng_lbl] = lang_visitors.get(lng_lbl, 0) + 1
+            if ctry_lbl:
+                country_visitors[ctry_lbl] = country_visitors.get(ctry_lbl, 0) + 1
+
+        if days == 1 and len(daily_visitors.get(yesterday_str, set())) == 0 and daily_chat_questions.get(yesterday_str, 0) == 0:
+            chart_date_keys = [today_str]
+        else:
+            chart_date_keys = date_keys
 
         u_count = len(unique_visitors)
         d_count = len(demo_visitors)
@@ -1523,7 +1817,7 @@ class PublicDemoChatLogger:
         total_story_completions = sum(v["completions"] for v in story_stats.values())
 
         sorted_sessions = sorted(
-            sessions_map.values(),
+            finalized_journeys,
             key=lambda s: s.get("last_seen") or "",
             reverse=True,
         )[:session_limit]
@@ -1602,6 +1896,7 @@ class PublicDemoChatLogger:
                 "trial_submissions": trial_submissions,
                 "brochure_downloads": brochure_downloads,
                 "bot_events_filtered": bot_events_filtered,
+                "excluded_internal_visitors": len(excluded_vids),
             },
             "daily_series": [
                 {
@@ -1610,7 +1905,7 @@ class PublicDemoChatLogger:
                     "demo_visitors": len(daily_demo_visitors[d_str]),
                     "chat_questions": daily_chat_questions[d_str],
                 }
-                for d_str in date_keys
+                for d_str in chart_date_keys
             ],
             "page_breakdown": [
                 {
@@ -1625,21 +1920,21 @@ class PublicDemoChatLogger:
             "story_breakdown": story_breakdown,
             "top_workflows": top_workflows,
             "source_breakdown": sorted(
-                [{"source": k, "sessions": len(v)} for k, v in source_sessions.items()],
+                [{"source": k, "sessions": v} for k, v in source_visitors.items()],
                 key=lambda x: x["sessions"],
                 reverse=True,
             )[:10],
             "device_breakdown": sorted(
-                [{"device": k, "sessions": len(v)} for k, v in device_sessions.items()],
+                [{"device": k, "sessions": v} for k, v in device_visitors.items()],
                 key=lambda x: x["sessions"],
                 reverse=True,
             ),
             "language_breakdown": {
-                "en": len(lang_sessions.get("en", set())),
-                "ar": len(lang_sessions.get("ar", set())),
+                "en": lang_visitors.get("en", 0),
+                "ar": lang_visitors.get("ar", 0),
             },
             "country_breakdown": sorted(
-                [{"country": k, "sessions": len(v)} for k, v in country_sessions.items()],
+                [{"country": k, "sessions": v} for k, v in country_visitors.items()],
                 key=lambda x: x["sessions"],
                 reverse=True,
             )[:10],
@@ -2278,6 +2573,8 @@ async def ask_public_product_expert(
     preferred_lang: str = "en",
     page_context: str = "demo",
     session_id: str = "anon",
+    visitor_id: str = "",
+    is_internal: bool = False,
     client_ip: str = "",
     user_agent: str = "",
 ) -> Dict[str, Any]:
@@ -2303,6 +2600,8 @@ async def ask_public_product_expert(
         latency_ms = (time.perf_counter() - t0) * 1000.0
         public_demo_chat_logger.log_exchange(
             session_id=session_id,
+            visitor_id=visitor_id,
+            is_internal=is_internal,
             page_context=page_context,
             lang=lang,
             question=clean_q,
@@ -2437,6 +2736,8 @@ async def ask_public_product_expert(
     latency_ms = (time.perf_counter() - t0) * 1000.0
     public_demo_chat_logger.log_exchange(
         session_id=session_id,
+        visitor_id=visitor_id,
+        is_internal=is_internal,
         page_context=page_context,
         lang=lang,
         question=clean_q,
@@ -2496,6 +2797,8 @@ async def ask_public_product_expert_voice(
     preferred_lang: str = "en",
     page_context: str = "demo",
     session_id: str = "anon",
+    visitor_id: str = "",
+    is_internal: bool = False,
     client_ip: str = "",
     user_agent: str = "",
 ) -> Dict[str, Any]:
@@ -2633,6 +2936,8 @@ async def ask_public_product_expert_voice(
     latency_ms = (time.perf_counter() - t0) * 1000.0
     public_demo_chat_logger.log_exchange(
         session_id=session_id,
+        visitor_id=visitor_id,
+        is_internal=is_internal,
         page_context=page_context,
         lang=out_lang,
         question=f"🎙️ {heard_q}",

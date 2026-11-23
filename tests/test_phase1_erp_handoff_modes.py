@@ -591,6 +591,7 @@ def test_phase1_http_endpoints_and_postgres_persistence():
             "total_debit",
             "total_credit",
             "is_balanced",
+            "statements_breakdown",
         }.issubset(s.keys())
         print("[PASS] test_phase1_http_endpoints_and_postgres_persistence passed")
     finally:
@@ -598,9 +599,133 @@ def test_phase1_http_endpoints_and_postgres_persistence():
         db.close()
 
 
+def test_multi_statement_grouping_and_account_fallback_continuity():
+    """
+    Reproduces the exact multi-bank 'All Statements' preview scenario where two statements
+    have overlapping booking dates and null header account_numbers:
+    - Statement 1 (Bank 1, Open 10,000,000): Nov 03 (+2,450,000 -> 12,450,000), Nov 05 (-5,000,175 -> 7,449,825), Nov 09 (-25,500 -> 7,424,325)
+    - Statement 2 (Bank 2, Open 3,000,000):  Nov 05 (+5,000,000 -> 8,000,000),  Nov 15 (+18,400 -> 8,018,400)
+    Verifies:
+    1. Rows are grouped by statement_id first so running_balance flows sequentially per bank without interleaving!
+    2. Missing account_number falls back cleanly instead of rendering empty ''.
+    """
+    db = _make_db()
+    try:
+        s1 = BankStatement(
+            company_id=88,
+            bank_id=10,
+            account_number=None,
+            file_name="FNCB_Nov2026.csv",
+            opening_balance=Decimal("10000000.00"),
+            closing_balance=Decimal("7424325.00"),
+            statement_start_date=datetime(2026, 11, 1),
+            statement_end_date=datetime(2026, 11, 30),
+            status="VALIDATED",
+        )
+        s2 = BankStatement(
+            company_id=88,
+            bank_id=20,
+            account_number=None,
+            file_name="MCB_Nov2026.csv",
+            opening_balance=Decimal("3000000.00"),
+            closing_balance=Decimal("8018400.00"),
+            statement_start_date=datetime(2026, 11, 1),
+            statement_end_date=datetime(2026, 11, 30),
+            status="VALIDATED",
+        )
+        db.add_all([s1, s2])
+        db.flush()
+
+        db.add_all([
+            BankTransaction(
+                statement_id=s1.id,
+                booking_date=datetime(2026, 11, 3),
+                value_date=datetime(2026, 11, 3),
+                currency="EGP",
+                debit_amount=Decimal("0.00"),
+                credit_amount=Decimal("2450000.00"),
+                running_balance=Decimal("12450000.00"),
+                raw_description="INSTAPAY COLLECTION",
+            ),
+            BankTransaction(
+                statement_id=s1.id,
+                booking_date=datetime(2026, 11, 5),
+                value_date=datetime(2026, 11, 5),
+                currency="EGP",
+                debit_amount=Decimal("5000175.00"),
+                credit_amount=Decimal("0.00"),
+                running_balance=Decimal("7449825.00"),
+                raw_description="CBE RTGS OUTWARD SWEEP",
+            ),
+            BankTransaction(
+                statement_id=s2.id,
+                booking_date=datetime(2026, 11, 5),
+                value_date=datetime(2026, 11, 5),
+                currency="EGP",
+                debit_amount=Decimal("0.00"),
+                credit_amount=Decimal("5000000.00"),
+                running_balance=Decimal("8000000.00"),
+                raw_description="INWARD RTGS SWEEP",
+            ),
+            BankTransaction(
+                statement_id=s1.id,
+                booking_date=datetime(2026, 11, 9),
+                value_date=datetime(2026, 11, 9),
+                currency="EGP",
+                debit_amount=Decimal("25500.00"),
+                credit_amount=Decimal("0.00"),
+                running_balance=Decimal("7424325.00"),
+                raw_description="LGC-2026 COMMISSION",
+            ),
+            BankTransaction(
+                statement_id=s2.id,
+                booking_date=datetime(2026, 11, 15),
+                value_date=datetime(2026, 11, 15),
+                currency="EGP",
+                debit_amount=Decimal("0.00"),
+                credit_amount=Decimal("18400.00"),
+                running_balance=Decimal("8018400.00"),
+                raw_description="CREDIT INTEREST",
+            ),
+        ])
+        db.commit()
+
+        req = CustomExportExecuteRequest(
+            handoff_mode="ENRICHED_STATEMENT",
+            columns_config=[
+                {"source_field": "account_number", "custom_header": "Account"},
+                {"source_field": "debit_amount", "custom_header": "Debit"},
+                {"source_field": "credit_amount", "custom_header": "Credit"},
+                {"source_field": "running_balance", "custom_header": "Balance"},
+            ],
+        )
+        _, rows, _, _ = bank_reconcile_service.build_custom_export_rows(db, customer_id=88, req=req)
+        assert len(rows) == 5
+
+        # First 3 rows MUST be Statement 1 in unbroken balance sequence:
+        balances = [Decimal(str(r["Balance"])) for r in rows]
+        assert balances == [
+            Decimal("12450000.00"),
+            Decimal("7449825.00"),
+            Decimal("7424325.00"),
+            Decimal("8000000.00"),
+            Decimal("8018400.00"),
+        ], f"Expected grouped statement balance continuity, got {balances}"
+
+        # Every row must have a non-empty fallback account identifier distinguishing Bank #10 vs Bank #20!
+        assert all(r["Account"] != "" for r in rows)
+        assert rows[0]["Account"] == rows[1]["Account"] == rows[2]["Account"]
+        assert rows[3]["Account"] == rows[4]["Account"]
+        assert rows[0]["Account"] != rows[3]["Account"]
+        print("[PASS] test_multi_statement_grouping_and_account_fallback_continuity passed")
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     test_mode_1_enriched_statement_grow_first()
     test_mode_2_subledger_clearing_flat_and_journal()
     test_mode_3_missing_gl_journal_and_cross_bank_sweep_zero_netting()
+    test_multi_statement_grouping_and_account_fallback_continuity()
     test_phase1_http_endpoints_and_postgres_persistence()
     print("ALL_PHASE1_ERP_HANDOFF_TESTS_PASSED")

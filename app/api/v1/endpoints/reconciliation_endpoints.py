@@ -615,6 +615,114 @@ def seed_foundational_knowledge(
         customer_id=current_user.customer_id
     )
 
+@router.get("/rules/bulk-template")
+def download_bulk_rules_template(
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """Downloads a ready-to-fill 3-sheet Excel template for Bulk Rules, Counterparties & Taxonomy."""
+    from app.services.reconciliation_onboarding_intelligence_service import (
+        reconciliation_onboarding_service,
+    )
+    xlsx_bytes = reconciliation_onboarding_service.generate_bulk_template_xlsx()
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": 'attachment; filename="Grow_Bulk_Rules_And_Knowledge_Template.xlsx"'
+        },
+    )
+
+
+@router.get("/rules/export")
+def export_reconciliation_rulebook(
+    format: str = "XLSX",
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_reconciliation_user_context),
+):
+    """Exports all tenant ClassificationRules, Counterparties, and Custom Taxonomy in XLSX or JSON."""
+    from app.services.reconciliation_onboarding_intelligence_service import (
+        reconciliation_onboarding_service,
+    )
+    raw_bytes, media_type, fname = reconciliation_onboarding_service.export_rulebook(
+        db=db,
+        customer_id=current_user.customer_id,
+        file_format=format,
+    )
+    return StreamingResponse(
+        io.BytesIO(raw_bytes),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.post("/rules/bulk-import")
+async def bulk_import_reconciliation_rules(
+    file: UploadFile = File(...),
+    dry_run: bool = Form(True),
+    duplicate_strategy: str = Form("UPDATE"),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """Bulk imports ClassificationRules, Counterparties, and Taxonomy from XLSX, CSV, or JSON."""
+    from app.services.reconciliation_onboarding_intelligence_service import (
+        reconciliation_onboarding_service,
+    )
+    content = await file.read()
+    return reconciliation_onboarding_service.bulk_import_rules_and_knowledge(
+        db=db,
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+        content=content,
+        filename=file.filename or "rules.xlsx",
+        dry_run=dry_run,
+        duplicate_strategy=duplicate_strategy,
+    )
+
+
+@router.post("/rules/train-from-file")
+async def train_rules_from_historical_sheet(
+    file: UploadFile = File(...),
+    bank_id: Optional[int] = Form(None),
+    dry_run: bool = Form(True),
+    auto_promote_min_hits: int = Form(2),
+    auto_create_taxonomy: bool = Form(True),
+    selected_signatures_json: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(get_current_corporate_admin_context),
+):
+    """
+    Train-Only Historical Sheet Learning:
+    Parses a pre-classified historical statement Excel/CSV and induces ClassificationRules,
+    Counterparties, Account Profiles, and optional Taxonomy WITHOUT adding rows to live statements!
+    """
+    import json as _json
+    from app.services.reconciliation_onboarding_intelligence_service import (
+        reconciliation_onboarding_service,
+    )
+    content = await file.read()
+    selected_sigs = None
+    if selected_signatures_json:
+        try:
+            parsed = _json.loads(selected_signatures_json)
+            if isinstance(parsed, list):
+                selected_sigs = [str(x) for x in parsed]
+        except Exception:
+            selected_sigs = None
+
+    return reconciliation_onboarding_service.train_from_historical_file(
+        db=db,
+        customer_id=current_user.customer_id,
+        user_id=current_user.user_id,
+        content=content,
+        filename=file.filename or "historical.xlsx",
+        bank_id=bank_id,
+        dry_run=dry_run,
+        auto_promote_min_hits=auto_promote_min_hits,
+        auto_create_taxonomy=auto_create_taxonomy,
+        selected_signatures=selected_sigs,
+    )
+
+
 @router.get("/rules", response_model=List[ClassificationRuleOut])
 def get_rules(
     db: Session = Depends(get_db),
@@ -1428,11 +1536,94 @@ def preview_custom_export(
     if req.bank_id:
         base_q = base_q.filter(BankStatement.bank_id == req.bank_id)
 
-    scoped_txns = base_q.all()
+    scoped_txns = base_q.order_by(
+        BankTransaction.statement_id.asc(),
+        BankTransaction.booking_date.asc(),
+        BankTransaction.id.asc(),
+    ).all()
     total_count = len(scoped_txns)
     finalized_count = sum(1 for t in scoped_txns if t.is_reconciled or t.is_classified)
     unclassified_count = sum(1 for t in scoped_txns if not t.is_classified)
     exported_count = sum(1 for t in scoped_txns if t.is_exported)
+
+    # Build per-statement Opening -> Net Movement -> Closing continuity breakdown
+    statements_breakdown = []
+    stmt_ids_present = sorted({t.statement_id for t in scoped_txns if t.statement_id})
+    if stmt_ids_present:
+        from decimal import Decimal
+        from app.models.models import Bank
+        banks_map = {b.id: (b.short_name or b.name) for b in db.query(Bank).all()}
+        default_cba_by_bank = {}
+        try:
+            from app.models.models_issuance import CustomerBankAccount
+            for a in db.query(CustomerBankAccount).filter(
+                CustomerBankAccount.customer_id == cid,
+                CustomerBankAccount.is_deleted == False,
+            ).all():
+                clean_acct = (a.account_number or "").strip()
+                if a.bank_id and clean_acct and (a.is_default or a.bank_id not in default_cba_by_bank):
+                    default_cba_by_bank[a.bank_id] = clean_acct
+        except Exception:
+            pass
+
+        txns_by_stmt = {}
+        for t in scoped_txns:
+            txns_by_stmt.setdefault(t.statement_id, []).append(t)
+
+        stmt_objs = db.query(BankStatement).filter(
+            BankStatement.id.in_(stmt_ids_present),
+            BankStatement.company_id == cid,
+        ).order_by(BankStatement.id.asc()).all()
+
+        for s in stmt_objs:
+            s_txns = txns_by_stmt.get(s.id, [])
+            if not s_txns:
+                continue
+            b_label = banks_map.get(s.bank_id, f"Bank #{s.bank_id}") if s.bank_id else "Bank"
+            acct_lbl = (
+                (s.account_number or "").strip()
+                or default_cba_by_bank.get(s.bank_id)
+                or f"{b_label} (Stmt #{s.id})"
+            )
+            curr_code = (
+                (s_txns[0].currency or "").strip().upper()
+                or (s.currency.iso_code.upper() if getattr(s, "currency", None) and s.currency.iso_code else "EGP")
+            )
+            first_t = s_txns[0]
+            last_t = s_txns[-1]
+            implied_open = None
+            if first_t.running_balance is not None:
+                implied_open = Decimal(str(first_t.running_balance)) - (
+                    Decimal(str(first_t.credit_amount or 0)) - Decimal(str(first_t.debit_amount or 0))
+                )
+            if s.opening_balance is not None and (Decimal(str(s.opening_balance)) != Decimal("0") or implied_open is None):
+                open_dec = Decimal(str(s.opening_balance))
+            else:
+                open_dec = implied_open if implied_open is not None else Decimal("0.00")
+
+            net_dec = sum(
+                (Decimal(str(x.credit_amount or 0)) - Decimal(str(x.debit_amount or 0)))
+                for x in s_txns
+            )
+            if last_t.running_balance is not None:
+                close_dec = Decimal(str(last_t.running_balance))
+            elif s.closing_balance is not None and Decimal(str(s.closing_balance)) != Decimal("0"):
+                close_dec = Decimal(str(s.closing_balance))
+            else:
+                close_dec = open_dec + net_dec
+
+            statements_breakdown.append({
+                "statement_id": s.id,
+                "bank_id": s.bank_id,
+                "bank_name": b_label,
+                "file_name": s.file_name,
+                "account_label": acct_lbl,
+                "currency": curr_code,
+                "txn_count": len(s_txns),
+                "opening_balance": float(open_dec),
+                "net_movement": float(net_dec),
+                "closing_balance": float(close_dec),
+            })
 
     scoped_ids = [t.id for t in scoped_txns]
     erp_matched_ids = set()
@@ -1492,6 +1683,7 @@ def preview_custom_export(
             "total_debit": total_dr,
             "total_credit": total_cr,
             "is_balanced": is_balanced,
+            "statements_breakdown": statements_breakdown,
         },
         "headers": headers,
         "preview_rows": rows[:50],

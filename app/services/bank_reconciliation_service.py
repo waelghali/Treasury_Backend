@@ -404,6 +404,7 @@ class BankReconciliationService:
             "currency": ['currency', 'ccy', 'curr', 'العملة', 'عملة'],
             "category": ['category', 'class', 'فئة', 'تصنيف'],
             "sub_category": ['subcategory', 'subclass', 'فئة فرعية'],
+            "gl_account": ['glaccount', 'glcode', 'accountcode', 'ledgeraccount', 'حسابالأستاذ', 'رقمحسابالأستاذ', 'كودالحساب'],
             "net": ['net', 'صافي'],
             "positive": ['positive', 'موجب'],
             "source": ['source', 'مصدر', 'نظام'],
@@ -879,8 +880,18 @@ class BankReconciliationService:
         top_col_low = [str(c).lower().strip() for c in df.columns if pd.notna(c) and not str(c).startswith("Unnamed")]
         if not top_col_low and len(df) > 0:
             top_col_low = [str(v).lower().strip() for v in df.iloc[0].values if pd.notna(v)]
+        has_category_label_col = any(
+            any(k in h for k in ('category', 'class', 'subclass', 'sub-category', 'تصنيف', 'فئة'))
+            for h in top_col_low
+        )
         has_erp_col_or_marker = (
-            any(any(k in h for k in ('invoice date', 'bill date', 'record type', 'invoice no', 'invoice #', 'bill #', 'voucher no', 'gl account', 'رقم الفاتورة')) for h in top_col_low)
+            any(any(k in h for k in ('invoice date', 'bill date', 'record type', 'invoice no', 'invoice #', 'bill #', 'voucher no', 'رقم الفاتورة')) for h in top_col_low)
+            or (
+                any('gl account' in h for h in top_col_low)
+                and not has_category_label_col
+                and any(any(k in h for k in ('entity', 'invoice', 'bill', 'vendor', 'customer', 'reference')) for h in top_col_low)
+                and not any(any(k in h for k in ('description', 'narrative', 'details', 'بيان', 'تفاصيل')) for h in top_col_low)
+            )
             or any(any(k in cell for k in ('ar_invoice', 'ap_bill', 'sales invoice', 'purchase invoice', 'vendor bill', 'open invoice')) for cell in probe_header_cells)
         )
         if has_erp_col_or_marker and not has_cash_ledger_cols:
@@ -1114,6 +1125,7 @@ class BankReconciliationService:
 
                 pre_category = self._sanitize_text(row.get(mapping.get("category"))) if mapping.get("category") else None
                 pre_sub_category = self._sanitize_text(row.get(mapping.get("sub_category"))) if mapping.get("sub_category") else None
+                pre_gl_account = self._sanitize_text(row.get(mapping.get("gl_account"))) if mapping.get("gl_account") else None
                 mapped_beneficiary = self._sanitize_text(row.get(mapping.get("beneficiary"))) if mapping.get("beneficiary") else None
                 effective_counterparty = mapped_beneficiary or std_decoded.get("extracted_counterparty")
                 mapped_bo_ref = self._sanitize_text(row.get(mapping.get("back_office_ref"))) if mapping.get("back_office_ref") else None
@@ -1143,7 +1155,7 @@ class BankReconciliationService:
                     "account_number": self._sanitize_text(row.get(mapping.get("account_no"))) if mapping.get("account_no") else metadata.get("account_number"),
                     "back_office_ref": mapped_bo_ref,
                     "cheque_number": self._sanitize_text(row.get(mapping.get("cheque_no"))) if mapping.get("cheque_no") else None,
-                    "category": pre_category,
+                    "category": pre_category or pre_gl_account,
                     "sub_category": pre_sub_category,
                     "net_amount": txn_net,
                     "is_positive": is_positive,
@@ -1156,16 +1168,18 @@ class BankReconciliationService:
                     "amount_in_egp": txn_amount_egp,
                     "transfer_type": self._sanitize_text(row.get(mapping.get("transfer_type"))) if mapping.get("transfer_type") else None,
                 }
-                if pre_category:
-                    txn["classification_category"] = pre_category
-                    txn["suggested_category"] = pre_category
-                    txn["internal_category"] = pre_category
+                if pre_category or pre_gl_account:
+                    eff_cat = pre_category or pre_gl_account
+                    eff_gl = pre_gl_account or pre_category
+                    txn["classification_category"] = eff_cat
+                    txn["suggested_category"] = eff_cat
+                    txn["internal_category"] = eff_gl
                     txn["classification_source"] = "HISTORICAL_IMPORT"
                     txn["classification_confidence"] = 100
                     txn["auto_confirmed"] = True
                     txn["manual_override"] = True
                     txn["is_classified"] = True
-                    txn["classification_reasoning"] = f"Imported with historical classification '{pre_category}'"
+                    txn["classification_reasoning"] = f"Imported with historical classification '{eff_cat}' (GL: '{eff_gl}')"
                 transactions.append(txn)
             except HTTPException:
                 raise
@@ -3886,8 +3900,63 @@ class BankReconciliationService:
         if getattr(req, "exclude_already_exported", False):
             query = query.filter(or_(BankTransaction.is_exported == False, BankTransaction.is_exported == None))
 
-        all_txns = query.order_by(BankTransaction.booking_date.asc(), BankTransaction.id.asc()).limit(5000).all()
+        all_txns = query.order_by(
+            BankTransaction.statement_id.asc(),
+            BankTransaction.booking_date.asc(),
+            BankTransaction.id.asc(),
+        ).limit(5000).all()
         all_txns = crud_bank_transaction._resolve_confidential_fields(db, all_txns, customer_id=customer_id)
+
+        # Build zero-lazy-load account identifier fallbacks per statement so multi-bank exports never show blank '—'
+        stmt_acct_fallback_by_id: Dict[int, str] = {}
+        stmt_ids_in_scope = {t.statement_id for t in all_txns if t.statement_id}
+        if stmt_ids_in_scope:
+            stmt_meta_rows = db.query(
+                BankStatement.id,
+                BankStatement.account_number,
+                BankStatement.bank_id,
+            ).filter(BankStatement.id.in_(stmt_ids_in_scope)).all()
+
+            banks_label_map: Dict[int, str] = {}
+            default_cba_acct_by_bank: Dict[int, str] = {}
+            try:
+                from sqlalchemy import inspect as sa_inspect
+                conn_insp = sa_inspect(db.connection())
+                if conn_insp.has_table("banks"):
+                    from app.models.models import Bank
+                    for b_row in db.query(Bank.id, Bank.short_name, Bank.name).all():
+                        banks_label_map[b_row[0]] = (b_row[1] or b_row[2] or f"Bank #{b_row[0]}").strip()
+                if conn_insp.has_table("customer_bank_accounts"):
+                    from app.models.models_issuance import CustomerBankAccount
+                    cba_rows = db.query(
+                        CustomerBankAccount.bank_id,
+                        CustomerBankAccount.account_number,
+                        CustomerBankAccount.is_default,
+                    ).filter(
+                        CustomerBankAccount.customer_id == customer_id,
+                        CustomerBankAccount.is_deleted == False,
+                    ).all()
+                    for c_bank_id, c_acct, c_is_def in cba_rows:
+                        clean_c_acct = (c_acct or "").strip()
+                        if not c_bank_id or not clean_c_acct:
+                            continue
+                        if c_is_def or c_bank_id not in default_cba_acct_by_bank:
+                            default_cba_acct_by_bank[c_bank_id] = clean_c_acct
+            except Exception:
+                pass
+
+            for s_id, s_acct, s_bank_id in stmt_meta_rows:
+                clean_s_acct = (s_acct or "").strip()
+                if clean_s_acct:
+                    stmt_acct_fallback_by_id[s_id] = clean_s_acct
+                elif s_bank_id and s_bank_id in default_cba_acct_by_bank:
+                    stmt_acct_fallback_by_id[s_id] = default_cba_acct_by_bank[s_bank_id]
+                elif s_bank_id and s_bank_id in banks_label_map:
+                    stmt_acct_fallback_by_id[s_id] = f"{banks_label_map[s_bank_id]} (Stmt #{s_id})"
+                elif s_bank_id:
+                    stmt_acct_fallback_by_id[s_id] = f"Bank #{s_bank_id} (Stmt #{s_id})"
+                else:
+                    stmt_acct_fallback_by_id[s_id] = f"Stmt #{s_id}"
 
         # Preload ERP match references & linked sweep/reversal counterparts
         txn_ids = [t.id for t in all_txns]
@@ -4058,8 +4127,8 @@ class BankReconciliationService:
                 return ""
 
             val = getattr(t, field_key, None)
-            if field_key == "account_number" and not val and t.statement:
-                val = t.statement.account_number
+            if field_key == "account_number" and not val:
+                val = stmt_acct_fallback_by_id.get(t.statement_id) or (t.statement.account_number if t.statement else None)
             if isinstance(val, datetime):
                 try:
                     return val.strftime(date_fmt)

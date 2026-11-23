@@ -146,6 +146,8 @@ class PublicChatRequest(BaseModel):
     preferred_lang: Optional[str] = Field(default="en")
     page_context: Optional[str] = Field(default="demo")
     session_id: Optional[str] = Field(default="anon")
+    visitor_id: Optional[str] = Field(default="")
+    is_internal: Optional[bool] = Field(default=False)
     website_url: Optional[str] = Field(default="")  # Anti-bot honeypot
 
 
@@ -176,6 +178,8 @@ class PublicVoiceChatRequest(BaseModel):
     preferred_lang: Optional[str] = Field(default="en")
     page_context: Optional[str] = Field(default="demo")
     session_id: Optional[str] = Field(default="anon")
+    visitor_id: Optional[str] = Field(default="")
+    is_internal: Optional[bool] = Field(default=False)
     website_url: Optional[str] = Field(default="")
 
 
@@ -249,6 +253,8 @@ async def public_product_expert_chat(
         preferred_lang=pref_lang,
         page_context=(payload.page_context or "demo")[:120],
         session_id=(payload.session_id or "anon")[:64],
+        visitor_id=(payload.visitor_id or "")[:64],
+        is_internal=bool(payload.is_internal),
         client_ip=client_ip,
         user_agent=user_agent,
     )
@@ -264,6 +270,7 @@ class PublicTelemetryEventRequest(BaseModel):
     utm_campaign: Optional[str] = Field(default="")
     device_type: Optional[str] = Field(default="desktop")
     lang: Optional[str] = Field(default="en")
+    is_internal: Optional[bool] = Field(default=False)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -280,6 +287,9 @@ def record_public_telemetry_event(
     evt = (payload.event_type or "").strip().lower()
     if evt not in _ALLOWED_TELEMETRY_EVENTS:
         return {"ok": False}
+
+    if payload.is_internal:
+        return {"ok": True}
 
     client_ip = _extract_client_ip(request)
     if is_production_public_telemetry_env() and (is_loopback_ip(client_ip) or _is_localhost_origin(request)):
@@ -306,6 +316,7 @@ def record_public_telemetry_event(
         metadata=payload.metadata if isinstance(payload.metadata, dict) else {},
         ip_hash=ip_hash,
         user_agent=user_agent,
+        is_internal=bool(payload.is_internal),
     )
     return {"ok": True}
 
@@ -396,6 +407,8 @@ async def public_product_expert_voice_chat(
             preferred_lang=(payload.preferred_lang or "en")[:8],
             page_context=(payload.page_context or "demo")[:120],
             session_id=(payload.session_id or "anon")[:64],
+            visitor_id=(payload.visitor_id or "")[:64],
+            is_internal=bool(payload.is_internal),
             client_ip=client_ip,
             user_agent=user_agent,
         )
@@ -484,11 +497,33 @@ def get_public_demo_chat_logs(
     return public_demo_chat_logger.read_recent_logs(days=days, limit=limit)
 
 
+class AdminTelemetryExclusionRequest(BaseModel):
+    visitor_id: str = Field(default="")
+    excluded: bool = Field(default=True)
+
+
+@router.post("/admin/telemetry-exclusion")
+def update_admin_telemetry_exclusion(
+    payload: AdminTelemetryExclusionRequest,
+    current_owner: TokenData = Depends(get_current_system_owner),
+) -> Dict[str, Any]:
+    """System-Owner-only endpoint to exclude or unexclude an internal/owner browser `visitor_id`."""
+    vid = (payload.visitor_id or "").strip()[:64]
+    if payload.excluded:
+        if hasattr(public_demo_chat_logger, "register_excluded_visitor"):
+            public_demo_chat_logger.register_excluded_visitor(vid)
+    else:
+        if hasattr(public_demo_chat_logger, "unexclude_visitor"):
+            public_demo_chat_logger.unexclude_visitor(vid)
+    return {"ok": True, "visitor_id": vid, "excluded": bool(payload.excluded)}
+
+
 @router.get("/admin/analytics")
 def get_public_website_and_demo_analytics(
     days: int = Query(default=14, ge=1, le=90),
     chat_limit: int = Query(default=300, ge=1, le=500),
     session_limit: int = Query(default=150, ge=1, le=300),
+    exclude_visitor_id: Optional[str] = Query(default=""),
     current_owner: TokenData = Depends(get_current_system_owner),
 ) -> Dict[str, Any]:
     """
@@ -496,6 +531,9 @@ def get_public_website_and_demo_analytics(
     Demo Story & Workflow Engagement, AI Chatbot Conversion & Q&A Inbox,
     and Visitor Session Journeys.
     """
+    if exclude_visitor_id and exclude_visitor_id.strip():
+        if hasattr(public_demo_chat_logger, "register_excluded_visitor"):
+            public_demo_chat_logger.register_excluded_visitor(exclude_visitor_id.strip()[:64])
     return public_demo_chat_logger.compute_public_analytics(
         days=days,
         chat_limit=chat_limit,
