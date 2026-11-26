@@ -4229,18 +4229,21 @@ def resubmit_quotation(
                 detail="A maximum of 4 currency pairs can be submitted in a single quotation request."
             )
 
+        from app.crud.crud_quotation import _normalize_leg_trade_key
         seen_pair_keys = set()
         for idx, p_item in enumerate(resubmit_pairs, start=1):
             b_curr = (getattr(p_item, 'buyCurrency', None) or getattr(p_item, 'buy_currency', None) or rfq.buy_currency or 'USD').strip().upper()
             s_curr = (getattr(p_item, 'sellCurrency', None) or getattr(p_item, 'sell_currency', None) or rfq.sell_currency or 'EGP').strip().upper()
-            v_date = str(getattr(p_item, 'valueDate', None) or getattr(p_item, 'value_date', None) or rfq.value_date or '').strip()
+            p_dir = (getattr(p_item, 'direction', None) or rfq.direction or 'Buy').strip().capitalize()
+            v_date = str(getattr(p_item, 'valueDate', None) or getattr(p_item, 'value_date', None) or rfq.value_date or '').strip().split('T')[0]
             q_b = (getattr(p_item, 'quotationBase', None) or getattr(p_item, 'quotation_base', None) or rfq.quotation_base or 'Execution').strip().lower()
 
-            pair_key = (frozenset([b_curr, s_curr]), v_date, q_b)
+            trade_key = _normalize_leg_trade_key(b_curr, s_curr, p_dir)
+            pair_key = (trade_key, v_date, q_b)
             if pair_key in seen_pair_keys:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Duplicate currency pair detected: Multiple legs requested for {b_curr}/{s_curr} with the same settlement date ({v_date}) and quotation base ({q_b.capitalize()}). Similar pairs with matching settlement date and quotation base are not permitted."
+                    detail=f"Duplicate currency pair detected: Multiple legs requested for {p_dir} {b_curr}/{s_curr} with the same settlement date ({v_date}) and quotation base ({q_b.capitalize()}). Identical legs with matching settlement date and quotation base are not permitted."
                 )
             seen_pair_keys.add(pair_key)
 

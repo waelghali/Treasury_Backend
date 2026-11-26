@@ -42,6 +42,11 @@ def _parse_banks_payload(raw_data):
     return []
 
 def _normalize_leg_trade_key(buy_curr: str, sell_curr: str, direction: str) -> str:
+    """
+    Canonicalizes an FX trade direction + pair so economically identical legs
+    (e.g., Buy USD/EGP vs Sell EGP/USD) produce the same key, while opposite
+    trades on the same pair (Buy USD/EGP vs Sell USD/EGP) remain distinct.
+    """
     b = (buy_curr or '').strip().upper()
     s = (sell_curr or '').strip().upper()
     d = (direction or 'Buy').strip().upper()
@@ -53,13 +58,17 @@ def _normalize_leg_trade_key(buy_curr: str, sell_curr: str, direction: str) -> s
 
 def get_bank_leg_signature(buy_curr: str, sell_curr: str, direction: str, value_date, quotation_base: str) -> str:
     """
-    Modular signature for bank leg uniqueness.
-    Easily hardened or eased by adjusting what fields are included in the signature.
+    Modular signature for Bank-level leg uniqueness.
+    Combines unordered currency pair + effective value date + quotation base.
+    Direction is intentionally excluded so a single counterparty cannot receive
+    both Buy and Sell requests for the same pair on the same date and base.
     """
-    trade_key = _normalize_leg_trade_key(buy_curr, sell_curr, direction)
+    b = (buy_curr or '').strip().upper()
+    s = (sell_curr or '').strip().upper()
+    pair_key = f"{b}/{s}" if b <= s else f"{s}/{b}"
     val_date_str = str(value_date).strip().split('T')[0] if value_date else ''
     base_str = (quotation_base or 'Execution').strip().lower()
-    return f"{trade_key}:{val_date_str}:{base_str}"
+    return f"{pair_key}:{val_date_str}:{base_str}"
 
 class CRUDQuotation:
     
@@ -520,20 +529,22 @@ class CRUDQuotation:
                     detail="A maximum of 4 currency pairs can be submitted in a single quotation request."
                 )
 
-            # Validate against similar/duplicate pairs (same currencies, same value date, and same quotation base)
+            # Validate against identical legs (same normalized trade direction+currencies, value date, and quotation base)
+            # Opposite directions (e.g., Buy USD/EGP vs Sell USD/EGP) are permitted at RFQ level so they can be routed to different banks.
             seen_pair_keys = set()
             for idx, p_item in enumerate(pairs_list, start=1):
                 b_curr = (getattr(p_item, 'buyCurrency', None) or getattr(p_item, 'buy_currency', None) or obj_in.buyCurrency or 'USD').strip().upper()
                 s_curr = (getattr(p_item, 'sellCurrency', None) or getattr(p_item, 'sell_currency', None) or obj_in.sellCurrency or 'EGP').strip().upper()
-                v_date = str(getattr(p_item, 'valueDate', None) or getattr(p_item, 'value_date', None) or obj_in.valueDate or '').strip()
+                p_dir = (getattr(p_item, 'direction', None) or obj_in.direction or 'Buy').strip().capitalize()
+                v_date = str(getattr(p_item, 'valueDate', None) or getattr(p_item, 'value_date', None) or obj_in.valueDate or '').strip().split('T')[0]
                 q_b = (getattr(p_item, 'quotationBase', None) or getattr(p_item, 'quotation_base', None) or obj_in.quotationBase or 'Execution').strip().lower()
 
-                # Currencies set handles both matching and reversed currencies (e.g., USD/EGP vs EGP/USD)
-                pair_key = (frozenset([b_curr, s_curr]), v_date, q_b)
+                trade_key = _normalize_leg_trade_key(b_curr, s_curr, p_dir)
+                pair_key = (trade_key, v_date, q_b)
                 if pair_key in seen_pair_keys:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Duplicate currency pair detected: Multiple legs requested for {b_curr}/{s_curr} with the same settlement date ({v_date}) and quotation base ({q_b.capitalize()}). Similar pairs with matching settlement date and quotation base are not permitted."
+                        detail=f"Duplicate currency pair detected: Multiple legs requested for {p_dir} {b_curr}/{s_curr} with the same settlement date ({v_date}) and quotation base ({q_b.capitalize()}). Identical legs with matching settlement date and quotation base are not permitted."
                     )
                 seen_pair_keys.add(pair_key)
 
