@@ -286,7 +286,9 @@ def configure_app_instance(fastapi_app: FastAPI):
 
     from app.core.security_headers import SecurityHeadersMiddleware
     from app.core.trial_guard import TrialRequestStateMiddleware
+    from app.core.cloudflare_guard import CloudflareGuardMiddleware
     fastapi_app.add_middleware(SecurityHeadersMiddleware)
+    fastapi_app.add_middleware(CloudflareGuardMiddleware)
     fastapi_app.add_middleware(TrialRequestStateMiddleware)
 
     # --- Module Imports ---
